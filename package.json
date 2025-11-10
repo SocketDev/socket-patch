@@ -1,0 +1,63 @@
+{
+  "name": "@socketsecurity/socket-patch-cli",
+  "version": "0.1.0",
+  "description": "CLI tool for applying security patches to dependencies",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "socket-patch": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema/manifest-schema.d.ts",
+      "require": "./dist/schema/manifest-schema.js",
+      "import": "./dist/schema/manifest-schema.js"
+    },
+    "./hash": {
+      "types": "./dist/hash/git-sha256.d.ts",
+      "require": "./dist/hash/git-sha256.js",
+      "import": "./dist/hash/git-sha256.js"
+    },
+    "./patch": {
+      "types": "./dist/patch/apply.d.ts",
+      "require": "./dist/patch/apply.js",
+      "import": "./dist/patch/apply.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "patch": "node dist/cli.js",
+    "lint": "oxlint -c ./.oxlintrc.json --tsconfig ./tsconfig.json --deny-warnings",
+    "lint:fix": "pnpm run lint --fix && pnpm run lint:fix:fast",
+    "lint:fix:fast": "biome format --write"
+  },
+  "keywords": [
+    "security",
+    "patch",
+    "cli",
+    "dependencies"
+  ],
+  "author": "Socket Security",
+  "license": "MIT",
+  "dependencies": {
+    "yargs": "^17.7.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.1.2",
+    "@types/node": "^20.0.0",
+    "@types/yargs": "^17.0.32",
+    "oxlint": "^1.15.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

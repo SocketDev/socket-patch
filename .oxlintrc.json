@@ -1,0 +1,64 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["**/dist/", "**/node_modules/", "**/.git/"],
+  "plugins": ["typescript", "oxc", "promise", "import"],
+  "categories": {
+    "correctness": "warn",
+    "perf": "warn",
+    "suspicious": "warn"
+  },
+  "rules": {
+    "no-unused-vars": "allow",
+    "no-new-array": "allow",
+    "no-empty-file": "allow",
+    "no-await-in-loop": "allow",
+    "consistent-function-scoping": "allow",
+    "no-new": "allow",
+    "no-extraneous-class": "allow",
+    "no-array-index-key": "allow",
+    "no-unsafe-optional-chaining": "allow",
+    "no-promise-in-callback": "allow",
+    "no-callback-in-promise": "allow",
+    "consistent-type-imports": "deny",
+    "no-empty-named-blocks": "allow",
+    "no-unnecessary-parameter-property-assignment": "allow",
+    "no-unneeded-ternary": "allow",
+    "no-eq-null": "allow",
+    "max-lines-per-function": "allow",
+    "max-depth": "allow",
+    "no-magic-numbers": "allow",
+    "no-unassigned-import": "allow",
+    "promise/always-return": "allow",
+    "no-unassigned-vars": "deny",
+    "typescript/no-floating-promises": "deny",
+    "typescript/no-misused-promises": "deny",
+    "typescript/return-await": "allow",
+    "typescript/await-thenable": "allow",
+    "typescript/consistent-type-imports": "allow",
+    "typescript/no-base-to-string": "allow",
+    "typescript/no-duplicate-type-constituents": "allow",
+    "typescript/no-for-in-array": "allow",
+    "typescript/no-meaningless-void-operator": "allow",
+    "typescript/no-misused-spread": "allow",
+    "typescript/no-redundant-type-constituents": "allow",
+    "typescript/no-unnecessary-boolean-literal-compare": "allow",
+    "typescript/no-unnecessary-template-expression": "allow",
+    "typescript/no-unnecessary-type-arguments": "allow",
+    "typescript/no-unnecessary-type-assertion": "allow",
+    "typescript/no-unsafe-enum-comparison": "allow",
+    "typescript/no-unsafe-type-assertion": "allow",
+    "typescript/require-array-sort-compare": "allow",
+    "typescript/restrict-template-expressions": "allow",
+    "typescript/triple-slash-reference": "allow",
+    "typescript/unbound-method": "allow"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.js", "**/*.spec.ts", "**/*.spec.js"],
+      "rules": {
+        "typescript/no-floating-promises": "allow",
+        "typescript/no-misused-promises": "allow"
+      }
+    }
+  ]
+}
