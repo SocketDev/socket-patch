@@ -30,7 +30,6 @@
     }
   },
   "scripts": {
-    "prepare": "tsc",
     "build": "tsc",
     "dev": "tsc --watch",
     "patch": "node dist/cli.js",
