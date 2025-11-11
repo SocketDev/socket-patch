@@ -11,6 +11,10 @@ import {
   applyPackagePatch,
 } from '../patch/apply.js'
 import type { ApplyResult } from '../patch/apply.js'
+import {
+  cleanupUnusedBlobs,
+  formatCleanupResult,
+} from '../utils/cleanup-blobs.js'
 
 interface ApplyArgs {
   cwd: string
@@ -92,6 +96,14 @@ async function applyPatches(
       if (!silent) {
         console.error(`Failed to patch ${purl}: ${result.error}`)
       }
+    }
+  }
+
+  // Clean up unused blobs after applying patches
+  if (!silent) {
+    const cleanupResult = await cleanupUnusedBlobs(manifest, blobsPath, dryRun)
+    if (cleanupResult.blobsRemoved > 0) {
+      console.log(`\n${formatCleanupResult(cleanupResult, dryRun)}`)
     }
   }
 

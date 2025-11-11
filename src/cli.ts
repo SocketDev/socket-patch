@@ -3,12 +3,14 @@
 import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
 import { applyCommand } from './commands/apply.js'
+import { downloadCommand } from './commands/download.js'
 
 async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
     .scriptName('socket-patch')
     .usage('$0 <command> [options]')
     .command(applyCommand)
+    .command(downloadCommand)
     .demandCommand(1, 'You must specify a command')
     .help()
     .alias('h', 'help')
