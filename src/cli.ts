@@ -4,6 +4,9 @@ import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
 import { applyCommand } from './commands/apply.js'
 import { downloadCommand } from './commands/download.js'
+import { listCommand } from './commands/list.js'
+import { removeCommand } from './commands/remove.js'
+import { gcCommand } from './commands/gc.js'
 
 async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
@@ -11,6 +14,9 @@ async function main(): Promise<void> {
     .usage('$0 <command> [options]')
     .command(applyCommand)
     .command(downloadCommand)
+    .command(listCommand)
+    .command(removeCommand)
+    .command(gcCommand)
     .demandCommand(1, 'You must specify a command')
     .help()
     .alias('h', 'help')
