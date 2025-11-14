@@ -4,7 +4,12 @@ import type { CommandModule } from 'yargs'
 import {
   PatchManifestSchema,
   DEFAULT_PATCH_MANIFEST_PATH,
+  type PatchManifest,
 } from '../schema/manifest-schema.js'
+import {
+  cleanupUnusedBlobs,
+  formatCleanupResult,
+} from '../utils/cleanup-blobs.js'
 
 interface RemoveArgs {
   identifier: string
@@ -15,7 +20,7 @@ interface RemoveArgs {
 async function removePatch(
   identifier: string,
   manifestPath: string,
-): Promise<{ removed: string[]; notFound: boolean }> {
+): Promise<{ removed: string[]; notFound: boolean; manifest: PatchManifest }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
   const manifestData = JSON.parse(manifestContent)
@@ -52,7 +57,7 @@ async function removePatch(
     )
   }
 
-  return { removed, notFound: !foundMatch }
+  return { removed, notFound: !foundMatch, manifest }
 }
 
 export const removeCommand: CommandModule<{}, RemoveArgs> = {
@@ -91,7 +96,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         process.exit(1)
       }
 
-      const { removed, notFound } = await removePatch(
+      const { removed, notFound, manifest } = await removePatch(
         argv.identifier,
         manifestPath,
       )
@@ -107,7 +112,14 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
       }
 
       console.log(`\nManifest updated at ${manifestPath}`)
-      console.log('Tip: Run "socket-patch gc" to clean up unused blob files.')
+
+      // Clean up unused blobs after removing patches
+      const socketDir = path.dirname(manifestPath)
+      const blobsPath = path.join(socketDir, 'blobs')
+      const cleanupResult = await cleanupUnusedBlobs(manifest, blobsPath, false)
+      if (cleanupResult.blobsRemoved > 0) {
+        console.log(`\n${formatCleanupResult(cleanupResult, false)}`)
+      }
 
       process.exit(0)
     } catch (err) {
