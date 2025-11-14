@@ -8,3 +8,10 @@ export * from './hash/git-sha256.js'
 // Re-export patch application utilities
 export * from './patch/file-hash.js'
 export * from './patch/apply.js'
+
+// Re-export manifest utilities
+export * from './manifest/operations.js'
+export * from './manifest/recovery.js'
+
+// Re-export constants
+export * from './constants.js'

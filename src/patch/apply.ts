@@ -273,12 +273,11 @@ export async function findPackagesForPatches(
           if (!scopedEntry.isDirectory() && !scopedEntry.isSymbolicLink()) continue
 
           const pkgPath = path.join(dirPath, scopedEntry.name)
-          const pkgName = `${entry.name}/${scopedEntry.name}`
-          await checkPackage(pkgPath, pkgName, manifest, packages)
+          await checkPackage(pkgPath, manifest, packages)
         }
       } else {
         // Handle non-scoped packages
-        await checkPackage(dirPath, entry.name, manifest, packages)
+        await checkPackage(dirPath, manifest, packages)
       }
     }
   } catch {
@@ -290,7 +289,6 @@ export async function findPackagesForPatches(
 
 async function checkPackage(
   pkgPath: string,
-  _pkgName: string,
   manifest: PatchManifest,
   packages: Map<string, PackageLocation>,
 ): Promise<void> {
