@@ -33,6 +33,19 @@ export interface ApplyResult {
 }
 
 /**
+ * Normalize file path by removing the 'package/' prefix if present
+ * Patch files come from the API with paths like 'package/lib/file.js'
+ * but we need relative paths like 'lib/file.js' for the actual package directory
+ */
+function normalizeFilePath(fileName: string): string {
+  const packagePrefix = 'package/'
+  if (fileName.startsWith(packagePrefix)) {
+    return fileName.slice(packagePrefix.length)
+  }
+  return fileName
+}
+
+/**
  * Verify a single file can be patched
  */
 export async function verifyFilePatch(
@@ -40,7 +53,8 @@ export async function verifyFilePatch(
   fileName: string,
   fileInfo: PatchFileInfo,
 ): Promise<VerifyResult> {
-  const filepath = path.join(packagePath, fileName)
+  const normalizedFileName = normalizeFilePath(fileName)
+  const filepath = path.join(packagePath, normalizedFileName)
 
   // Check if file exists
   try {
@@ -94,7 +108,8 @@ export async function applyFilePatch(
   patchedContent: Buffer,
   expectedHash: string,
 ): Promise<void> {
-  const filepath = path.join(packagePath, fileName)
+  const normalizedFileName = normalizeFilePath(fileName)
+  const filepath = path.join(packagePath, normalizedFileName)
 
   // Write the patched content
   await fs.writeFile(filepath, patchedContent)
@@ -244,7 +259,8 @@ export async function findPackagesForPatches(
     const entries = await fs.readdir(nodeModulesPath, { withFileTypes: true })
 
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue
+      // Allow both directories and symlinks (pnpm uses symlinks)
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
 
       const isScoped = entry.name.startsWith('@')
       const dirPath = path.join(nodeModulesPath, entry.name)
@@ -253,7 +269,8 @@ export async function findPackagesForPatches(
         // Handle scoped packages
         const scopedEntries = await fs.readdir(dirPath, { withFileTypes: true })
         for (const scopedEntry of scopedEntries) {
-          if (!scopedEntry.isDirectory()) continue
+          // Allow both directories and symlinks (pnpm uses symlinks)
+          if (!scopedEntry.isDirectory() && !scopedEntry.isSymbolicLink()) continue
 
           const pkgPath = path.join(dirPath, scopedEntry.name)
           const pkgName = `${entry.name}/${scopedEntry.name}`
