@@ -27,6 +27,21 @@
       "types": "./dist/patch/apply.d.ts",
       "require": "./dist/patch/apply.js",
       "import": "./dist/patch/apply.js"
+    },
+    "./manifest/operations": {
+      "types": "./dist/manifest/operations.d.ts",
+      "require": "./dist/manifest/operations.js",
+      "import": "./dist/manifest/operations.js"
+    },
+    "./manifest/recovery": {
+      "types": "./dist/manifest/recovery.d.ts",
+      "require": "./dist/manifest/recovery.js",
+      "import": "./dist/manifest/recovery.js"
+    },
+    "./constants": {
+      "types": "./dist/constants.d.ts",
+      "require": "./dist/constants.js",
+      "import": "./dist/constants.js"
     }
   },
   "scripts": {

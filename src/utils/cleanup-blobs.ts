@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import type { PatchManifest } from '../schema/manifest-schema.js'
+import { getReferencedBlobs } from '../manifest/operations.js'
 
 export interface CleanupResult {
   blobsChecked: number
@@ -25,19 +26,7 @@ export async function cleanupUnusedBlobs(
   dryRun: boolean = false,
 ): Promise<CleanupResult> {
   // Collect all blob hashes that are currently in use
-  const usedBlobs = new Set<string>()
-
-  for (const patch of Object.values(manifest.patches)) {
-    for (const fileInfo of Object.values(patch.files)) {
-      // Add both before and after hashes if they exist
-      if (fileInfo.beforeHash) {
-        usedBlobs.add(fileInfo.beforeHash)
-      }
-      if (fileInfo.afterHash) {
-        usedBlobs.add(fileInfo.afterHash)
-      }
-    }
-  }
+  const usedBlobs = getReferencedBlobs(manifest)
 
   // Check if blobs directory exists
   try {
