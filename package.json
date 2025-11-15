@@ -50,7 +50,12 @@
     "patch": "node dist/cli.js",
     "lint": "oxlint -c ./.oxlintrc.json --tsconfig ./tsconfig.json --deny-warnings",
     "lint:fix": "pnpm run lint --fix && pnpm run lint:fix:fast",
-    "lint:fix:fast": "biome format --write"
+    "lint:fix:fast": "biome format --write",
+    "publish:ci": "npm publish --provenance --access public"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "keywords": [
     "security",

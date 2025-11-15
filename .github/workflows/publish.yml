@@ -1,0 +1,33 @@
+name: 📦 Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist-tag:
+        description: 'npm dist-tag (latest, next, beta, canary, backport, etc.)'
+        required: false
+        default: 'latest'
+        type: string
+      debug:
+        description: 'Enable debug output'
+        required: false
+        default: '0'
+        type: string
+        options:
+          - '0'
+          - '1'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    uses: SocketDev/socket-registry/.github/workflows/provenance.yml@63ad52562c1f2d007a1833b2b22cffc3001e1cc2 # main
+    with:
+      debug: ${{ inputs.debug }}
+      dist-tag: ${{ inputs.dist-tag }}
+      package-name: '@socketsecurity/socket-patch'
+      publish-script: 'publish:ci'
+      setup-script: 'pnpm run build'
+      use-trusted-publishing: true
