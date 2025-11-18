@@ -43,6 +43,11 @@
       "types": "./dist/constants.d.ts",
       "require": "./dist/constants.js",
       "import": "./dist/constants.js"
+    },
+    "./package-json": {
+      "types": "./dist/package-json/index.d.ts",
+      "require": "./dist/package-json/index.js",
+      "import": "./dist/package-json/index.js"
     }
   },
   "scripts": {

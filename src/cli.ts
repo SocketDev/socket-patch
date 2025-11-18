@@ -7,12 +7,14 @@ import { downloadCommand } from './commands/download.js'
 import { listCommand } from './commands/list.js'
 import { removeCommand } from './commands/remove.js'
 import { gcCommand } from './commands/gc.js'
+import { setupCommand } from './commands/setup.js'
 
 async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
     .scriptName('socket-patch')
     .usage('$0 <command> [options]')
     .command(applyCommand)
+    .command(setupCommand)
     .command(downloadCommand)
     .command(listCommand)
     .command(removeCommand)
