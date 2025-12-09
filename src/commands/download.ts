@@ -1,67 +1,127 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as readline from 'readline'
 import type { CommandModule } from 'yargs'
 import { PatchManifestSchema } from '../schema/manifest-schema.js'
-import { getAPIClientFromEnv } from '../utils/api-client.js'
+import {
+  getAPIClientFromEnv,
+  type PatchResponse,
+  type PatchSearchResult,
+  type SearchResponse,
+} from '../utils/api-client.js'
 import {
   cleanupUnusedBlobs,
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
 
+// Identifier type patterns
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const CVE_PATTERN = /^CVE-\d{4}-\d+$/i
+const GHSA_PATTERN = /^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i
+
+type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'package'
+
 interface DownloadArgs {
-  uuid: string
+  identifier: string
   org: string
   cwd: string
+  id?: boolean
+  cve?: boolean
+  ghsa?: boolean
+  pkg?: boolean
+  yes?: boolean
   'api-url'?: string
   'api-token'?: string
 }
 
-async function downloadPatch(
-  uuid: string,
-  orgSlug: string,
-  cwd: string,
-  apiUrl?: string,
-  apiToken?: string,
+/**
+ * Detect the type of identifier based on its format
+ */
+function detectIdentifierType(identifier: string): IdentifierType {
+  if (UUID_PATTERN.test(identifier)) {
+    return 'uuid'
+  }
+  if (CVE_PATTERN.test(identifier)) {
+    return 'cve'
+  }
+  if (GHSA_PATTERN.test(identifier)) {
+    return 'ghsa'
+  }
+  // Default to package search for anything else
+  return 'package'
+}
+
+/**
+ * Prompt user for confirmation
+ */
+async function promptConfirmation(message: string): Promise<boolean> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  })
+
+  return new Promise(resolve => {
+    rl.question(`${message} [y/N] `, answer => {
+      rl.close()
+      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes')
+    })
+  })
+}
+
+/**
+ * Display search results to the user
+ */
+function displaySearchResults(
+  patches: PatchSearchResult[],
+  canAccessPaidPatches: boolean,
+): void {
+  console.log('\nFound patches:\n')
+
+  for (let i = 0; i < patches.length; i++) {
+    const patch = patches[i]
+    const tierLabel = patch.tier === 'paid' ? ' [PAID]' : ' [FREE]'
+    const accessLabel =
+      patch.tier === 'paid' && !canAccessPaidPatches ? ' (no access)' : ''
+
+    console.log(`  ${i + 1}. ${patch.purl}${tierLabel}${accessLabel}`)
+    console.log(`     UUID: ${patch.uuid}`)
+    if (patch.description) {
+      const desc =
+        patch.description.length > 80
+          ? patch.description.slice(0, 77) + '...'
+          : patch.description
+      console.log(`     Description: ${desc}`)
+    }
+
+    // Show vulnerabilities
+    const vulnIds = Object.keys(patch.vulnerabilities)
+    if (vulnIds.length > 0) {
+      const vulnSummary = vulnIds
+        .map(id => {
+          const vuln = patch.vulnerabilities[id]
+          const cves = vuln.cves.length > 0 ? vuln.cves.join(', ') : id
+          return `${cves} (${vuln.severity})`
+        })
+        .join(', ')
+      console.log(`     Fixes: ${vulnSummary}`)
+    }
+    console.log()
+  }
+}
+
+/**
+ * Save a patch to the manifest and blobs directory
+ */
+async function savePatch(
+  patch: PatchResponse,
+  manifest: any,
+  blobsDir: string,
 ): Promise<boolean> {
-  // Override environment variables if CLI options are provided
-  if (apiUrl) {
-    process.env.SOCKET_API_URL = apiUrl
-  }
-  if (apiToken) {
-    process.env.SOCKET_API_TOKEN = apiToken
-  }
-
-  // Get API client (will use env vars if not overridden)
-  const apiClient = getAPIClientFromEnv()
-
-  console.log(`Fetching patch ${uuid} from ${orgSlug}...`)
-
-  // Fetch patch from API
-  const patch = await apiClient.fetchPatch(orgSlug, uuid)
-
-  if (!patch) {
-    throw new Error(`Patch with UUID ${uuid} not found`)
-  }
-
-  console.log(`Downloaded patch for ${patch.purl}`)
-
-  // Prepare .socket directory
-  const socketDir = path.join(cwd, '.socket')
-  const blobsDir = path.join(socketDir, 'blobs')
-  const manifestPath = path.join(socketDir, 'manifest.json')
-
-  // Create directories
-  await fs.mkdir(socketDir, { recursive: true })
-  await fs.mkdir(blobsDir, { recursive: true })
-
-  // Read existing manifest or create new one
-  let manifest: any
-  try {
-    const manifestContent = await fs.readFile(manifestPath, 'utf-8')
-    manifest = PatchManifestSchema.parse(JSON.parse(manifestContent))
-  } catch {
-    // Create new manifest
-    manifest = { patches: {} }
+  // Check if patch already exists with same UUID
+  if (manifest.patches[patch.purl]?.uuid === patch.uuid) {
+    console.log(`  [skip] ${patch.purl} (already in manifest)`)
+    return false
   }
 
   // Save blob contents
@@ -79,7 +139,6 @@ async function downloadPatch(
       const blobPath = path.join(blobsDir, fileInfo.afterHash)
       const blobBuffer = Buffer.from(fileInfo.blobContent, 'base64')
       await fs.writeFile(blobPath, blobBuffer)
-      console.log(`  Saved blob: ${fileInfo.afterHash}`)
     }
   }
 
@@ -94,6 +153,199 @@ async function downloadPatch(
     tier: patch.tier,
   }
 
+  console.log(`  [add] ${patch.purl}`)
+  return true
+}
+
+async function downloadPatches(args: DownloadArgs): Promise<boolean> {
+  const {
+    identifier,
+    org: orgSlug,
+    cwd,
+    id: forceId,
+    cve: forceCve,
+    ghsa: forceGhsa,
+    pkg: forcePackage,
+    yes: skipConfirmation,
+    'api-url': apiUrl,
+    'api-token': apiToken,
+  } = args
+
+  // Override environment variables if CLI options are provided
+  if (apiUrl) {
+    process.env.SOCKET_API_URL = apiUrl
+  }
+  if (apiToken) {
+    process.env.SOCKET_API_TOKEN = apiToken
+  }
+
+  // Get API client
+  const apiClient = getAPIClientFromEnv()
+
+  // Determine identifier type
+  let idType: IdentifierType
+  if (forceId) {
+    idType = 'uuid'
+  } else if (forceCve) {
+    idType = 'cve'
+  } else if (forceGhsa) {
+    idType = 'ghsa'
+  } else if (forcePackage) {
+    idType = 'package'
+  } else {
+    idType = detectIdentifierType(identifier)
+    console.log(`Detected identifier type: ${idType}`)
+  }
+
+  // For UUID, directly fetch and download the patch
+  if (idType === 'uuid') {
+    console.log(`Fetching patch by UUID: ${identifier}`)
+    const patch = await apiClient.fetchPatch(orgSlug, identifier)
+    if (!patch) {
+      console.log(`No patch found with UUID: ${identifier}`)
+      return true
+    }
+
+    // Prepare .socket directory
+    const socketDir = path.join(cwd, '.socket')
+    const blobsDir = path.join(socketDir, 'blobs')
+    const manifestPath = path.join(socketDir, 'manifest.json')
+
+    await fs.mkdir(socketDir, { recursive: true })
+    await fs.mkdir(blobsDir, { recursive: true })
+
+    let manifest: any
+    try {
+      const manifestContent = await fs.readFile(manifestPath, 'utf-8')
+      manifest = PatchManifestSchema.parse(JSON.parse(manifestContent))
+    } catch {
+      manifest = { patches: {} }
+    }
+
+    const added = await savePatch(patch, manifest, blobsDir)
+
+    await fs.writeFile(
+      manifestPath,
+      JSON.stringify(manifest, null, 2) + '\n',
+      'utf-8',
+    )
+
+    console.log(`\nPatch saved to ${manifestPath}`)
+    if (added) {
+      console.log(`  Added: 1`)
+    } else {
+      console.log(`  Skipped: 1 (already exists)`)
+    }
+
+    return true
+  }
+
+  // For CVE/GHSA/package, first search then download
+  let searchResponse: SearchResponse
+
+  switch (idType) {
+    case 'cve': {
+      console.log(`Searching patches for CVE: ${identifier}`)
+      searchResponse = await apiClient.searchPatchesByCVE(orgSlug, identifier)
+      break
+    }
+    case 'ghsa': {
+      console.log(`Searching patches for GHSA: ${identifier}`)
+      searchResponse = await apiClient.searchPatchesByGHSA(orgSlug, identifier)
+      break
+    }
+    case 'package': {
+      console.log(`Searching patches for package: ${identifier}`)
+      searchResponse = await apiClient.searchPatchesByPackage(
+        orgSlug,
+        identifier,
+      )
+      break
+    }
+    default:
+      throw new Error(`Unknown identifier type: ${idType}`)
+  }
+
+  const { patches: searchResults, canAccessPaidPatches } = searchResponse
+
+  if (searchResults.length === 0) {
+    console.log(`No patches found for ${idType}: ${identifier}`)
+    return true
+  }
+
+  // Filter patches based on tier access
+  const accessiblePatches = searchResults.filter(
+    patch => patch.tier === 'free' || canAccessPaidPatches,
+  )
+  const inaccessibleCount = searchResults.length - accessiblePatches.length
+
+  // Display search results
+  displaySearchResults(searchResults, canAccessPaidPatches)
+
+  if (inaccessibleCount > 0) {
+    console.log(
+      `Note: ${inaccessibleCount} patch(es) require paid access and will be skipped.`,
+    )
+  }
+
+  if (accessiblePatches.length === 0) {
+    console.log(
+      'No accessible patches available. Upgrade to access paid patches.',
+    )
+    return true
+  }
+
+  // Prompt for confirmation if multiple patches and not using --yes
+  if (accessiblePatches.length > 1 && !skipConfirmation) {
+    const confirmed = await promptConfirmation(
+      `Download ${accessiblePatches.length} patch(es)?`,
+    )
+    if (!confirmed) {
+      console.log('Download cancelled.')
+      return true
+    }
+  }
+
+  // Prepare .socket directory
+  const socketDir = path.join(cwd, '.socket')
+  const blobsDir = path.join(socketDir, 'blobs')
+  const manifestPath = path.join(socketDir, 'manifest.json')
+
+  await fs.mkdir(socketDir, { recursive: true })
+  await fs.mkdir(blobsDir, { recursive: true })
+
+  let manifest: any
+  try {
+    const manifestContent = await fs.readFile(manifestPath, 'utf-8')
+    manifest = PatchManifestSchema.parse(JSON.parse(manifestContent))
+  } catch {
+    manifest = { patches: {} }
+  }
+
+  // Download and save each accessible patch
+  console.log(`\nDownloading ${accessiblePatches.length} patch(es)...`)
+
+  let patchesAdded = 0
+  let patchesSkipped = 0
+  let patchesFailed = 0
+
+  for (const searchResult of accessiblePatches) {
+    // Fetch full patch details with blob content
+    const patch = await apiClient.fetchPatch(orgSlug, searchResult.uuid)
+    if (!patch) {
+      console.log(`  [fail] ${searchResult.purl} (could not fetch details)`)
+      patchesFailed++
+      continue
+    }
+
+    const added = await savePatch(patch, manifest, blobsDir)
+    if (added) {
+      patchesAdded++
+    } else {
+      patchesSkipped++
+    }
+  }
+
   // Write updated manifest
   await fs.writeFile(
     manifestPath,
@@ -101,11 +353,14 @@ async function downloadPatch(
     'utf-8',
   )
 
-  console.log(`\nPatch saved to ${manifestPath}`)
-  console.log(`  PURL: ${patch.purl}`)
-  console.log(`  UUID: ${patch.uuid}`)
-  console.log(`  Files: ${Object.keys(files).length}`)
-  console.log(`  Vulnerabilities: ${Object.keys(patch.vulnerabilities).length}`)
+  console.log(`\nPatches saved to ${manifestPath}`)
+  console.log(`  Added: ${patchesAdded}`)
+  if (patchesSkipped > 0) {
+    console.log(`  Skipped: ${patchesSkipped}`)
+  }
+  if (patchesFailed > 0) {
+    console.log(`  Failed: ${patchesFailed}`)
+  }
 
   // Clean up unused blobs
   const cleanupResult = await cleanupUnusedBlobs(manifest, blobsDir, false)
@@ -117,12 +372,13 @@ async function downloadPatch(
 }
 
 export const downloadCommand: CommandModule<{}, DownloadArgs> = {
-  command: 'download',
-  describe: 'Download a security patch from Socket API',
+  command: 'download <identifier>',
+  describe: 'Download security patches from Socket API',
   builder: yargs => {
     return yargs
-      .option('uuid', {
-        describe: 'Patch UUID to download',
+      .positional('identifier', {
+        describe:
+          'Patch identifier (UUID, CVE ID, GHSA ID, or package name)',
         type: 'string',
         demandOption: true,
       })
@@ -130,6 +386,32 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         describe: 'Organization slug',
         type: 'string',
         demandOption: true,
+      })
+      .option('id', {
+        describe: 'Force identifier to be treated as a patch UUID',
+        type: 'boolean',
+        default: false,
+      })
+      .option('cve', {
+        describe: 'Force identifier to be treated as a CVE ID',
+        type: 'boolean',
+        default: false,
+      })
+      .option('ghsa', {
+        describe: 'Force identifier to be treated as a GHSA ID',
+        type: 'boolean',
+        default: false,
+      })
+      .option('pkg', {
+        describe: 'Force identifier to be treated as a package name',
+        type: 'boolean',
+        default: false,
+      })
+      .option('yes', {
+        alias: 'y',
+        describe: 'Skip confirmation prompt for multiple patches',
+        type: 'boolean',
+        default: false,
       })
       .option('cwd', {
         describe: 'Working directory',
@@ -144,18 +426,43 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         describe: 'Socket API token (overrides SOCKET_API_TOKEN env var)',
         type: 'string',
       })
+      .example(
+        '$0 download 12345678-1234-1234-1234-123456789abc --org myorg',
+        'Download a patch by UUID',
+      )
+      .example(
+        '$0 download CVE-2021-44228 --org myorg',
+        'Search and download patches for a CVE',
+      )
+      .example(
+        '$0 download GHSA-jfhm-5ghh-2f97 --org myorg',
+        'Search and download patches for a GHSA',
+      )
+      .example(
+        '$0 download lodash --org myorg --pkg',
+        'Search and download patches for a package',
+      )
+      .example(
+        '$0 download CVE-2021-44228 --org myorg --yes',
+        'Download all matching patches without confirmation',
+      )
+      .check(argv => {
+        // Ensure only one type flag is set
+        const typeFlags = [argv.id, argv.cve, argv.ghsa, argv.pkg].filter(
+          Boolean,
+        )
+        if (typeFlags.length > 1) {
+          throw new Error(
+            'Only one of --id, --cve, --ghsa, or --pkg can be specified',
+          )
+        }
+        return true
+      })
   },
   handler: async argv => {
     try {
-      await downloadPatch(
-        argv.uuid,
-        argv.org,
-        argv.cwd,
-        argv['api-url'],
-        argv['api-token'],
-      )
-
-      process.exit(0)
+      const success = await downloadPatches(argv)
+      process.exit(success ? 0 : 1)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)
       console.error(`Error: ${errorMessage}`)

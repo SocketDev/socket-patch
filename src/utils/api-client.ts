@@ -1,6 +1,7 @@
 import * as https from 'node:https'
 import * as http from 'node:http'
 
+// Full patch response with blob content (from view endpoint)
 export interface PatchResponse {
   uuid: string
   purl: string
@@ -28,6 +29,30 @@ export interface PatchResponse {
   tier: 'free' | 'paid'
 }
 
+// Lightweight search result (from search endpoints)
+export interface PatchSearchResult {
+  uuid: string
+  purl: string
+  publishedAt: string
+  description: string
+  license: string
+  tier: 'free' | 'paid'
+  vulnerabilities: Record<
+    string,
+    {
+      cves: string[]
+      summary: string
+      severity: string
+      description: string
+    }
+  >
+}
+
+export interface SearchResponse {
+  patches: PatchSearchResult[]
+  canAccessPaidPatches: boolean
+}
+
 export interface APIClientOptions {
   apiUrl: string
   apiToken: string
@@ -42,11 +67,11 @@ export class APIClient {
     this.apiToken = options.apiToken
   }
 
-  async fetchPatch(
-    orgSlug: string,
-    uuid: string,
-  ): Promise<PatchResponse | null> {
-    const url = `${this.apiUrl}/v0/orgs/${orgSlug}/patches/view/${uuid}`
+  /**
+   * Make a GET request to the API
+   */
+  private async get<T>(path: string): Promise<T | null> {
+    const url = `${this.apiUrl}${path}`
 
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url)
@@ -90,7 +115,9 @@ export class APIClient {
             reject(new Error('Rate limit exceeded. Please try again later.'))
           } else {
             reject(
-              new Error(`API request failed with status ${res.statusCode}: ${data}`),
+              new Error(
+                `API request failed with status ${res.statusCode}: ${data}`,
+              ),
             )
           }
         })
@@ -103,11 +130,62 @@ export class APIClient {
       req.end()
     })
   }
+
+  /**
+   * Fetch a patch by UUID (full details with blob content)
+   */
+  async fetchPatch(
+    orgSlug: string,
+    uuid: string,
+  ): Promise<PatchResponse | null> {
+    return this.get(`/v0/orgs/${orgSlug}/patches/view/${uuid}`)
+  }
+
+  /**
+   * Search patches by CVE ID
+   * Returns lightweight search results (no blob content)
+   */
+  async searchPatchesByCVE(
+    orgSlug: string,
+    cveId: string,
+  ): Promise<SearchResponse> {
+    const result = await this.get<SearchResponse>(
+      `/v0/orgs/${orgSlug}/patches/by-cve/${encodeURIComponent(cveId)}`,
+    )
+    return result ?? { patches: [], canAccessPaidPatches: false }
+  }
+
+  /**
+   * Search patches by GHSA ID
+   * Returns lightweight search results (no blob content)
+   */
+  async searchPatchesByGHSA(
+    orgSlug: string,
+    ghsaId: string,
+  ): Promise<SearchResponse> {
+    const result = await this.get<SearchResponse>(
+      `/v0/orgs/${orgSlug}/patches/by-ghsa/${encodeURIComponent(ghsaId)}`,
+    )
+    return result ?? { patches: [], canAccessPaidPatches: false }
+  }
+
+  /**
+   * Search patches by package name (partial PURL match)
+   * Returns lightweight search results (no blob content)
+   */
+  async searchPatchesByPackage(
+    orgSlug: string,
+    packageQuery: string,
+  ): Promise<SearchResponse> {
+    const result = await this.get<SearchResponse>(
+      `/v0/orgs/${orgSlug}/patches/by-package/${encodeURIComponent(packageQuery)}`,
+    )
+    return result ?? { patches: [], canAccessPaidPatches: false }
+  }
 }
 
 export function getAPIClientFromEnv(): APIClient {
-  const apiUrl =
-    process.env.SOCKET_API_URL || 'https://api.socket.dev'
+  const apiUrl = process.env.SOCKET_API_URL || 'https://api.socket.dev'
   const apiToken = process.env.SOCKET_API_TOKEN
 
   if (!apiToken) {
