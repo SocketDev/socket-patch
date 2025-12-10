@@ -72,6 +72,10 @@
   ],
   "author": "Socket Security",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  },
   "dependencies": {
     "yargs": "^17.7.2",
     "zod": "^3.24.4"
