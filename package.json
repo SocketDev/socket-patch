@@ -57,6 +57,7 @@
     "lint": "oxlint -c ./.oxlintrc.json --tsconfig ./tsconfig.json --deny-warnings",
     "lint:fix": "pnpm run lint --fix && pnpm run lint:fix:fast",
     "lint:fix:fast": "biome format --write",
+    "prepublishOnly": "tsc",
     "publish:ci": "npm publish --provenance --access public"
   },
   "publishConfig": {

@@ -1,0 +1,33 @@
+# Source files (dist is published instead)
+src/
+
+# GitHub workflows and configs
+.github/
+
+# Linting and formatting configs
+.oxlintrc.json
+biome.json
+
+# TypeScript config
+tsconfig.json
+
+# Lock files
+pnpm-lock.yaml
+
+# Git files
+.gitignore
+
+# Documentation (except README and LICENSE which npm includes by default)
+EDGE_CASES.md
+
+# Build artifacts
+*.tsbuildinfo
+
+# Environment files
+.env*
+!.env.example
+
+# Test files
+*.test.ts
+*.test.js
+__tests__/
