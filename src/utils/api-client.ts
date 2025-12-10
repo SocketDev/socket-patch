@@ -193,6 +193,28 @@ export class APIClient {
     return result ?? { patches: [], canAccessPaidPatches: false }
   }
 
+  /**
+   * Search patches by package PURL
+   * Returns lightweight search results (no blob content)
+   *
+   * The PURL must be a valid Package URL starting with "pkg:"
+   * Examples:
+   * - pkg:npm/lodash@4.17.21
+   * - pkg:npm/@types/node
+   * - pkg:pypi/django@3.2.0
+   */
+  async searchPatchesByPackage(
+    orgSlug: string | null,
+    purl: string,
+  ): Promise<SearchResponse> {
+    // Public proxy uses simpler URL structure (no org slug needed)
+    const path = this.usePublicProxy
+      ? `/by-package/${encodeURIComponent(purl)}`
+      : `/v0/orgs/${orgSlug}/patches/by-package/${encodeURIComponent(purl)}`
+    const result = await this.get<SearchResponse>(path)
+    return result ?? { patches: [], canAccessPaidPatches: false }
+  }
+
 }
 
 /**

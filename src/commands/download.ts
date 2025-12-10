@@ -13,6 +13,11 @@ import {
   cleanupUnusedBlobs,
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
+import {
+  enumerateNodeModules,
+  type EnumeratedPackage,
+} from '../utils/enumerate-packages.js'
+import { fuzzyMatchPackages, isPurl } from '../utils/fuzzy-match.js'
 
 // Identifier type patterns
 const UUID_PATTERN =
@@ -20,7 +25,7 @@ const UUID_PATTERN =
 const CVE_PATTERN = /^CVE-\d{4}-\d+$/i
 const GHSA_PATTERN = /^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i
 
-type IdentifierType = 'uuid' | 'cve' | 'ghsa'
+type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'purl' | 'package'
 
 interface DownloadArgs {
   identifier: string
@@ -29,6 +34,7 @@ interface DownloadArgs {
   id?: boolean
   cve?: boolean
   ghsa?: boolean
+  package?: boolean
   yes?: boolean
   'api-url'?: string
   'api-token'?: string
@@ -47,6 +53,9 @@ function detectIdentifierType(identifier: string): IdentifierType | null {
   if (GHSA_PATTERN.test(identifier)) {
     return 'ghsa'
   }
+  if (isPurl(identifier)) {
+    return 'purl'
+  }
   return null
 }
 
@@ -64,6 +73,44 @@ async function promptConfirmation(message: string): Promise<boolean> {
       rl.close()
       resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes')
     })
+  })
+}
+
+/**
+ * Display enumerated packages and prompt user to select one
+ */
+async function promptSelectPackage(
+  packages: EnumeratedPackage[],
+): Promise<EnumeratedPackage | null> {
+  console.log('\nMatching packages found:\n')
+
+  for (let i = 0; i < packages.length; i++) {
+    const pkg = packages[i]
+    const displayName = pkg.namespace
+      ? `${pkg.namespace}/${pkg.name}`
+      : pkg.name
+    console.log(`  ${i + 1}. ${displayName}@${pkg.version}`)
+    console.log(`     PURL: ${pkg.purl}`)
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  })
+
+  return new Promise(resolve => {
+    rl.question(
+      `\nSelect a package (1-${packages.length}) or 0 to cancel: `,
+      answer => {
+        rl.close()
+        const selection = parseInt(answer, 10)
+        if (isNaN(selection) || selection < 1 || selection > packages.length) {
+          resolve(null)
+        } else {
+          resolve(packages[selection - 1])
+        }
+      },
+    )
   })
 }
 
@@ -163,6 +210,7 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     id: forceId,
     cve: forceCve,
     ghsa: forceGhsa,
+    package: forcePackage,
     yes: skipConfirmation,
     'api-url': apiUrl,
     'api-token': apiToken,
@@ -197,15 +245,19 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     idType = 'cve'
   } else if (forceGhsa) {
     idType = 'ghsa'
+  } else if (forcePackage) {
+    // --package flag forces package search (fuzzy match against node_modules)
+    idType = 'package'
   } else {
     const detectedType = detectIdentifierType(identifier)
     if (!detectedType) {
-      throw new Error(
-        `Unrecognized identifier format: ${identifier}. Expected UUID, CVE ID (CVE-YYYY-NNNNN), or GHSA ID (GHSA-xxxx-xxxx-xxxx).`,
-      )
+      // If not recognized as UUID/CVE/GHSA/PURL, assume it's a package name search
+      idType = 'package'
+      console.log(`Treating "${identifier}" as a package name search`)
+    } else {
+      idType = detectedType
+      console.log(`Detected identifier type: ${idType}`)
     }
-    idType = detectedType
-    console.log(`Detected identifier type: ${idType}`)
   }
 
   // For UUID, directly fetch and download the patch
@@ -251,7 +303,7 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     return true
   }
 
-  // For CVE/GHSA/package, first search then download
+  // For CVE/GHSA/PURL/package, first search then download
   let searchResponse: SearchResponse
 
   switch (idType) {
@@ -263,6 +315,61 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     case 'ghsa': {
       console.log(`Searching patches for GHSA: ${identifier}`)
       searchResponse = await apiClient.searchPatchesByGHSA(effectiveOrgSlug, identifier)
+      break
+    }
+    case 'purl': {
+      console.log(`Searching patches for PURL: ${identifier}`)
+      searchResponse = await apiClient.searchPatchesByPackage(effectiveOrgSlug, identifier)
+      break
+    }
+    case 'package': {
+      // Enumerate packages from node_modules and fuzzy match
+      console.log(`Enumerating packages in ${cwd}...`)
+      const packages = await enumerateNodeModules(cwd)
+
+      if (packages.length === 0) {
+        console.log('No packages found in node_modules. Run npm/yarn/pnpm install first.')
+        return true
+      }
+
+      console.log(`Found ${packages.length} packages in node_modules`)
+
+      // Fuzzy match against the identifier
+      const matches = fuzzyMatchPackages(identifier, packages)
+
+      if (matches.length === 0) {
+        console.log(`No packages matching "${identifier}" found in node_modules.`)
+        return true
+      }
+
+      let selectedPackage: EnumeratedPackage
+
+      if (matches.length === 1) {
+        // Single match, use it directly
+        selectedPackage = matches[0]
+        console.log(`Found exact match: ${selectedPackage.purl}`)
+      } else {
+        // Multiple matches, prompt user to select
+        if (skipConfirmation) {
+          // With --yes, use the best match (first result)
+          selectedPackage = matches[0]
+          console.log(`Using best match: ${selectedPackage.purl}`)
+        } else {
+          const selected = await promptSelectPackage(matches)
+          if (!selected) {
+            console.log('No package selected. Download cancelled.')
+            return true
+          }
+          selectedPackage = selected
+        }
+      }
+
+      // Search for patches using the selected package's PURL
+      console.log(`Searching patches for package: ${selectedPackage.purl}`)
+      searchResponse = await apiClient.searchPatchesByPackage(
+        effectiveOrgSlug,
+        selectedPackage.purl,
+      )
       break
     }
     default:
@@ -381,7 +488,7 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
     return yargs
       .positional('identifier', {
         describe:
-          'Patch identifier (UUID, CVE ID, or GHSA ID)',
+          'Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name)',
         type: 'string',
         demandOption: true,
       })
@@ -402,6 +509,12 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
       })
       .option('ghsa', {
         describe: 'Force identifier to be treated as a GHSA ID',
+        type: 'boolean',
+        default: false,
+      })
+      .option('package', {
+        alias: 'p',
+        describe: 'Force identifier to be treated as a package name (fuzzy matches against node_modules)',
         type: 'boolean',
         default: false,
       })
@@ -433,6 +546,14 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         'Download free patches for a GHSA (no auth required)',
       )
       .example(
+        '$0 download pkg:npm/lodash@4.17.21',
+        'Download patches for a specific package version by PURL',
+      )
+      .example(
+        '$0 download lodash --package',
+        'Search for patches by package name (fuzzy matches node_modules)',
+      )
+      .example(
         '$0 download 12345678-1234-1234-1234-123456789abc --org myorg',
         'Download a patch by UUID (requires SOCKET_API_TOKEN)',
       )
@@ -442,12 +563,12 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
       )
       .check(argv => {
         // Ensure only one type flag is set
-        const typeFlags = [argv.id, argv.cve, argv.ghsa].filter(
+        const typeFlags = [argv.id, argv.cve, argv.ghsa, argv.package].filter(
           Boolean,
         )
         if (typeFlags.length > 1) {
           throw new Error(
-            'Only one of --id, --cve, or --ghsa can be specified',
+            'Only one of --id, --cve, --ghsa, or --package can be specified',
           )
         }
         return true
