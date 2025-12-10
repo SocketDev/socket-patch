@@ -24,7 +24,7 @@ type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'package'
 
 interface DownloadArgs {
   identifier: string
-  org: string
+  org?: string
   cwd: string
   id?: boolean
   cve?: boolean
@@ -179,8 +179,18 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     process.env.SOCKET_API_TOKEN = apiToken
   }
 
-  // Get API client
-  const apiClient = getAPIClientFromEnv()
+  // Get API client (will use public proxy if no token is set)
+  const { client: apiClient, usePublicProxy } = getAPIClientFromEnv()
+
+  // Validate that org is provided when using authenticated API
+  if (!usePublicProxy && !orgSlug) {
+    throw new Error(
+      '--org is required when using SOCKET_API_TOKEN. Provide an organization slug.',
+    )
+  }
+
+  // The org slug to use (null when using public proxy)
+  const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
 
   // Determine identifier type
   let idType: IdentifierType
@@ -200,7 +210,7 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
   // For UUID, directly fetch and download the patch
   if (idType === 'uuid') {
     console.log(`Fetching patch by UUID: ${identifier}`)
-    const patch = await apiClient.fetchPatch(orgSlug, identifier)
+    const patch = await apiClient.fetchPatch(effectiveOrgSlug, identifier)
     if (!patch) {
       console.log(`No patch found with UUID: ${identifier}`)
       return true
@@ -246,18 +256,18 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
   switch (idType) {
     case 'cve': {
       console.log(`Searching patches for CVE: ${identifier}`)
-      searchResponse = await apiClient.searchPatchesByCVE(orgSlug, identifier)
+      searchResponse = await apiClient.searchPatchesByCVE(effectiveOrgSlug, identifier)
       break
     }
     case 'ghsa': {
       console.log(`Searching patches for GHSA: ${identifier}`)
-      searchResponse = await apiClient.searchPatchesByGHSA(orgSlug, identifier)
+      searchResponse = await apiClient.searchPatchesByGHSA(effectiveOrgSlug, identifier)
       break
     }
     case 'package': {
       console.log(`Searching patches for package: ${identifier}`)
       searchResponse = await apiClient.searchPatchesByPackage(
-        orgSlug,
+        effectiveOrgSlug,
         identifier,
       )
       break
@@ -331,7 +341,7 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
 
   for (const searchResult of accessiblePatches) {
     // Fetch full patch details with blob content
-    const patch = await apiClient.fetchPatch(orgSlug, searchResult.uuid)
+    const patch = await apiClient.fetchPatch(effectiveOrgSlug, searchResult.uuid)
     if (!patch) {
       console.log(`  [fail] ${searchResult.purl} (could not fetch details)`)
       patchesFailed++
@@ -383,9 +393,9 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         demandOption: true,
       })
       .option('org', {
-        describe: 'Organization slug',
+        describe: 'Organization slug (required when using SOCKET_API_TOKEN, optional for public proxy)',
         type: 'string',
-        demandOption: true,
+        demandOption: false,
       })
       .option('id', {
         describe: 'Force identifier to be treated as a patch UUID',
@@ -427,24 +437,24 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         type: 'string',
       })
       .example(
+        '$0 download CVE-2021-44228',
+        'Download free patches for a CVE (no auth required)',
+      )
+      .example(
+        '$0 download GHSA-jfhm-5ghh-2f97',
+        'Download free patches for a GHSA (no auth required)',
+      )
+      .example(
+        '$0 download lodash --pkg',
+        'Download free patches for a package (no auth required)',
+      )
+      .example(
         '$0 download 12345678-1234-1234-1234-123456789abc --org myorg',
-        'Download a patch by UUID',
-      )
-      .example(
-        '$0 download CVE-2021-44228 --org myorg',
-        'Search and download patches for a CVE',
-      )
-      .example(
-        '$0 download GHSA-jfhm-5ghh-2f97 --org myorg',
-        'Search and download patches for a GHSA',
-      )
-      .example(
-        '$0 download lodash --org myorg --pkg',
-        'Search and download patches for a package',
+        'Download a patch by UUID (requires SOCKET_API_TOKEN)',
       )
       .example(
         '$0 download CVE-2021-44228 --org myorg --yes',
-        'Download all matching patches without confirmation',
+        'Download all matching patches without confirmation (with auth)',
       )
       .check(argv => {
         // Ensure only one type flag is set
