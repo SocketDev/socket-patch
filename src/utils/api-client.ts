@@ -2,7 +2,8 @@ import * as https from 'node:https'
 import * as http from 'node:http'
 
 // Default public patch API proxy URL for free patches (no auth required)
-const DEFAULT_PATCH_API_PROXY_URL = 'https://patch-api.socket.dev'
+// Patch API routes are now served via firewall-api-proxy under /patch prefix
+const DEFAULT_PATCH_API_PROXY_URL = 'https://firewall-api.socket.dev/patch'
 
 // Full patch response with blob content (from view endpoint)
 export interface PatchResponse {
@@ -192,21 +193,6 @@ export class APIClient {
     return result ?? { patches: [], canAccessPaidPatches: false }
   }
 
-  /**
-   * Search patches by package name (partial PURL match)
-   * Returns lightweight search results (no blob content)
-   */
-  async searchPatchesByPackage(
-    orgSlug: string | null,
-    packageQuery: string,
-  ): Promise<SearchResponse> {
-    // Public proxy uses simpler URL structure (no org slug needed)
-    const path = this.usePublicProxy
-      ? `/by-package/${encodeURIComponent(packageQuery)}`
-      : `/v0/orgs/${orgSlug}/patches/by-package/${encodeURIComponent(packageQuery)}`
-    const result = await this.get<SearchResponse>(path)
-    return result ?? { patches: [], canAccessPaidPatches: false }
-  }
 }
 
 /**

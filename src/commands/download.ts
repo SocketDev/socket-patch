@@ -20,7 +20,7 @@ const UUID_PATTERN =
 const CVE_PATTERN = /^CVE-\d{4}-\d+$/i
 const GHSA_PATTERN = /^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i
 
-type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'package'
+type IdentifierType = 'uuid' | 'cve' | 'ghsa'
 
 interface DownloadArgs {
   identifier: string
@@ -29,7 +29,6 @@ interface DownloadArgs {
   id?: boolean
   cve?: boolean
   ghsa?: boolean
-  pkg?: boolean
   yes?: boolean
   'api-url'?: string
   'api-token'?: string
@@ -38,7 +37,7 @@ interface DownloadArgs {
 /**
  * Detect the type of identifier based on its format
  */
-function detectIdentifierType(identifier: string): IdentifierType {
+function detectIdentifierType(identifier: string): IdentifierType | null {
   if (UUID_PATTERN.test(identifier)) {
     return 'uuid'
   }
@@ -48,8 +47,7 @@ function detectIdentifierType(identifier: string): IdentifierType {
   if (GHSA_PATTERN.test(identifier)) {
     return 'ghsa'
   }
-  // Default to package search for anything else
-  return 'package'
+  return null
 }
 
 /**
@@ -165,7 +163,6 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     id: forceId,
     cve: forceCve,
     ghsa: forceGhsa,
-    pkg: forcePackage,
     yes: skipConfirmation,
     'api-url': apiUrl,
     'api-token': apiToken,
@@ -200,10 +197,14 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     idType = 'cve'
   } else if (forceGhsa) {
     idType = 'ghsa'
-  } else if (forcePackage) {
-    idType = 'package'
   } else {
-    idType = detectIdentifierType(identifier)
+    const detectedType = detectIdentifierType(identifier)
+    if (!detectedType) {
+      throw new Error(
+        `Unrecognized identifier format: ${identifier}. Expected UUID, CVE ID (CVE-YYYY-NNNNN), or GHSA ID (GHSA-xxxx-xxxx-xxxx).`,
+      )
+    }
+    idType = detectedType
     console.log(`Detected identifier type: ${idType}`)
   }
 
@@ -262,14 +263,6 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     case 'ghsa': {
       console.log(`Searching patches for GHSA: ${identifier}`)
       searchResponse = await apiClient.searchPatchesByGHSA(effectiveOrgSlug, identifier)
-      break
-    }
-    case 'package': {
-      console.log(`Searching patches for package: ${identifier}`)
-      searchResponse = await apiClient.searchPatchesByPackage(
-        effectiveOrgSlug,
-        identifier,
-      )
       break
     }
     default:
@@ -388,7 +381,7 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
     return yargs
       .positional('identifier', {
         describe:
-          'Patch identifier (UUID, CVE ID, GHSA ID, or package name)',
+          'Patch identifier (UUID, CVE ID, or GHSA ID)',
         type: 'string',
         demandOption: true,
       })
@@ -409,11 +402,6 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
       })
       .option('ghsa', {
         describe: 'Force identifier to be treated as a GHSA ID',
-        type: 'boolean',
-        default: false,
-      })
-      .option('pkg', {
-        describe: 'Force identifier to be treated as a package name',
         type: 'boolean',
         default: false,
       })
@@ -445,10 +433,6 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         'Download free patches for a GHSA (no auth required)',
       )
       .example(
-        '$0 download lodash --pkg',
-        'Download free patches for a package (no auth required)',
-      )
-      .example(
         '$0 download 12345678-1234-1234-1234-123456789abc --org myorg',
         'Download a patch by UUID (requires SOCKET_API_TOKEN)',
       )
@@ -458,12 +442,12 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
       )
       .check(argv => {
         // Ensure only one type flag is set
-        const typeFlags = [argv.id, argv.cve, argv.ghsa, argv.pkg].filter(
+        const typeFlags = [argv.id, argv.cve, argv.ghsa].filter(
           Boolean,
         )
         if (typeFlags.length > 1) {
           throw new Error(
-            'Only one of --id, --cve, --ghsa, or --pkg can be specified',
+            'Only one of --id, --cve, or --ghsa can be specified',
           )
         }
         return true
