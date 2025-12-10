@@ -1,9 +1,8 @@
 import * as https from 'node:https'
 import * as http from 'node:http'
 
-// Default public patch API proxy URL for free patches (no auth required)
-// Patch API routes are now served via firewall-api-proxy under /patch prefix
-const DEFAULT_PATCH_API_PROXY_URL = 'https://firewall-api.socket.dev/patch'
+// Default public patch API URL for free patches (no auth required)
+const DEFAULT_PATCH_API_PROXY_URL = 'https://patches-api.socket.dev'
 
 // Full patch response with blob content (from view endpoint)
 export interface PatchResponse {
@@ -226,7 +225,7 @@ export class APIClient {
  * Environment variables:
  * - SOCKET_API_URL: Override the API URL (defaults to https://api.socket.dev)
  * - SOCKET_API_TOKEN: API token for authenticated access to all patches
- * - SOCKET_PATCH_PROXY_URL: Override the public proxy URL (defaults to https://patch-api.socket.dev)
+ * - SOCKET_PATCH_PROXY_URL: Override the public patch API URL (defaults to https://patches-api.socket.dev)
  */
 export function getAPIClientFromEnv(): { client: APIClient; usePublicProxy: boolean } {
   const apiToken = process.env.SOCKET_API_TOKEN
