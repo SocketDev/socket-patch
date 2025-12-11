@@ -6,6 +6,7 @@ import { applyCommand } from './commands/apply.js'
 import { downloadCommand } from './commands/download.js'
 import { listCommand } from './commands/list.js'
 import { removeCommand } from './commands/remove.js'
+import { rollbackCommand } from './commands/rollback.js'
 import { gcCommand } from './commands/gc.js'
 import { setupCommand } from './commands/setup.js'
 
@@ -14,6 +15,7 @@ async function main(): Promise<void> {
     .scriptName('socket-patch')
     .usage('$0 <command> [options]')
     .command(applyCommand)
+    .command(rollbackCommand)
     .command(setupCommand)
     .command(downloadCommand)
     .command(listCommand)
