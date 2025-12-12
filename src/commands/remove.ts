@@ -16,7 +16,7 @@ interface RemoveArgs {
   identifier: string
   cwd: string
   'manifest-path': string
-  'no-rollback': boolean
+  'skip-rollback': boolean
 }
 
 async function removePatch(
@@ -83,7 +83,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         type: 'string',
         default: DEFAULT_PATCH_MANIFEST_PATH,
       })
-      .option('no-rollback', {
+      .option('skip-rollback', {
         describe: 'Skip rolling back files before removing (only update manifest)',
         type: 'boolean',
         default: false,
@@ -97,7 +97,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         'Rollback and remove a patch by UUID',
       )
       .example(
-        '$0 remove pkg:npm/lodash@4.17.21 --no-rollback',
+        '$0 remove pkg:npm/lodash@4.17.21 --skip-rollback',
         'Remove from manifest without rolling back files',
       )
   },
@@ -116,7 +116,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
       }
 
       // First, rollback the patch if not skipped
-      if (!argv['no-rollback']) {
+      if (!argv['skip-rollback']) {
         console.log(`Rolling back patch before removal...`)
         const { success: rollbackSuccess, results: rollbackResults } =
           await rollbackPatches(
@@ -129,7 +129,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
 
         if (!rollbackSuccess) {
           console.error(
-            '\nRollback failed. Use --no-rollback to remove from manifest without restoring files.',
+            '\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.',
           )
           process.exit(1)
         }

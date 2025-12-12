@@ -83,7 +83,7 @@ describe('remove command with rollback', () => {
     assert.equal(updatedManifest.patches['pkg:npm/test-pkg@1.0.0'], undefined)
   })
 
-  it('should allow removal without rollback using --no-rollback flag', async () => {
+  it('should allow removal without rollback using --skip-rollback flag', async () => {
     const { manifestPath, packageDirs } = await setupTestEnvironment({
       testDir: path.join(testDir, 'norollback1'),
       patches: [
@@ -103,7 +103,7 @@ describe('remove command with rollback', () => {
 
     const pkgDir = packageDirs.get('pkg:npm/test-pkg@1.0.0')!
 
-    // Simulate --no-rollback: only remove from manifest without rollback
+    // Simulate --skip-rollback: only remove from manifest without rollback
     const manifestContent = await fs.readFile(manifestPath, 'utf-8')
     const manifest = PatchManifestSchema.parse(JSON.parse(manifestContent))
 
