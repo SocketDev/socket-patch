@@ -15,8 +15,7 @@ export interface PatchResponse {
       beforeHash?: string
       afterHash?: string
       socketBlob?: string
-      blobContent?: string // after blob content (base64)
-      beforeBlobContent?: string // before blob content (base64) - for rollback
+      blobContent?: string
     }
   >
   vulnerabilities: Record<

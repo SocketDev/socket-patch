@@ -10,13 +10,11 @@ import {
   cleanupUnusedBlobs,
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
-import { rollbackPatches } from './rollback.js'
 
 interface RemoveArgs {
   identifier: string
   cwd: string
   'manifest-path': string
-  'no-rollback': boolean
 }
 
 async function removePatch(
@@ -64,7 +62,7 @@ async function removePatch(
 
 export const removeCommand: CommandModule<{}, RemoveArgs> = {
   command: 'remove <identifier>',
-  describe: 'Remove a patch from the manifest by PURL or UUID (rolls back files first)',
+  describe: 'Remove a patch from the manifest by PURL or UUID',
   builder: yargs => {
     return yargs
       .positional('identifier', {
@@ -83,23 +81,6 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         type: 'string',
         default: DEFAULT_PATCH_MANIFEST_PATH,
       })
-      .option('no-rollback', {
-        describe: 'Skip rolling back files before removing (only update manifest)',
-        type: 'boolean',
-        default: false,
-      })
-      .example(
-        '$0 remove pkg:npm/lodash@4.17.21',
-        'Rollback and remove a patch by PURL',
-      )
-      .example(
-        '$0 remove 12345678-1234-1234-1234-123456789abc',
-        'Rollback and remove a patch by UUID',
-      )
-      .example(
-        '$0 remove pkg:npm/lodash@4.17.21 --no-rollback',
-        'Remove from manifest without rolling back files',
-      )
   },
   handler: async argv => {
     try {
@@ -115,50 +96,6 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         process.exit(1)
       }
 
-      // First, rollback the patch if not skipped
-      if (!argv['no-rollback']) {
-        console.log(`Rolling back patch before removal...`)
-        const { success: rollbackSuccess, results: rollbackResults } =
-          await rollbackPatches(
-            argv.cwd,
-            manifestPath,
-            argv.identifier,
-            false, // not dry run
-            false, // not silent
-          )
-
-        if (!rollbackSuccess) {
-          console.error(
-            '\nRollback failed. Use --no-rollback to remove from manifest without restoring files.',
-          )
-          process.exit(1)
-        }
-
-        // Report rollback results
-        const rolledBack = rollbackResults.filter(
-          r => r.success && r.filesRolledBack.length > 0,
-        )
-        const alreadyOriginal = rollbackResults.filter(
-          r =>
-            r.success &&
-            r.filesVerified.every(f => f.status === 'already-original'),
-        )
-
-        if (rolledBack.length > 0) {
-          console.log(`Rolled back ${rolledBack.length} package(s)`)
-        }
-        if (alreadyOriginal.length > 0) {
-          console.log(
-            `${alreadyOriginal.length} package(s) already in original state`,
-          )
-        }
-        if (rollbackResults.length === 0) {
-          console.log('No packages found to rollback (not installed)')
-        }
-        console.log()
-      }
-
-      // Now remove from manifest
       const { removed, notFound, manifest } = await removePatch(
         argv.identifier,
         manifestPath,
@@ -169,7 +106,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         process.exit(1)
       }
 
-      console.log(`Removed ${removed.length} patch(es) from manifest:`)
+      console.log(`Removed ${removed.length} patch(es):`)
       for (const purl of removed) {
         console.log(`  - ${purl}`)
       }

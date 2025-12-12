@@ -179,17 +179,10 @@ async function savePatch(
       }
     }
 
-    // Save after blob content if provided
+    // Save blob content if provided
     if (fileInfo.blobContent && fileInfo.afterHash) {
       const blobPath = path.join(blobsDir, fileInfo.afterHash)
       const blobBuffer = Buffer.from(fileInfo.blobContent, 'base64')
-      await fs.writeFile(blobPath, blobBuffer)
-    }
-
-    // Save before blob content if provided (for rollback support)
-    if (fileInfo.beforeBlobContent && fileInfo.beforeHash) {
-      const blobPath = path.join(blobsDir, fileInfo.beforeHash)
-      const blobBuffer = Buffer.from(fileInfo.beforeBlobContent, 'base64')
       await fs.writeFile(blobPath, blobBuffer)
     }
   }
