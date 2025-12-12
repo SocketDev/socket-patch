@@ -91,6 +91,7 @@ export class APIClient {
 
       const headers: Record<string, string> = {
         Accept: 'application/json',
+        'User-Agent': 'SocketPatchCLI/1.0',
       }
 
       // Only add auth header if we have a token (not using public proxy)
