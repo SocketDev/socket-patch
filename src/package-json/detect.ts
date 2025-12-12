@@ -33,7 +33,9 @@ export function isPostinstallConfigured(
     packageJson = packageJsonContent
   }
 
-  const currentScript = packageJson.scripts?.postinstall || ''
+  const rawPostinstall = packageJson.scripts?.postinstall
+  // Handle non-string values (null, object, array) by treating as empty string
+  const currentScript = typeof rawPostinstall === 'string' ? rawPostinstall : ''
 
   // Check if socket-patch apply is already present
   const configured = currentScript.includes('socket-patch apply')

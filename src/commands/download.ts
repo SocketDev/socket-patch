@@ -27,6 +27,65 @@ const GHSA_PATTERN = /^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i
 
 type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'purl' | 'package'
 
+/**
+ * Parse a PURL to extract the package directory path and version
+ * @example parsePurl('pkg:npm/lodash@4.17.21') => { packageDir: 'lodash', version: '4.17.21' }
+ * @example parsePurl('pkg:npm/@types/node@20.0.0') => { packageDir: '@types/node', version: '20.0.0' }
+ */
+function parsePurl(purl: string): { packageDir: string; version: string } | null {
+  const match = purl.match(/^pkg:npm\/(.+)@([^@]+)$/)
+  if (!match) return null
+  return { packageDir: match[1], version: match[2] }
+}
+
+/**
+ * Check which PURLs from search results are actually installed in node_modules.
+ * This is O(n) where n = number of unique packages in search results,
+ * NOT O(m) where m = total packages in node_modules.
+ */
+async function findInstalledPurls(
+  cwd: string,
+  purls: string[],
+): Promise<Set<string>> {
+  const nodeModulesPath = path.join(cwd, 'node_modules')
+  const installedPurls = new Set<string>()
+
+  // Group PURLs by package directory to handle multiple versions of same package
+  const packageVersions = new Map<string, Set<string>>()
+  const purlLookup = new Map<string, string>() // "packageDir@version" -> original purl
+
+  for (const purl of purls) {
+    const parsed = parsePurl(purl)
+    if (!parsed) continue
+
+    if (!packageVersions.has(parsed.packageDir)) {
+      packageVersions.set(parsed.packageDir, new Set())
+    }
+    packageVersions.get(parsed.packageDir)!.add(parsed.version)
+    purlLookup.set(`${parsed.packageDir}@${parsed.version}`, purl)
+  }
+
+  // Check only the specific packages we need - O(n) filesystem operations
+  for (const [packageDir, versions] of packageVersions) {
+    const pkgJsonPath = path.join(nodeModulesPath, packageDir, 'package.json')
+    try {
+      const content = await fs.readFile(pkgJsonPath, 'utf-8')
+      const pkg = JSON.parse(content)
+      if (pkg.version && versions.has(pkg.version)) {
+        const key = `${packageDir}@${pkg.version}`
+        const originalPurl = purlLookup.get(key)
+        if (originalPurl) {
+          installedPurls.add(originalPurl)
+        }
+      }
+    } catch {
+      // Package not found or invalid package.json - skip
+    }
+  }
+
+  return installedPurls
+}
+
 interface DownloadArgs {
   identifier: string
   org?: string
@@ -390,14 +449,41 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     return true
   }
 
+  // For CVE/GHSA searches, filter to only show patches for installed packages
+  // Uses O(n) filesystem operations where n = unique packages in results,
+  // NOT O(m) where m = all packages in node_modules
+  let filteredResults = searchResults
+  let notInstalledCount = 0
+
+  if (idType === 'cve' || idType === 'ghsa') {
+    console.log(`Checking which packages are installed...`)
+    const searchPurls = searchResults.map(patch => patch.purl)
+    const installedPurls = await findInstalledPurls(cwd, searchPurls)
+
+    filteredResults = searchResults.filter(patch => installedPurls.has(patch.purl))
+    notInstalledCount = searchResults.length - filteredResults.length
+
+    if (filteredResults.length === 0) {
+      console.log(`No patches found for installed packages.`)
+      if (notInstalledCount > 0) {
+        console.log(`  (${notInstalledCount} patch(es) exist for packages not installed in this project)`)
+      }
+      return true
+    }
+  }
+
   // Filter patches based on tier access
-  const accessiblePatches = searchResults.filter(
+  const accessiblePatches = filteredResults.filter(
     patch => patch.tier === 'free' || canAccessPaidPatches,
   )
-  const inaccessibleCount = searchResults.length - accessiblePatches.length
+  const inaccessibleCount = filteredResults.length - accessiblePatches.length
 
   // Display search results
-  displaySearchResults(searchResults, canAccessPaidPatches)
+  displaySearchResults(filteredResults, canAccessPaidPatches)
+
+  if (notInstalledCount > 0) {
+    console.log(`Note: ${notInstalledCount} patch(es) for packages not installed in this project were hidden.`)
+  }
 
   if (inaccessibleCount > 0) {
     console.log(
