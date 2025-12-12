@@ -154,9 +154,9 @@ export class APIClient {
     orgSlug: string | null,
     uuid: string,
   ): Promise<PatchResponse | null> {
-    // Public proxy uses simpler URL structure (no org slug needed)
+    // Public proxy uses /patch/* prefix for patch endpoints
     const path = this.usePublicProxy
-      ? `/view/${uuid}`
+      ? `/patch/view/${uuid}`
       : `/v0/orgs/${orgSlug}/patches/view/${uuid}`
     return this.get(path)
   }
@@ -169,9 +169,9 @@ export class APIClient {
     orgSlug: string | null,
     cveId: string,
   ): Promise<SearchResponse> {
-    // Public proxy uses simpler URL structure (no org slug needed)
+    // Public proxy uses /patch/* prefix for patch endpoints
     const path = this.usePublicProxy
-      ? `/by-cve/${encodeURIComponent(cveId)}`
+      ? `/patch/by-cve/${encodeURIComponent(cveId)}`
       : `/v0/orgs/${orgSlug}/patches/by-cve/${encodeURIComponent(cveId)}`
     const result = await this.get<SearchResponse>(path)
     return result ?? { patches: [], canAccessPaidPatches: false }
@@ -185,9 +185,9 @@ export class APIClient {
     orgSlug: string | null,
     ghsaId: string,
   ): Promise<SearchResponse> {
-    // Public proxy uses simpler URL structure (no org slug needed)
+    // Public proxy uses /patch/* prefix for patch endpoints
     const path = this.usePublicProxy
-      ? `/by-ghsa/${encodeURIComponent(ghsaId)}`
+      ? `/patch/by-ghsa/${encodeURIComponent(ghsaId)}`
       : `/v0/orgs/${orgSlug}/patches/by-ghsa/${encodeURIComponent(ghsaId)}`
     const result = await this.get<SearchResponse>(path)
     return result ?? { patches: [], canAccessPaidPatches: false }
@@ -207,9 +207,9 @@ export class APIClient {
     orgSlug: string | null,
     purl: string,
   ): Promise<SearchResponse> {
-    // Public proxy uses simpler URL structure (no org slug needed)
+    // Public proxy uses /patch/* prefix for patch endpoints
     const path = this.usePublicProxy
-      ? `/by-package/${encodeURIComponent(purl)}`
+      ? `/patch/by-package/${encodeURIComponent(purl)}`
       : `/v0/orgs/${orgSlug}/patches/by-package/${encodeURIComponent(purl)}`
     const result = await this.get<SearchResponse>(path)
     return result ?? { patches: [], canAccessPaidPatches: false }
