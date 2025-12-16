@@ -5,6 +5,7 @@ import type { CommandModule } from 'yargs'
 import { PatchManifestSchema } from '../schema/manifest-schema.js'
 import {
   getAPIClientFromEnv,
+  type APIClient,
   type PatchResponse,
   type PatchSearchResult,
   type SearchResponse,
@@ -19,11 +20,28 @@ import {
 } from '../utils/enumerate-packages.js'
 import { fuzzyMatchPackages, isPurl } from '../utils/fuzzy-match.js'
 
+/**
+ * Represents a package that has available patches with CVE information
+ */
+interface PackageWithPatchInfo extends EnumeratedPackage {
+  /** Available patches for this package */
+  patches: PatchSearchResult[]
+  /** Whether user can access paid patches */
+  canAccessPaidPatches: boolean
+  /** CVE IDs that this package's patches address */
+  cveIds: string[]
+  /** GHSA IDs that this package's patches address */
+  ghsaIds: string[]
+}
+
 // Identifier type patterns
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CVE_PATTERN = /^CVE-\d{4}-\d+$/i
 const GHSA_PATTERN = /^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i
+
+// Maximum number of packages to check for patches (to limit API queries)
+const MAX_PACKAGES_TO_CHECK = 15
 
 type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'purl' | 'package'
 
@@ -86,6 +104,89 @@ async function findInstalledPurls(
   return installedPurls
 }
 
+/**
+ * Check which packages have available patches with CVE fixes.
+ * Queries the API for each package and returns only those with patches.
+ *
+ * @param apiClient - API client to use for queries
+ * @param orgSlug - Organization slug (or null for public proxy)
+ * @param packages - Packages to check
+ * @param onProgress - Optional callback for progress updates
+ * @returns Packages that have available patches with CVE info
+ */
+async function findPackagesWithPatches(
+  apiClient: APIClient,
+  orgSlug: string | null,
+  packages: EnumeratedPackage[],
+  onProgress?: (checked: number, total: number, current: string) => void,
+): Promise<PackageWithPatchInfo[]> {
+  const packagesWithPatches: PackageWithPatchInfo[] = []
+
+  for (let i = 0; i < packages.length; i++) {
+    const pkg = packages[i]
+    const displayName = pkg.namespace
+      ? `${pkg.namespace}/${pkg.name}`
+      : pkg.name
+
+    if (onProgress) {
+      onProgress(i + 1, packages.length, displayName)
+    }
+
+    try {
+      const searchResponse = await apiClient.searchPatchesByPackage(
+        orgSlug,
+        pkg.purl,
+      )
+
+      const { patches, canAccessPaidPatches } = searchResponse
+
+      // Filter to only accessible patches
+      const accessiblePatches = patches.filter(
+        patch => patch.tier === 'free' || canAccessPaidPatches,
+      )
+
+      if (accessiblePatches.length === 0) {
+        continue
+      }
+
+      // Extract CVE and GHSA IDs from patches
+      const cveIds = new Set<string>()
+      const ghsaIds = new Set<string>()
+
+      for (const patch of accessiblePatches) {
+        for (const [vulnId, vulnInfo] of Object.entries(patch.vulnerabilities)) {
+          // Check if the vulnId itself is a GHSA
+          if (GHSA_PATTERN.test(vulnId)) {
+            ghsaIds.add(vulnId)
+          }
+          // Add all CVEs associated with this vulnerability
+          for (const cve of vulnInfo.cves) {
+            cveIds.add(cve)
+          }
+        }
+      }
+
+      // Only include packages that have CVE fixes
+      if (cveIds.size === 0 && ghsaIds.size === 0) {
+        continue
+      }
+
+      packagesWithPatches.push({
+        ...pkg,
+        patches: accessiblePatches,
+        canAccessPaidPatches,
+        cveIds: Array.from(cveIds).sort(),
+        ghsaIds: Array.from(ghsaIds).sort(),
+      })
+    } catch {
+      // Skip packages that fail API lookup (likely network issues)
+      continue
+    }
+  }
+
+  return packagesWithPatches
+}
+
 interface DownloadArgs {
   identifier: string
   org?: string
@@ -136,20 +237,40 @@ async function promptConfirmation(message: string): Promise<boolean> {
 }
 
 /**
- * Display enumerated packages and prompt user to select one
+ * Display packages with available patches and CVE info, prompt user to select one
  */
-async function promptSelectPackage(
-  packages: EnumeratedPackage[],
-): Promise<EnumeratedPackage | null> {
-  console.log('\nMatching packages found:\n')
+async function promptSelectPackageWithPatches(
+  packages: PackageWithPatchInfo[],
+): Promise<PackageWithPatchInfo | null> {
+  console.log('\nPackages with available security patches:\n')
 
   for (let i = 0; i < packages.length; i++) {
     const pkg = packages[i]
     const displayName = pkg.namespace
       ? `${pkg.namespace}/${pkg.name}`
       : pkg.name
+
+    // Build vulnerability summary
+    const vulnIds = [...pkg.cveIds, ...pkg.ghsaIds]
+    const vulnSummary = vulnIds.length > 3
+      ? `${vulnIds.slice(0, 3).join(', ')} (+${vulnIds.length - 3} more)`
+      : vulnIds.join(', ')
+
+    // Count patches and show severity info
+    const severities = new Set<string>()
+    for (const patch of pkg.patches) {
+      for (const vuln of Object.values(patch.vulnerabilities)) {
+        severities.add(vuln.severity)
+      }
+    }
+    const severityList = Array.from(severities).sort((a, b) => {
+      const order = ['critical', 'high', 'medium', 'low']
+      return order.indexOf(a.toLowerCase()) - order.indexOf(b.toLowerCase())
+    })
+
     console.log(`  ${i + 1}. ${displayName}@${pkg.version}`)
-    console.log(`     PURL: ${pkg.purl}`)
+    console.log(`     Patches: ${pkg.patches.length} | Severity: ${severityList.join(', ')}`)
+    console.log(`     Fixes: ${vulnSummary}`)
   }
 
   const rl = readline.createInterface({
@@ -401,27 +522,86 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
       console.log(`Found ${packages.length} packages in node_modules`)
 
       // Fuzzy match against the identifier
-      const matches = fuzzyMatchPackages(identifier, packages)
+      let matches = fuzzyMatchPackages(identifier, packages)
 
       if (matches.length === 0) {
         console.log(`No packages matching "${identifier}" found in node_modules.`)
         return true
       }
 
-      let selectedPackage: EnumeratedPackage
-
-      if (matches.length === 1) {
-        // Single match, use it directly
-        selectedPackage = matches[0]
-        console.log(`Found exact match: ${selectedPackage.purl}`)
+      // Sort by package name length (shorter names are typically more relevant/common)
+      // and truncate to limit API queries
+      let truncatedCount = 0
+      if (matches.length > MAX_PACKAGES_TO_CHECK) {
+        // Sort by full name length (namespace/name) - shorter = more relevant
+        matches = matches.sort((a, b) => {
+          const aFullName = a.namespace ? `${a.namespace}/${a.name}` : a.name
+          const bFullName = b.namespace ? `${b.namespace}/${b.name}` : b.name
+          return aFullName.length - bFullName.length
+        })
+        truncatedCount = matches.length - MAX_PACKAGES_TO_CHECK
+        matches = matches.slice(0, MAX_PACKAGES_TO_CHECK)
+        console.log(`Found ${matches.length + truncatedCount} matching package(s), checking top ${MAX_PACKAGES_TO_CHECK} by name length...`)
       } else {
-        // Multiple matches, prompt user to select
+        console.log(`Found ${matches.length} matching package(s), checking for available patches...`)
+      }
+
+      // Check which packages have available patches with CVE fixes
+      const packagesWithPatches = await findPackagesWithPatches(
+        apiClient,
+        effectiveOrgSlug,
+        matches,
+        (checked, total, current) => {
+          // Clear line and show progress
+          process.stdout.write(`\r  Checking ${checked}/${total}: ${current}`.padEnd(80))
+        },
+      )
+      // Clear the progress line
+      process.stdout.write('\r' + ' '.repeat(80) + '\r')
+
+      if (packagesWithPatches.length === 0) {
+        console.log(`No patches with CVE fixes found for packages matching "${identifier}".`)
+        const checkedCount = matches.length
+        if (checkedCount > 0) {
+          console.log(`  (${checkedCount} package(s) checked but none have available patches)`)
+        }
+        if (truncatedCount > 0) {
+          console.log(`  (${truncatedCount} additional match(es) not checked - try a more specific search)`)
+        }
+        return true
+      }
+
+      const skippedCount = matches.length - packagesWithPatches.length
+      if (skippedCount > 0 || truncatedCount > 0) {
+        let note = `Found ${packagesWithPatches.length} package(s) with available patches`
+        if (skippedCount > 0) {
+          note += ` (${skippedCount} without patches hidden)`
+        }
+        if (truncatedCount > 0) {
+          note += ` (${truncatedCount} additional match(es) not checked)`
+        }
+        console.log(note)
+      }
+
+      let selectedPackage: PackageWithPatchInfo
+
+      if (packagesWithPatches.length === 1) {
+        // Single match with patches, use it directly
+        selectedPackage = packagesWithPatches[0]
+        const displayName = selectedPackage.namespace
+          ? `${selectedPackage.namespace}/${selectedPackage.name}`
+          : selectedPackage.name
+        console.log(`Found: ${displayName}@${selectedPackage.version}`)
+        console.log(`  Patches: ${selectedPackage.patches.length}`)
+        console.log(`  Fixes: ${[...selectedPackage.cveIds, ...selectedPackage.ghsaIds].join(', ')}`)
+      } else {
+        // Multiple matches with patches, prompt user to select
         if (skipConfirmation) {
-          // With --yes, use the best match (first result)
-          selectedPackage = matches[0]
+          // With --yes, use the first result (best match with patches)
+          selectedPackage = packagesWithPatches[0]
           console.log(`Using best match: ${selectedPackage.purl}`)
         } else {
-          const selected = await promptSelectPackage(matches)
+          const selected = await promptSelectPackageWithPatches(packagesWithPatches)
           if (!selected) {
             console.log('No package selected. Download cancelled.')
             return true
@@ -430,12 +610,11 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
         }
       }
 
-      // Search for patches using the selected package's PURL
-      console.log(`Searching patches for package: ${selectedPackage.purl}`)
-      searchResponse = await apiClient.searchPatchesByPackage(
-        effectiveOrgSlug,
-        selectedPackage.purl,
-      )
+      // Use pre-fetched patch info directly
+      searchResponse = {
+        patches: selectedPackage.patches,
+        canAccessPaidPatches: selectedPackage.canAccessPaidPatches,
+      }
       break
     }
     default:
