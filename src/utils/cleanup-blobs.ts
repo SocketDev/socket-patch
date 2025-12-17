@@ -1,7 +1,7 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import type { PatchManifest } from '../schema/manifest-schema.js'
-import { getReferencedBlobs } from '../manifest/operations.js'
+import { getAfterHashBlobs } from '../manifest/operations.js'
 
 export interface CleanupResult {
   blobsChecked: number
@@ -12,8 +12,12 @@ export interface CleanupResult {
 
 /**
  * Cleans up unused blob files from the .socket/blobs directory.
- * Analyzes the manifest to determine which blobs are still in use,
- * then removes any blob files that are not referenced.
+ * Analyzes the manifest to determine which afterHash blobs are needed for applying patches,
+ * then removes any blob files that are not needed.
+ *
+ * Note: beforeHash blobs are considered "unused" because they are downloaded on-demand
+ * during rollback operations. This saves disk space since beforeHash blobs are only
+ * needed for rollback, not for applying patches.
  *
  * @param manifest - The patch manifest containing all active patches
  * @param blobsDir - Path to the .socket/blobs directory
@@ -25,8 +29,8 @@ export async function cleanupUnusedBlobs(
   blobsDir: string,
   dryRun: boolean = false,
 ): Promise<CleanupResult> {
-  // Collect all blob hashes that are currently in use
-  const usedBlobs = getReferencedBlobs(manifest)
+  // Only keep afterHash blobs - beforeHash blobs are downloaded on-demand during rollback
+  const usedBlobs = getAfterHashBlobs(manifest)
 
   // Check if blobs directory exists
   try {

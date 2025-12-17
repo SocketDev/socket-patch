@@ -324,6 +324,7 @@ describe('rollback command', () => {
         undefined, // no identifier = all patches
         false,
         true,
+        false, // not offline
       )
 
       assert.equal(success, true)
@@ -371,6 +372,7 @@ describe('rollback command', () => {
         'pkg:npm/pkg-a@1.0.0', // Only rollback pkg-a
         false,
         true,
+        false, // not offline
       )
 
       assert.equal(success, true)
@@ -419,6 +421,7 @@ describe('rollback command', () => {
         TEST_UUID_B, // Rollback by UUID
         false,
         true,
+        false, // not offline
       )
 
       assert.equal(success, true)
@@ -459,6 +462,7 @@ describe('rollback command', () => {
             'pkg:npm/nonexistent@1.0.0',
             false,
             true,
+            false, // not offline
           )
         },
         /No patch found matching identifier/,
@@ -491,6 +495,7 @@ describe('rollback command', () => {
             'dddddddd-dddd-4ddd-8ddd-dddddddddddd', // nonexistent UUID
             false,
             true,
+            false, // not offline
           )
         },
         /No patch found matching identifier/,
@@ -521,6 +526,7 @@ describe('rollback command', () => {
         'pkg:npm/@scope/pkg-a@1.0.0',
         false,
         true,
+        false, // not offline
       )
 
       assert.equal(success, true)

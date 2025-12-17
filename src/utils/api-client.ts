@@ -65,17 +65,24 @@ export interface APIClientOptions {
    * which only provides access to free patches without authentication.
    */
   usePublicProxy?: boolean
+  /**
+   * Organization slug for authenticated blob downloads.
+   * Required when using authenticated API (not public proxy).
+   */
+  orgSlug?: string
 }
 
 export class APIClient {
   private readonly apiUrl: string
   private readonly apiToken?: string
   private readonly usePublicProxy: boolean
+  private readonly orgSlug?: string
 
   constructor(options: APIClientOptions) {
     this.apiUrl = options.apiUrl.replace(/\/$/, '') // Remove trailing slash
     this.apiToken = options.apiToken
     this.usePublicProxy = options.usePublicProxy ?? false
+    this.orgSlug = options.orgSlug
   }
 
   /**
@@ -216,6 +223,86 @@ export class APIClient {
     return result ?? { patches: [], canAccessPaidPatches: false }
   }
 
+  /**
+   * Fetch a blob by its SHA256 hash.
+   * Returns the raw binary content as a Buffer, or null if not found.
+   *
+   * Uses authenticated API endpoint when token and orgSlug are available,
+   * otherwise falls back to the public proxy.
+   *
+   * @param hash - SHA256 hash (64 hex characters)
+   * @returns Buffer containing blob data, or null if not found
+   */
+  async fetchBlob(hash: string): Promise<Buffer | null> {
+    // Validate hash format (SHA256 = 64 hex chars)
+    if (!/^[a-f0-9]{64}$/i.test(hash)) {
+      throw new Error(`Invalid hash format: ${hash}. Expected SHA256 hash (64 hex characters).`)
+    }
+
+    // Use authenticated API endpoint when available, otherwise use public proxy
+    let url: string
+    let useAuth = false
+    if (this.apiToken && this.orgSlug && !this.usePublicProxy) {
+      // Use authenticated endpoint
+      url = `${this.apiUrl}/v0/orgs/${this.orgSlug}/patches/blob/${hash}`
+      useAuth = true
+    } else {
+      // Fall back to public proxy
+      const proxyUrl = process.env.SOCKET_PATCH_PROXY_URL || DEFAULT_PATCH_API_PROXY_URL
+      url = `${proxyUrl}/patch/blob/${hash}`
+    }
+
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url)
+      const isHttps = urlObj.protocol === 'https:'
+      const httpModule = isHttps ? https : http
+
+      const headers: Record<string, string> = {
+        Accept: 'application/octet-stream',
+        'User-Agent': 'SocketPatchCLI/1.0',
+      }
+
+      // Add auth header when using authenticated endpoint
+      if (useAuth && this.apiToken) {
+        headers['Authorization'] = `Bearer ${this.apiToken}`
+      }
+
+      const options: https.RequestOptions = {
+        method: 'GET',
+        headers,
+      }
+
+      const req = httpModule.request(urlObj, options, res => {
+        const chunks: Buffer[] = []
+
+        res.on('data', (chunk: Buffer) => {
+          chunks.push(chunk)
+        })
+
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolve(Buffer.concat(chunks))
+          } else if (res.statusCode === 404) {
+            resolve(null)
+          } else {
+            const errorBody = Buffer.concat(chunks).toString('utf-8')
+            reject(
+              new Error(
+                `Failed to fetch blob ${hash}: status ${res.statusCode} - ${errorBody}`,
+              ),
+            )
+          }
+        })
+      })
+
+      req.on('error', err => {
+        reject(new Error(`Network error fetching blob ${hash}: ${err.message}`))
+      })
+
+      req.end()
+    })
+  }
+
 }
 
 /**
@@ -228,9 +315,13 @@ export class APIClient {
  * - SOCKET_API_URL: Override the API URL (defaults to https://api.socket.dev)
  * - SOCKET_API_TOKEN: API token for authenticated access to all patches
  * - SOCKET_PATCH_PROXY_URL: Override the public patch API URL (defaults to https://patches-api.socket.dev)
+ * - SOCKET_ORG_SLUG: Organization slug for authenticated blob downloads
+ *
+ * @param orgSlug - Optional organization slug (overrides SOCKET_ORG_SLUG env var)
  */
-export function getAPIClientFromEnv(): { client: APIClient; usePublicProxy: boolean } {
+export function getAPIClientFromEnv(orgSlug?: string): { client: APIClient; usePublicProxy: boolean } {
   const apiToken = process.env.SOCKET_API_TOKEN
+  const resolvedOrgSlug = orgSlug || process.env.SOCKET_ORG_SLUG
 
   if (!apiToken) {
     // No token provided - use public proxy for free patches
@@ -244,7 +335,7 @@ export function getAPIClientFromEnv(): { client: APIClient; usePublicProxy: bool
 
   const apiUrl = process.env.SOCKET_API_URL || 'https://api.socket.dev'
   return {
-    client: new APIClient({ apiUrl, apiToken }),
+    client: new APIClient({ apiUrl, apiToken, orgSlug: resolvedOrgSlug }),
     usePublicProxy: false,
   }
 }

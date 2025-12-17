@@ -337,6 +337,7 @@ function displaySearchResults(
 
 /**
  * Save a patch to the manifest and blobs directory
+ * Only saves afterHash blobs - beforeHash blobs are downloaded on-demand during rollback
  */
 async function savePatch(
   patch: PatchResponse,
@@ -349,7 +350,7 @@ async function savePatch(
     return false
   }
 
-  // Save blob contents
+  // Save blob contents (only afterHash blobs to save disk space)
   const files: Record<string, { beforeHash?: string; afterHash?: string }> = {}
   for (const [filePath, fileInfo] of Object.entries(patch.files)) {
     if (fileInfo.afterHash) {
@@ -360,16 +361,10 @@ async function savePatch(
     }
 
     // Save after blob content if provided
+    // Note: beforeHash blobs are NOT saved here - they are downloaded on-demand during rollback
     if (fileInfo.blobContent && fileInfo.afterHash) {
       const blobPath = path.join(blobsDir, fileInfo.afterHash)
       const blobBuffer = Buffer.from(fileInfo.blobContent, 'base64')
-      await fs.writeFile(blobPath, blobBuffer)
-    }
-
-    // Save before blob content if provided (for rollback support)
-    if (fileInfo.beforeBlobContent && fileInfo.beforeHash) {
-      const blobPath = path.join(blobsDir, fileInfo.beforeHash)
-      const blobBuffer = Buffer.from(fileInfo.beforeBlobContent, 'base64')
       await fs.writeFile(blobPath, blobBuffer)
     }
   }
