@@ -198,6 +198,89 @@ export function createBlobEnsurer(
 }
 
 /**
+ * Fetch specific blobs by their hashes.
+ * This is useful for downloading beforeHash blobs during rollback.
+ *
+ * @param hashes - Set of blob hashes to download
+ * @param blobsPath - Path to the blobs directory
+ * @param client - Optional API client (will create one if not provided)
+ * @param options - Optional callbacks for progress tracking
+ * @returns Results of the download operation
+ */
+export async function fetchBlobsByHash(
+  hashes: Set<string>,
+  blobsPath: string,
+  client?: APIClient,
+  options?: FetchMissingBlobsOptions,
+): Promise<FetchMissingBlobsResult> {
+  if (hashes.size === 0) {
+    return {
+      total: 0,
+      downloaded: 0,
+      failed: 0,
+      skipped: 0,
+      results: [],
+    }
+  }
+
+  // Get client from environment if not provided
+  const apiClient = client ?? getAPIClientFromEnv().client
+
+  // Ensure blobs directory exists
+  await fs.mkdir(blobsPath, { recursive: true })
+
+  const results: BlobFetchResult[] = []
+  let downloaded = 0
+  let failed = 0
+
+  const hashArray = Array.from(hashes)
+  for (let i = 0; i < hashArray.length; i++) {
+    const hash = hashArray[i]
+
+    if (options?.onProgress) {
+      options.onProgress(hash, i + 1, hashArray.length)
+    }
+
+    try {
+      const blobData = await apiClient.fetchBlob(hash)
+
+      if (blobData === null) {
+        results.push({
+          hash,
+          success: false,
+          error: 'Blob not found on server',
+        })
+        failed++
+      } else {
+        const blobPath = path.join(blobsPath, hash)
+        await fs.writeFile(blobPath, blobData)
+        results.push({
+          hash,
+          success: true,
+        })
+        downloaded++
+      }
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err)
+      results.push({
+        hash,
+        success: false,
+        error: errorMessage,
+      })
+      failed++
+    }
+  }
+
+  return {
+    total: hashArray.length,
+    downloaded,
+    failed,
+    skipped: 0,
+    results,
+  }
+}
+
+/**
  * Format the fetch results for human-readable output.
  */
 export function formatFetchResult(result: FetchMissingBlobsResult): string {

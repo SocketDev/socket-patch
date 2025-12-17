@@ -14,7 +14,7 @@ import {
 import { rollbackPackagePatch } from '../patch/rollback.js'
 import type { RollbackResult } from '../patch/rollback.js'
 import {
-  fetchMissingBlobs,
+  fetchBlobsByHash,
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
 
@@ -165,7 +165,8 @@ async function rollbackPatches(
       console.log(`Downloading ${missingBlobs.size} missing blob(s)...`)
     }
 
-    const fetchResult = await fetchMissingBlobs(filteredManifest, blobsPath, undefined, {
+    // Use fetchBlobsByHash to download the specific beforeHash blobs
+    const fetchResult = await fetchBlobsByHash(missingBlobs, blobsPath, undefined, {
       onProgress: silent
         ? undefined
         : (hash, index, total) => {
