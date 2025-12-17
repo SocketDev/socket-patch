@@ -15,12 +15,18 @@ import {
   cleanupUnusedBlobs,
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
+import {
+  getMissingBlobs,
+  fetchMissingBlobs,
+  formatFetchResult,
+} from '../utils/blob-fetcher.js'
 
 interface ApplyArgs {
   cwd: string
   'dry-run': boolean
   silent: boolean
   'manifest-path': string
+  offline: boolean
 }
 
 async function applyPatches(
@@ -28,6 +34,7 @@ async function applyPatches(
   manifestPath: string,
   dryRun: boolean,
   silent: boolean,
+  offline: boolean,
 ): Promise<{ success: boolean; results: ApplyResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -38,11 +45,48 @@ async function applyPatches(
   const socketDir = path.dirname(manifestPath)
   const blobsPath = path.join(socketDir, 'blobs')
 
-  // Verify blobs directory exists
-  try {
-    await fs.access(blobsPath)
-  } catch {
-    throw new Error(`Blobs directory not found at ${blobsPath}`)
+  // Ensure blobs directory exists
+  await fs.mkdir(blobsPath, { recursive: true })
+
+  // Check for and download missing blobs (unless offline)
+  const missingBlobs = await getMissingBlobs(manifest, blobsPath)
+  if (missingBlobs.size > 0) {
+    if (offline) {
+      if (!silent) {
+        console.error(
+          `Error: ${missingBlobs.size} blob(s) are missing and --offline mode is enabled.`,
+        )
+        console.error('Run "socket-patch repair" to download missing blobs.')
+      }
+      return { success: false, results: [] }
+    }
+
+    if (!silent) {
+      console.log(`Downloading ${missingBlobs.size} missing blob(s)...`)
+    }
+
+    const fetchResult = await fetchMissingBlobs(manifest, blobsPath, undefined, {
+      onProgress: silent
+        ? undefined
+        : (hash, index, total) => {
+            process.stdout.write(
+              `\r  Downloading ${index}/${total}: ${hash.slice(0, 12)}...`.padEnd(60),
+            )
+          },
+    })
+
+    if (!silent) {
+      // Clear progress line
+      process.stdout.write('\r' + ' '.repeat(60) + '\r')
+      console.log(formatFetchResult(fetchResult))
+    }
+
+    if (fetchResult.failed > 0) {
+      if (!silent) {
+        console.error('Some blobs could not be downloaded. Cannot apply patches.')
+      }
+      return { success: false, results: [] }
+    }
   }
 
   // Find all node_modules directories
@@ -138,6 +182,11 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         type: 'string',
         default: DEFAULT_PATCH_MANIFEST_PATH,
       })
+      .option('offline', {
+        describe: 'Do not download missing blobs, fail if any are missing',
+        type: 'boolean',
+        default: false,
+      })
   },
   handler: async argv => {
     try {
@@ -160,6 +209,7 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         manifestPath,
         argv['dry-run'],
         argv.silent,
+        argv.offline,
       )
 
       // Print results if not silent

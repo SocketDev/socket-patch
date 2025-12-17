@@ -13,6 +13,10 @@ import {
 } from '../patch/apply.js'
 import { rollbackPackagePatch } from '../patch/rollback.js'
 import type { RollbackResult } from '../patch/rollback.js'
+import {
+  fetchMissingBlobs,
+  formatFetchResult,
+} from '../utils/blob-fetcher.js'
 
 interface RollbackArgs {
   identifier?: string
@@ -20,6 +24,7 @@ interface RollbackArgs {
   'dry-run': boolean
   silent: boolean
   'manifest-path': string
+  offline: boolean
 }
 
 interface PatchToRollback {
@@ -65,12 +70,50 @@ function findPatchesToRollback(
   return patches
 }
 
+/**
+ * Get the set of beforeHash blobs needed for rollback.
+ * These are different from the afterHash blobs needed for apply.
+ */
+function getBeforeHashBlobs(manifest: PatchManifest): Set<string> {
+  const blobs = new Set<string>()
+  for (const patchRecord of Object.values(manifest.patches)) {
+    const record = patchRecord as PatchRecord
+    for (const fileInfo of Object.values(record.files)) {
+      blobs.add(fileInfo.beforeHash)
+    }
+  }
+  return blobs
+}
+
+/**
+ * Check which beforeHash blobs are missing from disk.
+ */
+async function getMissingBeforeBlobs(
+  manifest: PatchManifest,
+  blobsPath: string,
+): Promise<Set<string>> {
+  const beforeBlobs = getBeforeHashBlobs(manifest)
+  const missingBlobs = new Set<string>()
+
+  for (const hash of beforeBlobs) {
+    const blobPath = path.join(blobsPath, hash)
+    try {
+      await fs.access(blobPath)
+    } catch {
+      missingBlobs.add(hash)
+    }
+  }
+
+  return missingBlobs
+}
+
 async function rollbackPatches(
   cwd: string,
   manifestPath: string,
   identifier: string | undefined,
   dryRun: boolean,
   silent: boolean,
+  offline: boolean,
 ): Promise<{ success: boolean; results: RollbackResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -81,12 +124,8 @@ async function rollbackPatches(
   const socketDir = path.dirname(manifestPath)
   const blobsPath = path.join(socketDir, 'blobs')
 
-  // Verify blobs directory exists
-  try {
-    await fs.access(blobsPath)
-  } catch {
-    throw new Error(`Blobs directory not found at ${blobsPath}`)
-  }
+  // Ensure blobs directory exists
+  await fs.mkdir(blobsPath, { recursive: true })
 
   // Find patches to rollback
   const patchesToRollback = findPatchesToRollback(manifest, identifier)
@@ -106,6 +145,50 @@ async function rollbackPatches(
     patches: Object.fromEntries(
       patchesToRollback.map(p => [p.purl, p.patch]),
     ),
+  }
+
+  // Check for and download missing beforeHash blobs (unless offline)
+  // Rollback needs the original (beforeHash) blobs, not the patched (afterHash) blobs
+  const missingBlobs = await getMissingBeforeBlobs(filteredManifest, blobsPath)
+  if (missingBlobs.size > 0) {
+    if (offline) {
+      if (!silent) {
+        console.error(
+          `Error: ${missingBlobs.size} blob(s) are missing and --offline mode is enabled.`,
+        )
+        console.error('Run "socket-patch repair" to download missing blobs.')
+      }
+      return { success: false, results: [] }
+    }
+
+    if (!silent) {
+      console.log(`Downloading ${missingBlobs.size} missing blob(s)...`)
+    }
+
+    const fetchResult = await fetchMissingBlobs(filteredManifest, blobsPath, undefined, {
+      onProgress: silent
+        ? undefined
+        : (hash, index, total) => {
+            process.stdout.write(
+              `\r  Downloading ${index}/${total}: ${hash.slice(0, 12)}...`.padEnd(60),
+            )
+          },
+    })
+
+    if (!silent) {
+      // Clear progress line
+      process.stdout.write('\r' + ' '.repeat(60) + '\r')
+      console.log(formatFetchResult(fetchResult))
+    }
+
+    // Re-check which blobs are still missing after download
+    const stillMissing = await getMissingBeforeBlobs(filteredManifest, blobsPath)
+    if (stillMissing.size > 0) {
+      if (!silent) {
+        console.error(`${stillMissing.size} blob(s) could not be downloaded. Cannot rollback.`)
+      }
+      return { success: false, results: [] }
+    }
   }
 
   // Find all node_modules directories
@@ -198,6 +281,11 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         type: 'string',
         default: DEFAULT_PATCH_MANIFEST_PATH,
       })
+      .option('offline', {
+        describe: 'Do not download missing blobs, fail if any are missing',
+        type: 'boolean',
+        default: false,
+      })
       .example('$0 rollback', 'Rollback all patches')
       .example(
         '$0 rollback pkg:npm/lodash@4.17.21',
@@ -231,6 +319,7 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         argv.identifier,
         argv['dry-run'],
         argv.silent,
+        argv.offline,
       )
 
       // Print results if not silent

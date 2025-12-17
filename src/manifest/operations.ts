@@ -3,7 +3,7 @@ import type { PatchManifest, PatchRecord } from '../schema/manifest-schema.js'
 import { PatchManifestSchema } from '../schema/manifest-schema.js'
 
 /**
- * Get all blob hashes referenced by a manifest
+ * Get all blob hashes referenced by a manifest (both beforeHash and afterHash)
  * Used for garbage collection and validation
  */
 export function getReferencedBlobs(manifest: PatchManifest): Set<string> {
@@ -14,6 +14,41 @@ export function getReferencedBlobs(manifest: PatchManifest): Set<string> {
     for (const fileInfo of Object.values(record.files)) {
       blobs.add(fileInfo.beforeHash)
       blobs.add(fileInfo.afterHash)
+    }
+  }
+
+  return blobs
+}
+
+/**
+ * Get only afterHash blobs referenced by a manifest
+ * Used for apply operations - we only need the patched file content, not the original
+ * This saves disk space since beforeHash blobs are not needed for applying patches
+ */
+export function getAfterHashBlobs(manifest: PatchManifest): Set<string> {
+  const blobs = new Set<string>()
+
+  for (const patchRecord of Object.values(manifest.patches)) {
+    const record = patchRecord as PatchRecord
+    for (const fileInfo of Object.values(record.files)) {
+      blobs.add(fileInfo.afterHash)
+    }
+  }
+
+  return blobs
+}
+
+/**
+ * Get only beforeHash blobs referenced by a manifest
+ * Used for rollback operations - we need the original file content to restore
+ */
+export function getBeforeHashBlobs(manifest: PatchManifest): Set<string> {
+  const blobs = new Set<string>()
+
+  for (const patchRecord of Object.values(manifest.patches)) {
+    const record = patchRecord as PatchRecord
+    for (const fileInfo of Object.values(record.files)) {
+      blobs.add(fileInfo.beforeHash)
     }
   }
 

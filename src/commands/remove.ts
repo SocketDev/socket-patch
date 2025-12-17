@@ -125,6 +125,7 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
             argv.identifier,
             false, // not dry run
             false, // not silent
+            false, // not offline
           )
 
         if (!rollbackSuccess) {

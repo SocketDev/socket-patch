@@ -7,7 +7,7 @@ import { downloadCommand } from './commands/download.js'
 import { listCommand } from './commands/list.js'
 import { removeCommand } from './commands/remove.js'
 import { rollbackCommand } from './commands/rollback.js'
-import { gcCommand } from './commands/gc.js'
+import { repairCommand } from './commands/repair.js'
 import { setupCommand } from './commands/setup.js'
 
 async function main(): Promise<void> {
@@ -20,7 +20,7 @@ async function main(): Promise<void> {
     .command(downloadCommand)
     .command(listCommand)
     .command(removeCommand)
-    .command(gcCommand)
+    .command(repairCommand)
     .demandCommand(1, 'You must specify a command')
     .help()
     .alias('h', 'help')

@@ -216,6 +216,69 @@ export class APIClient {
     return result ?? { patches: [], canAccessPaidPatches: false }
   }
 
+  /**
+   * Fetch a blob by its SHA256 hash.
+   * Returns the raw binary content as a Buffer, or null if not found.
+   *
+   * @param hash - SHA256 hash (64 hex characters)
+   * @returns Buffer containing blob data, or null if not found
+   */
+  async fetchBlob(hash: string): Promise<Buffer | null> {
+    // Validate hash format (SHA256 = 64 hex chars)
+    if (!/^[a-f0-9]{64}$/i.test(hash)) {
+      throw new Error(`Invalid hash format: ${hash}. Expected SHA256 hash (64 hex characters).`)
+    }
+
+    // Always use public proxy for blob downloads (no auth required)
+    const proxyUrl = process.env.SOCKET_PATCH_PROXY_URL || DEFAULT_PATCH_API_PROXY_URL
+    const url = `${proxyUrl}/patch/blob/${hash}`
+
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url)
+      const isHttps = urlObj.protocol === 'https:'
+      const httpModule = isHttps ? https : http
+
+      const headers: Record<string, string> = {
+        Accept: 'application/octet-stream',
+        'User-Agent': 'SocketPatchCLI/1.0',
+      }
+
+      const options: https.RequestOptions = {
+        method: 'GET',
+        headers,
+      }
+
+      const req = httpModule.request(urlObj, options, res => {
+        const chunks: Buffer[] = []
+
+        res.on('data', (chunk: Buffer) => {
+          chunks.push(chunk)
+        })
+
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolve(Buffer.concat(chunks))
+          } else if (res.statusCode === 404) {
+            resolve(null)
+          } else {
+            const errorBody = Buffer.concat(chunks).toString('utf-8')
+            reject(
+              new Error(
+                `Failed to fetch blob ${hash}: status ${res.statusCode} - ${errorBody}`,
+              ),
+            )
+          }
+        })
+      })
+
+      req.on('error', err => {
+        reject(new Error(`Network error fetching blob ${hash}: ${err.message}`))
+      })
+
+      req.end()
+    })
+  }
+
 }
 
 /**

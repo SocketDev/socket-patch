@@ -64,6 +64,7 @@ describe('remove command with rollback', () => {
       'pkg:npm/test-pkg@1.0.0',
       false,
       true,
+      false, // not offline
     )
 
     assert.equal(rollbackSuccess, true)
@@ -151,6 +152,7 @@ describe('remove command with rollback', () => {
       'pkg:npm/test-pkg@1.0.0',
       false,
       true,
+      false, // not offline
     )
 
     // Rollback should fail due to hash mismatch
@@ -192,6 +194,7 @@ describe('remove command with rollback', () => {
       TEST_UUID_SPECIFIC,
       false,
       true,
+      false, // not offline
     )
 
     assert.equal(success, true)
@@ -240,6 +243,7 @@ describe('remove command with rollback', () => {
       'pkg:npm/pkg-a@1.0.0',
       false,
       true,
+      false, // not offline
     )
 
     assert.equal(success, true)
