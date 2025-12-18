@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as readline from 'readline'
+import * as os from 'os'
 import type { CommandModule } from 'yargs'
 import { PatchManifestSchema } from '../schema/manifest-schema.js'
 import {
@@ -19,6 +20,18 @@ import {
   type EnumeratedPackage,
 } from '../utils/enumerate-packages.js'
 import { fuzzyMatchPackages, isPurl } from '../utils/fuzzy-match.js'
+import { getGlobalPrefix } from '../utils/global-packages.js'
+import {
+  findNodeModules,
+  findPackagesForPatches,
+  applyPackagePatch,
+} from '../patch/apply.js'
+import { rollbackPackagePatch } from '../patch/rollback.js'
+import {
+  getMissingBlobs,
+  fetchMissingBlobs,
+  formatFetchResult,
+} from '../utils/blob-fetcher.js'
 
 /**
  * Represents a package that has available patches with CVE information
@@ -62,10 +75,9 @@ function parsePurl(purl: string): { packageDir: string; version: string } | null
  * NOT O(m) where m = total packages in node_modules.
  */
 async function findInstalledPurls(
-  cwd: string,
+  nodeModulesPath: string,
   purls: string[],
 ): Promise<Set<string>> {
-  const nodeModulesPath = path.join(cwd, 'node_modules')
   const installedPurls = new Set<string>()
 
   // Group PURLs by package directory to handle multiple versions of same package
@@ -187,7 +199,7 @@ async function findPackagesWithPatches(
   return packagesWithPatches
 }
 
-interface DownloadArgs {
+interface GetArgs {
   identifier: string
   org?: string
   cwd: string
@@ -198,6 +210,10 @@ interface DownloadArgs {
   yes?: boolean
   'api-url'?: string
   'api-token'?: string
+  'no-apply'?: boolean
+  global?: boolean
+  'global-prefix'?: string
+  'one-off'?: boolean
 }
 
 /**
@@ -384,7 +400,286 @@ async function savePatch(
   return true
 }
 
-async function downloadPatches(args: DownloadArgs): Promise<boolean> {
+/**
+ * Apply patches after downloading
+ */
+async function applyDownloadedPatches(
+  cwd: string,
+  manifestPath: string,
+  silent: boolean,
+  useGlobal: boolean,
+  globalPrefix?: string,
+): Promise<boolean> {
+  // Read and parse manifest
+  const manifestContent = await fs.readFile(manifestPath, 'utf-8')
+  const manifestData = JSON.parse(manifestContent)
+  const manifest = PatchManifestSchema.parse(manifestData)
+
+  // Find .socket directory (contains blobs)
+  const socketDir = path.dirname(manifestPath)
+  const blobsPath = path.join(socketDir, 'blobs')
+
+  // Ensure blobs directory exists
+  await fs.mkdir(blobsPath, { recursive: true })
+
+  // Check for and download missing blobs
+  const missingBlobs = await getMissingBlobs(manifest, blobsPath)
+  if (missingBlobs.size > 0) {
+    if (!silent) {
+      console.log(`Downloading ${missingBlobs.size} missing blob(s)...`)
+    }
+
+    const fetchResult = await fetchMissingBlobs(manifest, blobsPath, undefined, {
+      onProgress: silent
+        ? undefined
+        : (hash, index, total) => {
+            process.stdout.write(
+              `\r  Downloading ${index}/${total}: ${hash.slice(0, 12)}...`.padEnd(60),
+            )
+          },
+    })
+
+    if (!silent) {
+      // Clear progress line
+      process.stdout.write('\r' + ' '.repeat(60) + '\r')
+      console.log(formatFetchResult(fetchResult))
+    }
+
+    if (fetchResult.failed > 0) {
+      if (!silent) {
+        console.error('Some blobs could not be downloaded. Cannot apply patches.')
+      }
+      return false
+    }
+  }
+
+  // Find node_modules directories
+  let nodeModulesPaths: string[]
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
+      }
+      return false
+    }
+  } else {
+    nodeModulesPaths = await findNodeModules(cwd)
+  }
+
+  if (nodeModulesPaths.length === 0) {
+    if (!silent) {
+      console.error(useGlobal || globalPrefix ? 'No global npm packages found' : 'No node_modules directories found')
+    }
+    return false
+  }
+
+  // Find all packages that need patching
+  const allPackages = new Map<string, string>()
+  for (const nmPath of nodeModulesPaths) {
+    const packages = await findPackagesForPatches(nmPath, manifest)
+    for (const [purl, location] of packages) {
+      if (!allPackages.has(purl)) {
+        allPackages.set(purl, location.path)
+      }
+    }
+  }
+
+  if (allPackages.size === 0) {
+    if (!silent) {
+      console.log('No packages found that match available patches')
+    }
+    return true
+  }
+
+  // Apply patches to each package
+  let hasErrors = false
+  const patchedPackages: string[] = []
+  const alreadyPatched: string[] = []
+
+  for (const [purl, pkgPath] of allPackages) {
+    const patch = manifest.patches[purl]
+    if (!patch) continue
+
+    const result = await applyPackagePatch(
+      purl,
+      pkgPath,
+      patch.files,
+      blobsPath,
+      false,
+    )
+
+    if (!result.success) {
+      hasErrors = true
+      if (!silent) {
+        console.error(`Failed to patch ${purl}: ${result.error}`)
+      }
+    } else if (result.filesPatched.length > 0) {
+      patchedPackages.push(purl)
+    } else if (result.filesVerified.every(f => f.status === 'already-patched')) {
+      alreadyPatched.push(purl)
+    }
+  }
+
+  // Print results
+  if (!silent) {
+    if (patchedPackages.length > 0) {
+      console.log(`\nPatched packages:`)
+      for (const pkg of patchedPackages) {
+        console.log(`  ${pkg}`)
+      }
+    }
+    if (alreadyPatched.length > 0) {
+      console.log(`\nAlready patched:`)
+      for (const pkg of alreadyPatched) {
+        console.log(`  ${pkg}`)
+      }
+    }
+  }
+
+  return !hasErrors
+}
+
+/**
+ * Handle one-off patch application (no manifest storage)
+ */
+async function applyOneOffPatch(
+  patch: PatchResponse,
+  useGlobal: boolean,
+  cwd: string,
+  silent: boolean,
+  globalPrefix?: string,
+): Promise<{ success: boolean; rollback?: () => Promise<void> }> {
+  // Find the package location
+  let nodeModulesPath: string
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPath = getGlobalPrefix(globalPrefix)
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
+      }
+      return { success: false }
+    }
+  } else {
+    nodeModulesPath = path.join(cwd, 'node_modules')
+  }
+
+  // Parse PURL to get package directory
+  const parsed = parsePurl(patch.purl)
+  if (!parsed) {
+    if (!silent) {
+      console.error(`Invalid PURL format: ${patch.purl}`)
+    }
+    return { success: false }
+  }
+
+  const pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+
+  // Verify package exists
+  try {
+    const pkgJsonPath = path.join(pkgPath, 'package.json')
+    const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
+    const pkgJson = JSON.parse(pkgJsonContent)
+    if (pkgJson.version !== parsed.version) {
+      if (!silent) {
+        console.error(`Version mismatch: installed ${pkgJson.version}, patch is for ${parsed.version}`)
+      }
+      return { success: false }
+    }
+  } catch {
+    if (!silent) {
+      console.error(`Package not found: ${parsed.packageDir}`)
+    }
+    return { success: false }
+  }
+
+  // Create temporary directory for blobs
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'socket-patch-'))
+  const tempBlobsDir = path.join(tempDir, 'blobs')
+  await fs.mkdir(tempBlobsDir, { recursive: true })
+
+  // Store beforeHash blobs in temp directory for rollback
+  const beforeBlobs = new Map<string, Buffer>()
+  for (const [, fileInfo] of Object.entries(patch.files)) {
+    if (fileInfo.beforeBlobContent && fileInfo.beforeHash) {
+      const blobBuffer = Buffer.from(fileInfo.beforeBlobContent, 'base64')
+      beforeBlobs.set(fileInfo.beforeHash, blobBuffer)
+      await fs.writeFile(path.join(tempBlobsDir, fileInfo.beforeHash), blobBuffer)
+    }
+    if (fileInfo.blobContent && fileInfo.afterHash) {
+      const blobBuffer = Buffer.from(fileInfo.blobContent, 'base64')
+      await fs.writeFile(path.join(tempBlobsDir, fileInfo.afterHash), blobBuffer)
+    }
+  }
+
+  // Build files record for applyPackagePatch
+  const files: Record<string, { beforeHash: string; afterHash: string }> = {}
+  for (const [filePath, fileInfo] of Object.entries(patch.files)) {
+    if (fileInfo.beforeHash && fileInfo.afterHash) {
+      files[filePath] = {
+        beforeHash: fileInfo.beforeHash,
+        afterHash: fileInfo.afterHash,
+      }
+    }
+  }
+
+  // Apply the patch
+  const result = await applyPackagePatch(
+    patch.purl,
+    pkgPath,
+    files,
+    tempBlobsDir,
+    false,
+  )
+
+  if (!result.success) {
+    if (!silent) {
+      console.error(`Failed to patch ${patch.purl}: ${result.error}`)
+    }
+    // Clean up temp directory
+    await fs.rm(tempDir, { recursive: true, force: true })
+    return { success: false }
+  }
+
+  if (!silent) {
+    if (result.filesPatched.length > 0) {
+      console.log(`\nPatched ${patch.purl}`)
+    } else if (result.filesVerified.every(f => f.status === 'already-patched')) {
+      console.log(`\n${patch.purl} is already patched`)
+    }
+  }
+
+  // Return rollback function
+  const rollback = async () => {
+    if (!silent) {
+      console.log(`Rolling back ${patch.purl}...`)
+    }
+    const rollbackResult = await rollbackPackagePatch(
+      patch.purl,
+      pkgPath,
+      files,
+      tempBlobsDir,
+      false,
+    )
+    if (rollbackResult.success) {
+      if (!silent) {
+        console.log(`Rolled back ${patch.purl}`)
+      }
+    } else {
+      if (!silent) {
+        console.error(`Failed to rollback: ${rollbackResult.error}`)
+      }
+    }
+    // Clean up temp directory
+    await fs.rm(tempDir, { recursive: true, force: true })
+  }
+
+  return { success: true, rollback }
+}
+
+async function getPatches(args: GetArgs): Promise<boolean> {
   const {
     identifier,
     org: orgSlug,
@@ -396,6 +691,10 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     yes: skipConfirmation,
     'api-url': apiUrl,
     'api-token': apiToken,
+    'no-apply': noApply,
+    global: useGlobal,
+    'global-prefix': globalPrefix,
+    'one-off': oneOff,
   } = args
 
   // Override environment variables if CLI options are provided
@@ -418,6 +717,21 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
 
   // The org slug to use (null when using public proxy)
   const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
+
+  // Determine node_modules path for package lookups
+  let nodeModulesPath: string
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPath = getGlobalPrefix(globalPrefix)
+      console.log(`Using global npm packages at: ${nodeModulesPath}`)
+    } catch (error) {
+      throw new Error(
+        `Failed to find global npm packages: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  } else {
+    nodeModulesPath = path.join(cwd, 'node_modules')
+  }
 
   // Determine identifier type
   let idType: IdentifierType
@@ -451,6 +765,16 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
       return true
     }
 
+    // Handle one-off mode
+    if (oneOff) {
+      const { success, rollback } = await applyOneOffPatch(patch, useGlobal ?? false, cwd, false, globalPrefix)
+      if (success && rollback) {
+        console.log('\nPatch applied (one-off mode). The patch will persist until you reinstall the package.')
+        console.log('To rollback, use: socket-patch rollback --one-off ' + identifier + (useGlobal ? ' --global' : ''))
+      }
+      return success
+    }
+
     // Prepare .socket directory
     const socketDir = path.join(cwd, '.socket')
     const blobsDir = path.join(socketDir, 'blobs')
@@ -482,6 +806,15 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
       console.log(`  Skipped: 1 (already exists)`)
     }
 
+    // Auto-apply unless --no-apply is specified
+    if (!noApply) {
+      console.log('\nApplying patches...')
+      const applySuccess = await applyDownloadedPatches(cwd, manifestPath, false, useGlobal ?? false, globalPrefix)
+      if (!applySuccess) {
+        console.error('\nSome patches could not be applied.')
+      }
+    }
+
     return true
   }
 
@@ -506,21 +839,26 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     }
     case 'package': {
       // Enumerate packages from node_modules and fuzzy match
-      console.log(`Enumerating packages in ${cwd}...`)
-      const packages = await enumerateNodeModules(cwd)
+      const enumPath = useGlobal ? nodeModulesPath : cwd
+      console.log(`Enumerating packages in ${enumPath}...`)
+      const packages = useGlobal
+        ? await enumerateNodeModules(path.dirname(nodeModulesPath))
+        : await enumerateNodeModules(cwd)
 
       if (packages.length === 0) {
-        console.log('No packages found in node_modules. Run npm/yarn/pnpm install first.')
+        console.log(useGlobal
+          ? 'No global packages found.'
+          : 'No packages found in node_modules. Run npm/yarn/pnpm install first.')
         return true
       }
 
-      console.log(`Found ${packages.length} packages in node_modules`)
+      console.log(`Found ${packages.length} packages`)
 
       // Fuzzy match against the identifier
       let matches = fuzzyMatchPackages(identifier, packages)
 
       if (matches.length === 0) {
-        console.log(`No packages matching "${identifier}" found in node_modules.`)
+        console.log(`No packages matching "${identifier}" found.`)
         return true
       }
 
@@ -632,7 +970,7 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
   if (idType === 'cve' || idType === 'ghsa') {
     console.log(`Checking which packages are installed...`)
     const searchPurls = searchResults.map(patch => patch.purl)
-    const installedPurls = await findInstalledPurls(cwd, searchPurls)
+    const installedPurls = await findInstalledPurls(nodeModulesPath, searchPurls)
 
     filteredResults = searchResults.filter(patch => installedPurls.has(patch.purl))
     notInstalledCount = searchResults.length - filteredResults.length
@@ -681,6 +1019,26 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
       console.log('Download cancelled.')
       return true
     }
+  }
+
+  // Handle one-off mode for search results
+  if (oneOff) {
+    // For one-off mode with multiple patches, apply the first one
+    const patchToApply = accessiblePatches[0]
+    console.log(`\nFetching and applying patch for ${patchToApply.purl}...`)
+
+    const fullPatch = await apiClient.fetchPatch(effectiveOrgSlug, patchToApply.uuid)
+    if (!fullPatch) {
+      console.error(`Could not fetch patch details for ${patchToApply.uuid}`)
+      return false
+    }
+
+    const { success, rollback } = await applyOneOffPatch(fullPatch, useGlobal ?? false, cwd, false, globalPrefix)
+    if (success && rollback) {
+      console.log('\nPatch applied (one-off mode). The patch will persist until you reinstall the package.')
+      console.log('To rollback, use: socket-patch rollback --one-off ' + patchToApply.uuid + (useGlobal ? ' --global' : ''))
+    }
+    return success
   }
 
   // Prepare .socket directory
@@ -745,12 +1103,22 @@ async function downloadPatches(args: DownloadArgs): Promise<boolean> {
     console.log(`\n${formatCleanupResult(cleanupResult, false)}`)
   }
 
+  // Auto-apply unless --no-apply is specified
+  if (!noApply && patchesAdded > 0) {
+    console.log('\nApplying patches...')
+    const applySuccess = await applyDownloadedPatches(cwd, manifestPath, false, useGlobal ?? false, globalPrefix)
+    if (!applySuccess) {
+      console.error('\nSome patches could not be applied.')
+    }
+  }
+
   return true
 }
 
-export const downloadCommand: CommandModule<{}, DownloadArgs> = {
-  command: 'download <identifier>',
-  describe: 'Download security patches from Socket API',
+export const getCommand: CommandModule<{}, GetArgs> = {
+  command: 'get <identifier>',
+  aliases: ['download'],
+  describe: 'Get security patches from Socket API and apply them',
   builder: yargs => {
     return yargs
       .positional('identifier', {
@@ -804,29 +1172,57 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
         describe: 'Socket API token (overrides SOCKET_API_TOKEN env var)',
         type: 'string',
       })
+      .option('no-apply', {
+        describe: 'Download patch without applying it',
+        type: 'boolean',
+        default: false,
+      })
+      .option('global', {
+        alias: 'g',
+        describe: 'Apply patch to globally installed npm packages',
+        type: 'boolean',
+        default: false,
+      })
+      .option('global-prefix', {
+        describe: 'Custom path to global node_modules (overrides auto-detection, useful for yarn/pnpm)',
+        type: 'string',
+      })
+      .option('one-off', {
+        describe: 'Apply patch immediately without saving to .socket folder (ephemeral)',
+        type: 'boolean',
+        default: false,
+      })
       .example(
-        '$0 download CVE-2021-44228',
-        'Download free patches for a CVE (no auth required)',
+        '$0 get CVE-2021-44228',
+        'Get and apply free patches for a CVE',
       )
       .example(
-        '$0 download GHSA-jfhm-5ghh-2f97',
-        'Download free patches for a GHSA (no auth required)',
+        '$0 get GHSA-jfhm-5ghh-2f97',
+        'Get and apply free patches for a GHSA',
       )
       .example(
-        '$0 download pkg:npm/lodash@4.17.21',
-        'Download patches for a specific package version by PURL',
+        '$0 get pkg:npm/lodash@4.17.21',
+        'Get and apply patches for a specific package version by PURL',
       )
       .example(
-        '$0 download lodash --package',
+        '$0 get lodash --package',
         'Search for patches by package name (fuzzy matches node_modules)',
       )
       .example(
-        '$0 download 12345678-1234-1234-1234-123456789abc --org myorg',
-        'Download a patch by UUID (requires SOCKET_API_TOKEN)',
+        '$0 get CVE-2021-44228 --no-apply',
+        'Download patches without applying them',
       )
       .example(
-        '$0 download CVE-2021-44228 --org myorg --yes',
-        'Download all matching patches without confirmation (with auth)',
+        '$0 get lodash --global',
+        'Get and apply patches to globally installed package',
+      )
+      .example(
+        '$0 get CVE-2021-44228 --one-off',
+        'Apply patch immediately without saving to .socket folder',
+      )
+      .example(
+        '$0 get lodash --global --one-off',
+        'Apply patch to global package without saving',
       )
       .check(argv => {
         // Ensure only one type flag is set
@@ -838,12 +1234,18 @@ export const downloadCommand: CommandModule<{}, DownloadArgs> = {
             'Only one of --id, --cve, --ghsa, or --package can be specified',
           )
         }
+        // --one-off implies apply, so --no-apply doesn't make sense
+        if (argv['one-off'] && argv['no-apply']) {
+          throw new Error(
+            '--one-off and --no-apply cannot be used together',
+          )
+        }
         return true
       })
   },
   handler: async argv => {
     try {
-      const success = await downloadPatches(argv)
+      const success = await getPatches(argv)
       process.exit(success ? 0 : 1)
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err)

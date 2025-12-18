@@ -17,6 +17,8 @@ interface RemoveArgs {
   cwd: string
   'manifest-path': string
   'skip-rollback': boolean
+  global: boolean
+  'global-prefix'?: string
 }
 
 async function removePatch(
@@ -88,6 +90,16 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         type: 'boolean',
         default: false,
       })
+      .option('global', {
+        alias: 'g',
+        describe: 'Remove patches from globally installed npm packages',
+        type: 'boolean',
+        default: false,
+      })
+      .option('global-prefix', {
+        describe: 'Custom path to global node_modules (overrides auto-detection, useful for yarn/pnpm)',
+        type: 'string',
+      })
       .example(
         '$0 remove pkg:npm/lodash@4.17.21',
         'Rollback and remove a patch by PURL',
@@ -99,6 +111,10 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
       .example(
         '$0 remove pkg:npm/lodash@4.17.21 --skip-rollback',
         'Remove from manifest without rolling back files',
+      )
+      .example(
+        '$0 remove pkg:npm/lodash@4.17.21 --global',
+        'Remove and rollback from global npm packages',
       )
   },
   handler: async argv => {
@@ -126,6 +142,8 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
             false, // not dry run
             false, // not silent
             false, // not offline
+            argv.global,
+            argv['global-prefix'],
           )
 
         if (!rollbackSuccess) {
