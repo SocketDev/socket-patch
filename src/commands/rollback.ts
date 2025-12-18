@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as os from 'os'
 import type { CommandModule } from 'yargs'
 import {
   PatchManifestSchema,
@@ -17,6 +18,8 @@ import {
   fetchBlobsByHash,
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
+import { getGlobalPrefix } from '../utils/global-packages.js'
+import { getAPIClientFromEnv } from '../utils/api-client.js'
 
 interface RollbackArgs {
   identifier?: string
@@ -25,6 +28,12 @@ interface RollbackArgs {
   silent: boolean
   'manifest-path': string
   offline: boolean
+  global: boolean
+  'global-prefix'?: string
+  'one-off': boolean
+  org?: string
+  'api-url'?: string
+  'api-token'?: string
 }
 
 interface PatchToRollback {
@@ -114,6 +123,8 @@ async function rollbackPatches(
   dryRun: boolean,
   silent: boolean,
   offline: boolean,
+  useGlobal: boolean,
+  globalPrefix?: string,
 ): Promise<{ success: boolean; results: RollbackResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -192,12 +203,27 @@ async function rollbackPatches(
     }
   }
 
-  // Find all node_modules directories
-  const nodeModulesPaths = await findNodeModules(cwd)
+  // Find node_modules directories
+  let nodeModulesPaths: string[]
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
+      if (!silent) {
+        console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
+      }
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
+      }
+      return { success: false, results: [] }
+    }
+  } else {
+    nodeModulesPaths = await findNodeModules(cwd)
+  }
 
   if (nodeModulesPaths.length === 0) {
     if (!silent) {
-      console.error('No node_modules directories found')
+      console.error(useGlobal || globalPrefix ? 'No global npm packages found' : 'No node_modules directories found')
     }
     return { success: false, results: [] }
   }
@@ -287,6 +313,33 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         type: 'boolean',
         default: false,
       })
+      .option('global', {
+        alias: 'g',
+        describe: 'Rollback patches from globally installed npm packages',
+        type: 'boolean',
+        default: false,
+      })
+      .option('global-prefix', {
+        describe: 'Custom path to global node_modules (overrides auto-detection, useful for yarn/pnpm)',
+        type: 'string',
+      })
+      .option('one-off', {
+        describe: 'Rollback a patch by fetching beforeHash blobs from API (no manifest required)',
+        type: 'boolean',
+        default: false,
+      })
+      .option('org', {
+        describe: 'Organization slug (required for --one-off when using SOCKET_API_TOKEN)',
+        type: 'string',
+      })
+      .option('api-url', {
+        describe: 'Socket API URL (overrides SOCKET_API_URL env var)',
+        type: 'string',
+      })
+      .option('api-token', {
+        describe: 'Socket API token (overrides SOCKET_API_TOKEN env var)',
+        type: 'string',
+      })
       .example('$0 rollback', 'Rollback all patches')
       .example(
         '$0 rollback pkg:npm/lodash@4.17.21',
@@ -297,9 +350,36 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         'Rollback a patch by UUID',
       )
       .example('$0 rollback --dry-run', 'Preview what would be rolled back')
+      .example('$0 rollback --global', 'Rollback patches from global npm packages')
+      .example(
+        '$0 rollback pkg:npm/lodash@4.17.21 --one-off --global',
+        'Rollback global package by fetching blobs from API',
+      )
+      .check(argv => {
+        if (argv['one-off'] && !argv.identifier) {
+          throw new Error('--one-off requires an identifier (UUID or PURL)')
+        }
+        return true
+      })
   },
   handler: async argv => {
     try {
+      // Handle one-off mode (no manifest required)
+      if (argv['one-off']) {
+        const success = await rollbackOneOff(
+          argv.identifier!,
+          argv.cwd,
+          argv.global,
+          argv['global-prefix'],
+          argv['dry-run'],
+          argv.silent,
+          argv.org,
+          argv['api-url'],
+          argv['api-token'],
+        )
+        process.exit(success ? 0 : 1)
+      }
+
       const manifestPath = path.isAbsolute(argv['manifest-path'])
         ? argv['manifest-path']
         : path.join(argv.cwd, argv['manifest-path'])
@@ -321,6 +401,8 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         argv['dry-run'],
         argv.silent,
         argv.offline,
+        argv.global,
+        argv['global-prefix'],
       )
 
       // Print results if not silent
@@ -371,6 +453,200 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
       process.exit(1)
     }
   },
+}
+
+/**
+ * Parse a PURL to extract the package directory path and version
+ */
+function parsePurl(purl: string): { packageDir: string; version: string } | null {
+  const match = purl.match(/^pkg:npm\/(.+)@([^@]+)$/)
+  if (!match) return null
+  return { packageDir: match[1], version: match[2] }
+}
+
+/**
+ * Rollback a patch without using the manifest (one-off mode)
+ * Downloads beforeHash blobs from API on demand
+ */
+async function rollbackOneOff(
+  identifier: string,
+  cwd: string,
+  useGlobal: boolean,
+  globalPrefix: string | undefined,
+  dryRun: boolean,
+  silent: boolean,
+  orgSlug: string | undefined,
+  apiUrl: string | undefined,
+  apiToken: string | undefined,
+): Promise<boolean> {
+  // Override environment variables if CLI options are provided
+  if (apiUrl) {
+    process.env.SOCKET_API_URL = apiUrl
+  }
+  if (apiToken) {
+    process.env.SOCKET_API_TOKEN = apiToken
+  }
+
+  // Get API client
+  const { client: apiClient, usePublicProxy } = getAPIClientFromEnv()
+
+  // Validate that org is provided when using authenticated API
+  if (!usePublicProxy && !orgSlug) {
+    throw new Error(
+      '--org is required when using SOCKET_API_TOKEN. Provide an organization slug.',
+    )
+  }
+
+  const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
+
+  if (!silent) {
+    console.log(`Fetching patch data for: ${identifier}`)
+  }
+
+  // Fetch the patch (can be UUID or PURL)
+  let patch
+  if (identifier.startsWith('pkg:')) {
+    // Search by PURL
+    const searchResponse = await apiClient.searchPatchesByPackage(effectiveOrgSlug, identifier)
+    if (searchResponse.patches.length === 0) {
+      throw new Error(`No patch found for PURL: ${identifier}`)
+    }
+    patch = await apiClient.fetchPatch(effectiveOrgSlug, searchResponse.patches[0].uuid)
+  } else {
+    // Assume UUID
+    patch = await apiClient.fetchPatch(effectiveOrgSlug, identifier)
+  }
+
+  if (!patch) {
+    throw new Error(`Could not fetch patch: ${identifier}`)
+  }
+
+  // Determine node_modules path
+  let nodeModulesPath: string
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPath = getGlobalPrefix(globalPrefix)
+      if (!silent) {
+        console.log(`Using global npm packages at: ${nodeModulesPath}`)
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to find global npm packages: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  } else {
+    nodeModulesPath = path.join(cwd, 'node_modules')
+  }
+
+  // Parse PURL to get package directory
+  const parsed = parsePurl(patch.purl)
+  if (!parsed) {
+    throw new Error(`Invalid PURL format: ${patch.purl}`)
+  }
+
+  const pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+
+  // Verify package exists
+  try {
+    const pkgJsonPath = path.join(pkgPath, 'package.json')
+    const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
+    const pkgJson = JSON.parse(pkgJsonContent)
+    if (pkgJson.version !== parsed.version) {
+      if (!silent) {
+        console.log(`Note: Installed version ${pkgJson.version} differs from patch version ${parsed.version}`)
+      }
+    }
+  } catch {
+    throw new Error(`Package not found: ${parsed.packageDir}`)
+  }
+
+  // Create temporary directory for blobs
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'socket-patch-'))
+  const tempBlobsDir = path.join(tempDir, 'blobs')
+  await fs.mkdir(tempBlobsDir, { recursive: true })
+
+  try {
+    // Download beforeHash blobs
+    const beforeHashes = new Set<string>()
+    for (const fileInfo of Object.values(patch.files)) {
+      if (fileInfo.beforeHash) {
+        beforeHashes.add(fileInfo.beforeHash)
+      }
+      // Also save beforeBlobContent if available
+      if (fileInfo.beforeBlobContent && fileInfo.beforeHash) {
+        const blobBuffer = Buffer.from(fileInfo.beforeBlobContent, 'base64')
+        await fs.writeFile(path.join(tempBlobsDir, fileInfo.beforeHash), blobBuffer)
+        beforeHashes.delete(fileInfo.beforeHash)
+      }
+    }
+
+    // Fetch any missing beforeHash blobs
+    if (beforeHashes.size > 0) {
+      if (!silent) {
+        console.log(`Downloading ${beforeHashes.size} blob(s) for rollback...`)
+      }
+      const fetchResult = await fetchBlobsByHash(beforeHashes, tempBlobsDir, undefined, {
+        onProgress: silent
+          ? undefined
+          : (hash, index, total) => {
+              process.stdout.write(
+                `\r  Downloading ${index}/${total}: ${hash.slice(0, 12)}...`.padEnd(60),
+              )
+            },
+      })
+      if (!silent) {
+        process.stdout.write('\r' + ' '.repeat(60) + '\r')
+        console.log(formatFetchResult(fetchResult))
+      }
+      if (fetchResult.failed > 0) {
+        throw new Error('Some blobs could not be downloaded. Cannot rollback.')
+      }
+    }
+
+    // Build files record
+    const files: Record<string, { beforeHash: string; afterHash: string }> = {}
+    for (const [filePath, fileInfo] of Object.entries(patch.files)) {
+      if (fileInfo.beforeHash && fileInfo.afterHash) {
+        files[filePath] = {
+          beforeHash: fileInfo.beforeHash,
+          afterHash: fileInfo.afterHash,
+        }
+      }
+    }
+
+    if (dryRun) {
+      if (!silent) {
+        console.log(`\nDry run: Would rollback ${patch.purl}`)
+        console.log(`  Files: ${Object.keys(files).length}`)
+      }
+      return true
+    }
+
+    // Perform rollback
+    const result = await rollbackPackagePatch(
+      patch.purl,
+      pkgPath,
+      files,
+      tempBlobsDir,
+      false,
+    )
+
+    if (result.success) {
+      if (!silent) {
+        if (result.filesRolledBack.length > 0) {
+          console.log(`\nRolled back ${patch.purl}`)
+        } else if (result.filesVerified.every(f => f.status === 'already-original')) {
+          console.log(`\n${patch.purl} is already in original state`)
+        }
+      }
+      return true
+    } else {
+      throw new Error(result.error || 'Unknown rollback error')
+    }
+  } finally {
+    // Clean up temp directory
+    await fs.rm(tempDir, { recursive: true, force: true })
+  }
 }
 
 // Export the rollback function for use by other commands (e.g., remove)

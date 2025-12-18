@@ -20,6 +20,7 @@ import {
   fetchMissingBlobs,
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
+import { getGlobalPrefix } from '../utils/global-packages.js'
 
 interface ApplyArgs {
   cwd: string
@@ -27,6 +28,8 @@ interface ApplyArgs {
   silent: boolean
   'manifest-path': string
   offline: boolean
+  global: boolean
+  'global-prefix'?: string
 }
 
 async function applyPatches(
@@ -35,6 +38,8 @@ async function applyPatches(
   dryRun: boolean,
   silent: boolean,
   offline: boolean,
+  useGlobal: boolean,
+  globalPrefix?: string,
 ): Promise<{ success: boolean; results: ApplyResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -89,12 +94,27 @@ async function applyPatches(
     }
   }
 
-  // Find all node_modules directories
-  const nodeModulesPaths = await findNodeModules(cwd)
+  // Find node_modules directories
+  let nodeModulesPaths: string[]
+  if (useGlobal || globalPrefix) {
+    try {
+      nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
+      if (!silent) {
+        console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
+      }
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
+      }
+      return { success: false, results: [] }
+    }
+  } else {
+    nodeModulesPaths = await findNodeModules(cwd)
+  }
 
   if (nodeModulesPaths.length === 0) {
     if (!silent) {
-      console.error('No node_modules directories found')
+      console.error(useGlobal || globalPrefix ? 'No global npm packages found' : 'No node_modules directories found')
     }
     return { success: false, results: [] }
   }
@@ -187,6 +207,20 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         type: 'boolean',
         default: false,
       })
+      .option('global', {
+        alias: 'g',
+        describe: 'Apply patches to globally installed npm packages',
+        type: 'boolean',
+        default: false,
+      })
+      .option('global-prefix', {
+        describe: 'Custom path to global node_modules (overrides auto-detection, useful for yarn/pnpm)',
+        type: 'string',
+      })
+      .example('$0 apply', 'Apply all patches to local packages')
+      .example('$0 apply --global', 'Apply patches to global npm packages')
+      .example('$0 apply --global-prefix /custom/path', 'Apply patches to custom global location')
+      .example('$0 apply --dry-run', 'Preview patches without applying')
   },
   handler: async argv => {
     try {
@@ -210,6 +244,8 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         argv['dry-run'],
         argv.silent,
         argv.offline,
+        argv.global,
+        argv['global-prefix'],
       )
 
       // Print results if not silent

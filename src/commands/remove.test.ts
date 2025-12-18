@@ -65,6 +65,8 @@ describe('remove command with rollback', () => {
       false,
       true,
       false, // not offline
+      false, // not global
+      undefined, // no global prefix
     )
 
     assert.equal(rollbackSuccess, true)
@@ -153,6 +155,8 @@ describe('remove command with rollback', () => {
       false,
       true,
       false, // not offline
+      false, // not global
+      undefined, // no global prefix
     )
 
     // Rollback should fail due to hash mismatch
@@ -195,6 +199,8 @@ describe('remove command with rollback', () => {
       false,
       true,
       false, // not offline
+      false, // not global
+      undefined, // no global prefix
     )
 
     assert.equal(success, true)
@@ -244,6 +250,8 @@ describe('remove command with rollback', () => {
       false,
       true,
       false, // not offline
+      false, // not global
+      undefined, // no global prefix
     )
 
     assert.equal(success, true)

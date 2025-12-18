@@ -3,7 +3,7 @@
 import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
 import { applyCommand } from './commands/apply.js'
-import { downloadCommand } from './commands/download.js'
+import { getCommand } from './commands/get.js'
 import { listCommand } from './commands/list.js'
 import { removeCommand } from './commands/remove.js'
 import { rollbackCommand } from './commands/rollback.js'
@@ -14,12 +14,12 @@ async function main(): Promise<void> {
   await yargs(hideBin(process.argv))
     .scriptName('socket-patch')
     .usage('$0 <command> [options]')
+    .command(getCommand)
     .command(applyCommand)
     .command(rollbackCommand)
-    .command(setupCommand)
-    .command(downloadCommand)
-    .command(listCommand)
     .command(removeCommand)
+    .command(listCommand)
+    .command(setupCommand)
     .command(repairCommand)
     .demandCommand(1, 'You must specify a command')
     .help()

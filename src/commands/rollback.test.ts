@@ -325,6 +325,8 @@ describe('rollback command', () => {
         false,
         true,
         false, // not offline
+        false, // not global
+        undefined, // no global prefix
       )
 
       assert.equal(success, true)
@@ -373,6 +375,8 @@ describe('rollback command', () => {
         false,
         true,
         false, // not offline
+        false, // not global
+        undefined, // no global prefix
       )
 
       assert.equal(success, true)
@@ -422,6 +426,8 @@ describe('rollback command', () => {
         false,
         true,
         false, // not offline
+        false, // not global
+        undefined, // no global prefix
       )
 
       assert.equal(success, true)
@@ -463,6 +469,8 @@ describe('rollback command', () => {
             false,
             true,
             false, // not offline
+            false, // not global
+            undefined, // no global prefix
           )
         },
         /No patch found matching identifier/,
@@ -496,6 +504,8 @@ describe('rollback command', () => {
             false,
             true,
             false, // not offline
+            false, // not global
+            undefined, // no global prefix
           )
         },
         /No patch found matching identifier/,
@@ -527,6 +537,8 @@ describe('rollback command', () => {
         false,
         true,
         false, // not offline
+        false, // not global
+        undefined, // no global prefix
       )
 
       assert.equal(success, true)
