@@ -1,9 +1,17 @@
 /**
- * Shared logic for detecting and generating postinstall scripts
- * Used by both CLI and GitHub bot
+ * Shared logic for detecting and generating postinstall scripts.
+ * Used by both CLI and GitHub bot.
  */
 
-const SOCKET_PATCH_COMMAND = 'npx @socketsecurity/socket-patch apply'
+// The command to run for applying patches via socket CLI.
+const SOCKET_PATCH_COMMAND = 'socket patch apply --silent'
+
+// Legacy command patterns to detect existing configurations.
+const LEGACY_PATCH_PATTERNS = [
+  'socket-patch apply',
+  'npx @socketsecurity/socket-patch apply',
+  'socket patch apply',
+]
 
 export interface PostinstallStatus {
   configured: boolean
@@ -34,11 +42,13 @@ export function isPostinstallConfigured(
   }
 
   const rawPostinstall = packageJson.scripts?.postinstall
-  // Handle non-string values (null, object, array) by treating as empty string
+  // Handle non-string values (null, object, array) by treating as empty string.
   const currentScript = typeof rawPostinstall === 'string' ? rawPostinstall : ''
 
-  // Check if socket-patch apply is already present
-  const configured = currentScript.includes('socket-patch apply')
+  // Check if any socket-patch apply variant is already present.
+  const configured = LEGACY_PATCH_PATTERNS.some(pattern =>
+    currentScript.includes(pattern),
+  )
 
   return {
     configured,
@@ -48,25 +58,28 @@ export function isPostinstallConfigured(
 }
 
 /**
- * Generate an updated postinstall script that includes socket-patch
+ * Generate an updated postinstall script that includes socket-patch.
  */
 export function generateUpdatedPostinstall(
   currentPostinstall: string,
 ): string {
   const trimmed = currentPostinstall.trim()
 
-  // If empty, just add the socket-patch command
+  // If empty, just add the socket-patch command.
   if (!trimmed) {
     return SOCKET_PATCH_COMMAND
   }
 
-  // If socket-patch is already present, return unchanged
-  if (trimmed.includes('socket-patch apply')) {
+  // If any socket-patch variant is already present, return unchanged.
+  const alreadyConfigured = LEGACY_PATCH_PATTERNS.some(pattern =>
+    trimmed.includes(pattern),
+  )
+  if (alreadyConfigured) {
     return trimmed
   }
 
-  // Prepend socket-patch command so it runs first, then existing script
-  // Using && ensures existing script only runs if patching succeeds
+  // Prepend socket-patch command so it runs first, then existing script.
+  // Using && ensures existing script only runs if patching succeeds.
   return `${SOCKET_PATCH_COMMAND} && ${trimmed}`
 }
 

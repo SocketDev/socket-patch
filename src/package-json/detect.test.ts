@@ -313,6 +313,40 @@ describe('isPostinstallConfigured', () => {
       assert.equal(result.configured, true)
       assert.equal(result.needsUpdate, false)
     })
+
+    it('should detect socket patch apply (Socket CLI subcommand) as configured', () => {
+      const packageJson = {
+        name: 'test',
+        version: '1.0.0',
+        scripts: {
+          postinstall: 'socket patch apply',
+        },
+      }
+
+      const result = isPostinstallConfigured(packageJson)
+
+      assert.equal(
+        result.configured,
+        true,
+        'socket patch apply (CLI subcommand) should be recognized',
+      )
+      assert.equal(result.needsUpdate, false)
+    })
+
+    it('should detect socket patch apply with --silent flag as configured', () => {
+      const packageJson = {
+        name: 'test',
+        version: '1.0.0',
+        scripts: {
+          postinstall: 'socket patch apply --silent',
+        },
+      }
+
+      const result = isPostinstallConfigured(packageJson)
+
+      assert.equal(result.configured, true)
+      assert.equal(result.needsUpdate, false)
+    })
   })
 
   describe('Edge Case 5: Invalid or malformed data', () => {
@@ -377,19 +411,19 @@ describe('isPostinstallConfigured', () => {
 describe('generateUpdatedPostinstall', () => {
   it('should create command for empty string', () => {
     const result = generateUpdatedPostinstall('')
-    assert.equal(result, 'npx @socketsecurity/socket-patch apply')
+    assert.equal(result, 'socket patch apply --silent')
   })
 
   it('should create command for whitespace-only string', () => {
     const result = generateUpdatedPostinstall('   \n\t  ')
-    assert.equal(result, 'npx @socketsecurity/socket-patch apply')
+    assert.equal(result, 'socket patch apply --silent')
   })
 
   it('should prepend to existing script', () => {
     const result = generateUpdatedPostinstall('echo "Hello"')
     assert.equal(
       result,
-      'npx @socketsecurity/socket-patch apply && echo "Hello"',
+      'socket patch apply --silent && echo "Hello"',
     )
   })
 
@@ -405,13 +439,25 @@ describe('generateUpdatedPostinstall', () => {
     assert.equal(result, existing)
   })
 
-  it('should prepend to script with socket apply (main CLI)', () => {
+  it('should preserve socket patch apply (CLI subcommand)', () => {
+    const existing = 'socket patch apply'
+    const result = generateUpdatedPostinstall(existing)
+    assert.equal(result, existing)
+  })
+
+  it('should preserve socket patch apply --silent', () => {
+    const existing = 'socket patch apply --silent'
+    const result = generateUpdatedPostinstall(existing)
+    assert.equal(result, existing)
+  })
+
+  it('should prepend to script with socket apply (non-patch command)', () => {
     const existing = 'socket apply'
     const result = generateUpdatedPostinstall(existing)
     assert.equal(
       result,
-      'npx @socketsecurity/socket-patch apply && socket apply',
-      'Should add socket-patch even if socket apply is present',
+      'socket patch apply --silent && socket apply',
+      'Should add socket patch apply even if socket apply is present',
     )
   })
 })
@@ -430,7 +476,7 @@ describe('updatePackageJsonContent', () => {
     assert.ok(updated.scripts)
     assert.equal(
       updated.scripts.postinstall,
-      'npx @socketsecurity/socket-patch apply',
+      'socket patch apply --silent',
     )
   })
 
@@ -450,7 +496,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'npx @socketsecurity/socket-patch apply',
+      'socket patch apply --silent',
     )
     assert.equal(updated.scripts.test, 'jest', 'Should preserve other scripts')
     assert.equal(updated.scripts.build, 'tsc', 'Should preserve other scripts')
@@ -471,16 +517,31 @@ describe('updatePackageJsonContent', () => {
     assert.equal(result.oldScript, 'echo "Setup complete"')
     assert.equal(
       result.newScript,
-      'npx @socketsecurity/socket-patch apply && echo "Setup complete"',
+      'socket patch apply --silent && echo "Setup complete"',
     )
   })
 
-  it('should not modify when already configured', () => {
+  it('should not modify when already configured with legacy format', () => {
     const content = JSON.stringify({
       name: 'test',
       version: '1.0.0',
       scripts: {
         postinstall: 'npx @socketsecurity/socket-patch apply',
+      },
+    })
+
+    const result = updatePackageJsonContent(content)
+
+    assert.equal(result.modified, false)
+    assert.equal(result.content, content)
+  })
+
+  it('should not modify when already configured with socket patch apply', () => {
+    const content = JSON.stringify({
+      name: 'test',
+      version: '1.0.0',
+      scripts: {
+        postinstall: 'socket patch apply --silent',
       },
     })
 
@@ -514,7 +575,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'npx @socketsecurity/socket-patch apply',
+      'socket patch apply --silent',
     )
   })
 
@@ -533,7 +594,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'npx @socketsecurity/socket-patch apply',
+      'socket patch apply --silent',
     )
   })
 

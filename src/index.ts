@@ -15,3 +15,7 @@ export * from './manifest/recovery.js'
 
 // Re-export constants
 export * from './constants.js'
+
+// Re-export programmatic API
+export { runPatch } from './run.js'
+export type { PatchOptions } from './run.js'
