@@ -228,14 +228,15 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         ? argv['manifest-path']
         : path.join(argv.cwd, argv['manifest-path'])
 
-      // Check if manifest exists
+      // Check if manifest exists - exit successfully if no .socket folder is set up
       try {
         await fs.access(manifestPath)
       } catch {
+        // No manifest means no patches to apply - this is a successful no-op
         if (!argv.silent) {
-          console.error(`Manifest not found at ${manifestPath}`)
+          console.log('No .socket folder found, skipping patch application.')
         }
-        process.exit(1)
+        process.exit(0)
       }
 
       const { success, results } = await applyPatches(
