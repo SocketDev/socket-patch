@@ -1,8 +1,41 @@
 import * as https from 'node:https'
 import * as http from 'node:http'
 
-// Default public patch API URL for free patches (no auth required)
+// Default public patch API URL for free patches (no auth required).
 const DEFAULT_PATCH_API_PROXY_URL = 'https://patches-api.socket.dev'
+
+/**
+ * Check if debug mode is enabled.
+ */
+function isDebugEnabled(): boolean {
+  return process.env.SOCKET_PATCH_DEBUG === '1' || process.env.SOCKET_PATCH_DEBUG === 'true'
+}
+
+/**
+ * Log debug messages when debug mode is enabled.
+ */
+function debugLog(message: string, ...args: unknown[]): void {
+  if (isDebugEnabled()) {
+    console.error(`[socket-patch debug] ${message}`, ...args)
+  }
+}
+
+/**
+ * Get the HTTP proxy URL from environment variables.
+ * Returns undefined if no proxy is configured.
+ *
+ * Note: Full HTTP proxy support requires manual configuration.
+ * Node.js native http/https modules don't support proxies natively.
+ * For proxy support, set NODE_EXTRA_CA_CERTS and configure your
+ * system/corporate proxy settings.
+ */
+function getHttpProxyUrl(): string | undefined {
+  return process.env.SOCKET_PATCH_HTTP_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy
+}
 
 // Full patch response with blob content (from view endpoint)
 export interface PatchResponse {
@@ -86,10 +119,17 @@ export class APIClient {
   }
 
   /**
-   * Make a GET request to the API
+   * Make a GET request to the API.
    */
   private async get<T>(path: string): Promise<T | null> {
     const url = `${this.apiUrl}${path}`
+    debugLog(`GET ${url}`)
+
+    // Log proxy warning if configured but not natively supported.
+    const proxyUrl = getHttpProxyUrl()
+    if (proxyUrl) {
+      debugLog(`HTTP proxy detected: ${proxyUrl} (Note: native http/https modules don't support proxies directly)`)
+    }
 
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url)
@@ -101,7 +141,7 @@ export class APIClient {
         'User-Agent': 'SocketPatchCLI/1.0',
       }
 
-      // Only add auth header if we have a token (not using public proxy)
+      // Only add auth header if we have a token (not using public proxy).
       if (this.apiToken) {
         headers['Authorization'] = `Bearer ${this.apiToken}`
       }
