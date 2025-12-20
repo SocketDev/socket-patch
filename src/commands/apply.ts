@@ -21,6 +21,10 @@ import {
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
 import { getGlobalPrefix } from '../utils/global-packages.js'
+import {
+  trackPatchApplied,
+  trackPatchApplyFailed,
+} from '../utils/telemetry.js'
 
 interface ApplyArgs {
   cwd: string
@@ -223,6 +227,10 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
       .example('$0 apply --dry-run', 'Preview patches without applying')
   },
   handler: async argv => {
+    // Get API credentials for authenticated telemetry (optional).
+    const apiToken = process.env['SOCKET_API_TOKEN']
+    const orgSlug = process.env['SOCKET_ORG_SLUG']
+
     try {
       const manifestPath = path.isAbsolute(argv['manifest-path'])
         ? argv['manifest-path']
@@ -276,8 +284,25 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         }
       }
 
+      // Track telemetry event.
+      const patchedCount = results.filter(r => r.success && r.filesPatched.length > 0).length
+      if (success) {
+        await trackPatchApplied(patchedCount, argv['dry-run'], apiToken, orgSlug)
+      } else {
+        await trackPatchApplyFailed(
+          new Error('One or more patches failed to apply'),
+          argv['dry-run'],
+          apiToken,
+          orgSlug,
+        )
+      }
+
       process.exit(success ? 0 : 1)
     } catch (err) {
+      // Track telemetry for unexpected errors.
+      const error = err instanceof Error ? err : new Error(String(err))
+      await trackPatchApplyFailed(error, argv['dry-run'], apiToken, orgSlug)
+
       if (!argv.silent) {
         const errorMessage = err instanceof Error ? err.message : String(err)
         console.error(`Error: ${errorMessage}`)
