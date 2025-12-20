@@ -20,6 +20,10 @@ import {
 } from '../utils/blob-fetcher.js'
 import { getGlobalPrefix } from '../utils/global-packages.js'
 import { getAPIClientFromEnv } from '../utils/api-client.js'
+import {
+  trackPatchRolledBack,
+  trackPatchRollbackFailed,
+} from '../utils/telemetry.js'
 
 interface RollbackArgs {
   identifier?: string
@@ -363,6 +367,10 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
       })
   },
   handler: async argv => {
+    // Get API credentials for authenticated telemetry (optional).
+    const apiToken = argv['api-token'] || process.env['SOCKET_API_TOKEN']
+    const orgSlug = argv.org || process.env['SOCKET_ORG_SLUG']
+
     try {
       // Handle one-off mode (no manifest required)
       if (argv['one-off']) {
@@ -377,6 +385,18 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
           argv['api-url'],
           argv['api-token'],
         )
+
+        // Track telemetry for one-off rollback.
+        if (success) {
+          await trackPatchRolledBack(1, apiToken, orgSlug)
+        } else {
+          await trackPatchRollbackFailed(
+            new Error('One-off rollback failed'),
+            apiToken,
+            orgSlug,
+          )
+        }
+
         process.exit(success ? 0 : 1)
       }
 
@@ -444,8 +464,24 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         }
       }
 
+      // Track telemetry event.
+      const rolledBackCount = results.filter(r => r.success && r.filesRolledBack.length > 0).length
+      if (success) {
+        await trackPatchRolledBack(rolledBackCount, apiToken, orgSlug)
+      } else {
+        await trackPatchRollbackFailed(
+          new Error('One or more rollbacks failed'),
+          apiToken,
+          orgSlug,
+        )
+      }
+
       process.exit(success ? 0 : 1)
     } catch (err) {
+      // Track telemetry for unexpected errors.
+      const error = err instanceof Error ? err : new Error(String(err))
+      await trackPatchRollbackFailed(error, apiToken, orgSlug)
+
       if (!argv.silent) {
         const errorMessage = err instanceof Error ? err.message : String(err)
         console.error(`Error: ${errorMessage}`)
