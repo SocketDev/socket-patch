@@ -11,6 +11,10 @@ import {
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
 import { rollbackPatches } from './rollback.js'
+import {
+  trackPatchRemoved,
+  trackPatchRemoveFailed,
+} from '../utils/telemetry.js'
 
 interface RemoveArgs {
   identifier: string
@@ -118,6 +122,10 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
       )
   },
   handler: async argv => {
+    // Get API credentials for authenticated telemetry (optional).
+    const apiToken = process.env['SOCKET_API_TOKEN']
+    const orgSlug = process.env['SOCKET_ORG_SLUG']
+
     try {
       const manifestPath = path.isAbsolute(argv['manifest-path'])
         ? argv['manifest-path']
@@ -147,6 +155,11 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
           )
 
         if (!rollbackSuccess) {
+          await trackPatchRemoveFailed(
+            new Error('Rollback failed during patch removal'),
+            apiToken,
+            orgSlug,
+          )
           console.error(
             '\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.',
           )
@@ -184,6 +197,11 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
       )
 
       if (notFound) {
+        await trackPatchRemoveFailed(
+          new Error(`No patch found matching identifier: ${argv.identifier}`),
+          apiToken,
+          orgSlug,
+        )
         console.error(`No patch found matching identifier: ${argv.identifier}`)
         process.exit(1)
       }
@@ -203,8 +221,15 @@ export const removeCommand: CommandModule<{}, RemoveArgs> = {
         console.log(`\n${formatCleanupResult(cleanupResult, false)}`)
       }
 
+      // Track successful removal.
+      await trackPatchRemoved(removed.length, apiToken, orgSlug)
+
       process.exit(0)
     } catch (err) {
+      // Track telemetry for unexpected errors.
+      const error = err instanceof Error ? err : new Error(String(err))
+      await trackPatchRemoveFailed(error, apiToken, orgSlug)
+
       const errorMessage = err instanceof Error ? err.message : String(err)
       console.error(`Error: ${errorMessage}`)
       process.exit(1)
