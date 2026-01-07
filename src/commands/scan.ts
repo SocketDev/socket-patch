@@ -35,6 +35,8 @@ interface ScanResult {
   scannedPackages: number
   packagesWithPatches: number
   totalPatches: number
+  freePatches: number
+  paidPatches: number
   canAccessPaidPatches: boolean
   packages: Array<{
     purl: string
@@ -83,19 +85,31 @@ function getSeverityOrder(severity: string | null): number {
  */
 function formatTableRow(
   purl: string,
-  patchCount: number,
+  freeCount: number,
+  paidCount: number,
   severity: string | null,
   cveIds: string[],
   ghsaIds: string[],
+  canAccessPaidPatches: boolean,
 ): string {
   // Truncate PURL if too long
-  const maxPurlLen = 45
+  const maxPurlLen = 40
   const displayPurl =
     purl.length > maxPurlLen ? purl.slice(0, maxPurlLen - 3) + '...' : purl
 
+  // Format patch counts
+  let countStr = String(freeCount)
+  if (paidCount > 0) {
+    if (canAccessPaidPatches) {
+      countStr += `+${paidCount}`
+    } else {
+      countStr += `\x1b[33m+${paidCount}\x1b[0m` // yellow for locked paid patches
+    }
+  }
+
   // Format vulnerability IDs
   const vulnIds = [...cveIds, ...ghsaIds]
-  const maxVulnLen = 35
+  const maxVulnLen = 30
   let vulnStr =
     vulnIds.length > 0
       ? vulnIds.slice(0, 2).join(', ')
@@ -107,7 +121,7 @@ function formatTableRow(
     vulnStr = vulnStr.slice(0, maxVulnLen - 3) + '...'
   }
 
-  return `${displayPurl.padEnd(maxPurlLen)}  ${String(patchCount).padStart(3)}  ${formatSeverity(severity).padEnd(16)}  ${vulnStr}`
+  return `${displayPurl.padEnd(maxPurlLen)}  ${countStr.padStart(8)}  ${formatSeverity(severity).padEnd(16)}  ${vulnStr}`
 }
 
 /**
@@ -190,6 +204,8 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
             scannedPackages: 0,
             packagesWithPatches: 0,
             totalPatches: 0,
+            freePatches: 0,
+            paidPatches: 0,
             canAccessPaidPatches: false,
             packages: [],
           } satisfies ScanResult,
@@ -235,15 +251,12 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
         canAccessPaidPatches = true
       }
 
+      // Include ALL patches (free and paid) - we'll show paid as upgrade options
       for (const pkg of response.packages) {
-        // Filter to only accessible patches
-        const accessiblePatches = pkg.patches.filter(
-          patch => patch.tier === 'free' || canAccessPaidPatches,
-        )
-        if (accessiblePatches.length > 0) {
+        if (pkg.patches.length > 0) {
           allPackagesWithPatches.push({
             purl: pkg.purl,
-            patches: accessiblePatches,
+            patches: pkg.patches,
           })
         }
       }
@@ -261,17 +274,27 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
     process.stdout.write('\r' + ' '.repeat(40) + '\r')
   }
 
-  // Calculate total patches
-  const totalPatches = allPackagesWithPatches.reduce(
-    (sum, pkg) => sum + pkg.patches.length,
-    0,
-  )
+  // Calculate patch counts by tier
+  let freePatches = 0
+  let paidPatches = 0
+  for (const pkg of allPackagesWithPatches) {
+    for (const patch of pkg.patches) {
+      if (patch.tier === 'free') {
+        freePatches++
+      } else {
+        paidPatches++
+      }
+    }
+  }
+  const totalPatches = freePatches + paidPatches
 
   // Prepare result
   const result: ScanResult = {
     scannedPackages: packageCount,
     packagesWithPatches: allPackagesWithPatches.length,
     totalPatches,
+    freePatches,
+    paidPatches,
     canAccessPaidPatches,
     packages: allPackagesWithPatches,
   }
@@ -284,9 +307,6 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
   // Console table output
   if (allPackagesWithPatches.length === 0) {
     console.log('\nNo patches available for installed packages.')
-    if (!canAccessPaidPatches) {
-      console.log('Note: Only free patches are shown. Set SOCKET_API_TOKEN for paid patch access.')
-    }
     return true
   }
 
@@ -303,7 +323,7 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
 
   // Print table header
   console.log('\n' + '='.repeat(100))
-  console.log('PACKAGE'.padEnd(45) + '  ' + 'CNT'.padStart(3) + '  ' + 'SEVERITY'.padEnd(16) + '  VULNERABILITIES')
+  console.log('PACKAGE'.padEnd(40) + '  ' + 'PATCHES'.padStart(8) + '  ' + 'SEVERITY'.padEnd(16) + '  VULNERABILITIES')
   console.log('='.repeat(100))
 
   // Print each package
@@ -317,6 +337,10 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
         : acc
     }, null)
 
+    // Count free vs paid patches for this package
+    const pkgFreeCount = pkg.patches.filter(p => p.tier === 'free').length
+    const pkgPaidCount = pkg.patches.filter(p => p.tier === 'paid').length
+
     // Collect all CVE/GHSA IDs
     const allCveIds = new Set<string>()
     const allGhsaIds = new Set<string>()
@@ -328,21 +352,35 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
     console.log(
       formatTableRow(
         pkg.purl,
-        pkg.patches.length,
+        pkgFreeCount,
+        pkgPaidCount,
         highestSeverity,
         Array.from(allCveIds),
         Array.from(allGhsaIds),
+        canAccessPaidPatches,
       ),
     )
   }
 
   console.log('='.repeat(100))
-  console.log(
-    `\nSummary: ${allPackagesWithPatches.length} package(s) with ${totalPatches} available patch(es)`,
-  )
 
-  if (!canAccessPaidPatches) {
-    console.log('Note: Only free patches are shown. Set SOCKET_API_TOKEN for paid patch access.')
+  // Summary with breakdown
+  if (canAccessPaidPatches) {
+    console.log(
+      `\nSummary: ${allPackagesWithPatches.length} package(s) with ${totalPatches} available patch(es)`,
+    )
+  } else {
+    console.log(
+      `\nSummary: ${allPackagesWithPatches.length} package(s) with ${freePatches} free patch(es)`,
+    )
+    if (paidPatches > 0) {
+      console.log(
+        `\x1b[33m         + ${paidPatches} additional patch(es) available with paid subscription\x1b[0m`,
+      )
+      console.log(
+        '\nUpgrade to Socket\'s paid plan to access all patches: https://socket.dev/pricing',
+      )
+    }
   }
 
   console.log('\nTo apply a patch, run:')
