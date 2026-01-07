@@ -144,20 +144,16 @@ async function findPackagesWithPatches(
 
       const { patches, canAccessPaidPatches } = searchResponse
 
-      // Filter to only accessible patches
-      const accessiblePatches = patches.filter(
-        patch => patch.tier === 'free' || canAccessPaidPatches,
-      )
-
-      if (accessiblePatches.length === 0) {
+      // Include all patches (free and paid) - we'll show upgrade CTA for paid patches
+      if (patches.length === 0) {
         continue
       }
 
-      // Extract CVE and GHSA IDs from patches
+      // Extract CVE and GHSA IDs from all patches
       const cveIds = new Set<string>()
       const ghsaIds = new Set<string>()
 
-      for (const patch of accessiblePatches) {
+      for (const patch of patches) {
         for (const [vulnId, vulnInfo] of Object.entries(patch.vulnerabilities)) {
           // Check if the vulnId itself is a GHSA
           if (GHSA_PATTERN.test(vulnId)) {
@@ -177,7 +173,7 @@ async function findPackagesWithPatches(
 
       packagesWithPatches.push({
         ...pkg,
-        patches: accessiblePatches,
+        patches,
         canAccessPaidPatches,
         cveIds: Array.from(cveIds).sort(),
         ghsaIds: Array.from(ghsaIds).sort(),
@@ -264,6 +260,10 @@ async function promptSelectPackageWithPatches(
       ? `${vulnIds.slice(0, 3).join(', ')} (+${vulnIds.length - 3} more)`
       : vulnIds.join(', ')
 
+    // Count free vs paid patches
+    const freePatches = pkg.patches.filter(p => p.tier === 'free').length
+    const paidPatches = pkg.patches.filter(p => p.tier === 'paid').length
+
     // Count patches and show severity info
     const severities = new Set<string>()
     for (const patch of pkg.patches) {
@@ -276,8 +276,18 @@ async function promptSelectPackageWithPatches(
       return order.indexOf(a.toLowerCase()) - order.indexOf(b.toLowerCase())
     })
 
+    // Build patch count string
+    let patchCountStr = String(freePatches)
+    if (paidPatches > 0) {
+      if (pkg.canAccessPaidPatches) {
+        patchCountStr += `+${paidPatches}`
+      } else {
+        patchCountStr += `+\x1b[33m${paidPatches} paid\x1b[0m`
+      }
+    }
+
     console.log(`  ${i + 1}. ${displayName}@${pkg.version}`)
-    console.log(`     Patches: ${pkg.patches.length} | Severity: ${severityList.join(', ')}`)
+    console.log(`     Patches: ${patchCountStr} | Severity: ${severityList.join(', ')}`)
     console.log(`     Fixes: ${vulnSummary}`)
   }
 
@@ -765,6 +775,18 @@ async function getPatches(args: GetArgs): Promise<boolean> {
       return true
     }
 
+    // Check if patch is paid and user doesn't have access
+    if (patch.tier === 'paid' && usePublicProxy) {
+      console.log(`\n\x1b[33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m`)
+      console.log(`\x1b[33m  This patch requires a paid subscription to download.\x1b[0m`)
+      console.log(`\x1b[33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m`)
+      console.log(`\n  Patch: ${patch.purl}`)
+      console.log(`  Tier:  \x1b[33mpaid\x1b[0m`)
+      console.log(`\n  Upgrade to Socket's paid plan to access this patch and many more:`)
+      console.log(`  \x1b[36mhttps://socket.dev/pricing\x1b[0m\n`)
+      return true
+    }
+
     // Handle one-off mode
     if (oneOff) {
       const { success, rollback } = await applyOneOffPatch(patch, useGlobal ?? false, cwd, false, globalPrefix)
@@ -998,16 +1020,19 @@ async function getPatches(args: GetArgs): Promise<boolean> {
     console.log(`Note: ${notInstalledCount} patch(es) for packages not installed in this project were hidden.`)
   }
 
-  if (inaccessibleCount > 0) {
+  if (inaccessibleCount > 0 && !canAccessPaidPatches) {
     console.log(
-      `Note: ${inaccessibleCount} patch(es) require paid access and will be skipped.`,
+      `\x1b[33mNote: ${inaccessibleCount} patch(es) require a paid subscription and will be skipped.\x1b[0m`,
     )
   }
 
   if (accessiblePatches.length === 0) {
-    console.log(
-      'No accessible patches available. Upgrade to access paid patches.',
-    )
+    console.log(`\n\x1b[33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m`)
+    console.log(`\x1b[33m  All available patches require a paid subscription.\x1b[0m`)
+    console.log(`\x1b[33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m`)
+    console.log(`\n  Found ${inaccessibleCount} paid patch(es) that you cannot currently access.`)
+    console.log(`\n  Upgrade to Socket's paid plan to access these patches:`)
+    console.log(`  \x1b[36mhttps://socket.dev/pricing\x1b[0m\n`)
     return true
   }
 
