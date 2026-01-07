@@ -5,11 +5,7 @@ import {
   PatchManifestSchema,
   DEFAULT_PATCH_MANIFEST_PATH,
 } from '../schema/manifest-schema.js'
-import {
-  findNodeModules,
-  findPackagesForPatches,
-  applyPackagePatch,
-} from '../patch/apply.js'
+import { applyPackagePatch } from '../patch/apply.js'
 import type { ApplyResult } from '../patch/apply.js'
 import {
   cleanupUnusedBlobs,
@@ -20,7 +16,7 @@ import {
   fetchMissingBlobs,
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
-import { getGlobalPrefix } from '../utils/global-packages.js'
+import { NpmCrawler } from '../crawlers/index.js'
 import {
   trackPatchApplied,
   trackPatchApplyFailed,
@@ -98,22 +94,23 @@ async function applyPatches(
     }
   }
 
-  // Find node_modules directories
+  // Find node_modules directories using the crawler
+  const crawler = new NpmCrawler()
   let nodeModulesPaths: string[]
-  if (useGlobal || globalPrefix) {
-    try {
-      nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
-      if (!silent) {
-        console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
-      }
-    } catch (error) {
-      if (!silent) {
-        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
-      }
-      return { success: false, results: [] }
+  try {
+    nodeModulesPaths = await crawler.getNodeModulesPaths({
+      cwd,
+      global: useGlobal,
+      globalPrefix,
+    })
+    if ((useGlobal || globalPrefix) && !silent && nodeModulesPaths.length > 0) {
+      console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
     }
-  } else {
-    nodeModulesPaths = await findNodeModules(cwd)
+  } catch (error) {
+    if (!silent) {
+      console.error('Failed to find npm packages:', error instanceof Error ? error.message : String(error))
+    }
+    return { success: false, results: [] }
   }
 
   if (nodeModulesPaths.length === 0) {
@@ -123,10 +120,11 @@ async function applyPatches(
     return { success: false, results: [] }
   }
 
-  // Find all packages that need patching
+  // Find all packages that need patching using the crawler
+  const manifestPurls = Object.keys(manifest.patches)
   const allPackages = new Map<string, string>()
   for (const nmPath of nodeModulesPaths) {
-    const packages = await findPackagesForPatches(nmPath, manifest)
+    const packages = await crawler.findByPurls(nmPath, manifestPurls)
     for (const [purl, location] of packages) {
       if (!allPackages.has(purl)) {
         allPackages.set(purl, location.path)
