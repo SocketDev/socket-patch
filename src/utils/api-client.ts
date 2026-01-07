@@ -20,6 +20,24 @@ function debugLog(message: string, ...args: unknown[]): void {
   }
 }
 
+// Severity order for sorting (most severe = lowest number)
+const SEVERITY_ORDER: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  unknown: 4,
+}
+
+/**
+ * Get numeric severity order for comparison.
+ * Lower numbers = higher severity.
+ */
+function getSeverityOrder(severity: string | null): number {
+  if (!severity) return 4
+  return SEVERITY_ORDER[severity.toLowerCase()] ?? 4
+}
+
 /**
  * Get the HTTP proxy URL from environment variables.
  * Returns undefined if no proxy is configured.
@@ -371,17 +389,126 @@ export class APIClient {
    * - Include version (required for batch lookups)
    *
    * Maximum 500 PURLs per request.
+   *
+   * When using the public proxy, this falls back to individual GET requests
+   * per package since the batch endpoint is not available on the public proxy
+   * (POST requests with varying bodies cannot be cached by Cloudflare CDN).
    */
   async searchPatchesBatch(
     orgSlug: string | null,
     purls: string[],
   ): Promise<BatchSearchResponse> {
-    // Public proxy uses /patch/* prefix for patch endpoints
-    const path = this.usePublicProxy
-      ? `/patch/batch`
-      : `/v0/orgs/${orgSlug}/patches/batch`
-    const result = await this.post<BatchSearchResponse>(path, { purls })
-    return result ?? { packages: [], canAccessPaidPatches: false }
+    // For authenticated API, use the batch endpoint
+    if (!this.usePublicProxy) {
+      const path = `/v0/orgs/${orgSlug}/patches/batch`
+      const result = await this.post<BatchSearchResponse>(path, { purls })
+      return result ?? { packages: [], canAccessPaidPatches: false }
+    }
+
+    // For public proxy, fall back to individual per-package GET requests
+    // These are cacheable by Cloudflare CDN
+    return this.searchPatchesBatchViaIndividualQueries(purls)
+  }
+
+  /**
+   * Internal method to search patches by making individual GET requests
+   * for each PURL. Used when the batch endpoint is not available.
+   *
+   * Runs requests in parallel with a concurrency limit to avoid overwhelming
+   * the server while still being efficient.
+   */
+  private async searchPatchesBatchViaIndividualQueries(
+    purls: string[],
+  ): Promise<BatchSearchResponse> {
+    const CONCURRENCY_LIMIT = 10
+    const packages: BatchPackagePatches[] = []
+    let canAccessPaidPatches = false
+
+    // Process PURLs in parallel with concurrency limit
+    const results: Array<{ purl: string; response: SearchResponse | null }> = []
+
+    for (let i = 0; i < purls.length; i += CONCURRENCY_LIMIT) {
+      const batch = purls.slice(i, i + CONCURRENCY_LIMIT)
+      const batchResults = await Promise.all(
+        batch.map(async purl => {
+          try {
+            const response = await this.searchPatchesByPackage(null, purl)
+            return { purl, response }
+          } catch (error) {
+            // Log error but continue with other packages
+            debugLog(`Error fetching patches for ${purl}:`, error)
+            return { purl, response: null }
+          }
+        }),
+      )
+      results.push(...batchResults)
+    }
+
+    // Convert individual responses to batch response format
+    for (const { purl, response } of results) {
+      if (!response || response.patches.length === 0) {
+        continue
+      }
+
+      // Track paid patch access
+      if (response.canAccessPaidPatches) {
+        canAccessPaidPatches = true
+      }
+
+      // Convert PatchSearchResult[] to BatchPatchInfo[]
+      const batchPatches: BatchPatchInfo[] = response.patches.map(patch => {
+        // Extract CVE and GHSA IDs from vulnerabilities
+        const cveIds: string[] = []
+        const ghsaIds: string[] = []
+        let highestSeverity: string | null = null
+        let title = ''
+
+        for (const [ghsaId, vuln] of Object.entries(patch.vulnerabilities)) {
+          // GHSA ID is the key
+          ghsaIds.push(ghsaId)
+          // CVE IDs are in the vuln object
+          for (const cve of vuln.cves) {
+            if (!cveIds.includes(cve)) {
+              cveIds.push(cve)
+            }
+          }
+          // Track highest severity
+          if (!highestSeverity || getSeverityOrder(vuln.severity) < getSeverityOrder(highestSeverity)) {
+            highestSeverity = vuln.severity || null
+          }
+          // Use first summary as title
+          if (!title && vuln.summary) {
+            title = vuln.summary.length > 100
+              ? vuln.summary.slice(0, 97) + '...'
+              : vuln.summary
+          }
+        }
+
+        // Use description as fallback title
+        if (!title && patch.description) {
+          title = patch.description.length > 100
+            ? patch.description.slice(0, 97) + '...'
+            : patch.description
+        }
+
+        return {
+          uuid: patch.uuid,
+          purl: patch.purl,
+          tier: patch.tier,
+          cveIds: cveIds.sort(),
+          ghsaIds: ghsaIds.sort(),
+          severity: highestSeverity,
+          title,
+        }
+      })
+
+      packages.push({
+        purl,
+        patches: batchPatches,
+      })
+    }
+
+    return { packages, canAccessPaidPatches }
   }
 
   /**
