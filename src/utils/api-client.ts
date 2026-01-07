@@ -401,7 +401,9 @@ export class APIClient {
     // For authenticated API, use the batch endpoint
     if (!this.usePublicProxy) {
       const path = `/v0/orgs/${orgSlug}/patches/batch`
-      const result = await this.post<BatchSearchResponse>(path, { purls })
+      // Use CDX-style components format
+      const components = purls.map(purl => ({ purl }))
+      const result = await this.post<BatchSearchResponse>(path, { components })
       return result ?? { packages: [], canAccessPaidPatches: false }
     }
 
