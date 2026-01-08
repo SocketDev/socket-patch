@@ -4,6 +4,7 @@ import {
   type BatchPackagePatches,
 } from '../utils/api-client.js'
 import { NpmCrawler } from '../crawlers/index.js'
+import { createSpinner } from '../utils/spinner.js'
 
 // Default batch size for API queries
 const DEFAULT_BATCH_SIZE = 100
@@ -160,20 +161,20 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
   // The org slug to use (null when using public proxy)
   const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
 
-  // Initialize crawler
+  // Initialize crawler and spinner
   const crawler = new NpmCrawler()
+  const spinner = createSpinner({ disabled: outputJson })
 
-  if (!outputJson) {
-    console.log(
-      useGlobal || globalPrefix
-        ? 'Scanning global npm packages...'
-        : 'Scanning npm packages...',
-    )
-  }
+  const scanTarget = useGlobal || globalPrefix
+    ? 'global npm packages'
+    : 'npm packages'
+
+  spinner.start(`Scanning ${scanTarget}...`)
 
   // Collect all packages using batching to be memory-efficient
   const allPurls: string[] = []
   let packageCount = 0
+  let lastPath = ''
 
   for await (const batch of crawler.crawlBatches({
     cwd,
@@ -184,19 +185,19 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
     for (const pkg of batch) {
       allPurls.push(pkg.purl)
       packageCount++
+      lastPath = pkg.path
     }
 
-    // Show progress for large codebases
-    if (!outputJson && packageCount % 500 === 0) {
-      process.stdout.write(`\r  Found ${packageCount} packages...`)
-    }
-  }
-
-  if (!outputJson && packageCount >= 500) {
-    process.stdout.write('\r' + ' '.repeat(40) + '\r')
+    // Update spinner with progress - show last package scanned and its relative path
+    // Compute relative path from cwd
+    const relativePath = lastPath.startsWith(cwd)
+      ? lastPath.slice(cwd.length + 1) // +1 to remove leading slash
+      : lastPath
+    spinner.update(`Scanning... ${packageCount} pkgs | ${relativePath}`)
   }
 
   if (packageCount === 0) {
+    spinner.stop()
     if (outputJson) {
       console.log(
         JSON.stringify(
@@ -223,25 +224,24 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
     return true
   }
 
-  if (!outputJson) {
-    console.log(`Found ${packageCount} packages. Checking for available patches...`)
-  }
+  spinner.succeed(`Found ${packageCount} packages`)
 
   // Query API in batches
   const allPackagesWithPatches: BatchPackagePatches[] = []
   let canAccessPaidPatches = false
   let batchIndex = 0
   const totalBatches = Math.ceil(allPurls.length / batchSize)
+  let totalPatchesFound = 0
+
+  spinner.start(`Querying API for patches... (batch 1/${totalBatches})`)
 
   for (let i = 0; i < allPurls.length; i += batchSize) {
     batchIndex++
     const batch = allPurls.slice(i, i + batchSize)
 
-    if (!outputJson && totalBatches > 1) {
-      process.stdout.write(
-        `\r  Querying batch ${batchIndex}/${totalBatches}...`.padEnd(40),
-      )
-    }
+    // Show progress with batch number and patches found so far
+    const patchInfo = totalPatchesFound > 0 ? `, ${totalPatchesFound} patches found` : ''
+    spinner.update(`Querying API for patches... (batch ${batchIndex}/${totalBatches}${patchInfo})`)
 
     try {
       const response = await apiClient.searchPatchesBatch(effectiveOrgSlug, batch)
@@ -258,20 +258,27 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
             purl: pkg.purl,
             patches: pkg.patches,
           })
+          totalPatchesFound += pkg.patches.length
         }
       }
     } catch (error) {
+      spinner.stop()
       if (!outputJson) {
         console.error(
-          `\nError querying batch ${batchIndex}: ${error instanceof Error ? error.message : String(error)}`,
+          `Error querying batch ${batchIndex}: ${error instanceof Error ? error.message : String(error)}`,
         )
       }
-      // Continue with other batches
+      // Restart spinner and continue with other batches
+      if (batchIndex < totalBatches) {
+        spinner.start(`Querying API for patches... (batch ${batchIndex + 1}/${totalBatches})`)
+      }
     }
   }
 
-  if (!outputJson && totalBatches > 1) {
-    process.stdout.write('\r' + ' '.repeat(40) + '\r')
+  if (totalPatchesFound > 0) {
+    spinner.succeed(`Found ${totalPatchesFound} patches for ${allPackagesWithPatches.length} packages`)
+  } else {
+    spinner.succeed('API query complete')
   }
 
   // Calculate patch counts by tier

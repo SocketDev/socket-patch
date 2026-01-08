@@ -113,56 +113,126 @@ export class NpmCrawler {
    */
   async getNodeModulesPaths(options: CrawlerOptions): Promise<string[]> {
     if (options.global || options.globalPrefix) {
-      // Global mode: return single global path
+      // Global mode: return well-known global paths
       if (options.globalPrefix) {
         return [options.globalPrefix]
       }
-      return [getNpmGlobalPrefix()]
+      return this.getGlobalNodeModulesPaths()
     }
 
-    // Local mode: find all node_modules directories recursively
-    return this.findNodeModulesDirs(options.cwd)
+    // Local mode: find node_modules in cwd and workspace directories
+    return this.findLocalNodeModulesDirs(options.cwd)
   }
 
   /**
-   * Find all node_modules directories recursively from a start path
+   * Get well-known global node_modules paths
+   * Only checks standard locations where global packages are installed
    */
-  private async findNodeModulesDirs(startPath: string): Promise<string[]> {
-    const results: string[] = []
+  private getGlobalNodeModulesPaths(): string[] {
+    const paths: string[] = []
 
-    const search = async (dir: string): Promise<void> => {
-      try {
-        const entries = await fs.readdir(dir, { withFileTypes: true })
-
-        for (const entry of entries) {
-          if (!entry.isDirectory()) continue
-
-          const fullPath = path.join(dir, entry.name)
-
-          if (entry.name === 'node_modules') {
-            results.push(fullPath)
-            // Don't recurse into nested node_modules
-            continue
-          }
-
-          // Skip hidden directories and common non-source directories
-          if (
-            entry.name.startsWith('.') ||
-            entry.name === 'dist' ||
-            entry.name === 'build'
-          ) {
-            continue
-          }
-
-          await search(fullPath)
-        }
-      } catch {
-        // Ignore permission errors
-      }
+    // Try npm global path
+    try {
+      paths.push(getNpmGlobalPrefix())
+    } catch {
+      // npm not available
     }
 
-    await search(startPath)
+    // Try pnpm global path
+    const pnpmPath = getPnpmGlobalPrefix()
+    if (pnpmPath) {
+      paths.push(pnpmPath)
+    }
+
+    // Try yarn global path
+    const yarnPath = getYarnGlobalPrefix()
+    if (yarnPath) {
+      paths.push(yarnPath)
+    }
+
+    return paths
+  }
+
+  /**
+   * Find node_modules directories within the project root.
+   * Recursively searches for workspace node_modules but stays within the project.
+   */
+  private async findLocalNodeModulesDirs(startPath: string): Promise<string[]> {
+    const results: string[] = []
+
+    // Check for node_modules directly in startPath
+    const directNodeModules = path.join(startPath, 'node_modules')
+    try {
+      const stat = await fs.stat(directNodeModules)
+      if (stat.isDirectory()) {
+        results.push(directNodeModules)
+      }
+    } catch {
+      // No direct node_modules
+    }
+
+    // Recursively search for workspace node_modules
+    await this.findWorkspaceNodeModules(startPath, startPath, results)
+
     return results
+  }
+
+  /**
+   * Recursively find node_modules in subdirectories (for monorepos/workspaces).
+   * Stays within the project by not crossing into other projects or system directories.
+   * Skips symlinks to avoid duplicates and potential infinite loops.
+   */
+  private async findWorkspaceNodeModules(
+    dir: string,
+    rootPath: string,
+    results: string[],
+  ): Promise<void> {
+    let entries
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+
+    for (const entry of entries) {
+      // Skip non-directories and symlinks (avoid duplicates and infinite loops)
+      if (!entry.isDirectory()) continue
+
+      const fullPath = path.join(dir, entry.name)
+
+      // Skip node_modules - we handle these separately when found
+      if (entry.name === 'node_modules') continue
+
+      // Skip hidden directories
+      if (entry.name.startsWith('.')) continue
+
+      // Skip common build/output directories that won't have workspace node_modules
+      if (
+        entry.name === 'dist' ||
+        entry.name === 'build' ||
+        entry.name === 'coverage' ||
+        entry.name === 'tmp' ||
+        entry.name === 'temp' ||
+        entry.name === '__pycache__' ||
+        entry.name === 'vendor'
+      ) {
+        continue
+      }
+
+      // Check if this subdirectory has its own node_modules
+      const subNodeModules = path.join(fullPath, 'node_modules')
+      try {
+        const stat = await fs.stat(subNodeModules)
+        if (stat.isDirectory()) {
+          results.push(subNodeModules)
+        }
+      } catch {
+        // No node_modules here
+      }
+
+      // Recurse into subdirectory
+      await this.findWorkspaceNodeModules(fullPath, rootPath, results)
+    }
   }
 
   /**
@@ -292,13 +362,10 @@ export class NpmCrawler {
           yield pkg
         }
 
-        // Check for nested node_modules
-        const nestedNodeModules = path.join(entryPath, 'node_modules')
-        try {
-          await fs.access(nestedNodeModules)
-          yield* this.scanNodeModules(nestedNodeModules, seen)
-        } catch {
-          // No nested node_modules
+        // Check for nested node_modules only for real directories (not symlinks)
+        // Symlinked packages (pnpm) have their deps managed separately
+        if (entry.isDirectory()) {
+          yield* this.scanNestedNodeModules(entryPath, seen)
         }
       }
     }
@@ -333,14 +400,49 @@ export class NpmCrawler {
         yield pkg
       }
 
-      // Check for nested node_modules
-      const nestedNodeModules = path.join(pkgPath, 'node_modules')
-      try {
-        await fs.access(nestedNodeModules)
-        yield* this.scanNodeModules(nestedNodeModules, seen)
-      } catch {
-        // No nested node_modules
+      // Check for nested node_modules only for real directories (not symlinks)
+      if (scopeEntry.isDirectory()) {
+        yield* this.scanNestedNodeModules(pkgPath, seen)
       }
+    }
+  }
+
+  /**
+   * Scan nested node_modules inside a package (if it exists)
+   */
+  private async *scanNestedNodeModules(
+    pkgPath: string,
+    seen: Set<string>,
+  ): AsyncGenerator<CrawledPackage, void, unknown> {
+    const nestedNodeModules = path.join(pkgPath, 'node_modules')
+    try {
+      // Try to read the directory - this checks existence and gets entries in one call
+      const entries = await fs.readdir(nestedNodeModules, { withFileTypes: true })
+      // If we got here, the directory exists and we have its entries
+      // Yield packages from this nested node_modules
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') {
+          continue
+        }
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+          continue
+        }
+
+        const entryPath = path.join(nestedNodeModules, entry.name)
+
+        if (entry.name.startsWith('@')) {
+          yield* this.scanScopedPackages(entryPath, entry.name, seen)
+        } else {
+          const pkg = await this.checkPackage(entryPath, seen)
+          if (pkg) {
+            yield pkg
+          }
+          // Recursively check for deeper nested node_modules
+          yield* this.scanNestedNodeModules(entryPath, seen)
+        }
+      }
+    } catch {
+      // No nested node_modules or can't read it - this is the common case
     }
   }
 
