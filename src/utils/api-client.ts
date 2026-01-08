@@ -20,6 +20,24 @@ function debugLog(message: string, ...args: unknown[]): void {
   }
 }
 
+// Severity order for sorting (most severe = lowest number)
+const SEVERITY_ORDER: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  unknown: 4,
+}
+
+/**
+ * Get numeric severity order for comparison.
+ * Lower numbers = higher severity.
+ */
+function getSeverityOrder(severity: string | null): number {
+  if (!severity) return 4
+  return SEVERITY_ORDER[severity.toLowerCase()] ?? 4
+}
+
 /**
  * Get the HTTP proxy URL from environment variables.
  * Returns undefined if no proxy is configured.
@@ -87,6 +105,27 @@ export interface PatchSearchResult {
 
 export interface SearchResponse {
   patches: PatchSearchResult[]
+  canAccessPaidPatches: boolean
+}
+
+// Minimal patch info from batch search
+export interface BatchPatchInfo {
+  uuid: string
+  purl: string
+  tier: 'free' | 'paid'
+  cveIds: string[]
+  ghsaIds: string[]
+  severity: string | null
+  title: string
+}
+
+export interface BatchPackagePatches {
+  purl: string
+  patches: BatchPatchInfo[]
+}
+
+export interface BatchSearchResponse {
+  packages: BatchPackagePatches[]
   canAccessPaidPatches: boolean
 }
 
@@ -196,6 +235,82 @@ export class APIClient {
   }
 
   /**
+   * Make a POST request to the API.
+   */
+  private async post<T>(path: string, body: unknown): Promise<T | null> {
+    const url = `${this.apiUrl}${path}`
+    debugLog(`POST ${url}`)
+
+    return new Promise((resolve, reject) => {
+      const urlObj = new URL(url)
+      const isHttps = urlObj.protocol === 'https:'
+      const httpModule = isHttps ? https : http
+
+      const jsonBody = JSON.stringify(body)
+
+      const headers: Record<string, string> = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(jsonBody).toString(),
+        'User-Agent': 'SocketPatchCLI/1.0',
+      }
+
+      // Only add auth header if we have a token (not using public proxy).
+      if (this.apiToken) {
+        headers['Authorization'] = `Bearer ${this.apiToken}`
+      }
+
+      const options: https.RequestOptions = {
+        method: 'POST',
+        headers,
+      }
+
+      const req = httpModule.request(urlObj, options, res => {
+        let data = ''
+
+        res.on('data', chunk => {
+          data += chunk
+        })
+
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            try {
+              const parsed = JSON.parse(data)
+              resolve(parsed)
+            } catch (err) {
+              reject(new Error(`Failed to parse response: ${err}`))
+            }
+          } else if (res.statusCode === 404) {
+            resolve(null)
+          } else if (res.statusCode === 401) {
+            reject(new Error('Unauthorized: Invalid API token'))
+          } else if (res.statusCode === 403) {
+            const msg = this.usePublicProxy
+              ? 'Forbidden: This resource is only available to paid subscribers.'
+              : 'Forbidden: Access denied.'
+            reject(new Error(msg))
+          } else if (res.statusCode === 429) {
+            reject(new Error('Rate limit exceeded. Please try again later.'))
+          } else {
+            reject(
+              new Error(
+                `API request failed with status ${res.statusCode}: ${data}`,
+              ),
+            )
+          }
+        })
+      })
+
+      req.on('error', err => {
+        reject(new Error(`Network error: ${err.message}`))
+      })
+
+      req.write(jsonBody)
+      req.end()
+    })
+  }
+
+  /**
    * Fetch a patch by UUID (full details with blob content)
    */
   async fetchPatch(
@@ -261,6 +376,141 @@ export class APIClient {
       : `/v0/orgs/${orgSlug}/patches/by-package/${encodeURIComponent(purl)}`
     const result = await this.get<SearchResponse>(path)
     return result ?? { patches: [], canAccessPaidPatches: false }
+  }
+
+  /**
+   * Search patches for multiple packages by PURL (batch)
+   * Returns minimal patch information for each package that has available patches.
+   *
+   * Each PURL must:
+   * - Start with "pkg:"
+   * - Include a valid ecosystem type (npm, pypi, maven, etc.)
+   * - Include package name
+   * - Include version (required for batch lookups)
+   *
+   * Maximum 500 PURLs per request.
+   *
+   * When using the public proxy, this falls back to individual GET requests
+   * per package since the batch endpoint is not available on the public proxy
+   * (POST requests with varying bodies cannot be cached by Cloudflare CDN).
+   */
+  async searchPatchesBatch(
+    orgSlug: string | null,
+    purls: string[],
+  ): Promise<BatchSearchResponse> {
+    // For authenticated API, use the batch endpoint
+    if (!this.usePublicProxy) {
+      const path = `/v0/orgs/${orgSlug}/patches/batch`
+      // Use CDX-style components format
+      const components = purls.map(purl => ({ purl }))
+      const result = await this.post<BatchSearchResponse>(path, { components })
+      return result ?? { packages: [], canAccessPaidPatches: false }
+    }
+
+    // For public proxy, fall back to individual per-package GET requests
+    // These are cacheable by Cloudflare CDN
+    return this.searchPatchesBatchViaIndividualQueries(purls)
+  }
+
+  /**
+   * Internal method to search patches by making individual GET requests
+   * for each PURL. Used when the batch endpoint is not available.
+   *
+   * Runs requests in parallel with a concurrency limit to avoid overwhelming
+   * the server while still being efficient.
+   */
+  private async searchPatchesBatchViaIndividualQueries(
+    purls: string[],
+  ): Promise<BatchSearchResponse> {
+    const CONCURRENCY_LIMIT = 10
+    const packages: BatchPackagePatches[] = []
+    let canAccessPaidPatches = false
+
+    // Process PURLs in parallel with concurrency limit
+    const results: Array<{ purl: string; response: SearchResponse | null }> = []
+
+    for (let i = 0; i < purls.length; i += CONCURRENCY_LIMIT) {
+      const batch = purls.slice(i, i + CONCURRENCY_LIMIT)
+      const batchResults = await Promise.all(
+        batch.map(async purl => {
+          try {
+            const response = await this.searchPatchesByPackage(null, purl)
+            return { purl, response }
+          } catch (error) {
+            // Log error but continue with other packages
+            debugLog(`Error fetching patches for ${purl}:`, error)
+            return { purl, response: null }
+          }
+        }),
+      )
+      results.push(...batchResults)
+    }
+
+    // Convert individual responses to batch response format
+    for (const { purl, response } of results) {
+      if (!response || response.patches.length === 0) {
+        continue
+      }
+
+      // Track paid patch access
+      if (response.canAccessPaidPatches) {
+        canAccessPaidPatches = true
+      }
+
+      // Convert PatchSearchResult[] to BatchPatchInfo[]
+      const batchPatches: BatchPatchInfo[] = response.patches.map(patch => {
+        // Extract CVE and GHSA IDs from vulnerabilities
+        const cveIds: string[] = []
+        const ghsaIds: string[] = []
+        let highestSeverity: string | null = null
+        let title = ''
+
+        for (const [ghsaId, vuln] of Object.entries(patch.vulnerabilities)) {
+          // GHSA ID is the key
+          ghsaIds.push(ghsaId)
+          // CVE IDs are in the vuln object
+          for (const cve of vuln.cves) {
+            if (!cveIds.includes(cve)) {
+              cveIds.push(cve)
+            }
+          }
+          // Track highest severity
+          if (!highestSeverity || getSeverityOrder(vuln.severity) < getSeverityOrder(highestSeverity)) {
+            highestSeverity = vuln.severity || null
+          }
+          // Use first summary as title
+          if (!title && vuln.summary) {
+            title = vuln.summary.length > 100
+              ? vuln.summary.slice(0, 97) + '...'
+              : vuln.summary
+          }
+        }
+
+        // Use description as fallback title
+        if (!title && patch.description) {
+          title = patch.description.length > 100
+            ? patch.description.slice(0, 97) + '...'
+            : patch.description
+        }
+
+        return {
+          uuid: patch.uuid,
+          purl: patch.purl,
+          tier: patch.tier,
+          cveIds: cveIds.sort(),
+          ghsaIds: ghsaIds.sort(),
+          severity: highestSeverity,
+          title,
+        }
+      })
+
+      packages.push({
+        purl,
+        patches: batchPatches,
+      })
+    }
+
+    return { packages, canAccessPaidPatches }
   }
 
   /**

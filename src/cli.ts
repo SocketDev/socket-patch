@@ -8,6 +8,7 @@ import { listCommand } from './commands/list.js'
 import { removeCommand } from './commands/remove.js'
 import { rollbackCommand } from './commands/rollback.js'
 import { repairCommand } from './commands/repair.js'
+import { scanCommand } from './commands/scan.js'
 import { setupCommand } from './commands/setup.js'
 
 async function main(): Promise<void> {
@@ -19,6 +20,7 @@ async function main(): Promise<void> {
     .command(rollbackCommand)
     .command(removeCommand)
     .command(listCommand)
+    .command(scanCommand)
     .command(setupCommand)
     .command(repairCommand)
     .demandCommand(1, 'You must specify a command')
