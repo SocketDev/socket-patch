@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "packageManager": "pnpm@10.16.1",
   "description": "CLI tool for applying security patches to dependencies",
   "main": "dist/index.js",
