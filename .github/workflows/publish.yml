@@ -3,6 +3,14 @@ name: 📦 Publish
 on:
   workflow_dispatch:
     inputs:
+      version-bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       dist-tag:
         description: 'npm dist-tag (latest, next, beta, canary, backport, etc.)'
         required: false
@@ -12,7 +20,7 @@ on:
         description: 'Enable debug output'
         required: false
         default: '0'
-        type: string
+        type: choice
         options:
           - '0'
           - '1'
@@ -22,7 +30,30 @@ permissions:
   id-token: write
 
 jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        run: npm version ${{ inputs.version-bump }} -m "v%s"
+
+      - name: Push changes
+        run: git push && git push --tags
+
   publish:
+    needs: bump-version
     uses: SocketDev/socket-registry/.github/workflows/provenance.yml@main
     with:
       debug: ${{ inputs.debug }}
