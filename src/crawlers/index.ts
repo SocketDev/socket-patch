@@ -4,4 +4,5 @@ export {
   getNpmGlobalPrefix,
   getYarnGlobalPrefix,
   getPnpmGlobalPrefix,
+  getBunGlobalPrefix,
 } from './npm-crawler.js'
