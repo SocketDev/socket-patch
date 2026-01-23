@@ -121,6 +121,26 @@ function getBunGlobalPrefix(): string | null {
 }
 
 /**
+ * Get the deno global npm cache path
+ */
+function getDenoGlobalPrefix(): string | null {
+  try {
+    const result = execSync('deno info --json', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const info = JSON.parse(result)
+    // Deno stores npm packages at: denoDir/npm/registry.npmjs.org/
+    if (info.denoDir) {
+      return path.join(info.denoDir, 'npm', 'registry.npmjs.org')
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * NPM ecosystem crawler for discovering packages in node_modules
  */
 export class NpmCrawler {
@@ -170,6 +190,12 @@ export class NpmCrawler {
     const bunPath = getBunGlobalPrefix()
     if (bunPath) {
       paths.push(bunPath)
+    }
+
+    // Try deno global path
+    const denoPath = getDenoGlobalPrefix()
+    if (denoPath) {
+      paths.push(denoPath)
     }
 
     return paths
@@ -525,4 +551,5 @@ export {
   getYarnGlobalPrefix,
   getPnpmGlobalPrefix,
   getBunGlobalPrefix,
+  getDenoGlobalPrefix,
 }

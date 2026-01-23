@@ -69,6 +69,27 @@ export function getBunGlobalPrefix(): string | null {
 }
 
 /**
+ * Get the deno global npm cache path
+ * @returns The path to deno's npm cache directory, or null if not available
+ */
+export function getDenoGlobalPrefix(): string | null {
+  try {
+    const result = execSync('deno info --json', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const info = JSON.parse(result)
+    // Deno stores npm packages at: denoDir/npm/registry.npmjs.org/
+    if (info.denoDir) {
+      return path.join(info.denoDir, 'npm', 'registry.npmjs.org')
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Get the global node_modules path, with support for custom override
  * @param customPrefix - Optional custom path to use instead of auto-detection
  * @returns The path to the global node_modules directory
@@ -112,6 +133,11 @@ export function getGlobalNodeModulesPaths(customPrefix?: string): string[] {
   const bunPath = getBunGlobalPrefix()
   if (bunPath) {
     paths.push(bunPath)
+  }
+
+  const denoPath = getDenoGlobalPrefix()
+  if (denoPath) {
+    paths.push(denoPath)
   }
 
   return paths
