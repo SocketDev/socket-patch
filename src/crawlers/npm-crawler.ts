@@ -105,6 +105,22 @@ function getPnpmGlobalPrefix(): string | null {
 }
 
 /**
+ * Get the bun global node_modules path
+ */
+function getBunGlobalPrefix(): string | null {
+  try {
+    const binPath = execSync('bun pm bin -g', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim()
+    const bunRoot = path.dirname(binPath)
+    return path.join(bunRoot, 'install', 'global', 'node_modules')
+  } catch {
+    return null
+  }
+}
+
+/**
  * NPM ecosystem crawler for discovering packages in node_modules
  */
 export class NpmCrawler {
@@ -148,6 +164,12 @@ export class NpmCrawler {
     const yarnPath = getYarnGlobalPrefix()
     if (yarnPath) {
       paths.push(yarnPath)
+    }
+
+    // Try bun global path
+    const bunPath = getBunGlobalPrefix()
+    if (bunPath) {
+      paths.push(bunPath)
     }
 
     return paths
@@ -498,4 +520,9 @@ export class NpmCrawler {
 }
 
 // Re-export global prefix functions for backward compatibility
-export { getNpmGlobalPrefix, getYarnGlobalPrefix, getPnpmGlobalPrefix }
+export {
+  getNpmGlobalPrefix,
+  getYarnGlobalPrefix,
+  getPnpmGlobalPrefix,
+  getBunGlobalPrefix,
+}

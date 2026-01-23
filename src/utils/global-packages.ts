@@ -52,6 +52,23 @@ export function getPnpmGlobalPrefix(): string | null {
 }
 
 /**
+ * Get the bun global node_modules path
+ * @returns The path to bun's global node_modules directory, or null if not available
+ */
+export function getBunGlobalPrefix(): string | null {
+  try {
+    const binPath = execSync('bun pm bin -g', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim()
+    const bunRoot = path.dirname(binPath)
+    return path.join(bunRoot, 'install', 'global', 'node_modules')
+  } catch {
+    return null
+  }
+}
+
+/**
  * Get the global node_modules path, with support for custom override
  * @param customPrefix - Optional custom path to use instead of auto-detection
  * @returns The path to the global node_modules directory
@@ -65,7 +82,7 @@ export function getGlobalPrefix(customPrefix?: string): string {
 
 /**
  * Get all global node_modules paths for package lookup
- * Currently returns npm global path, but could be extended for yarn global, etc.
+ * Returns paths from all detected package managers (npm, pnpm, yarn, bun)
  * @param customPrefix - Optional custom path to use instead of auto-detection
  * @returns Array of global node_modules paths
  */
@@ -73,7 +90,31 @@ export function getGlobalNodeModulesPaths(customPrefix?: string): string[] {
   if (customPrefix) {
     return [customPrefix]
   }
-  return [getNpmGlobalPrefix()]
+
+  const paths: string[] = []
+
+  try {
+    paths.push(getNpmGlobalPrefix())
+  } catch {
+    // npm not available
+  }
+
+  const pnpmPath = getPnpmGlobalPrefix()
+  if (pnpmPath) {
+    paths.push(pnpmPath)
+  }
+
+  const yarnPath = getYarnGlobalPrefix()
+  if (yarnPath) {
+    paths.push(yarnPath)
+  }
+
+  const bunPath = getBunGlobalPrefix()
+  if (bunPath) {
+    paths.push(bunPath)
+  }
+
+  return paths
 }
 
 /**

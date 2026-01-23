@@ -436,11 +436,13 @@ describe('crawlers module', () => {
         getNpmGlobalPrefix,
         getYarnGlobalPrefix,
         getPnpmGlobalPrefix,
+        getBunGlobalPrefix,
       } = await import('../crawlers/index.js')
 
       assert.equal(typeof getNpmGlobalPrefix, 'function')
       assert.equal(typeof getYarnGlobalPrefix, 'function')
       assert.equal(typeof getPnpmGlobalPrefix, 'function')
+      assert.equal(typeof getBunGlobalPrefix, 'function')
     })
   })
 })
