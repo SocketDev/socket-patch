@@ -7,7 +7,7 @@
  * - Running in test environment: VITEST=true
  *
  * Events are sent to:
- * - Authenticated: https://api.socket.dev/v0/orgs/{org}/telemetry
+ * - Authenticated: https://api.socket.dev/v0/orgs/{org}/events
  * - Public proxy: https://patches-api.socket.dev/patch/telemetry
  */
 
@@ -186,7 +186,7 @@ async function sendTelemetryEvent(
   if (apiToken && orgSlug) {
     // Authenticated endpoint.
     const apiUrl = process.env['SOCKET_API_URL'] || 'https://api.socket.dev'
-    url = `${apiUrl}/v0/orgs/${orgSlug}/telemetry`
+    url = `${apiUrl}/v0/orgs/${orgSlug}/events`
     useAuth = true
   } else {
     // Public proxy endpoint.
