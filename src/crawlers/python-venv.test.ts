@@ -85,6 +85,8 @@ describe('PythonCrawler - real venv tests', () => {
       } finally {
         if (origVirtualEnv !== undefined) {
           process.env['VIRTUAL_ENV'] = origVirtualEnv
+        } else {
+          delete process.env['VIRTUAL_ENV']
         }
       }
     } finally {
@@ -172,6 +174,8 @@ describe('PythonCrawler - real venv tests', () => {
     } finally {
       if (origVirtualEnv !== undefined) {
         process.env['VIRTUAL_ENV'] = origVirtualEnv
+      } else {
+        delete process.env['VIRTUAL_ENV']
       }
       await removeTestDir(testDir)
     }

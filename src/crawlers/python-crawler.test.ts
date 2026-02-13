@@ -414,6 +414,8 @@ describe('PythonCrawler', () => {
       } finally {
         if (origVirtualEnv !== undefined) {
           process.env['VIRTUAL_ENV'] = origVirtualEnv
+        } else {
+          delete process.env['VIRTUAL_ENV']
         }
       }
     })
@@ -442,6 +444,8 @@ describe('PythonCrawler', () => {
       } finally {
         if (origVirtualEnv !== undefined) {
           process.env['VIRTUAL_ENV'] = origVirtualEnv
+        } else {
+          delete process.env['VIRTUAL_ENV']
         }
         await removeTestDir(tempDir)
       }
