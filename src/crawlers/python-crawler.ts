@@ -150,26 +150,6 @@ export async function findLocalVenvSitePackages(cwd: string): Promise<string[]> 
     results.push(...matches)
   }
 
-  if (results.length > 0) return results
-
-  // 3. Fallback: ask Python for site-packages
-  try {
-    const output = execSync(
-      'python3 -c "import site; print(\'\\n\'.join(site.getsitepackages()))"',
-      {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd,
-      },
-    )
-    for (const line of output.trim().split('\n')) {
-      const p = line.trim()
-      if (p) results.push(p)
-    }
-  } catch {
-    // python3 not available
-  }
-
   return results
 }
 

@@ -157,9 +157,9 @@ describe('PythonCrawler - real venv tests', () => {
     assert.ok(existingCount >= 0, 'Some global site-packages paths may exist')
   })
 
-  it('should fall back to python3 -c for site-packages', { skip: !hasPython }, async () => {
+  it('should return empty when no venv exists in local mode', { skip: !hasPython }, async () => {
     // Create a temp dir with no venv
-    const testDir = await createTestDir('python-fallback-')
+    const testDir = await createTestDir('python-no-venv-')
     const origVirtualEnv = process.env['VIRTUAL_ENV']
     delete process.env['VIRTUAL_ENV']
 
@@ -167,10 +167,9 @@ describe('PythonCrawler - real venv tests', () => {
       const crawler = new PythonCrawler()
       const paths = await crawler.getSitePackagesPaths({ cwd: testDir })
 
-      // Without VIRTUAL_ENV and no .venv/venv dir, it should fall back to python3
-      // The result may be empty if python3 returns system paths we can't access,
-      // but the function should not throw
-      assert.ok(Array.isArray(paths), 'Should return an array')
+      // Without VIRTUAL_ENV and no .venv/venv dir, local mode should return empty
+      // (system packages are only returned in global mode)
+      assert.equal(paths.length, 0, 'Local mode with no venv should return empty')
     } finally {
       if (origVirtualEnv !== undefined) {
         process.env['VIRTUAL_ENV'] = origVirtualEnv
