@@ -177,6 +177,40 @@ export async function createTestPackage(
 }
 
 /**
+ * Create a mock Python package in site-packages
+ * Creates <sitePackagesDir>/<name>-<version>.dist-info/METADATA
+ * and writes package files relative to sitePackagesDir
+ */
+export async function createTestPythonPackage(
+  sitePackagesDir: string,
+  name: string,
+  version: string,
+  files: Record<string, string>,
+): Promise<string> {
+  await fs.mkdir(sitePackagesDir, { recursive: true })
+
+  // Create dist-info directory with METADATA
+  const distInfoDir = path.join(
+    sitePackagesDir,
+    `${name}-${version}.dist-info`,
+  )
+  await fs.mkdir(distInfoDir, { recursive: true })
+  await fs.writeFile(
+    path.join(distInfoDir, 'METADATA'),
+    `Metadata-Version: 2.1\nName: ${name}\nVersion: ${version}\nSummary: Test package\n`,
+  )
+
+  // Write package files relative to sitePackagesDir
+  for (const [filePath, content] of Object.entries(files)) {
+    const fullPath = path.join(sitePackagesDir, filePath)
+    await fs.mkdir(path.dirname(fullPath), { recursive: true })
+    await fs.writeFile(fullPath, content)
+  }
+
+  return sitePackagesDir
+}
+
+/**
  * Read file content from a package
  */
 export async function readPackageFile(
@@ -201,6 +235,7 @@ export async function setupTestEnvironment(options: {
   manifestPath: string
   blobsDir: string
   nodeModulesDir: string
+  sitePackagesDir: string
   socketDir: string
   packageDirs: Map<string, string>
 }> {
@@ -209,6 +244,13 @@ export async function setupTestEnvironment(options: {
   const socketDir = path.join(testDir, '.socket')
   const blobsDir = path.join(socketDir, 'blobs')
   const nodeModulesDir = path.join(testDir, 'node_modules')
+  const sitePackagesDir = path.join(
+    testDir,
+    '.venv',
+    'lib',
+    'python3.11',
+    'site-packages',
+  )
 
   await fs.mkdir(socketDir, { recursive: true })
   await fs.mkdir(blobsDir, { recursive: true })
@@ -227,11 +269,15 @@ export async function setupTestEnvironment(options: {
     manifestPatches[patch.purl] = entry
     Object.assign(allBlobs, blobs)
 
+    // Strip qualifiers for PURL matching
+    const qIdx = patch.purl.indexOf('?')
+    const basePurl = qIdx === -1 ? patch.purl : patch.purl.slice(0, qIdx)
+
     // Extract package name and version from PURL
     // Format: pkg:npm/name@version or pkg:npm/@scope/name@version
-    const purlMatch = patch.purl.match(/^pkg:npm\/(.+)@([^@]+)$/)
-    if (purlMatch) {
-      const [, name, version] = purlMatch
+    const npmMatch = basePurl.match(/^pkg:npm\/(.+)@([^@]+)$/)
+    if (npmMatch) {
+      const [, name, version] = npmMatch
 
       // Prepare package files in initial state
       const packageFiles: Record<string, string> = {}
@@ -254,6 +300,29 @@ export async function setupTestEnvironment(options: {
       )
       packageDirs.set(patch.purl, pkgDir)
     }
+
+    // Handle pkg:pypi/ PURLs
+    const pypiMatch = basePurl.match(/^pkg:pypi\/([^@]+)@(.+)$/)
+    if (pypiMatch) {
+      const [, name, version] = pypiMatch
+
+      // Prepare package files in initial state relative to site-packages
+      const packageFiles: Record<string, string> = {}
+      for (const [filePath, { beforeContent, afterContent }] of Object.entries(
+        patch.files,
+      )) {
+        packageFiles[filePath] =
+          initialState === 'before' ? beforeContent : afterContent
+      }
+
+      await createTestPythonPackage(
+        sitePackagesDir,
+        name,
+        version,
+        packageFiles,
+      )
+      packageDirs.set(patch.purl, sitePackagesDir)
+    }
   }
 
   await writeTestBlobs(blobsDir, allBlobs)
@@ -266,6 +335,7 @@ export async function setupTestEnvironment(options: {
     manifestPath,
     blobsDir,
     nodeModulesDir,
+    sitePackagesDir,
     socketDir,
     packageDirs,
   }
