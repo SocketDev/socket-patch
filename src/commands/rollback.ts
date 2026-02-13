@@ -20,6 +20,11 @@ import {
 } from '../utils/blob-fetcher.js'
 import { getGlobalPrefix } from '../utils/global-packages.js'
 import { getAPIClientFromEnv } from '../utils/api-client.js'
+import { PythonCrawler } from '../crawlers/index.js'
+import {
+  isPyPIPurl,
+  stripPurlQualifiers,
+} from '../utils/purl-utils.js'
 import {
   trackPatchRolledBack,
   trackPatchRollbackFailed,
@@ -207,38 +212,63 @@ async function rollbackPatches(
     }
   }
 
-  // Find node_modules directories
-  let nodeModulesPaths: string[]
-  if (useGlobal || globalPrefix) {
+  // Partition PURLs by ecosystem
+  const rollbackPurls = patchesToRollback.map(p => p.purl)
+  const npmPurls = rollbackPurls.filter(p => !isPyPIPurl(p))
+  const pypiPurls = rollbackPurls.filter(p => isPyPIPurl(p))
+
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
+  const allPackages = new Map<string, string>()
+
+  // Find npm packages
+  if (npmPurls.length > 0) {
+    let nodeModulesPaths: string[]
+    if (useGlobal || globalPrefix) {
+      try {
+        nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
+        if (!silent) {
+          console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
+        }
+      } catch (error) {
+        if (!silent) {
+          console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
+        }
+        return { success: false, results: [] }
+      }
+    } else {
+      nodeModulesPaths = await findNodeModules(cwd)
+    }
+
+    for (const nmPath of nodeModulesPaths) {
+      const packages = await findPackagesForPatches(nmPath, filteredManifest)
+      for (const [purl, location] of packages) {
+        if (!allPackages.has(purl)) {
+          allPackages.set(purl, location.path)
+        }
+      }
+    }
+  }
+
+  // Find Python packages
+  if (pypiPurls.length > 0) {
+    const pythonCrawler = new PythonCrawler()
     try {
-      nodeModulesPaths = [getGlobalPrefix(globalPrefix)]
-      if (!silent) {
-        console.log(`Using global npm packages at: ${nodeModulesPaths[0]}`)
+      const basePypiPurls = [...new Set(pypiPurls.map(stripPurlQualifiers))]
+      const sitePackagesPaths = await pythonCrawler.getSitePackagesPaths(crawlerOptions)
+      for (const spPath of sitePackagesPaths) {
+        const packages = await pythonCrawler.findByPurls(spPath, basePypiPurls)
+        for (const [basePurl, location] of packages) {
+          // Map back to the qualified PURL(s) in the manifest
+          for (const qualifiedPurl of pypiPurls) {
+            if (stripPurlQualifiers(qualifiedPurl) === basePurl && !allPackages.has(qualifiedPurl)) {
+              allPackages.set(qualifiedPurl, location.path)
+            }
+          }
+        }
       }
     } catch (error) {
       if (!silent) {
-        console.error('Failed to find global npm packages:', error instanceof Error ? error.message : String(error))
-      }
-      return { success: false, results: [] }
-    }
-  } else {
-    nodeModulesPaths = await findNodeModules(cwd)
-  }
-
-  if (nodeModulesPaths.length === 0) {
-    if (!silent) {
-      console.error(useGlobal || globalPrefix ? 'No global npm packages found' : 'No node_modules directories found')
-    }
-    return { success: false, results: [] }
-  }
-
-  // Find all packages that need rollback
-  const allPackages = new Map<string, string>()
-  for (const nmPath of nodeModulesPaths) {
-    const packages = await findPackagesForPatches(nmPath, filteredManifest)
-    for (const [purl, location] of packages) {
-      if (!allPackages.has(purl)) {
-        allPackages.set(purl, location.path)
+        console.error('Failed to find Python packages:', error instanceof Error ? error.message : String(error))
       }
     }
   }
@@ -492,12 +522,16 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
 }
 
 /**
- * Parse a PURL to extract the package directory path and version
+ * Parse a PURL to extract the package directory path, version, and ecosystem.
+ * Supports both npm and pypi PURLs.
  */
-function parsePurl(purl: string): { packageDir: string; version: string } | null {
-  const match = purl.match(/^pkg:npm\/(.+)@([^@]+)$/)
-  if (!match) return null
-  return { packageDir: match[1], version: match[2] }
+function parsePurl(purl: string): { packageDir: string; version: string; ecosystem: 'npm' | 'pypi' } | null {
+  const base = stripPurlQualifiers(purl)
+  const npmMatch = base.match(/^pkg:npm\/(.+)@([^@]+)$/)
+  if (npmMatch) return { packageDir: npmMatch[1], version: npmMatch[2], ecosystem: 'npm' }
+  const pypiMatch = base.match(/^pkg:pypi\/(.+)@([^@]+)$/)
+  if (pypiMatch) return { packageDir: pypiMatch[1], version: pypiMatch[2], ecosystem: 'pypi' }
+  return null
 }
 
 /**
@@ -557,43 +591,69 @@ async function rollbackOneOff(
     throw new Error(`Could not fetch patch: ${identifier}`)
   }
 
-  // Determine node_modules path
-  let nodeModulesPath: string
-  if (useGlobal || globalPrefix) {
-    try {
-      nodeModulesPath = getGlobalPrefix(globalPrefix)
-      if (!silent) {
-        console.log(`Using global npm packages at: ${nodeModulesPath}`)
-      }
-    } catch (error) {
-      throw new Error(
-        `Failed to find global npm packages: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  } else {
-    nodeModulesPath = path.join(cwd, 'node_modules')
-  }
-
   // Parse PURL to get package directory
   const parsed = parsePurl(patch.purl)
   if (!parsed) {
     throw new Error(`Invalid PURL format: ${patch.purl}`)
   }
 
-  const pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+  let pkgPath: string
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
 
-  // Verify package exists
-  try {
-    const pkgJsonPath = path.join(pkgPath, 'package.json')
-    const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
-    const pkgJson = JSON.parse(pkgJsonContent)
-    if (pkgJson.version !== parsed.version) {
-      if (!silent) {
-        console.log(`Note: Installed version ${pkgJson.version} differs from patch version ${parsed.version}`)
+  if (parsed.ecosystem === 'pypi') {
+    // Find the Python package in site-packages
+    const pythonCrawler = new PythonCrawler()
+    const basePurl = stripPurlQualifiers(patch.purl)
+    const spPaths = await pythonCrawler.getSitePackagesPaths(crawlerOptions)
+    let found = false
+    pkgPath = ''
+
+    for (const spPath of spPaths) {
+      const packages = await pythonCrawler.findByPurls(spPath, [basePurl])
+      const pkg = packages.get(basePurl)
+      if (pkg) {
+        pkgPath = pkg.path
+        found = true
+        break
       }
     }
-  } catch {
-    throw new Error(`Package not found: ${parsed.packageDir}`)
+
+    if (!found) {
+      throw new Error(`Python package not found: ${parsed.packageDir}@${parsed.version}`)
+    }
+  } else {
+    // npm: Determine node_modules path
+    let nodeModulesPath: string
+    if (useGlobal || globalPrefix) {
+      try {
+        nodeModulesPath = getGlobalPrefix(globalPrefix)
+        if (!silent) {
+          console.log(`Using global npm packages at: ${nodeModulesPath}`)
+        }
+      } catch (error) {
+        throw new Error(
+          `Failed to find global npm packages: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
+    } else {
+      nodeModulesPath = path.join(cwd, 'node_modules')
+    }
+
+    pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+
+    // Verify npm package exists
+    try {
+      const pkgJsonPath = path.join(pkgPath, 'package.json')
+      const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
+      const pkgJson = JSON.parse(pkgJsonContent)
+      if (pkgJson.version !== parsed.version) {
+        if (!silent) {
+          console.log(`Note: Installed version ${pkgJson.version} differs from patch version ${parsed.version}`)
+        }
+      }
+    } catch {
+      throw new Error(`Package not found: ${parsed.packageDir}`)
+    }
   }
 
   // Create temporary directory for blobs

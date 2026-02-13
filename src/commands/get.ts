@@ -15,15 +15,20 @@ import {
   cleanupUnusedBlobs,
   formatCleanupResult,
 } from '../utils/cleanup-blobs.js'
-import { NpmCrawler, type CrawledPackage } from '../crawlers/index.js'
+import { NpmCrawler, PythonCrawler, type CrawledPackage } from '../crawlers/index.js'
 import { fuzzyMatchPackages, isPurl } from '../utils/fuzzy-match.js'
-import { applyPackagePatch } from '../patch/apply.js'
+import { applyPackagePatch, verifyFilePatch } from '../patch/apply.js'
 import { rollbackPackagePatch } from '../patch/rollback.js'
 import {
   getMissingBlobs,
   fetchMissingBlobs,
   formatFetchResult,
 } from '../utils/blob-fetcher.js'
+import {
+  isPyPIPurl,
+  isNpmPurl,
+  stripPurlQualifiers,
+} from '../utils/purl-utils.js'
 
 /**
  * Represents a package that has available patches with CVE information
@@ -51,57 +56,77 @@ const MAX_PACKAGES_TO_CHECK = 15
 type IdentifierType = 'uuid' | 'cve' | 'ghsa' | 'purl' | 'package'
 
 /**
- * Parse a PURL to extract the package directory path and version
- * @example parsePurl('pkg:npm/lodash@4.17.21') => { packageDir: 'lodash', version: '4.17.21' }
- * @example parsePurl('pkg:npm/@types/node@20.0.0') => { packageDir: '@types/node', version: '20.0.0' }
+ * Parse a PURL to extract the package directory path, version, and ecosystem.
+ * Supports both npm and pypi PURLs.
+ * @example parsePurl('pkg:npm/lodash@4.17.21') => { packageDir: 'lodash', version: '4.17.21', ecosystem: 'npm' }
+ * @example parsePurl('pkg:npm/@types/node@20.0.0') => { packageDir: '@types/node', version: '20.0.0', ecosystem: 'npm' }
+ * @example parsePurl('pkg:pypi/requests@2.28.0') => { packageDir: 'requests', version: '2.28.0', ecosystem: 'pypi' }
  */
-function parsePurl(purl: string): { packageDir: string; version: string } | null {
-  const match = purl.match(/^pkg:npm\/(.+)@([^@]+)$/)
-  if (!match) return null
-  return { packageDir: match[1], version: match[2] }
+function parsePurl(purl: string): { packageDir: string; version: string; ecosystem: 'npm' | 'pypi' } | null {
+  // Strip qualifiers for parsing
+  const base = stripPurlQualifiers(purl)
+  const npmMatch = base.match(/^pkg:npm\/(.+)@([^@]+)$/)
+  if (npmMatch) return { packageDir: npmMatch[1], version: npmMatch[2], ecosystem: 'npm' }
+  const pypiMatch = base.match(/^pkg:pypi\/(.+)@([^@]+)$/)
+  if (pypiMatch) return { packageDir: pypiMatch[1], version: pypiMatch[2], ecosystem: 'pypi' }
+  return null
 }
 
 /**
- * Check which PURLs from search results are actually installed in node_modules.
+ * Check which PURLs from search results are actually installed.
+ * Supports both npm (node_modules) and pypi (site-packages) packages.
  * This is O(n) where n = number of unique packages in search results,
- * NOT O(m) where m = total packages in node_modules.
+ * NOT O(m) where m = total packages in node_modules/site-packages.
  */
 async function findInstalledPurls(
-  nodeModulesPath: string,
+  cwd: string,
   purls: string[],
+  useGlobal: boolean,
+  globalPrefix?: string,
 ): Promise<Set<string>> {
   const installedPurls = new Set<string>()
 
-  // Group PURLs by package directory to handle multiple versions of same package
-  const packageVersions = new Map<string, Set<string>>()
-  const purlLookup = new Map<string, string>() // "packageDir@version" -> original purl
+  // Partition PURLs by ecosystem
+  const npmPurls = purls.filter(p => isNpmPurl(p))
+  const pypiPurls = purls.filter(p => isPyPIPurl(p))
 
-  for (const purl of purls) {
-    const parsed = parsePurl(purl)
-    if (!parsed) continue
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
 
-    if (!packageVersions.has(parsed.packageDir)) {
-      packageVersions.set(parsed.packageDir, new Set())
-    }
-    packageVersions.get(parsed.packageDir)!.add(parsed.version)
-    purlLookup.set(`${parsed.packageDir}@${parsed.version}`, purl)
-  }
-
-  // Check only the specific packages we need - O(n) filesystem operations
-  for (const [packageDir, versions] of packageVersions) {
-    const pkgJsonPath = path.join(nodeModulesPath, packageDir, 'package.json')
+  // Check npm PURLs
+  if (npmPurls.length > 0) {
+    const npmCrawler = new NpmCrawler()
     try {
-      const content = await fs.readFile(pkgJsonPath, 'utf-8')
-      const pkg = JSON.parse(content)
-      if (pkg.version && versions.has(pkg.version)) {
-        const key = `${packageDir}@${pkg.version}`
-        const originalPurl = purlLookup.get(key)
-        if (originalPurl) {
-          installedPurls.add(originalPurl)
+      const nmPaths = await npmCrawler.getNodeModulesPaths(crawlerOptions)
+      for (const nmPath of nmPaths) {
+        const packages = await npmCrawler.findByPurls(nmPath, npmPurls)
+        for (const purl of packages.keys()) {
+          installedPurls.add(purl)
         }
       }
     } catch {
-      // Package not found or invalid package.json - skip
+      // npm not available
+    }
+  }
+
+  // Check pypi PURLs
+  if (pypiPurls.length > 0) {
+    const pythonCrawler = new PythonCrawler()
+    try {
+      const basePurls = [...new Set(pypiPurls.map(stripPurlQualifiers))]
+      const spPaths = await pythonCrawler.getSitePackagesPaths(crawlerOptions)
+      for (const spPath of spPaths) {
+        const packages = await pythonCrawler.findByPurls(spPath, basePurls)
+        for (const basePurl of packages.keys()) {
+          // Mark all qualified variants of this base PURL as installed
+          for (const originalPurl of pypiPurls) {
+            if (stripPurlQualifiers(originalPurl) === basePurl) {
+              installedPurls.add(originalPurl)
+            }
+          }
+        }
+      }
+    } catch {
+      // python not available
     }
   }
 
@@ -455,37 +480,51 @@ async function applyDownloadedPatches(
     }
   }
 
-  // Find node_modules directories using the crawler
-  const crawler = new NpmCrawler()
-  let nodeModulesPaths: string[]
-  try {
-    nodeModulesPaths = await crawler.getNodeModulesPaths({
-      cwd,
-      global: useGlobal,
-      globalPrefix,
-    })
-  } catch (error) {
-    if (!silent) {
-      console.error('Failed to find npm packages:', error instanceof Error ? error.message : String(error))
-    }
-    return false
-  }
-
-  if (nodeModulesPaths.length === 0) {
-    if (!silent) {
-      console.error(useGlobal || globalPrefix ? 'No global npm packages found' : 'No node_modules directories found')
-    }
-    return false
-  }
-
-  // Find all packages that need patching using the crawler
+  // Partition manifest PURLs by ecosystem
   const manifestPurls = Object.keys(manifest.patches)
+  const npmPurls = manifestPurls.filter(p => isNpmPurl(p))
+  const pypiPurls = manifestPurls.filter(p => isPyPIPurl(p))
+
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
   const allPackages = new Map<string, string>()
-  for (const nmPath of nodeModulesPaths) {
-    const packages = await crawler.findByPurls(nmPath, manifestPurls)
-    for (const [purl, location] of packages) {
-      if (!allPackages.has(purl)) {
-        allPackages.set(purl, location.path)
+
+  // Find npm packages
+  if (npmPurls.length > 0) {
+    const npmCrawler = new NpmCrawler()
+    try {
+      const nodeModulesPaths = await npmCrawler.getNodeModulesPaths(crawlerOptions)
+      for (const nmPath of nodeModulesPaths) {
+        const packages = await npmCrawler.findByPurls(nmPath, npmPurls)
+        for (const [purl, location] of packages) {
+          if (!allPackages.has(purl)) {
+            allPackages.set(purl, location.path)
+          }
+        }
+      }
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find npm packages:', error instanceof Error ? error.message : String(error))
+      }
+    }
+  }
+
+  // Find Python packages
+  if (pypiPurls.length > 0) {
+    const pythonCrawler = new PythonCrawler()
+    try {
+      const basePypiPurls = [...new Set(pypiPurls.map(stripPurlQualifiers))]
+      const sitePackagesPaths = await pythonCrawler.getSitePackagesPaths(crawlerOptions)
+      for (const spPath of sitePackagesPaths) {
+        const packages = await pythonCrawler.findByPurls(spPath, basePypiPurls)
+        for (const [purl, location] of packages) {
+          if (!allPackages.has(purl)) {
+            allPackages.set(purl, location.path)
+          }
+        }
+      }
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find Python packages:', error instanceof Error ? error.message : String(error))
       }
     }
   }
@@ -497,32 +536,92 @@ async function applyDownloadedPatches(
     return true
   }
 
+  // Group pypi manifest PURLs by base PURL for qualifier fallback
+  const pypiQualifiedGroups = new Map<string, string[]>()
+  for (const purl of pypiPurls) {
+    const base = stripPurlQualifiers(purl)
+    const group = pypiQualifiedGroups.get(base)
+    if (group) {
+      group.push(purl)
+    } else {
+      pypiQualifiedGroups.set(base, [purl])
+    }
+  }
+
   // Apply patches to each package
   let hasErrors = false
   const patchedPackages: string[] = []
   const alreadyPatched: string[] = []
+  const appliedBasePurls = new Set<string>()
 
   for (const [purl, pkgPath] of allPackages) {
-    const patch = manifest.patches[purl]
-    if (!patch) continue
+    if (isPyPIPurl(purl)) {
+      const basePurl = stripPurlQualifiers(purl)
+      if (appliedBasePurls.has(basePurl)) continue
 
-    const result = await applyPackagePatch(
-      purl,
-      pkgPath,
-      patch.files,
-      blobsPath,
-      false,
-    )
+      const variants = pypiQualifiedGroups.get(basePurl) ?? [basePurl]
+      let applied = false
 
-    if (!result.success) {
-      hasErrors = true
-      if (!silent) {
-        console.error(`Failed to patch ${purl}: ${result.error}`)
+      for (const variantPurl of variants) {
+        const patch = manifest.patches[variantPurl]
+        if (!patch) continue
+
+        // Check if this variant's beforeHash matches the file on disk
+        const firstFile = Object.entries(patch.files)[0]
+        if (firstFile) {
+          const [fileName, fileInfo] = firstFile
+          const verify = await verifyFilePatch(pkgPath, fileName, fileInfo)
+          if (verify.status === 'hash-mismatch') continue
+        }
+
+        const result = await applyPackagePatch(
+          variantPurl,
+          pkgPath,
+          patch.files,
+          blobsPath,
+          false,
+        )
+
+        if (result.success) {
+          applied = true
+          appliedBasePurls.add(basePurl)
+          if (result.filesPatched.length > 0) {
+            patchedPackages.push(variantPurl)
+          } else if (result.filesVerified.every(f => f.status === 'already-patched')) {
+            alreadyPatched.push(variantPurl)
+          }
+          break
+        }
       }
-    } else if (result.filesPatched.length > 0) {
-      patchedPackages.push(purl)
-    } else if (result.filesVerified.every(f => f.status === 'already-patched')) {
-      alreadyPatched.push(purl)
+
+      if (!applied) {
+        hasErrors = true
+        if (!silent) {
+          console.error(`Failed to patch ${basePurl}: no matching variant found`)
+        }
+      }
+    } else {
+      const patch = manifest.patches[purl]
+      if (!patch) continue
+
+      const result = await applyPackagePatch(
+        purl,
+        pkgPath,
+        patch.files,
+        blobsPath,
+        false,
+      )
+
+      if (!result.success) {
+        hasErrors = true
+        if (!silent) {
+          console.error(`Failed to patch ${purl}: ${result.error}`)
+        }
+      } else if (result.filesPatched.length > 0) {
+        patchedPackages.push(purl)
+      } else if (result.filesVerified.every(f => f.status === 'already-patched')) {
+        alreadyPatched.push(purl)
+      }
     }
   }
 
@@ -555,24 +654,6 @@ async function applyOneOffPatch(
   silent: boolean,
   globalPrefix?: string,
 ): Promise<{ success: boolean; rollback?: () => Promise<void> }> {
-  // Find the package location using the crawler
-  const crawler = new NpmCrawler()
-  let nodeModulesPath: string
-  try {
-    const paths = await crawler.getNodeModulesPaths({
-      cwd,
-      global: useGlobal,
-      globalPrefix,
-    })
-    nodeModulesPath = paths[0] ?? path.join(cwd, 'node_modules')
-  } catch (error) {
-    if (!silent) {
-      console.error('Failed to find npm packages:', error instanceof Error ? error.message : String(error))
-    }
-    return { success: false }
-  }
-
-  // Parse PURL to get package directory
   const parsed = parsePurl(patch.purl)
   if (!parsed) {
     if (!silent) {
@@ -581,24 +662,73 @@ async function applyOneOffPatch(
     return { success: false }
   }
 
-  const pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+  let pkgPath: string
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
 
-  // Verify package exists
-  try {
-    const pkgJsonPath = path.join(pkgPath, 'package.json')
-    const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
-    const pkgJson = JSON.parse(pkgJsonContent)
-    if (pkgJson.version !== parsed.version) {
+  if (parsed.ecosystem === 'pypi') {
+    // Find the package in Python site-packages
+    const pythonCrawler = new PythonCrawler()
+    try {
+      const basePurl = stripPurlQualifiers(patch.purl)
+      const spPaths = await pythonCrawler.getSitePackagesPaths(crawlerOptions)
+      let found = false
+      pkgPath = '' // Will be set if found
+
+      for (const spPath of spPaths) {
+        const packages = await pythonCrawler.findByPurls(spPath, [basePurl])
+        const pkg = packages.get(basePurl)
+        if (pkg) {
+          pkgPath = pkg.path
+          found = true
+          break
+        }
+      }
+
+      if (!found) {
+        if (!silent) {
+          console.error(`Python package not found: ${parsed.packageDir}@${parsed.version}`)
+        }
+        return { success: false }
+      }
+    } catch (error) {
       if (!silent) {
-        console.error(`Version mismatch: installed ${pkgJson.version}, patch is for ${parsed.version}`)
+        console.error('Failed to find Python packages:', error instanceof Error ? error.message : String(error))
       }
       return { success: false }
     }
-  } catch {
-    if (!silent) {
-      console.error(`Package not found: ${parsed.packageDir}`)
+  } else {
+    // npm: Find the package in node_modules
+    const npmCrawler = new NpmCrawler()
+    let nodeModulesPath: string
+    try {
+      const paths = await npmCrawler.getNodeModulesPaths(crawlerOptions)
+      nodeModulesPath = paths[0] ?? path.join(cwd, 'node_modules')
+    } catch (error) {
+      if (!silent) {
+        console.error('Failed to find npm packages:', error instanceof Error ? error.message : String(error))
+      }
+      return { success: false }
     }
-    return { success: false }
+
+    pkgPath = path.join(nodeModulesPath, parsed.packageDir)
+
+    // Verify npm package exists
+    try {
+      const pkgJsonPath = path.join(pkgPath, 'package.json')
+      const pkgJsonContent = await fs.readFile(pkgJsonPath, 'utf-8')
+      const pkgJson = JSON.parse(pkgJsonContent)
+      if (pkgJson.version !== parsed.version) {
+        if (!silent) {
+          console.error(`Version mismatch: installed ${pkgJson.version}, patch is for ${parsed.version}`)
+        }
+        return { success: false }
+      }
+    } catch {
+      if (!silent) {
+        console.error(`Package not found: ${parsed.packageDir}`)
+      }
+      return { success: false }
+    }
   }
 
   // Create temporary directory for blobs
@@ -724,24 +854,10 @@ async function getPatches(args: GetArgs): Promise<boolean> {
   // The org slug to use (null when using public proxy)
   const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
 
-  // Determine node_modules path for package lookups using the crawler
-  const crawler = new NpmCrawler()
-  let nodeModulesPath: string
-  try {
-    const paths = await crawler.getNodeModulesPaths({
-      cwd,
-      global: useGlobal,
-      globalPrefix,
-    })
-    nodeModulesPath = paths[0] ?? path.join(cwd, 'node_modules')
-    if (useGlobal || globalPrefix) {
-      console.log(`Using global npm packages at: ${nodeModulesPath}`)
-    }
-  } catch (error) {
-    throw new Error(
-      `Failed to find npm packages: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
+  // Set up crawlers for package lookups
+  const npmCrawler = new NpmCrawler()
+  const pythonCrawler = new PythonCrawler()
+  const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
 
   // Determine identifier type
   let idType: IdentifierType
@@ -860,18 +976,16 @@ async function getPatches(args: GetArgs): Promise<boolean> {
       break
     }
     case 'package': {
-      // Enumerate packages from node_modules using the crawler and fuzzy match
-      console.log(`Enumerating packages in ${nodeModulesPath}...`)
-      const packages = await crawler.crawlAll({
-        cwd,
-        global: useGlobal,
-        globalPrefix,
-      })
+      // Enumerate packages from both npm and Python ecosystems, then fuzzy match
+      console.log(`Enumerating packages...`)
+      const npmPackages = await npmCrawler.crawlAll(crawlerOptions)
+      const pythonPackages = await pythonCrawler.crawlAll(crawlerOptions)
+      const packages: CrawledPackage[] = [...npmPackages, ...pythonPackages]
 
       if (packages.length === 0) {
         console.log(useGlobal
           ? 'No global packages found.'
-          : 'No packages found in node_modules. Run npm/yarn/pnpm install first.')
+          : 'No packages found. Run npm/yarn/pnpm/pip install first.')
         return true
       }
 
@@ -993,7 +1107,7 @@ async function getPatches(args: GetArgs): Promise<boolean> {
   if (idType === 'cve' || idType === 'ghsa') {
     console.log(`Checking which packages are installed...`)
     const searchPurls = searchResults.map(patch => patch.purl)
-    const installedPurls = await findInstalledPurls(nodeModulesPath, searchPurls)
+    const installedPurls = await findInstalledPurls(cwd, searchPurls, useGlobal ?? false, globalPrefix)
 
     filteredResults = searchResults.filter(patch => installedPurls.has(patch.purl))
     notInstalledCount = searchResults.length - filteredResults.length

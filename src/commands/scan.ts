@@ -3,7 +3,7 @@ import {
   getAPIClientFromEnv,
   type BatchPackagePatches,
 } from '../utils/api-client.js'
-import { NpmCrawler } from '../crawlers/index.js'
+import { NpmCrawler, PythonCrawler } from '../crawlers/index.js'
 import { createSpinner } from '../utils/spinner.js'
 
 // Default batch size for API queries
@@ -161,39 +161,59 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
   // The org slug to use (null when using public proxy)
   const effectiveOrgSlug = usePublicProxy ? null : orgSlug ?? null
 
-  // Initialize crawler and spinner
-  const crawler = new NpmCrawler()
+  // Initialize crawlers and spinner
+  const npmCrawler = new NpmCrawler()
+  const pythonCrawler = new PythonCrawler()
   const spinner = createSpinner({ disabled: outputJson })
 
   const scanTarget = useGlobal || globalPrefix
-    ? 'global npm packages'
-    : 'npm packages'
+    ? 'global packages'
+    : 'packages'
 
   spinner.start(`Scanning ${scanTarget}...`)
 
   // Collect all packages using batching to be memory-efficient
   const allPurls: string[] = []
   let packageCount = 0
+  let npmCount = 0
+  let pythonCount = 0
   let lastPath = ''
 
-  for await (const batch of crawler.crawlBatches({
+  const crawlerOptions = {
     cwd,
     global: useGlobal,
     globalPrefix,
     batchSize,
-  })) {
+  }
+
+  // Crawl npm packages
+  for await (const batch of npmCrawler.crawlBatches(crawlerOptions)) {
     for (const pkg of batch) {
       allPurls.push(pkg.purl)
       packageCount++
+      npmCount++
       lastPath = pkg.path
     }
 
-    // Update spinner with progress - show last package scanned and its relative path
-    // Compute relative path from cwd
     const relativePath = lastPath.startsWith(cwd)
-      ? lastPath.slice(cwd.length + 1) // +1 to remove leading slash
+      ? lastPath.slice(cwd.length + 1)
       : lastPath
-    spinner.update(`Scanning... ${packageCount} pkgs | ${relativePath}`)
+    spinner.update(`Scanning npm... ${packageCount} pkgs | ${relativePath}`)
+  }
+
+  // Crawl Python packages
+  for await (const batch of pythonCrawler.crawlBatches(crawlerOptions)) {
+    for (const pkg of batch) {
+      allPurls.push(pkg.purl)
+      packageCount++
+      pythonCount++
+      lastPath = pkg.path
+    }
+
+    const relativePath = lastPath.startsWith(cwd)
+      ? lastPath.slice(cwd.length + 1)
+      : lastPath
+    spinner.update(`Scanning python... ${packageCount} pkgs | ${relativePath}`)
   }
 
   if (packageCount === 0) {
@@ -217,14 +237,22 @@ async function scanPatches(args: ScanArgs): Promise<boolean> {
     } else {
       console.log(
         useGlobal || globalPrefix
-          ? 'No global npm packages found.'
-          : 'No packages found. Run npm/yarn/pnpm install first.',
+          ? 'No global packages found.'
+          : 'No packages found. Run npm/yarn/pnpm/pip install first.',
       )
     }
     return true
   }
 
-  spinner.succeed(`Found ${packageCount} packages`)
+  // Build a summary showing what ecosystems were found
+  const ecosystemParts: string[] = []
+  if (npmCount > 0) ecosystemParts.push(`${npmCount} npm`)
+  if (pythonCount > 0) ecosystemParts.push(`${pythonCount} python`)
+  const ecosystemSummary = ecosystemParts.length > 0
+    ? ` (${ecosystemParts.join(', ')})`
+    : ''
+
+  spinner.succeed(`Found ${packageCount} packages${ecosystemSummary}`)
 
   // Query API in batches
   const allPackagesWithPatches: BatchPackagePatches[] = []
