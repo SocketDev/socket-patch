@@ -36,6 +36,7 @@ interface ApplyArgs {
   offline: boolean
   global: boolean
   'global-prefix'?: string
+  ecosystems?: string[]
 }
 
 async function applyPatches(
@@ -46,6 +47,7 @@ async function applyPatches(
   offline: boolean,
   useGlobal: boolean,
   globalPrefix?: string,
+  ecosystems?: string[],
 ): Promise<{ success: boolean; results: ApplyResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -102,8 +104,14 @@ async function applyPatches(
 
   // Partition manifest PURLs by ecosystem
   const manifestPurls = Object.keys(manifest.patches)
-  const npmPurls = manifestPurls.filter(p => isNpmPurl(p))
-  const pypiPurls = manifestPurls.filter(p => isPyPIPurl(p))
+  let npmPurls = manifestPurls.filter(p => isNpmPurl(p))
+  let pypiPurls = manifestPurls.filter(p => isPyPIPurl(p))
+
+  // Filter by ecosystem if specified
+  if (ecosystems && ecosystems.length > 0) {
+    if (!ecosystems.includes('npm')) npmPurls = []
+    if (!ecosystems.includes('pypi')) pypiPurls = []
+  }
 
   const crawlerOptions = {
     cwd,
@@ -316,6 +324,11 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         describe: 'Custom path to global node_modules (overrides auto-detection, useful for yarn/pnpm)',
         type: 'string',
       })
+      .option('ecosystems', {
+        describe: 'Restrict patching to specific ecosystems (comma-separated)',
+        type: 'array',
+        choices: ['npm', 'pypi'],
+      })
       .example('$0 apply', 'Apply all patches to local packages')
       .example('$0 apply --global', 'Apply patches to global npm packages')
       .example('$0 apply --global-prefix /custom/path', 'Apply patches to custom global location')
@@ -350,6 +363,7 @@ export const applyCommand: CommandModule<{}, ApplyArgs> = {
         argv.offline,
         argv.global,
         argv['global-prefix'],
+        argv.ecosystems,
       )
 
       // Print results if not silent

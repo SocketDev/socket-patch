@@ -411,19 +411,19 @@ describe('isPostinstallConfigured', () => {
 describe('generateUpdatedPostinstall', () => {
   it('should create command for empty string', () => {
     const result = generateUpdatedPostinstall('')
-    assert.equal(result, 'socket patch apply --silent')
+    assert.equal(result, 'socket patch apply --silent --ecosystems npm')
   })
 
   it('should create command for whitespace-only string', () => {
     const result = generateUpdatedPostinstall('   \n\t  ')
-    assert.equal(result, 'socket patch apply --silent')
+    assert.equal(result, 'socket patch apply --silent --ecosystems npm')
   })
 
   it('should prepend to existing script', () => {
     const result = generateUpdatedPostinstall('echo "Hello"')
     assert.equal(
       result,
-      'socket patch apply --silent && echo "Hello"',
+      'socket patch apply --silent --ecosystems npm && echo "Hello"',
     )
   })
 
@@ -456,7 +456,7 @@ describe('generateUpdatedPostinstall', () => {
     const result = generateUpdatedPostinstall(existing)
     assert.equal(
       result,
-      'socket patch apply --silent && socket apply',
+      'socket patch apply --silent --ecosystems npm && socket apply',
       'Should add socket patch apply even if socket apply is present',
     )
   })
@@ -476,7 +476,7 @@ describe('updatePackageJsonContent', () => {
     assert.ok(updated.scripts)
     assert.equal(
       updated.scripts.postinstall,
-      'socket patch apply --silent',
+      'socket patch apply --silent --ecosystems npm',
     )
   })
 
@@ -496,7 +496,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'socket patch apply --silent',
+      'socket patch apply --silent --ecosystems npm',
     )
     assert.equal(updated.scripts.test, 'jest', 'Should preserve other scripts')
     assert.equal(updated.scripts.build, 'tsc', 'Should preserve other scripts')
@@ -517,7 +517,7 @@ describe('updatePackageJsonContent', () => {
     assert.equal(result.oldScript, 'echo "Setup complete"')
     assert.equal(
       result.newScript,
-      'socket patch apply --silent && echo "Setup complete"',
+      'socket patch apply --silent --ecosystems npm && echo "Setup complete"',
     )
   })
 
@@ -575,7 +575,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'socket patch apply --silent',
+      'socket patch apply --silent --ecosystems npm',
     )
   })
 
@@ -594,7 +594,7 @@ describe('updatePackageJsonContent', () => {
     const updated = JSON.parse(result.content)
     assert.equal(
       updated.scripts.postinstall,
-      'socket patch apply --silent',
+      'socket patch apply --silent --ecosystems npm',
     )
   })
 

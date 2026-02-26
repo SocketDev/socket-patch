@@ -4,7 +4,7 @@
  */
 
 // The command to run for applying patches via socket CLI.
-const SOCKET_PATCH_COMMAND = 'socket patch apply --silent'
+const SOCKET_PATCH_COMMAND = 'socket patch apply --silent --ecosystems npm'
 
 // Legacy command patterns to detect existing configurations.
 const LEGACY_PATCH_PATTERNS = [

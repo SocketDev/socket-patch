@@ -43,6 +43,7 @@ interface RollbackArgs {
   org?: string
   'api-url'?: string
   'api-token'?: string
+  ecosystems?: string[]
 }
 
 interface PatchToRollback {
@@ -134,6 +135,7 @@ async function rollbackPatches(
   offline: boolean,
   useGlobal: boolean,
   globalPrefix?: string,
+  ecosystems?: string[],
 ): Promise<{ success: boolean; results: RollbackResult[] }> {
   // Read and parse manifest
   const manifestContent = await fs.readFile(manifestPath, 'utf-8')
@@ -214,8 +216,14 @@ async function rollbackPatches(
 
   // Partition PURLs by ecosystem
   const rollbackPurls = patchesToRollback.map(p => p.purl)
-  const npmPurls = rollbackPurls.filter(p => !isPyPIPurl(p))
-  const pypiPurls = rollbackPurls.filter(p => isPyPIPurl(p))
+  let npmPurls = rollbackPurls.filter(p => !isPyPIPurl(p))
+  let pypiPurls = rollbackPurls.filter(p => isPyPIPurl(p))
+
+  // Filter by ecosystem if specified
+  if (ecosystems && ecosystems.length > 0) {
+    if (!ecosystems.includes('npm')) npmPurls = []
+    if (!ecosystems.includes('pypi')) pypiPurls = []
+  }
 
   const crawlerOptions = { cwd, global: useGlobal, globalPrefix }
   const allPackages = new Map<string, string>()
@@ -374,6 +382,11 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         describe: 'Socket API token (overrides SOCKET_API_TOKEN env var)',
         type: 'string',
       })
+      .option('ecosystems', {
+        describe: 'Restrict rollback to specific ecosystems (comma-separated)',
+        type: 'array',
+        choices: ['npm', 'pypi'],
+      })
       .example('$0 rollback', 'Rollback all patches')
       .example(
         '$0 rollback pkg:npm/lodash@4.17.21',
@@ -453,6 +466,7 @@ export const rollbackCommand: CommandModule<{}, RollbackArgs> = {
         argv.offline,
         argv.global,
         argv['global-prefix'],
+        argv.ecosystems,
       )
 
       // Print results if not silent
