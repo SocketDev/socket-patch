@@ -137,3 +137,11 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Rust
+target/
+
+# npm platform binaries (populated at publish time)
+npm/*/bin/socket-patch
+npm/*/bin/socket-patch.exe
+!npm/socket-patch/bin/socket-patch

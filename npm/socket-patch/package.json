@@ -1,0 +1,33 @@
+{
+  "name": "@socketsecurity/socket-patch",
+  "version": "0.0.0",
+  "description": "CLI tool for applying security patches to dependencies",
+  "bin": {
+    "socket-patch": "bin/socket-patch"
+  },
+  "optionalDependencies": {
+    "@socketsecurity/socket-patch-darwin-arm64": "0.0.0",
+    "@socketsecurity/socket-patch-darwin-x64": "0.0.0",
+    "@socketsecurity/socket-patch-linux-x64": "0.0.0",
+    "@socketsecurity/socket-patch-linux-arm64": "0.0.0",
+    "@socketsecurity/socket-patch-win32-x64": "0.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "security",
+    "patch",
+    "cli",
+    "dependencies"
+  ],
+  "author": "Socket Security",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.build-tool == 'cross'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cargo)
+        if: matrix.build-tool == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.build-tool == 'cross'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../socket-patch-${{ matrix.target }}.tar.gz socket-patch
+          cd ../../..
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/socket-patch.exe" -DestinationPath "socket-patch-${{ matrix.target }}.zip"
+
+      - name: Upload artifact (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.tar.gz
+
+      - name: Upload artifact (zip)
+        if: matrix.archive == 'zip'
+        uses: actions/upload-artifact@v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.zip
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes \
+            artifacts/*
+
+  npm-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Extract version and sync
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          bash scripts/version-sync.sh "$VERSION"
+
+      - name: Stage darwin-arm64 binary
+        run: |
+          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C npm/socket-patch-darwin-arm64/bin/
+
+      - name: Stage darwin-x64 binary
+        run: |
+          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C npm/socket-patch-darwin-x64/bin/
+
+      - name: Stage linux-x64 binary
+        run: |
+          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C npm/socket-patch-linux-x64/bin/
+
+      - name: Stage linux-arm64 binary
+        run: |
+          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch-linux-arm64/bin/
+
+      - name: Stage win32-x64 binary
+        run: |
+          cd npm/socket-patch-win32-x64/bin
+          unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in \
+            npm/socket-patch-darwin-arm64 \
+            npm/socket-patch-darwin-x64 \
+            npm/socket-patch-linux-x64 \
+            npm/socket-patch-linux-arm64 \
+            npm/socket-patch-win32-x64; do
+            npm publish "$pkg" --provenance --access public
+          done
+
+      - name: Publish root package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/socket-patch --provenance --access public
