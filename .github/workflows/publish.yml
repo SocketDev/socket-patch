@@ -34,10 +34,16 @@ jobs:
 
       - name: Bump version and sync
         run: |
-          npm version ${{ inputs.version-bump }} --no-git-tag-version
-          VERSION=$(node -p "require('./package.json').version")
+          CURRENT=$(node -p "require('./npm/socket-patch/package.json').version")
+          VERSION=$(node -e "
+            const [major, minor, patch] = '$CURRENT'.split('.').map(Number);
+            const bump = '${{ inputs.version-bump }}';
+            if (bump === 'major') console.log((major+1)+'.0.0');
+            else if (bump === 'minor') console.log(major+'.'+(minor+1)+'.0');
+            else console.log(major+'.'+minor+'.'+(patch+1));
+          ")
           bash scripts/version-sync.sh "$VERSION"
-          git add Cargo.toml package.json npm/
+          git add Cargo.toml npm/
           git commit -m "v$VERSION"
           git tag "v$VERSION"
 

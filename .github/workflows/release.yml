@@ -129,41 +129,22 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           bash scripts/version-sync.sh "$VERSION"
 
-      - name: Stage darwin-arm64 binary
+      - name: Stage binaries
         run: |
-          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C npm/socket-patch-darwin-arm64/bin/
-
-      - name: Stage darwin-x64 binary
-        run: |
-          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C npm/socket-patch-darwin-x64/bin/
-
-      - name: Stage linux-x64 binary
-        run: |
-          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C npm/socket-patch-linux-x64/bin/
-
-      - name: Stage linux-arm64 binary
-        run: |
-          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch-linux-arm64/bin/
-
-      - name: Stage win32-x64 binary
-        run: |
-          cd npm/socket-patch-win32-x64/bin
+          mkdir -p npm/socket-patch/bin
+          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-arm64
+          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-x64
+          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-x64
+          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm64
+          cd npm/socket-patch/bin
           unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
+          mv socket-patch.exe socket-patch-win32-x64.exe
 
-      - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          for pkg in \
-            npm/socket-patch-darwin-arm64 \
-            npm/socket-patch-darwin-x64 \
-            npm/socket-patch-linux-x64 \
-            npm/socket-patch-linux-arm64 \
-            npm/socket-patch-win32-x64; do
-            npm publish "$pkg" --provenance --access public
-          done
-
-      - name: Publish root package
+      - name: Publish package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish npm/socket-patch --provenance --access public

@@ -1,32 +1,24 @@
 #!/usr/bin/env node
+const { spawnSync } = require("child_process");
 const path = require("path");
 
-const PLATFORMS = {
-  "darwin arm64": "@socketsecurity/socket-patch-darwin-arm64",
-  "darwin x64": "@socketsecurity/socket-patch-darwin-x64",
-  "linux x64": "@socketsecurity/socket-patch-linux-x64",
-  "linux arm64": "@socketsecurity/socket-patch-linux-arm64",
-  "win32 x64": "@socketsecurity/socket-patch-win32-x64",
+const BINARIES = {
+  "darwin arm64": "socket-patch-darwin-arm64",
+  "darwin x64": "socket-patch-darwin-x64",
+  "linux x64": "socket-patch-linux-x64",
+  "linux arm64": "socket-patch-linux-arm64",
+  "win32 x64": "socket-patch-win32-x64.exe",
 };
 
 const key = `${process.platform} ${process.arch}`;
-const pkg = PLATFORMS[key];
-if (!pkg) {
+const bin = BINARIES[key];
+if (!bin) {
   console.error(`Unsupported platform: ${key}`);
-  console.error("Install from GitHub Releases: https://github.com/SocketDev/socket-patch/releases");
   process.exit(1);
 }
 
-const binName = process.platform === "win32" ? "socket-patch.exe" : "socket-patch";
-let binPath;
-try {
-  binPath = path.join(path.dirname(require.resolve(`${pkg}/package.json`)), "bin", binName);
-} catch {
-  console.error(`Could not find ${pkg}. Your platform may not be supported.`);
-  process.exit(1);
-}
-
-const result = require("child_process").spawnSync(binPath, process.argv.slice(2), {
+const binPath = path.join(__dirname, bin);
+const result = spawnSync(binPath, process.argv.slice(2), {
   stdio: "inherit",
   env: process.env,
 });
