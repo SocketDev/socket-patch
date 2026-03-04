@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "socket-patch"
 version = "1.2.0"
 description = "CLI tool for applying security patches to dependencies"
-readme = "../../README.md"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
 authors = [

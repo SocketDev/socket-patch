@@ -143,3 +143,8 @@ target/
 
 # npm binaries (populated at publish time)
 npm/socket-patch/bin/socket-patch-*
+
+# READMEs copied at publish time
+crates/socket-patch-cli/README.md
+npm/socket-patch/README.md
+pypi/socket-patch/README.md

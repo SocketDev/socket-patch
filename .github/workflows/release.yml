@@ -163,6 +163,9 @@ jobs:
       - name: Wait for crates.io index update
         run: sleep 30
 
+      - name: Copy README for CLI crate
+        run: cp README.md crates/socket-patch-cli/README.md
+
       - name: Publish socket-patch-cli
         run: cargo publish -p socket-patch-cli
 
@@ -201,6 +204,9 @@ jobs:
           cd npm/socket-patch/bin
           unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
           mv socket-patch.exe socket-patch-win32-x64.exe
+
+      - name: Copy README for npm package
+        run: cp README.md npm/socket-patch/README.md
 
       - name: Publish package
         env:
@@ -251,6 +257,9 @@ jobs:
           chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-darwin-x64
           chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-x64
           chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-arm64
+
+      - name: Copy README for PyPI package
+        run: cp README.md pypi/socket-patch/README.md
 
       - name: Build package
         run: python -m build pypi/socket-patch
