@@ -1,9 +1,11 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::api::types::BatchPackagePatches;
-use socket_patch_core::crawlers::{CrawlerOptions, NpmCrawler, PythonCrawler};
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+use crate::ecosystem_dispatch::crawl_all_ecosystems;
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
@@ -77,23 +79,10 @@ pub async fn run(args: ScanArgs) -> i32 {
     }
 
     // Crawl packages
-    let npm_crawler = NpmCrawler;
-    let python_crawler = PythonCrawler;
+    let (all_crawled, eco_counts) = crawl_all_ecosystems(&crawler_options).await;
 
-    let npm_packages = npm_crawler.crawl_all(&crawler_options).await;
-    let python_packages = python_crawler.crawl_all(&crawler_options).await;
-
-    let mut all_purls: Vec<String> = Vec::new();
-    for pkg in &npm_packages {
-        all_purls.push(pkg.purl.clone());
-    }
-    for pkg in &python_packages {
-        all_purls.push(pkg.purl.clone());
-    }
-
+    let all_purls: Vec<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
-    let npm_count = npm_packages.len();
-    let python_count = python_packages.len();
 
     if package_count == 0 {
         if !args.json {
@@ -116,18 +105,22 @@ pub async fn run(args: ScanArgs) -> i32 {
         } else if args.global || args.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
-            println!("No packages found. Run npm/yarn/pnpm/pip install first.");
+            #[cfg(feature = "cargo")]
+            let install_cmds = "npm/yarn/pnpm/pip/cargo";
+            #[cfg(not(feature = "cargo"))]
+            let install_cmds = "npm/yarn/pnpm/pip";
+            println!("No packages found. Run {install_cmds} install first.");
         }
         return 0;
     }
 
     // Build ecosystem summary
     let mut eco_parts = Vec::new();
-    if npm_count > 0 {
-        eco_parts.push(format!("{npm_count} npm"));
-    }
-    if python_count > 0 {
-        eco_parts.push(format!("{python_count} python"));
+    for eco in Ecosystem::all() {
+        let count = eco_counts.get(eco).copied().unwrap_or(0);
+        if count > 0 {
+            eco_parts.push(format!("{count} {}", eco.display_name()));
+        }
     }
     let eco_summary = if eco_parts.is_empty() {
         String::new()

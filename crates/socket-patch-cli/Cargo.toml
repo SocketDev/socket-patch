@@ -22,6 +22,10 @@ uuid = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
 
+[features]
+default = []
+cargo = ["socket-patch-core/cargo"]
+
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }

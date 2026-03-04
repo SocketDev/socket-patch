@@ -4,15 +4,15 @@ use socket_patch_core::api::blob_fetcher::{
 };
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::crawlers::{CrawlerOptions, NpmCrawler, PythonCrawler};
+use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult};
-use socket_patch_core::utils::global_packages::get_global_prefix;
-use socket_patch_core::utils::purl::{is_pypi_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 
 #[derive(Args)]
 pub struct RollbackArgs {
@@ -330,17 +330,8 @@ async fn rollback_patches_inner(
 
     // Partition PURLs by ecosystem
     let rollback_purls: Vec<String> = patches_to_rollback.iter().map(|p| p.purl.clone()).collect();
-    let mut npm_purls: Vec<String> = rollback_purls.iter().filter(|p| !is_pypi_purl(p)).cloned().collect();
-    let mut pypi_purls: Vec<String> = rollback_purls.iter().filter(|p| is_pypi_purl(p)).cloned().collect();
-
-    if let Some(ref ecosystems) = args.ecosystems {
-        if !ecosystems.iter().any(|e| e == "npm") {
-            npm_purls.clear();
-        }
-        if !ecosystems.iter().any(|e| e == "pypi") {
-            pypi_purls.clear();
-        }
-    }
+    let partitioned =
+        partition_purls(&rollback_purls, args.ecosystems.as_deref());
 
     let crawler_options = CrawlerOptions {
         cwd: args.cwd.clone(),
@@ -349,70 +340,8 @@ async fn rollback_patches_inner(
         batch_size: 100,
     };
 
-    let mut all_packages: HashMap<String, PathBuf> = HashMap::new();
-
-    // Find npm packages
-    if !npm_purls.is_empty() {
-        if args.global || args.global_prefix.is_some() {
-            match get_global_prefix(args.global_prefix.as_ref().map(|p| p.to_str().unwrap_or(""))) {
-                Ok(prefix) => {
-                    if !args.silent {
-                        println!("Using global npm packages at: {prefix}");
-                    }
-                    let npm_crawler = NpmCrawler;
-                    if let Ok(packages) = npm_crawler.find_by_purls(Path::new(&prefix), &npm_purls).await {
-                        for (purl, pkg) in packages {
-                            all_packages.entry(purl).or_insert(pkg.path);
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !args.silent {
-                        eprintln!("Failed to find global npm packages: {e}");
-                    }
-                    return Ok((false, Vec::new()));
-                }
-            }
-        } else {
-            let npm_crawler = NpmCrawler;
-            if let Ok(nm_paths) = npm_crawler.get_node_modules_paths(&crawler_options).await {
-                for nm_path in &nm_paths {
-                    if let Ok(packages) = npm_crawler.find_by_purls(nm_path, &npm_purls).await {
-                        for (purl, pkg) in packages {
-                            all_packages.entry(purl).or_insert(pkg.path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Find Python packages
-    if !pypi_purls.is_empty() {
-        let python_crawler = PythonCrawler;
-        let base_pypi_purls: Vec<String> = pypi_purls
-            .iter()
-            .map(|p| strip_purl_qualifiers(p).to_string())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        if let Ok(sp_paths) = python_crawler.get_site_packages_paths(&crawler_options).await {
-            for sp_path in &sp_paths {
-                if let Ok(packages) = python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
-                    for (base_purl, pkg) in packages {
-                        for qualified_purl in &pypi_purls {
-                            if strip_purl_qualifiers(qualified_purl) == base_purl
-                                && !all_packages.contains_key(qualified_purl)
-                            {
-                                all_packages.insert(qualified_purl.clone(), pkg.path.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let all_packages =
+        find_packages_for_rollback(&partitioned, &crawler_options, args.silent).await;
 
     if all_packages.is_empty() {
         if !args.silent {

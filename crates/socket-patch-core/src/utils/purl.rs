@@ -64,8 +64,36 @@ pub fn parse_npm_purl(purl: &str) -> Option<(Option<&str>, &str, &str)> {
     }
 }
 
+/// Check if a PURL is a Cargo/Rust crate.
+#[cfg(feature = "cargo")]
+pub fn is_cargo_purl(purl: &str) -> bool {
+    purl.starts_with("pkg:cargo/")
+}
+
+/// Parse a Cargo PURL to extract name and version.
+///
+/// e.g., `"pkg:cargo/serde@1.0.200"` -> `Some(("serde", "1.0.200"))`
+#[cfg(feature = "cargo")]
+pub fn parse_cargo_purl(purl: &str) -> Option<(&str, &str)> {
+    let base = strip_purl_qualifiers(purl);
+    let rest = base.strip_prefix("pkg:cargo/")?;
+    let at_idx = rest.rfind('@')?;
+    let name = &rest[..at_idx];
+    let version = &rest[at_idx + 1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name, version))
+}
+
+/// Build a Cargo PURL from components.
+#[cfg(feature = "cargo")]
+pub fn build_cargo_purl(name: &str, version: &str) -> String {
+    format!("pkg:cargo/{name}@{version}")
+}
+
 /// Parse a PURL into ecosystem, package directory path, and version.
-/// Supports both npm and pypi PURLs.
+/// Supports npm, pypi, and (with `cargo` feature) cargo PURLs.
 pub fn parse_purl(purl: &str) -> Option<(&str, String, &str)> {
     let base = strip_purl_qualifiers(purl);
     if let Some(rest) = base.strip_prefix("pkg:npm/") {
@@ -85,6 +113,16 @@ pub fn parse_purl(purl: &str) -> Option<(&str, String, &str)> {
         }
         Some(("pypi", name.to_string(), version))
     } else {
+        #[cfg(feature = "cargo")]
+        if let Some(rest) = base.strip_prefix("pkg:cargo/") {
+            let at_idx = rest.rfind('@')?;
+            let name = &rest[..at_idx];
+            let version = &rest[at_idx + 1..];
+            if name.is_empty() || version.is_empty() {
+                return None;
+            }
+            return Some(("cargo", name.to_string(), version));
+        }
         None
     }
 }
@@ -207,5 +245,56 @@ mod tests {
             build_pypi_purl("requests", "2.28.0"),
             "pkg:pypi/requests@2.28.0"
         );
+    }
+
+    #[cfg(feature = "cargo")]
+    #[test]
+    fn test_is_cargo_purl() {
+        assert!(is_cargo_purl("pkg:cargo/serde@1.0.200"));
+        assert!(!is_cargo_purl("pkg:npm/lodash@4.17.21"));
+        assert!(!is_cargo_purl("pkg:pypi/requests@2.28.0"));
+    }
+
+    #[cfg(feature = "cargo")]
+    #[test]
+    fn test_parse_cargo_purl() {
+        assert_eq!(
+            parse_cargo_purl("pkg:cargo/serde@1.0.200"),
+            Some(("serde", "1.0.200"))
+        );
+        assert_eq!(
+            parse_cargo_purl("pkg:cargo/serde_json@1.0.120"),
+            Some(("serde_json", "1.0.120"))
+        );
+        assert_eq!(parse_cargo_purl("pkg:npm/lodash@4.17.21"), None);
+        assert_eq!(parse_cargo_purl("pkg:cargo/@1.0.0"), None);
+        assert_eq!(parse_cargo_purl("pkg:cargo/serde@"), None);
+    }
+
+    #[cfg(feature = "cargo")]
+    #[test]
+    fn test_build_cargo_purl() {
+        assert_eq!(
+            build_cargo_purl("serde", "1.0.200"),
+            "pkg:cargo/serde@1.0.200"
+        );
+    }
+
+    #[cfg(feature = "cargo")]
+    #[test]
+    fn test_cargo_purl_round_trip() {
+        let purl = build_cargo_purl("tokio", "1.38.0");
+        let (name, version) = parse_cargo_purl(&purl).unwrap();
+        assert_eq!(name, "tokio");
+        assert_eq!(version, "1.38.0");
+    }
+
+    #[cfg(feature = "cargo")]
+    #[test]
+    fn test_parse_purl_cargo() {
+        let (eco, dir, ver) = parse_purl("pkg:cargo/serde@1.0.200").unwrap();
+        assert_eq!(eco, "cargo");
+        assert_eq!(dir, "serde");
+        assert_eq!(ver, "1.0.200");
     }
 }
