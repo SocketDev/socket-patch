@@ -27,9 +27,9 @@ impl Ecosystem {
             return Some(Ecosystem::Cargo);
         }
         if purl.starts_with("pkg:npm/") {
-            return Some(Ecosystem::Npm)
+            Some(Ecosystem::Npm)
         } else if purl.starts_with("pkg:pypi/") {
-            return Some(Ecosystem::Pypi)
+            Some(Ecosystem::Pypi)
         } else {
             None
         }
