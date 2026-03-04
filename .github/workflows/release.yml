@@ -107,6 +107,9 @@ jobs:
   cargo-publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -116,17 +119,16 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+
       - name: Publish socket-patch-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p socket-patch-core
 
       - name: Wait for crates.io index update
         run: sleep 30
 
       - name: Publish socket-patch-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p socket-patch-cli
 
   npm-publish:
