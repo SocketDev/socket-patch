@@ -517,6 +517,60 @@ fn test_pypi_global_lifecycle() {
     );
 }
 
+/// `get --save-only` should save the patch to the manifest without applying.
+#[test]
+#[ignore]
+fn test_pypi_save_only() {
+    if !has_python3() {
+        eprintln!("SKIP: python3 not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    setup_venv(cwd);
+
+    let site_packages = find_site_packages(cwd);
+    let messages_py = site_packages.join("pydantic_ai/messages.py");
+    assert!(messages_py.exists());
+    let original_hash = git_sha256_file(&messages_py);
+
+    // Download with --save-only.
+    assert_run_ok(cwd, &["get", PYPI_UUID, "--save-only"], "get --save-only");
+
+    // File should be unchanged.
+    assert_eq!(
+        git_sha256_file(&messages_py),
+        original_hash,
+        "file should not change after get --save-only"
+    );
+
+    // Manifest should exist with the patch.
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after get --save-only");
+
+    let (purl, _) = read_patch_files(&manifest_path);
+    assert!(
+        purl.starts_with(PYPI_PURL_PREFIX),
+        "manifest should contain a pydantic-ai patch"
+    );
+
+    // Real apply should work.
+    assert_run_ok(cwd, &["apply"], "apply");
+
+    let (_, files_value) = read_patch_files(&manifest_path);
+    let files = files_value.as_object().unwrap();
+    let after_hash = files["pydantic_ai/messages.py"]["afterHash"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        git_sha256_file(&messages_py),
+        after_hash,
+        "file should match afterHash after apply"
+    );
+}
+
 /// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
 #[test]
 #[ignore]

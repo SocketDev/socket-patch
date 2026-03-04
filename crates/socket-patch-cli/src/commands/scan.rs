@@ -53,13 +53,10 @@ pub async fn run(args: ScanArgs) -> i32 {
         std::env::set_var("SOCKET_API_TOKEN", token);
     }
 
-    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
+    let (api_client, _use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
 
-    let effective_org_slug: Option<&str> = if use_public_proxy {
-        None
-    } else {
-        None // org slug is already stored in the client
-    };
+    // org slug is already stored in the client
+    let effective_org_slug: Option<&str> = None;
 
     let crawler_options = CrawlerOptions {
         cwd: args.cwd.clone(),
