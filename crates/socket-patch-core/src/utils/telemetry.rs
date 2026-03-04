@@ -470,20 +470,35 @@ pub async fn track_patch_rollback_failed(
 mod tests {
     use super::*;
 
+    /// Combined into a single test to avoid env-var races across parallel tests.
     #[test]
-    fn test_is_telemetry_disabled_default() {
+    fn test_is_telemetry_disabled() {
+        // Save originals
+        let orig_disabled = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+        let orig_vitest = std::env::var("VITEST").ok();
+
+        // Default: not disabled
         std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
         std::env::remove_var("VITEST");
         assert!(!is_telemetry_disabled());
-    }
 
-    #[test]
-    fn test_is_telemetry_disabled_when_set() {
+        // Disabled via "1"
         std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "1");
         assert!(is_telemetry_disabled());
+
+        // Disabled via "true"
         std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "true");
         assert!(is_telemetry_disabled());
-        std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+
+        // Restore originals
+        match orig_disabled {
+            Some(v) => std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v),
+            None => std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED"),
+        }
+        match orig_vitest {
+            Some(v) => std::env::set_var("VITEST", v),
+            None => std::env::remove_var("VITEST"),
+        }
     }
 
     #[test]
