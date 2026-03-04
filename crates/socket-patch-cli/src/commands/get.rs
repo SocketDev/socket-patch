@@ -550,13 +550,14 @@ async fn save_and_apply_patch(
     // Build and save patch record
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
-        if let (Some(ref before), Some(ref after)) =
-            (&file_info.before_hash, &file_info.after_hash)
-        {
+        if let Some(ref after) = file_info.after_hash {
             files.insert(
                 file_path.clone(),
                 PatchFileInfo {
-                    before_hash: before.clone(),
+                    before_hash: file_info
+                        .before_hash
+                        .clone()
+                        .unwrap_or_default(),
                     after_hash: after.clone(),
                 },
             );
@@ -566,6 +567,16 @@ async fn save_and_apply_patch(
         {
             if let Ok(decoded) = base64_decode(blob_content) {
                 tokio::fs::write(blobs_dir.join(after_hash), &decoded)
+                    .await
+                    .ok();
+            }
+        }
+        // Also store beforeHash blob if present (needed for rollback)
+        if let (Some(ref before_blob), Some(ref before_hash)) =
+            (&file_info.before_blob_content, &file_info.before_hash)
+        {
+            if let Ok(decoded) = base64_decode(before_blob) {
+                tokio::fs::write(blobs_dir.join(before_hash), &decoded)
                     .await
                     .ok();
             }

@@ -60,8 +60,21 @@ pub async fn verify_file_patch(
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
 
+    let is_new_file = file_info.before_hash.is_empty();
+
     // Check if file exists
     if tokio::fs::metadata(&filepath).await.is_err() {
+        // New files (empty beforeHash) are expected to not exist yet.
+        if is_new_file {
+            return VerifyResult {
+                file: file_name.to_string(),
+                status: VerifyStatus::Ready,
+                message: None,
+                current_hash: None,
+                expected_hash: None,
+                target_hash: Some(file_info.after_hash.clone()),
+            };
+        }
         return VerifyResult {
             file: file_name.to_string(),
             status: VerifyStatus::NotFound,
@@ -99,6 +112,19 @@ pub async fn verify_file_patch(
         };
     }
 
+    // New files (empty beforeHash) with existing content that doesn't match
+    // afterHash: treat as Ready (force overwrite).
+    if is_new_file {
+        return VerifyResult {
+            file: file_name.to_string(),
+            status: VerifyStatus::Ready,
+            message: None,
+            current_hash: Some(current_hash),
+            expected_hash: None,
+            target_hash: Some(file_info.after_hash.clone()),
+        };
+    }
+
     // Check if matches expected before hash
     if current_hash != file_info.before_hash {
         return VerifyResult {
@@ -131,6 +157,11 @@ pub async fn apply_file_patch(
 ) -> Result<(), std::io::Error> {
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
+
+    // Create parent directories if needed (e.g., new files added by a patch)
+    if let Some(parent) = filepath.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
 
     // Write the patched content
     tokio::fs::write(&filepath, patched_content).await?;

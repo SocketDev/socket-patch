@@ -66,6 +66,44 @@ pub async fn verify_file_rollback(
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
 
+    let is_new_file = file_info.before_hash.is_empty();
+
+    // For new files (empty beforeHash), rollback means deleting the file.
+    if is_new_file {
+        if tokio::fs::metadata(&filepath).await.is_err() {
+            // File already doesn't exist — already rolled back.
+            return VerifyRollbackResult {
+                file: file_name.to_string(),
+                status: VerifyRollbackStatus::AlreadyOriginal,
+                message: None,
+                current_hash: None,
+                expected_hash: None,
+                target_hash: None,
+            };
+        }
+        let current_hash = compute_file_git_sha256(&filepath).await.unwrap_or_default();
+        if current_hash == file_info.after_hash {
+            return VerifyRollbackResult {
+                file: file_name.to_string(),
+                status: VerifyRollbackStatus::Ready,
+                message: None,
+                current_hash: Some(current_hash),
+                expected_hash: None,
+                target_hash: None,
+            };
+        }
+        return VerifyRollbackResult {
+            file: file_name.to_string(),
+            status: VerifyRollbackStatus::HashMismatch,
+            message: Some(
+                "File has been modified after patching. Cannot safely rollback.".to_string(),
+            ),
+            current_hash: Some(current_hash),
+            expected_hash: Some(file_info.after_hash.clone()),
+            target_hash: None,
+        };
+    }
+
     // Check if file exists
     if tokio::fs::metadata(&filepath).await.is_err() {
         return VerifyRollbackResult {
@@ -246,6 +284,18 @@ pub async fn rollback_package_patch(
             if vr.status == VerifyRollbackStatus::AlreadyOriginal {
                 continue;
             }
+        }
+
+        // New files (empty beforeHash): delete instead of restoring.
+        if file_info.before_hash.is_empty() {
+            let normalized = normalize_file_path(file_name);
+            let filepath = pkg_path.join(normalized);
+            if let Err(e) = tokio::fs::remove_file(&filepath).await {
+                result.error = Some(format!("Failed to delete {}: {}", file_name, e));
+                return result;
+            }
+            result.files_rolled_back.push(file_name.clone());
+            continue;
         }
 
         // Read original content from blobs
