@@ -19,6 +19,10 @@ uuid = { workspace = true }
 regex = { workspace = true }
 once_cell = { workspace = true }
 
+[features]
+default = []
+cargo = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }

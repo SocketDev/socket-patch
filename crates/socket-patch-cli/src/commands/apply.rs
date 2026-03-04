@@ -4,14 +4,16 @@ use socket_patch_core::api::blob_fetcher::{
 };
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::crawlers::{CrawlerOptions, NpmCrawler, PythonCrawler};
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::{apply_package_patch, verify_file_patch, ApplyResult};
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
-use socket_patch_core::utils::purl::{is_npm_purl, is_pypi_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
 #[derive(Args)]
 pub struct ApplyArgs {
@@ -173,18 +175,8 @@ async fn apply_patches_inner(
 
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let mut npm_purls: Vec<String> = manifest_purls.iter().filter(|p| is_npm_purl(p)).cloned().collect();
-    let mut pypi_purls: Vec<String> = manifest_purls.iter().filter(|p| is_pypi_purl(p)).cloned().collect();
-
-    // Filter by ecosystem if specified
-    if let Some(ref ecosystems) = args.ecosystems {
-        if !ecosystems.iter().any(|e| e == "npm") {
-            npm_purls.clear();
-        }
-        if !ecosystems.iter().any(|e| e == "pypi") {
-            pypi_purls.clear();
-        }
-    }
+    let partitioned =
+        partition_purls(&manifest_purls, args.ecosystems.as_deref());
 
     let crawler_options = CrawlerOptions {
         cwd: args.cwd.clone(),
@@ -193,63 +185,12 @@ async fn apply_patches_inner(
         batch_size: 100,
     };
 
-    let mut all_packages: HashMap<String, PathBuf> = HashMap::new();
+    let all_packages =
+        find_packages_for_purls(&partitioned, &crawler_options, args.silent).await;
 
-    // Find npm packages
-    if !npm_purls.is_empty() {
-        let npm_crawler = NpmCrawler;
-        match npm_crawler.get_node_modules_paths(&crawler_options).await {
-            Ok(nm_paths) => {
-                if (args.global || args.global_prefix.is_some()) && !args.silent {
-                    if let Some(first) = nm_paths.first() {
-                        println!("Using global npm packages at: {}", first.display());
-                    }
-                }
-                for nm_path in &nm_paths {
-                    if let Ok(packages) = npm_crawler.find_by_purls(nm_path, &npm_purls).await {
-                        for (purl, pkg) in packages {
-                            all_packages.entry(purl).or_insert(pkg.path);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if !args.silent {
-                    eprintln!("Failed to find npm packages: {e}");
-                }
-            }
-        }
-    }
+    let has_any_purls = !partitioned.is_empty();
 
-    // Find Python packages
-    if !pypi_purls.is_empty() {
-        let python_crawler = PythonCrawler;
-        let base_pypi_purls: Vec<String> = pypi_purls
-            .iter()
-            .map(|p| strip_purl_qualifiers(p).to_string())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        match python_crawler.get_site_packages_paths(&crawler_options).await {
-            Ok(sp_paths) => {
-                for sp_path in &sp_paths {
-                    if let Ok(packages) = python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
-                        for (purl, pkg) in packages {
-                            all_packages.entry(purl).or_insert(pkg.path);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if !args.silent {
-                    eprintln!("Failed to find Python packages: {e}");
-                }
-            }
-        }
-    }
-
-    if all_packages.is_empty() && npm_purls.is_empty() && pypi_purls.is_empty() {
+    if all_packages.is_empty() && !has_any_purls {
         if !args.silent {
             if args.global || args.global_prefix.is_some() {
                 eprintln!("No global packages found");
@@ -271,20 +212,22 @@ async fn apply_patches_inner(
     let mut results: Vec<ApplyResult> = Vec::new();
     let mut has_errors = false;
 
-    // Group pypi PURLs by base
+    // Group pypi PURLs by base (for variant matching with qualifiers)
     let mut pypi_qualified_groups: HashMap<String, Vec<String>> = HashMap::new();
-    for purl in &pypi_purls {
-        let base = strip_purl_qualifiers(purl).to_string();
-        pypi_qualified_groups
-            .entry(base)
-            .or_default()
-            .push(purl.clone());
+    if let Some(pypi_purls) = partitioned.get(&Ecosystem::Pypi) {
+        for purl in pypi_purls {
+            let base = strip_purl_qualifiers(purl).to_string();
+            pypi_qualified_groups
+                .entry(base)
+                .or_default()
+                .push(purl.clone());
+        }
     }
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
     for (purl, pkg_path) in &all_packages {
-        if is_pypi_purl(purl) {
+        if Ecosystem::from_purl(purl) == Some(Ecosystem::Pypi) {
             let base_purl = strip_purl_qualifiers(purl).to_string();
             if applied_base_purls.contains(&base_purl) {
                 continue;

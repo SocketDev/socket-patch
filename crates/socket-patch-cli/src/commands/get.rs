@@ -2,7 +2,7 @@ use clap::Args;
 use regex::Regex;
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::api::types::{PatchSearchResult, SearchResponse};
-use socket_patch_core::crawlers::{CrawlerOptions, NpmCrawler, PythonCrawler};
+use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
@@ -12,6 +12,8 @@ use socket_patch_core::utils::purl::is_purl;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+use crate::ecosystem_dispatch::crawl_all_ecosystems;
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -236,18 +238,17 @@ pub async fn run(args: GetArgs) -> i32 {
                 global_prefix: args.global_prefix.clone(),
                 batch_size: 100,
             };
-            let npm_crawler = NpmCrawler;
-            let python_crawler = PythonCrawler;
-            let npm_packages = npm_crawler.crawl_all(&crawler_options).await;
-            let python_packages = python_crawler.crawl_all(&crawler_options).await;
-            let mut all_packages = npm_packages;
-            all_packages.extend(python_packages);
+            let (all_packages, _) = crawl_all_ecosystems(&crawler_options).await;
 
             if all_packages.is_empty() {
                 if args.global {
                     println!("No global packages found.");
                 } else {
-                    println!("No packages found. Run npm/yarn/pnpm/pip install first.");
+                    #[cfg(feature = "cargo")]
+                    let install_cmds = "npm/yarn/pnpm/pip/cargo";
+                    #[cfg(not(feature = "cargo"))]
+                    let install_cmds = "npm/yarn/pnpm/pip";
+                    println!("No packages found. Run {install_cmds} install first.");
                 }
                 return 0;
             }
