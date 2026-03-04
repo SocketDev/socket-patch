@@ -57,8 +57,8 @@ pub struct GetArgs {
     pub api_token: Option<String>,
 
     /// Download patch without applying it
-    #[arg(long = "no-apply", default_value_t = false)]
-    pub no_apply: bool,
+    #[arg(long = "save-only", alias = "no-apply", default_value_t = false)]
+    pub save_only: bool,
 
     /// Apply patch to globally installed npm packages
     #[arg(short = 'g', long, default_value_t = false)]
@@ -110,8 +110,8 @@ pub async fn run(args: GetArgs) -> i32 {
         eprintln!("Error: Only one of --id, --cve, --ghsa, or --package can be specified");
         return 1;
     }
-    if args.one_off && args.no_apply {
-        eprintln!("Error: --one-off and --no-apply cannot be used together");
+    if args.one_off && args.save_only {
+        eprintln!("Error: --one-off and --save-only cannot be used together");
         return 1;
     }
 
@@ -125,11 +125,8 @@ pub async fn run(args: GetArgs) -> i32 {
 
     let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
 
-    let effective_org_slug: Option<&str> = if use_public_proxy {
-        None
-    } else {
-        None // org slug is already stored in the client
-    };
+    // org slug is already stored in the client
+    let effective_org_slug: Option<&str> = None;
 
     // Determine identifier type
     let id_type = if args.id {
@@ -438,8 +435,8 @@ pub async fn run(args: GetArgs) -> i32 {
         println!("  Failed: {patches_failed}");
     }
 
-    // Auto-apply unless --no-apply
-    if !args.no_apply && patches_added > 0 {
+    // Auto-apply unless --save-only
+    if !args.save_only && patches_added > 0 {
         println!("\nApplying patches...");
         let apply_args = super::apply::ApplyArgs {
             cwd: args.cwd.clone(),
@@ -450,6 +447,7 @@ pub async fn run(args: GetArgs) -> i32 {
             global: args.global,
             global_prefix: args.global_prefix.clone(),
             ecosystems: None,
+            force: false,
         };
         let code = super::apply::run(apply_args).await;
         if code != 0 {
@@ -621,7 +619,7 @@ async fn save_and_apply_patch(
         println!("  Skipped: 1 (already exists)");
     }
 
-    if !args.no_apply {
+    if !args.save_only {
         println!("\nApplying patches...");
         let apply_args = super::apply::ApplyArgs {
             cwd: args.cwd.clone(),
@@ -632,6 +630,7 @@ async fn save_and_apply_patch(
             global: args.global,
             global_prefix: args.global_prefix.clone(),
             ecosystems: None,
+            force: false,
         };
         let code = super::apply::run(apply_args).await;
         if code != 0 {

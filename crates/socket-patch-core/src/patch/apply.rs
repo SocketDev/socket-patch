@@ -193,6 +193,7 @@ pub async fn apply_package_patch(
     files: &HashMap<String, PatchFileInfo>,
     blobs_path: &Path,
     dry_run: bool,
+    force: bool,
 ) -> ApplyResult {
     let mut result = ApplyResult {
         package_key: package_key.to_string(),
@@ -205,32 +206,46 @@ pub async fn apply_package_patch(
 
     // First, verify all files
     for (file_name, file_info) in files {
-        let verify_result = verify_file_patch(pkg_path, file_name, file_info).await;
+        let mut verify_result = verify_file_patch(pkg_path, file_name, file_info).await;
 
-        // If any file is not ready or already patched, we can't proceed
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
         {
-            let msg = verify_result
-                .message
-                .clone()
-                .unwrap_or_else(|| format!("{:?}", verify_result.status));
-            result.error = Some(format!(
-                "Cannot apply patch: {} - {}",
-                verify_result.file, msg
-            ));
-            result.files_verified.push(verify_result);
-            return result;
+            if force {
+                match verify_result.status {
+                    VerifyStatus::HashMismatch => {
+                        // Force: treat hash mismatch as ready
+                        verify_result.status = VerifyStatus::Ready;
+                    }
+                    VerifyStatus::NotFound => {
+                        // Force: skip files that don't exist (non-new files)
+                        result.files_verified.push(verify_result);
+                        continue;
+                    }
+                    _ => {}
+                }
+            } else {
+                let msg = verify_result
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", verify_result.status));
+                result.error = Some(format!(
+                    "Cannot apply patch: {} - {}",
+                    verify_result.file, msg
+                ));
+                result.files_verified.push(verify_result);
+                return result;
+            }
         }
 
         result.files_verified.push(verify_result);
     }
 
-    // Check if all files are already patched
+    // Check if all files are already patched (or skipped due to NotFound with force)
     let all_patched = result
         .files_verified
         .iter()
-        .all(|v| v.status == VerifyStatus::AlreadyPatched);
+        .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
     if all_patched {
         result.success = true;
         return result;
@@ -246,7 +261,9 @@ pub async fn apply_package_patch(
     for (file_name, file_info) in files {
         let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
         if let Some(vr) = verify_result {
-            if vr.status == VerifyStatus::AlreadyPatched {
+            if vr.status == VerifyStatus::AlreadyPatched
+                || vr.status == VerifyStatus::NotFound
+            {
                 continue;
             }
         }
@@ -455,7 +472,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
                 .await;
 
         assert!(result.success);
@@ -485,7 +502,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), true)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), true, false)
                 .await;
 
         assert!(result.success);
@@ -518,7 +535,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
                 .await;
 
         assert!(result.success);
@@ -544,10 +561,87 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
                 .await;
 
         assert!(!result.success);
         assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_apply_package_patch_force_hash_mismatch() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let patched = b"patched content";
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        // Write a file whose hash does NOT match before_hash
+        tokio::fs::write(pkg_dir.path().join("index.js"), b"something unexpected")
+            .await
+            .unwrap();
+
+        // Write blob
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: after_hash.clone(),
+            },
+        );
+
+        // Without force: should fail
+        let result =
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+                .await;
+        assert!(!result.success);
+
+        // Reset the file
+        tokio::fs::write(pkg_dir.path().join("index.js"), b"something unexpected")
+            .await
+            .unwrap();
+
+        // With force: should succeed
+        let result =
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, true)
+                .await;
+        assert!(result.success);
+        assert_eq!(result.files_patched.len(), 1);
+
+        let written = tokio::fs::read(pkg_dir.path().join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_package_patch_force_not_found_skips() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "missing.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: "bbbb".to_string(),
+            },
+        );
+
+        // Without force: should fail (NotFound for non-new file)
+        let result =
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+                .await;
+        assert!(!result.success);
+
+        // With force: should succeed by skipping the missing file
+        let result =
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, true)
+                .await;
+        assert!(result.success);
+        assert_eq!(result.files_patched.len(), 0);
     }
 }

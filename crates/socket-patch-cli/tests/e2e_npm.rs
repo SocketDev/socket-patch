@@ -393,6 +393,98 @@ fn test_npm_global_lifecycle() {
     );
 }
 
+/// `get --save-only` should save the patch to the manifest without applying.
+#[test]
+#[ignore]
+fn test_npm_save_only() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
+
+    // Download with --save-only (new name for --no-apply).
+    assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
+
+    // File should still be original.
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "file should not change after get --save-only"
+    );
+
+    // Manifest should exist with the patch.
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after get --save-only");
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let patch = &manifest["patches"][NPM_PURL];
+    assert!(patch.is_object(), "manifest should contain {NPM_PURL}");
+    assert_eq!(patch["uuid"].as_str().unwrap(), NPM_UUID);
+
+    // Real apply should work.
+    assert_run_ok(cwd, &["apply"], "apply");
+    assert_eq!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "file should match afterHash after apply"
+    );
+}
+
+/// `apply --force` should apply patches even when the installed version differs.
+#[test]
+#[ignore]
+fn test_npm_apply_force() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    // Install minimist@1.2.2 first, get the patch, then swap to a different version.
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
+
+    // Save the patch without applying.
+    assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
+
+    // Now reinstall a different version to create a hash mismatch.
+    npm_run(cwd, &["install", "minimist@1.2.5"]);
+
+    let mismatched_hash = git_sha256_file(&index_js);
+    assert_ne!(
+        mismatched_hash, BEFORE_HASH,
+        "minimist@1.2.5 should have a different index.js hash"
+    );
+
+    // Normal apply should fail due to hash mismatch.
+    let (code, _stdout, _stderr) = run(cwd, &["apply"]);
+    assert_ne!(code, 0, "apply without --force should fail on hash mismatch");
+
+    // Apply with --force should succeed.
+    assert_run_ok(cwd, &["apply", "--force"], "apply --force");
+
+    assert_eq!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "index.js should match afterHash after apply --force"
+    );
+}
+
 /// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
 #[test]
 #[ignore]

@@ -48,6 +48,10 @@ pub struct ApplyArgs {
     /// Restrict patching to specific ecosystems
     #[arg(long, value_delimiter = ',')]
     pub ecosystems: Option<Vec<String>>,
+
+    /// Skip pre-application hash verification (apply even if package version differs)
+    #[arg(short = 'f', long, default_value_t = false)]
+    pub force: bool,
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
@@ -246,11 +250,13 @@ async fn apply_patches_inner(
                     None => continue,
                 };
 
-                // Check first file hash match
-                if let Some((file_name, file_info)) = patch.files.iter().next() {
-                    let verify = verify_file_patch(pkg_path, file_name, file_info).await;
-                    if verify.status == socket_patch_core::patch::apply::VerifyStatus::HashMismatch {
-                        continue;
+                // Check first file hash match (skip when --force)
+                if !args.force {
+                    if let Some((file_name, file_info)) = patch.files.iter().next() {
+                        let verify = verify_file_patch(pkg_path, file_name, file_info).await;
+                        if verify.status == socket_patch_core::patch::apply::VerifyStatus::HashMismatch {
+                            continue;
+                        }
                     }
                 }
 
@@ -260,6 +266,7 @@ async fn apply_patches_inner(
                     &patch.files,
                     &blobs_path,
                     args.dry_run,
+                    args.force,
                 )
                 .await;
 
@@ -292,6 +299,7 @@ async fn apply_patches_inner(
                 &patch.files,
                 &blobs_path,
                 args.dry_run,
+                args.force,
             )
             .await;
 
