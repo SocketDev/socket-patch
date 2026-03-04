@@ -440,7 +440,7 @@ fn test_npm_save_only() {
     );
 }
 
-/// `apply --force` should apply patches even when the installed version differs.
+/// `apply --force` should apply patches even when file hashes don't match.
 #[test]
 #[ignore]
 fn test_npm_apply_force() {
@@ -452,7 +452,6 @@ fn test_npm_apply_force() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
 
-    // Install minimist@1.2.2 first, get the patch, then swap to a different version.
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
@@ -462,13 +461,12 @@ fn test_npm_apply_force() {
     // Save the patch without applying.
     assert_run_ok(cwd, &["get", NPM_UUID, "--save-only"], "get --save-only");
 
-    // Now reinstall a different version to create a hash mismatch.
-    npm_run(cwd, &["install", "minimist@1.2.5"]);
-
-    let mismatched_hash = git_sha256_file(&index_js);
+    // Corrupt the file to create a hash mismatch (keep same version so PURL matches).
+    std::fs::write(&index_js, b"// corrupted content\n").unwrap();
     assert_ne!(
-        mismatched_hash, BEFORE_HASH,
-        "minimist@1.2.5 should have a different index.js hash"
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "corrupted file should have a different hash"
     );
 
     // Normal apply should fail due to hash mismatch.

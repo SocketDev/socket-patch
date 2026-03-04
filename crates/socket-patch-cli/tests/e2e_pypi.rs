@@ -594,22 +594,33 @@ fn test_pypi_apply_force() {
     let (_, files_value) = read_patch_files(&manifest_path);
     let files = files_value.as_object().unwrap();
 
-    // Corrupt one of the files to create a hash mismatch.
-    let messages_py = site_packages.join("pydantic_ai/messages.py");
-    let before_hash = files["pydantic_ai/messages.py"]["beforeHash"]
-        .as_str()
-        .unwrap();
+    // Find a file with a non-empty beforeHash (i.e., an existing file, not a new one).
+    let (target_rel, target_before_hash) = files
+        .iter()
+        .filter_map(|(rel_path, info)| {
+            let bh = info["beforeHash"].as_str().unwrap_or("");
+            if !bh.is_empty() {
+                Some((rel_path.clone(), bh.to_string()))
+            } else {
+                None
+            }
+        })
+        .next()
+        .expect("patch should have at least one file with a non-empty beforeHash");
+
+    let target_path = site_packages.join(&target_rel);
     assert_eq!(
-        git_sha256_file(&messages_py),
-        before_hash,
-        "file should match beforeHash before corruption"
+        git_sha256_file(&target_path),
+        target_before_hash,
+        "{target_rel} should match beforeHash before corruption"
     );
 
-    std::fs::write(&messages_py, b"# corrupted content\n").unwrap();
+    // Corrupt the file to create a hash mismatch.
+    std::fs::write(&target_path, b"# corrupted content\n").unwrap();
     assert_ne!(
-        git_sha256_file(&messages_py),
-        before_hash,
-        "file should have a different hash after corruption"
+        git_sha256_file(&target_path),
+        target_before_hash,
+        "{target_rel} should have a different hash after corruption"
     );
 
     // Normal apply should fail due to hash mismatch.
