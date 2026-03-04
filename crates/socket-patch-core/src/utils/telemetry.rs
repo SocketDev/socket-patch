@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_error_message() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/testuser".to_string());
+        let home = home_dir_string().unwrap_or_else(|| "/home/testuser".to_string());
         let msg = format!("Failed to read {home}/projects/secret/file.txt");
         let sanitized = sanitize_error_message(&msg);
         assert!(sanitized.contains("~/projects/secret/file.txt"));

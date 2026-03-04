@@ -740,7 +740,11 @@ mod tests {
     async fn test_crawl_all_python() {
         let dir = tempfile::tempdir().unwrap();
         let venv = dir.path().join(".venv");
-        let sp = venv.join("lib").join("python3.11").join("site-packages");
+        let sp = if cfg!(windows) {
+            venv.join("Lib").join("site-packages")
+        } else {
+            venv.join("lib").join("python3.11").join("site-packages")
+        };
         tokio::fs::create_dir_all(&sp).await.unwrap();
 
         // Create a dist-info dir with METADATA
