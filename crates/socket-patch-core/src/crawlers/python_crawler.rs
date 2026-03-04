@@ -1,8 +1,28 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+
+// ---------------------------------------------------------------------------
+// Python command discovery
+// ---------------------------------------------------------------------------
+
+/// Find a working Python command on the system.
+///
+/// Tries `python3`, `python`, and `py` (Windows launcher) in order,
+/// returning the first one that responds to `--version`.
+pub fn find_python_command() -> Option<&'static str> {
+    ["python3", "python", "py"].into_iter().find(|cmd| {
+        Command::new(cmd)
+            .args(["--version"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
 
 /// Default batch size for crawling.
 const _DEFAULT_BATCH_SIZE: usize = 100;
@@ -215,29 +235,33 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     };
 
     // 1. Ask Python for site-packages
-    if let Ok(output) = Command::new("python3")
-        .args([
-            "-c",
-            "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let p = line.trim();
-                if !p.is_empty() {
-                    add_path(PathBuf::from(p), &mut seen, &mut results);
+    if let Some(python_cmd) = find_python_command() {
+        if let Ok(output) = Command::new(python_cmd)
+            .args([
+                "-c",
+                "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let p = line.trim();
+                    if !p.is_empty() {
+                        add_path(PathBuf::from(p), &mut seen, &mut results);
+                    }
                 }
             }
         }
     }
 
     // 2. Well-known system paths
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "~".to_string());
 
     // Helper closure to scan base/lib/python3.*/[dist|site]-packages
     async fn scan_well_known(
@@ -259,27 +283,29 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    // Debian/Ubuntu
-    scan_well_known(Path::new("/usr"), "dist-packages", &mut seen, &mut results).await;
-    scan_well_known(Path::new("/usr"), "site-packages", &mut seen, &mut results).await;
-    // Debian pip / most distros / macOS
-    scan_well_known(
-        Path::new("/usr/local"),
-        "dist-packages",
-        &mut seen,
-        &mut results,
-    )
-    .await;
-    scan_well_known(
-        Path::new("/usr/local"),
-        "site-packages",
-        &mut seen,
-        &mut results,
-    )
-    .await;
-    // pip --user
-    let user_local = PathBuf::from(&home_dir).join(".local");
-    scan_well_known(&user_local, "site-packages", &mut seen, &mut results).await;
+    if !cfg!(windows) {
+        // Debian/Ubuntu
+        scan_well_known(Path::new("/usr"), "dist-packages", &mut seen, &mut results).await;
+        scan_well_known(Path::new("/usr"), "site-packages", &mut seen, &mut results).await;
+        // Debian pip / most distros / macOS
+        scan_well_known(
+            Path::new("/usr/local"),
+            "dist-packages",
+            &mut seen,
+            &mut results,
+        )
+        .await;
+        scan_well_known(
+            Path::new("/usr/local"),
+            "site-packages",
+            &mut seen,
+            &mut results,
+        )
+        .await;
+        // pip --user on Unix
+        let user_local = PathBuf::from(&home_dir).join(".local");
+        scan_well_known(&user_local, "site-packages", &mut seen, &mut results).await;
+    }
 
     // macOS-specific
     if cfg!(target_os = "macos") {
@@ -311,6 +337,51 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // Windows-specific
+    if cfg!(windows) {
+        // pip --user on Windows: %APPDATA%\Python\PythonXY\site-packages
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let appdata_python = PathBuf::from(&appdata).join("Python");
+            if let Ok(mut entries) = tokio::fs::read_dir(&appdata_python).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let p = appdata_python.join(entry.file_name()).join("site-packages");
+                    if tokio::fs::metadata(&p).await.is_ok() {
+                        add_path(p, &mut seen, &mut results);
+                    }
+                }
+            }
+        }
+        // Common Windows Python install locations
+        for base in &["C:\\Python", "C:\\Program Files\\Python"] {
+            if let Ok(mut entries) = tokio::fs::read_dir(base).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let sp = PathBuf::from(base)
+                        .join(entry.file_name())
+                        .join("Lib")
+                        .join("site-packages");
+                    if tokio::fs::metadata(&sp).await.is_ok() {
+                        add_path(sp, &mut seen, &mut results);
+                    }
+                }
+            }
+        }
+        // Microsoft Store / python.org via LocalAppData
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let programs_python = PathBuf::from(&local).join("Programs").join("Python");
+            if let Ok(mut entries) = tokio::fs::read_dir(&programs_python).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let sp = programs_python
+                        .join(entry.file_name())
+                        .join("Lib")
+                        .join("site-packages");
+                    if tokio::fs::metadata(&sp).await.is_ok() {
+                        add_path(sp, &mut seen, &mut results);
+                    }
+                }
+            }
+        }
+    }
+
     // Conda
     let anaconda = PathBuf::from(&home_dir).join("anaconda3");
     scan_well_known(&anaconda, "site-packages", &mut seen, &mut results).await;
@@ -328,6 +399,16 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
             find_python_dirs(&uv_base, &["*", "lib", "python3.*", "site-packages"]).await;
         for m in uv_matches {
             add_path(m, &mut seen, &mut results);
+        }
+    } else if cfg!(windows) {
+        // %LOCALAPPDATA%\uv\tools
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let uv_base = PathBuf::from(local).join("uv").join("tools");
+            let uv_matches =
+                find_python_dirs(&uv_base, &["*", "Lib", "site-packages"]).await;
+            for m in uv_matches {
+                add_path(m, &mut seen, &mut results);
+            }
         }
     } else {
         let uv_base = PathBuf::from(&home_dir)
@@ -686,6 +767,32 @@ mod tests {
         assert_eq!(packages[0].version, "2.28.0");
         assert_eq!(packages[0].purl, "pkg:pypi/requests@2.28.0");
         assert!(packages[0].namespace.is_none());
+    }
+
+    #[test]
+    fn test_find_python_command() {
+        // On any platform with Python installed, this should return Some
+        // In CI environments, Python is typically available
+        let cmd = find_python_command();
+        // We don't assert Some because Python may not be installed,
+        // but if it is, the command should be valid
+        if let Some(c) = cmd {
+            assert!(
+                ["python3", "python", "py"].contains(&c),
+                "unexpected command: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_home_dir_detection() {
+        // Verify the fallback chain works: HOME -> USERPROFILE -> "~"
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "~".to_string());
+        // On any CI or dev machine, we should get a real path, not "~"
+        assert_ne!(home, "~", "expected a real home directory");
+        assert!(!home.is_empty());
     }
 
     #[tokio::test]
