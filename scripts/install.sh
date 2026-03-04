@@ -23,6 +23,8 @@ case "$OS" in
     case "$ARCH" in
       x86_64)  TARGET="x86_64-unknown-linux-musl" ;;
       aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+      armv7l)  TARGET="arm-unknown-linux-gnueabihf" ;;
+      i686)    TARGET="i686-unknown-linux-gnu" ;;
       *)       echo "Error: unsupported architecture: $ARCH" >&2; exit 1 ;;
     esac
     ;;

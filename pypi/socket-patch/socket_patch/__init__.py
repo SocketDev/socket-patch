@@ -1,23 +1,20 @@
 import os
 import sys
 import subprocess
-import platform
-
-BINARIES = {
-    ("darwin", "arm64"): "socket-patch-darwin-arm64",
-    ("darwin", "x86_64"): "socket-patch-darwin-x64",
-    ("linux", "x86_64"): "socket-patch-linux-x64",
-    ("linux", "aarch64"): "socket-patch-linux-arm64",
-    ("win32", "amd64"): "socket-patch-win32-x64.exe",
-}
 
 
 def main():
-    machine = platform.machine().lower()
-    key = (sys.platform, machine)
-    bin_name = BINARIES.get(key)
-    if not bin_name:
-        print(f"Unsupported platform: {sys.platform} {machine}", file=sys.stderr)
+    bin_dir = os.path.join(os.path.dirname(__file__), "bin")
+    try:
+        entries = os.listdir(bin_dir)
+    except OSError:
+        entries = []
+    bins = [e for e in entries if e.startswith("socket-patch")]
+    if len(bins) != 1:
+        print(
+            f"Expected exactly one socket-patch binary in {bin_dir}, found {len(bins)}",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    bin_path = os.path.join(os.path.dirname(__file__), "bin", bin_name)
+    bin_path = os.path.join(bin_dir, bins[0])
     raise SystemExit(subprocess.call([bin_path] + sys.argv[1:]))

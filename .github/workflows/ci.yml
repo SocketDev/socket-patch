@@ -40,6 +40,28 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  dispatch-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Run npm dispatch tests
+        run: node --test npm/socket-patch/bin/socket-patch.test.mjs
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Run pypi dispatch tests
+        run: python pypi/socket-patch/test_dispatch.py
+
   e2e:
     needs: test
     strategy:

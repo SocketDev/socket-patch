@@ -80,6 +80,26 @@ jobs:
             runner: windows-latest
             archive: zip
             build-tool: cargo
+          - target: i686-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+          - target: aarch64-linux-android
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: arm-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: i686-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -213,8 +233,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22'
+
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Stage binaries
         run: |
@@ -227,16 +249,24 @@ jobs:
           mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-x64
           tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
           mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm64
+          tar xzf artifacts/socket-patch-arm-unknown-linux-gnueabihf.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm
+          tar xzf artifacts/socket-patch-i686-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-ia32
+          tar xzf artifacts/socket-patch-aarch64-linux-android.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-android-arm64
           cd npm/socket-patch/bin
           unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
           mv socket-patch.exe socket-patch-win32-x64.exe
+          unzip ../../../artifacts/socket-patch-i686-pc-windows-msvc.zip
+          mv socket-patch.exe socket-patch-win32-ia32.exe
+          unzip ../../../artifacts/socket-patch-aarch64-pc-windows-msvc.zip
+          mv socket-patch.exe socket-patch-win32-arm64.exe
 
       - name: Copy README for npm package
         run: cp README.md npm/socket-patch/README.md
 
       - name: Publish package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish ./npm/socket-patch --provenance --access public
 
   pypi-publish:
@@ -262,38 +292,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install build tools
-        run: pip install build
-
-      - name: Stage binaries
+      - name: Build platform wheels
         run: |
-          mkdir -p pypi/socket-patch/socket_patch/bin
-          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C pypi/socket-patch/socket_patch/bin/
-          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-darwin-arm64
-          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C pypi/socket-patch/socket_patch/bin/
-          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-darwin-x64
-          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C pypi/socket-patch/socket_patch/bin/
-          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-linux-x64
-          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C pypi/socket-patch/socket_patch/bin/
-          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-linux-arm64
-          cd pypi/socket-patch/socket_patch/bin
-          unzip ../../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
-          mv socket-patch.exe socket-patch-win32-x64.exe
-
-      - name: Set executable permissions
-        run: |
-          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-darwin-arm64
-          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-darwin-x64
-          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-x64
-          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-arm64
-
-      - name: Copy README for PyPI package
-        run: cp README.md pypi/socket-patch/README.md
-
-      - name: Build package
-        run: python -m build pypi/socket-patch
+          VERSION="${{ needs.sync-and-tag.outputs.version }}"
+          python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
-          packages-dir: pypi/socket-patch/dist/
+          packages-dir: dist/
