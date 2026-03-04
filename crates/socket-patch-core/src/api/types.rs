@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Organization info returned by the `/v0/organizations` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrganizationInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub image: Option<String>,
+    pub plan: String,
+    pub slug: String,
+}
+
+/// Response from `GET /v0/organizations`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrganizationsResponse {
+    pub organizations: HashMap<String, OrganizationInfo>,
+}
+
 /// Full patch response with blob content (from view endpoint).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

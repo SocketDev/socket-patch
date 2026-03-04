@@ -35,8 +35,10 @@ pub struct RemoveArgs {
 }
 
 pub async fn run(args: RemoveArgs) -> i32 {
-    let api_token = std::env::var("SOCKET_API_TOKEN").ok();
-    let org_slug = std::env::var("SOCKET_ORG_SLUG").ok();
+    let (telemetry_client, _) =
+        socket_patch_core::api::client::get_api_client_from_env(None).await;
+    let api_token = telemetry_client.api_token().cloned();
+    let org_slug = telemetry_client.org_slug().cloned();
 
     let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
         PathBuf::from(&args.manifest_path)

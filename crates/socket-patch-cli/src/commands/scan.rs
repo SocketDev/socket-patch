@@ -51,17 +51,12 @@ pub async fn run(args: ScanArgs) -> i32 {
         std::env::set_var("SOCKET_API_TOKEN", token);
     }
 
-    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref());
+    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
 
-    if !use_public_proxy && args.org.is_none() {
-        eprintln!("Error: --org is required when using SOCKET_API_TOKEN. Provide an organization slug.");
-        return 1;
-    }
-
-    let effective_org_slug = if use_public_proxy {
+    let effective_org_slug: Option<&str> = if use_public_proxy {
         None
     } else {
-        args.org.as_deref()
+        None // org slug is already stored in the client
     };
 
     let crawler_options = CrawlerOptions {

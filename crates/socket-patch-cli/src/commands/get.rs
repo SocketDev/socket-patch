@@ -121,17 +121,12 @@ pub async fn run(args: GetArgs) -> i32 {
         std::env::set_var("SOCKET_API_TOKEN", token);
     }
 
-    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref());
+    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
 
-    if !use_public_proxy && args.org.is_none() {
-        eprintln!("Error: --org is required when using SOCKET_API_TOKEN. Provide an organization slug.");
-        return 1;
-    }
-
-    let effective_org_slug = if use_public_proxy {
+    let effective_org_slug: Option<&str> = if use_public_proxy {
         None
     } else {
-        args.org.as_deref()
+        None // org slug is already stored in the client
     };
 
     // Determine identifier type
@@ -517,12 +512,8 @@ async fn save_and_apply_patch(
     _org_slug: Option<&str>,
 ) -> i32 {
     // For UUID mode, fetch and save
-    let (api_client, _) = get_api_client_from_env(args.org.as_deref());
-    let effective_org = if args.org.is_some() {
-        args.org.as_deref()
-    } else {
-        None
-    };
+    let (api_client, _) = get_api_client_from_env(args.org.as_deref()).await;
+    let effective_org: Option<&str> = None; // org slug is already stored in the client
 
     let patch = match api_client.fetch_patch(effective_org, uuid).await {
         Ok(Some(p)) => p,

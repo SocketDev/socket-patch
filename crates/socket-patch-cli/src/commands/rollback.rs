@@ -136,27 +136,22 @@ async fn get_missing_before_blobs(
 }
 
 pub async fn run(args: RollbackArgs) -> i32 {
-    let api_token = args
-        .api_token
-        .clone()
-        .or_else(|| std::env::var("SOCKET_API_TOKEN").ok());
-    let org_slug = args
-        .org
-        .clone()
-        .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok());
-
-    // Validate one-off requires identifier
-    if args.one_off && args.identifier.is_none() {
-        eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
-        return 1;
-    }
-
-    // Override env vars if CLI options provided
+    // Override env vars if CLI options provided (before building client)
     if let Some(ref url) = args.api_url {
         std::env::set_var("SOCKET_API_URL", url);
     }
     if let Some(ref token) = args.api_token {
         std::env::set_var("SOCKET_API_TOKEN", token);
+    }
+
+    let (telemetry_client, _) = get_api_client_from_env(args.org.as_deref()).await;
+    let api_token = telemetry_client.api_token().cloned();
+    let org_slug = telemetry_client.org_slug().cloned();
+
+    // Validate one-off requires identifier
+    if args.one_off && args.identifier.is_none() {
+        eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
+        return 1;
     }
 
     // Handle one-off mode
@@ -314,7 +309,7 @@ async fn rollback_patches_inner(
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
-        let (client, _) = get_api_client_from_env(None);
+        let (client, _) = get_api_client_from_env(None).await;
         let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, &client, None).await;
 
         if !args.silent {
