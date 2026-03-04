@@ -65,7 +65,7 @@ jobs:
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-unknown-linux-musl
