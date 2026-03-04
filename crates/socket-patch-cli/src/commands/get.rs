@@ -348,7 +348,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 if manifest
                     .patches
                     .get(&patch.purl)
-                    .map_or(false, |p| p.uuid == patch.uuid)
+                    .is_some_and(|p| p.uuid == patch.uuid)
                 {
                     println!("  [skip] {} (already in manifest)", patch.purl);
                     patches_skipped += 1;
@@ -588,10 +588,10 @@ async fn save_and_apply_patch(
         })
         .collect();
 
-    let added = !manifest
+    let added = manifest
         .patches
         .get(&patch.purl)
-        .map_or(false, |p| p.uuid == patch.uuid);
+        .is_none_or(|p| p.uuid != patch.uuid);
 
     manifest.patches.insert(
         patch.purl.clone(),

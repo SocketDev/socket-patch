@@ -4,6 +4,43 @@ Apply security patches to npm dependencies without waiting for upstream fixes.
 
 ## Installation
 
+### One-line install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh
+```
+
+Detects your platform (macOS/Linux, x64/ARM64), downloads the latest binary, and installs to `/usr/local/bin` or `~/.local/bin`. Use `sudo sh` instead of `sh` if `/usr/local/bin` requires root.
+
+<details>
+<summary>Manual download</summary>
+
+Download a prebuilt binary from the [latest release](https://github.com/SocketDev/socket-patch/releases/latest):
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-aarch64-apple-darwin.tar.gz | tar xz
+
+# macOS (Intel)
+curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-x86_64-apple-darwin.tar.gz | tar xz
+
+# Linux (x86_64)
+curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-x86_64-unknown-linux-musl.tar.gz | tar xz
+
+# Linux (ARM64)
+curl -fsSL https://github.com/SocketDev/socket-patch/releases/latest/download/socket-patch-aarch64-unknown-linux-gnu.tar.gz | tar xz
+```
+
+Then move the binary onto your `PATH`:
+
+```bash
+sudo mv socket-patch /usr/local/bin/
+```
+
+</details>
+
+### npm
+
 ```bash
 npx @socketsecurity/socket-patch
 ```
@@ -12,6 +49,12 @@ Or install globally:
 
 ```bash
 npm install -g @socketsecurity/socket-patch
+```
+
+### Cargo
+
+```bash
+cargo install socket-patch-cli
 ```
 
 ## Commands

@@ -104,6 +104,31 @@ jobs:
             --generate-notes \
             artifacts/*
 
+  cargo-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Publish socket-patch-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p socket-patch-core
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish socket-patch-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p socket-patch-cli
+
   npm-publish:
     needs: build
     runs-on: ubuntu-latest

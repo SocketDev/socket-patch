@@ -553,6 +553,16 @@ fn urlencoding_encode(input: &str) -> String {
     out
 }
 
+/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
+/// Unlike byte slicing (`&s[..n]`), this is safe for multi-byte UTF-8 characters.
+fn truncate_to_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{}...", truncated)
+}
+
 /// Validate that a string is a 64-character hex string (SHA-256).
 fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -586,21 +596,13 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
 
         // Use first non-empty summary as title
         if title.is_empty() && !vuln.summary.is_empty() {
-            title = if vuln.summary.len() > 100 {
-                format!("{}...", &vuln.summary[..97])
-            } else {
-                vuln.summary.clone()
-            };
+            title = truncate_to_chars(&vuln.summary, 97);
         }
     }
 
     // Use description as fallback title
     if title.is_empty() && !patch.description.is_empty() {
-        title = if patch.description.len() > 100 {
-            format!("{}...", &patch.description[..97])
-        } else {
-            patch.description.clone()
-        };
+        title = truncate_to_chars(&patch.description, 97);
     }
 
     cve_ids.sort();
@@ -647,6 +649,7 @@ pub enum ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_urlencoding_basic() {
@@ -682,8 +685,6 @@ mod tests {
 
     #[test]
     fn test_convert_search_result_to_batch_info() {
-        use std::collections::HashMap;
-
         let mut vulns = HashMap::new();
         vulns.insert(
             "GHSA-1234-5678-9abc".to_string(),
@@ -720,5 +721,218 @@ mod tests {
         let (client, is_public) = get_api_client_from_env(None);
         assert!(is_public);
         assert!(client.use_public_proxy);
+    }
+
+    // ── Group 6: convert_search_result_to_batch_info edge cases ──────
+
+    fn make_vuln(summary: &str, severity: &str, cves: Vec<&str>) -> VulnerabilityResponse {
+        VulnerabilityResponse {
+            cves: cves.into_iter().map(String::from).collect(),
+            summary: summary.into(),
+            severity: severity.into(),
+            description: "desc".into(),
+        }
+    }
+
+    fn make_patch(
+        vulns: HashMap<String, VulnerabilityResponse>,
+        description: &str,
+    ) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: "uuid-1".into(),
+            purl: "pkg:npm/test@1.0.0".into(),
+            published_at: "2024-01-01".into(),
+            description: description.into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+            vulnerabilities: vulns,
+        }
+    }
+
+    #[test]
+    fn test_convert_no_vulnerabilities() {
+        let patch = make_patch(HashMap::new(), "A patch description");
+        let info = convert_search_result_to_batch_info(patch);
+        assert!(info.cve_ids.is_empty());
+        assert!(info.ghsa_ids.is_empty());
+        assert_eq!(info.title, "A patch description");
+        assert!(info.severity.is_none());
+    }
+
+    #[test]
+    fn test_convert_multiple_vulns_picks_highest_severity() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("Medium vuln", "medium", vec!["CVE-2024-0001"]),
+        );
+        vulns.insert(
+            "GHSA-2222".into(),
+            make_vuln("Critical vuln", "critical", vec!["CVE-2024-0002"]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        assert_eq!(info.severity, Some("critical".into()));
+    }
+
+    #[test]
+    fn test_convert_duplicate_cves_deduplicated() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("Vuln A", "high", vec!["CVE-2024-0001"]),
+        );
+        vulns.insert(
+            "GHSA-2222".into(),
+            make_vuln("Vuln B", "high", vec!["CVE-2024-0001"]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        // Same CVE in both vulns should only appear once
+        let cve_count = info.cve_ids.iter().filter(|c| *c == "CVE-2024-0001").count();
+        assert_eq!(cve_count, 1);
+    }
+
+    #[test]
+    fn test_convert_title_truncated_at_100() {
+        let long_summary = "x".repeat(150);
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln(&long_summary, "high", vec![]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        // Should be 97 chars + "..." = 100 chars
+        assert_eq!(info.title.len(), 100);
+        assert!(info.title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_convert_title_unicode_truncation() {
+        // Create a summary with multi-byte chars that would panic with byte slicing
+        // Each emoji is 4 bytes, so 30 emojis = 120 bytes but only 30 chars
+        let emoji_summary = "\u{1F600}".repeat(30);
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln(&emoji_summary, "high", vec![]),
+        );
+        let patch = make_patch(vulns, "desc");
+        // This should NOT panic (validates the UTF-8 truncation fix)
+        let info = convert_search_result_to_batch_info(patch);
+        assert!(!info.title.is_empty());
+
+        // Also test with description fallback
+        let patch2 = make_patch(HashMap::new(), &"\u{1F600}".repeat(120));
+        let info2 = convert_search_result_to_batch_info(patch2);
+        assert!(info2.title.ends_with("..."));
+    }
+
+    #[test]
+    fn test_convert_title_falls_back_to_description() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("", "high", vec![]),
+        );
+        let patch = make_patch(vulns, "Fallback desc");
+        let info = convert_search_result_to_batch_info(patch);
+        assert_eq!(info.title, "Fallback desc");
+    }
+
+    #[test]
+    fn test_convert_empty_summary_and_description() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("", "high", vec![]),
+        );
+        let patch = make_patch(vulns, "");
+        let info = convert_search_result_to_batch_info(patch);
+        assert!(info.title.is_empty());
+    }
+
+    #[test]
+    fn test_convert_cves_and_ghsas_sorted() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-cccc".into(),
+            make_vuln("V1", "high", vec!["CVE-2024-0003"]),
+        );
+        vulns.insert(
+            "GHSA-aaaa".into(),
+            make_vuln("V2", "high", vec!["CVE-2024-0001"]),
+        );
+        vulns.insert(
+            "GHSA-bbbb".into(),
+            make_vuln("V3", "high", vec!["CVE-2024-0002"]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        // Both should be sorted alphabetically
+        let mut sorted_cves = info.cve_ids.clone();
+        sorted_cves.sort();
+        assert_eq!(info.cve_ids, sorted_cves);
+        let mut sorted_ghsas = info.ghsa_ids.clone();
+        sorted_ghsas.sort();
+        assert_eq!(info.ghsa_ids, sorted_ghsas);
+    }
+
+    // ── Group 7: urlencoding + SHA256 edge cases ─────────────────────
+
+    #[test]
+    fn test_urlencoding_unicode() {
+        // Multi-byte UTF-8: 'é' = 0xC3 0xA9
+        let encoded = urlencoding_encode("café");
+        assert_eq!(encoded, "caf%C3%A9");
+    }
+
+    #[test]
+    fn test_urlencoding_empty() {
+        assert_eq!(urlencoding_encode(""), "");
+    }
+
+    #[test]
+    fn test_urlencoding_all_safe_chars() {
+        // Unreserved chars should pass through
+        let safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+        assert_eq!(urlencoding_encode(safe), safe);
+    }
+
+    #[test]
+    fn test_urlencoding_slash_and_at() {
+        assert_eq!(urlencoding_encode("/"), "%2F");
+        assert_eq!(urlencoding_encode("@"), "%40");
+    }
+
+    #[test]
+    fn test_sha256_uppercase_valid() {
+        let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        assert!(is_valid_sha256_hex(upper));
+    }
+
+    #[test]
+    fn test_sha256_65_chars_invalid() {
+        let too_long = "a".repeat(65);
+        assert!(!is_valid_sha256_hex(&too_long));
+    }
+
+    #[test]
+    fn test_sha256_63_chars_invalid() {
+        let too_short = "a".repeat(63);
+        assert!(!is_valid_sha256_hex(&too_short));
+    }
+
+    #[test]
+    fn test_sha256_empty_invalid() {
+        assert!(!is_valid_sha256_hex(""));
+    }
+
+    #[test]
+    fn test_sha256_mixed_case_valid() {
+        let mixed = "aAbBcCdDeEfF0123456789aAbBcCdDeEfF0123456789aAbBcCdDeEfF01234567";
+        assert_eq!(mixed.len(), 64);
+        assert!(is_valid_sha256_hex(mixed));
     }
 }

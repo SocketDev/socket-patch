@@ -86,6 +86,7 @@ pub type RefetchPatchFn = Box<
 pub type OnRecoveryEventFn = Box<dyn Fn(RecoveryEvent) + Send + Sync>;
 
 /// Options for manifest recovery.
+#[derive(Default)]
 pub struct RecoveryOptions {
     /// Optional function to refetch patch data from external source (e.g., database).
     /// Should return patch data or None if not found.
@@ -95,14 +96,6 @@ pub struct RecoveryOptions {
     pub on_recovery_event: Option<OnRecoveryEventFn>,
 }
 
-impl Default for RecoveryOptions {
-    fn default() -> Self {
-        Self {
-            refetch_patch: None,
-            on_recovery_event: None,
-        }
-    }
-}
 
 /// Recover and validate manifest with automatic repair of invalid patches.
 ///
@@ -265,14 +258,14 @@ pub async fn recover_manifest(
             } else {
                 // No UUID or no refetch function, can't recover
                 discarded_patches.push(purl.clone());
-                if uuid.is_none() {
-                    emit(RecoveryEvent::DiscardedPatchNoUuid {
-                        purl: purl.clone(),
-                    });
-                } else {
+                if let Some(uuid) = uuid {
                     emit(RecoveryEvent::DiscardedPatchNotFound {
                         purl: purl.clone(),
-                        uuid: uuid.unwrap(),
+                        uuid,
+                    });
+                } else {
+                    emit(RecoveryEvent::DiscardedPatchNoUuid {
+                        purl: purl.clone(),
                     });
                 }
             }

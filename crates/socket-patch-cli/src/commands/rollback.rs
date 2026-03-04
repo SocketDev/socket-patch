@@ -462,6 +462,7 @@ async fn rollback_patches_inner(
 }
 
 // Export for use by remove command
+#[allow(clippy::too_many_arguments)]
 pub async fn rollback_patches(
     cwd: &Path,
     manifest_path: &Path,

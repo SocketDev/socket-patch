@@ -320,3 +320,286 @@ async fn search_nested(
         Box::pin(search_nested(&full_path, root_pkg, depth + 1, results)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Group 1: parse_pnpm_workspace_patterns ───────────────────────
+
+    #[test]
+    fn test_parse_pnpm_basic() {
+        let yaml = "packages:\n  - packages/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
+    #[test]
+    fn test_parse_pnpm_multiple_patterns() {
+        let yaml = "packages:\n  - packages/*\n  - apps/*\n  - tools/*";
+        assert_eq!(
+            parse_pnpm_workspace_patterns(yaml),
+            vec!["packages/*", "apps/*", "tools/*"]
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_quoted_patterns() {
+        let yaml = "packages:\n  - 'packages/*'\n  - \"apps/*\"";
+        assert_eq!(
+            parse_pnpm_workspace_patterns(yaml),
+            vec!["packages/*", "apps/*"]
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_comments_interspersed() {
+        let yaml = "packages:\n  # workspace packages\n  - packages/*\n  # apps\n  - apps/*";
+        assert_eq!(
+            parse_pnpm_workspace_patterns(yaml),
+            vec!["packages/*", "apps/*"]
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_empty_content() {
+        assert!(parse_pnpm_workspace_patterns("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_pnpm_no_packages_key() {
+        let yaml = "name: my-project\nversion: 1.0.0";
+        assert!(parse_pnpm_workspace_patterns(yaml).is_empty());
+    }
+
+    #[test]
+    fn test_parse_pnpm_stops_at_next_section() {
+        let yaml = "packages:\n  - packages/*\ncatalog:\n  lodash: 4.17.21";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
+    #[test]
+    fn test_parse_pnpm_indented_key() {
+        // The parser uses `trimmed == "packages:"` so leading spaces should match
+        let yaml = "  packages:\n  - packages/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
+    #[test]
+    fn test_parse_pnpm_dash_only_line() {
+        let yaml = "packages:\n  -\n  - packages/*";
+        // A bare "-" with no value should be skipped (empty after trim)
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
+    }
+
+    #[test]
+    fn test_parse_pnpm_glob_star_star() {
+        let yaml = "packages:\n  - packages/**";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/**"]);
+    }
+
+    // ── Group 2: workspace detection + file discovery ────────────────
+
+    #[tokio::test]
+    async fn test_detect_workspaces_npm_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"workspaces": ["packages/*"]}"#)
+            .await
+            .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Npm));
+        assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_npm_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(
+            &pkg,
+            r#"{"workspaces": {"packages": ["packages/*", "apps/*"]}}"#,
+        )
+        .await
+        .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Npm));
+        assert_eq!(config.patterns, vec!["packages/*", "apps/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name": "root"}"#).await.unwrap();
+        let pnpm = dir.path().join("pnpm-workspace.yaml");
+        fs::write(&pnpm, "packages:\n  - packages/*")
+            .await
+            .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
+        assert_eq!(config.patterns, vec!["packages/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name": "root"}"#).await.unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::None));
+        assert!(config.patterns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, "not valid json!!!").await.unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::None));
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("nonexistent.json");
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::None));
+    }
+
+    #[tokio::test]
+    async fn test_find_no_root_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_root);
+    }
+
+    #[tokio::test]
+    async fn test_find_npm_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let pkg_a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&pkg_a).await.unwrap();
+        fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        // root + workspace member
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_root);
+        assert!(results[1].is_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_find_pnpm_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*",
+        )
+        .await
+        .unwrap();
+        let pkg_a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&pkg_a).await.unwrap();
+        fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_root);
+        assert!(results[1].is_workspace);
+    }
+
+    #[tokio::test]
+    async fn test_find_nested_skips_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        let nm = dir.path().join("node_modules").join("lodash");
+        fs::create_dir_all(&nm).await.unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"lodash"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        // Only root, node_modules should be skipped
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_root);
+    }
+
+    #[tokio::test]
+    async fn test_find_nested_depth_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
+            .await
+            .unwrap();
+        // Create deeply nested package.json at depth 7 (> limit of 5)
+        let mut deep = dir.path().to_path_buf();
+        for i in 0..7 {
+            deep = deep.join(format!("level{}", i));
+        }
+        fs::create_dir_all(&deep).await.unwrap();
+        fs::write(deep.join("package.json"), r#"{"name":"deep"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        // Only root (the deep one exceeds depth limit)
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_double_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/**"]}"#,
+        )
+        .await
+        .unwrap();
+        let nested = dir.path().join("apps").join("web").join("client");
+        fs::create_dir_all(&nested).await.unwrap();
+        fs::write(nested.join("package.json"), r#"{"name":"client"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        // root + recursively found workspace member
+        assert!(results.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/core"]}"#,
+        )
+        .await
+        .unwrap();
+        let core = dir.path().join("packages").join("core");
+        fs::create_dir_all(&core).await.unwrap();
+        fs::write(core.join("package.json"), r#"{"name":"core"}"#)
+            .await
+            .unwrap();
+        let results = find_package_json_files(dir.path()).await;
+        assert_eq!(results.len(), 2);
+    }
+}

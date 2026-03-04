@@ -169,4 +169,106 @@ mod tests {
         let current = "socket-patch apply && echo done";
         assert_eq!(generate_updated_postinstall(current), current);
     }
+
+    // ── Group 4: expanded edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_is_postinstall_configured_str_invalid_json() {
+        let status = is_postinstall_configured_str("not json");
+        assert!(!status.configured);
+        assert!(status.needs_update);
+    }
+
+    #[test]
+    fn test_is_postinstall_configured_str_legacy_npx_pattern() {
+        let content = r#"{"scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent"}}"#;
+        let status = is_postinstall_configured_str(content);
+        // "npx @socketsecurity/socket-patch apply" contains "socket-patch apply"
+        assert!(status.configured);
+        assert!(!status.needs_update);
+    }
+
+    #[test]
+    fn test_is_postinstall_configured_str_socket_dash_patch() {
+        let content =
+            r#"{"scripts":{"postinstall":"socket-patch apply --silent --ecosystems npm"}}"#;
+        let status = is_postinstall_configured_str(content);
+        assert!(status.configured);
+        assert!(!status.needs_update);
+    }
+
+    #[test]
+    fn test_is_postinstall_configured_no_scripts() {
+        let pkg: serde_json::Value = serde_json::json!({"name": "test"});
+        let status = is_postinstall_configured(&pkg);
+        assert!(!status.configured);
+        assert!(status.current_script.is_empty());
+    }
+
+    #[test]
+    fn test_is_postinstall_configured_no_postinstall() {
+        let pkg: serde_json::Value = serde_json::json!({
+            "scripts": {"build": "tsc"}
+        });
+        let status = is_postinstall_configured(&pkg);
+        assert!(!status.configured);
+        assert!(status.current_script.is_empty());
+    }
+
+    #[test]
+    fn test_update_object_creates_scripts() {
+        let mut pkg: serde_json::Value = serde_json::json!({"name": "test"});
+        let (modified, new_script) = update_package_json_object(&mut pkg);
+        assert!(modified);
+        assert!(new_script.contains("socket patch apply"));
+        assert!(pkg.get("scripts").is_some());
+        assert!(pkg["scripts"]["postinstall"].is_string());
+    }
+
+    #[test]
+    fn test_update_object_noop_when_configured() {
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "scripts": {
+                "postinstall": "socket patch apply --silent --ecosystems npm"
+            }
+        });
+        let (modified, existing) = update_package_json_object(&mut pkg);
+        assert!(!modified);
+        assert!(existing.contains("socket patch apply"));
+    }
+
+    #[test]
+    fn test_update_content_roundtrip_no_scripts() {
+        let content = r#"{"name": "test"}"#;
+        let (modified, new_content, old_script, new_script) =
+            update_package_json_content(content).unwrap();
+        assert!(modified);
+        assert!(old_script.is_empty());
+        assert!(new_script.contains("socket patch apply"));
+        // new_content should be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert!(parsed["scripts"]["postinstall"].is_string());
+    }
+
+    #[test]
+    fn test_update_content_already_configured() {
+        let content = r#"{"scripts":{"postinstall":"socket patch apply --silent --ecosystems npm"}}"#;
+        let (modified, _new_content, _old, _new) =
+            update_package_json_content(content).unwrap();
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_update_content_invalid_json() {
+        let result = update_package_json_content("not json");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid package.json"));
+    }
+
+    #[test]
+    fn test_generate_whitespace_only() {
+        // Whitespace-only string should be treated as empty after trim
+        let result = generate_updated_postinstall("  \t  ");
+        assert_eq!(result, "socket patch apply --silent --ecosystems npm");
+    }
 }

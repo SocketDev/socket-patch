@@ -61,10 +61,10 @@ pub async fn get_missing_blobs(
 ///
 /// * `manifest`    – Patch manifest whose `afterHash` blobs to check.
 /// * `blobs_path`  – Directory where blob files are stored (one file per
-///                    hash).
+///   hash).
 /// * `client`      – [`ApiClient`] used to fetch blobs from the server.
 /// * `on_progress` – Optional callback invoked before each download with
-///                    `(hash, 1-based index, total)`.
+///   `(hash, 1-based index, total)`.
 pub async fn fetch_missing_blobs(
     manifest: &PatchManifest,
     blobs_path: &Path,
@@ -449,5 +449,85 @@ mod tests {
         };
         let output = format_fetch_result(&result);
         assert!(output.contains("... and 3 more"));
+    }
+
+    // ── Group 8: format edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_format_only_downloaded() {
+        let result = FetchMissingBlobsResult {
+            total: 3,
+            downloaded: 3,
+            failed: 0,
+            skipped: 0,
+            results: vec![
+                BlobFetchResult { hash: "a".repeat(64), success: true, error: None },
+                BlobFetchResult { hash: "b".repeat(64), success: true, error: None },
+                BlobFetchResult { hash: "c".repeat(64), success: true, error: None },
+            ],
+        };
+        let output = format_fetch_result(&result);
+        assert!(output.contains("Downloaded 3 blob(s)"));
+        assert!(!output.contains("Failed"));
+    }
+
+    #[test]
+    fn test_format_short_hash() {
+        let result = FetchMissingBlobsResult {
+            total: 1,
+            downloaded: 0,
+            failed: 1,
+            skipped: 0,
+            results: vec![BlobFetchResult {
+                hash: "abc".into(),
+                success: false,
+                error: Some("not found".into()),
+            }],
+        };
+        let output = format_fetch_result(&result);
+        // Hash is < 12 chars, should show full hash
+        assert!(output.contains("abc..."));
+    }
+
+    #[test]
+    fn test_format_error_none() {
+        let result = FetchMissingBlobsResult {
+            total: 1,
+            downloaded: 0,
+            failed: 1,
+            skipped: 0,
+            results: vec![BlobFetchResult {
+                hash: "d".repeat(64),
+                success: false,
+                error: None,
+            }],
+        };
+        let output = format_fetch_result(&result);
+        assert!(output.contains("unknown error"));
+    }
+
+    #[test]
+    fn test_format_only_failed() {
+        let result = FetchMissingBlobsResult {
+            total: 2,
+            downloaded: 0,
+            failed: 2,
+            skipped: 0,
+            results: vec![
+                BlobFetchResult {
+                    hash: "a".repeat(64),
+                    success: false,
+                    error: Some("timeout".into()),
+                },
+                BlobFetchResult {
+                    hash: "b".repeat(64),
+                    success: false,
+                    error: Some("timeout".into()),
+                },
+            ],
+        };
+        let output = format_fetch_result(&result);
+        assert!(!output.contains("Downloaded"));
+        assert!(output.contains("Failed to download 2 blob(s)"));
     }
 }

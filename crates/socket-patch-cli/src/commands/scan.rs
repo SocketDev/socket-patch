@@ -147,7 +147,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let total_batches = (all_purls.len() + args.batch_size - 1) / args.batch_size;
+    let total_batches = all_purls.len().div_ceil(args.batch_size);
 
     if !args.json {
         eprint!("Querying API for patches... (batch 1/{total_batches})");
@@ -239,7 +239,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     println!(
         "{}  {}  {}  VULNERABILITIES",
         "PACKAGE".to_string() + &" ".repeat(33),
-        "PATCHES".to_string() + &" ".repeat(1),
+        "PATCHES".to_string() + " ",
         "SEVERITY".to_string() + &" ".repeat(8),
     );
     println!("{}", "=".repeat(100));

@@ -9,6 +9,10 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
 rm -f "$REPO_ROOT/Cargo.toml.bak"
 
+# Update socket-patch-core workspace dependency version (needed for cargo publish)
+sed -i.bak "s/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \".*\" }/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \"$VERSION\" }/" "$REPO_ROOT/Cargo.toml"
+rm -f "$REPO_ROOT/Cargo.toml.bak"
+
 # Update npm package version
 pkg_json="$REPO_ROOT/npm/socket-patch/package.json"
 node -e "

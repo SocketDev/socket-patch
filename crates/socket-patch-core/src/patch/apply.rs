@@ -44,8 +44,8 @@ pub struct ApplyResult {
 /// but we need relative paths like "lib/file.js" for the actual package directory.
 pub fn normalize_file_path(file_name: &str) -> &str {
     const PACKAGE_PREFIX: &str = "package/";
-    if file_name.starts_with(PACKAGE_PREFIX) {
-        &file_name[PACKAGE_PREFIX.len()..]
+    if let Some(stripped) = file_name.strip_prefix(PACKAGE_PREFIX) {
+        stripped
     } else {
         file_name
     }
