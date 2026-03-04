@@ -111,6 +111,16 @@ impl ApiClient {
         }
     }
 
+    /// Returns the API token, if set.
+    pub fn api_token(&self) -> Option<&String> {
+        self.api_token.as_ref()
+    }
+
+    /// Returns the org slug, if set.
+    pub fn org_slug(&self) -> Option<&String> {
+        self.org_slug.as_ref()
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.
@@ -397,6 +407,46 @@ impl ApiClient {
         })
     }
 
+    /// Fetch organizations accessible to the current API token.
+    pub async fn fetch_organizations(
+        &self,
+    ) -> Result<Vec<crate::api::types::OrganizationInfo>, ApiError> {
+        let path = "/v0/organizations";
+        match self
+            .get_json::<crate::api::types::OrganizationsResponse>(path)
+            .await?
+        {
+            Some(resp) => Ok(resp.organizations.into_values().collect()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Resolve the org slug from the API token by querying `/v0/organizations`.
+    ///
+    /// If there is exactly one org, returns its slug.
+    /// If there are multiple, picks the first and prints a warning.
+    /// If there are none, returns an error.
+    pub async fn resolve_org_slug(&self) -> Result<String, ApiError> {
+        let orgs = self.fetch_organizations().await?;
+        match orgs.len() {
+            0 => Err(ApiError::Other(
+                "No organizations found for this API token.".into(),
+            )),
+            1 => Ok(orgs.into_iter().next().unwrap().slug),
+            _ => {
+                let slugs: Vec<_> = orgs.iter().map(|o| o.slug.as_str()).collect();
+                let first = orgs[0].slug.clone();
+                eprintln!(
+                    "Multiple organizations found: {}. Using \"{}\". \
+                     Pass --org to select a different one.",
+                    slugs.join(", "),
+                    first
+                );
+                Ok(first)
+            }
+        }
+    }
+
     /// Fetch a blob by its SHA-256 hash.
     ///
     /// Returns the raw binary content, or `Ok(None)` if not found.
@@ -490,6 +540,10 @@ impl ApiClient {
 /// API proxy which provides free access to free-tier patches without
 /// authentication.
 ///
+/// When `SOCKET_API_TOKEN` is set but no org slug is provided (neither via
+/// argument nor `SOCKET_ORG_SLUG` env var), the function will attempt to
+/// auto-resolve the org slug by querying `GET /v0/organizations`.
+///
 /// # Environment variables
 ///
 /// | Variable | Purpose |
@@ -500,7 +554,7 @@ impl ApiClient {
 /// | `SOCKET_ORG_SLUG` | Organization slug |
 ///
 /// Returns `(client, use_public_proxy)`.
-pub fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
+pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
     let api_token = std::env::var("SOCKET_API_TOKEN").ok();
     let resolved_org_slug = org_slug
         .map(String::from)
@@ -524,11 +578,30 @@ pub fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
     let api_url =
         std::env::var("SOCKET_API_URL").unwrap_or_else(|_| DEFAULT_SOCKET_API_URL.to_string());
 
+    // Auto-resolve org slug if not provided
+    let final_org_slug = if resolved_org_slug.is_some() {
+        resolved_org_slug
+    } else {
+        let temp_client = ApiClient::new(ApiClientOptions {
+            api_url: api_url.clone(),
+            api_token: api_token.clone(),
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        match temp_client.resolve_org_slug().await {
+            Ok(slug) => Some(slug),
+            Err(e) => {
+                eprintln!("Warning: Could not auto-detect organization: {e}");
+                None
+            }
+        }
+    };
+
     let client = ApiClient::new(ApiClientOptions {
         api_url,
         api_token,
         use_public_proxy: false,
-        org_slug: resolved_org_slug,
+        org_slug: final_org_slug,
     });
     (client, false)
 }
@@ -714,11 +787,11 @@ mod tests {
         assert_eq!(info.title, "Test vulnerability");
     }
 
-    #[test]
-    fn test_get_api_client_from_env_no_token() {
+    #[tokio::test]
+    async fn test_get_api_client_from_env_no_token() {
         // Clear token to ensure public proxy mode
         std::env::remove_var("SOCKET_API_TOKEN");
-        let (client, is_public) = get_api_client_from_env(None);
+        let (client, is_public) = get_api_client_from_env(None).await;
         assert!(is_public);
         assert!(client.use_public_proxy);
     }

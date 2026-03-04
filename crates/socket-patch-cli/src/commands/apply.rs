@@ -49,8 +49,9 @@ pub struct ApplyArgs {
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
-    let api_token = std::env::var("SOCKET_API_TOKEN").ok();
-    let org_slug = std::env::var("SOCKET_ORG_SLUG").ok();
+    let (telemetry_client, _) = get_api_client_from_env(None).await;
+    let api_token = telemetry_client.api_token().cloned();
+    let org_slug = telemetry_client.org_slug().cloned();
 
     let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
         PathBuf::from(&args.manifest_path)
@@ -156,7 +157,7 @@ async fn apply_patches_inner(
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
-        let (client, _) = get_api_client_from_env(None);
+        let (client, _) = get_api_client_from_env(None).await;
         let fetch_result = fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
 
         if !args.silent {

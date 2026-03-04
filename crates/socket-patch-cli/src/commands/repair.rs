@@ -78,7 +78,7 @@ async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<(), Str
                 }
             } else {
                 println!("\nDownloading missing blobs...");
-                let (client, _) = get_api_client_from_env(None);
+                let (client, _) = get_api_client_from_env(None).await;
                 let fetch_result = fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
                 println!("{}", format_fetch_result(&fetch_result));
             }
