@@ -2,61 +2,46 @@ name: Release
 
 on:
   workflow_dispatch:
-    inputs:
-      version-bump:
-        description: 'Version bump type'
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
-  bump-and-tag:
+  sync-and-tag:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.bump.outputs.VERSION }}
+      version: ${{ steps.sync.outputs.VERSION }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '20'
 
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Bump version and sync
-        id: bump
+      - name: Sync versions and tag
+        id: sync
         run: |
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          VERSION=$(node -e "
-            const [major, minor, patch] = '$CURRENT'.split('.').map(Number);
-            const bump = '${{ inputs.version-bump }}';
-            if (bump === 'major') console.log((major+1)+'.0.0');
-            else if (bump === 'minor') console.log(major+'.'+(minor+1)+'.0');
-            else console.log(major+'.'+minor+'.'+(patch+1));
-          ")
-          bash scripts/version-sync.sh "$VERSION"
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-          git add Cargo.toml npm/ pypi/
-          git commit -m "v$VERSION"
+          bash scripts/version-sync.sh "$VERSION"
+          if ! git diff --quiet; then
+            git add Cargo.toml npm/ pypi/
+            git commit -m "v$VERSION: sync package versions"
+          fi
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists. Bump the version in Cargo.toml before releasing."
+            exit 1
+          fi
           git tag "v$VERSION"
 
       - name: Push changes and tag
         run: git push && git push --tags
 
   build:
-    needs: bump-and-tag
+    needs: sync-and-tag
     strategy:
       matrix:
         include:
@@ -85,7 +70,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: v${{ needs.bump-and-tag.outputs.version }}
+          ref: v${{ needs.sync-and-tag.outputs.version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -133,7 +118,7 @@ jobs:
           path: socket-patch-${{ matrix.target }}.zip
 
   github-release:
-    needs: [bump-and-tag, build]
+    needs: [sync-and-tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -146,14 +131,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.bump-and-tag.outputs.version }}"
+          TAG="v${{ needs.sync-and-tag.outputs.version }}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             artifacts/*
 
   cargo-publish:
-    needs: [bump-and-tag, build]
+    needs: [sync-and-tag, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -162,7 +147,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: v${{ needs.bump-and-tag.outputs.version }}
+          ref: v${{ needs.sync-and-tag.outputs.version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -182,13 +167,13 @@ jobs:
         run: cargo publish -p socket-patch-cli
 
   npm-publish:
-    needs: [bump-and-tag, build]
+    needs: [sync-and-tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: v${{ needs.bump-and-tag.outputs.version }}
+          ref: v${{ needs.sync-and-tag.outputs.version }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -223,13 +208,13 @@ jobs:
         run: npm publish npm/socket-patch --provenance --access public
 
   pypi-publish:
-    needs: [bump-and-tag, build]
+    needs: [sync-and-tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: v${{ needs.bump-and-tag.outputs.version }}
+          ref: v${{ needs.sync-and-tag.outputs.version }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
