@@ -2,6 +2,16 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -21,18 +31,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync versions and tag
+      - name: Bump version and sync
         id: sync
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           bash scripts/version-sync.sh "$VERSION"
-          if ! git diff --quiet; then
-            git add Cargo.toml npm/ pypi/
-            git commit -m "v$VERSION: sync package versions"
-          fi
+          git add Cargo.toml npm/ pypi/
+          git commit -m "v$VERSION: bump and sync package versions"
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Tag v$VERSION already exists. Bump the version in Cargo.toml before releasing."
+            echo "::error::Tag v$VERSION already exists."
             exit 1
           fi
           git tag "v$VERSION"
