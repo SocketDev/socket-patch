@@ -1,4 +1,4 @@
-name: 📦 Publish
+name: Publish
 
 on:
   workflow_dispatch:
@@ -11,29 +11,13 @@ on:
           - patch
           - minor
           - major
-      dist-tag:
-        description: 'npm dist-tag (latest, next, beta, canary, backport, etc.)'
-        required: false
-        default: 'latest'
-        type: string
-      debug:
-        description: 'Enable debug output'
-        required: false
-        default: '0'
-        type: choice
-        options:
-          - '0'
-          - '1'
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
-  bump-version:
+  bump-and-tag:
     runs-on: ubuntu-latest
-    outputs:
-      new-tag: ${{ steps.bump.outputs.new-tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -48,23 +32,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Bump version
-        id: bump
+      - name: Bump version and sync
         run: |
-          npm version ${{ inputs.version-bump }} -m "v%s"
-          echo "new-tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
+          CURRENT=$(node -p "require('./npm/socket-patch/package.json').version")
+          VERSION=$(node -e "
+            const [major, minor, patch] = '$CURRENT'.split('.').map(Number);
+            const bump = '${{ inputs.version-bump }}';
+            if (bump === 'major') console.log((major+1)+'.0.0');
+            else if (bump === 'minor') console.log(major+'.'+(minor+1)+'.0');
+            else console.log(major+'.'+minor+'.'+(patch+1));
+          ")
+          bash scripts/version-sync.sh "$VERSION"
+          git add Cargo.toml npm/
+          git commit -m "v$VERSION"
+          git tag "v$VERSION"
 
-      - name: Push changes
+      - name: Push changes and tag
         run: git push && git push --tags
-
-  publish:
-    needs: bump-version
-    uses: SocketDev/socket-registry/.github/workflows/provenance.yml@main
-    with:
-      debug: ${{ inputs.debug }}
-      dist-tag: ${{ inputs.dist-tag }}
-      package-name: '@socketsecurity/socket-patch'
-      publish-script: 'publish:ci'
-      ref: ${{ needs.bump-version.outputs.new-tag }}
-      setup-script: 'pnpm run build'
-      use-trusted-publishing: true

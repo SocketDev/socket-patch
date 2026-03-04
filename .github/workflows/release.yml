@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.build-tool == 'cross'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cargo)
+        if: matrix.build-tool == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.build-tool == 'cross'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../socket-patch-${{ matrix.target }}.tar.gz socket-patch
+          cd ../../..
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/socket-patch.exe" -DestinationPath "socket-patch-${{ matrix.target }}.zip"
+
+      - name: Upload artifact (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.tar.gz
+
+      - name: Upload artifact (zip)
+        if: matrix.archive == 'zip'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.zip
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes \
+            artifacts/*
+
+  cargo-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+
+      - name: Publish socket-patch-core
+        run: cargo publish -p socket-patch-core
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish socket-patch-cli
+        run: cargo publish -p socket-patch-cli
+
+  npm-publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Extract version and sync
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          bash scripts/version-sync.sh "$VERSION"
+
+      - name: Stage binaries
+        run: |
+          mkdir -p npm/socket-patch/bin
+          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-arm64
+          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-x64
+          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-x64
+          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
+          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm64
+          cd npm/socket-patch/bin
+          unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
+          mv socket-patch.exe socket-patch-win32-x64.exe
+
+      - name: Publish package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/socket-patch --provenance --access public

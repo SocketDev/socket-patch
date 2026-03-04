@@ -1,0 +1,26 @@
+{
+  "name": "@socketsecurity/socket-patch",
+  "version": "1.2.0",
+  "description": "CLI tool for applying security patches to dependencies",
+  "bin": {
+    "socket-patch": "bin/socket-patch"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "security",
+    "patch",
+    "cli",
+    "dependencies"
+  ],
+  "author": "Socket Security",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "socket-patch-cli"
+description = "CLI binary for socket-patch: apply, rollback, get, scan security patches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "socket-patch"
+path = "src/main.rs"
+
+[dependencies]
+socket-patch-core = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
