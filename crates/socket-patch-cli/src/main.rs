@@ -1,5 +1,6 @@
 mod commands;
 mod ecosystem_dispatch;
+mod output;
 
 use clap::{Parser, Subcommand};
 

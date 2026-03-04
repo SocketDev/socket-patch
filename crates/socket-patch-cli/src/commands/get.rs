@@ -10,10 +10,12 @@ use socket_patch_core::manifest::schema::{
 use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::utils::purl::is_purl;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
+use crate::output::stdin_is_tty;
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -71,6 +73,10 @@ pub struct GetArgs {
     /// Apply patch immediately without saving to .socket folder
     #[arg(long = "one-off", default_value_t = false)]
     pub one_off: bool,
+
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -80,6 +86,18 @@ enum IdentifierType {
     Ghsa,
     Purl,
     Package,
+}
+
+impl fmt::Display for IdentifierType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IdentifierType::Uuid => write!(f, "UUID"),
+            IdentifierType::Cve => write!(f, "CVE"),
+            IdentifierType::Ghsa => write!(f, "GHSA"),
+            IdentifierType::Purl => write!(f, "PURL"),
+            IdentifierType::Package => write!(f, "package name"),
+        }
+    }
 }
 
 fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
@@ -100,6 +118,25 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
     }
 }
 
+/// Check if confirmation should proceed: returns true if -y was passed,
+/// stdin is not a TTY (non-interactive), or the user answers yes.
+fn should_proceed(args: &GetArgs, prompt: &str) -> bool {
+    if args.yes {
+        return true;
+    }
+    if !stdin_is_tty() {
+        // Non-interactive: default to yes (with warning on stderr)
+        eprintln!("Non-interactive mode detected, proceeding automatically.");
+        return true;
+    }
+    print!("{prompt}");
+    io::stdout().flush().unwrap();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).unwrap();
+    let answer = answer.trim().to_lowercase();
+    answer == "y" || answer == "yes"
+}
+
 pub async fn run(args: GetArgs) -> i32 {
     // Validate flags
     let type_flags = [args.id, args.cve, args.ghsa, args.package]
@@ -107,11 +144,25 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        eprintln!("Error: Only one of --id, --cve, --ghsa, or --package can be specified");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "Only one of --id, --cve, --ghsa, or --package can be specified",
+            })).unwrap());
+        } else {
+            eprintln!("Error: Only one of --id, --cve, --ghsa, or --package can be specified");
+        }
         return 1;
     }
     if args.one_off && args.save_only {
-        eprintln!("Error: --one-off and --save-only cannot be used together");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "--one-off and --save-only cannot be used together",
+            })).unwrap());
+        } else {
+            eprintln!("Error: --one-off and --save-only cannot be used together");
+        }
         return 1;
     }
 
@@ -139,12 +190,11 @@ pub async fn run(args: GetArgs) -> i32 {
         IdentifierType::Package
     } else {
         match detect_identifier_type(&args.identifier) {
-            Some(t) => {
-                println!("Detected identifier type: {:?}", t);
-                t
-            }
+            Some(t) => t,
             None => {
-                println!("Treating \"{}\" as a package name search", args.identifier);
+                if !args.json {
+                    println!("Treating \"{}\" as a package name search", args.identifier);
+                }
                 IdentifierType::Package
             }
         }
@@ -152,17 +202,33 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Handle UUID: fetch and download directly
     if id_type == IdentifierType::Uuid {
-        println!("Fetching patch by UUID: {}", args.identifier);
+        if !args.json {
+            println!("Fetching patch by UUID: {}", args.identifier);
+        }
         match api_client
             .fetch_patch(effective_org_slug, &args.identifier)
             .await
         {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
-                    println!("\n\x1b[33mThis patch requires a paid subscription to download.\x1b[0m");
-                    println!("\n  Patch: {}", patch.purl);
-                    println!("  Tier:  \x1b[33mpaid\x1b[0m");
-                    println!("\n  Upgrade at: \x1b[36mhttps://socket.dev/pricing\x1b[0m\n");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "paid_required",
+                            "found": 1,
+                            "downloaded": 0,
+                            "applied": 0,
+                            "patches": [{
+                                "purl": patch.purl,
+                                "uuid": patch.uuid,
+                                "tier": "paid",
+                            }],
+                        })).unwrap());
+                    } else {
+                        println!("\nThis patch requires a paid subscription to download.");
+                        println!("\n  Patch: {}", patch.purl);
+                        println!("  Tier:  paid");
+                        println!("\n  Upgrade at: https://socket.dev/pricing\n");
+                    }
                     return 0;
                 }
 
@@ -171,11 +237,28 @@ pub async fn run(args: GetArgs) -> i32 {
                     .await;
             }
             Ok(None) => {
-                println!("No patch found with UUID: {}", args.identifier);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "not_found",
+                        "found": 0,
+                        "downloaded": 0,
+                        "applied": 0,
+                        "patches": [],
+                    })).unwrap());
+                } else {
+                    println!("No patch found with UUID: {}", args.identifier);
+                }
                 return 0;
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string(),
+                    })).unwrap());
+                } else {
+                    eprintln!("Error: {e}");
+                }
                 return 1;
             }
         }
@@ -184,46 +267,75 @@ pub async fn run(args: GetArgs) -> i32 {
     // For CVE/GHSA/PURL/package, search first
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve => {
-            println!("Searching patches for CVE: {}", args.identifier);
+            if !args.json {
+                println!("Searching patches for CVE: {}", args.identifier);
+            }
             match api_client
                 .search_patches_by_cve(effective_org_slug, &args.identifier)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        })).unwrap());
+                    } else {
+                        eprintln!("Error: {e}");
+                    }
                     return 1;
                 }
             }
         }
         IdentifierType::Ghsa => {
-            println!("Searching patches for GHSA: {}", args.identifier);
+            if !args.json {
+                println!("Searching patches for GHSA: {}", args.identifier);
+            }
             match api_client
                 .search_patches_by_ghsa(effective_org_slug, &args.identifier)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        })).unwrap());
+                    } else {
+                        eprintln!("Error: {e}");
+                    }
                     return 1;
                 }
             }
         }
         IdentifierType::Purl => {
-            println!("Searching patches for PURL: {}", args.identifier);
+            if !args.json {
+                println!("Searching patches for PURL: {}", args.identifier);
+            }
             match api_client
                 .search_patches_by_package(effective_org_slug, &args.identifier)
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        })).unwrap());
+                    } else {
+                        eprintln!("Error: {e}");
+                    }
                     return 1;
                 }
             }
         }
         IdentifierType::Package => {
-            println!("Enumerating packages...");
+            if !args.json {
+                println!("Enumerating packages...");
+            }
             let crawler_options = CrawlerOptions {
                 cwd: args.cwd.clone(),
                 global: args.global,
@@ -233,7 +345,15 @@ pub async fn run(args: GetArgs) -> i32 {
             let (all_packages, _) = crawl_all_ecosystems(&crawler_options).await;
 
             if all_packages.is_empty() {
-                if args.global {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "no_packages",
+                        "found": 0,
+                        "downloaded": 0,
+                        "applied": 0,
+                        "patches": [],
+                    })).unwrap());
+                } else if args.global {
                     println!("No global packages found.");
                 } else {
                     #[cfg(feature = "cargo")]
@@ -245,19 +365,33 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            println!("Found {} packages", all_packages.len());
+            if !args.json {
+                println!("Found {} packages", all_packages.len());
+            }
 
             let matches = fuzzy_match_packages(&args.identifier, &all_packages, 20);
 
             if matches.is_empty() {
-                println!("No packages matching \"{}\" found.", args.identifier);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "no_match",
+                        "found": 0,
+                        "downloaded": 0,
+                        "applied": 0,
+                        "patches": [],
+                    })).unwrap());
+                } else {
+                    println!("No packages matching \"{}\" found.", args.identifier);
+                }
                 return 0;
             }
 
-            println!(
-                "Found {} matching package(s), checking for available patches...",
-                matches.len()
-            );
+            if !args.json {
+                println!(
+                    "Found {} matching package(s), checking for available patches...",
+                    matches.len()
+                );
+            }
 
             // Search for patches for the best match
             let best_match = &matches[0];
@@ -267,7 +401,14 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string(),
+                        })).unwrap());
+                    } else {
+                        eprintln!("Error: {e}");
+                    }
                     return 1;
                 }
             }
@@ -276,15 +417,27 @@ pub async fn run(args: GetArgs) -> i32 {
     };
 
     if search_response.patches.is_empty() {
-        println!(
-            "No patches found for {:?}: {}",
-            id_type, args.identifier
-        );
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "not_found",
+                "found": 0,
+                "downloaded": 0,
+                "applied": 0,
+                "patches": [],
+            })).unwrap());
+        } else {
+            println!(
+                "No patches found for {}: {}",
+                id_type, args.identifier
+            );
+        }
         return 0;
     }
 
-    // Display results
-    display_search_results(&search_response.patches, search_response.can_access_paid_patches);
+    if !args.json {
+        // Display results
+        display_search_results(&search_response.patches, search_response.can_access_paid_patches);
+    }
 
     // Filter accessible patches
     let accessible: Vec<_> = search_response
@@ -294,19 +447,29 @@ pub async fn run(args: GetArgs) -> i32 {
         .collect();
 
     if accessible.is_empty() {
-        println!("\n\x1b[33mAll available patches require a paid subscription.\x1b[0m");
-        println!("\n  Upgrade at: \x1b[36mhttps://socket.dev/pricing\x1b[0m\n");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "paid_required",
+                "found": search_response.patches.len(),
+                "downloaded": 0,
+                "applied": 0,
+                "patches": search_response.patches.iter().map(|p| serde_json::json!({
+                    "purl": p.purl,
+                    "uuid": p.uuid,
+                    "tier": p.tier,
+                })).collect::<Vec<_>>(),
+            })).unwrap());
+        } else {
+            println!("\nAll available patches require a paid subscription.");
+            println!("\n  Upgrade at: https://socket.dev/pricing\n");
+        }
         return 0;
     }
 
     // Prompt for confirmation
-    if accessible.len() > 1 && !args.yes {
-        print!("Download {} patch(es)? [y/N] ", accessible.len());
-        io::stdout().flush().unwrap();
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer).unwrap();
-        let answer = answer.trim().to_lowercase();
-        if answer != "y" && answer != "yes" {
+    if accessible.len() > 1 && !args.json {
+        let prompt = format!("Download {} patch(es)? [y/N] ", accessible.len());
+        if !should_proceed(&args, &prompt) {
             println!("Download cancelled.");
             return 0;
         }
@@ -325,11 +488,14 @@ pub async fn run(args: GetArgs) -> i32 {
         _ => PatchManifest::new(),
     };
 
-    println!("\nDownloading {} patch(es)...", accessible.len());
+    if !args.json {
+        println!("\nDownloading {} patch(es)...", accessible.len());
+    }
 
     let mut patches_added = 0;
     let mut patches_skipped = 0;
     let mut patches_failed = 0;
+    let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
     for search_result in &accessible {
         match api_client
@@ -343,7 +509,14 @@ pub async fn run(args: GetArgs) -> i32 {
                     .get(&patch.purl)
                     .is_some_and(|p| p.uuid == patch.uuid)
                 {
-                    println!("  [skip] {} (already in manifest)", patch.purl);
+                    if !args.json {
+                        println!("  [skip] {} (already in manifest)", patch.purl);
+                    }
+                    downloaded_patches.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "skipped",
+                    }));
                     patches_skipped += 1;
                     continue;
                 }
@@ -406,15 +579,38 @@ pub async fn run(args: GetArgs) -> i32 {
                     },
                 );
 
-                println!("  [add] {}", patch.purl);
+                if !args.json {
+                    println!("  [add] {}", patch.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": patch.purl,
+                    "uuid": patch.uuid,
+                    "action": "added",
+                }));
                 patches_added += 1;
             }
             Ok(None) => {
-                println!("  [fail] {} (could not fetch details)", search_result.purl);
+                if !args.json {
+                    println!("  [fail] {} (could not fetch details)", search_result.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": "could not fetch details",
+                }));
                 patches_failed += 1;
             }
             Err(e) => {
-                println!("  [fail] {} ({e})", search_result.purl);
+                if !args.json {
+                    println!("  [fail] {} ({e})", search_result.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": e.to_string(),
+                }));
                 patches_failed += 1;
             }
         }
@@ -422,37 +618,62 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Write manifest
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        eprintln!("Error writing manifest: {e}");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": format!("Error writing manifest: {e}"),
+            })).unwrap());
+        } else {
+            eprintln!("Error writing manifest: {e}");
+        }
         return 1;
     }
 
-    println!("\nPatches saved to {}", manifest_path.display());
-    println!("  Added: {patches_added}");
-    if patches_skipped > 0 {
-        println!("  Skipped: {patches_skipped}");
-    }
-    if patches_failed > 0 {
-        println!("  Failed: {patches_failed}");
+    if !args.json {
+        println!("\nPatches saved to {}", manifest_path.display());
+        println!("  Added: {patches_added}");
+        if patches_skipped > 0 {
+            println!("  Skipped: {patches_skipped}");
+        }
+        if patches_failed > 0 {
+            println!("  Failed: {patches_failed}");
+        }
     }
 
     // Auto-apply unless --save-only
     if !args.save_only && patches_added > 0 {
-        println!("\nApplying patches...");
+        if !args.json {
+            println!("\nApplying patches...");
+        }
         let apply_args = super::apply::ApplyArgs {
             cwd: args.cwd.clone(),
             dry_run: false,
-            silent: false,
+            silent: args.json, // suppress text output when in JSON mode
             manifest_path: manifest_path.display().to_string(),
             offline: false,
             global: args.global,
             global_prefix: args.global_prefix.clone(),
             ecosystems: None,
             force: false,
+            json: false, // we handle JSON output ourselves
+            verbose: false,
         };
         let code = super::apply::run(apply_args).await;
-        if code != 0 {
+        if code != 0 && !args.json {
             eprintln!("\nSome patches could not be applied.");
         }
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "status": "success",
+            "found": search_response.patches.len(),
+            "downloaded": patches_added,
+            "skipped": patches_skipped,
+            "failed": patches_failed,
+            "applied": if !args.save_only && patches_added > 0 { patches_added } else { 0 },
+            "patches": downloaded_patches,
+        })).unwrap());
     }
 
     0
@@ -517,11 +738,28 @@ async fn save_and_apply_patch(
     let patch = match api_client.fetch_patch(effective_org, uuid).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            println!("No patch found with UUID: {uuid}");
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "not_found",
+                    "found": 0,
+                    "downloaded": 0,
+                    "applied": 0,
+                    "patches": [],
+                })).unwrap());
+            } else {
+                println!("No patch found with UUID: {uuid}");
+            }
             return 0;
         }
         Err(e) => {
-            eprintln!("Error: {e}");
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                })).unwrap());
+            } else {
+                eprintln!("Error: {e}");
+            }
             return 1;
         }
     };
@@ -608,34 +846,61 @@ async fn save_and_apply_patch(
     );
 
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        eprintln!("Error writing manifest: {e}");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": format!("Error writing manifest: {e}"),
+            })).unwrap());
+        } else {
+            eprintln!("Error writing manifest: {e}");
+        }
         return 1;
     }
 
-    println!("\nPatch saved to {}", manifest_path.display());
-    if added {
-        println!("  Added: 1");
-    } else {
-        println!("  Skipped: 1 (already exists)");
+    if !args.json {
+        println!("\nPatch saved to {}", manifest_path.display());
+        if added {
+            println!("  Added: 1");
+        } else {
+            println!("  Skipped: 1 (already exists)");
+        }
     }
 
     if !args.save_only {
-        println!("\nApplying patches...");
+        if !args.json {
+            println!("\nApplying patches...");
+        }
         let apply_args = super::apply::ApplyArgs {
             cwd: args.cwd.clone(),
             dry_run: false,
-            silent: false,
+            silent: args.json,
             manifest_path: manifest_path.display().to_string(),
             offline: false,
             global: args.global,
             global_prefix: args.global_prefix.clone(),
             ecosystems: None,
             force: false,
+            json: false,
+            verbose: false,
         };
         let code = super::apply::run(apply_args).await;
-        if code != 0 {
+        if code != 0 && !args.json {
             eprintln!("\nSome patches could not be applied.");
         }
+    }
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "status": "success",
+            "found": 1,
+            "downloaded": if added { 1 } else { 0 },
+            "applied": if !args.save_only && added { 1 } else { 0 },
+            "patches": [{
+                "purl": patch.purl,
+                "uuid": patch.uuid,
+                "action": if added { "added" } else { "skipped" },
+            }],
+        })).unwrap());
     }
 
     0

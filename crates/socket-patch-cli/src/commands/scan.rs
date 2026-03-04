@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
+use crate::output::{color, format_severity, stderr_is_tty, stdout_is_tty};
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
@@ -42,6 +43,10 @@ pub struct ScanArgs {
     /// Socket API token (overrides SOCKET_API_TOKEN env var)
     #[arg(long = "api-token")]
     pub api_token: Option<String>,
+
+    /// Restrict scanning to specific ecosystems (comma-separated: npm,pypi,cargo)
+    #[arg(long, value_delimiter = ',')]
+    pub ecosystems: Option<Vec<String>>,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -71,24 +76,43 @@ pub async fn run(args: ScanArgs) -> i32 {
         "packages"
     };
 
-    if !args.json {
+    let show_progress = !args.json && stderr_is_tty();
+
+    if show_progress {
         eprint!("Scanning {scan_target}...");
     }
 
     // Crawl packages
     let (all_crawled, eco_counts) = crawl_all_ecosystems(&crawler_options).await;
 
-    let all_purls: Vec<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
+    // Filter by --ecosystems if provided
+    let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.ecosystems {
+        all_crawled
+            .into_iter()
+            .filter(|pkg| {
+                if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
+                    allowed.iter().any(|a| a == eco.cli_name())
+                } else {
+                    false
+                }
+            })
+            .collect()
+    } else {
+        all_crawled
+    };
+
+    let all_purls: Vec<String> = filtered_crawled.iter().map(|p| p.purl.clone()).collect();
     let package_count = all_purls.len();
 
     if package_count == 0 {
-        if !args.json {
+        if show_progress {
             eprintln!();
         }
         if args.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "success",
                     "scannedPackages": 0,
                     "packagesWithPatches": 0,
                     "totalPatches": 0,
@@ -114,7 +138,12 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Build ecosystem summary
     let mut eco_parts = Vec::new();
     for eco in Ecosystem::all() {
-        let count = eco_counts.get(eco).copied().unwrap_or(0);
+        let count = if args.ecosystems.is_some() {
+            // When filtering, count the filtered packages
+            filtered_crawled.iter().filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco)).count()
+        } else {
+            eco_counts.get(eco).copied().unwrap_or(0)
+        };
         if count > 0 {
             eco_parts.push(format!("{count} {}", eco.display_name()));
         }
@@ -126,7 +155,11 @@ pub async fn run(args: ScanArgs) -> i32 {
     };
 
     if !args.json {
-        eprintln!("\rFound {package_count} packages{eco_summary}");
+        if show_progress {
+            eprintln!("\rFound {package_count} packages{eco_summary}");
+        } else {
+            eprintln!("Found {package_count} packages{eco_summary}");
+        }
     }
 
     // Query API in batches
@@ -134,12 +167,12 @@ pub async fn run(args: ScanArgs) -> i32 {
     let mut can_access_paid_patches = false;
     let total_batches = all_purls.len().div_ceil(args.batch_size);
 
-    if !args.json {
+    if show_progress {
         eprint!("Querying API for patches... (batch 1/{total_batches})");
     }
 
     for (batch_idx, chunk) in all_purls.chunks(args.batch_size).enumerate() {
-        if !args.json {
+        if show_progress {
             eprint!(
                 "\rQuerying API for patches... (batch {}/{})",
                 batch_idx + 1,
@@ -177,12 +210,21 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     if !args.json {
         if total_patches_found > 0 {
-            eprintln!(
-                "\rFound {total_patches_found} patches for {} packages",
-                all_packages_with_patches.len()
-            );
-        } else {
+            if show_progress {
+                eprintln!(
+                    "\rFound {total_patches_found} patches for {} packages",
+                    all_packages_with_patches.len()
+                );
+            } else {
+                eprintln!(
+                    "Found {total_patches_found} patches for {} packages",
+                    all_packages_with_patches.len()
+                );
+            }
+        } else if show_progress {
             eprintln!("\rAPI query complete");
+        } else {
+            eprintln!("API query complete");
         }
     }
 
@@ -202,6 +244,7 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     if args.json {
         let result = serde_json::json!({
+            "status": "success",
             "scannedPackages": package_count,
             "packagesWithPatches": all_packages_with_patches.len(),
             "totalPatches": total_patches,
@@ -213,6 +256,8 @@ pub async fn run(args: ScanArgs) -> i32 {
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         return 0;
     }
+
+    let use_color = stdout_is_tty();
 
     if all_packages_with_patches.is_empty() {
         println!("\nNo patches available for installed packages.");
@@ -244,7 +289,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             if can_access_paid_patches {
                 format!("{}+{}", pkg_free, pkg_paid)
             } else {
-                format!("{}\x1b[33m+{}\x1b[0m", pkg_free, pkg_paid)
+                format!("{}+{}", pkg_free, color(&pkg_paid.to_string(), "33", use_color))
             }
         } else {
             format!("{}", pkg_free)
@@ -286,7 +331,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             "{:<40}  {:>8}  {:<16}  {}",
             display_purl,
             count_str,
-            format_severity(severity),
+            format_severity(severity, use_color),
             vuln_str,
         );
     }
@@ -308,8 +353,12 @@ pub async fn run(args: ScanArgs) -> i32 {
         );
         if paid_patches > 0 {
             println!(
-                "\x1b[33m         + {} additional patch(es) available with paid subscription\x1b[0m",
-                paid_patches,
+                "{}",
+                color(
+                    &format!("         + {} additional patch(es) available with paid subscription", paid_patches),
+                    "33",
+                    use_color,
+                ),
             );
             println!(
                 "\nUpgrade to Socket's paid plan to access all patches: https://socket.dev/pricing"
@@ -331,15 +380,5 @@ fn severity_order(s: &str) -> u8 {
         "medium" => 2,
         "low" => 3,
         _ => 4,
-    }
-}
-
-fn format_severity(s: &str) -> String {
-    match s.to_lowercase().as_str() {
-        "critical" => "\x1b[31mcritical\x1b[0m".to_string(),
-        "high" => "\x1b[91mhigh\x1b[0m".to_string(),
-        "medium" => "\x1b[33mmedium\x1b[0m".to_string(),
-        "low" => "\x1b[36mlow\x1b[0m".to_string(),
-        other => other.to_string(),
     }
 }

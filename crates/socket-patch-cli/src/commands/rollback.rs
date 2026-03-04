@@ -7,7 +7,7 @@ use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult};
+use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,14 @@ pub struct RollbackArgs {
     /// Restrict rollback to specific ecosystems
     #[arg(long, value_delimiter = ',')]
     pub ecosystems: Option<Vec<String>>,
+
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+
+    /// Show detailed per-file verification information
+    #[arg(short = 'v', long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 struct PatchToRollback {
@@ -135,6 +143,36 @@ async fn get_missing_before_blobs(
     missing
 }
 
+fn verify_rollback_status_str(status: &VerifyRollbackStatus) -> &'static str {
+    match status {
+        VerifyRollbackStatus::Ready => "ready",
+        VerifyRollbackStatus::AlreadyOriginal => "already_original",
+        VerifyRollbackStatus::HashMismatch => "hash_mismatch",
+        VerifyRollbackStatus::NotFound => "not_found",
+        VerifyRollbackStatus::MissingBlob => "missing_blob",
+    }
+}
+
+fn result_to_json(result: &RollbackResult) -> serde_json::Value {
+    serde_json::json!({
+        "purl": result.package_key,
+        "path": result.package_path,
+        "success": result.success,
+        "error": result.error,
+        "filesRolledBack": result.files_rolled_back,
+        "filesVerified": result.files_verified.iter().map(|f| {
+            serde_json::json!({
+                "file": f.file,
+                "status": verify_rollback_status_str(&f.status),
+                "message": f.message,
+                "currentHash": f.current_hash,
+                "expectedHash": f.expected_hash,
+                "targetHash": f.target_hash,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
     // Override env vars if CLI options provided (before building client)
     if let Some(ref url) = args.api_url {
@@ -150,15 +188,27 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     // Validate one-off requires identifier
     if args.one_off && args.identifier.is_none() {
-        eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "--one-off requires an identifier (UUID or PURL)",
+            })).unwrap());
+        } else {
+            eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
+        }
         return 1;
     }
 
     // Handle one-off mode
     if args.one_off {
-        // One-off mode not fully implemented yet - placeholder
-        eprintln!("One-off rollback mode: fetching patch data...");
-        // TODO: implement one-off rollback
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "One-off rollback mode is not yet implemented",
+            })).unwrap());
+        } else {
+            eprintln!("One-off rollback mode: fetching patch data...");
+        }
         return 1;
     }
 
@@ -169,7 +219,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
     };
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if !args.silent {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "Manifest not found",
+                "path": manifest_path.display().to_string(),
+            })).unwrap());
+        } else if !args.silent {
             eprintln!("Manifest not found at {}", manifest_path.display());
         }
         return 1;
@@ -177,7 +233,31 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     match rollback_patches_inner(&args, &manifest_path).await {
         Ok((success, results)) => {
-            if !args.silent && !results.is_empty() {
+            let rolled_back_count = results
+                .iter()
+                .filter(|r| r.success && !r.files_rolled_back.is_empty())
+                .count();
+            let already_original_count = results
+                .iter()
+                .filter(|r| {
+                    r.success
+                        && r.files_verified.iter().all(|f| {
+                            f.status == VerifyRollbackStatus::AlreadyOriginal
+                        })
+                })
+                .count();
+            let failed_count = results.iter().filter(|r| !r.success).count();
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if success { "success" } else { "partial_failure" },
+                    "rolledBack": rolled_back_count,
+                    "alreadyOriginal": already_original_count,
+                    "failed": failed_count,
+                    "dryRun": args.dry_run,
+                    "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+                })).unwrap());
+            } else if !args.silent && !results.is_empty() {
                 let rolled_back: Vec<_> = results
                     .iter()
                     .filter(|r| r.success && !r.files_rolled_back.is_empty())
@@ -187,8 +267,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .filter(|r| {
                         r.success
                             && r.files_verified.iter().all(|f| {
-                                f.status
-                                    == socket_patch_core::patch::rollback::VerifyRollbackStatus::AlreadyOriginal
+                                f.status == VerifyRollbackStatus::AlreadyOriginal
                             })
                     })
                     .collect();
@@ -228,12 +307,37 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         }
                     }
                 }
+
+                if args.verbose {
+                    println!("\nDetailed verification:");
+                    for result in &results {
+                        println!("  {}:", result.package_key);
+                        for f in &result.files_verified {
+                            let status_str = match f.status {
+                                VerifyRollbackStatus::Ready => "ready",
+                                VerifyRollbackStatus::AlreadyOriginal => "already original",
+                                VerifyRollbackStatus::HashMismatch => "hash mismatch",
+                                VerifyRollbackStatus::NotFound => "not found",
+                                VerifyRollbackStatus::MissingBlob => "missing blob",
+                            };
+                            println!("    {} [{}]", f.file, status_str);
+                            if let Some(ref msg) = f.message {
+                                println!("      message: {msg}");
+                            }
+                            if let Some(ref h) = f.current_hash {
+                                println!("      current:  {h}");
+                            }
+                            if let Some(ref h) = f.expected_hash {
+                                println!("      expected: {h}");
+                            }
+                            if let Some(ref h) = f.target_hash {
+                                println!("      target:   {h}");
+                            }
+                        }
+                    }
+                }
             }
 
-            let rolled_back_count = results
-                .iter()
-                .filter(|r| r.success && !r.files_rolled_back.is_empty())
-                .count();
             if success {
                 track_patch_rolled_back(rolled_back_count, api_token.as_deref(), org_slug.as_deref()).await;
             } else {
@@ -244,7 +348,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
         Err(e) => {
             track_patch_rollback_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            if !args.silent {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": e,
+                    "rolledBack": 0,
+                    "alreadyOriginal": 0,
+                    "failed": 0,
+                    "dryRun": args.dry_run,
+                    "results": [],
+                })).unwrap());
+            } else if !args.silent {
                 eprintln!("Error: {e}");
             }
             1
@@ -277,7 +391,7 @@ async fn rollback_patches_inner(
                 args.identifier.as_deref().unwrap()
             ));
         }
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("No patches found in manifest");
         }
         return Ok((true, Vec::new()));
@@ -295,7 +409,7 @@ async fn rollback_patches_inner(
     let missing_blobs = get_missing_before_blobs(&filtered_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.offline {
-            if !args.silent {
+            if !args.silent && !args.json {
                 eprintln!(
                     "Error: {} blob(s) are missing and --offline mode is enabled.",
                     missing_blobs.len()
@@ -305,20 +419,20 @@ async fn rollback_patches_inner(
             return Ok((false, Vec::new()));
         }
 
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
         let (client, _) = get_api_client_from_env(None).await;
         let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, &client, None).await;
 
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("{}", format_fetch_result(&fetch_result));
         }
 
         let still_missing = get_missing_before_blobs(&filtered_manifest, &blobs_path).await;
         if !still_missing.is_empty() {
-            if !args.silent {
+            if !args.silent && !args.json {
                 eprintln!(
                     "{} blob(s) could not be downloaded. Cannot rollback.",
                     still_missing.len()
@@ -341,10 +455,10 @@ async fn rollback_patches_inner(
     };
 
     let all_packages =
-        find_packages_for_rollback(&partitioned, &crawler_options, args.silent).await;
+        find_packages_for_rollback(&partitioned, &crawler_options, args.silent || args.json).await;
 
     if all_packages.is_empty() {
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("No packages found that match patches to rollback");
         }
         return Ok((true, Vec::new()));
@@ -371,7 +485,7 @@ async fn rollback_patches_inner(
 
         if !result.success {
             has_errors = true;
-            if !args.silent {
+            if !args.silent && !args.json {
                 eprintln!(
                     "Failed to rollback {}: {}",
                     purl,
@@ -412,6 +526,8 @@ pub async fn rollback_patches(
         api_url: None,
         api_token: None,
         ecosystems,
+        json: false,
+        verbose: false,
     };
     rollback_patches_inner(&args, manifest_path).await
 }

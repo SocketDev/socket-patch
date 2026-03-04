@@ -30,10 +30,11 @@ pub async fn run(args: ListArgs) -> i32 {
         if args.json {
             println!(
                 "{}",
-                serde_json::json!({
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
                     "error": "Manifest not found",
                     "path": manifest_path.display().to_string()
-                })
+                })).unwrap()
             );
         } else {
             eprintln!("Manifest not found at {}", manifest_path.display());
@@ -47,7 +48,7 @@ pub async fn run(args: ListArgs) -> i32 {
 
             if patch_entries.is_empty() {
                 if args.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "patches": [] })).unwrap());
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "success", "patches": [] })).unwrap());
                 } else {
                     println!("No patches found in manifest.");
                 }
@@ -56,6 +57,7 @@ pub async fn run(args: ListArgs) -> i32 {
 
             if args.json {
                 let json_output = serde_json::json!({
+                    "status": "success",
                     "patches": patch_entries.iter().map(|(purl, patch)| {
                         serde_json::json!({
                             "purl": purl,
@@ -123,7 +125,7 @@ pub async fn run(args: ListArgs) -> i32 {
         }
         Ok(None) => {
             if args.json {
-                println!("{}", serde_json::json!({ "error": "Invalid manifest" }));
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "error", "error": "Invalid manifest" })).unwrap());
             } else {
                 eprintln!("Error: Invalid manifest at {}", manifest_path.display());
             }
@@ -131,7 +133,7 @@ pub async fn run(args: ListArgs) -> i32 {
         }
         Err(e) => {
             if args.json {
-                println!("{}", serde_json::json!({ "error": e.to_string() }));
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "error", "error": e.to_string() })).unwrap());
             } else {
                 eprintln!("Error: {e}");
             }

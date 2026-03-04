@@ -32,6 +32,10 @@ pub struct RemoveArgs {
     /// Custom path to global node_modules
     #[arg(long = "global-prefix")]
     pub global_prefix: Option<PathBuf>,
+
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 pub async fn run(args: RemoveArgs) -> i32 {
@@ -47,19 +51,30 @@ pub async fn run(args: RemoveArgs) -> i32 {
     };
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        eprintln!("Manifest not found at {}", manifest_path.display());
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": "Manifest not found",
+                "path": manifest_path.display().to_string(),
+            })).unwrap());
+        } else {
+            eprintln!("Manifest not found at {}", manifest_path.display());
+        }
         return 1;
     }
 
     // First, rollback the patch if not skipped
+    let mut rollback_count = 0;
     if !args.skip_rollback {
-        println!("Rolling back patch before removal...");
+        if !args.json {
+            println!("Rolling back patch before removal...");
+        }
         match rollback_patches(
             &args.cwd,
             &manifest_path,
             Some(&args.identifier),
             false,
-            false,
+            args.json, // silent when JSON
             false,
             args.global,
             args.global_prefix.clone(),
@@ -75,11 +90,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         org_slug.as_deref(),
                     )
                     .await;
-                    eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "error",
+                            "error": "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.",
+                        })).unwrap());
+                    } else {
+                        eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
+                    }
                     return 1;
                 }
 
-                let rolled_back = results
+                rollback_count = results
                     .iter()
                     .filter(|r| r.success && !r.files_rolled_back.is_empty())
                     .count();
@@ -94,21 +116,30 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     })
                     .count();
 
-                if rolled_back > 0 {
-                    println!("Rolled back {rolled_back} package(s)");
+                if !args.json {
+                    if rollback_count > 0 {
+                        println!("Rolled back {rollback_count} package(s)");
+                    }
+                    if already_original > 0 {
+                        println!("{already_original} package(s) already in original state");
+                    }
+                    if results.is_empty() {
+                        println!("No packages found to rollback (not installed)");
+                    }
+                    println!();
                 }
-                if already_original > 0 {
-                    println!("{already_original} package(s) already in original state");
-                }
-                if results.is_empty() {
-                    println!("No packages found to rollback (not installed)");
-                }
-                println!();
             }
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-                eprintln!("Error during rollback: {e}");
-                eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "error",
+                        "error": format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
+                    })).unwrap());
+                } else {
+                    eprintln!("Error during rollback: {e}");
+                    eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
+                }
                 return 1;
             }
         }
@@ -124,27 +155,49 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     org_slug.as_deref(),
                 )
                 .await;
-                eprintln!(
-                    "No patch found matching identifier: {}",
-                    args.identifier
-                );
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "not_found",
+                        "error": format!("No patch found matching identifier: {}", args.identifier),
+                        "removed": 0,
+                        "purls": [],
+                    })).unwrap());
+                } else {
+                    eprintln!(
+                        "No patch found matching identifier: {}",
+                        args.identifier
+                    );
+                }
                 return 1;
             }
 
-            println!("Removed {} patch(es) from manifest:", removed.len());
-            for purl in &removed {
-                println!("  - {purl}");
+            if !args.json {
+                println!("Removed {} patch(es) from manifest:", removed.len());
+                for purl in &removed {
+                    println!("  - {purl}");
+                }
+                println!("\nManifest updated at {}", manifest_path.display());
             }
-
-            println!("\nManifest updated at {}", manifest_path.display());
 
             // Clean up unused blobs
             let socket_dir = manifest_path.parent().unwrap();
             let blobs_path = socket_dir.join("blobs");
+            let mut blobs_removed = 0;
             if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
-                if cleanup_result.blobs_removed > 0 {
+                blobs_removed = cleanup_result.blobs_removed;
+                if !args.json && cleanup_result.blobs_removed > 0 {
                     println!("\n{}", format_cleanup_result(&cleanup_result, false));
                 }
+            }
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "success",
+                    "removed": removed.len(),
+                    "rolledBack": rollback_count,
+                    "blobsCleaned": blobs_removed,
+                    "purls": removed,
+                })).unwrap());
             }
 
             track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
@@ -152,7 +205,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            eprintln!("Error: {e}");
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": e,
+                })).unwrap());
+            } else {
+                eprintln!("Error: {e}");
+            }
             1
         }
     }

@@ -74,6 +74,8 @@ socket-patch 550e8400-e29b-41d4-a716-446655440000
 
 ## Commands
 
+All commands support `--json` for structured JSON output and `--cwd <dir>` to set the working directory (default: `.`). Every JSON response includes a `"status"` field (`"success"`, `"error"`, `"no_manifest"`, etc.) for reliable programmatic consumption.
+
 ### `get`
 
 Get security patches from Socket API and apply them. Accepts a UUID, CVE ID, GHSA ID, PURL, or package name. The identifier type is auto-detected but can be forced with a flag.
@@ -94,10 +96,11 @@ socket-patch get <identifier> [options]
 | `--ghsa` | Force identifier to be treated as a GHSA ID |
 | `-p, --package` | Force identifier to be treated as a package name |
 | `-y, --yes` | Skip confirmation prompt for multiple patches |
-| `--no-apply` | Download patch without applying it |
+| `--save-only` | Download patch without applying it (alias: `--no-apply`) |
 | `--one-off` | Apply patch immediately without saving to `.socket` folder |
 | `-g, --global` | Apply to globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
+| `--json` | Output results as JSON |
 | `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
 | `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
 | `--cwd <dir>` | Working directory (default: `.`) |
@@ -117,10 +120,13 @@ socket-patch get GHSA-xxxx-yyyy-zzzz
 socket-patch get lodash
 
 # Download only, don't apply
-socket-patch get CVE-2024-12345 --no-apply
+socket-patch get CVE-2024-12345 --save-only
 
 # Apply to global packages
 socket-patch get lodash -g
+
+# JSON output for scripting
+socket-patch get CVE-2024-12345 --json -y
 ```
 
 ### `scan`
@@ -137,6 +143,7 @@ socket-patch scan [options]
 |------|-------------|
 | `--org <slug>` | Organization slug |
 | `--json` | Output results as JSON |
+| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated: `npm,pypi,cargo`) |
 | `-g, --global` | Scan globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
@@ -151,6 +158,9 @@ socket-patch scan
 
 # Scan with JSON output
 socket-patch scan --json
+
+# Scan only npm packages
+socket-patch scan --ecosystems npm
 
 # Scan global packages
 socket-patch scan -g
@@ -170,11 +180,14 @@ socket-patch apply [options]
 |------|-------------|
 | `-d, --dry-run` | Verify patches without modifying files |
 | `-s, --silent` | Only output errors |
+| `-f, --force` | Skip pre-application hash verification (apply even if package version differs) |
 | `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
 | `--offline` | Do not download missing blobs; fail if any are missing |
 | `-g, --global` | Apply to globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
+| `--json` | Output results as JSON |
+| `-v, --verbose` | Show detailed per-file verification information |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
@@ -190,6 +203,9 @@ socket-patch apply --ecosystems npm
 
 # Apply in offline mode
 socket-patch apply --offline
+
+# JSON output for CI/CD
+socket-patch apply --json
 ```
 
 ### `rollback`
@@ -211,6 +227,8 @@ socket-patch rollback [identifier] [options]
 | `-g, --global` | Rollback globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated) |
+| `--json` | Output results as JSON |
+| `-v, --verbose` | Show detailed per-file verification information |
 | `--org <slug>` | Organization slug |
 | `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
 | `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
@@ -229,6 +247,9 @@ socket-patch rollback 550e8400-e29b-41d4-a716-446655440000
 
 # Dry run
 socket-patch rollback --dry-run
+
+# JSON output
+socket-patch rollback --json
 ```
 
 ### `list`
@@ -290,6 +311,7 @@ socket-patch remove <identifier> [options]
 | `--skip-rollback` | Only update manifest, do not restore original files |
 | `-g, --global` | Remove from globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
+| `--json` | Output results as JSON |
 | `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
@@ -303,6 +325,9 @@ socket-patch remove 550e8400-e29b-41d4-a716-446655440000
 
 # Remove without rolling back files
 socket-patch remove "pkg:npm/lodash@4.17.20" --skip-rollback
+
+# JSON output
+socket-patch remove "pkg:npm/lodash@4.17.20" --json
 ```
 
 ### `setup`
@@ -319,6 +344,7 @@ socket-patch setup [options]
 |------|-------------|
 | `-d, --dry-run` | Preview changes without modifying files |
 | `-y, --yes` | Skip confirmation prompt |
+| `--json` | Output results as JSON |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
@@ -331,6 +357,9 @@ socket-patch setup -y
 
 # Preview changes
 socket-patch setup --dry-run
+
+# JSON output for scripting
+socket-patch setup --json -y
 ```
 
 ### `repair`
@@ -350,6 +379,7 @@ socket-patch repair [options]
 | `-d, --dry-run` | Show what would be done without doing it |
 | `--offline` | Skip network operations (cleanup only) |
 | `--download-only` | Only download missing blobs, do not clean up |
+| `--json` | Output results as JSON |
 | `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
@@ -363,7 +393,26 @@ socket-patch repair --offline
 
 # Download missing blobs only
 socket-patch repair --download-only
+
+# JSON output
+socket-patch repair --json
 ```
+
+## Scripting & CI/CD
+
+All commands support `--json` for machine-readable output. JSON responses always include a `"status"` field for easy error detection:
+
+```bash
+# Check for available patches in CI
+result=$(socket-patch scan --json --ecosystems npm)
+patches=$(echo "$result" | jq '.totalPatches')
+
+# Apply patches and check result
+socket-patch apply --json | jq '.status'
+# "success", "partial_failure", "no_manifest", or "error"
+```
+
+When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-proceed instead of blocking. Progress indicators and ANSI colors are automatically suppressed when output is piped.
 
 ## Environment Variables
 

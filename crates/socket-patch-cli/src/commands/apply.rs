@@ -6,7 +6,7 @@ use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::patch::apply::{apply_package_patch, verify_file_patch, ApplyResult};
+use socket_patch_core::patch::apply::{apply_package_patch, verify_file_patch, ApplyResult, VerifyStatus};
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
@@ -52,6 +52,43 @@ pub struct ApplyArgs {
     /// Skip pre-application hash verification (apply even if package version differs)
     #[arg(short = 'f', long, default_value_t = false)]
     pub force: bool,
+
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+
+    /// Show detailed per-file verification information
+    #[arg(short = 'v', long, default_value_t = false)]
+    pub verbose: bool,
+}
+
+fn verify_status_str(status: &VerifyStatus) -> &'static str {
+    match status {
+        VerifyStatus::Ready => "ready",
+        VerifyStatus::AlreadyPatched => "already_patched",
+        VerifyStatus::HashMismatch => "hash_mismatch",
+        VerifyStatus::NotFound => "not_found",
+    }
+}
+
+fn result_to_json(result: &ApplyResult) -> serde_json::Value {
+    serde_json::json!({
+        "purl": result.package_key,
+        "path": result.package_path,
+        "success": result.success,
+        "error": result.error,
+        "filesPatched": result.files_patched,
+        "filesVerified": result.files_verified.iter().map(|f| {
+            serde_json::json!({
+                "file": f.file,
+                "status": verify_status_str(&f.status),
+                "message": f.message,
+                "currentHash": f.current_hash,
+                "expectedHash": f.expected_hash,
+                "targetHash": f.target_hash,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
@@ -67,7 +104,16 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if !args.silent {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "no_manifest",
+                "patchesApplied": 0,
+                "alreadyPatched": 0,
+                "failed": 0,
+                "dryRun": args.dry_run,
+                "results": [],
+            })).unwrap());
+        } else if !args.silent {
             println!("No .socket folder found, skipping patch application.");
         }
         return 0;
@@ -75,15 +121,37 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
     match apply_patches_inner(&args, &manifest_path).await {
         Ok((success, results)) => {
-            // Print results
-            if !args.silent && !results.is_empty() {
+            let patched_count = results
+                .iter()
+                .filter(|r| r.success && !r.files_patched.is_empty())
+                .count();
+            let already_patched_count = results
+                .iter()
+                .filter(|r| {
+                    r.files_verified
+                        .iter()
+                        .all(|f| f.status == VerifyStatus::AlreadyPatched)
+                })
+                .count();
+            let failed_count = results.iter().filter(|r| !r.success).count();
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if success { "success" } else { "partial_failure" },
+                    "patchesApplied": patched_count,
+                    "alreadyPatched": already_patched_count,
+                    "failed": failed_count,
+                    "dryRun": args.dry_run,
+                    "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+                })).unwrap());
+            } else if !args.silent && !results.is_empty() {
                 let patched: Vec<_> = results.iter().filter(|r| r.success).collect();
                 let already_patched: Vec<_> = results
                     .iter()
                     .filter(|r| {
                         r.files_verified
                             .iter()
-                            .all(|f| f.status == socket_patch_core::patch::apply::VerifyStatus::AlreadyPatched)
+                            .all(|f| f.status == VerifyStatus::AlreadyPatched)
                     })
                     .collect();
 
@@ -99,19 +167,45 @@ pub async fn run(args: ApplyArgs) -> i32 {
                         if !result.files_patched.is_empty() {
                             println!("  {}", result.package_key);
                         } else if result.files_verified.iter().all(|f| {
-                            f.status == socket_patch_core::patch::apply::VerifyStatus::AlreadyPatched
+                            f.status == VerifyStatus::AlreadyPatched
                         }) {
                             println!("  {} (already patched)", result.package_key);
+                        }
+                    }
+                }
+
+                if args.verbose {
+                    println!("\nDetailed verification:");
+                    for result in &results {
+                        println!("  {}:", result.package_key);
+                        for f in &result.files_verified {
+                            let status_str = match f.status {
+                                VerifyStatus::Ready => "ready",
+                                VerifyStatus::AlreadyPatched => "already patched",
+                                VerifyStatus::HashMismatch => "hash mismatch",
+                                VerifyStatus::NotFound => "not found",
+                            };
+                            println!("    {} [{}]", f.file, status_str);
+                            if let Some(ref msg) = f.message {
+                                println!("      message: {msg}");
+                            }
+                            if args.verbose {
+                                if let Some(ref h) = f.current_hash {
+                                    println!("      current:  {h}");
+                                }
+                                if let Some(ref h) = f.expected_hash {
+                                    println!("      expected: {h}");
+                                }
+                                if let Some(ref h) = f.target_hash {
+                                    println!("      target:   {h}");
+                                }
+                            }
                         }
                     }
                 }
             }
 
             // Track telemetry
-            let patched_count = results
-                .iter()
-                .filter(|r| r.success && !r.files_patched.is_empty())
-                .count();
             if success {
                 track_patch_applied(patched_count, args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
             } else {
@@ -122,7 +216,17 @@ pub async fn run(args: ApplyArgs) -> i32 {
         }
         Err(e) => {
             track_patch_apply_failed(&e, args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
-            if !args.silent {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": e,
+                    "patchesApplied": 0,
+                    "alreadyPatched": 0,
+                    "failed": 0,
+                    "dryRun": args.dry_run,
+                    "results": [],
+                })).unwrap());
+            } else if !args.silent {
                 eprintln!("Error: {e}");
             }
             1
@@ -149,7 +253,7 @@ async fn apply_patches_inner(
     let missing_blobs = get_missing_blobs(&manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.offline {
-            if !args.silent {
+            if !args.silent && !args.json {
                 eprintln!(
                     "Error: {} blob(s) are missing and --offline mode is enabled.",
                     missing_blobs.len()
@@ -159,19 +263,19 @@ async fn apply_patches_inner(
             return Ok((false, Vec::new()));
         }
 
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
         let (client, _) = get_api_client_from_env(None).await;
         let fetch_result = fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
 
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("{}", format_fetch_result(&fetch_result));
         }
 
         if fetch_result.failed > 0 {
-            if !args.silent {
+            if !args.silent && !args.json {
                 eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
             }
             return Ok((false, Vec::new()));
@@ -191,12 +295,12 @@ async fn apply_patches_inner(
     };
 
     let all_packages =
-        find_packages_for_purls(&partitioned, &crawler_options, args.silent).await;
+        find_packages_for_purls(&partitioned, &crawler_options, args.silent || args.json).await;
 
     let has_any_purls = !partitioned.is_empty();
 
     if all_packages.is_empty() && !has_any_purls {
-        if !args.silent {
+        if !args.silent && !args.json {
             if args.global || args.global_prefix.is_some() {
                 eprintln!("No global packages found");
             } else {
@@ -207,7 +311,7 @@ async fn apply_patches_inner(
     }
 
     if all_packages.is_empty() {
-        if !args.silent {
+        if !args.silent && !args.json {
             println!("No packages found that match available patches");
         }
         return Ok((true, Vec::new()));
@@ -254,7 +358,7 @@ async fn apply_patches_inner(
                 if !args.force {
                     if let Some((file_name, file_info)) = patch.files.iter().next() {
                         let verify = verify_file_patch(pkg_path, file_name, file_info).await;
-                        if verify.status == socket_patch_core::patch::apply::VerifyStatus::HashMismatch {
+                        if verify.status == VerifyStatus::HashMismatch {
                             continue;
                         }
                     }
@@ -282,7 +386,7 @@ async fn apply_patches_inner(
 
             if !applied {
                 has_errors = true;
-                if !args.silent {
+                if !args.silent && !args.json {
                     eprintln!("Failed to patch {base_purl}: no matching variant found");
                 }
             }
@@ -305,7 +409,7 @@ async fn apply_patches_inner(
 
             if !result.success {
                 has_errors = true;
-                if !args.silent {
+                if !args.silent && !args.json {
                     eprintln!(
                         "Failed to patch {}: {}",
                         purl,
@@ -318,7 +422,7 @@ async fn apply_patches_inner(
     }
 
     // Clean up unused blobs
-    if !args.silent {
+    if !args.silent && !args.json {
         if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, args.dry_run).await {
             if cleanup_result.blobs_removed > 0 {
                 println!("\n{}", format_cleanup_result(&cleanup_result, args.dry_run));

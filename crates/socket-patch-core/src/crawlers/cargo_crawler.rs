@@ -96,7 +96,10 @@ impl CargoCrawler {
     /// Get crate source paths based on options.
     ///
     /// In local mode, checks `<cwd>/vendor/` first, then falls back to
-    /// `$CARGO_HOME/registry/src/` index directories.
+    /// `$CARGO_HOME/registry/src/` index directories — but only if the
+    /// `cwd` actually contains a `Cargo.toml` or `Cargo.lock` (i.e. is a
+    /// Rust project). This prevents scanning the global cargo registry
+    /// when patching a non-Rust project.
     ///
     /// In global mode, returns `$CARGO_HOME/registry/src/` index directories
     /// (or the `--global-prefix` override).
@@ -117,8 +120,20 @@ impl CargoCrawler {
             return Ok(vec![vendor_dir]);
         }
 
-        // Fall back to registry cache
-        Ok(Self::get_registry_src_paths().await)
+        // Only fall back to global registry if this looks like a Cargo project
+        let has_cargo_toml = tokio::fs::metadata(options.cwd.join("Cargo.toml"))
+            .await
+            .is_ok();
+        let has_cargo_lock = tokio::fs::metadata(options.cwd.join("Cargo.lock"))
+            .await
+            .is_ok();
+
+        if has_cargo_toml || has_cargo_lock {
+            return Ok(Self::get_registry_src_paths().await);
+        }
+
+        // Not a Cargo project — return empty
+        Ok(Vec::new())
     }
 
     /// Crawl all discovered crate source directories and return every
