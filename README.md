@@ -1,6 +1,6 @@
 # Socket Patch CLI
 
-Apply security patches to npm and Python dependencies without waiting for upstream fixes.
+Apply security patches to npm, Python, and Rust dependencies without waiting for upstream fixes.
 
 ## Installation
 
@@ -226,6 +226,7 @@ socket-patch rollback [identifier] [options]
 | `--offline` | Do not download missing blobs; fail if any are missing |
 | `-g, --global` | Rollback globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
+| `--one-off` | Rollback by fetching original files from API (no manifest required) |
 | `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated) |
 | `--json` | Output results as JSON |
 | `-v, --verbose` | Show detailed per-file verification information |
@@ -424,7 +425,7 @@ When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-procee
 
 ## Manifest Format
 
-Downloaded patches (for both npm and Python packages) are stored in `.socket/manifest.json`:
+Downloaded patches (for npm, Python, and Rust packages) are stored in `.socket/manifest.json`:
 
 ```json
 {
@@ -445,13 +446,16 @@ Downloaded patches (for both npm and Python packages) are stored in `.socket/man
           "severity": "high",
           "description": "Detailed description"
         }
-      }
+      },
+      "description": "Patch description",
+      "license": "MIT",
+      "tier": "free"
     }
   }
 }
 ```
 
-Patched file contents are in `.socket/blobs/` (named by git SHA256 hash).
+Patched file contents are in `.socket/blob/` (named by git SHA256 hash).
 
 ## Supported Platforms
 
