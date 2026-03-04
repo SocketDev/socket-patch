@@ -22,4 +22,9 @@ node -e "
   fs.writeFileSync('$pkg_json', JSON.stringify(pkg, null, 2) + '\n');
 "
 
+# Update PyPI package version
+pyproject="$REPO_ROOT/pypi/socket-patch/pyproject.toml"
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$pyproject"
+rm -f "$pyproject.bak"
+
 echo "Synced version to $VERSION"

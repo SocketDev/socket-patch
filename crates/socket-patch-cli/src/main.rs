@@ -43,9 +43,39 @@ enum Commands {
     Repair(commands::repair::RepairArgs),
 }
 
+/// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
+fn looks_like_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let expected = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(expected.iter())
+        .all(|(p, &len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // If parsing failed, check whether the user passed a bare UUID
+            // (e.g. `socket-patch 80630680-...`) and retry as `get <UUID> ...`.
+            let args: Vec<String> = std::env::args().collect();
+            if args.len() >= 2 && looks_like_uuid(&args[1]) {
+                let mut new_args = vec![args[0].clone(), "get".into()];
+                new_args.extend_from_slice(&args[1..]);
+                match Cli::try_parse_from(&new_args) {
+                    Ok(cli) => cli,
+                    Err(_) => err.exit(),
+                }
+            } else {
+                err.exit()
+            }
+        }
+    };
 
     let exit_code = match cli.command {
         Commands::Apply(args) => commands::apply::run(args).await,

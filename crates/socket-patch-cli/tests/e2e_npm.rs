@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 // ---------------------------------------------------------------------------
 
 const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+#[allow(dead_code)]
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 
 /// Git SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
@@ -265,4 +266,160 @@ fn test_npm_dry_run() {
         AFTER_HASH,
         "file should match afterHash after real apply"
     );
+}
+
+/// Global lifecycle: scan → get → list → rollback → apply → remove using `-g --global-prefix`.
+#[test]
+#[ignore]
+fn test_npm_global_lifecycle() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+
+    let global_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+
+    // -- Setup: install minimist@1.2.2 globally into a temp prefix ----------
+    let out = Command::new("npm")
+        .args(["install", "-g", "--prefix", global_dir.path().to_str().unwrap(), "minimist@1.2.2"])
+        .output()
+        .expect("failed to run npm install -g");
+    assert!(
+        out.status.success(),
+        "npm install -g failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // On Unix, npm -g --prefix puts packages under <prefix>/lib/node_modules/
+    // On Windows, it's <prefix>/node_modules/
+    let nm_path = if cfg!(windows) {
+        global_dir.path().join("node_modules")
+    } else {
+        global_dir.path().join("lib/node_modules")
+    };
+
+    let index_js = nm_path.join("minimist/index.js");
+    assert!(
+        index_js.exists(),
+        "minimist/index.js must exist after global install at {}",
+        index_js.display()
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "globally installed index.js should have the expected beforeHash"
+    );
+
+    let nm_str = nm_path.to_str().unwrap();
+
+    // -- SCAN: verify scan -g finds the package ------------------------------
+    let (stdout, _) = assert_run_ok(
+        cwd,
+        &["scan", "-g", "--global-prefix", nm_str, "--json"],
+        "scan -g --json",
+    );
+    let scan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let scanned = scan["scannedPackages"]
+        .as_u64()
+        .expect("scannedPackages should be a number");
+    assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+
+    // -- GET: download + apply patch globally --------------------------------
+    assert_run_ok(
+        cwd,
+        &["get", NPM_UUID, "-g", "--global-prefix", nm_str],
+        "get -g",
+    );
+
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after get");
+    assert_eq!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "index.js should match afterHash after global get"
+    );
+
+    // -- LIST: verify patch in output ----------------------------------------
+    let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
+    let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let patches = list["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["uuid"].as_str().unwrap(), NPM_UUID);
+
+    // -- ROLLBACK: restore original file globally ----------------------------
+    assert_run_ok(
+        cwd,
+        &["rollback", "-g", "--global-prefix", nm_str],
+        "rollback -g",
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "index.js should match beforeHash after global rollback"
+    );
+
+    // -- APPLY: re-apply from manifest globally ------------------------------
+    assert_run_ok(
+        cwd,
+        &["apply", "-g", "--global-prefix", nm_str],
+        "apply -g",
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "index.js should match afterHash after global apply"
+    );
+
+    // -- REMOVE: rollback + remove from manifest globally --------------------
+    assert_run_ok(
+        cwd,
+        &["remove", NPM_UUID, "-g", "--global-prefix", nm_str],
+        "remove -g",
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "index.js should match beforeHash after global remove"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert!(
+        manifest["patches"].as_object().unwrap().is_empty(),
+        "manifest should be empty after global remove"
+    );
+}
+
+/// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
+#[test]
+#[ignore]
+fn test_npm_uuid_shortcut() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    assert_eq!(git_sha256_file(&index_js), BEFORE_HASH);
+
+    // Run with bare UUID (no "get" subcommand).
+    assert_run_ok(cwd, &[NPM_UUID], "uuid shortcut");
+
+    assert_eq!(
+        git_sha256_file(&index_js),
+        AFTER_HASH,
+        "index.js should match afterHash after UUID shortcut"
+    );
+
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
 }

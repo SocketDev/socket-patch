@@ -381,3 +381,175 @@ fn test_pypi_dry_run() {
         "file should match afterHash after real apply"
     );
 }
+
+/// Global lifecycle: scan → get → rollback → apply → remove using `-g --global-prefix`.
+#[test]
+#[ignore]
+fn test_pypi_global_lifecycle() {
+    if !has_python3() {
+        eprintln!("SKIP: python3 not found on PATH");
+        return;
+    }
+
+    let global_dir = tempfile::tempdir().unwrap();
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+
+    // -- Setup: pip install --target into global_dir -------------------------
+    let out = Command::new("python3")
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--target",
+            global_dir.path().to_str().unwrap(),
+            "--no-deps",
+            "--disable-pip-version-check",
+            "pydantic-ai==0.0.36",
+            "pydantic-ai-slim==0.0.36",
+        ])
+        .output()
+        .expect("failed to run pip install --target");
+    assert!(
+        out.status.success(),
+        "pip install --target failed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert!(
+        global_dir.path().join("pydantic_ai").exists(),
+        "pydantic_ai package should be installed in global_dir"
+    );
+
+    let gp_str = global_dir.path().to_str().unwrap();
+
+    // -- SCAN: verify scan -g finds the package ------------------------------
+    let (stdout, _) = assert_run_ok(
+        cwd,
+        &["scan", "-g", "--global-prefix", gp_str, "--json"],
+        "scan -g --json",
+    );
+    let scan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let scanned = scan["scannedPackages"]
+        .as_u64()
+        .expect("scannedPackages should be a number");
+    assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+
+    // -- GET: download + apply patch globally --------------------------------
+    assert_run_ok(
+        cwd,
+        &["get", PYPI_UUID, "-g", "--global-prefix", gp_str],
+        "get -g",
+    );
+
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after get");
+
+    let (_, files_value) = read_patch_files(&manifest_path);
+    let files = files_value.as_object().expect("files object");
+
+    // Verify every patched file matches afterHash.
+    for (rel_path, info) in files {
+        let after_hash = info["afterHash"].as_str().expect("afterHash");
+        let full_path = global_dir.path().join(rel_path);
+        assert!(full_path.exists(), "patched file should exist: {}", full_path.display());
+        assert_eq!(
+            git_sha256_file(&full_path),
+            after_hash,
+            "{rel_path} should match afterHash after global get"
+        );
+    }
+
+    // -- ROLLBACK: restore original files globally ---------------------------
+    assert_run_ok(
+        cwd,
+        &["rollback", "-g", "--global-prefix", gp_str],
+        "rollback -g",
+    );
+
+    for (rel_path, info) in files {
+        let before_hash = info["beforeHash"].as_str().unwrap_or("");
+        let full_path = global_dir.path().join(rel_path);
+        if before_hash.is_empty() {
+            assert!(
+                !full_path.exists(),
+                "new file {rel_path} should be removed after global rollback"
+            );
+        } else {
+            assert_eq!(
+                git_sha256_file(&full_path),
+                before_hash,
+                "{rel_path} should match beforeHash after global rollback"
+            );
+        }
+    }
+
+    // -- APPLY: re-apply from manifest globally ------------------------------
+    assert_run_ok(
+        cwd,
+        &["apply", "-g", "--global-prefix", gp_str],
+        "apply -g",
+    );
+
+    for (rel_path, info) in files {
+        let after_hash = info["afterHash"].as_str().expect("afterHash");
+        let full_path = global_dir.path().join(rel_path);
+        assert_eq!(
+            git_sha256_file(&full_path),
+            after_hash,
+            "{rel_path} should match afterHash after global apply"
+        );
+    }
+
+    // -- REMOVE: rollback + remove from manifest globally --------------------
+    assert_run_ok(
+        cwd,
+        &["remove", PYPI_UUID, "-g", "--global-prefix", gp_str],
+        "remove -g",
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert!(
+        manifest["patches"].as_object().unwrap().is_empty(),
+        "manifest should be empty after global remove"
+    );
+}
+
+/// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
+#[test]
+#[ignore]
+fn test_pypi_uuid_shortcut() {
+    if !has_python3() {
+        eprintln!("SKIP: python3 not found on PATH");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+
+    setup_venv(cwd);
+
+    let site_packages = find_site_packages(cwd);
+    assert!(site_packages.join("pydantic_ai").exists());
+
+    // Run with bare UUID (no "get" subcommand).
+    assert_run_ok(cwd, &[PYPI_UUID], "uuid shortcut");
+
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
+
+    let (_, files_value) = read_patch_files(&manifest_path);
+    let files = files_value.as_object().expect("files object");
+
+    for (rel_path, info) in files {
+        let after_hash = info["afterHash"].as_str().expect("afterHash");
+        let full_path = site_packages.join(rel_path);
+        assert_eq!(
+            git_sha256_file(&full_path),
+            after_hash,
+            "{rel_path} should match afterHash after UUID shortcut"
+        );
+    }
+}

@@ -1,16 +1,62 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version-bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  bump-and-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version and sync
+        id: bump
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(node -e "
+            const [major, minor, patch] = '$CURRENT'.split('.').map(Number);
+            const bump = '${{ inputs.version-bump }}';
+            if (bump === 'major') console.log((major+1)+'.0.0');
+            else if (bump === 'minor') console.log(major+'.'+(minor+1)+'.0');
+            else console.log(major+'.'+minor+'.'+(patch+1));
+          ")
+          bash scripts/version-sync.sh "$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          git add Cargo.toml npm/ pypi/
+          git commit -m "v$VERSION"
+          git tag "v$VERSION"
+
+      - name: Push changes and tag
+        run: git push && git push --tags
+
   build:
+    needs: bump-and-tag
     strategy:
       matrix:
         include:
@@ -38,6 +84,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.bump-and-tag.outputs.version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -85,7 +133,7 @@ jobs:
           path: socket-patch-${{ matrix.target }}.zip
 
   github-release:
-    needs: build
+    needs: [bump-and-tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -98,14 +146,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="v${{ needs.bump-and-tag.outputs.version }}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             artifacts/*
 
   cargo-publish:
-    needs: build
+    needs: [bump-and-tag, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -113,6 +161,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.bump-and-tag.outputs.version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -132,11 +182,13 @@ jobs:
         run: cargo publish -p socket-patch-cli
 
   npm-publish:
-    needs: build
+    needs: [bump-and-tag, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.bump-and-tag.outputs.version }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -149,12 +201,6 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-
-      - name: Extract version and sync
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          bash scripts/version-sync.sh "$VERSION"
 
       - name: Stage binaries
         run: |
@@ -175,3 +221,57 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish npm/socket-patch --provenance --access public
+
+  pypi-publish:
+    needs: [bump-and-tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.bump-and-tag.outputs.version }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Stage binaries
+        run: |
+          mkdir -p pypi/socket-patch/socket_patch/bin
+          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C pypi/socket-patch/socket_patch/bin/
+          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-darwin-arm64
+          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C pypi/socket-patch/socket_patch/bin/
+          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-darwin-x64
+          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C pypi/socket-patch/socket_patch/bin/
+          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-linux-x64
+          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C pypi/socket-patch/socket_patch/bin/
+          mv pypi/socket-patch/socket_patch/bin/socket-patch pypi/socket-patch/socket_patch/bin/socket-patch-linux-arm64
+          cd pypi/socket-patch/socket_patch/bin
+          unzip ../../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
+          mv socket-patch.exe socket-patch-win32-x64.exe
+
+      - name: Set executable permissions
+        run: |
+          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-darwin-arm64
+          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-darwin-x64
+          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-x64
+          chmod +x pypi/socket-patch/socket_patch/bin/socket-patch-linux-arm64
+
+      - name: Build package
+        run: python -m build pypi/socket-patch
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload pypi/socket-patch/dist/*
