@@ -216,6 +216,9 @@ jobs:
   pypi-publish:
     needs: [sync-and-tag, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -234,7 +237,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install build tools
-        run: pip install build twine
+        run: pip install build
 
       - name: Stage binaries
         run: |
@@ -265,7 +268,6 @@ jobs:
         run: python -m build pypi/socket-patch
 
       - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: twine upload pypi/socket-patch/dist/*
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b54a752e1b56a22940bc7640 # v1.12.4
+        with:
+          packages-dir: pypi/socket-patch/dist/
