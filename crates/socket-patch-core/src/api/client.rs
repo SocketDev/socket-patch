@@ -555,7 +555,9 @@ impl ApiClient {
 ///
 /// Returns `(client, use_public_proxy)`.
 pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
-    let api_token = std::env::var("SOCKET_API_TOKEN").ok();
+    let api_token = std::env::var("SOCKET_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let resolved_org_slug = org_slug
         .map(String::from)
         .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok());
