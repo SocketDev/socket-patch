@@ -2,27 +2,39 @@
 const { spawnSync } = require("child_process");
 const path = require("path");
 
-const BINARIES = {
-  "darwin arm64": "socket-patch-darwin-arm64",
-  "darwin x64": "socket-patch-darwin-x64",
-  "linux x64": "socket-patch-linux-x64",
-  "linux arm64": "socket-patch-linux-arm64",
-  "linux arm": "socket-patch-linux-arm",
-  "linux ia32": "socket-patch-linux-ia32",
-  "win32 x64": "socket-patch-win32-x64.exe",
-  "win32 ia32": "socket-patch-win32-ia32.exe",
-  "win32 arm64": "socket-patch-win32-arm64.exe",
-  "android arm64": "socket-patch-android-arm64",
+const PLATFORMS = {
+  "darwin arm64": "@socketsecurity/socket-patch-darwin-arm64",
+  "darwin x64": "@socketsecurity/socket-patch-darwin-x64",
+  "linux x64": "@socketsecurity/socket-patch-linux-x64",
+  "linux arm64": "@socketsecurity/socket-patch-linux-arm64",
+  "linux arm": "@socketsecurity/socket-patch-linux-arm",
+  "linux ia32": "@socketsecurity/socket-patch-linux-ia32",
+  "win32 x64": "@socketsecurity/socket-patch-win32-x64",
+  "win32 ia32": "@socketsecurity/socket-patch-win32-ia32",
+  "win32 arm64": "@socketsecurity/socket-patch-win32-arm64",
+  "android arm64": "@socketsecurity/socket-patch-android-arm64",
 };
 
 const key = `${process.platform} ${process.arch}`;
-const bin = BINARIES[key];
-if (!bin) {
+const pkg = PLATFORMS[key];
+if (!pkg) {
   console.error(`Unsupported platform: ${key}`);
   process.exit(1);
 }
 
-const binPath = path.join(__dirname, bin);
+const exe = process.platform === "win32" ? "socket-patch.exe" : "socket-patch";
+let binPath;
+try {
+  const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
+  binPath = path.join(pkgDir, exe);
+} catch {
+  // Fallback: try local bin directory (for development or bundled installs)
+  const localBin = process.platform === "win32"
+    ? `socket-patch-${key.replace(" ", "-")}.exe`
+    : `socket-patch-${key.replace(" ", "-")}`;
+  binPath = path.join(__dirname, localBin);
+}
+
 const result = spawnSync(binPath, process.argv.slice(2), {
   stdio: "inherit",
   env: process.env,

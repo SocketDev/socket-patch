@@ -1,0 +1,19 @@
+{
+  "name": "@socketsecurity/socket-patch-linux-arm",
+  "version": "1.6.0",
+  "description": "socket-patch binary for Linux ARM",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}

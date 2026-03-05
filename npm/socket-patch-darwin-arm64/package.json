@@ -1,0 +1,19 @@
+{
+  "name": "@socketsecurity/socket-patch-darwin-arm64",
+  "version": "1.6.0",
+  "description": "socket-patch binary for macOS ARM64",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}

@@ -238,35 +238,46 @@ jobs:
       - name: Update npm for trusted publishing
         run: npm install -g npm@latest
 
-      - name: Stage binaries
+      - name: Stage binaries into platform packages
         run: |
-          mkdir -p npm/socket-patch/bin
-          tar xzf artifacts/socket-patch-aarch64-apple-darwin.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-arm64
-          tar xzf artifacts/socket-patch-x86_64-apple-darwin.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-darwin-x64
-          tar xzf artifacts/socket-patch-x86_64-unknown-linux-musl.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-x64
-          tar xzf artifacts/socket-patch-aarch64-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm64
-          tar xzf artifacts/socket-patch-arm-unknown-linux-gnueabihf.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-arm
-          tar xzf artifacts/socket-patch-i686-unknown-linux-gnu.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-linux-ia32
-          tar xzf artifacts/socket-patch-aarch64-linux-android.tar.gz -C npm/socket-patch/bin/
-          mv npm/socket-patch/bin/socket-patch npm/socket-patch/bin/socket-patch-android-arm64
-          cd npm/socket-patch/bin
-          unzip ../../../artifacts/socket-patch-x86_64-pc-windows-msvc.zip
-          mv socket-patch.exe socket-patch-win32-x64.exe
-          unzip ../../../artifacts/socket-patch-i686-pc-windows-msvc.zip
-          mv socket-patch.exe socket-patch-win32-ia32.exe
-          unzip ../../../artifacts/socket-patch-aarch64-pc-windows-msvc.zip
-          mv socket-patch.exe socket-patch-win32-arm64.exe
+          # Unix platforms: extract binary into each platform package directory
+          stage_unix() {
+            local artifact="$1" pkg_dir="$2"
+            tar xzf "artifacts/${artifact}.tar.gz" -C "${pkg_dir}/"
+          }
+
+          # Windows platforms: extract .exe into each platform package directory
+          stage_win() {
+            local artifact="$1" pkg_dir="$2"
+            unzip -o "artifacts/${artifact}.zip" -d "${pkg_dir}/"
+          }
+
+          stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
+          stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
+          stage_unix socket-patch-x86_64-unknown-linux-musl  npm/socket-patch-linux-x64
+          stage_unix socket-patch-aarch64-unknown-linux-gnu  npm/socket-patch-linux-arm64
+          stage_unix socket-patch-arm-unknown-linux-gnueabihf npm/socket-patch-linux-arm
+          stage_unix socket-patch-i686-unknown-linux-gnu     npm/socket-patch-linux-ia32
+          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
+
+          stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
+          stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
+          stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
+
+      - name: Publish platform packages
+        run: |
+          for pkg_dir in npm/socket-patch-*/; do
+            echo "Publishing ${pkg_dir}..."
+            npm publish "./${pkg_dir}" --provenance --access public
+          done
+
+      - name: Wait for npm registry propagation
+        run: sleep 30
 
       - name: Copy README for npm package
         run: cp README.md npm/socket-patch/README.md
 
-      - name: Publish package
+      - name: Publish main package
         run: npm publish ./npm/socket-patch --provenance --access public
 
   pypi-publish:
@@ -291,6 +302,9 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+
+      - name: Copy README for PyPI package
+        run: cp README.md pypi/socket-patch/README.md
 
       - name: Build platform wheels
         run: |

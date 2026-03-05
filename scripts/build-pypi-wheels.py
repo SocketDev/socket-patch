@@ -115,12 +115,16 @@ def read_pyproject_metadata(pyproject_dir: Path) -> dict:
             raise ValueError(f"Could not find {name} in {pyproject_path}")
         return m.group(1)
 
+    readme_path = pyproject_dir / "README.md"
+    readme = readme_path.read_text() if readme_path.exists() else ""
+
     return {
         "name": extract_field("name"),
         "version": extract_field("version"),
         "description": extract_field("description"),
         "license": extract_field("license"),
         "requires_python": extract_field("requires-python"),
+        "readme": readme,
     }
 
 
@@ -159,14 +163,18 @@ def build_wheel(
     files.append((f"{DIST_NAME}/bin/{binary_name}", binary_data, True))
 
     # METADATA
-    metadata_content = (
+    metadata_header = (
         f"Metadata-Version: 2.1\n"
         f"Name: {metadata['name']}\n"
         f"Version: {version}\n"
         f"Summary: {metadata['description']}\n"
         f"License: {metadata['license']}\n"
         f"Requires-Python: {metadata['requires_python']}\n"
-    ).encode()
+    )
+    if metadata.get("readme"):
+        metadata_header += "Description-Content-Type: text/markdown\n"
+        metadata_header += f"\n{metadata['readme']}"
+    metadata_content = metadata_header.encode()
     files.append((f"{dist_info}/METADATA", metadata_content, False))
 
     # WHEEL

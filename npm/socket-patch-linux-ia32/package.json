@@ -1,0 +1,19 @@
+{
+  "name": "@socketsecurity/socket-patch-linux-ia32",
+  "version": "1.6.0",
+  "description": "socket-patch binary for Linux ia32",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "ia32"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}

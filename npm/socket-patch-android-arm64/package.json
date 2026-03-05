@@ -1,0 +1,19 @@
+{
+  "name": "@socketsecurity/socket-patch-android-arm64",
+  "version": "1.6.0",
+  "description": "socket-patch binary for Android ARM64",
+  "os": [
+    "android"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}

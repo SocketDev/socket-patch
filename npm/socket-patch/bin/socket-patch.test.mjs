@@ -7,15 +7,15 @@ import { dirname, join } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(join(__dirname, "socket-patch"), "utf8");
 
-// Extract the BINARIES object from the source
-const match = src.match(/const BINARIES = \{([\s\S]*?)\};/);
-assert.ok(match, "BINARIES object not found in socket-patch");
+// Extract the PLATFORMS object from the source
+const match = src.match(/const PLATFORMS = \{([\s\S]*?)\};/);
+assert.ok(match, "PLATFORMS object not found in socket-patch");
 
 // Parse keys and values from the object literal
 const entries = [...match[1].matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map(
   ([, key, value]) => [key, value]
 );
-const BINARIES = Object.fromEntries(entries);
+const PLATFORMS = Object.fromEntries(entries);
 
 const EXPECTED_KEYS = [
   "darwin arm64",
@@ -33,39 +33,21 @@ const EXPECTED_KEYS = [
 describe("npm platform dispatch", () => {
   it("has all expected platform keys", () => {
     for (const key of EXPECTED_KEYS) {
-      assert.ok(BINARIES[key], `missing platform key: ${key}`);
+      assert.ok(PLATFORMS[key], `missing platform key: ${key}`);
     }
   });
 
   it("has no unexpected platform keys", () => {
-    for (const key of Object.keys(BINARIES)) {
+    for (const key of Object.keys(PLATFORMS)) {
       assert.ok(EXPECTED_KEYS.includes(key), `unexpected platform key: ${key}`);
     }
   });
 
-  it("binary names follow socket-patch-<platform>-<arch>[.exe] convention", () => {
-    for (const [key, bin] of Object.entries(BINARIES)) {
+  it("package names follow @socketsecurity/socket-patch-<platform>-<arch> convention", () => {
+    for (const [key, pkg] of Object.entries(PLATFORMS)) {
       const [platform, arch] = key.split(" ");
-      const expected = platform === "win32"
-        ? `socket-patch-${platform}-${arch}.exe`
-        : `socket-patch-${platform}-${arch}`;
-      assert.equal(bin, expected, `binary name mismatch for ${key}`);
-    }
-  });
-
-  it("windows entries end in .exe", () => {
-    for (const [key, bin] of Object.entries(BINARIES)) {
-      if (key.startsWith("win32")) {
-        assert.ok(bin.endsWith(".exe"), `${key} should end in .exe`);
-      }
-    }
-  });
-
-  it("non-windows entries do not end in .exe", () => {
-    for (const [key, bin] of Object.entries(BINARIES)) {
-      if (!key.startsWith("win32")) {
-        assert.ok(!bin.endsWith(".exe"), `${key} should not end in .exe`);
-      }
+      const expected = `@socketsecurity/socket-patch-${platform}-${arch}`;
+      assert.equal(pkg, expected, `package name mismatch for ${key}`);
     }
   });
 });

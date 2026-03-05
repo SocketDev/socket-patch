@@ -22,5 +22,17 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "@socketsecurity/socket-patch-android-arm64": "1.6.0",
+    "@socketsecurity/socket-patch-darwin-arm64": "1.6.0",
+    "@socketsecurity/socket-patch-darwin-x64": "1.6.0",
+    "@socketsecurity/socket-patch-linux-arm": "1.6.0",
+    "@socketsecurity/socket-patch-linux-arm64": "1.6.0",
+    "@socketsecurity/socket-patch-linux-ia32": "1.6.0",
+    "@socketsecurity/socket-patch-linux-x64": "1.6.0",
+    "@socketsecurity/socket-patch-win32-arm64": "1.6.0",
+    "@socketsecurity/socket-patch-win32-ia32": "1.6.0",
+    "@socketsecurity/socket-patch-win32-x64": "1.6.0"
   }
 }
