@@ -1,5 +1,3 @@
-#![cfg(feature = "composer")]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

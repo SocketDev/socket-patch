@@ -1,6 +1,6 @@
 # Socket Patch CLI
 
-Apply security patches to npm, Python, and Rust dependencies without waiting for upstream fixes.
+Apply security patches to npm and Python dependencies without waiting for upstream fixes.
 
 ## Installation
 
@@ -61,6 +61,12 @@ pip install socket-patch
 
 ```bash
 cargo install socket-patch-cli
+```
+
+By default this builds with npm and PyPI support. For additional ecosystems:
+
+```bash
+cargo install socket-patch-cli --features cargo,golang,maven,gem,composer,nuget
 ```
 
 ## Quick Start
@@ -143,7 +149,7 @@ socket-patch scan [options]
 |------|-------------|
 | `--org <slug>` | Organization slug |
 | `--json` | Output results as JSON |
-| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated: `npm,pypi,cargo`) |
+| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
 | `-g, --global` | Scan globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
@@ -425,7 +431,7 @@ When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-procee
 
 ## Manifest Format
 
-Downloaded patches (for npm, Python, and Rust packages) are stored in `.socket/manifest.json`:
+Downloaded patches are stored in `.socket/manifest.json`:
 
 ```json
 {
@@ -462,5 +468,6 @@ Patched file contents are in `.socket/blob/` (named by git SHA256 hash).
 | Platform | Architecture |
 |----------|-------------|
 | macOS | ARM64 (Apple Silicon), x86_64 (Intel) |
-| Linux | x86_64, ARM64 |
-| Windows | x86_64 |
+| Linux | x86_64, ARM64, ARMv7, i686 |
+| Windows | x86_64, ARM64, i686 |
+| Android | ARM64 |

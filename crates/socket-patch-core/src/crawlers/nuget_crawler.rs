@@ -1,5 +1,3 @@
-#![cfg(feature = "nuget")]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -48,10 +46,8 @@ impl NuGetCrawler {
 
         // 1. Check <cwd>/packages/ (legacy packages.config layout)
         let packages_dir = options.cwd.join("packages");
-        if is_dir(&packages_dir).await {
-            if seen.insert(packages_dir.clone()) {
-                paths.push(packages_dir);
-            }
+        if is_dir(&packages_dir).await && seen.insert(packages_dir.clone()) {
+            paths.push(packages_dir);
         }
 
         // 2. Fall back to global cache if this looks like a .NET project
@@ -499,7 +495,7 @@ async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let folders = json.get("packageFolders")?.as_object()?;
 
-    let result: Vec<PathBuf> = folders.keys().map(|k| PathBuf::from(k)).collect();
+    let result: Vec<PathBuf> = folders.keys().map(PathBuf::from).collect();
 
     if result.is_empty() {
         None

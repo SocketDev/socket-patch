@@ -35,10 +35,10 @@ jobs:
           restore-keys: ${{ matrix.os }}-cargo-
 
       - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --all-features
 
   dispatch-tests:
     runs-on: ubuntu-latest
@@ -72,6 +72,18 @@ jobs:
             suite: e2e_npm
           - os: ubuntu-latest
             suite: e2e_pypi
+          - os: ubuntu-latest
+            suite: e2e_cargo
+          - os: ubuntu-latest
+            suite: e2e_golang
+          - os: ubuntu-latest
+            suite: e2e_maven
+          - os: ubuntu-latest
+            suite: e2e_gem
+          - os: ubuntu-latest
+            suite: e2e_composer
+          - os: ubuntu-latest
+            suite: e2e_nuget
           - os: macos-latest
             suite: e2e_npm
           - os: macos-latest
@@ -109,4 +121,4 @@ jobs:
           python-version: "3.12"
 
       - name: Run e2e tests
-        run: cargo test -p socket-patch-cli --test ${{ matrix.suite }} -- --ignored
+        run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored

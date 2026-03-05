@@ -1,5 +1,3 @@
-#![cfg(feature = "maven")]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -344,7 +342,7 @@ impl MavenCrawler {
                 continue;
             }
             let path = entry.path();
-            if !path.extension().map_or(false, |ext| ext == "pom") {
+            if path.extension().is_none_or(|ext| ext != "pom") {
                 continue;
             }
 

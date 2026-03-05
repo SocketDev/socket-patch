@@ -1,5 +1,3 @@
-#![cfg(feature = "gem")]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
