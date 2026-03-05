@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-linux-ia32",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "socket-patch binary for Linux ia32",
   "os": [
     "linux"

@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-win32-arm64",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "socket-patch binary for Windows ARM64",
   "os": [
     "win32"
