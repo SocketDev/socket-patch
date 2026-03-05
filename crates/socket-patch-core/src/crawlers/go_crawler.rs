@@ -276,9 +276,10 @@ impl GoCrawler {
         _dir_name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<CrawledPackage> {
-        // Get the relative path from the cache root
+        // Get the relative path from the cache root.
+        // Normalize to forward slashes so PURLs are correct on Windows.
         let rel_path = dir_path.strip_prefix(base_path).ok()?;
-        let rel_str = rel_path.to_string_lossy();
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
         // Find the last `@` to split module path and version
         let at_idx = rel_str.rfind('@')?;

@@ -1,12 +1,23 @@
 {
   "name": "@socketsecurity/socket-patch",
   "version": "1.6.3",
-  "description": "CLI tool for applying security patches to dependencies",
+  "description": "CLI tool and schema library for applying security patches to dependencies",
   "bin": {
     "socket-patch": "bin/socket-patch"
   },
+  "exports": {
+    "./schema": {
+      "types": "./dist/schema/manifest-schema.d.ts",
+      "import": "./dist/schema/manifest-schema.js",
+      "require": "./dist/schema/manifest-schema.js"
+    }
+  },
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "pnpm run build && node --test dist/**/*.test.js"
   },
   "keywords": [
     "security",
@@ -22,6 +33,13 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
   },
   "optionalDependencies": {
     "@socketsecurity/socket-patch-android-arm64": "1.6.3",
