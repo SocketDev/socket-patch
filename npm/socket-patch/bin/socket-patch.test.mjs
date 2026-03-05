@@ -27,7 +27,6 @@ const EXPECTED_KEYS = [
   "win32 x64",
   "win32 ia32",
   "win32 arm64",
-  "android arm64",
 ];
 
 describe("npm platform dispatch", () => {

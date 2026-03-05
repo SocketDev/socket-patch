@@ -24,7 +24,6 @@
     "node": ">=18.0.0"
   },
   "optionalDependencies": {
-    "@socketsecurity/socket-patch-android-arm64": "1.6.1",
     "@socketsecurity/socket-patch-darwin-arm64": "1.6.1",
     "@socketsecurity/socket-patch-darwin-x64": "1.6.1",
     "@socketsecurity/socket-patch-linux-arm": "1.6.1",

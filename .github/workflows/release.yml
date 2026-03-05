@@ -88,10 +88,6 @@ jobs:
             runner: windows-latest
             archive: zip
             build-tool: cargo
-          - target: aarch64-linux-android
-            runner: ubuntu-latest
-            archive: tar.gz
-            build-tool: cross
           - target: arm-unknown-linux-gnueabihf
             runner: ubuntu-latest
             archive: tar.gz
@@ -258,7 +254,6 @@ jobs:
           stage_unix socket-patch-aarch64-unknown-linux-gnu  npm/socket-patch-linux-arm64
           stage_unix socket-patch-arm-unknown-linux-gnueabihf npm/socket-patch-linux-arm
           stage_unix socket-patch-i686-unknown-linux-gnu     npm/socket-patch-linux-ia32
-          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
 
           stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
           stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
