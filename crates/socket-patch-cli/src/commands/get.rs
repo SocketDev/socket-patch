@@ -356,10 +356,15 @@ pub async fn run(args: GetArgs) -> i32 {
                 } else if args.global {
                     println!("No global packages found.");
                 } else {
+                    let mut install_cmds = String::from("npm/yarn/pnpm/pip");
                     #[cfg(feature = "cargo")]
-                    let install_cmds = "npm/yarn/pnpm/pip/cargo";
-                    #[cfg(not(feature = "cargo"))]
-                    let install_cmds = "npm/yarn/pnpm/pip";
+                    install_cmds.push_str("/cargo");
+                    #[cfg(feature = "golang")]
+                    install_cmds.push_str("/go");
+                    #[cfg(feature = "maven")]
+                    install_cmds.push_str("/mvn");
+                    #[cfg(feature = "composer")]
+                    install_cmds.push_str("/composer");
                     println!("No packages found. Run {install_cmds} install first.");
                 }
                 return 0;

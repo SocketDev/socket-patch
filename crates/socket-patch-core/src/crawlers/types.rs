@@ -7,6 +7,16 @@ pub enum Ecosystem {
     Pypi,
     #[cfg(feature = "cargo")]
     Cargo,
+    #[cfg(feature = "gem")]
+    Gem,
+    #[cfg(feature = "golang")]
+    Golang,
+    #[cfg(feature = "maven")]
+    Maven,
+    #[cfg(feature = "composer")]
+    Composer,
+    #[cfg(feature = "nuget")]
+    Nuget,
 }
 
 impl Ecosystem {
@@ -17,6 +27,16 @@ impl Ecosystem {
             Ecosystem::Pypi,
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo,
+            #[cfg(feature = "gem")]
+            Ecosystem::Gem,
+            #[cfg(feature = "golang")]
+            Ecosystem::Golang,
+            #[cfg(feature = "maven")]
+            Ecosystem::Maven,
+            #[cfg(feature = "composer")]
+            Ecosystem::Composer,
+            #[cfg(feature = "nuget")]
+            Ecosystem::Nuget,
         ]
     }
 
@@ -25,6 +45,26 @@ impl Ecosystem {
         #[cfg(feature = "cargo")]
         if purl.starts_with("pkg:cargo/") {
             return Some(Ecosystem::Cargo);
+        }
+        #[cfg(feature = "gem")]
+        if purl.starts_with("pkg:gem/") {
+            return Some(Ecosystem::Gem);
+        }
+        #[cfg(feature = "golang")]
+        if purl.starts_with("pkg:golang/") {
+            return Some(Ecosystem::Golang);
+        }
+        #[cfg(feature = "maven")]
+        if purl.starts_with("pkg:maven/") {
+            return Some(Ecosystem::Maven);
+        }
+        #[cfg(feature = "composer")]
+        if purl.starts_with("pkg:composer/") {
+            return Some(Ecosystem::Composer);
+        }
+        #[cfg(feature = "nuget")]
+        if purl.starts_with("pkg:nuget/") {
+            return Some(Ecosystem::Nuget);
         }
         if purl.starts_with("pkg:npm/") {
             Some(Ecosystem::Npm)
@@ -42,6 +82,16 @@ impl Ecosystem {
             Ecosystem::Pypi => "pkg:pypi/",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "pkg:cargo/",
+            #[cfg(feature = "gem")]
+            Ecosystem::Gem => "pkg:gem/",
+            #[cfg(feature = "golang")]
+            Ecosystem::Golang => "pkg:golang/",
+            #[cfg(feature = "maven")]
+            Ecosystem::Maven => "pkg:maven/",
+            #[cfg(feature = "composer")]
+            Ecosystem::Composer => "pkg:composer/",
+            #[cfg(feature = "nuget")]
+            Ecosystem::Nuget => "pkg:nuget/",
         }
     }
 
@@ -52,6 +102,16 @@ impl Ecosystem {
             Ecosystem::Pypi => "pypi",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
+            #[cfg(feature = "gem")]
+            Ecosystem::Gem => "gem",
+            #[cfg(feature = "golang")]
+            Ecosystem::Golang => "golang",
+            #[cfg(feature = "maven")]
+            Ecosystem::Maven => "maven",
+            #[cfg(feature = "composer")]
+            Ecosystem::Composer => "composer",
+            #[cfg(feature = "nuget")]
+            Ecosystem::Nuget => "nuget",
         }
     }
 
@@ -62,6 +122,16 @@ impl Ecosystem {
             Ecosystem::Pypi => "python",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
+            #[cfg(feature = "gem")]
+            Ecosystem::Gem => "ruby",
+            #[cfg(feature = "golang")]
+            Ecosystem::Golang => "go",
+            #[cfg(feature = "maven")]
+            Ecosystem::Maven => "maven",
+            #[cfg(feature = "composer")]
+            Ecosystem::Composer => "php",
+            #[cfg(feature = "nuget")]
+            Ecosystem::Nuget => "nuget",
         }
     }
 }
@@ -147,10 +217,33 @@ mod tests {
     #[test]
     fn test_all_count() {
         let all = Ecosystem::all();
-        #[cfg(not(feature = "cargo"))]
-        assert_eq!(all.len(), 2);
+        #[allow(unused_mut)]
+        let mut expected = 2;
         #[cfg(feature = "cargo")]
-        assert_eq!(all.len(), 3);
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "gem")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "golang")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "maven")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "composer")]
+        {
+            expected += 1;
+        }
+        #[cfg(feature = "nuget")]
+        {
+            expected += 1;
+        }
+        assert_eq!(all.len(), expected);
     }
 
     #[test]
@@ -177,5 +270,90 @@ mod tests {
         assert_eq!(Ecosystem::Cargo.cli_name(), "cargo");
         assert_eq!(Ecosystem::Cargo.display_name(), "cargo");
         assert_eq!(Ecosystem::Cargo.purl_prefix(), "pkg:cargo/");
+    }
+
+    #[cfg(feature = "gem")]
+    #[test]
+    fn test_from_purl_gem() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:gem/rails@7.1.0"),
+            Some(Ecosystem::Gem)
+        );
+    }
+
+    #[cfg(feature = "gem")]
+    #[test]
+    fn test_gem_properties() {
+        assert_eq!(Ecosystem::Gem.cli_name(), "gem");
+        assert_eq!(Ecosystem::Gem.display_name(), "ruby");
+        assert_eq!(Ecosystem::Gem.purl_prefix(), "pkg:gem/");
+    }
+
+    #[cfg(feature = "maven")]
+    #[test]
+    fn test_from_purl_maven() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:maven/org.apache.commons/commons-lang3@3.12.0"),
+            Some(Ecosystem::Maven)
+        );
+    }
+
+    #[cfg(feature = "maven")]
+    #[test]
+    fn test_maven_properties() {
+        assert_eq!(Ecosystem::Maven.cli_name(), "maven");
+        assert_eq!(Ecosystem::Maven.display_name(), "maven");
+        assert_eq!(Ecosystem::Maven.purl_prefix(), "pkg:maven/");
+    }
+
+    #[cfg(feature = "golang")]
+    #[test]
+    fn test_from_purl_golang() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1"),
+            Some(Ecosystem::Golang)
+        );
+    }
+
+    #[cfg(feature = "golang")]
+    #[test]
+    fn test_golang_properties() {
+        assert_eq!(Ecosystem::Golang.cli_name(), "golang");
+        assert_eq!(Ecosystem::Golang.display_name(), "go");
+        assert_eq!(Ecosystem::Golang.purl_prefix(), "pkg:golang/");
+    }
+
+    #[cfg(feature = "composer")]
+    #[test]
+    fn test_from_purl_composer() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:composer/monolog/monolog@3.5.0"),
+            Some(Ecosystem::Composer)
+        );
+    }
+
+    #[cfg(feature = "composer")]
+    #[test]
+    fn test_composer_properties() {
+        assert_eq!(Ecosystem::Composer.cli_name(), "composer");
+        assert_eq!(Ecosystem::Composer.display_name(), "php");
+        assert_eq!(Ecosystem::Composer.purl_prefix(), "pkg:composer/");
+    }
+
+    #[cfg(feature = "nuget")]
+    #[test]
+    fn test_from_purl_nuget() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:nuget/Newtonsoft.Json@13.0.3"),
+            Some(Ecosystem::Nuget)
+        );
+    }
+
+    #[cfg(feature = "nuget")]
+    #[test]
+    fn test_nuget_properties() {
+        assert_eq!(Ecosystem::Nuget.cli_name(), "nuget");
+        assert_eq!(Ecosystem::Nuget.display_name(), "nuget");
+        assert_eq!(Ecosystem::Nuget.purl_prefix(), "pkg:nuget/");
     }
 }

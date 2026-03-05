@@ -26,6 +26,11 @@ tempfile = { workspace = true }
 [features]
 default = []
 cargo = ["socket-patch-core/cargo"]
+gem = ["socket-patch-core/gem"]
+golang = ["socket-patch-core/golang"]
+maven = ["socket-patch-core/maven"]
+composer = ["socket-patch-core/composer"]
+nuget = ["socket-patch-core/nuget"]
 
 [dev-dependencies]
 sha2 = { workspace = true }

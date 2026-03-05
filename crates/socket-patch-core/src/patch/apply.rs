@@ -163,6 +163,19 @@ pub async fn apply_file_patch(
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    // Make file writable if it exists and is read-only (e.g. Go module cache)
+    #[cfg(unix)]
+    if let Ok(meta) = tokio::fs::metadata(&filepath).await {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = meta.permissions();
+        if perms.readonly() {
+            let mode = perms.mode();
+            let mut new_perms = perms;
+            new_perms.set_mode(mode | 0o200);
+            tokio::fs::set_permissions(&filepath, new_perms).await?;
+        }
+    }
+
     // Write the patched content
     tokio::fs::write(&filepath, patched_content).await?;
 

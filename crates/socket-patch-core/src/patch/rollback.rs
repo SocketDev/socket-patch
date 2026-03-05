@@ -194,6 +194,19 @@ pub async fn rollback_file_patch(
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
 
+    // Make file writable if it is read-only (e.g. Go module cache)
+    #[cfg(unix)]
+    if let Ok(meta) = tokio::fs::metadata(&filepath).await {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = meta.permissions();
+        if perms.readonly() {
+            let mode = perms.mode();
+            let mut new_perms = perms;
+            new_perms.set_mode(mode | 0o200);
+            tokio::fs::set_permissions(&filepath, new_perms).await?;
+        }
+    }
+
     // Write the original content
     tokio::fs::write(&filepath, original_content).await?;
 
