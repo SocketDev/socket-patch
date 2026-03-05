@@ -571,6 +571,38 @@ fn test_pypi_save_only() {
     );
 }
 
+/// macOS auto-discovery: `scan -g --json` without `--global-prefix` uses real path probing.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore]
+fn test_pypi_macos_global_auto_discovery() {
+    if !has_python3() {
+        eprintln!("SKIP: python3 not found on PATH");
+        return;
+    }
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+
+    // Run scan -g without --global-prefix to exercise macOS auto-discovery
+    let (code, stdout, stderr) = run(cwd, &["scan", "-g", "--json"]);
+
+    // Should complete without error (exit 0)
+    assert_eq!(
+        code, 0,
+        "scan -g --json failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Output should be valid JSON with scannedPackages field
+    let scan: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON from scan -g: {e}\nstdout:\n{stdout}"));
+    assert!(
+        scan["scannedPackages"].is_u64(),
+        "scannedPackages should be a number, got: {}",
+        scan["scannedPackages"]
+    );
+}
+
 /// UUID shortcut: `socket-patch <UUID>` should behave like `socket-patch get <UUID>`.
 #[test]
 #[ignore]
