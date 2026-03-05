@@ -2,8 +2,6 @@
   "name": "@socketsecurity/socket-patch",
   "version": "1.6.3",
   "description": "CLI tool and schema library for applying security patches to dependencies",
-  "main": "dist/schema/manifest-schema.js",
-  "types": "dist/schema/manifest-schema.d.ts",
   "bin": {
     "socket-patch": "bin/socket-patch"
   },
@@ -12,31 +10,6 @@
       "types": "./dist/schema/manifest-schema.d.ts",
       "import": "./dist/schema/manifest-schema.js",
       "require": "./dist/schema/manifest-schema.js"
-    },
-    "./hash": {
-      "types": "./dist/hash/git-sha256.d.ts",
-      "import": "./dist/hash/git-sha256.js",
-      "require": "./dist/hash/git-sha256.js"
-    },
-    "./constants": {
-      "types": "./dist/constants.d.ts",
-      "import": "./dist/constants.js",
-      "require": "./dist/constants.js"
-    },
-    "./manifest/operations": {
-      "types": "./dist/manifest/operations.d.ts",
-      "import": "./dist/manifest/operations.js",
-      "require": "./dist/manifest/operations.js"
-    },
-    "./manifest/recovery": {
-      "types": "./dist/manifest/recovery.d.ts",
-      "import": "./dist/manifest/recovery.js",
-      "require": "./dist/manifest/recovery.js"
-    },
-    "./package-json": {
-      "types": "./dist/package-json/index.d.ts",
-      "import": "./dist/package-json/index.js",
-      "require": "./dist/package-json/index.js"
     }
   },
   "publishConfig": {
