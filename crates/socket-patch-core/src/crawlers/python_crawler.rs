@@ -382,6 +382,22 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // pyenv (works on macOS and Linux)
+    if !cfg!(windows) {
+        let pyenv_root = std::env::var("PYENV_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home_dir).join(".pyenv"));
+        let pyenv_versions = pyenv_root.join("versions");
+        let pyenv_matches = find_python_dirs(
+            &pyenv_versions,
+            &["*", "lib", "python3.*", "site-packages"],
+        )
+        .await;
+        for m in pyenv_matches {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+
     // Conda
     let anaconda = PathBuf::from(&home_dir).join("anaconda3");
     scan_well_known(&anaconda, "site-packages", &mut seen, &mut results).await;
@@ -734,6 +750,37 @@ mod tests {
         .await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], sp1);
+    }
+
+    #[tokio::test]
+    async fn test_find_python_dirs_pyenv_layout() {
+        // Create a pyenv-like layout: versions/3.11.5/lib/python3.11/site-packages
+        let dir = tempfile::tempdir().unwrap();
+        let sp1 = dir
+            .path()
+            .join("versions")
+            .join("3.11.5")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        let sp2 = dir
+            .path()
+            .join("versions")
+            .join("3.12.0")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&sp1).await.unwrap();
+        tokio::fs::create_dir_all(&sp2).await.unwrap();
+
+        let results = find_python_dirs(
+            &dir.path().join("versions"),
+            &["*", "lib", "python3.*", "site-packages"],
+        )
+        .await;
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&sp1));
+        assert!(results.contains(&sp2));
     }
 
     #[tokio::test]

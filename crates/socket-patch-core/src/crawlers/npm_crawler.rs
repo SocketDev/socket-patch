@@ -174,6 +174,45 @@ pub fn get_bun_global_prefix() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers: synchronous wildcard directory resolver
+// ---------------------------------------------------------------------------
+
+/// Resolve a path with `"*"` wildcard segments synchronously.
+///
+/// Each segment is either a literal directory name or `"*"` which matches any
+/// directory entry. Symlinks are followed via `std::fs::metadata`.
+fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
+    if !base.is_dir() {
+        return Vec::new();
+    }
+    if segments.is_empty() {
+        return vec![base.to_path_buf()];
+    }
+
+    let first = segments[0];
+    let rest = &segments[1..];
+
+    if first == "*" {
+        let mut results = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for entry in entries.flatten() {
+                // Follow symlinks: use metadata() not symlink_metadata()
+                let is_dir = entry
+                    .metadata()
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if is_dir {
+                    results.extend(find_node_dirs_sync(&base.join(entry.file_name()), rest));
+                }
+            }
+        }
+        results
+    } else {
+        find_node_dirs_sync(&base.join(first), rest)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NpmCrawler
 // ---------------------------------------------------------------------------
 
@@ -297,19 +336,60 @@ impl NpmCrawler {
 
     /// Collect global `node_modules` paths from all known package managers.
     fn get_global_node_modules_paths(&self) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
         let mut paths = Vec::new();
 
+        let mut add = |p: PathBuf| {
+            if p.is_dir() && seen.insert(p.clone()) {
+                paths.push(p);
+            }
+        };
+
         if let Ok(npm_path) = get_npm_global_prefix() {
-            paths.push(PathBuf::from(npm_path));
+            add(PathBuf::from(npm_path));
         }
         if let Some(pnpm_path) = get_pnpm_global_prefix() {
-            paths.push(PathBuf::from(pnpm_path));
+            add(PathBuf::from(pnpm_path));
         }
         if let Some(yarn_path) = get_yarn_global_prefix() {
-            paths.push(PathBuf::from(yarn_path));
+            add(PathBuf::from(yarn_path));
         }
         if let Some(bun_path) = get_bun_global_prefix() {
-            paths.push(PathBuf::from(bun_path));
+            add(PathBuf::from(bun_path));
+        }
+
+        // macOS-specific fallback paths
+        if cfg!(target_os = "macos") {
+            let home = std::env::var("HOME").unwrap_or_default();
+
+            // Homebrew Apple Silicon
+            add(PathBuf::from("/opt/homebrew/lib/node_modules"));
+            // Homebrew Intel / default npm
+            add(PathBuf::from("/usr/local/lib/node_modules"));
+
+            if !home.is_empty() {
+                // nvm
+                for p in find_node_dirs_sync(
+                    &PathBuf::from(&home).join(".nvm/versions/node"),
+                    &["*", "lib", "node_modules"],
+                ) {
+                    add(p);
+                }
+                // volta
+                for p in find_node_dirs_sync(
+                    &PathBuf::from(&home).join(".volta/tools/image/node"),
+                    &["*", "lib", "node_modules"],
+                ) {
+                    add(p);
+                }
+                // fnm
+                for p in find_node_dirs_sync(
+                    &PathBuf::from(&home).join(".fnm/node-versions"),
+                    &["*", "installation", "lib", "node_modules"],
+                ) {
+                    add(p);
+                }
+            }
         }
 
         paths
@@ -788,6 +868,48 @@ mod tests {
         assert_eq!(packages[0].name, "node");
         assert_eq!(packages[0].namespace.as_deref(), Some("@types"));
         assert_eq!(packages[0].purl, "pkg:npm/@types/node@20.0.0");
+    }
+
+    #[test]
+    fn test_find_node_dirs_sync_wildcard() {
+        // Create an nvm-like layout: base/v18.0.0/lib/node_modules
+        let dir = tempfile::tempdir().unwrap();
+        let nm1 = dir.path().join("v18.0.0/lib/node_modules");
+        let nm2 = dir.path().join("v20.1.0/lib/node_modules");
+        std::fs::create_dir_all(&nm1).unwrap();
+        std::fs::create_dir_all(&nm2).unwrap();
+
+        let results = find_node_dirs_sync(dir.path(), &["*", "lib", "node_modules"]);
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&nm1));
+        assert!(results.contains(&nm2));
+    }
+
+    #[test]
+    fn test_find_node_dirs_sync_empty() {
+        // Non-existent base path should return empty
+        let results = find_node_dirs_sync(Path::new("/nonexistent/path/xyz"), &["*", "lib"]);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_node_dirs_sync_literal() {
+        // All literal segments (no wildcard)
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lib/node_modules");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let results = find_node_dirs_sync(dir.path(), &["lib", "node_modules"]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], target);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_get_global_node_modules_paths_no_panic() {
+        let crawler = NpmCrawler::new();
+        // Should not panic, even if no package managers are installed
+        let _paths = crawler.get_global_node_modules_paths();
     }
 
     #[tokio::test]
