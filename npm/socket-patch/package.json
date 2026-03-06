@@ -2,6 +2,9 @@
   "name": "@socketsecurity/socket-patch",
   "version": "1.7.0",
   "description": "CLI tool and schema library for applying security patches to dependencies",
+  "bin": {
+    "socket-patch": "bin/socket-patch"
+  },
   "exports": {
     "./schema": {
       "types": "./dist/schema/manifest-schema.d.ts",
@@ -37,5 +40,17 @@
   "devDependencies": {
     "typescript": "^5.3.0",
     "@types/node": "^20.0.0"
+  },
+  "optionalDependencies": {
+    "@socketsecurity/socket-patch-android-arm64": "1.7.0",
+    "@socketsecurity/socket-patch-darwin-arm64": "1.7.0",
+    "@socketsecurity/socket-patch-darwin-x64": "1.7.0",
+    "@socketsecurity/socket-patch-linux-arm": "1.7.0",
+    "@socketsecurity/socket-patch-linux-arm64": "1.7.0",
+    "@socketsecurity/socket-patch-linux-ia32": "1.7.0",
+    "@socketsecurity/socket-patch-linux-x64": "1.7.0",
+    "@socketsecurity/socket-patch-win32-arm64": "1.7.0",
+    "@socketsecurity/socket-patch-win32-ia32": "1.7.0",
+    "@socketsecurity/socket-patch-win32-x64": "1.7.0"
   }
 }
