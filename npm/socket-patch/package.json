@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch",
-  "version": "1.6.3",
+  "version": "1.7.0",
   "description": "CLI tool and schema library for applying security patches to dependencies",
   "exports": {
     "./schema": {

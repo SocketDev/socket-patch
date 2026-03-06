@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-linux-arm",
-  "version": "1.6.3",
+  "version": "1.7.0",
   "description": "socket-patch binary for Linux ARM",
   "os": [
     "linux"
