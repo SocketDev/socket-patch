@@ -17,4 +17,6 @@ def main():
         )
         sys.exit(1)
     bin_path = os.path.join(bin_dir, bins[0])
+    if not os.access(bin_path, os.X_OK):
+        os.chmod(bin_path, os.stat(bin_path).st_mode | 0o111)
     raise SystemExit(subprocess.call([bin_path] + sys.argv[1:]))
