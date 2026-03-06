@@ -496,7 +496,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             }
             let sev = vuln.severity.as_str();
             if highest_severity
-                .map_or(true, |cur| severity_order(sev) < severity_order(cur))
+                .is_none_or(|cur| severity_order(sev) < severity_order(cur))
             {
                 highest_severity = Some(sev);
             }
@@ -521,7 +521,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             println!("    Fixes: {}", vuln_ids.join(", "));
         }
         // Show per-vulnerability summaries
-        for (_id, vuln) in &patch.vulnerabilities {
+        for vuln in patch.vulnerabilities.values() {
             if !vuln.summary.is_empty() {
                 let summary = if vuln.summary.len() > 76 {
                     format!("{}...", &vuln.summary[..73])
