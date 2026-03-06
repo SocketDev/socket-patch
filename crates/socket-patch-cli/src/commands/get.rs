@@ -11,11 +11,10 @@ use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::utils::purl::is_purl;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, Write};
 use std::path::PathBuf;
 
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
-use crate::output::stdin_is_tty;
+use crate::output::{confirm, select_one, SelectError};
 
 #[derive(Args)]
 pub struct GetArgs {
@@ -118,23 +117,378 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
     }
 }
 
-/// Check if confirmation should proceed: returns true if -y was passed,
-/// stdin is not a TTY (non-interactive), or the user answers yes.
-fn should_proceed(args: &GetArgs, prompt: &str) -> bool {
-    if args.yes {
-        return true;
+/// Select one patch per PURL from available patches.
+///
+/// - Paid users: auto-select the most recent paid patch per PURL.
+/// - Free users with one patch: auto-select it.
+/// - Free users with multiple patches: interactive selection via dialoguer.
+/// - JSON mode with multiple free patches: returns an error with options list.
+///
+/// Returns `Ok(selected_patches)` or `Err(exit_code)` if selection fails.
+pub fn select_patches(
+    patches: &[PatchSearchResult],
+    can_access_paid: bool,
+    is_json: bool,
+) -> Result<Vec<PatchSearchResult>, i32> {
+    // Group accessible patches by PURL
+    let mut by_purl: HashMap<String, Vec<&PatchSearchResult>> = HashMap::new();
+    for p in patches {
+        if p.tier == "free" || can_access_paid {
+            by_purl.entry(p.purl.clone()).or_default().push(p);
+        }
     }
-    if !stdin_is_tty() {
-        // Non-interactive: default to yes (with warning on stderr)
-        eprintln!("Non-interactive mode detected, proceeding automatically.");
-        return true;
+
+    let mut selected = Vec::new();
+
+    for (purl, mut group) in by_purl {
+        // Sort by published_at descending (most recent first)
+        group.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+
+        if can_access_paid {
+            // Paid user: prefer most recent paid patch, fallback to most recent free
+            let choice = group
+                .iter()
+                .find(|p| p.tier == "paid")
+                .or_else(|| group.first())
+                .unwrap();
+            selected.push((*choice).clone());
+        } else if group.len() == 1 {
+            selected.push(group[0].clone());
+        } else {
+            // Free user with multiple patches: interactive selection
+            let options: Vec<String> = group
+                .iter()
+                .map(|p| {
+                    let vuln_summary: Vec<String> = p
+                        .vulnerabilities
+                        .iter()
+                        .map(|(id, v)| {
+                            if v.cves.is_empty() {
+                                id.clone()
+                            } else {
+                                v.cves.join(", ")
+                            }
+                        })
+                        .collect();
+                    let vulns = if vuln_summary.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (fixes: {})", vuln_summary.join(", "))
+                    };
+                    let desc = if p.description.len() > 60 {
+                        format!("{}...", &p.description[..57])
+                    } else {
+                        p.description.clone()
+                    };
+                    format!("{} [{}]{} - {}", p.uuid, p.tier, vulns, desc)
+                })
+                .collect();
+
+            match select_one(
+                &format!("Multiple patches available for {purl}. Select one:"),
+                &options,
+                is_json,
+            ) {
+                Ok(idx) => {
+                    selected.push(group[idx].clone());
+                }
+                Err(SelectError::JsonModeNeedsExplicit) => {
+                    let options_json: Vec<serde_json::Value> = group
+                        .iter()
+                        .map(|p| {
+                            let vulns: Vec<serde_json::Value> = p
+                                .vulnerabilities
+                                .iter()
+                                .map(|(id, v)| {
+                                    serde_json::json!({
+                                        "id": id,
+                                        "cves": v.cves,
+                                        "severity": v.severity,
+                                        "summary": v.summary,
+                                    })
+                                })
+                                .collect();
+                            serde_json::json!({
+                                "uuid": p.uuid,
+                                "tier": p.tier,
+                                "published_at": p.published_at,
+                                "description": p.description,
+                                "vulnerabilities": vulns,
+                            })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "selection_required",
+                            "error": format!("Multiple patches available for {purl}. Specify --id <UUID> to select one."),
+                            "purl": purl,
+                            "options": options_json,
+                        }))
+                        .unwrap()
+                    );
+                    return Err(1);
+                }
+                Err(SelectError::Cancelled) => {
+                    eprintln!("Selection cancelled.");
+                    return Err(0);
+                }
+            }
+        }
     }
-    print!("{prompt}");
-    io::stdout().flush().unwrap();
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).unwrap();
-    let answer = answer.trim().to_lowercase();
-    answer == "y" || answer == "yes"
+
+    Ok(selected)
+}
+
+/// Download parameters shared between get and scan commands.
+#[allow(dead_code)]
+pub struct DownloadParams {
+    pub cwd: PathBuf,
+    pub org: Option<String>,
+    pub save_only: bool,
+    pub one_off: bool,
+    pub global: bool,
+    pub global_prefix: Option<PathBuf>,
+    pub json: bool,
+    pub silent: bool,
+}
+
+/// Download and apply a set of selected patches.
+///
+/// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
+pub async fn download_and_apply_patches(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+) -> (i32, serde_json::Value) {
+    let (api_client, _) = get_api_client_from_env(params.org.as_deref()).await;
+    let effective_org: Option<&str> = None;
+
+    let socket_dir = params.cwd.join(".socket");
+    let blobs_dir = socket_dir.join("blobs");
+    let manifest_path = socket_dir.join("manifest.json");
+
+    tokio::fs::create_dir_all(&socket_dir).await.ok();
+    tokio::fs::create_dir_all(&blobs_dir).await.ok();
+
+    let mut manifest = match read_manifest(&manifest_path).await {
+        Ok(Some(m)) => m,
+        _ => PatchManifest::new(),
+    };
+
+    if !params.json && !params.silent {
+        eprintln!("\nDownloading {} patch(es)...", selected.len());
+    }
+
+    let mut patches_added = 0;
+    let mut patches_skipped = 0;
+    let mut patches_failed = 0;
+    let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
+    let mut updates: Vec<String> = Vec::new();
+
+    for search_result in selected {
+        // Check for updates: existing patch with different UUID
+        if let Some(existing) = manifest.patches.get(&search_result.purl) {
+            if existing.uuid != search_result.uuid {
+                updates.push(search_result.purl.clone());
+                if !params.json && !params.silent {
+                    eprintln!(
+                        "  [update] {} (replacing {})",
+                        search_result.purl,
+                        &existing.uuid[..8]
+                    );
+                }
+            }
+        }
+
+        match api_client
+            .fetch_patch(effective_org, &search_result.uuid)
+            .await
+        {
+            Ok(Some(patch)) => {
+                // Check if already in manifest with same UUID
+                if manifest
+                    .patches
+                    .get(&patch.purl)
+                    .is_some_and(|p| p.uuid == patch.uuid)
+                {
+                    if !params.json && !params.silent {
+                        eprintln!("  [skip] {} (already in manifest)", patch.purl);
+                    }
+                    downloaded_patches.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "skipped",
+                    }));
+                    patches_skipped += 1;
+                    continue;
+                }
+
+                // Save blob contents
+                let mut files = HashMap::new();
+                for (file_path, file_info) in &patch.files {
+                    if let (Some(ref before), Some(ref after)) =
+                        (&file_info.before_hash, &file_info.after_hash)
+                    {
+                        files.insert(
+                            file_path.clone(),
+                            PatchFileInfo {
+                                before_hash: before.clone(),
+                                after_hash: after.clone(),
+                            },
+                        );
+                    }
+
+                    if let (Some(ref blob_content), Some(ref after_hash)) =
+                        (&file_info.blob_content, &file_info.after_hash)
+                    {
+                        if let Ok(decoded) = base64_decode(blob_content) {
+                            let blob_path = blobs_dir.join(after_hash);
+                            tokio::fs::write(&blob_path, &decoded).await.ok();
+                        }
+                    }
+
+                    // Also store beforeHash blob if present (needed for rollback)
+                    if let (Some(ref before_blob), Some(ref before_hash)) =
+                        (&file_info.before_blob_content, &file_info.before_hash)
+                    {
+                        if let Ok(decoded) = base64_decode(before_blob) {
+                            tokio::fs::write(blobs_dir.join(before_hash), &decoded)
+                                .await
+                                .ok();
+                        }
+                    }
+                }
+
+                let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
+                    .vulnerabilities
+                    .iter()
+                    .map(|(id, v)| {
+                        (
+                            id.clone(),
+                            VulnerabilityInfo {
+                                cves: v.cves.clone(),
+                                summary: v.summary.clone(),
+                                severity: v.severity.clone(),
+                                description: v.description.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+
+                manifest.patches.insert(
+                    patch.purl.clone(),
+                    PatchRecord {
+                        uuid: patch.uuid.clone(),
+                        exported_at: patch.published_at.clone(),
+                        files,
+                        vulnerabilities,
+                        description: patch.description.clone(),
+                        license: patch.license.clone(),
+                        tier: patch.tier.clone(),
+                    },
+                );
+
+                if !params.json && !params.silent {
+                    eprintln!("  [add] {}", patch.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": patch.purl,
+                    "uuid": patch.uuid,
+                    "action": "added",
+                }));
+                patches_added += 1;
+            }
+            Ok(None) => {
+                if !params.json && !params.silent {
+                    eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": "could not fetch details",
+                }));
+                patches_failed += 1;
+            }
+            Err(e) => {
+                if !params.json && !params.silent {
+                    eprintln!("  [fail] {} ({e})", search_result.purl);
+                }
+                downloaded_patches.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": e.to_string(),
+                }));
+                patches_failed += 1;
+            }
+        }
+    }
+
+    // Write manifest
+    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
+        let err_json = serde_json::json!({
+            "status": "error",
+            "error": format!("Error writing manifest: {e}"),
+        });
+        if params.json {
+            println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+        } else {
+            eprintln!("Error writing manifest: {e}");
+        }
+        return (1, err_json);
+    }
+
+    if !params.json && !params.silent {
+        eprintln!("\nPatches saved to {}", manifest_path.display());
+        eprintln!("  Added: {patches_added}");
+        if patches_skipped > 0 {
+            eprintln!("  Skipped: {patches_skipped}");
+        }
+        if patches_failed > 0 {
+            eprintln!("  Failed: {patches_failed}");
+        }
+        if !updates.is_empty() {
+            eprintln!("  Updated: {}", updates.len());
+        }
+    }
+
+    // Auto-apply unless --save-only
+    if !params.save_only && patches_added > 0 {
+        if !params.json && !params.silent {
+            eprintln!("\nApplying patches...");
+        }
+        let apply_args = super::apply::ApplyArgs {
+            cwd: params.cwd.clone(),
+            dry_run: false,
+            silent: params.json || params.silent,
+            manifest_path: manifest_path.display().to_string(),
+            offline: false,
+            global: params.global,
+            global_prefix: params.global_prefix.clone(),
+            ecosystems: None,
+            force: false,
+            json: false,
+            verbose: false,
+        };
+        let code = super::apply::run(apply_args).await;
+        if code != 0 && !params.json && !params.silent {
+            eprintln!("\nSome patches could not be applied.");
+        }
+    }
+
+    let result_json = serde_json::json!({
+        "status": "success",
+        "found": selected.len(),
+        "downloaded": patches_added,
+        "skipped": patches_skipped,
+        "failed": patches_failed,
+        "applied": if !params.save_only && patches_added > 0 { patches_added } else { 0 },
+        "updated": updates.len(),
+        "patches": downloaded_patches,
+    });
+
+    (0, result_json)
 }
 
 pub async fn run(args: GetArgs) -> i32 {
@@ -356,6 +710,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 } else if args.global {
                     println!("No global packages found.");
                 } else {
+                    #[allow(unused_mut)]
                     let mut install_cmds = String::from("npm/yarn/pnpm/pip");
                     #[cfg(feature = "cargo")]
                     install_cmds.push_str("/cargo");
@@ -440,7 +795,6 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     if !args.json {
-        // Display results
         display_search_results(&search_response.patches, search_response.can_access_paid_patches);
     }
 
@@ -449,6 +803,7 @@ pub async fn run(args: GetArgs) -> i32 {
         .patches
         .iter()
         .filter(|p| p.tier == "free" || search_response.can_access_paid_patches)
+        .cloned()
         .collect();
 
     if accessible.is_empty() {
@@ -471,217 +826,51 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    // Prompt for confirmation
-    if accessible.len() > 1 && !args.json {
-        let prompt = format!("Download {} patch(es)? [y/N] ", accessible.len());
-        if !should_proceed(&args, &prompt) {
-            println!("Download cancelled.");
-            return 0;
-        }
-    }
-
-    // Download and save patches
-    let socket_dir = args.cwd.join(".socket");
-    let blobs_dir = socket_dir.join("blobs");
-    let manifest_path = socket_dir.join("manifest.json");
-
-    tokio::fs::create_dir_all(&socket_dir).await.ok();
-    tokio::fs::create_dir_all(&blobs_dir).await.ok();
-
-    let mut manifest = match read_manifest(&manifest_path).await {
-        Ok(Some(m)) => m,
-        _ => PatchManifest::new(),
+    // Smart patch selection: pick one patch per PURL
+    let selected = match select_patches(
+        &accessible,
+        search_response.can_access_paid_patches,
+        args.json,
+    ) {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
-    if !args.json {
-        println!("\nDownloading {} patch(es)...", accessible.len());
-    }
-
-    let mut patches_added = 0;
-    let mut patches_skipped = 0;
-    let mut patches_failed = 0;
-    let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
-
-    for search_result in &accessible {
-        match api_client
-            .fetch_patch(effective_org_slug, &search_result.uuid)
-            .await
-        {
-            Ok(Some(patch)) => {
-                // Check if already in manifest
-                if manifest
-                    .patches
-                    .get(&patch.purl)
-                    .is_some_and(|p| p.uuid == patch.uuid)
-                {
-                    if !args.json {
-                        println!("  [skip] {} (already in manifest)", patch.purl);
-                    }
-                    downloaded_patches.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "skipped",
-                    }));
-                    patches_skipped += 1;
-                    continue;
-                }
-
-                // Save blob contents (afterHash only)
-                let mut files = HashMap::new();
-                for (file_path, file_info) in &patch.files {
-                    if let (Some(ref before), Some(ref after)) =
-                        (&file_info.before_hash, &file_info.after_hash)
-                    {
-                        files.insert(
-                            file_path.clone(),
-                            PatchFileInfo {
-                                before_hash: before.clone(),
-                                after_hash: after.clone(),
-                            },
-                        );
-                    }
-
-                    // Save after blob content
-                    if let (Some(ref blob_content), Some(ref after_hash)) =
-                        (&file_info.blob_content, &file_info.after_hash)
-                    {
-                        if let Ok(decoded) =
-                            base64_decode(blob_content)
-                        {
-                            let blob_path = blobs_dir.join(after_hash);
-                            tokio::fs::write(&blob_path, &decoded).await.ok();
-                        }
-                    }
-                }
-
-                // Build vulnerabilities
-                let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
-                    .vulnerabilities
-                    .iter()
-                    .map(|(id, v)| {
-                        (
-                            id.clone(),
-                            VulnerabilityInfo {
-                                cves: v.cves.clone(),
-                                summary: v.summary.clone(),
-                                severity: v.severity.clone(),
-                                description: v.description.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-
-                manifest.patches.insert(
-                    patch.purl.clone(),
-                    PatchRecord {
-                        uuid: patch.uuid.clone(),
-                        exported_at: patch.published_at.clone(),
-                        files,
-                        vulnerabilities,
-                        description: patch.description.clone(),
-                        license: patch.license.clone(),
-                        tier: patch.tier.clone(),
-                    },
-                );
-
-                if !args.json {
-                    println!("  [add] {}", patch.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "added",
-                }));
-                patches_added += 1;
-            }
-            Ok(None) => {
-                if !args.json {
-                    println!("  [fail] {} (could not fetch details)", search_result.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": "could not fetch details",
-                }));
-                patches_failed += 1;
-            }
-            Err(e) => {
-                if !args.json {
-                    println!("  [fail] {} ({e})", search_result.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": e.to_string(),
-                }));
-                patches_failed += 1;
-            }
-        }
-    }
-
-    // Write manifest
-    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": format!("Error writing manifest: {e}"),
-            })).unwrap());
-        } else {
-            eprintln!("Error writing manifest: {e}");
-        }
-        return 1;
-    }
-
-    if !args.json {
-        println!("\nPatches saved to {}", manifest_path.display());
-        println!("  Added: {patches_added}");
-        if patches_skipped > 0 {
-            println!("  Skipped: {patches_skipped}");
-        }
-        if patches_failed > 0 {
-            println!("  Failed: {patches_failed}");
-        }
-    }
-
-    // Auto-apply unless --save-only
-    if !args.save_only && patches_added > 0 {
+    if selected.is_empty() {
         if !args.json {
-            println!("\nApplying patches...");
+            println!("No patches selected.");
         }
-        let apply_args = super::apply::ApplyArgs {
-            cwd: args.cwd.clone(),
-            dry_run: false,
-            silent: args.json, // suppress text output when in JSON mode
-            manifest_path: manifest_path.display().to_string(),
-            offline: false,
-            global: args.global,
-            global_prefix: args.global_prefix.clone(),
-            ecosystems: None,
-            force: false,
-            json: false, // we handle JSON output ourselves
-            verbose: false,
-        };
-        let code = super::apply::run(apply_args).await;
-        if code != 0 && !args.json {
-            eprintln!("\nSome patches could not be applied.");
-        }
+        return 0;
     }
+
+    // Confirm before downloading (default YES)
+    let prompt = format!("Download {} patch(es)?", selected.len());
+    if !confirm(&prompt, true, args.yes, args.json) {
+        if !args.json {
+            println!("Download cancelled.");
+        }
+        return 0;
+    }
+
+    // Download and apply
+    let params = DownloadParams {
+        cwd: args.cwd.clone(),
+        org: args.org.clone(),
+        save_only: args.save_only,
+        one_off: args.one_off,
+        global: args.global,
+        global_prefix: args.global_prefix.clone(),
+        json: args.json,
+        silent: false,
+    };
+
+    let (code, result_json) = download_and_apply_patches(&selected, &params).await;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "status": "success",
-            "found": search_response.patches.len(),
-            "downloaded": patches_added,
-            "skipped": patches_skipped,
-            "failed": patches_failed,
-            "applied": if !args.save_only && patches_added > 0 { patches_added } else { 0 },
-            "patches": downloaded_patches,
-        })).unwrap());
+        println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
     }
 
-    0
+    code
 }
 
 fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) {
@@ -912,7 +1101,6 @@ async fn save_and_apply_patch(
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    // Simple base64 decoder
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [255u8; 256];
     for (i, &c) in chars.iter().enumerate() {

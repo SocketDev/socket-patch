@@ -7,6 +7,7 @@ use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remov
 use std::path::{Path, PathBuf};
 
 use super::rollback::rollback_patches;
+use crate::output::confirm;
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -24,6 +25,10 @@ pub struct RemoveArgs {
     /// Skip rolling back files before removing (only update manifest)
     #[arg(long = "skip-rollback", default_value_t = false)]
     pub skip_rollback: bool,
+
+    /// Skip confirmation prompts
+    #[arg(short = 'y', long, default_value_t = false)]
+    pub yes: bool,
 
     /// Remove patches from globally installed npm packages
     #[arg(short = 'g', long, default_value_t = false)]
@@ -61,6 +66,93 @@ pub async fn run(args: RemoveArgs) -> i32 {
             eprintln!("Manifest not found at {}", manifest_path.display());
         }
         return 1;
+    }
+
+    // Read manifest to show what will be removed and confirm
+    let manifest = match read_manifest(&manifest_path).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": "Invalid manifest",
+                })).unwrap());
+            } else {
+                eprintln!("Invalid manifest at {}", manifest_path.display());
+            }
+            return 1;
+        }
+        Err(e) => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": e.to_string(),
+                })).unwrap());
+            } else {
+                eprintln!("Error reading manifest: {e}");
+            }
+            return 1;
+        }
+    };
+
+    // Find matching patches to show what will be removed
+    let matching: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
+        if args.identifier.starts_with("pkg:") {
+            manifest
+                .patches
+                .iter()
+                .filter(|(purl, _)| *purl == &args.identifier)
+                .collect()
+        } else {
+            manifest
+                .patches
+                .iter()
+                .filter(|(_, patch)| patch.uuid == args.identifier)
+                .collect()
+        };
+
+    if matching.is_empty() {
+        track_patch_remove_failed(
+            &format!("No patch found matching identifier: {}", args.identifier),
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "not_found",
+                "error": format!("No patch found matching identifier: {}", args.identifier),
+                "removed": 0,
+                "purls": [],
+            })).unwrap());
+        } else {
+            eprintln!(
+                "No patch found matching identifier: {}",
+                args.identifier
+            );
+        }
+        return 1;
+    }
+
+    // Show what will be removed and confirm
+    if !args.json {
+        eprintln!("The following patch(es) will be removed:");
+        for (purl, patch) in &matching {
+            let file_count = patch.files.len();
+            eprintln!("  - {} (UUID: {}, {} file(s))", purl, &patch.uuid[..8], file_count);
+        }
+        eprintln!();
+    }
+
+    let prompt = format!(
+        "Remove {} patch(es) and rollback files?",
+        matching.len()
+    );
+    if !confirm(&prompt, true, args.yes, args.json) {
+        if !args.json {
+            println!("Removal cancelled.");
+        }
+        return 0;
     }
 
     // First, rollback the patch if not skipped

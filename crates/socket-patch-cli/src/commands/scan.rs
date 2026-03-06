@@ -1,12 +1,15 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_from_env;
-use socket_patch_core::api::types::BatchPackagePatches;
+use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::manifest::operations::read_manifest;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
-use crate::output::{color, format_severity, stderr_is_tty, stdout_is_tty};
+use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
+
+use super::get::{download_and_apply_patches, select_patches, DownloadParams};
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
@@ -23,6 +26,10 @@ pub struct ScanArgs {
     /// Output results as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// Skip confirmation prompts
+    #[arg(short = 'y', long, default_value_t = false)]
+    pub yes: bool,
 
     /// Scan globally installed npm packages
     #[arg(short = 'g', long, default_value_t = false)]
@@ -126,6 +133,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         } else if args.global || args.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
+            #[allow(unused_mut)]
             let mut install_cmds = String::from("npm/yarn/pnpm/pip");
             #[cfg(feature = "cargo")]
             install_cmds.push_str("/cargo");
@@ -269,6 +277,11 @@ pub async fn run(args: ScanArgs) -> i32 {
         return 0;
     }
 
+    // Check manifest for existing patches (update detection)
+    let manifest_path = args.cwd.join(".socket").join("manifest.json");
+    let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
+    let mut updates_available = 0usize;
+
     // Print table
     println!("\n{}", "=".repeat(100));
     println!(
@@ -332,12 +345,34 @@ pub async fn run(args: ScanArgs) -> i32 {
             vuln_ids.join(", ")
         };
 
+        // Check for updates
+        let has_update = if let Some(ref manifest) = existing_manifest {
+            if let Some(existing) = manifest.patches.get(&pkg.purl) {
+                // If any patch in the batch has a different UUID than what's in manifest, update available
+                pkg.patches.iter().any(|p| p.uuid != existing.uuid)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if has_update {
+            updates_available += 1;
+        }
+
+        let update_marker = if has_update {
+            color(" [UPDATE]", "33", use_color)
+        } else {
+            String::new()
+        };
+
         println!(
-            "{:<40}  {:>8}  {:<16}  {}",
+            "{:<40}  {:>8}  {:<16}  {}{}",
             display_purl,
             count_str,
             format_severity(severity, use_color),
             vuln_str,
+            update_marker,
         );
     }
 
@@ -371,11 +406,165 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
     }
 
-    println!("\nTo apply a patch, run:");
-    println!("  socket-patch get <package-name-or-purl>");
-    println!("  socket-patch get <CVE-ID>");
+    if updates_available > 0 {
+        println!(
+            "\n{}",
+            color(
+                &format!("{updates_available} package(s) have newer patches available."),
+                "33",
+                use_color,
+            ),
+        );
+    }
 
-    0
+    // Count downloadable patches
+    let downloadable_count = if can_access_paid_patches {
+        all_packages_with_patches.len()
+    } else {
+        all_packages_with_patches
+            .iter()
+            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
+            .count()
+    };
+
+    if downloadable_count == 0 {
+        println!("\nNo downloadable patches (paid subscription required).");
+        return 0;
+    }
+
+    // Fetch full PatchSearchResult for each package that has patches
+    if show_progress {
+        eprint!("\nFetching patch details...");
+    }
+
+    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+    for (i, pkg) in all_packages_with_patches.iter().enumerate() {
+        if show_progress {
+            eprint!(
+                "\rFetching patch details... ({}/{})",
+                i + 1,
+                all_packages_with_patches.len()
+            );
+        }
+        match api_client
+            .search_patches_by_package(effective_org_slug, &pkg.purl)
+            .await
+        {
+            Ok(response) => {
+                all_search_results.extend(response.patches);
+            }
+            Err(e) => {
+                eprintln!("\n  Warning: could not fetch details for {}: {e}", pkg.purl);
+            }
+        }
+    }
+
+    if show_progress {
+        eprintln!();
+    }
+
+    if all_search_results.is_empty() {
+        eprintln!("Could not fetch patch details.");
+        return 1;
+    }
+
+    // Smart selection
+    let selected: Vec<PatchSearchResult> =
+        match select_patches(&all_search_results, can_access_paid_patches, false) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+
+    if selected.is_empty() {
+        println!("No patches selected.");
+        return 0;
+    }
+
+    // Display detailed summary of selected patches before confirming
+    println!("\nPatches to apply:\n");
+    for patch in &selected {
+        // Collect CVE/GHSA IDs and highest severity from vulnerabilities
+        let mut vuln_ids: Vec<String> = Vec::new();
+        let mut highest_severity: Option<&str> = None;
+        for (id, vuln) in &patch.vulnerabilities {
+            if vuln.cves.is_empty() {
+                vuln_ids.push(id.clone());
+            } else {
+                for cve in &vuln.cves {
+                    vuln_ids.push(cve.clone());
+                }
+            }
+            let sev = vuln.severity.as_str();
+            if highest_severity
+                .is_none_or(|cur| severity_order(sev) < severity_order(cur))
+            {
+                highest_severity = Some(sev);
+            }
+        }
+
+        let sev_display = highest_severity.unwrap_or("unknown");
+        let sev_colored = format_severity(sev_display, use_color);
+
+        let desc = if patch.description.len() > 72 {
+            format!("{}...", &patch.description[..69])
+        } else {
+            patch.description.clone()
+        };
+
+        println!(
+            "  {} [{}] {}",
+            patch.purl,
+            patch.tier.to_uppercase(),
+            sev_colored,
+        );
+        if !vuln_ids.is_empty() {
+            println!("    Fixes: {}", vuln_ids.join(", "));
+        }
+        // Show per-vulnerability summaries
+        for vuln in patch.vulnerabilities.values() {
+            if !vuln.summary.is_empty() {
+                let summary = if vuln.summary.len() > 76 {
+                    format!("{}...", &vuln.summary[..73])
+                } else {
+                    vuln.summary.clone()
+                };
+                let cve_label = if vuln.cves.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}: ", vuln.cves.join(", "))
+                };
+                println!("    - {cve_label}{summary}");
+            }
+        }
+        if !desc.is_empty() {
+            println!("    {desc}");
+        }
+        println!();
+    }
+
+    // Prompt to download
+    let prompt = format!("Download and apply {} patch(es)?", selected.len());
+    if !confirm(&prompt, true, args.yes, args.json) {
+        println!("\nTo apply a patch, run:");
+        println!("  socket-patch get <package-name-or-purl>");
+        println!("  socket-patch get <CVE-ID>");
+        return 0;
+    }
+
+    // Download and apply
+    let params = DownloadParams {
+        cwd: args.cwd.clone(),
+        org: args.org.clone(),
+        save_only: false,
+        one_off: false,
+        global: args.global,
+        global_prefix: args.global_prefix.clone(),
+        json: false,
+        silent: false,
+    };
+
+    let (code, _) = download_and_apply_patches(&selected, &params).await;
+    code
 }
 
 fn severity_order(s: &str) -> u8 {
