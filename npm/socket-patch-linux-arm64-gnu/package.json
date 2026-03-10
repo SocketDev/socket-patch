@@ -1,12 +1,15 @@
 {
-  "name": "@socketsecurity/socket-patch-linux-arm",
+  "name": "@socketsecurity/socket-patch-linux-arm64-gnu",
   "version": "2.0.0",
-  "description": "socket-patch binary for Linux ARM",
+  "description": "socket-patch binary for Linux ARM64 (glibc)",
   "os": [
     "linux"
   ],
   "cpu": [
-    "arm"
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
   ],
   "publishConfig": {
     "access": "public"

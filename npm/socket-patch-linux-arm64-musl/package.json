@@ -1,0 +1,22 @@
+{
+  "name": "@socketsecurity/socket-patch-linux-arm64-musl",
+  "version": "2.0.0",
+  "description": "socket-patch binary for Linux ARM64 (musl)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}

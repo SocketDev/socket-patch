@@ -1,0 +1,22 @@
+{
+  "name": "@socketsecurity/socket-patch-linux-arm-gnu",
+  "version": "2.0.0",
+  "description": "socket-patch binary for Linux ARM (glibc)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SocketDev/socket-patch"
+  }
+}
