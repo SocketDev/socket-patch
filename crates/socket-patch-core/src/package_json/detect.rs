@@ -1,5 +1,5 @@
 /// The command to run for applying patches via socket CLI.
-const SOCKET_PATCH_COMMAND: &str = "socket patch apply --silent --ecosystems npm";
+const SOCKET_PATCH_COMMAND: &str = "npx @socketsecurity/socket-patch apply --silent --ecosystems npm";
 
 /// Legacy command patterns to detect existing configurations.
 const LEGACY_PATCH_PATTERNS: &[&str] = &[
@@ -140,7 +140,7 @@ mod tests {
         let pkg: serde_json::Value = serde_json::json!({
             "name": "test",
             "scripts": {
-                "postinstall": "socket patch apply --silent --ecosystems npm"
+                "postinstall": "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
             }
         });
         let status = is_postinstall_configured(&pkg);
@@ -152,7 +152,7 @@ mod tests {
     fn test_generate_empty() {
         assert_eq!(
             generate_updated_postinstall(""),
-            "socket patch apply --silent --ecosystems npm"
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
         );
     }
 
@@ -160,7 +160,7 @@ mod tests {
     fn test_generate_prepend() {
         assert_eq!(
             generate_updated_postinstall("echo done"),
-            "socket patch apply --silent --ecosystems npm && echo done"
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo done"
         );
     }
 
@@ -220,7 +220,7 @@ mod tests {
         let mut pkg: serde_json::Value = serde_json::json!({"name": "test"});
         let (modified, new_script) = update_package_json_object(&mut pkg);
         assert!(modified);
-        assert!(new_script.contains("socket patch apply"));
+        assert!(new_script.contains("socket-patch apply"));
         assert!(pkg.get("scripts").is_some());
         assert!(pkg["scripts"]["postinstall"].is_string());
     }
@@ -229,12 +229,12 @@ mod tests {
     fn test_update_object_noop_when_configured() {
         let mut pkg: serde_json::Value = serde_json::json!({
             "scripts": {
-                "postinstall": "socket patch apply --silent --ecosystems npm"
+                "postinstall": "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
             }
         });
         let (modified, existing) = update_package_json_object(&mut pkg);
         assert!(!modified);
-        assert!(existing.contains("socket patch apply"));
+        assert!(existing.contains("socket-patch apply"));
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
             update_package_json_content(content).unwrap();
         assert!(modified);
         assert!(old_script.is_empty());
-        assert!(new_script.contains("socket patch apply"));
+        assert!(new_script.contains("socket-patch apply"));
         // new_content should be valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
         assert!(parsed["scripts"]["postinstall"].is_string());
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_update_content_already_configured() {
-        let content = r#"{"scripts":{"postinstall":"socket patch apply --silent --ecosystems npm"}}"#;
+        let content = r#"{"scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#;
         let (modified, _new_content, _old, _new) =
             update_package_json_content(content).unwrap();
         assert!(!modified);
@@ -269,6 +269,6 @@ mod tests {
     fn test_generate_whitespace_only() {
         // Whitespace-only string should be treated as empty after trim
         let result = generate_updated_postinstall("  \t  ");
-        assert_eq!(result, "socket patch apply --silent --ecosystems npm");
+        assert_eq!(result, "npx @socketsecurity/socket-patch apply --silent --ecosystems npm");
     }
 }
