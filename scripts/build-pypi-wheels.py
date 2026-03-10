@@ -33,8 +33,13 @@ TARGETS = {
         "archive_ext": "tar.gz",
         "binary_name": "socket-patch",
     },
+    "x86_64-unknown-linux-gnu": {
+        "platform_tag": "manylinux_2_17_x86_64.manylinux2014_x86_64",
+        "archive_ext": "tar.gz",
+        "binary_name": "socket-patch",
+    },
     "x86_64-unknown-linux-musl": {
-        "platform_tag": "manylinux_2_17_x86_64.manylinux2014_x86_64.musllinux_1_1_x86_64",
+        "platform_tag": "musllinux_1_1_x86_64",
         "archive_ext": "tar.gz",
         "binary_name": "socket-patch",
     },
@@ -43,13 +48,28 @@ TARGETS = {
         "archive_ext": "tar.gz",
         "binary_name": "socket-patch",
     },
+    "aarch64-unknown-linux-musl": {
+        "platform_tag": "musllinux_1_1_aarch64",
+        "archive_ext": "tar.gz",
+        "binary_name": "socket-patch",
+    },
     "arm-unknown-linux-gnueabihf": {
         "platform_tag": "manylinux_2_17_armv7l.manylinux2014_armv7l",
         "archive_ext": "tar.gz",
         "binary_name": "socket-patch",
     },
+    "arm-unknown-linux-musleabihf": {
+        "platform_tag": "musllinux_1_1_armv7l",
+        "archive_ext": "tar.gz",
+        "binary_name": "socket-patch",
+    },
     "i686-unknown-linux-gnu": {
         "platform_tag": "manylinux_2_17_i686.manylinux2014_i686",
+        "archive_ext": "tar.gz",
+        "binary_name": "socket-patch",
+    },
+    "i686-unknown-linux-musl": {
+        "platform_tag": "musllinux_1_1_i686",
         "archive_ext": "tar.gz",
         "binary_name": "socket-patch",
     },

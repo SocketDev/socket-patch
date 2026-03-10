@@ -68,11 +68,19 @@ jobs:
             runner: macos-14
             archive: tar.gz
             build-tool: cargo
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tar.gz
             build-tool: cross
           - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tar.gz
             build-tool: cross
@@ -96,7 +104,15 @@ jobs:
             runner: ubuntu-latest
             archive: tar.gz
             build-tool: cross
+          - target: arm-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
           - target: i686-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: i686-unknown-linux-musl
             runner: ubuntu-latest
             archive: tar.gz
             build-tool: cross
@@ -254,10 +270,14 @@ jobs:
 
           stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
           stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
-          stage_unix socket-patch-x86_64-unknown-linux-musl  npm/socket-patch-linux-x64
-          stage_unix socket-patch-aarch64-unknown-linux-gnu  npm/socket-patch-linux-arm64
-          stage_unix socket-patch-arm-unknown-linux-gnueabihf npm/socket-patch-linux-arm
-          stage_unix socket-patch-i686-unknown-linux-gnu     npm/socket-patch-linux-ia32
+          stage_unix socket-patch-x86_64-unknown-linux-gnu      npm/socket-patch-linux-x64-gnu
+          stage_unix socket-patch-x86_64-unknown-linux-musl     npm/socket-patch-linux-x64-musl
+          stage_unix socket-patch-aarch64-unknown-linux-gnu     npm/socket-patch-linux-arm64-gnu
+          stage_unix socket-patch-aarch64-unknown-linux-musl    npm/socket-patch-linux-arm64-musl
+          stage_unix socket-patch-arm-unknown-linux-gnueabihf   npm/socket-patch-linux-arm-gnu
+          stage_unix socket-patch-arm-unknown-linux-musleabihf  npm/socket-patch-linux-arm-musl
+          stage_unix socket-patch-i686-unknown-linux-gnu        npm/socket-patch-linux-ia32-gnu
+          stage_unix socket-patch-i686-unknown-linux-musl       npm/socket-patch-linux-ia32-musl
           stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
 
           stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
