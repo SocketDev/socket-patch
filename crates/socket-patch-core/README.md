@@ -6,7 +6,7 @@ Core library for [socket-patch](https://github.com/SocketDev/socket-patch) — a
 
 - **Manifest management** — read, write, and validate `.socket/manifest.json` patch manifests
 - **Patch engine** — apply and rollback file-level patches using git SHA-256 content hashes
-- **Crawlers** — discover installed packages across npm and PyPI (default), plus Cargo, Go, Maven, Ruby gems, Composer, and NuGet (via feature flags)
+- **Crawlers** — discover installed packages across npm, PyPI, and Ruby gems (default), plus Cargo, Go, Maven, Composer, and NuGet (via feature flags)
 - **API client** — fetch patches from the Socket API
 - **Utilities** — PURL parsing, blob storage, hash verification, fuzzy matching
 

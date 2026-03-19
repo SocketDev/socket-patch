@@ -3,7 +3,6 @@ pub mod python_crawler;
 pub mod types;
 #[cfg(feature = "cargo")]
 pub mod cargo_crawler;
-#[cfg(feature = "gem")]
 pub mod ruby_crawler;
 #[cfg(feature = "golang")]
 pub mod go_crawler;
@@ -19,7 +18,6 @@ pub use python_crawler::PythonCrawler;
 pub use types::*;
 #[cfg(feature = "cargo")]
 pub use cargo_crawler::CargoCrawler;
-#[cfg(feature = "gem")]
 pub use ruby_crawler::RubyCrawler;
 #[cfg(feature = "golang")]
 pub use go_crawler::GoCrawler;

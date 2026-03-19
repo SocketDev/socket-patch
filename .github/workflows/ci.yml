@@ -120,5 +120,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Setup Ruby
+        if: matrix.suite == 'e2e_gem'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: false
+
       - name: Run e2e tests
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored

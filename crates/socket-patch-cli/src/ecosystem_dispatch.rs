@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 #[cfg(feature = "cargo")]
 use socket_patch_core::crawlers::CargoCrawler;
-#[cfg(feature = "gem")]
 use socket_patch_core::crawlers::RubyCrawler;
 #[cfg(feature = "golang")]
 use socket_patch_core::crawlers::GoCrawler;
@@ -141,7 +140,6 @@ pub async fn find_packages_for_purls(
     }
 
     // gem
-    #[cfg(feature = "gem")]
     if let Some(gem_purls) = partitioned.get(&Ecosystem::Gem) {
         if !gem_purls.is_empty() {
             let ruby_crawler = RubyCrawler;
@@ -323,7 +321,6 @@ pub async fn crawl_all_ecosystems(
         all_packages.extend(cargo_packages);
     }
 
-    #[cfg(feature = "gem")]
     {
         let ruby_crawler = RubyCrawler;
         let gem_packages = ruby_crawler.crawl_all(options).await;
@@ -468,7 +465,6 @@ pub async fn find_packages_for_rollback(
     }
 
     // gem
-    #[cfg(feature = "gem")]
     if let Some(gem_purls) = partitioned.get(&Ecosystem::Gem) {
         if !gem_purls.is_empty() {
             let ruby_crawler = RubyCrawler;

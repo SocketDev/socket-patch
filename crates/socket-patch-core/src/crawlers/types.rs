@@ -7,7 +7,6 @@ pub enum Ecosystem {
     Pypi,
     #[cfg(feature = "cargo")]
     Cargo,
-    #[cfg(feature = "gem")]
     Gem,
     #[cfg(feature = "golang")]
     Golang,
@@ -27,7 +26,6 @@ impl Ecosystem {
             Ecosystem::Pypi,
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo,
-            #[cfg(feature = "gem")]
             Ecosystem::Gem,
             #[cfg(feature = "golang")]
             Ecosystem::Golang,
@@ -46,7 +44,6 @@ impl Ecosystem {
         if purl.starts_with("pkg:cargo/") {
             return Some(Ecosystem::Cargo);
         }
-        #[cfg(feature = "gem")]
         if purl.starts_with("pkg:gem/") {
             return Some(Ecosystem::Gem);
         }
@@ -82,7 +79,6 @@ impl Ecosystem {
             Ecosystem::Pypi => "pkg:pypi/",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "pkg:cargo/",
-            #[cfg(feature = "gem")]
             Ecosystem::Gem => "pkg:gem/",
             #[cfg(feature = "golang")]
             Ecosystem::Golang => "pkg:golang/",
@@ -102,7 +98,6 @@ impl Ecosystem {
             Ecosystem::Pypi => "pypi",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
-            #[cfg(feature = "gem")]
             Ecosystem::Gem => "gem",
             #[cfg(feature = "golang")]
             Ecosystem::Golang => "golang",
@@ -122,7 +117,6 @@ impl Ecosystem {
             Ecosystem::Pypi => "python",
             #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
-            #[cfg(feature = "gem")]
             Ecosystem::Gem => "ruby",
             #[cfg(feature = "golang")]
             Ecosystem::Golang => "go",
@@ -218,12 +212,8 @@ mod tests {
     fn test_all_count() {
         let all = Ecosystem::all();
         #[allow(unused_mut)]
-        let mut expected = 2;
+        let mut expected = 3;
         #[cfg(feature = "cargo")]
-        {
-            expected += 1;
-        }
-        #[cfg(feature = "gem")]
         {
             expected += 1;
         }
@@ -272,7 +262,6 @@ mod tests {
         assert_eq!(Ecosystem::Cargo.purl_prefix(), "pkg:cargo/");
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_from_purl_gem() {
         assert_eq!(
@@ -281,7 +270,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_gem_properties() {
         assert_eq!(Ecosystem::Gem.cli_name(), "gem");

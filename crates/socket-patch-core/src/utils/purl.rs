@@ -65,7 +65,6 @@ pub fn parse_npm_purl(purl: &str) -> Option<(Option<&str>, &str, &str)> {
 }
 
 /// Check if a PURL is a Ruby gem.
-#[cfg(feature = "gem")]
 pub fn is_gem_purl(purl: &str) -> bool {
     purl.starts_with("pkg:gem/")
 }
@@ -73,7 +72,6 @@ pub fn is_gem_purl(purl: &str) -> bool {
 /// Parse a gem PURL to extract name and version.
 ///
 /// e.g., `"pkg:gem/rails@7.1.0"` -> `Some(("rails", "7.1.0"))`
-#[cfg(feature = "gem")]
 pub fn parse_gem_purl(purl: &str) -> Option<(&str, &str)> {
     let base = strip_purl_qualifiers(purl);
     let rest = base.strip_prefix("pkg:gem/")?;
@@ -87,7 +85,6 @@ pub fn parse_gem_purl(purl: &str) -> Option<(&str, &str)> {
 }
 
 /// Build a gem PURL from components.
-#[cfg(feature = "gem")]
 pub fn build_gem_purl(name: &str, version: &str) -> String {
     format!("pkg:gem/{name}@{version}")
 }
@@ -296,7 +293,6 @@ pub fn parse_purl(purl: &str) -> Option<(&str, String, &str)> {
             }
             return Some(("golang", module_path.to_string(), version));
         }
-        #[cfg(feature = "gem")]
         if let Some(rest) = base.strip_prefix("pkg:gem/") {
             let at_idx = rest.rfind('@')?;
             let name = &rest[..at_idx];
@@ -511,7 +507,6 @@ mod tests {
         assert_eq!(ver, "1.0.200");
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_is_gem_purl() {
         assert!(is_gem_purl("pkg:gem/rails@7.1.0"));
@@ -519,7 +514,6 @@ mod tests {
         assert!(!is_gem_purl("pkg:pypi/requests@2.28.0"));
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_parse_gem_purl() {
         assert_eq!(
@@ -535,7 +529,6 @@ mod tests {
         assert_eq!(parse_gem_purl("pkg:gem/rails@"), None);
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_build_gem_purl() {
         assert_eq!(
@@ -544,7 +537,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_gem_purl_round_trip() {
         let purl = build_gem_purl("nokogiri", "1.16.5");
@@ -553,7 +545,6 @@ mod tests {
         assert_eq!(version, "1.16.5");
     }
 
-    #[cfg(feature = "gem")]
     #[test]
     fn test_parse_purl_gem() {
         let (eco, dir, ver) = parse_purl("pkg:gem/rails@7.1.0").unwrap();
