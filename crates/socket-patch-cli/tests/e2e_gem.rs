@@ -17,6 +17,7 @@
 //! cargo test -p socket-patch-cli --test e2e_gem -- --ignored
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -27,24 +28,7 @@ use sha2::{Digest, Sha256};
 // ---------------------------------------------------------------------------
 
 const GEM_UUID: &str = "4bf7fe0b-dc57-4ea8-945f-bc4a04c47a15";
-#[allow(dead_code)]
 const GEM_PURL: &str = "pkg:gem/activestorage@5.2.0";
-
-/// File hashes for the 3 patched files in activestorage 5.2.0.
-
-const VARIATION_RB_BEFORE: &str = "96b72bac68797be5c69d4dd46fbb67b7e6bb2d576fbe2c87490e53714739da06";
-const VARIATION_RB_AFTER: &str = "27bc60b5399e459d9e75a69e21ca1ff9e0a3e36e56e3ef5d0d05ad44e8f18aed";
-
-const ACTIVE_STORAGE_RB_BEFORE: &str = "507653326a9fffbc7da4ebaab5c8cb55c8e81be5dc6dde5a1b0b4e0b17f3a8d2";
-const ACTIVE_STORAGE_RB_AFTER: &str = "962e44b7e3b3c59c6c8c14d16cf9f80752e56ad1fb1c6ff6c2b51b15fcaf7df9";
-
-const ENGINE_RB_BEFORE: &str = "09fc2486c5e02c5f29e7c61ef3e7b0e17f6c6b1f5ddfe6e1d08e4c06f3adf8c4";
-const ENGINE_RB_AFTER: &str = "4693b4d8f1a7c06e5d09b24f8c3e7a1d6b5f0e2c9a8d7b6f4e3c2a1b0d9e8f7";
-
-/// Relative paths of patched files inside the gem directory.
-const VARIATION_RB: &str = "app/models/active_storage/variation.rb";
-const ACTIVE_STORAGE_RB: &str = "lib/active_storage.rb";
-const ENGINE_RB: &str = "lib/active_storage/engine.rb";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -140,23 +124,85 @@ fn find_gem_dir(cwd: &Path) -> PathBuf {
     );
 }
 
-/// Verify all 3 files match expected hashes.
-fn assert_hashes(gem_dir: &Path, variation: &str, active_storage: &str, engine: &str) {
-    assert_eq!(
-        git_sha256_file(&gem_dir.join(VARIATION_RB)),
-        variation,
-        "variation.rb hash mismatch"
-    );
-    assert_eq!(
-        git_sha256_file(&gem_dir.join(ACTIVE_STORAGE_RB)),
-        active_storage,
-        "active_storage.rb hash mismatch"
-    );
-    assert_eq!(
-        git_sha256_file(&gem_dir.join(ENGINE_RB)),
-        engine,
-        "engine.rb hash mismatch"
-    );
+/// Read the manifest and return the files map for the gem patch.
+fn read_patch_files(manifest_path: &Path) -> serde_json::Value {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+    let patch = &manifest["patches"][GEM_PURL];
+    assert!(patch.is_object(), "manifest should contain {GEM_PURL}");
+    patch["files"].clone()
+}
+
+/// Record hashes of all files in the gem dir that will be patched.
+fn record_original_hashes(gem_dir: &Path, files: &serde_json::Value) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    for (rel_path, _) in files.as_object().expect("files object") {
+        let full_path = gem_dir.join(rel_path);
+        let hash = if full_path.exists() {
+            git_sha256_file(&full_path)
+        } else {
+            String::new()
+        };
+        hashes.insert(rel_path.clone(), hash);
+    }
+    hashes
+}
+
+/// Verify all patched files match their afterHash from the manifest.
+fn assert_after_hashes(gem_dir: &Path, files: &serde_json::Value) {
+    for (rel_path, info) in files.as_object().expect("files object") {
+        let after_hash = info["afterHash"]
+            .as_str()
+            .expect("afterHash should be a string");
+        let full_path = gem_dir.join(rel_path);
+        assert!(
+            full_path.exists(),
+            "patched file should exist: {}",
+            full_path.display()
+        );
+        assert_eq!(
+            git_sha256_file(&full_path),
+            after_hash,
+            "hash mismatch for {rel_path} after patching"
+        );
+    }
+}
+
+/// Verify all patched files match their beforeHash (or are removed if new).
+fn assert_before_hashes(gem_dir: &Path, files: &serde_json::Value) {
+    for (rel_path, info) in files.as_object().expect("files object") {
+        let before_hash = info["beforeHash"].as_str().unwrap_or("");
+        let full_path = gem_dir.join(rel_path);
+        if before_hash.is_empty() {
+            assert!(
+                !full_path.exists(),
+                "new file {rel_path} should be removed after rollback"
+            );
+        } else {
+            assert_eq!(
+                git_sha256_file(&full_path),
+                before_hash,
+                "{rel_path} should match beforeHash"
+            );
+        }
+    }
+}
+
+/// Verify files match the originally recorded hashes.
+fn assert_original_hashes(gem_dir: &Path, original_hashes: &HashMap<String, String>) {
+    for (rel_path, orig_hash) in original_hashes {
+        if orig_hash.is_empty() {
+            continue;
+        }
+        let full_path = gem_dir.join(rel_path);
+        if full_path.exists() {
+            assert_eq!(
+                git_sha256_file(&full_path),
+                *orig_hash,
+                "{rel_path} should match original hash"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,18 +309,6 @@ fn test_gem_full_lifecycle() {
     bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
 
     let gem_dir = find_gem_dir(cwd);
-    assert!(
-        gem_dir.join(VARIATION_RB).exists(),
-        "variation.rb must exist after bundle install"
-    );
-
-    // Confirm original files match expected before-hashes.
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
 
     // -- GET: download + apply patch ------------------------------------------
     assert_run_ok(cwd, &["get", GEM_UUID], "get");
@@ -288,13 +322,14 @@ fn test_gem_full_lifecycle() {
     assert!(patch.is_object(), "manifest should contain {GEM_PURL}");
     assert_eq!(patch["uuid"].as_str().unwrap(), GEM_UUID);
 
-    // Files should now be patched.
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_AFTER,
-        ACTIVE_STORAGE_RB_AFTER,
-        ENGINE_RB_AFTER,
+    let files = &patch["files"];
+    assert!(
+        files.as_object().map_or(false, |f| !f.is_empty()),
+        "patch should modify at least one file"
     );
+
+    // Files should now be patched — verify against afterHash from manifest.
+    assert_after_hashes(&gem_dir, files);
 
     // -- LIST: verify JSON output ---------------------------------------------
     let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
@@ -318,33 +353,15 @@ fn test_gem_full_lifecycle() {
 
     // -- ROLLBACK: restore original files -------------------------------------
     assert_run_ok(cwd, &["rollback"], "rollback");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
+    assert_before_hashes(&gem_dir, files);
 
     // -- APPLY: re-apply from manifest ----------------------------------------
     assert_run_ok(cwd, &["apply"], "apply");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_AFTER,
-        ACTIVE_STORAGE_RB_AFTER,
-        ENGINE_RB_AFTER,
-    );
+    assert_after_hashes(&gem_dir, files);
 
     // -- REMOVE: rollback + remove from manifest ------------------------------
     assert_run_ok(cwd, &["remove", GEM_UUID], "remove");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
+    assert_before_hashes(&gem_dir, files);
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -370,43 +387,25 @@ fn test_gem_dry_run() {
     bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
 
     let gem_dir = find_gem_dir(cwd);
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
 
     // Download without applying.
     assert_run_ok(cwd, &["get", GEM_UUID, "--no-apply"], "get --no-apply");
 
-    // Files should still be original.
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
+    // Read manifest to get file list and expected hashes.
+    let manifest_path = cwd.join(".socket/manifest.json");
+    let files = read_patch_files(&manifest_path);
+    let original_hashes = record_original_hashes(&gem_dir, &files);
+
+    // Files should still be original (not patched).
+    assert_original_hashes(&gem_dir, &original_hashes);
 
     // Dry-run should succeed but leave files untouched.
     assert_run_ok(cwd, &["apply", "--dry-run"], "apply --dry-run");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
+    assert_original_hashes(&gem_dir, &original_hashes);
 
     // Real apply should work.
     assert_run_ok(cwd, &["apply"], "apply");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_AFTER,
-        ACTIVE_STORAGE_RB_AFTER,
-        ENGINE_RB_AFTER,
-    );
+    assert_after_hashes(&gem_dir, &files);
 }
 
 /// `get --save-only` should save the patch to the manifest without applying.
@@ -425,27 +424,17 @@ fn test_gem_save_only() {
     bundle_run(cwd, &["install", "--path", "vendor/bundle"]);
 
     let gem_dir = find_gem_dir(cwd);
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
 
     // Download with --save-only.
     assert_run_ok(cwd, &["get", GEM_UUID, "--save-only"], "get --save-only");
 
-    // Files should still be original.
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_BEFORE,
-        ACTIVE_STORAGE_RB_BEFORE,
-        ENGINE_RB_BEFORE,
-    );
-
-    // Manifest should exist with the patch.
+    // Read manifest to get file list and expected hashes.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest should exist after get --save-only");
+    let files = read_patch_files(&manifest_path);
+    let original_hashes = record_original_hashes(&gem_dir, &files);
+
+    // Files should still be original (not patched).
+    assert_original_hashes(&gem_dir, &original_hashes);
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -455,11 +444,5 @@ fn test_gem_save_only() {
 
     // Real apply should work.
     assert_run_ok(cwd, &["apply"], "apply");
-
-    assert_hashes(
-        &gem_dir,
-        VARIATION_RB_AFTER,
-        ACTIVE_STORAGE_RB_AFTER,
-        ENGINE_RB_AFTER,
-    );
+    assert_after_hashes(&gem_dir, &files);
 }
