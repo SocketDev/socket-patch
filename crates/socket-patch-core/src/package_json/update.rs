@@ -156,7 +156,7 @@ mod tests {
         let result = update_package_json(&pkg, false).await;
         assert_eq!(result.status, UpdateStatus::Updated);
         let content = fs::read_to_string(&pkg).await.unwrap();
-        assert!(content.contains("socket patch apply"));
+        assert!(content.contains("socket-patch apply"));
     }
 
     #[tokio::test]
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(result.status, UpdateStatus::Updated);
         let content = fs::read_to_string(&pkg).await.unwrap();
         assert!(content.contains("postinstall"));
-        assert!(content.contains("socket patch apply"));
+        assert!(content.contains("socket-patch apply"));
     }
 
     #[tokio::test]
