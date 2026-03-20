@@ -23,7 +23,6 @@ once_cell = { workspace = true }
 [features]
 default = []
 cargo = []
-gem = []
 golang = []
 maven = []
 composer = []
