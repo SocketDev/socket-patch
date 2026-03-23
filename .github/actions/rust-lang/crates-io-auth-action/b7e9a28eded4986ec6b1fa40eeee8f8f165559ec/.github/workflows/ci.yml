@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  # renovate: datasource=npm depName=pnpm
+  PNPM_VERSION: 10.18.3
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: |
+          pnpm test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: |
+          pnpm lint
+
+  format:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Prettier
+        run: pnpm install --frozen-lockfile
+
+      - name: Format
+        run: pnpm prettier --check .
+
+  zizmor:
+    name: Zizmor
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@e673c3917a1aef3c65c972347ed84ccd013ecda4 # v0.2.0
+        with:
+          persona: pedantic
+          # Don't use GitHub advanced security.
+          # Instead, fail if there's a security issue.
+          advanced-security: false
+
+  package:
+    name: Package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check is packaged
+        run: |
+          # Compile to single js files.
+          pnpm package
+
+          # Assert that the git diff is empty.
+          git diff --exit-code || (echo "Git diff is not empty. Please run 'pnpm package' and commit the changes." && exit 1)
+
+  # This job tests the action directly by running it against a mock server.
+  action-test:
+    name: Action Test
+    runs-on: ubuntu-24.04
+    # This job fails in forks, because it requires `id-token: write` permission.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'rust-lang/crates-io-auth-action' }}
+
+    permissions:
+      id-token: write # Required for OpenID Connect token retrieval.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Start mock crates.io server
+        run: |
+          # Build the mock server in advance so that the binary is already built
+          # when we start checking the health endpoint.
+          manifest_path="--manifest-path=mock/Cargo.toml"
+          cargo build $manifest_path
+          # Run the mock server in the background.
+          cargo run   $manifest_path &
+
+          # Wait for server to be ready.
+          retry_count=0
+          max_retries=3
+          until curl -s http://localhost:3000/health > /dev/null 2>&1; do
+            echo "Waiting for mock server to start... (attempt $((retry_count + 1))/$max_retries)"
+            sleep 2
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -ge $max_retries ]; then
+              echo "Mock server failed to start after $max_retries attempts"
+              exit 1
+            fi
+          done
+          echo "Mock server is ready"
+
+      - name: Run trusted publishing action
+        id: trusted-publishing
+        uses: ./ # Uses the action in the root directory.
+        with:
+          url: "http://localhost:3000" # Mock server url.
+
+      - name: Assert action output
+        env:
+          TOKEN: ${{ steps.trusted-publishing.outputs.token }}
+        run: |
+          if [ "$TOKEN" != "mock-token" ]; then
+            echo "Expected token to be 'mock-token', but got '$TOKEN'"
+            exit 1
+          fi
+          echo "Token assertion passed. Token value: $TOKEN"
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+        working-directory: mock
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Clippy check
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+        working-directory: mock
+
+  conclusion:
+    name: Conclusion
+    needs:
+      - test
+      - lint
+      - format
+      - zizmor
+      - package
+      - rustfmt
+      - action-test
+      - clippy
+    # !cancelled() executes the job regardless of whether the previous jobs passed, failed or get skipped.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Conclusion
+        env:
+          # Store the JSON in an environment variable to avoid template injection.
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          # Print the dependent jobs to see them in the CI log
+          printf '%s\n' "$NEEDS_JSON" | jq -C
+          # Check if all jobs that we depend on (in the needs array) were successful.
+          printf '%s\n' "$NEEDS_JSON" | jq --exit-status 'all(.result == "success" or .result == "skipped")'

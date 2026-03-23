@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "generatedAt": "2026-03-23T23:51:37.725Z",
+  "entries": [
+    {
+      "owner": "actions",
+      "repo": "checkout",
+      "ref": "34e114876b0b11c390a56381ad16ebd13914f8d5",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5",
+      "actionType": "node"
+    },
+    {
+      "owner": "dtolnay",
+      "repo": "rust-toolchain",
+      "ref": "efa25f7f19611383d5b0ccf2d1c8914531636bf9",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/dtolnay/rust-toolchain/efa25f7f19611383d5b0ccf2d1c8914531636bf9",
+      "actionType": "composite"
+    },
+    {
+      "owner": "actions",
+      "repo": "cache",
+      "ref": "0057852bfaa89a56745cba8c7296529d2fc39830",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830",
+      "actionType": "node"
+    },
+    {
+      "owner": "actions",
+      "repo": "setup-node",
+      "ref": "49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/setup-node/49933ea5288caeca8642d1e84afbd3f7d6820020",
+      "actionType": "node"
+    },
+    {
+      "owner": "actions",
+      "repo": "setup-python",
+      "ref": "a26af69be951a213d495a4c3e4e4022e16d87065",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/setup-python/a26af69be951a213d495a4c3e4e4022e16d87065",
+      "actionType": "node"
+    },
+    {
+      "owner": "ruby",
+      "repo": "setup-ruby",
+      "ref": "319994f95fa847cf3fb3cd3dbe89f6dcde9f178f",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/ruby/setup-ruby/319994f95fa847cf3fb3cd3dbe89f6dcde9f178f",
+      "actionType": "node"
+    },
+    {
+      "owner": "actions",
+      "repo": "upload-artifact",
+      "ref": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "actionType": "node"
+    },
+    {
+      "owner": "actions",
+      "repo": "download-artifact",
+      "ref": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/actions/download-artifact/d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "actionType": "node"
+    },
+    {
+      "owner": "rust-lang",
+      "repo": "crates-io-auth-action",
+      "ref": "b7e9a28eded4986ec6b1fa40eeee8f8f165559ec",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/rust-lang/crates-io-auth-action/b7e9a28eded4986ec6b1fa40eeee8f8f165559ec",
+      "actionType": "node"
+    },
+    {
+      "owner": "pypa",
+      "repo": "gh-action-pypi-publish",
+      "ref": "ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e",
+      "path": null,
+      "resolvedSha": null,
+      "vendoredTo": ".github/actions/pypa/gh-action-pypi-publish/ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e",
+      "actionType": "composite"
+    }
+  ]
+}

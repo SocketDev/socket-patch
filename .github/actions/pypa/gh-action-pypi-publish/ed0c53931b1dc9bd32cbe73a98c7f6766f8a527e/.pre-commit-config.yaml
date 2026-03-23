@@ -1,0 +1,138 @@
+---
+ci:
+  autoupdate_schedule: quarterly
+  default_language_version: python3.11
+
+repos:
+- repo: https://github.com/asottile/add-trailing-comma.git
+  rev: v3.1.0
+  hooks:
+  - id: add-trailing-comma
+
+- repo: https://github.com/PyCQA/isort.git
+  rev: 6.0.0
+  hooks:
+  - id: isort
+    args:
+    - --honor-noqa
+
+- repo: https://github.com/Lucas-C/pre-commit-hooks.git
+  rev: v1.5.5
+  hooks:
+  - id: remove-tabs
+
+- repo: https://github.com/python-jsonschema/check-jsonschema.git
+  rev: 0.31.1
+  hooks:
+  - id: check-github-actions
+  - id: check-github-workflows
+  - id: check-jsonschema
+    name: Check GitHub Workflows set timeout-minutes
+    args:
+    - --builtin-schema
+    - github-workflows-require-timeout
+    files: ^\.github/workflows/[^/]+$
+    types:
+    - yaml
+  - id: check-readthedocs
+
+- repo: https://github.com/pre-commit/pre-commit-hooks.git
+  rev: v5.0.0
+  hooks:
+  # Side-effects:
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: mixed-line-ending
+  # Non-modifying checks:
+  - id: name-tests-test
+    files: >-
+      ^tests/[^_].*\.py$
+  - id: check-added-large-files
+  - id: check-byte-order-marker
+  - id: check-case-conflict
+  - id: check-executables-have-shebangs
+  - id: check-merge-conflict
+  - id: check-json
+  - id: check-symlinks
+  - id: check-yaml
+  - id: detect-private-key
+  # Heavy checks:
+  - id: check-ast
+  - id: debug-statements
+    language_version: python3
+
+- repo: https://github.com/codespell-project/codespell
+  rev: v2.4.1
+  hooks:
+  - id: codespell
+
+- repo: https://github.com/adrienverge/yamllint.git
+  rev: v1.35.1
+  hooks:
+  - id: yamllint
+    files: \.(yaml|yml)$
+    types:
+    - file
+    - yaml
+    args:
+    - --strict
+
+- repo: https://github.com/PyCQA/flake8.git
+  rev: 7.1.1
+  hooks:
+  - id: flake8
+    args:
+    - --ignore
+    # NOTE: WPS326: Found implicit string concatenation
+    # NOTE: WPS332: Found walrus operator
+    - >-
+      D100,
+      D101,
+      D103,
+      D107,
+      E402,
+      E501,
+      WPS102,
+      WPS110,
+      WPS111,
+      WPS305,
+      WPS318,
+      WPS326,
+      WPS332,
+      WPS347,
+      WPS360,
+      WPS421,
+      WPS422,
+      WPS432,
+      WPS433,
+      WPS437,
+      WPS440,
+      WPS441,
+      WPS453,
+    - --per-file-ignores=attestations.py:WPS202 oidc-exchange.py:WPS202
+    additional_dependencies:
+    - flake8-2020 ~= 1.8.1
+    - flake8-pytest-style ~= 2.1.0
+    - wemake-python-styleguide ~= 1.0.0
+
+- repo: https://github.com/PyCQA/pylint.git
+  rev: v3.3.4
+  hooks:
+  - id: pylint
+    args:
+    - --disable
+    - >-
+      import-error,
+      invalid-name,
+      line-too-long,
+      missing-class-docstring,
+      missing-function-docstring,
+      missing-module-docstring,
+      protected-access,
+      super-init-not-called,
+      unused-argument,
+      wrong-import-position,
+    - --output-format
+    - colorized
+
+...

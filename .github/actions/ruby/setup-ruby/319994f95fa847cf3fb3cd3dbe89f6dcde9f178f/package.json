@@ -1,0 +1,36 @@
+{
+  "name": "setup-ruby",
+  "version": "0.1.0",
+  "description": "Download a prebuilt Ruby and add it to the PATH in 5 seconds",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "package": "ncc build index.js -o dist"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruby/setup-ruby.git"
+  },
+  "keywords": [
+    "GitHub",
+    "Actions",
+    "Ruby"
+  ],
+  "author": "Benoit Daloze",
+  "bugs": {
+    "url": "https://github.com/ruby/setup-ruby/issues"
+  },
+  "homepage": "https://github.com/ruby/setup-ruby",
+  "dependencies": {
+    "@actions/cache": "^5.0.3",
+    "@actions/core": "^2.0.2",
+    "@actions/exec": "^2.0.0",
+    "@actions/io": "^2.0.0",
+    "@actions/tool-cache": "^3.0.0",
+    "linux-os-info": "^2.0.0",
+    "semver": "^7.7.3"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.3"
+  }
+}

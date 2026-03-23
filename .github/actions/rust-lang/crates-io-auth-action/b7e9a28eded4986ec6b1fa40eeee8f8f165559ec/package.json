@@ -1,0 +1,37 @@
+{
+    "name": "crates-io-auth-action",
+    "version": "1.0.1",
+    "description": "Get a temporary access token that you can use to interact with crates.io.",
+    "private": true,
+    "scripts": {
+        "package": "tsdown",
+        "format": "prettier --write .",
+        "lint": "eslint",
+        "test": "vitest"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/rust-lang/crates-io-auth-action.git"
+    },
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/rust-lang/crates-io-auth-action/issues"
+    },
+    "homepage": "https://github.com/rust-lang/crates-io-auth-action#readme",
+    "devDependencies": {
+        "@actions/core": "^1.11.1",
+        "@types/node": "^20",
+        "eslint": "^9.37.0",
+        "globals": "^16.4.0",
+        "msw": "^2.11.5",
+        "prettier": "^3.6.2",
+        "tsdown": "^0.16.0",
+        "tslib": "^2.8.1",
+        "typescript": "^5.9.3",
+        "typescript-eslint": "^8.46.1",
+        "vitest": "^4.0.0"
+    }
+}

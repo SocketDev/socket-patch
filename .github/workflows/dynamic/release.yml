@@ -1,0 +1,337 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  sync-and-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.sync.outputs.VERSION }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version and sync
+        id: sync
+        run: |
+          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          bash scripts/version-sync.sh "$VERSION"
+          git add Cargo.toml npm/ pypi/
+          git commit -m "v$VERSION: bump and sync package versions"
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+          git tag "v$VERSION"
+
+      - name: Push changes and tag
+        run: git push && git push --tags
+
+  build:
+    needs: sync-and-tag
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            archive: tar.gz
+            build-tool: cargo
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+          - target: i686-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+            build-tool: cargo
+          - target: aarch64-linux-android
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: arm-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: arm-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: i686-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+          - target: i686-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+            build-tool: cross
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.sync-and-tag.outputs.version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.build-tool == 'cross'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cargo)
+        if: matrix.build-tool == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.build-tool == 'cross'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../socket-patch-${{ matrix.target }}.tar.gz socket-patch
+          cd ../../..
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/socket-patch.exe" -DestinationPath "socket-patch-${{ matrix.target }}.zip"
+
+      - name: Upload artifact (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.tar.gz
+
+      - name: Upload artifact (zip)
+        if: matrix.archive == 'zip'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: socket-patch-${{ matrix.target }}
+          path: socket-patch-${{ matrix.target }}.zip
+
+  github-release:
+    needs: [sync-and-tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.sync-and-tag.outputs.version }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes \
+            artifacts/*
+
+  cargo-publish:
+    needs: [sync-and-tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.sync-and-tag.outputs.version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          toolchain: stable
+
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+
+      - name: Publish socket-patch-core
+        run: cargo publish -p socket-patch-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Copy README for CLI crate
+        run: cp README.md crates/socket-patch-cli/README.md
+
+      - name: Publish socket-patch-cli
+        run: cargo publish -p socket-patch-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  npm-publish:
+    needs: [sync-and-tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.sync-and-tag.outputs.version }}
+
+      - name: Configure git for HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Stage binaries into platform packages
+        run: |
+          # Unix platforms: extract binary into each platform package directory
+          stage_unix() {
+            local artifact="$1" pkg_dir="$2"
+            tar xzf "artifacts/${artifact}.tar.gz" -C "${pkg_dir}/"
+          }
+
+          # Windows platforms: extract .exe into each platform package directory
+          stage_win() {
+            local artifact="$1" pkg_dir="$2"
+            unzip -o "artifacts/${artifact}.zip" -d "${pkg_dir}/"
+          }
+
+          stage_unix socket-patch-aarch64-apple-darwin       npm/socket-patch-darwin-arm64
+          stage_unix socket-patch-x86_64-apple-darwin        npm/socket-patch-darwin-x64
+          stage_unix socket-patch-x86_64-unknown-linux-gnu      npm/socket-patch-linux-x64-gnu
+          stage_unix socket-patch-x86_64-unknown-linux-musl     npm/socket-patch-linux-x64-musl
+          stage_unix socket-patch-aarch64-unknown-linux-gnu     npm/socket-patch-linux-arm64-gnu
+          stage_unix socket-patch-aarch64-unknown-linux-musl    npm/socket-patch-linux-arm64-musl
+          stage_unix socket-patch-arm-unknown-linux-gnueabihf   npm/socket-patch-linux-arm-gnu
+          stage_unix socket-patch-arm-unknown-linux-musleabihf  npm/socket-patch-linux-arm-musl
+          stage_unix socket-patch-i686-unknown-linux-gnu        npm/socket-patch-linux-ia32-gnu
+          stage_unix socket-patch-i686-unknown-linux-musl       npm/socket-patch-linux-ia32-musl
+          stage_unix socket-patch-aarch64-linux-android      npm/socket-patch-android-arm64
+
+          stage_win socket-patch-x86_64-pc-windows-msvc      npm/socket-patch-win32-x64
+          stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
+          stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
+
+      - name: Publish platform packages
+        run: |
+          for pkg_dir in npm/socket-patch-*/; do
+            echo "Publishing ${pkg_dir}..."
+            npm publish "./${pkg_dir}" --provenance --access public
+          done
+
+      - name: Wait for npm registry propagation
+        run: sleep 30
+
+      - name: Copy README for npm package
+        run: cp README.md npm/socket-patch/README.md
+
+      - name: Publish main package
+        run: npm publish ./npm/socket-patch --provenance --access public
+
+  pypi-publish:
+    needs: [sync-and-tag, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: v${{ needs.sync-and-tag.outputs.version }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Copy README for PyPI package
+        run: cp README.md pypi/socket-patch/README.md
+
+      - name: Build platform wheels
+        run: |
+          VERSION="${{ needs.sync-and-tag.outputs.version }}"
+          python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist/

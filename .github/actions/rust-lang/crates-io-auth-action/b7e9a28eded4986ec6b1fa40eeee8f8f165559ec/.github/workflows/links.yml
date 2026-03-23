@@ -1,0 +1,44 @@
+# Check if links present in the repository are valid.
+
+name: Links
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check-links:
+    name: Check links
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+        with:
+          persist-credentials: false
+
+      - name: Link Checker
+        uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2.7.0
+        env:
+          # Set the GitHub token to avoid rate limits when checking GitHub links.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          fail: true
+          # Accept the HTTP status code 429 (Too Many Requests) to avoid failing the workflow
+          # when the rate limit is exceeded.
+          # lychee strictly validates fragments; Zulip fragments are JS-routed and lack HTML anchors,
+          # which leads to false failures. Strip Zulip fragments and check the base URL instead.
+          # See lychee issues: https://github.com/lycheeverse/lychee/issues/1791
+          args: |
+            --no-progress
+            --include-fragments
+            --accept '100..=103, 200..=299, 429'
+            --remap '(https://rust-lang\.zulipchat\.com[^#]*)#.* $1'
+            .
