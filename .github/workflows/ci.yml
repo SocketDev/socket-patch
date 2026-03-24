@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: ./.github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
         uses: ./.github/actions/dtolnay/rust-toolchain/efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -44,7 +44,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: ./.github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
         uses: ./.github/actions/dtolnay/rust-toolchain/efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: ./.github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node.js
         uses: ./.github/actions/actions/setup-node/49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -115,7 +115,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: ./.github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
         uses: ./.github/actions/dtolnay/rust-toolchain/efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable

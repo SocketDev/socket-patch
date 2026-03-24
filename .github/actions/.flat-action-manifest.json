@@ -1,16 +1,7 @@
 {
   "version": 1,
-  "generatedAt": "2026-03-23T23:51:37.725Z",
+  "generatedAt": "2026-03-24T00:01:49.935Z",
   "entries": [
-    {
-      "owner": "actions",
-      "repo": "checkout",
-      "ref": "34e114876b0b11c390a56381ad16ebd13914f8d5",
-      "path": null,
-      "resolvedSha": null,
-      "vendoredTo": ".github/actions/actions/checkout/34e114876b0b11c390a56381ad16ebd13914f8d5",
-      "actionType": "node"
-    },
     {
       "owner": "dtolnay",
       "repo": "rust-toolchain",
