@@ -16,9 +16,10 @@ jobs:
     steps:
       - name: Extract version from branch name
         id: extract
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
-          BRANCH="${{ github.event.pull_request.head.ref }}"
-          VERSION="${BRANCH#release/v}"
+          VERSION="${HEAD_REF#release/v}"
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Detected release version: $VERSION"
 
