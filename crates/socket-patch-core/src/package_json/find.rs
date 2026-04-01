@@ -25,10 +25,17 @@ pub struct PackageJsonLocation {
     pub workspace_pattern: Option<String>,
 }
 
+/// Result of finding package.json files.
+#[derive(Debug)]
+pub struct PackageJsonFindResult {
+    pub files: Vec<PackageJsonLocation>,
+    pub workspace_type: WorkspaceType,
+}
+
 /// Find all package.json files, respecting workspace configurations.
 pub async fn find_package_json_files(
     start_path: &Path,
-) -> Vec<PackageJsonLocation> {
+) -> PackageJsonFindResult {
     let mut results = Vec::new();
     let root_package_json = start_path.join("package.json");
 
@@ -63,7 +70,10 @@ pub async fn find_package_json_files(
         }
     }
 
-    results
+    PackageJsonFindResult {
+        files: results,
+        workspace_type: workspace_config.ws_type,
+    }
 }
 
 /// Detect workspace configuration from package.json.
@@ -82,6 +92,19 @@ pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         Ok(v) => v,
         Err(_) => return default,
     };
+
+    // Check for pnpm workspaces first — pnpm projects may also have
+    // "workspaces" in package.json for compatibility, but
+    // pnpm-workspace.yaml is the definitive signal.
+    let dir = package_json_path.parent().unwrap_or(Path::new("."));
+    let pnpm_workspace = dir.join("pnpm-workspace.yaml");
+    if let Ok(yaml_content) = fs::read_to_string(&pnpm_workspace).await {
+        let patterns = parse_pnpm_workspace_patterns(&yaml_content);
+        return WorkspaceConfig {
+            ws_type: WorkspaceType::Pnpm,
+            patterns,
+        };
+    }
 
     // Check for npm/yarn workspaces
     if let Some(workspaces) = pkg.get("workspaces") {
@@ -104,17 +127,6 @@ pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
 
         return WorkspaceConfig {
             ws_type: WorkspaceType::Npm,
-            patterns,
-        };
-    }
-
-    // Check for pnpm workspaces
-    let dir = package_json_path.parent().unwrap_or(Path::new("."));
-    let pnpm_workspace = dir.join("pnpm-workspace.yaml");
-    if let Ok(yaml_content) = fs::read_to_string(&pnpm_workspace).await {
-        let patterns = parse_pnpm_workspace_patterns(&yaml_content);
-        return WorkspaceConfig {
-            ws_type: WorkspaceType::Pnpm,
             patterns,
         };
     }
@@ -441,6 +453,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detect_workspaces_pnpm_with_workspaces_field() {
+        // When both pnpm-workspace.yaml AND "workspaces" in package.json
+        // exist, pnpm should take priority
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(
+            &pkg,
+            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let pnpm = dir.path().join("pnpm-workspace.yaml");
+        fs::write(&pnpm, "packages:\n  - workspaces/*")
+            .await
+            .unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
+        // Should use pnpm-workspace.yaml patterns, not package.json workspaces
+        assert_eq!(config.patterns, vec!["workspaces/*"]);
+    }
+
+    #[tokio::test]
     async fn test_detect_workspaces_none() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
@@ -470,8 +504,8 @@ mod tests {
     #[tokio::test]
     async fn test_find_no_root_package_json() {
         let dir = tempfile::tempdir().unwrap();
-        let results = find_package_json_files(dir.path()).await;
-        assert!(results.is_empty());
+        let result = find_package_json_files(dir.path()).await;
+        assert!(result.files.is_empty());
     }
 
     #[tokio::test]
@@ -480,9 +514,9 @@ mod tests {
         fs::write(dir.path().join("package.json"), r#"{"name":"root"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_root);
+        let result = find_package_json_files(dir.path()).await;
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files[0].is_root);
     }
 
     #[tokio::test]
@@ -499,11 +533,12 @@ mod tests {
         fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Npm));
         // root + workspace member
-        assert_eq!(results.len(), 2);
-        assert!(results[0].is_root);
-        assert!(results[1].is_workspace);
+        assert_eq!(result.files.len(), 2);
+        assert!(result.files[0].is_root);
+        assert!(result.files[1].is_workspace);
     }
 
     #[tokio::test]
@@ -523,10 +558,13 @@ mod tests {
         fs::write(pkg_a.join("package.json"), r#"{"name":"a"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
-        assert_eq!(results.len(), 2);
-        assert!(results[0].is_root);
-        assert!(results[1].is_workspace);
+        let result = find_package_json_files(dir.path()).await;
+        assert!(matches!(result.workspace_type, WorkspaceType::Pnpm));
+        // find_package_json_files still returns all files;
+        // filtering for pnpm is done by the caller (setup command)
+        assert_eq!(result.files.len(), 2);
+        assert!(result.files[0].is_root);
+        assert!(result.files[1].is_workspace);
     }
 
     #[tokio::test]
@@ -540,10 +578,10 @@ mod tests {
         fs::write(nm.join("package.json"), r#"{"name":"lodash"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
+        let result = find_package_json_files(dir.path()).await;
         // Only root, node_modules should be skipped
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_root);
+        assert_eq!(result.files.len(), 1);
+        assert!(result.files[0].is_root);
     }
 
     #[tokio::test]
@@ -561,9 +599,9 @@ mod tests {
         fs::write(deep.join("package.json"), r#"{"name":"deep"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
+        let result = find_package_json_files(dir.path()).await;
         // Only root (the deep one exceeds depth limit)
-        assert_eq!(results.len(), 1);
+        assert_eq!(result.files.len(), 1);
     }
 
     #[tokio::test]
@@ -580,9 +618,9 @@ mod tests {
         fs::write(nested.join("package.json"), r#"{"name":"client"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
+        let result = find_package_json_files(dir.path()).await;
         // root + recursively found workspace member
-        assert!(results.len() >= 2);
+        assert!(result.files.len() >= 2);
     }
 
     #[tokio::test]
@@ -599,7 +637,7 @@ mod tests {
         fs::write(core.join("package.json"), r#"{"name":"core"}"#)
             .await
             .unwrap();
-        let results = find_package_json_files(dir.path()).await;
-        assert_eq!(results.len(), 2);
+        let result = find_package_json_files(dir.path()).await;
+        assert_eq!(result.files.len(), 2);
     }
 }
