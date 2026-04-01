@@ -1,27 +1,32 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: 'Version bump type'
-        required: true
-        default: 'patch'
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions: {}
 
 jobs:
-  sync-and-tag:
+  check-release:
+    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.VERSION }}
+    steps:
+      - name: Extract version from branch name
+        id: extract
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${BRANCH#release/v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected release version: $VERSION"
+
+  tag:
+    needs: check-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      version: ${{ steps.sync.outputs.VERSION }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -31,32 +36,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Bump version and sync
-        id: sync
+      - name: Create and push tag
         run: |
-          CURRENT=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-          VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-          bash scripts/version-sync.sh "$VERSION"
-          git add Cargo.toml npm/ pypi/
-          git commit -m "v$VERSION: bump and sync package versions"
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Tag v$VERSION already exists."
+          VERSION="${{ needs.check-release.outputs.version }}"
+          TAG="v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists."
             exit 1
           fi
-          git tag "v$VERSION"
-
-      - name: Push changes and tag
-        run: git push && git push --tags
+          git tag "$TAG"
+          git push origin "$TAG"
 
   build:
-    needs: sync-and-tag
+    needs: [check-release, tag]
     strategy:
       matrix:
         include:
@@ -123,7 +115,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.sync-and-tag.outputs.version }}
+          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Install Rust
@@ -172,7 +164,7 @@ jobs:
           path: socket-patch-${{ matrix.target }}.zip
 
   github-release:
-    needs: [sync-and-tag, build]
+    needs: [check-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -187,14 +179,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.sync-and-tag.outputs.version }}"
+          TAG="v${{ needs.check-release.outputs.version }}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             artifacts/*
 
   cargo-publish:
-    needs: [sync-and-tag, build]
+    needs: [check-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -203,7 +195,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.sync-and-tag.outputs.version }}
+          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Install Rust
@@ -232,7 +224,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
   npm-publish:
-    needs: [sync-and-tag, build]
+    needs: [check-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -241,7 +233,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.sync-and-tag.outputs.version }}
+          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Configure git for HTTPS
@@ -308,7 +300,7 @@ jobs:
         run: npm publish ./npm/socket-patch --provenance --access public
 
   pypi-publish:
-    needs: [sync-and-tag, build]
+    needs: [check-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -317,7 +309,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.sync-and-tag.outputs.version }}
+          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Download all artifacts
@@ -336,7 +328,7 @@ jobs:
 
       - name: Build platform wheels
         run: |
-          VERSION="${{ needs.sync-and-tag.outputs.version }}"
+          VERSION="${{ needs.check-release.outputs.version }}"
           python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
 
       - name: Publish to PyPI
