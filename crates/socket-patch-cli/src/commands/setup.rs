@@ -1,5 +1,5 @@
 use clap::Args;
-use socket_patch_core::package_json::find::find_package_json_files;
+use socket_patch_core::package_json::find::{find_package_json_files, WorkspaceType};
 use socket_patch_core::package_json::update::{update_package_json, UpdateStatus};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +30,22 @@ pub async fn run(args: SetupArgs) -> i32 {
         println!("Searching for package.json files...");
     }
 
-    let package_json_files = find_package_json_files(&args.cwd).await;
+    let find_result = find_package_json_files(&args.cwd).await;
+
+    // For pnpm monorepos, only update root package.json.
+    // pnpm runs root postinstall on `pnpm install`, so workspace-level
+    // postinstall scripts are unnecessary. Individual workspaces may not
+    // have `@socketsecurity/socket-patch` as a dependency, causing
+    // `npx @socketsecurity/socket-patch apply` to fail due to pnpm's
+    // strict module isolation.
+    let package_json_files = match find_result.workspace_type {
+        WorkspaceType::Pnpm => find_result
+            .files
+            .into_iter()
+            .filter(|loc| loc.is_root)
+            .collect(),
+        _ => find_result.files,
+    };
 
     if package_json_files.is_empty() {
         if args.json {
