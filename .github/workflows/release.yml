@@ -56,6 +56,7 @@ jobs:
     needs: [version, tag]
     if: ${{ always() && needs.version.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -233,6 +234,7 @@ jobs:
     needs: [version, build]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
+    environment: npm-publish
     permissions:
       contents: read
       id-token: write
@@ -291,6 +293,8 @@ jobs:
           stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
 
       - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg_dir in npm/socket-patch-*/; do
             echo "Publishing ${pkg_dir}..."
@@ -304,6 +308,8 @@ jobs:
         run: cp README.md npm/socket-patch/README.md
 
       - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish ./npm/socket-patch --provenance --access public
 
   pypi-publish:
