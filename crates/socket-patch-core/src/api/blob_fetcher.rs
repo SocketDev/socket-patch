@@ -253,6 +253,21 @@ async fn download_hashes(
 
         match client.fetch_blob(hash).await {
             Ok(Some(data)) => {
+                // Verify content hash matches expected hash before writing
+                let actual_hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&data);
+                if actual_hash != *hash {
+                    results.push(BlobFetchResult {
+                        hash: hash.clone(),
+                        success: false,
+                        error: Some(format!(
+                            "Content hash mismatch: expected {}, got {}",
+                            hash, actual_hash
+                        )),
+                    });
+                    failed += 1;
+                    continue;
+                }
+
                 let blob_path: PathBuf = blobs_path.join(hash);
                 match tokio::fs::write(&blob_path, &data).await {
                     Ok(()) => {
