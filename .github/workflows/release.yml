@@ -1,30 +1,44 @@
 name: Release
 
 on:
-  pull_request:
-    types: [closed]
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Dry run (build only, skip publish)'
+        type: boolean
+        default: false
 
 permissions: {}
 
 jobs:
-  check-release:
-    if: github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'release/v')
+  version:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.extract.outputs.VERSION }}
+      version: ${{ steps.read.outputs.VERSION }}
     steps:
-      - name: Extract version from branch name
-        id: extract
-        env:
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Read version from Cargo.toml
+        id: read
         run: |
-          VERSION="${HEAD_REF#release/v}"
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Detected release version: $VERSION"
+          echo "Release version: $VERSION"
+
+      - name: Check tag does not exist
+        run: |
+          VERSION="${{ steps.read.outputs.VERSION }}"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists. Bump the version in a PR first."
+            exit 1
+          fi
 
   tag:
-    needs: check-release
+    needs: version
+    if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -32,24 +46,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
       - name: Create and push tag
         run: |
-          VERSION="${{ needs.check-release.outputs.version }}"
-          TAG="v${VERSION}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "::error::Tag $TAG already exists."
-            exit 1
-          fi
+          TAG="v${{ needs.version.outputs.version }}"
           git tag "$TAG"
           git push origin "$TAG"
 
   build:
-    needs: [check-release, tag]
+    needs: [version, tag]
+    if: ${{ always() && needs.version.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
     strategy:
       matrix:
         include:
@@ -116,7 +121,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Install Rust
@@ -165,7 +169,8 @@ jobs:
           path: socket-patch-${{ matrix.target }}.zip
 
   github-release:
-    needs: [check-release, build]
+    needs: [version, build]
+    if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -180,14 +185,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ needs.check-release.outputs.version }}"
+          TAG="v${{ needs.version.outputs.version }}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             artifacts/*
 
   cargo-publish:
-    needs: [check-release, build]
+    needs: [version, build]
+    if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -196,7 +202,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Install Rust
@@ -225,7 +230,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
   npm-publish:
-    needs: [check-release, build]
+    needs: [version, build]
+    if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -234,7 +240,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Configure git for HTTPS
@@ -250,6 +255,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm for trusted publishing
         run: npm install -g npm@latest
@@ -301,7 +307,8 @@ jobs:
         run: npm publish ./npm/socket-patch --provenance --access public
 
   pypi-publish:
-    needs: [check-release, build]
+    needs: [version, build]
+    if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -310,7 +317,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v${{ needs.check-release.outputs.version }}
           persist-credentials: false
 
       - name: Download all artifacts
@@ -329,7 +335,7 @@ jobs:
 
       - name: Build platform wheels
         run: |
-          VERSION="${{ needs.check-release.outputs.version }}"
+          VERSION="${{ needs.version.outputs.version }}"
           python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
 
       - name: Publish to PyPI
