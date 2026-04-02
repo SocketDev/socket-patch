@@ -120,7 +120,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
     }
 
     match apply_patches_inner(&args, &manifest_path).await {
-        Ok((success, results)) => {
+        Ok((success, results, unmatched)) => {
             let patched_count = results
                 .iter()
                 .filter(|r| r.success && !r.files_patched.is_empty())
@@ -141,6 +141,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     "patchesApplied": patched_count,
                     "alreadyPatched": already_patched_count,
                     "failed": failed_count,
+                    "unmatchedPatches": unmatched.len(),
+                    "unmatchedPurls": unmatched,
                     "dryRun": args.dry_run,
                     "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
                 })).unwrap());
@@ -237,7 +239,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
 async fn apply_patches_inner(
     args: &ApplyArgs,
     manifest_path: &Path,
-) -> Result<(bool, Vec<ApplyResult>), String> {
+) -> Result<(bool, Vec<ApplyResult>, Vec<String>), String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -260,7 +262,7 @@ async fn apply_patches_inner(
                 );
                 eprintln!("Run \"socket-patch repair\" to download missing blobs.");
             }
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         }
 
         if !args.silent && !args.json {
@@ -278,7 +280,7 @@ async fn apply_patches_inner(
             if !args.silent && !args.json {
                 eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
             }
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         }
     }
 
@@ -286,6 +288,11 @@ async fn apply_patches_inner(
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
     let partitioned =
         partition_purls(&manifest_purls, args.ecosystems.as_deref());
+
+    let target_manifest_purls: HashSet<String> = partitioned
+        .values()
+        .flat_map(|purls| purls.iter().cloned())
+        .collect();
 
     let crawler_options = CrawlerOptions {
         cwd: args.cwd.clone(),
@@ -307,14 +314,20 @@ async fn apply_patches_inner(
                 eprintln!("No package directories found");
             }
         }
-        return Ok((false, Vec::new()));
+        return Ok((false, Vec::new(), Vec::new()));
     }
 
     if all_packages.is_empty() {
         if !args.silent && !args.json {
-            println!("No packages found that match available patches");
+            eprintln!("Warning: No packages found that match available patches");
+            eprintln!(
+                "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
+                target_manifest_purls.len()
+            );
+            eprintln!("  Check that packages are installed and --cwd points to the right directory.");
         }
-        return Ok((true, Vec::new()));
+        let unmatched: Vec<String> = target_manifest_purls.iter().cloned().collect();
+        return Ok((false, Vec::new(), unmatched));
     }
 
     // Apply patches
@@ -334,6 +347,7 @@ async fn apply_patches_inner(
     }
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
+    let mut matched_manifest_purls: HashSet<String> = HashSet::new();
 
     for (purl, pkg_path) in &all_packages {
         if Ecosystem::from_purl(purl) == Some(Ecosystem::Pypi) {
@@ -378,6 +392,7 @@ async fn apply_patches_inner(
                     applied = true;
                     applied_base_purls.insert(base_purl.clone());
                     results.push(result);
+                    matched_manifest_purls.insert(variant_purl.clone());
                     break;
                 } else {
                     results.push(result);
@@ -418,7 +433,44 @@ async fn apply_patches_inner(
                 }
             }
             results.push(result);
+            matched_manifest_purls.insert(purl.clone());
         }
+    }
+
+    // Check if targeted manifest entries had no matches
+    let unmatched: Vec<String> = target_manifest_purls
+        .iter()
+        .filter(|p| !matched_manifest_purls.contains(*p))
+        .cloned()
+        .collect();
+
+    if !unmatched.is_empty() && !args.silent && !args.json {
+        eprintln!("\nWarning: {} manifest patch(es) had no matching installed package:", unmatched.len());
+        for purl in &unmatched {
+            eprintln!("  - {}", purl);
+        }
+    }
+
+    if !target_manifest_purls.is_empty() && matched_manifest_purls.is_empty() && !all_packages.is_empty() {
+        if !args.silent && !args.json {
+            eprintln!("Warning: None of the targeted manifest patches matched installed packages.");
+        }
+        has_errors = true;
+    }
+
+    // Post-apply summary
+    if !args.silent && !args.json {
+        let applied_count = results.iter().filter(|r| r.success && !r.files_patched.is_empty()).count();
+        let already_count = results.iter().filter(|r| {
+            r.files_verified.iter().all(|f| f.status == VerifyStatus::AlreadyPatched)
+        }).count();
+        println!(
+            "\nSummary: {}/{} targeted patches applied, {} already patched, {} not found on disk",
+            applied_count,
+            target_manifest_purls.len(),
+            already_count,
+            unmatched.len()
+        );
     }
 
     // Clean up unused blobs
@@ -430,5 +482,5 @@ async fn apply_patches_inner(
         }
     }
 
-    Ok((!has_errors, results))
+    Ok((!has_errors, results, unmatched))
 }
