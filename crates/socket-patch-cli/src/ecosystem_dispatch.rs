@@ -60,9 +60,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for nm_path in &nm_paths {
-                        if let Ok(packages) = npm_crawler.find_by_purls(nm_path, npm_purls).await {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match npm_crawler.find_by_purls(nm_path, npm_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", nm_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -90,11 +97,16 @@ pub async fn find_packages_for_purls(
             match python_crawler.get_site_packages_paths(options).await {
                 Ok(sp_paths) => {
                     for sp_path in &sp_paths {
-                        if let Ok(packages) =
-                            python_crawler.find_by_purls(sp_path, &base_pypi_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", sp_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -121,11 +133,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for src_path in &src_paths {
-                        if let Ok(packages) =
-                            cargo_crawler.find_by_purls(src_path, cargo_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match cargo_crawler.find_by_purls(src_path, cargo_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", src_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -151,11 +168,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for gem_path in &gem_paths {
-                        if let Ok(packages) =
-                            ruby_crawler.find_by_purls(gem_path, gem_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match ruby_crawler.find_by_purls(gem_path, gem_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", gem_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -182,11 +204,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for cache_path in &cache_paths {
-                        if let Ok(packages) =
-                            go_crawler.find_by_purls(cache_path, golang_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match go_crawler.find_by_purls(cache_path, golang_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -213,11 +240,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for repo_path in &repo_paths {
-                        if let Ok(packages) =
-                            maven_crawler.find_by_purls(repo_path, maven_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match maven_crawler.find_by_purls(repo_path, maven_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", repo_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -244,11 +276,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for vendor_path in &vendor_paths {
-                        if let Ok(packages) =
-                            composer_crawler.find_by_purls(vendor_path, composer_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match composer_crawler.find_by_purls(vendor_path, composer_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", vendor_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -275,11 +312,16 @@ pub async fn find_packages_for_purls(
                         }
                     }
                     for pkg_path in &pkg_paths {
-                        if let Ok(packages) =
-                            nuget_crawler.find_by_purls(pkg_path, nuget_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match nuget_crawler.find_by_purls(pkg_path, nuget_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", pkg_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -385,9 +427,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for nm_path in &nm_paths {
-                        if let Ok(packages) = npm_crawler.find_by_purls(nm_path, npm_purls).await {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match npm_crawler.find_by_purls(nm_path, npm_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", nm_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -414,17 +463,22 @@ pub async fn find_packages_for_rollback(
 
             if let Ok(sp_paths) = python_crawler.get_site_packages_paths(options).await {
                 for sp_path in &sp_paths {
-                    if let Ok(packages) =
-                        python_crawler.find_by_purls(sp_path, &base_pypi_purls).await
-                    {
-                        for (base_purl, pkg) in packages {
-                            for qualified_purl in pypi_purls {
-                                if strip_purl_qualifiers(qualified_purl) == base_purl
-                                    && !all_packages.contains_key(qualified_purl)
-                                {
-                                    all_packages
-                                        .insert(qualified_purl.clone(), pkg.path.clone());
+                    match python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
+                        Ok(packages) => {
+                            for (base_purl, pkg) in packages {
+                                for qualified_purl in pypi_purls {
+                                    if strip_purl_qualifiers(qualified_purl) == base_purl
+                                        && !all_packages.contains_key(qualified_purl)
+                                    {
+                                        all_packages
+                                            .insert(qualified_purl.clone(), pkg.path.clone());
+                                    }
                                 }
+                            }
+                        }
+                        Err(e) => {
+                            if !silent {
+                                eprintln!("Warning: Failed to scan {}: {}", sp_path.display(), e);
                             }
                         }
                     }
@@ -446,11 +500,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for src_path in &src_paths {
-                        if let Ok(packages) =
-                            cargo_crawler.find_by_purls(src_path, cargo_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match cargo_crawler.find_by_purls(src_path, cargo_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", src_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -476,11 +535,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for gem_path in &gem_paths {
-                        if let Ok(packages) =
-                            ruby_crawler.find_by_purls(gem_path, gem_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match ruby_crawler.find_by_purls(gem_path, gem_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", gem_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -507,11 +571,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for cache_path in &cache_paths {
-                        if let Ok(packages) =
-                            go_crawler.find_by_purls(cache_path, golang_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match go_crawler.find_by_purls(cache_path, golang_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -538,11 +607,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for repo_path in &repo_paths {
-                        if let Ok(packages) =
-                            maven_crawler.find_by_purls(repo_path, maven_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match maven_crawler.find_by_purls(repo_path, maven_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", repo_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -569,11 +643,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for vendor_path in &vendor_paths {
-                        if let Ok(packages) =
-                            composer_crawler.find_by_purls(vendor_path, composer_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match composer_crawler.find_by_purls(vendor_path, composer_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", vendor_path.display(), e);
+                                }
                             }
                         }
                     }
@@ -600,11 +679,16 @@ pub async fn find_packages_for_rollback(
                         }
                     }
                     for pkg_path in &pkg_paths {
-                        if let Ok(packages) =
-                            nuget_crawler.find_by_purls(pkg_path, nuget_purls).await
-                        {
-                            for (purl, pkg) in packages {
-                                all_packages.entry(purl).or_insert(pkg.path);
+                        match nuget_crawler.find_by_purls(pkg_path, nuget_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", pkg_path.display(), e);
+                                }
                             }
                         }
                     }
