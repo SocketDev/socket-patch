@@ -254,13 +254,33 @@ pub async fn apply_package_patch(
         result.files_verified.push(verify_result);
     }
 
-    // Check if all files are already patched (or skipped due to NotFound with force)
-    let all_patched = result
+    // Check if all files are already patched
+    let all_already_patched = result
+        .files_verified
+        .iter()
+        .all(|v| v.status == VerifyStatus::AlreadyPatched);
+
+    if all_already_patched {
+        result.success = true;
+        return result;
+    }
+
+    // Check if all files are either already patched or not found (force mode skip)
+    let all_done_or_skipped = result
         .files_verified
         .iter()
         .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
-    if all_patched {
+
+    if all_done_or_skipped {
+        // Some or all files were not found but skipped via --force
+        let not_found_count = result.files_verified.iter()
+            .filter(|v| v.status == VerifyStatus::NotFound)
+            .count();
         result.success = true;
+        result.error = Some(format!(
+            "All patch files were skipped: {} not found on disk (--force)",
+            not_found_count
+        ));
         return result;
     }
 

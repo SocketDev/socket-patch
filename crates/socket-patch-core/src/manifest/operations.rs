@@ -104,24 +104,31 @@ pub fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, Str
 }
 
 /// Read and parse a manifest from the filesystem.
-/// Returns Ok(None) if the file does not exist or cannot be parsed.
+/// Returns Ok(None) if the file does not exist.
+/// Returns Err for I/O errors, JSON parse errors, or validation errors.
 pub async fn read_manifest(path: impl AsRef<Path>) -> Result<Option<PatchManifest>, std::io::Error> {
     let path = path.as_ref();
 
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Ok(None),
+        Err(e) => return Err(e),   // FIX: propagate actual I/O error
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(_) => return Ok(None),
+        Err(e) => return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse manifest JSON: {}", e),
+        )),
     };
 
     match validate_manifest(&parsed) {
         Ok(manifest) => Ok(Some(manifest)),
-        Err(_) => Ok(None),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )),
     }
 }
 
