@@ -208,7 +208,7 @@ mod tests {
         let result = update_package_json(&pkg, false, PackageManager::Pnpm).await;
         assert_eq!(result.status, UpdateStatus::Updated);
         let content = fs::read_to_string(&pkg).await.unwrap();
-        assert!(content.contains("pnpx @socketsecurity/socket-patch apply"));
+        assert!(content.contains("pnpm dlx @socketsecurity/socket-patch apply"));
     }
 
     #[tokio::test]

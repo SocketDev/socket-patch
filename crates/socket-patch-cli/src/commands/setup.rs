@@ -54,7 +54,7 @@ pub async fn run(args: SetupArgs) -> i32 {
     if !args.json {
         println!("Found {} package.json file(s)", package_json_files.len());
         if pm == PackageManager::Pnpm {
-            println!("Detected pnpm project (using pnpx)");
+            println!("Detected pnpm project (using pnpm dlx)");
         }
     }
 

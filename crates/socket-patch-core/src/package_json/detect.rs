@@ -10,7 +10,7 @@ fn socket_patch_command(pm: PackageManager) -> &'static str {
     match pm {
         PackageManager::Npm => "npx @socketsecurity/socket-patch apply --silent --ecosystems npm",
         PackageManager::Pnpm => {
-            "pnpx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+            "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm"
         }
     }
 }
@@ -294,10 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_str_pnpx_pattern() {
-        let content = r#"{"scripts":{"postinstall":"pnpx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#;
+    fn test_configured_str_pnpm_dlx_pattern() {
+        let content = r#"{"scripts":{"postinstall":"pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#;
         let status = is_setup_configured_str(content);
-        // "pnpx @socketsecurity/socket-patch apply" contains "socket-patch apply"
+        // "pnpm dlx @socketsecurity/socket-patch apply" contains "socket-patch apply"
         assert!(status.postinstall_configured);
     }
 
@@ -315,7 +315,7 @@ mod tests {
     fn test_generate_empty_pnpm() {
         assert_eq!(
             generate_updated_script("", PackageManager::Pnpm),
-            "pnpx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+            "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm"
         );
     }
 
@@ -331,7 +331,7 @@ mod tests {
     fn test_generate_prepend_pnpm() {
         assert_eq!(
             generate_updated_script("echo done", PackageManager::Pnpm),
-            "pnpx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo done"
+            "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo done"
         );
     }
 
@@ -374,8 +374,8 @@ mod tests {
         let (modified, new_postinstall, new_dependencies) =
             update_package_json_object(&mut pkg, PackageManager::Pnpm);
         assert!(modified);
-        assert!(new_postinstall.contains("pnpx @socketsecurity/socket-patch apply"));
-        assert!(new_dependencies.contains("pnpx @socketsecurity/socket-patch apply"));
+        assert!(new_postinstall.contains("pnpm dlx @socketsecurity/socket-patch apply"));
+        assert!(new_dependencies.contains("pnpm dlx @socketsecurity/socket-patch apply"));
     }
 
     #[test]
@@ -446,16 +446,16 @@ mod tests {
         let (modified, new_content, _, new_pi, _, new_dep) =
             update_package_json_content(content, PackageManager::Pnpm).unwrap();
         assert!(modified);
-        assert!(new_pi.contains("pnpx @socketsecurity/socket-patch apply"));
-        assert!(new_dep.contains("pnpx @socketsecurity/socket-patch apply"));
+        assert!(new_pi.contains("pnpm dlx @socketsecurity/socket-patch apply"));
+        assert!(new_dep.contains("pnpm dlx @socketsecurity/socket-patch apply"));
         let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
         assert!(parsed["scripts"]["postinstall"]
             .as_str()
             .unwrap()
-            .contains("pnpx"));
+            .contains("pnpm dlx"));
         assert!(parsed["scripts"]["dependencies"]
             .as_str()
             .unwrap()
-            .contains("pnpx"));
+            .contains("pnpm dlx"));
     }
 }
