@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokio::fs;
 
-use super::detect::{is_postinstall_configured_str, update_package_json_content};
+use super::detect::{is_setup_configured_str, update_package_json_content, PackageManager};
 
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
@@ -10,6 +10,8 @@ pub struct UpdateResult {
     pub status: UpdateStatus,
     pub old_script: String,
     pub new_script: String,
+    pub old_dependencies_script: String,
+    pub new_dependencies_script: String,
     pub error: Option<String>,
 }
 
@@ -20,10 +22,11 @@ pub enum UpdateStatus {
     Error,
 }
 
-/// Update a single package.json file with socket-patch postinstall script.
+/// Update a single package.json file with socket-patch lifecycle scripts.
 pub async fn update_package_json(
     package_json_path: &Path,
     dry_run: bool,
+    pm: PackageManager,
 ) -> UpdateResult {
     let path_str = package_json_path.display().to_string();
 
@@ -35,30 +38,36 @@ pub async fn update_package_json(
                 status: UpdateStatus::Error,
                 old_script: String::new(),
                 new_script: String::new(),
+                old_dependencies_script: String::new(),
+                new_dependencies_script: String::new(),
                 error: Some(e.to_string()),
             };
         }
     };
 
-    let status = is_postinstall_configured_str(&content);
+    let status = is_setup_configured_str(&content);
     if !status.needs_update {
         return UpdateResult {
             path: path_str,
             status: UpdateStatus::AlreadyConfigured,
-            old_script: status.current_script.clone(),
-            new_script: status.current_script,
+            old_script: status.postinstall_script.clone(),
+            new_script: status.postinstall_script,
+            old_dependencies_script: status.dependencies_script.clone(),
+            new_dependencies_script: status.dependencies_script,
             error: None,
         };
     }
 
-    match update_package_json_content(&content) {
-        Ok((modified, new_content, old_script, new_script)) => {
+    match update_package_json_content(&content, pm) {
+        Ok((modified, new_content, old_pi, new_pi, old_dep, new_dep)) => {
             if !modified {
                 return UpdateResult {
                     path: path_str,
                     status: UpdateStatus::AlreadyConfigured,
-                    old_script,
-                    new_script,
+                    old_script: old_pi,
+                    new_script: new_pi,
+                    old_dependencies_script: old_dep,
+                    new_dependencies_script: new_dep,
                     error: None,
                 };
             }
@@ -68,8 +77,10 @@ pub async fn update_package_json(
                     return UpdateResult {
                         path: path_str,
                         status: UpdateStatus::Error,
-                        old_script,
-                        new_script,
+                        old_script: old_pi,
+                        new_script: new_pi,
+                        old_dependencies_script: old_dep,
+                        new_dependencies_script: new_dep,
                         error: Some(e.to_string()),
                     };
                 }
@@ -78,8 +89,10 @@ pub async fn update_package_json(
             UpdateResult {
                 path: path_str,
                 status: UpdateStatus::Updated,
-                old_script,
-                new_script,
+                old_script: old_pi,
+                new_script: new_pi,
+                old_dependencies_script: old_dep,
+                new_dependencies_script: new_dep,
                 error: None,
             }
         }
@@ -88,6 +101,8 @@ pub async fn update_package_json(
             status: UpdateStatus::Error,
             old_script: String::new(),
             new_script: String::new(),
+            old_dependencies_script: String::new(),
+            new_dependencies_script: String::new(),
             error: Some(e),
         },
     }
@@ -97,10 +112,11 @@ pub async fn update_package_json(
 pub async fn update_multiple_package_jsons(
     paths: &[&Path],
     dry_run: bool,
+    pm: PackageManager,
 ) -> Vec<UpdateResult> {
     let mut results = Vec::new();
     for path in paths {
-        let result = update_package_json(path, dry_run).await;
+        let result = update_package_json(path, dry_run, pm).await;
         results.push(result);
     }
     results
@@ -114,7 +130,7 @@ mod tests {
     async fn test_update_file_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nonexistent.json");
-        let result = update_package_json(&missing, false).await;
+        let result = update_package_json(&missing, false, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::Error);
         assert!(result.error.is_some());
     }
@@ -125,11 +141,11 @@ mod tests {
         let pkg = dir.path().join("package.json");
         fs::write(
             &pkg,
-            r#"{"name":"test","scripts":{"postinstall":"socket patch apply --silent --ecosystems npm"}}"#,
+            r#"{"name":"test","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm","dependencies":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#,
         )
         .await
         .unwrap();
-        let result = update_package_json(&pkg, false).await;
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::AlreadyConfigured);
     }
 
@@ -139,7 +155,7 @@ mod tests {
         let pkg = dir.path().join("package.json");
         let original = r#"{"name":"test","scripts":{"build":"tsc"}}"#;
         fs::write(&pkg, original).await.unwrap();
-        let result = update_package_json(&pkg, true).await;
+        let result = update_package_json(&pkg, true, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::Updated);
         // File should remain unchanged
         let content = fs::read_to_string(&pkg).await.unwrap();
@@ -153,10 +169,12 @@ mod tests {
         fs::write(&pkg, r#"{"name":"test","scripts":{"build":"tsc"}}"#)
             .await
             .unwrap();
-        let result = update_package_json(&pkg, false).await;
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::Updated);
         let content = fs::read_to_string(&pkg).await.unwrap();
-        assert!(content.contains("socket patch apply"));
+        assert!(content.contains("npx @socketsecurity/socket-patch apply"));
+        assert!(content.contains("postinstall"));
+        assert!(content.contains("dependencies"));
     }
 
     #[tokio::test]
@@ -164,7 +182,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
         fs::write(&pkg, "not json!!!").await.unwrap();
-        let result = update_package_json(&pkg, false).await;
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::Error);
         assert!(result.error.is_some());
     }
@@ -174,11 +192,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
         fs::write(&pkg, r#"{"name":"x"}"#).await.unwrap();
-        let result = update_package_json(&pkg, false).await;
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
         assert_eq!(result.status, UpdateStatus::Updated);
         let content = fs::read_to_string(&pkg).await.unwrap();
         assert!(content.contains("postinstall"));
-        assert!(content.contains("socket patch apply"));
+        assert!(content.contains("dependencies"));
+        assert!(content.contains("npx @socketsecurity/socket-patch apply"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x"}"#).await.unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Pnpm).await;
+        assert_eq!(result.status, UpdateStatus::Updated);
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        assert!(content.contains("pnpx @socketsecurity/socket-patch apply"));
+    }
+
+    #[tokio::test]
+    async fn test_update_adds_dependencies_when_postinstall_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(
+            &pkg,
+            r#"{"name":"test","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#,
+        )
+        .await
+        .unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+        assert_eq!(result.status, UpdateStatus::Updated);
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        assert!(content.contains("dependencies"));
     }
 
     #[tokio::test]
@@ -191,7 +237,7 @@ mod tests {
         let p2 = dir.path().join("b.json");
         fs::write(
             &p2,
-            r#"{"name":"b","scripts":{"postinstall":"socket patch apply --silent --ecosystems npm"}}"#,
+            r#"{"name":"b","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm","dependencies":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#,
         )
         .await
         .unwrap();
@@ -200,7 +246,7 @@ mod tests {
         // Don't create p3 — file not found
 
         let paths: Vec<&Path> = vec![p1.as_path(), p2.as_path(), p3.as_path()];
-        let results = update_multiple_package_jsons(&paths, false).await;
+        let results = update_multiple_package_jsons(&paths, false, PackageManager::Npm).await;
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].status, UpdateStatus::Updated);
         assert_eq!(results[1].status, UpdateStatus::AlreadyConfigured);
