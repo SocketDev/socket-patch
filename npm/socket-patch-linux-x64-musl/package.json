@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-linux-x64-musl",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "socket-patch binary for Linux x64 (musl)",
   "os": [
     "linux"
