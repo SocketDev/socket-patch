@@ -267,8 +267,30 @@ pub async fn download_and_apply_patches(
     let blobs_dir = socket_dir.join("blobs");
     let manifest_path = socket_dir.join("manifest.json");
 
-    tokio::fs::create_dir_all(&socket_dir).await.ok();
-    tokio::fs::create_dir_all(&blobs_dir).await.ok();
+    if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
+        let err = format!("Failed to create .socket directory: {}", e);
+        if params.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": &err,
+            })).unwrap());
+        } else {
+            eprintln!("Error: {}", &err);
+        }
+        return (1, serde_json::json!({"status": "error", "error": err}));
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+        let err = format!("Failed to create blobs directory: {}", e);
+        if params.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": &err,
+            })).unwrap());
+        } else {
+            eprintln!("Error: {}", &err);
+        }
+        return (1, serde_json::json!({"status": "error", "error": err}));
+    }
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
@@ -324,6 +346,7 @@ pub async fn download_and_apply_patches(
                 }
 
                 // Save blob contents
+                let mut patch_failed = false;
                 let mut files = HashMap::new();
                 for (file_path, file_info) in &patch.files {
                     if let (Some(ref before), Some(ref after)) =
@@ -341,9 +364,24 @@ pub async fn download_and_apply_patches(
                     if let (Some(ref blob_content), Some(ref after_hash)) =
                         (&file_info.blob_content, &file_info.after_hash)
                     {
-                        if let Ok(decoded) = base64_decode(blob_content) {
-                            let blob_path = blobs_dir.join(after_hash);
-                            tokio::fs::write(&blob_path, &decoded).await.ok();
+                        match base64_decode(blob_content) {
+                            Ok(decoded) => {
+                                let blob_path = blobs_dir.join(after_hash);
+                                if let Err(e) = tokio::fs::write(&blob_path, &decoded).await {
+                                    if !params.json && !params.silent {
+                                        eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
+                                    }
+                                    patch_failed = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !params.json && !params.silent {
+                                    eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
+                                }
+                                patch_failed = true;
+                                break;
+                            }
                         }
                     }
 
@@ -351,12 +389,36 @@ pub async fn download_and_apply_patches(
                     if let (Some(ref before_blob), Some(ref before_hash)) =
                         (&file_info.before_blob_content, &file_info.before_hash)
                     {
-                        if let Ok(decoded) = base64_decode(before_blob) {
-                            tokio::fs::write(blobs_dir.join(before_hash), &decoded)
-                                .await
-                                .ok();
+                        match base64_decode(before_blob) {
+                            Ok(decoded) => {
+                                if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
+                                    if !params.json && !params.silent {
+                                        eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
+                                    }
+                                    patch_failed = true;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                if !params.json && !params.silent {
+                                    eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
+                                }
+                                patch_failed = true;
+                                break;
+                            }
                         }
                     }
+                }
+
+                if patch_failed {
+                    patches_failed += 1;
+                    downloaded_patches.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "Blob decode or write failed",
+                    }));
+                    continue;
                 }
 
                 let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
@@ -454,6 +516,7 @@ pub async fn download_and_apply_patches(
     }
 
     // Auto-apply unless --save-only
+    let mut apply_succeeded = false;
     if !params.save_only && patches_added > 0 {
         if !params.json && !params.silent {
             eprintln!("\nApplying patches...");
@@ -472,23 +535,25 @@ pub async fn download_and_apply_patches(
             verbose: false,
         };
         let code = super::apply::run(apply_args).await;
+        apply_succeeded = code == 0;
         if code != 0 && !params.json && !params.silent {
             eprintln!("\nSome patches could not be applied.");
         }
     }
 
     let result_json = serde_json::json!({
-        "status": "success",
+        "status": if patches_failed > 0 { "partial_failure" } else { "success" },
         "found": selected.len(),
         "downloaded": patches_added,
         "skipped": patches_skipped,
         "failed": patches_failed,
-        "applied": if !params.save_only && patches_added > 0 { patches_added } else { 0 },
+        "applied": if apply_succeeded { patches_added } else { 0 },
         "updated": updates.len(),
         "patches": downloaded_patches,
     });
 
-    (0, result_json)
+    let exit_code = if patches_failed > 0 || (!apply_succeeded && patches_added > 0 && !params.save_only) { 1 } else { 0 };
+    (exit_code, result_json)
 }
 
 pub async fn run(args: GetArgs) -> i32 {
@@ -962,7 +1027,17 @@ async fn save_and_apply_patch(
     let blobs_dir = socket_dir.join("blobs");
     let manifest_path = socket_dir.join("manifest.json");
 
-    tokio::fs::create_dir_all(&blobs_dir).await.ok();
+    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "error": format!("Failed to create blobs directory: {}", e),
+            })).unwrap());
+        } else {
+            eprintln!("Error: Failed to create blobs directory: {}", e);
+        }
+        return 1;
+    }
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
@@ -970,6 +1045,7 @@ async fn save_and_apply_patch(
     };
 
     // Build and save patch record
+    let mut blob_failed = false;
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
         if let Some(ref after) = file_info.after_hash {
@@ -987,22 +1063,69 @@ async fn save_and_apply_patch(
         if let (Some(ref blob_content), Some(ref after_hash)) =
             (&file_info.blob_content, &file_info.after_hash)
         {
-            if let Ok(decoded) = base64_decode(blob_content) {
-                tokio::fs::write(blobs_dir.join(after_hash), &decoded)
-                    .await
-                    .ok();
+            match base64_decode(blob_content) {
+                Ok(decoded) => {
+                    if let Err(e) = tokio::fs::write(blobs_dir.join(after_hash), &decoded).await {
+                        if !args.json {
+                            eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
+                        }
+                        blob_failed = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
+                    }
+                    blob_failed = true;
+                    break;
+                }
             }
         }
         // Also store beforeHash blob if present (needed for rollback)
         if let (Some(ref before_blob), Some(ref before_hash)) =
             (&file_info.before_blob_content, &file_info.before_hash)
         {
-            if let Ok(decoded) = base64_decode(before_blob) {
-                tokio::fs::write(blobs_dir.join(before_hash), &decoded)
-                    .await
-                    .ok();
+            match base64_decode(before_blob) {
+                Ok(decoded) => {
+                    if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
+                        if !args.json {
+                            eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
+                        }
+                        blob_failed = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if !args.json {
+                        eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
+                    }
+                    blob_failed = true;
+                    break;
+                }
             }
         }
+    }
+
+    if blob_failed {
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "error",
+                "found": 1,
+                "downloaded": 0,
+                "applied": 0,
+                "error": "Blob decode or write failed",
+                "patches": [{
+                    "purl": patch.purl,
+                    "uuid": patch.uuid,
+                    "action": "failed",
+                    "error": "Blob decode or write failed",
+                }],
+            })).unwrap());
+        } else {
+            eprintln!("Error: Blob decode or write failed for patch {}", patch.purl);
+        }
+        return 1;
     }
 
     let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
@@ -1060,7 +1183,8 @@ async fn save_and_apply_patch(
         }
     }
 
-    if !args.save_only {
+    let mut apply_succeeded = false;
+    if !args.save_only && added {
         if !args.json {
             println!("\nApplying patches...");
         }
@@ -1078,6 +1202,7 @@ async fn save_and_apply_patch(
             verbose: false,
         };
         let code = super::apply::run(apply_args).await;
+        apply_succeeded = code == 0;
         if code != 0 && !args.json {
             eprintln!("\nSome patches could not be applied.");
         }
@@ -1088,7 +1213,7 @@ async fn save_and_apply_patch(
             "status": "success",
             "found": 1,
             "downloaded": if added { 1 } else { 0 },
-            "applied": if !args.save_only && added { 1 } else { 0 },
+            "applied": if apply_succeeded { 1 } else { 0 },
             "patches": [{
                 "purl": patch.purl,
                 "uuid": patch.uuid,
@@ -1097,7 +1222,7 @@ async fn save_and_apply_patch(
         })).unwrap());
     }
 
-    0
+    if !apply_succeeded && added && !args.save_only { 1 } else { 0 }
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
