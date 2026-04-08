@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "CLI tool and schema library for applying security patches to dependencies",
   "bin": {
     "socket-patch": "bin/socket-patch"
@@ -42,19 +42,19 @@
     "@types/node": "^20.0.0"
   },
   "optionalDependencies": {
-    "@socketsecurity/socket-patch-android-arm64": "2.1.1",
-    "@socketsecurity/socket-patch-darwin-arm64": "2.1.1",
-    "@socketsecurity/socket-patch-darwin-x64": "2.1.1",
-    "@socketsecurity/socket-patch-linux-arm-gnu": "2.1.1",
-    "@socketsecurity/socket-patch-linux-arm-musl": "2.1.1",
-    "@socketsecurity/socket-patch-linux-arm64-gnu": "2.1.1",
-    "@socketsecurity/socket-patch-linux-arm64-musl": "2.1.1",
-    "@socketsecurity/socket-patch-linux-ia32-gnu": "2.1.1",
-    "@socketsecurity/socket-patch-linux-ia32-musl": "2.1.1",
-    "@socketsecurity/socket-patch-linux-x64-gnu": "2.1.1",
-    "@socketsecurity/socket-patch-linux-x64-musl": "2.1.1",
-    "@socketsecurity/socket-patch-win32-arm64": "2.1.1",
-    "@socketsecurity/socket-patch-win32-ia32": "2.1.1",
-    "@socketsecurity/socket-patch-win32-x64": "2.1.1"
+    "@socketsecurity/socket-patch-android-arm64": "2.1.2",
+    "@socketsecurity/socket-patch-darwin-arm64": "2.1.2",
+    "@socketsecurity/socket-patch-darwin-x64": "2.1.2",
+    "@socketsecurity/socket-patch-linux-arm-gnu": "2.1.2",
+    "@socketsecurity/socket-patch-linux-arm-musl": "2.1.2",
+    "@socketsecurity/socket-patch-linux-arm64-gnu": "2.1.2",
+    "@socketsecurity/socket-patch-linux-arm64-musl": "2.1.2",
+    "@socketsecurity/socket-patch-linux-ia32-gnu": "2.1.2",
+    "@socketsecurity/socket-patch-linux-ia32-musl": "2.1.2",
+    "@socketsecurity/socket-patch-linux-x64-gnu": "2.1.2",
+    "@socketsecurity/socket-patch-linux-x64-musl": "2.1.2",
+    "@socketsecurity/socket-patch-win32-arm64": "2.1.2",
+    "@socketsecurity/socket-patch-win32-ia32": "2.1.2",
+    "@socketsecurity/socket-patch-win32-x64": "2.1.2"
   }
 }
