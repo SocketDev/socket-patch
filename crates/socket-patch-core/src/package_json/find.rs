@@ -1,6 +1,19 @@
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+use super::detect::PackageManager;
+
+/// Detect the package manager based on lockfiles in the project root.
+/// Checks for pnpm-lock.yaml, pnpm-lock.yml, and pnpm-workspace.yaml.
+pub async fn detect_package_manager(start_path: &Path) -> PackageManager {
+    for name in &["pnpm-lock.yaml", "pnpm-lock.yml", "pnpm-workspace.yaml"] {
+        if fs::metadata(start_path.join(name)).await.is_ok() {
+            return PackageManager::Pnpm;
+        }
+    }
+    PackageManager::Npm
+}
+
 /// Workspace configuration type.
 #[derive(Debug, Clone)]
 pub enum WorkspaceType {
@@ -639,5 +652,37 @@ mod tests {
             .unwrap();
         let result = find_package_json_files(dir.path()).await;
         assert_eq!(result.files.len(), 2);
+    }
+
+    // ── detect_package_manager ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_detect_npm_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let pm = detect_package_manager(dir.path()).await;
+        assert_eq!(pm, PackageManager::Npm);
+    }
+
+    #[tokio::test]
+    async fn test_detect_pnpm_lock_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 9.0\n")
+            .await
+            .unwrap();
+        let pm = detect_package_manager(dir.path()).await;
+        assert_eq!(pm, PackageManager::Pnpm);
+    }
+
+    #[tokio::test]
+    async fn test_detect_pnpm_workspace_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*",
+        )
+        .await
+        .unwrap();
+        let pm = detect_package_manager(dir.path()).await;
+        assert_eq!(pm, PackageManager::Pnpm);
     }
 }
