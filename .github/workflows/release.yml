@@ -294,7 +294,13 @@ jobs:
         run: |
           for pkg_dir in npm/socket-patch-*/; do
             echo "Publishing ${pkg_dir}..."
-            npm publish "./${pkg_dir}" --provenance --access public
+            npm publish "./${pkg_dir}" --provenance --access public || {
+              if npm view "@socketsecurity/$(basename "$pkg_dir")@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
+                echo "Already published, skipping."
+              else
+                exit 1
+              fi
+            }
           done
 
       - name: Wait for npm registry propagation
@@ -304,7 +310,14 @@ jobs:
         run: cp README.md npm/socket-patch/README.md
 
       - name: Publish main package
-        run: npm publish ./npm/socket-patch --provenance --access public
+        run: |
+          npm publish ./npm/socket-patch --provenance --access public || {
+            if npm view "@socketsecurity/socket-patch@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
+              echo "Already published, skipping."
+            else
+              exit 1
+            fi
+          }
 
   pypi-publish:
     needs: [version, build]
