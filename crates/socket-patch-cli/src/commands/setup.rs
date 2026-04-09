@@ -1,5 +1,8 @@
 use clap::Args;
-use socket_patch_core::package_json::find::{find_package_json_files, WorkspaceType};
+use socket_patch_core::package_json::detect::PackageManager;
+use socket_patch_core::package_json::find::{
+    detect_package_manager, find_package_json_files, WorkspaceType,
+};
 use socket_patch_core::package_json::update::{update_package_json, UpdateStatus};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -62,14 +65,20 @@ pub async fn run(args: SetupArgs) -> i32 {
         return 0;
     }
 
+    // Detect package manager from lockfiles in the project root.
+    let pm = detect_package_manager(&args.cwd).await;
+
     if !args.json {
         println!("Found {} package.json file(s)", package_json_files.len());
+        if pm == PackageManager::Pnpm {
+            println!("Detected pnpm project (using pnpm dlx)");
+        }
     }
 
     // Preview changes (always preview first)
     let mut preview_results = Vec::new();
     for loc in &package_json_files {
-        let result = update_package_json(&loc.path, true).await;
+        let result = update_package_json(&loc.path, true, pm).await;
         preview_results.push(result);
     }
 
@@ -96,11 +105,20 @@ pub async fn run(args: SetupArgs) -> i32 {
                 let rel_path = pathdiff(&result.path, &args.cwd);
                 println!("  + {rel_path}");
                 if result.old_script.is_empty() {
-                    println!("    Current:  (no postinstall script)");
+                    println!("    postinstall:   (no script)");
                 } else {
-                    println!("    Current:  \"{}\"", result.old_script);
+                    println!("    postinstall:   \"{}\"", result.old_script);
                 }
-                println!("    New:      \"{}\"", result.new_script);
+                println!("    -> postinstall: \"{}\"", result.new_script);
+                if result.old_dependencies_script.is_empty() {
+                    println!("    dependencies:  (no script)");
+                } else {
+                    println!("    dependencies:  \"{}\"", result.old_dependencies_script);
+                }
+                println!(
+                    "    -> dependencies: \"{}\"",
+                    result.new_dependencies_script
+                );
             }
             println!();
         }
@@ -177,7 +195,7 @@ pub async fn run(args: SetupArgs) -> i32 {
         }
         let mut results = Vec::new();
         for loc in &package_json_files {
-            let result = update_package_json(&loc.path, false).await;
+            let result = update_package_json(&loc.path, false, pm).await;
             results.push(result);
         }
 
@@ -191,6 +209,10 @@ pub async fn run(args: SetupArgs) -> i32 {
                 "updated": updated,
                 "alreadyConfigured": already,
                 "errors": errs,
+                "packageManager": match pm {
+                    PackageManager::Npm => "npm",
+                    PackageManager::Pnpm => "pnpm",
+                },
                 "files": results.iter().map(|r| {
                     serde_json::json!({
                         "path": r.path,
@@ -225,6 +247,10 @@ pub async fn run(args: SetupArgs) -> i32 {
                 "alreadyConfigured": already,
                 "errors": errs,
                 "dryRun": true,
+                "packageManager": match pm {
+                    PackageManager::Npm => "npm",
+                    PackageManager::Pnpm => "pnpm",
+                },
                 "files": preview_results.iter().map(|r| {
                     serde_json::json!({
                         "path": r.path,
@@ -235,6 +261,8 @@ pub async fn run(args: SetupArgs) -> i32 {
                         },
                         "oldScript": r.old_script,
                         "newScript": r.new_script,
+                        "oldDependenciesScript": r.old_dependencies_script,
+                        "newDependenciesScript": r.new_dependencies_script,
                         "error": r.error,
                     })
                 }).collect::<Vec<_>>(),
