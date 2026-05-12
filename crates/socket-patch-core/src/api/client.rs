@@ -460,22 +460,69 @@ impl ApiClient {
                 hash
             )));
         }
+        self.fetch_binary("blob", "blob", hash).await
+    }
 
+    /// Fetch a per-file diff archive (tar.gz of bsdiff deltas) by patch UUID.
+    ///
+    /// Returns the raw archive bytes, or `Ok(None)` if not found (404). The
+    /// public proxy serves these under `/patch/diff/<uuid>`; the
+    /// authenticated API serves them under `/v0/orgs/<slug>/patches/diff/<uuid>`.
+    pub async fn fetch_diff(&self, uuid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+        if !is_valid_uuid(uuid) {
+            return Err(ApiError::InvalidHash(format!(
+                "Invalid patch UUID: {}",
+                uuid
+            )));
+        }
+        self.fetch_binary("diff", "diff", uuid).await
+    }
+
+    /// Fetch a per-package patch archive (tar.gz of patched files) by patch UUID.
+    ///
+    /// Returns the raw archive bytes, or `Ok(None)` if not found (404).
+    pub async fn fetch_package(&self, uuid: &str) -> Result<Option<Vec<u8>>, ApiError> {
+        if !is_valid_uuid(uuid) {
+            return Err(ApiError::InvalidHash(format!(
+                "Invalid patch UUID: {}",
+                uuid
+            )));
+        }
+        self.fetch_binary("package", "package", uuid).await
+    }
+
+    /// Shared implementation for `fetch_blob` / `fetch_diff` / `fetch_package`.
+    ///
+    /// `kind` is the URL segment (`blob` / `diff` / `package`). `label` is the
+    /// human-readable noun used in log + error messages. `identifier` is the
+    /// hash or UUID interpolated into the URL.
+    async fn fetch_binary(
+        &self,
+        kind: &str,
+        label: &str,
+        identifier: &str,
+    ) -> Result<Option<Vec<u8>>, ApiError> {
         let (url, use_auth) =
             if self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy {
-                // Authenticated endpoint
                 let slug = self.org_slug.as_deref().unwrap();
-                let u = format!("{}/v0/orgs/{}/patches/blob/{}", self.api_url, slug, hash);
+                let u = format!(
+                    "{}/v0/orgs/{}/patches/{}/{}",
+                    self.api_url, slug, kind, identifier
+                );
                 (u, true)
             } else {
-                // Public proxy
                 let proxy_url = std::env::var("SOCKET_PATCH_PROXY_URL")
                     .unwrap_or_else(|_| DEFAULT_PATCH_API_PROXY_URL.to_string());
-                let u = format!("{}/patch/blob/{}", proxy_url.trim_end_matches('/'), hash);
+                let u = format!(
+                    "{}/patch/{}/{}",
+                    proxy_url.trim_end_matches('/'),
+                    kind,
+                    identifier
+                );
                 (u, false)
             };
 
-        debug_log(&format!("GET blob {}", url));
+        debug_log(&format!("GET {} {}", label, url));
 
         // Build the request. When fetching from the public proxy (different
         // base URL than self.api_url), we use a plain client without auth
@@ -506,7 +553,10 @@ impl ApiClient {
         };
 
         let resp = resp.map_err(|e| {
-            ApiError::Network(format!("Network error fetching blob {}: {}", hash, e))
+            ApiError::Network(format!(
+                "Network error fetching {} {}: {}",
+                label, identifier, e
+            ))
         })?;
 
         let status = resp.status();
@@ -514,7 +564,10 @@ impl ApiClient {
         match status {
             StatusCode::OK => {
                 let bytes = resp.bytes().await.map_err(|e| {
-                    ApiError::Network(format!("Error reading blob body for {}: {}", hash, e))
+                    ApiError::Network(format!(
+                        "Error reading {} body for {}: {}",
+                        label, identifier, e
+                    ))
                 })?;
                 Ok(Some(bytes.to_vec()))
             }
@@ -522,8 +575,9 @@ impl ApiClient {
             _ => {
                 let text = resp.text().await.unwrap_or_default();
                 Err(ApiError::Other(format!(
-                    "Failed to fetch blob {}: status {} - {}",
-                    hash,
+                    "Failed to fetch {} {}: status {} - {}",
+                    label,
+                    identifier,
                     status.as_u16(),
                     text,
                 )))
@@ -641,6 +695,19 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> String {
 /// Validate that a string is a 64-character hex string (SHA-256).
 fn is_valid_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Validate the standard 8-4-4-4-12 UUID hex grouping.
+fn is_valid_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    let lengths = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(lengths.iter())
+        .all(|(part, &want)| part.len() == want && part.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Convert a `PatchSearchResult` into a `BatchPatchInfo`, extracting
@@ -1009,5 +1076,52 @@ mod tests {
         let mixed = "aAbBcCdDeEfF0123456789aAbBcCdDeEfF0123456789aAbBcCdDeEfF01234567";
         assert_eq!(mixed.len(), 64);
         assert!(is_valid_sha256_hex(mixed));
+    }
+
+    // ── UUID validation tests ───────────────────────────────────────
+
+    #[test]
+    fn test_is_valid_uuid_accepts_standard_form() {
+        assert!(is_valid_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c"));
+        assert!(is_valid_uuid("00000000-0000-0000-0000-000000000000"));
+        // Uppercase hex is acceptable.
+        assert!(is_valid_uuid("ABCDEF01-2345-6789-ABCD-EF0123456789"));
+    }
+
+    #[test]
+    fn test_is_valid_uuid_rejects_malformed() {
+        assert!(!is_valid_uuid(""));
+        assert!(!is_valid_uuid("not-a-uuid"));
+        // Wrong segment count.
+        assert!(!is_valid_uuid("80630680-4da6-45f9-bba8"));
+        // Wrong length on first segment.
+        assert!(!is_valid_uuid("8063068-4da6-45f9-bba8-b888e0ffd58c"));
+        // Non-hex character.
+        assert!(!is_valid_uuid("80630680-4da6-45f9-bba8-b888e0ffd58z"));
+        // No dashes.
+        assert!(!is_valid_uuid("80630680xxxxx"));
+    }
+
+    // ── fetch_diff / fetch_package validation tests ─────────────────
+    //
+    // These tests cover input validation only — they intentionally do
+    // NOT hit the network. The shared `fetch_binary` helper handles the
+    // transport, and `fetch_blob` already has integration coverage via
+    // the e2e_npm test.
+
+    #[tokio::test]
+    async fn test_fetch_diff_rejects_invalid_uuid() {
+        std::env::remove_var("SOCKET_API_TOKEN");
+        let (client, _) = get_api_client_from_env(None).await;
+        let result = client.fetch_diff("not-a-uuid").await;
+        assert!(matches!(result, Err(ApiError::InvalidHash(_))));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_package_rejects_invalid_uuid() {
+        std::env::remove_var("SOCKET_API_TOKEN");
+        let (client, _) = get_api_client_from_env(None).await;
+        let result = client.fetch_package("xxx").await;
+        assert!(matches!(result, Err(ApiError::InvalidHash(_))));
     }
 }

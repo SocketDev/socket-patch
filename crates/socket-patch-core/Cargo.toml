@@ -19,6 +19,9 @@ walkdir = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 once_cell = { workspace = true }
+qbsdiff = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [features]
 default = []

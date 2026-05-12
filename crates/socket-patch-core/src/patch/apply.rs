@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
+use crate::patch::diff::apply_diff;
 use crate::patch::file_hash::compute_file_git_sha256;
+use crate::patch::package::read_archive_filtered;
 
 /// Status of a file patch verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,54 @@ pub struct VerifyResult {
     pub target_hash: Option<String>,
 }
 
+/// Which patch source actually wrote the patched bytes for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedVia {
+    /// Bytes came from a per-package archive in `.socket/packages/`.
+    Package,
+    /// Bytes were produced by applying a bsdiff delta from
+    /// `.socket/diffs/<uuid>.tar.gz`.
+    Diff,
+    /// Bytes came from a per-file blob in `.socket/blobs/`.
+    Blob,
+}
+
+impl AppliedVia {
+    /// Short lowercase tag, suitable for JSON and human output.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            AppliedVia::Package => "package",
+            AppliedVia::Diff => "diff",
+            AppliedVia::Blob => "blob",
+        }
+    }
+}
+
+/// Patch sources the apply pipeline may use to obtain patched bytes.
+///
+/// `blobs_path` is always required and serves as the universal fallback.
+/// `packages_path` and `diffs_path` are optional opt-ins to the new
+/// pathways introduced in socket-patch 2.2.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchSources<'a> {
+    pub blobs_path: &'a Path,
+    pub packages_path: Option<&'a Path>,
+    pub diffs_path: Option<&'a Path>,
+}
+
+impl<'a> PatchSources<'a> {
+    /// Construct a `PatchSources` that only knows about the legacy
+    /// per-file blob directory. Convenient for tests and existing call
+    /// sites that have not been upgraded.
+    pub fn blobs_only(blobs_path: &'a Path) -> Self {
+        Self {
+            blobs_path,
+            packages_path: None,
+            diffs_path: None,
+        }
+    }
+}
+
 /// Result of applying patches to a single package.
 #[derive(Debug, Clone)]
 pub struct ApplyResult {
@@ -36,6 +87,9 @@ pub struct ApplyResult {
     pub success: bool,
     pub files_verified: Vec<VerifyResult>,
     pub files_patched: Vec<String>,
+    /// Per-file record of which source produced the patched bytes. Only
+    /// populated for files in `files_patched`.
+    pub applied_via: HashMap<String, AppliedVia>,
     pub error: Option<String>,
 }
 
@@ -198,13 +252,20 @@ pub async fn apply_file_patch(
 ///
 /// For each file in `files`, this function:
 /// 1. Verifies the file is ready to be patched (or already patched).
-/// 2. If not dry_run, reads the blob from `blobs_path` and writes it.
+/// 2. If not dry_run, tries patch sources in order: package archive → diff
+///    archive → per-file blob. Each strategy is opt-in via `sources`.
 /// 3. Returns a summary of what happened.
+///
+/// `uuid` is the patch UUID. Pass `Some` to enable package- and
+/// diff-archive lookup (the corresponding `sources.packages_path` /
+/// `sources.diffs_path` must also be set). Pass `None` to restrict the
+/// pipeline to per-file blobs only — equivalent to pre-2.2 behavior.
 pub async fn apply_package_patch(
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
-    blobs_path: &Path,
+    sources: &PatchSources<'_>,
+    uuid: Option<&str>,
     dry_run: bool,
     force: bool,
 ) -> ApplyResult {
@@ -214,6 +275,7 @@ pub async fn apply_package_patch(
         success: false,
         files_verified: Vec::new(),
         files_patched: Vec::new(),
+        applied_via: HashMap::new(),
         error: None,
     };
 
@@ -290,7 +352,19 @@ pub async fn apply_package_patch(
         return result;
     }
 
-    // Apply patches to files that need it
+    // Eagerly load the package and diff archives (if any) into memory so
+    // we don't reparse the tar.gz once per file. Both are small archives.
+    let package_entries = match (uuid, sources.packages_path) {
+        (Some(uuid), Some(dir)) => load_archive_if_present(dir, uuid, files).await,
+        _ => None,
+    };
+    let diff_entries = match (uuid, sources.diffs_path) {
+        (Some(uuid), Some(dir)) => load_archive_if_present(dir, uuid, files).await,
+        _ => None,
+    };
+
+    // Apply patches to files that need it. For each file, try package
+    // archive first, then diff, then blob.
     for (file_name, file_info) in files {
         let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
         if let Some(vr) = verify_result {
@@ -301,8 +375,53 @@ pub async fn apply_package_patch(
             }
         }
 
-        // Read patched content from blobs
-        let blob_path = blobs_path.join(&file_info.after_hash);
+        let normalized = normalize_file_path(file_name).to_string();
+
+        // ── Strategy 1: package archive ──────────────────────────────
+        if try_apply_from_archive(
+            package_entries.as_ref(),
+            &normalized,
+            pkg_path,
+            file_name,
+            file_info,
+        )
+        .await
+        {
+            result.files_patched.push(file_name.clone());
+            result
+                .applied_via
+                .insert(file_name.clone(), AppliedVia::Package);
+            continue;
+        }
+
+        // ── Strategy 2: per-file diff ────────────────────────────────
+        // Diffs only apply cleanly when the on-disk content actually
+        // hashes to `before_hash` — otherwise the bsdiff output won't
+        // match `after_hash`. We pass the pre-apply current_hash
+        // captured by `verify_file_patch` so `try_apply_from_diff` can
+        // skip the wasted decompress+apply work when --force is
+        // overriding a hash mismatch (force flips status to Ready but
+        // the underlying hash is still wrong).
+        let current_hash_for_diff = verify_result.and_then(|v| v.current_hash.as_deref());
+        if try_apply_from_diff(
+            diff_entries.as_ref(),
+            &normalized,
+            pkg_path,
+            file_name,
+            file_info,
+            current_hash_for_diff,
+        )
+        .await
+        {
+            result.files_patched.push(file_name.clone());
+            result
+                .applied_via
+                .insert(file_name.clone(), AppliedVia::Diff);
+            continue;
+        }
+
+        // ── Strategy 3: per-file blob (legacy fallback) ──────────────
+        let blob_path = sources.blobs_path.join(&file_info.after_hash);
         let patched_content = match tokio::fs::read(&blob_path).await {
             Ok(content) => content,
             Err(e) => {
@@ -314,17 +433,128 @@ pub async fn apply_package_patch(
             }
         };
 
-        // Apply the patch
-        if let Err(e) = apply_file_patch(pkg_path, file_name, &patched_content, &file_info.after_hash).await {
+        if let Err(e) =
+            apply_file_patch(pkg_path, file_name, &patched_content, &file_info.after_hash).await
+        {
             result.error = Some(e.to_string());
             return result;
         }
 
         result.files_patched.push(file_name.clone());
+        result
+            .applied_via
+            .insert(file_name.clone(), AppliedVia::Blob);
     }
 
     result.success = true;
     result
+}
+
+/// Try to write the patched bytes from `package_entries[normalized_path]`
+/// to disk, verifying the post-write hash. Returns `true` on success.
+async fn try_apply_from_archive(
+    package_entries: Option<&HashMap<String, Vec<u8>>>,
+    normalized_path: &str,
+    pkg_path: &Path,
+    file_name: &str,
+    file_info: &PatchFileInfo,
+) -> bool {
+    let entries = match package_entries {
+        Some(e) => e,
+        None => return false,
+    };
+    let bytes = match entries.get(normalized_path) {
+        Some(b) => b,
+        None => return false,
+    };
+    if compute_git_sha256_from_bytes(bytes) != file_info.after_hash {
+        return false;
+    }
+    apply_file_patch(pkg_path, file_name, bytes, &file_info.after_hash)
+        .await
+        .is_ok()
+}
+
+/// Try to apply the bsdiff delta from `diff_entries[normalized_path]` to
+/// the on-disk file at `pkg_path/normalized_path`. Bails out (returning
+/// `false`) for any of:
+///   * no diff entry,
+///   * `current_hash` is missing or doesn't match `file_info.before_hash`
+///     (this is the strong gate — even `--force` promoting a
+///     HashMismatch to Ready will still bail here, because the on-disk
+///     hash captured by `verify_file_patch` was the real, mismatched
+///     value),
+///   * `file_info.before_hash` is empty (new files),
+///   * read/diff/verify/write failure.
+async fn try_apply_from_diff(
+    diff_entries: Option<&HashMap<String, Vec<u8>>>,
+    normalized_path: &str,
+    pkg_path: &Path,
+    file_name: &str,
+    file_info: &PatchFileInfo,
+    current_hash: Option<&str>,
+) -> bool {
+    let entries = match diff_entries {
+        Some(e) => e,
+        None => return false,
+    };
+    let delta = match entries.get(normalized_path) {
+        Some(d) => d,
+        None => return false,
+    };
+    if file_info.before_hash.is_empty() {
+        // New files have no before content to diff against.
+        return false;
+    }
+    // Strong invariant: only run the diff when on-disk bytes hash to
+    // exactly the `before_hash` the delta was authored against. This
+    // closes the force-mode loophole — `--force` flips VerifyStatus to
+    // Ready, but `current_hash` retains the original on-disk hash, so
+    // the comparison below still rejects.
+    match current_hash {
+        Some(h) if h == file_info.before_hash => {}
+        _ => return false,
+    }
+
+    let on_disk_path = pkg_path.join(normalized_path);
+    let before_bytes = match tokio::fs::read(&on_disk_path).await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let patched = match apply_diff(&before_bytes, delta) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if compute_git_sha256_from_bytes(&patched) != file_info.after_hash {
+        return false;
+    }
+    apply_file_patch(pkg_path, file_name, &patched, &file_info.after_hash)
+        .await
+        .is_ok()
+}
+
+/// Open `<dir>/<uuid>.tar.gz` (if it exists) and return its entries
+/// filtered to the patched files in `files`. Errors and missing files
+/// both yield `None` so the caller silently falls through to the next
+/// strategy.
+async fn load_archive_if_present(
+    dir: &Path,
+    uuid: &str,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Option<HashMap<String, Vec<u8>>> {
+    let archive_path = dir.join(format!("{uuid}.tar.gz"));
+    if tokio::fs::metadata(&archive_path).await.is_err() {
+        return None;
+    }
+    // `read_archive_filtered` is synchronous (tar + flate2 are sync). Run
+    // it on the blocking pool so we don't stall the executor for large
+    // archives.
+    let archive_path_owned = archive_path.clone();
+    let files_owned = files.clone();
+    tokio::task::spawn_blocking(move || read_archive_filtered(&archive_path_owned, &files_owned))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
 }
 
 #[cfg(test)]
@@ -505,7 +735,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
                 .await;
 
         assert!(result.success);
@@ -535,7 +765,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), true, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, true, false)
                 .await;
 
         assert!(result.success);
@@ -568,7 +798,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
                 .await;
 
         assert!(result.success);
@@ -594,7 +824,7 @@ mod tests {
         );
 
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
                 .await;
 
         assert!(!result.success);
@@ -630,7 +860,7 @@ mod tests {
 
         // Without force: should fail
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
                 .await;
         assert!(!result.success);
 
@@ -641,7 +871,7 @@ mod tests {
 
         // With force: should succeed
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, true)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, true)
                 .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 1);
@@ -666,15 +896,357 @@ mod tests {
 
         // Without force: should fail (NotFound for non-new file)
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, false)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
                 .await;
         assert!(!result.success);
 
         // With force: should succeed by skipping the missing file
         let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, blobs_dir.path(), false, true)
+            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, true)
                 .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
+    }
+
+    // ── Fallback-chain tests ─────────────────────────────────────────
+    //
+    // Tests below exercise the new strategies introduced in 2.2:
+    // package archive (.socket/packages/<uuid>.tar.gz) and per-file diff
+    // archive (.socket/diffs/<uuid>.tar.gz), plus the priority order
+    // package → diff → blob.
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression as GzCompression;
+    use qbsdiff::Bsdiff;
+
+    const TEST_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// Write a tar.gz archive at `<dir>/<uuid>.tar.gz` containing the
+    /// given (entry name → bytes) pairs.
+    fn write_uuid_archive(dir: &Path, uuid: &str, entries: &[(&str, &[u8])]) {
+        let archive_path = dir.join(format!("{uuid}.tar.gz"));
+        let file = std::fs::File::create(&archive_path).unwrap();
+        let gz = GzEncoder::new(file, GzCompression::default());
+        let mut builder = tar::Builder::new(gz);
+        for (name, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    fn make_delta(before: &[u8], after: &[u8]) -> Vec<u8> {
+        let mut delta = Vec::new();
+        Bsdiff::new(before, after)
+            .compare(std::io::Cursor::new(&mut delta))
+            .unwrap();
+        delta
+    }
+
+    /// Returns a fully-populated three-source fixture: original file on
+    /// disk, all of (package, diff, blob) available with valid patched
+    /// content. Caller can then delete sources to test fallback.
+    async fn make_fixture() -> (
+        tempfile::TempDir, // root holding pkg/, blobs/, packages/, diffs/
+        std::path::PathBuf, // pkg dir
+        std::path::PathBuf, // blobs dir
+        std::path::PathBuf, // packages dir
+        std::path::PathBuf, // diffs dir
+        HashMap<String, PatchFileInfo>,
+        Vec<u8>, // original bytes
+        Vec<u8>, // patched bytes
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        let packages_dir = root.path().join("packages");
+        let diffs_dir = root.path().join("diffs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        tokio::fs::create_dir_all(&packages_dir).await.unwrap();
+        tokio::fs::create_dir_all(&diffs_dir).await.unwrap();
+
+        let original: Vec<u8> = b"the original content of the file".to_vec();
+        let patched: Vec<u8> = b"the PATCHED content of the file!".to_vec();
+        let before_hash = compute_git_sha256_from_bytes(&original);
+        let after_hash = compute_git_sha256_from_bytes(&patched);
+
+        // On-disk file at pkg/index.js
+        tokio::fs::write(pkg_dir.join("index.js"), &original)
+            .await
+            .unwrap();
+
+        // Per-file blob at blobs/<after_hash>
+        tokio::fs::write(blobs_dir.join(&after_hash), &patched)
+            .await
+            .unwrap();
+
+        // Package archive containing the patched bytes
+        write_uuid_archive(&packages_dir, TEST_UUID, &[("index.js", &patched)]);
+
+        // Diff archive containing bsdiff(original -> patched)
+        let delta = make_delta(&original, &patched);
+        write_uuid_archive(&diffs_dir, TEST_UUID, &[("index.js", &delta)]);
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash,
+            },
+        );
+
+        (root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, original, patched)
+    }
+
+    #[tokio::test]
+    async fn test_apply_via_package_when_archive_present() {
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(result.files_patched, vec!["index.js".to_string()]);
+        assert_eq!(
+            result.applied_via.get("index.js"),
+            Some(&AppliedVia::Package)
+        );
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_falls_back_to_diff_when_no_package() {
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+        // Delete the package archive.
+        tokio::fs::remove_file(packages_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Diff));
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_falls_back_to_blob_when_no_archives() {
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+        // Delete both archives.
+        tokio::fs::remove_file(packages_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+        tokio::fs::remove_file(diffs_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success);
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_uuid_none_disables_alt_sources() {
+        // Even if archives exist, passing `uuid = None` must restrict the
+        // pipeline to the blob path — preserving pre-2.2 behavior.
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, _patched) =
+            make_fixture().await;
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success);
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
+    }
+
+    #[tokio::test]
+    async fn test_apply_via_diff_falls_through_when_before_hash_mismatch() {
+        // Corrupt the on-disk file so its hash no longer matches
+        // before_hash. Diff strategy must NOT run (its output would never
+        // match after_hash), so we fall through to the blob.
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+        tokio::fs::remove_file(packages_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+        // Overwrite on-disk content with garbage; use --force so verify
+        // promotes the HashMismatch to Ready and the pipeline still tries
+        // to apply.
+        tokio::fs::write(pkg_dir.join("index.js"), b"garbage")
+            .await
+            .unwrap();
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            true, // --force
+        )
+        .await;
+
+        assert!(result.success);
+        // Diff would produce wrong output → strategy skipped → blob writes.
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Blob));
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_via_package_skips_when_hash_mismatches() {
+        // Package archive contains the WRONG bytes (would not hash to
+        // after_hash). The package strategy must refuse the entry and
+        // fall back to diff or blob.
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, _orig, patched) =
+            make_fixture().await;
+        // Replace the package archive with one whose entry is corrupt.
+        tokio::fs::remove_file(packages_dir.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .unwrap();
+        write_uuid_archive(
+            &packages_dir,
+            TEST_UUID,
+            &[("index.js", b"corrupt package payload")],
+        );
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success);
+        // Package refused → diff succeeded next.
+        assert_eq!(result.applied_via.get("index.js"), Some(&AppliedVia::Diff));
+        let written = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(written, patched);
+    }
+
+    #[tokio::test]
+    async fn test_apply_dry_run_does_not_touch_alternative_sources() {
+        // Even with package/diff archives present, dry-run must not modify
+        // files on disk.
+        let (_root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, original, _patched) =
+            make_fixture().await;
+
+        let sources = PatchSources {
+            blobs_path: &blobs_dir,
+            packages_path: Some(&packages_dir),
+            diffs_path: Some(&diffs_dir),
+        };
+        let result = apply_package_patch(
+            "pkg:npm/x@1.0.0",
+            &pkg_dir,
+            &files,
+            &sources,
+            Some(TEST_UUID),
+            true, // dry-run
+            false,
+        )
+        .await;
+
+        assert!(result.success);
+        assert!(result.files_patched.is_empty());
+        let on_disk = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
+        assert_eq!(on_disk, original);
+    }
+
+    #[test]
+    fn test_applied_via_as_tag() {
+        assert_eq!(AppliedVia::Package.as_tag(), "package");
+        assert_eq!(AppliedVia::Diff.as_tag(), "diff");
+        assert_eq!(AppliedVia::Blob.as_tag(), "blob");
+    }
+
+    #[test]
+    fn test_patch_sources_blobs_only_disables_other_strategies() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = PatchSources::blobs_only(dir.path());
+        assert!(sources.packages_path.is_none());
+        assert!(sources.diffs_path.is_none());
     }
 }
