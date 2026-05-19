@@ -527,3 +527,71 @@ pub async fn rollback_patches(
     };
     rollback_patches_inner(&args, manifest_path).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+    use std::collections::HashMap;
+
+    fn make_record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "test patch".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    fn make_manifest() -> PatchManifest {
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        patches.insert("pkg:npm/bar@2.0".to_string(), make_record("uuid-bar"));
+        patches.insert("pkg:pypi/baz@3.0".to_string(), make_record("uuid-baz"));
+        PatchManifest { patches }
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_none_returns_all() {
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_purl_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_purl_no_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_uuid_match() {
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, Some("uuid-bar"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].patch.uuid, "uuid-bar");
+        assert_eq!(result[0].purl, "pkg:npm/bar@2.0");
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_uuid_no_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
+        assert!(result.is_empty());
+    }
+}
