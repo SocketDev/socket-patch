@@ -1268,3 +1268,187 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::api::types::VulnerabilityResponse;
+    use std::collections::HashMap;
+
+    // --- detect_identifier_type -------------------------------------------
+
+    #[test]
+    fn detect_uuid_lowercase() {
+        assert_eq!(
+            detect_identifier_type("80630680-4da6-45f9-bba8-b888e0ffd58c"),
+            Some(IdentifierType::Uuid)
+        );
+    }
+
+    #[test]
+    fn detect_uuid_uppercase() {
+        // Case-insensitive UUID regex per contract.
+        assert_eq!(
+            detect_identifier_type("80630680-4DA6-45F9-BBA8-B888E0FFD58C"),
+            Some(IdentifierType::Uuid)
+        );
+    }
+
+    #[test]
+    fn detect_cve_uppercase() {
+        assert_eq!(
+            detect_identifier_type("CVE-2021-44906"),
+            Some(IdentifierType::Cve)
+        );
+    }
+
+    #[test]
+    fn detect_cve_lowercase() {
+        // Load-bearing: CVE detection must be case-insensitive.
+        assert_eq!(
+            detect_identifier_type("cve-2021-44906"),
+            Some(IdentifierType::Cve)
+        );
+    }
+
+    #[test]
+    fn detect_ghsa_uppercase() {
+        assert_eq!(
+            detect_identifier_type("GHSA-abcd-1234-wxyz"),
+            Some(IdentifierType::Ghsa)
+        );
+    }
+
+    #[test]
+    fn detect_ghsa_lowercase() {
+        // Load-bearing: GHSA detection must be case-insensitive.
+        assert_eq!(
+            detect_identifier_type("ghsa-abcd-1234-wxyz"),
+            Some(IdentifierType::Ghsa)
+        );
+    }
+
+    #[test]
+    fn detect_purl() {
+        assert_eq!(
+            detect_identifier_type("pkg:npm/foo@1.0"),
+            Some(IdentifierType::Purl)
+        );
+    }
+
+    #[test]
+    fn detect_package_name_returns_none() {
+        // Bare package names don't match any pattern; caller treats this as
+        // Package via the `else` branch in run().
+        assert_eq!(detect_identifier_type("minimist"), None);
+    }
+
+    #[test]
+    fn detect_malformed_cve_returns_none() {
+        assert_eq!(detect_identifier_type("CVE-not-a-year"), None);
+    }
+
+    #[test]
+    fn detect_empty_string_returns_none() {
+        assert_eq!(detect_identifier_type(""), None);
+    }
+
+    // --- select_patches ---------------------------------------------------
+
+    fn mk_patch(
+        uuid: &str,
+        purl: &str,
+        tier: &str,
+        published_at: &str,
+    ) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: uuid.into(),
+            purl: purl.into(),
+            published_at: published_at.into(),
+            description: format!("desc-{uuid}"),
+            license: "MIT".into(),
+            tier: tier.into(),
+            vulnerabilities: HashMap::<String, VulnerabilityResponse>::new(),
+        }
+    }
+
+    #[test]
+    fn select_free_user_one_free_patch_returns_it() {
+        let patches = vec![mk_patch("u1", "pkg:npm/foo@1.0", "free", "2024-01-01")];
+        let out = select_patches(&patches, false, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "u1");
+    }
+
+    #[test]
+    fn select_paid_user_prefers_paid_over_free_same_purl() {
+        let patches = vec![
+            mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+            mk_patch("paid1", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        // Paid wins even if free is more recent.
+        assert_eq!(out[0].uuid, "paid1");
+        assert_eq!(out[0].tier, "paid");
+    }
+
+    #[test]
+    fn select_paid_user_picks_most_recent_paid() {
+        let patches = vec![
+            mk_patch("old", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
+            mk_patch("new", "pkg:npm/foo@1.0", "paid", "2024-06-01"),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "new");
+    }
+
+    #[test]
+    fn select_paid_user_falls_back_to_most_recent_free_when_no_paid() {
+        let patches = vec![
+            mk_patch("old", "pkg:npm/foo@1.0", "free", "2024-01-01"),
+            mk_patch("new", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+        ];
+        let out = select_patches(&patches, true, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "new");
+    }
+
+    #[test]
+    fn select_free_user_multi_free_json_mode_errors() {
+        // JSON mode requires explicit selection; multiple free patches in JSON
+        // mode means the caller must pass --id.
+        let patches = vec![
+            mk_patch("a", "pkg:npm/foo@1.0", "free", "2024-01-01"),
+            mk_patch("b", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+        ];
+        let err = select_patches(&patches, false, true).expect_err("should fail");
+        assert_eq!(err, 1);
+    }
+
+    #[test]
+    fn select_empty_input_returns_empty() {
+        let out = select_patches(&[], false, false).expect("ok");
+        assert!(out.is_empty());
+        let out = select_patches(&[], true, false).expect("ok");
+        assert!(out.is_empty());
+        let out = select_patches(&[], false, true).expect("ok");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn select_free_user_paid_filtered_out_then_single_free_auto_selects() {
+        // Free user: paid patch is filtered out before grouping; only the free
+        // patch survives, and since the group has exactly one entry it
+        // auto-selects without hitting the interactive path.
+        let patches = vec![
+            mk_patch("paid", "pkg:npm/foo@1.0", "paid", "2024-06-01"),
+            mk_patch("free", "pkg:npm/foo@1.0", "free", "2024-01-01"),
+        ];
+        let out = select_patches(&patches, false, false).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "free");
+        assert_eq!(out[0].tier, "free");
+    }
+}
