@@ -1,12 +1,15 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_blobs, format_fetch_result, get_missing_blobs,
+    fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
+    get_missing_blobs, DownloadMode,
 };
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::patch::apply::{apply_package_patch, verify_file_patch, ApplyResult, VerifyStatus};
+use socket_patch_core::patch::apply::{
+    apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
+};
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
@@ -60,6 +63,14 @@ pub struct ApplyArgs {
     /// Show detailed per-file verification information
     #[arg(short = 'v', long, default_value_t = false)]
     pub verbose: bool,
+
+    /// Which kind of patch artifact to download when local files are
+    /// missing. `diff` (default) fetches the smallest delta archive;
+    /// `package` fetches a full per-package tarball; `file` falls back to
+    /// the legacy per-file blob behavior. The apply pipeline always tries
+    /// already-downloaded sources in the order package → diff → blob.
+    #[arg(long = "download-mode", default_value = "diff")]
+    pub download_mode: String,
 }
 
 fn verify_status_str(status: &VerifyStatus) -> &'static str {
@@ -72,12 +83,18 @@ fn verify_status_str(status: &VerifyStatus) -> &'static str {
 }
 
 fn result_to_json(result: &ApplyResult) -> serde_json::Value {
+    let applied_via: HashMap<&String, &str> = result
+        .applied_via
+        .iter()
+        .map(|(k, v)| (k, v.as_tag()))
+        .collect();
     serde_json::json!({
         "purl": result.package_key,
         "path": result.package_path,
         "success": result.success,
         "error": result.error,
         "filesPatched": result.files_patched,
+        "appliedVia": applied_via,
         "filesVerified": result.files_verified.iter().map(|f| {
             serde_json::json!({
                 "file": f.file,
@@ -167,7 +184,23 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     println!("\nPatched packages:");
                     for result in &patched {
                         if !result.files_patched.is_empty() {
-                            println!("  {}", result.package_key);
+                            // Summarize the per-file strategy used by this
+                            // package: if everything came from the same
+                            // source, show just that tag; otherwise list
+                            // distinct sources.
+                            let mut tags: Vec<&'static str> = result
+                                .applied_via
+                                .values()
+                                .map(|v| v.as_tag())
+                                .collect();
+                            tags.sort_unstable();
+                            tags.dedup();
+                            let suffix = if tags.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (via {})", tags.join("+"))
+                            };
+                            println!("  {}{}", result.package_key, suffix);
                         } else if result.files_verified.iter().all(|f| {
                             f.status == VerifyStatus::AlreadyPatched
                         }) {
@@ -247,36 +280,129 @@ async fn apply_patches_inner(
 
     let socket_dir = manifest_path.parent().unwrap();
     let blobs_path = socket_dir.join("blobs");
+    let diffs_path = socket_dir.join("diffs");
+    let packages_path = socket_dir.join("packages");
     tokio::fs::create_dir_all(&blobs_path)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Check for and download missing blobs
+    let download_mode = DownloadMode::parse(&args.download_mode).map_err(|e| e.to_string())?;
+
+    // Compute per-patch source availability so both the offline guard
+    // (next block) and the `download_needed` decision below share the
+    // same notion of what's already on disk.
     let missing_blobs = get_missing_blobs(&manifest, &blobs_path).await;
-    if !missing_blobs.is_empty() {
-        if args.offline {
+    let missing_diff_archives = get_missing_archives(&manifest, &diffs_path).await;
+    let missing_package_archives = get_missing_archives(&manifest, &packages_path).await;
+
+    // A patch is "locally applicable" iff at least one of:
+    //   - every `after_hash` blob it references is on disk, OR
+    //   - its diff archive is on disk, OR
+    //   - its package archive is on disk.
+    // The apply pipeline will pick whichever is present per file.
+    let patches_without_source: Vec<&str> = manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let all_blobs_present = record
+                .files
+                .values()
+                .all(|f| !missing_blobs.contains(&f.after_hash));
+            let diff_present = !missing_diff_archives.contains(&record.uuid);
+            let pkg_present = !missing_package_archives.contains(&record.uuid);
+            if all_blobs_present || diff_present || pkg_present {
+                None
+            } else {
+                Some(purl.as_str())
+            }
+        })
+        .collect();
+
+    if args.offline {
+        // Offline: bail only if some patch has no usable local source.
+        // Note: with `--force`, the apply pipeline can short-circuit
+        // verification on its own; we still surface the no-source
+        // diagnosis so the user runs `repair` before retrying.
+        if !patches_without_source.is_empty() {
             if !args.silent && !args.json {
                 eprintln!(
-                    "Error: {} blob(s) are missing and --offline mode is enabled.",
-                    missing_blobs.len()
+                    "Error: {} patch(es) have no local source and --offline is set:",
+                    patches_without_source.len()
                 );
-                eprintln!("Run \"socket-patch repair\" to download missing blobs.");
+                for purl in patches_without_source.iter().take(5) {
+                    eprintln!("  - {}", purl);
+                }
+                if patches_without_source.len() > 5 {
+                    eprintln!("  ... and {} more", patches_without_source.len() - 5);
+                }
+                eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
             }
             return Ok((false, Vec::new(), Vec::new()));
         }
+    }
 
+    // Decide what (if anything) needs downloading.
+    //
+    // The apply pipeline tries sources in the order package → diff →
+    // blob locally. We honor `--download-mode` for the primary fetch
+    // when there's actually a gap to close. Skip the archive fetch
+    // entirely when all file blobs are already present locally —
+    // apply will succeed via the blob path, and the archive endpoints
+    // would just 404 (current server doesn't serve them yet).
+    let download_needed = !args.offline
+        && match download_mode {
+            DownloadMode::File => !missing_blobs.is_empty(),
+            DownloadMode::Diff | DownloadMode::Package if missing_blobs.is_empty() => false,
+            DownloadMode::Diff => !missing_diff_archives.is_empty(),
+            DownloadMode::Package => !missing_package_archives.is_empty(),
+        };
+
+    if download_needed {
         if !args.silent && !args.json {
-            println!("Downloading {} missing blob(s)...", missing_blobs.len());
+            println!(
+                "Downloading missing patch artifacts (mode: {})...",
+                download_mode.as_tag()
+            );
         }
 
         let (client, _) = get_api_client_from_env(None).await;
-        let fetch_result = fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
+        let sources = PatchSources {
+            blobs_path: &blobs_path,
+            packages_path: Some(&packages_path),
+            diffs_path: Some(&diffs_path),
+        };
+        let fetch_result =
+            fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
 
         if !args.silent && !args.json {
             println!("{}", format_fetch_result(&fetch_result));
         }
 
-        if fetch_result.failed > 0 {
+        // For non-file modes, automatically fetch any still-missing file
+        // blobs as a fallback. Patches that lack the requested mode on
+        // the server will still apply via the legacy blob path.
+        if download_mode != DownloadMode::File {
+            let still_missing_blobs = get_missing_blobs(&manifest, &blobs_path).await;
+            if !still_missing_blobs.is_empty() {
+                if !args.silent && !args.json {
+                    println!(
+                        "Falling back to per-file blob downloads for {} blob(s)...",
+                        still_missing_blobs.len()
+                    );
+                }
+                let blob_result =
+                    fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
+                if !args.silent && !args.json {
+                    println!("{}", format_fetch_result(&blob_result));
+                }
+                if blob_result.failed > 0 && fetch_result.failed > 0 {
+                    if !args.silent && !args.json {
+                        eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
+                    }
+                    return Ok((false, Vec::new(), Vec::new()));
+                }
+            }
+        } else if fetch_result.failed > 0 {
             if !args.silent && !args.json {
                 eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
             }
@@ -378,11 +504,17 @@ async fn apply_patches_inner(
                     }
                 }
 
+                let sources = PatchSources {
+                    blobs_path: &blobs_path,
+                    packages_path: Some(&packages_path),
+                    diffs_path: Some(&diffs_path),
+                };
                 let result = apply_package_patch(
                     variant_purl,
                     pkg_path,
                     &patch.files,
-                    &blobs_path,
+                    &sources,
+                    Some(&patch.uuid),
                     args.dry_run,
                     args.force,
                 )
@@ -412,11 +544,17 @@ async fn apply_patches_inner(
                 None => continue,
             };
 
+            let sources = PatchSources {
+                blobs_path: &blobs_path,
+                packages_path: Some(&packages_path),
+                diffs_path: Some(&diffs_path),
+            };
             let result = apply_package_patch(
                 purl,
                 pkg_path,
                 &patch.files,
-                &blobs_path,
+                &sources,
+                Some(&patch.uuid),
                 args.dry_run,
                 args.force,
             )

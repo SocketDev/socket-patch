@@ -4,6 +4,46 @@ use std::path::{Path, PathBuf};
 use crate::api::client::ApiClient;
 use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
+use crate::patch::apply::PatchSources;
+
+/// Selects which kind of patch artifact `fetch_missing_sources` downloads.
+///
+/// * `File` — per-file blobs (legacy, largest, always applicable).
+/// * `Diff` — per-patch tar.gz of bsdiff deltas (smallest, only useful
+///   when the original file is on disk).
+/// * `Package` — per-patch tar.gz of patched files (mid-size, applicable
+///   even when the original file is missing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadMode {
+    Diff,
+    Package,
+    File,
+}
+
+impl DownloadMode {
+    /// Short lowercase tag, suitable for JSON output and `--download-mode`
+    /// flag values.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            DownloadMode::Diff => "diff",
+            DownloadMode::Package => "package",
+            DownloadMode::File => "file",
+        }
+    }
+
+    /// Parse `--download-mode` flag values.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "diff" => Ok(DownloadMode::Diff),
+            "package" => Ok(DownloadMode::Package),
+            "file" | "blob" => Ok(DownloadMode::File),
+            other => Err(format!(
+                "unknown download mode '{}'. Expected diff, package, or file.",
+                other
+            )),
+        }
+    }
+}
 
 /// Result of fetching a single blob.
 #[derive(Debug, Clone)]
@@ -192,6 +232,187 @@ pub async fn fetch_blobs_by_hash(
             combined.extend(download_result.results);
             combined
         },
+    }
+}
+
+/// Return the set of patch UUIDs whose archive at
+/// `<archives_dir>/<uuid>.tar.gz` is missing from disk. Used as the
+/// "what do I need to download" query for diff and package modes.
+pub async fn get_missing_archives(
+    manifest: &PatchManifest,
+    archives_dir: &Path,
+) -> HashSet<String> {
+    let mut missing = HashSet::new();
+    for record in manifest.patches.values() {
+        let archive_path = archives_dir.join(format!("{}.tar.gz", record.uuid));
+        if tokio::fs::metadata(&archive_path).await.is_err() {
+            missing.insert(record.uuid.clone());
+        }
+    }
+    missing
+}
+
+/// Download all missing archives for the chosen [`DownloadMode`].
+///
+/// * [`DownloadMode::File`] delegates to [`fetch_missing_blobs`].
+/// * [`DownloadMode::Diff`] downloads each missing `<uuid>.tar.gz` into
+///   `sources.diffs_path` via [`ApiClient::fetch_diff`].
+/// * [`DownloadMode::Package`] does the same with `sources.packages_path`
+///   and [`ApiClient::fetch_package`].
+///
+/// Returns a [`FetchMissingBlobsResult`] in which each `BlobFetchResult`'s
+/// `hash` field carries the patch UUID (not a blob hash) for diff and
+/// package modes. A `sources.packages_path` / `sources.diffs_path` of
+/// `None` while requesting that mode yields an immediate empty result —
+/// the caller is expected to fall back to a different mode in that case.
+pub async fn fetch_missing_sources(
+    manifest: &PatchManifest,
+    sources: &PatchSources<'_>,
+    mode: DownloadMode,
+    client: &ApiClient,
+    on_progress: Option<&OnProgress>,
+) -> FetchMissingBlobsResult {
+    match mode {
+        DownloadMode::File => {
+            fetch_missing_blobs(manifest, sources.blobs_path, client, on_progress).await
+        }
+        DownloadMode::Diff => match sources.diffs_path {
+            Some(dir) => {
+                fetch_missing_archives_inner(manifest, dir, ArchiveKind::Diff, client, on_progress)
+                    .await
+            }
+            None => empty_result(),
+        },
+        DownloadMode::Package => match sources.packages_path {
+            Some(dir) => fetch_missing_archives_inner(
+                manifest,
+                dir,
+                ArchiveKind::Package,
+                client,
+                on_progress,
+            )
+            .await,
+            None => empty_result(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArchiveKind {
+    Diff,
+    Package,
+}
+
+fn empty_result() -> FetchMissingBlobsResult {
+    FetchMissingBlobsResult {
+        total: 0,
+        downloaded: 0,
+        failed: 0,
+        skipped: 0,
+        results: Vec::new(),
+    }
+}
+
+async fn fetch_missing_archives_inner(
+    manifest: &PatchManifest,
+    archives_dir: &Path,
+    kind: ArchiveKind,
+    client: &ApiClient,
+    on_progress: Option<&OnProgress>,
+) -> FetchMissingBlobsResult {
+    let missing = get_missing_archives(manifest, archives_dir).await;
+    if missing.is_empty() {
+        return empty_result();
+    }
+
+    if let Err(e) = tokio::fs::create_dir_all(archives_dir).await {
+        let results: Vec<BlobFetchResult> = missing
+            .iter()
+            .map(|u| BlobFetchResult {
+                hash: u.clone(),
+                success: false,
+                error: Some(format!("Cannot create archives directory: {}", e)),
+            })
+            .collect();
+        let failed = results.len();
+        return FetchMissingBlobsResult {
+            total: failed,
+            downloaded: 0,
+            failed,
+            skipped: 0,
+            results,
+        };
+    }
+
+    let uuids: Vec<String> = missing.into_iter().collect();
+    let total = uuids.len();
+    let mut downloaded = 0usize;
+    let mut failed = 0usize;
+    let mut results = Vec::with_capacity(total);
+
+    for (i, uuid) in uuids.iter().enumerate() {
+        if let Some(ref cb) = on_progress {
+            cb(uuid, i + 1, total);
+        }
+
+        let fetch_result = match kind {
+            ArchiveKind::Diff => client.fetch_diff(uuid).await,
+            ArchiveKind::Package => client.fetch_package(uuid).await,
+        };
+
+        match fetch_result {
+            Ok(Some(data)) => {
+                let archive_path: PathBuf = archives_dir.join(format!("{}.tar.gz", uuid));
+                match tokio::fs::write(&archive_path, &data).await {
+                    Ok(()) => {
+                        results.push(BlobFetchResult {
+                            hash: uuid.clone(),
+                            success: true,
+                            error: None,
+                        });
+                        downloaded += 1;
+                    }
+                    Err(e) => {
+                        results.push(BlobFetchResult {
+                            hash: uuid.clone(),
+                            success: false,
+                            error: Some(format!("Failed to write archive to disk: {}", e)),
+                        });
+                        failed += 1;
+                    }
+                }
+            }
+            Ok(None) => {
+                results.push(BlobFetchResult {
+                    hash: uuid.clone(),
+                    success: false,
+                    error: Some(format!(
+                        "{} archive not found on server",
+                        match kind {
+                            ArchiveKind::Diff => "Diff",
+                            ArchiveKind::Package => "Package",
+                        }
+                    )),
+                });
+                failed += 1;
+            }
+            Err(e) => {
+                results.push(BlobFetchResult {
+                    hash: uuid.clone(),
+                    success: false,
+                    error: Some(e.to_string()),
+                });
+                failed += 1;
+            }
+        }
+    }
+
+    FetchMissingBlobsResult {
+        total,
+        downloaded,
+        failed,
+        skipped: 0,
+        results,
     }
 }
 
@@ -519,6 +740,108 @@ mod tests {
         };
         let output = format_fetch_result(&result);
         assert!(output.contains("unknown error"));
+    }
+
+    // ── DownloadMode + archive helpers ──────────────────────────────
+
+    #[test]
+    fn test_download_mode_parse() {
+        assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
+        assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
+        assert_eq!(
+            DownloadMode::parse("package").unwrap(),
+            DownloadMode::Package
+        );
+        assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
+        // `blob` aliases to `file` so users can think in pre-2.2 terms.
+        assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
+        assert!(DownloadMode::parse("nope").is_err());
+    }
+
+    #[test]
+    fn test_download_mode_tag() {
+        assert_eq!(DownloadMode::Diff.as_tag(), "diff");
+        assert_eq!(DownloadMode::Package.as_tag(), "package");
+        assert_eq!(DownloadMode::File.as_tag(), "file");
+    }
+
+    fn make_manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
+        let mut patches = HashMap::new();
+        for (i, uuid) in uuids.iter().enumerate() {
+            let key = format!("pkg:npm/test-{}@1.0.0", i);
+            patches.insert(
+                key,
+                PatchRecord {
+                    uuid: (*uuid).to_string(),
+                    exported_at: "2024-01-01T00:00:00Z".to_string(),
+                    files: HashMap::new(),
+                    vulnerabilities: HashMap::new(),
+                    description: "test".to_string(),
+                    license: "MIT".to_string(),
+                    tier: "free".to_string(),
+                },
+            );
+        }
+        PatchManifest { patches }
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_archives_all_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let u1 = "11111111-1111-4111-8111-111111111111";
+        let u2 = "22222222-2222-4222-8222-222222222222";
+        let manifest = make_manifest_with_uuids(&[u1, u2]);
+
+        let missing = get_missing_archives(&manifest, &archives).await;
+        assert_eq!(missing.len(), 2);
+        assert!(missing.contains(u1));
+        assert!(missing.contains(u2));
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_archives_some_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let u1 = "11111111-1111-4111-8111-111111111111";
+        let u2 = "22222222-2222-4222-8222-222222222222";
+
+        tokio::fs::write(archives.join(format!("{u1}.tar.gz")), b"data")
+            .await
+            .unwrap();
+
+        let manifest = make_manifest_with_uuids(&[u1, u2]);
+        let missing = get_missing_archives(&manifest, &archives).await;
+        assert_eq!(missing.len(), 1);
+        assert!(missing.contains(u2));
+        assert!(!missing.contains(u1));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_missing_sources_unsupported_mode_returns_empty() {
+        // Asking for Diff mode without a diffs_path yields an empty result
+        // rather than panicking. Same for Package mode.
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let manifest = make_manifest_with_uuids(&["11111111-1111-4111-8111-111111111111"]);
+        let (client, _) = crate::api::client::get_api_client_from_env(None).await;
+
+        let res = fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None)
+            .await;
+        assert_eq!(res.total, 0);
+        assert_eq!(res.downloaded, 0);
+        assert_eq!(res.failed, 0);
+
+        let res = fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None)
+            .await;
+        assert_eq!(res.total, 0);
     }
 
     #[test]

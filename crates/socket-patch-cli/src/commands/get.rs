@@ -76,6 +76,12 @@ pub struct GetArgs {
     /// Output results as JSON
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// Which kind of patch artifact to download. `diff` (default) fetches
+    /// the smallest delta archive; `package` fetches a full per-package
+    /// tarball; `file` falls back to legacy per-file blob downloads.
+    #[arg(long = "download-mode", default_value = "diff")]
+    pub download_mode: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -251,6 +257,8 @@ pub struct DownloadParams {
     pub global_prefix: Option<PathBuf>,
     pub json: bool,
     pub silent: bool,
+    /// `--download-mode` value forwarded to the apply step.
+    pub download_mode: String,
 }
 
 /// Download and apply a set of selected patches.
@@ -533,6 +541,7 @@ pub async fn download_and_apply_patches(
             force: false,
             json: false,
             verbose: false,
+            download_mode: params.download_mode.clone(),
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
@@ -927,6 +936,7 @@ pub async fn run(args: GetArgs) -> i32 {
         global_prefix: args.global_prefix.clone(),
         json: args.json,
         silent: false,
+        download_mode: args.download_mode.clone(),
     };
 
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
@@ -1196,6 +1206,7 @@ async fn save_and_apply_patch(
             offline: false,
             global: args.global,
             global_prefix: args.global_prefix.clone(),
+            download_mode: args.download_mode.clone(),
             ecosystems: None,
             force: false,
             json: false,

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::manifest::operations::get_after_hash_blobs;
@@ -81,6 +82,78 @@ pub async fn cleanup_unused_blobs(
             if !dry_run {
                 tokio::fs::remove_file(&blob_path).await?;
             }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Cleans up unused per-patch archive files from `archives_dir`.
+///
+/// Archives are named `<patch_uuid>.tar.gz`. Any file matching that
+/// pattern whose UUID is not present in the manifest is removed. Files
+/// that do *not* end in `.tar.gz` are treated as orphans and also
+/// removed — these directories are managed exclusively by socket-patch,
+/// so any stray non-archive file is assumed to be left over from an
+/// older socket-patch version. Subdirectories and hidden files are
+/// left untouched.
+pub async fn cleanup_unused_archives(
+    manifest: &PatchManifest,
+    archives_dir: &Path,
+    dry_run: bool,
+) -> Result<CleanupResult, std::io::Error> {
+    let used_uuids: HashSet<String> = manifest
+        .patches
+        .values()
+        .map(|r| r.uuid.clone())
+        .collect();
+
+    if tokio::fs::metadata(archives_dir).await.is_err() {
+        return Ok(CleanupResult {
+            blobs_checked: 0,
+            blobs_removed: 0,
+            bytes_freed: 0,
+            removed_blobs: vec![],
+        });
+    }
+
+    let mut read_dir = tokio::fs::read_dir(archives_dir).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        entries.push(entry);
+    }
+
+    let mut result = CleanupResult {
+        blobs_checked: entries.len(),
+        blobs_removed: 0,
+        bytes_freed: 0,
+        removed_blobs: vec![],
+    };
+
+    for entry in &entries {
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy().to_string();
+        if file_name_str.starts_with('.') {
+            continue;
+        }
+        let archive_path = archives_dir.join(&file_name_str);
+        let metadata = tokio::fs::metadata(&archive_path).await?;
+        if !metadata.is_file() {
+            continue;
+        }
+        // Strip the .tar.gz suffix to recover the UUID; if it doesn't end
+        // in .tar.gz, treat the entry as orphaned and remove it.
+        let uuid_part = file_name_str
+            .strip_suffix(".tar.gz")
+            .unwrap_or(&file_name_str);
+        if used_uuids.contains(uuid_part) {
+            continue;
+        }
+        result.blobs_removed += 1;
+        result.bytes_freed += metadata.len();
+        result.removed_blobs.push(file_name_str);
+        if !dry_run {
+            tokio::fs::remove_file(&archive_path).await?;
         }
     }
 
@@ -400,6 +473,99 @@ mod tests {
             format_cleanup_result(&result, false),
             "Removed 2 unused blob(s) (2.00 KB freed)"
         );
+    }
+
+    // ── cleanup_unused_archives tests ──────────────────────────────
+
+    const SECOND_UUID: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[tokio::test]
+    async fn test_cleanup_archives_keeps_referenced_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let manifest = create_test_manifest();
+        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
+            .await
+            .unwrap();
+        tokio::fs::write(archives.join(format!("{SECOND_UUID}.tar.gz")), b"orphan")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_archives(&manifest, &archives, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_removed, 1);
+        assert!(result
+            .removed_blobs
+            .contains(&format!("{SECOND_UUID}.tar.gz")));
+        assert!(tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
+            .await
+            .is_ok());
+        assert!(tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_dry_run_does_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let manifest = create_test_manifest();
+        tokio::fs::write(archives.join(format!("{SECOND_UUID}.tar.gz")), b"orphan")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_archives(&manifest, &archives, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_removed, 1);
+        assert!(tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_removes_non_archive_files() {
+        // Stray files (no .tar.gz suffix, or wrong UUID) are treated as
+        // orphans. This keeps the directory tidy when the on-disk format
+        // changes in the future.
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let manifest = create_test_manifest();
+        tokio::fs::write(archives.join("stray.txt"), b"junk")
+            .await
+            .unwrap();
+        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_archives(&manifest, &archives, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_removed, 1);
+        assert!(result.removed_blobs.contains(&"stray.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("does-not-exist");
+        let manifest = create_test_manifest();
+
+        let result = cleanup_unused_archives(&manifest, &archives, false)
+            .await
+            .unwrap();
+        assert_eq!(result.blobs_checked, 0);
+        assert_eq!(result.blobs_removed, 0);
     }
 
     #[test]

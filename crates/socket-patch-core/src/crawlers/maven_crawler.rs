@@ -410,21 +410,6 @@ impl MavenCrawler {
 
         false
     }
-
-    /// Find and parse the first `.pom` file in a directory.
-    #[allow(dead_code)]
-    async fn read_pom_in_dir(dir: &Path) -> Option<(String, String, String)> {
-        let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".pom") {
-                    let content = tokio::fs::read_to_string(entry.path()).await.ok()?;
-                    return parse_pom_group_artifact_version(&content);
-                }
-            }
-        }
-        None
-    }
 }
 
 impl Default for MavenCrawler {

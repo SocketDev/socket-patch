@@ -23,7 +23,6 @@ use sha2::{Digest, Sha256};
 // ---------------------------------------------------------------------------
 
 const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
-#[allow(dead_code)]
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 
 /// Git SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.

@@ -54,6 +54,12 @@ pub struct ScanArgs {
     /// Restrict scanning to specific ecosystems (comma-separated: npm,pypi,cargo,maven)
     #[arg(long, value_delimiter = ',')]
     pub ecosystems: Option<Vec<String>>,
+
+    /// Which kind of patch artifact to download. `diff` (default) fetches
+    /// the smallest delta archive; `package` fetches a full per-package
+    /// tarball; `file` falls back to legacy per-file blob downloads.
+    #[arg(long = "download-mode", default_value = "diff")]
+    pub download_mode: String,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -561,6 +567,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         global_prefix: args.global_prefix.clone(),
         json: false,
         silent: false,
+        download_mode: args.download_mode.clone(),
     };
 
     let (code, _) = download_and_apply_patches(&selected, &params).await;
