@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[lib]
+name = "socket_patch_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "socket-patch"
 path = "src/main.rs"

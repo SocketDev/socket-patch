@@ -6,7 +6,7 @@ use socket_patch_core::api::blob_fetcher::{
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
@@ -113,11 +113,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {

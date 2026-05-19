@@ -1,6 +1,8 @@
 use clap::Args;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::operations::{
+    read_manifest, resolve_manifest_path, write_manifest,
+};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remove_failed};
@@ -49,11 +51,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.json {

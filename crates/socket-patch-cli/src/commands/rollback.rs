@@ -5,7 +5,7 @@ use socket_patch_core::api::blob_fetcher::{
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::CrawlerOptions;
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
@@ -212,11 +212,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         return 1;
     }
 
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.json {
