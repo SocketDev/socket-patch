@@ -137,7 +137,7 @@ socket-patch get CVE-2024-12345 --json -y
 
 ### `scan`
 
-Scan installed packages for available security patches.
+Scan installed packages for available security patches. Since v3.0 `scan` is the single command bots need: it discovers patches, optionally applies them, and garbage-collects orphan blob files plus manifest entries for uninstalled packages.
 
 **Usage:**
 ```bash
@@ -147,23 +147,33 @@ socket-patch scan [options]
 **Options:**
 | Flag | Description |
 |------|-------------|
+| `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. |
+| `--no-prune` | Disable garbage collection. By default `scan` removes manifest entries for uninstalled packages and orphan blob/diff/package-archive files. |
 | `--org <slug>` | Organization slug |
 | `--json` | Output results as JSON |
+| `-y, --yes` | Skip confirmation prompts |
 | `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
 | `-g, --global` | Scan globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
+| `--download-mode <mode>` | `diff` (default), `package`, or `file` |
 | `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
 | `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
 ```bash
-# Scan local project
+# Scan local project (interactive prompt to apply)
 socket-patch scan
 
-# Scan with JSON output
+# Scan with JSON output (read-only: discover + updates + GC preview)
 socket-patch scan --json
+
+# Bot mode: discover, apply, prune, sweep — all in one
+socket-patch scan --json --apply --yes
+
+# Apply without pruning (preserve manifest entries for uninstalled packages)
+socket-patch scan --apply --yes --no-prune
 
 # Scan only npm packages
 socket-patch scan --ecosystems npm
@@ -367,42 +377,6 @@ socket-patch setup --dry-run
 
 # JSON output for scripting
 socket-patch setup --json -y
-```
-
-### `repair`
-
-Download missing blobs and clean up unused blobs.
-
-Alias: `gc`
-
-**Usage:**
-```bash
-socket-patch repair [options]
-```
-
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `-d, --dry-run` | Show what would be done without doing it |
-| `--offline` | Skip network operations (cleanup only) |
-| `--download-only` | Only download missing blobs, do not clean up |
-| `--json` | Output results as JSON |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
-
-**Examples:**
-```bash
-# Repair (download missing + clean up unused)
-socket-patch repair
-
-# Cleanup only, no downloads
-socket-patch repair --offline
-
-# Download missing blobs only
-socket-patch repair --download-only
-
-# JSON output
-socket-patch repair --json
 ```
 
 ## Scripting & CI/CD

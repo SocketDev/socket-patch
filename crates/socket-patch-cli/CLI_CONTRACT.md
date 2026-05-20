@@ -84,8 +84,11 @@ The hidden alias `--no-apply` on `--save-only` is **part of the contract** — i
 | `--ecosystems` | — | (none) | CSV → `Vec<String>` |
 | `--download-mode` | — | **`diff`** | string |
 | `--apply` | — | `false` | bool |
+| `--no-prune` | — | `false` | bool |
 
-`--apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively. Designed for unattended workflows (cron jobs, bots that open PRs).
+`--apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array + `gc` preview only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively. Designed for unattended workflows (cron jobs, bots that open PRs).
+
+`--no-prune` disables garbage collection. By default (since v3.0) `scan` removes manifest entries for packages no longer present in the crawl and deletes orphan blob, diff, and package-archive files from `.socket/`. Pass `--no-prune` to leave the manifest and `.socket/` directory untouched.
 
 ### `list`
 
@@ -118,7 +121,9 @@ Required positional `identifier`. Flags:
 | `--yes` | `-y` | `false` | bool |
 | `--json` | — | `false` | bool |
 
-### `repair`
+### `repair` *(deprecated since v3.0)*
+
+`scan` now performs garbage collection by default (manifest pruning + orphan file cleanup); prefer `scan` or `scan --no-prune`. `repair` and its `gc` alias remain available for direct invocation but no longer appear in `socket-patch --help`. The subcommand itself is hidden via `clap`'s `hide = true`, and `gc` is demoted from `visible_alias` to `alias`. **Removing `repair` entirely or unhiding it requires a MAJOR bump.**
 
 | Long | Short | Default | Type |
 |---|---|---|---|
@@ -236,15 +241,24 @@ When `--json` is set, commands print a single JSON object to stdout. The schemas
   ],
   "updates": [
     { "purl": "pkg:npm/foo@1.0", "oldUuid": "<previous>", "newUuid": "<newest>" }
-  ]
+  ],
+  "gc": {
+    "prunableManifestEntries": ["pkg:npm/uninstalled@1.0"],
+    "orphanBlobs": 3,
+    "orphanDiffArchives": 1,
+    "orphanPackageArchives": 0,
+    "bytesReclaimable": 8421
+  }
 }
 ```
 
 The `updates` array lists PURLs where the newest available patch UUID differs from the one currently recorded in `.socket/manifest.json`. Bots use this to drive "what would change" summaries without mutating anything.
 
+The `gc` sub-object in read-only mode is a *preview*: it reports what `scan --apply` *would* prune and clean up, without touching disk. When `scan` runs with no crawl results (e.g., empty project, `node_modules` missing), GC is intentionally skipped and `gc` is emitted as `{ "skipped": true }` to prevent destroying a manifest the user may still want.
+
 ### `scan` — `--apply` mode
 
-When invoked as `scan --json --apply`, the discovery object above is augmented with a top-level `apply` sub-object reporting per-patch outcomes from the download + manifest write:
+When invoked as `scan --json --apply`, the discovery object above is augmented with a top-level `apply` sub-object reporting per-patch outcomes from the download + manifest write, and the `gc` sub-object switches from preview to actual results:
 
 ```json
 {
@@ -265,9 +279,18 @@ When invoked as `scan --json --apply`, the discovery object above is augmented w
       { "purl": "pkg:npm/baz@3.0", "uuid": "<existing>", "action": "skipped" },
       { "purl": "pkg:npm/qux@4.0", "uuid": "<attempted>", "action": "failed", "error": "…" }
     ]
+  },
+  "gc": {
+    "prunedManifestEntries": ["pkg:npm/uninstalled@1.0"],
+    "removedBlobs": 3,
+    "removedDiffArchives": 1,
+    "removedPackageArchives": 0,
+    "bytesFreed": 8421
   }
 }
 ```
+
+With `--no-prune`, the `gc` sub-object is emitted as `{ "skipped": true }` in both read-only and `--apply` modes. GC field names differ between preview (`prunable*`/`orphan*`/`bytesReclaimable`) and apply (`pruned*`/`removed*`/`bytesFreed`) modes — bots should check `gc.prunedManifestEntries` vs `gc.prunableManifestEntries` accordingly.
 
 Per-patch `action` vocabulary is stable:
 
@@ -304,6 +327,7 @@ Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) a
 | Rename a JSON output key or change a `status` string | **MAJOR** |
 | Remove a JSON output key | **MAJOR** |
 | Rename or remove a per-patch `action` value (`added`/`updated`/`skipped`/`failed`) | **MAJOR** |
+| Change `scan`'s default behavior (e.g. pruning, GC, apply) | **MAJOR** — done once in v3.0; future flips also MAJOR. |
 | Drop the bare-UUID fallback | **MAJOR** |
 | Add a *required* new flag | **MAJOR** |
 | Add a new subcommand | **MINOR** |
