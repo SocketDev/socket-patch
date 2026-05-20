@@ -109,17 +109,14 @@ async fn run_gc(
 
 /// Apply-mode GC: re-read the manifest written by `download_and_apply_patches`,
 /// prune manifest entries for PURLs not in `scanned_purls`, write the manifest
-/// back, then sweep orphan blob/diff/package files. Honors `no_prune` by
-/// returning an empty `GcSummary { skipped: true }` instead.
+/// back, then sweep orphan blob/diff/package files. Callers must gate on the
+/// `prune` flag — when GC isn't requested, simply don't call this function and
+/// don't emit a `gc` sub-object.
 async fn run_apply_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
-    no_prune: bool,
 ) -> GcSummary {
-    if no_prune {
-        return GcSummary { skipped: true, ..Default::default() };
-    }
     // Re-read the just-written manifest (the apply step may have added
     // or updated entries we now want to consider for pruning).
     let mut manifest = match read_manifest(manifest_path).await {
@@ -136,6 +133,22 @@ async fn run_apply_gc(
         let _ = write_manifest(manifest_path, &manifest).await;
     }
     run_gc(&manifest, prunable, socket_dir, /*dry_run=*/false).await
+}
+
+/// Dry-run preview of the apply-mode GC pass. Same shape as
+/// [`run_apply_gc`] but emits `prunable*`/`orphan*` field names and
+/// performs no mutation.
+async fn preview_apply_gc(
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+) -> GcSummary {
+    let manifest = match read_manifest(manifest_path).await {
+        Ok(Some(m)) => m,
+        _ => return GcSummary::default(),
+    };
+    let prunable = detect_prunable(&manifest, scanned_purls);
+    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/true).await
 }
 
 /// PURL strings present in the manifest but absent from `scanned_purls`.
@@ -246,17 +259,40 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
-    /// Disable garbage collection. By default `scan` removes manifest
-    /// entries for packages no longer present in the crawl and deletes
-    /// orphan blob, diff, and package-archive files from `.socket/`.
-    /// Pass `--no-prune` to leave the manifest and `.socket/` directory
-    /// untouched (useful when the absence of a package in the crawl
-    /// reflects a temporary uninstall, not a permanent removal).
-    #[arg(long = "no-prune", default_value_t = false)]
-    pub no_prune: bool,
+    /// Garbage-collect after the scan: prune manifest entries for
+    /// packages no longer present in the crawl, then delete orphan
+    /// blob, diff, and package-archive files from `.socket/`. Off by
+    /// default to preserve manifest state across temporary uninstalls;
+    /// pair with `--apply` (or use `--sync`) for the auto-update
+    /// workflow.
+    #[arg(long, default_value_t = false)]
+    pub prune: bool,
+
+    /// Convenience flag for the auto-update workflow: implies both
+    /// `--apply` and `--prune`. Designed so a cron job or CI workflow
+    /// can run `socket-patch scan --json --sync --yes` and end up in a
+    /// fully-reconciled state in one invocation.
+    #[arg(long, default_value_t = false)]
+    pub sync: bool,
+
+    /// Show what `--apply` / `--prune` / `--sync` would do without
+    /// mutating the manifest, downloading patches, or deleting files.
+    /// In dry-run mode the JSON output's `apply.patches[*]` and
+    /// `gc.prunable*` / `gc.orphan*` fields are populated with the
+    /// would-be actions, but no I/O is performed. No effect without
+    /// at least one of `--apply`, `--prune`, or `--sync`.
+    #[arg(short = 'd', long = "dry-run", default_value_t = false)]
+    pub dry_run: bool,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
+    // `--sync` is sugar for `--apply --prune`. Derive locals once and
+    // use them everywhere downstream so the flag interactions are
+    // expressed in one place. `--apply --prune --sync` is redundant
+    // but legal (all three end up true).
+    let apply = args.apply || args.sync;
+    let prune = args.prune || args.sync;
+
     // Override env vars if CLI options provided
     if let Some(ref url) = args.api_url {
         std::env::set_var("SOCKET_API_URL", url);
@@ -318,8 +354,9 @@ pub async fn run(args: ScanArgs) -> i32 {
         if args.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
-            // user "uninstalled everything" is too destructive. Bots that
-            // need full cleanup can call `repair` explicitly.
+            // user "uninstalled everything" is too destructive. Bots
+            // that need full cleanup can call `repair` explicitly. No
+            // `gc` field emitted because the user didn't request one.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -332,7 +369,6 @@ pub async fn run(args: ScanArgs) -> i32 {
                     "canAccessPaidPatches": false,
                     "packages": [],
                     "updates": [],
-                    "gc": { "skipped": true },
                 }))
                 .unwrap()
             );
@@ -490,44 +526,14 @@ pub async fn run(args: ScanArgs) -> i32 {
             })).collect::<Vec<_>>(),
         });
 
-        // Read-only GC preview: compute prunable manifest entries + count
-        // orphan files via the cleanup helpers' dry_run mode. Skipped if
-        // --no-prune or if no manifest exists yet.
-        let preview_gc = if args.no_prune {
-            GcSummary { skipped: true, ..Default::default() }
-        } else if let Some(ref manifest) = existing_manifest {
-            let prunable = detect_prunable(manifest, &scanned_purls);
-            run_gc(manifest, prunable, &socket_dir, /*dry_run=*/true).await
-        } else {
-            // No manifest → nothing to prune, no files to count.
-            GcSummary::default()
-        };
-        result["gc"] = preview_gc.to_preview_json();
+        // `apply` and `prune` are computed once at the top of run()
+        // (factoring in --sync, which implies both). They're independent
+        // here: a bot can `--apply` without `--prune`, or `--prune`
+        // without `--apply` (just GC-sweep), or both (full sync).
+        let dry = args.dry_run;
 
-        // --apply opts JSON callers into the full discover → select → apply
-        // pipeline. Without it `scan --json` stays read-only (the prior
-        // contract). When --apply is set we delegate to the same selection
-        // and download path the non-JSON branch uses below, then graft the
-        // apply summary onto the discovery result as a sub-object. GC
-        // *always* runs in apply mode — even when no new patches are
-        // available — so an uninstalled package gets pruned from the
-        // manifest on a subsequent scan.
-        if args.apply && all_packages_with_patches.is_empty() {
-            // Apply mode with nothing to download: still emit an `apply`
-            // sub-object for shape stability + run mutating GC.
-            result["apply"] = serde_json::json!({
-                "found": 0, "downloaded": 0, "skipped": 0,
-                "failed": 0, "applied": 0, "updated": 0,
-                "patches": [],
-            });
-            result["gc"] =
-                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
-                    .await
-                    .to_apply_json();
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            return 0;
-        }
-        if args.apply && !all_packages_with_patches.is_empty() {
+        // --- Apply path (if requested) -----------------------------------
+        if apply {
             let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
             for pkg in &all_packages_with_patches {
                 match api_client
@@ -540,70 +546,125 @@ pub async fn run(args: ScanArgs) -> i32 {
             }
 
             // For scan-driven bot workflows there's no "specify --id"
-            // option — we're scanning the whole project. When multiple
-            // free patches exist for a PURL, fall back to the
-            // non-TTY auto-select-newest path inside `select_one` rather
-            // than erroring with `selection_required`. Passing
-            // `is_json = false` here means scan never returns that
-            // error variant; bots get forward progress.
-            let selected = match select_patches(&all_search_results, can_access_paid_patches, false) {
-                Ok(s) => s,
-                Err(code) => return code,
+            // option — we're scanning the whole project. Pass
+            // `is_json = false` so `select_one` auto-selects the newest
+            // patch in non-TTY mode rather than erroring with
+            // `selection_required`.
+            let selected = if all_search_results.is_empty() {
+                Vec::new()
+            } else {
+                match select_patches(&all_search_results, can_access_paid_patches, false) {
+                    Ok(s) => s,
+                    Err(code) => return code,
+                }
             };
 
-            if selected.is_empty() {
+            let mut apply_code = 0i32;
+            if dry {
+                // Synthesize the per-patch outcome without touching disk.
+                // `decide_patch_action` consults the existing manifest,
+                // so it accurately reports what `--apply` *would* do.
+                let manifest_for_preview = existing_manifest
+                    .clone()
+                    .unwrap_or_else(PatchManifest::new);
+                let patches: Vec<serde_json::Value> = selected
+                    .iter()
+                    .map(|p| {
+                        match super::get::decide_patch_action(
+                            &manifest_for_preview,
+                            &p.purl,
+                            &p.uuid,
+                        ) {
+                            super::get::PatchAction::Added => serde_json::json!({
+                                "purl": p.purl, "uuid": p.uuid, "action": "added",
+                            }),
+                            super::get::PatchAction::Updated { old_uuid } => serde_json::json!({
+                                "purl": p.purl, "uuid": p.uuid,
+                                "action": "updated", "oldUuid": old_uuid,
+                            }),
+                            super::get::PatchAction::Skipped => serde_json::json!({
+                                "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                            }),
+                        }
+                    })
+                    .collect();
+                let added = patches.iter().filter(|p| p["action"] == "added").count();
+                let updated = patches.iter().filter(|p| p["action"] == "updated").count();
+                let skipped = patches.iter().filter(|p| p["action"] == "skipped").count();
                 result["apply"] = serde_json::json!({
-                    "found": 0,
+                    "found": selected.len(),
                     "downloaded": 0,
-                    "skipped": 0,
+                    "skipped": skipped,
                     "failed": 0,
                     "applied": 0,
-                    "updated": 0,
+                    "updated": updated,
+                    "added": added,
+                    "patches": patches,
+                    "dryRun": true,
+                });
+            } else if selected.is_empty() {
+                // No patches selected (e.g. all paid for a free user, or
+                // no packages had patches). Emit empty `apply` so JSON
+                // shape is stable, then fall through to GC if requested.
+                result["apply"] = serde_json::json!({
+                    "found": 0, "downloaded": 0, "skipped": 0,
+                    "failed": 0, "applied": 0, "updated": 0,
                     "patches": [],
                 });
-                // No patches selected, but GC still runs — the manifest
-                // may have stale entries that need pruning even when no
-                // new patches were added.
-                result["gc"] = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
-                    .await
-                    .to_apply_json();
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                return 0;
+            } else {
+                let params = DownloadParams {
+                    cwd: args.cwd.clone(),
+                    org: args.org.clone(),
+                    save_only: false,
+                    one_off: false,
+                    global: args.global,
+                    global_prefix: args.global_prefix.clone(),
+                    json: true,
+                    silent: true,
+                    download_mode: args.download_mode.clone(),
+                };
+                let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
+                apply_code = code;
+                let mut apply_obj = apply_json;
+                if let Some(obj) = apply_obj.as_object_mut() {
+                    obj.remove("status");
+                }
+                result["apply"] = apply_obj;
+                if apply_code != 0 {
+                    result["status"] = serde_json::json!("partial_failure");
+                }
             }
 
-            let params = DownloadParams {
-                cwd: args.cwd.clone(),
-                org: args.org.clone(),
-                save_only: false,
-                one_off: false,
-                global: args.global,
-                global_prefix: args.global_prefix.clone(),
-                json: true,
-                silent: true,
-                download_mode: args.download_mode.clone(),
-            };
-            let (apply_code, apply_json) = download_and_apply_patches(&selected, &params).await;
-            // Strip the `status` field — the outer scan JSON owns it. Keep
-            // everything else so bots can summarize per-patch outcomes.
-            let mut apply_obj = apply_json;
-            if let Some(obj) = apply_obj.as_object_mut() {
-                obj.remove("status");
+            // --- GC (if requested) --------------------------------------
+            if prune {
+                let gc = if dry {
+                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                } else {
+                    run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                };
+                result["gc"] = if dry {
+                    gc.to_preview_json()
+                } else {
+                    gc.to_apply_json()
+                };
             }
-            result["apply"] = apply_obj;
-            if apply_code != 0 {
-                result["status"] = serde_json::json!("partial_failure");
-            }
-
-            // Post-apply GC: prune manifest entries for uninstalled
-            // packages, then sweep orphan blob/diff/package files. The
-            // manifest read here is the just-written one from the apply
-            // step. Overrides the read-only preview emitted above.
-            result["gc"] = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
-                .await
-                .to_apply_json();
 
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             return apply_code;
+        }
+
+        // --- GC-only path (no --apply, just --prune) --------------------
+        if prune {
+            let gc = if dry {
+                preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+            } else {
+                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+            };
+            result["gc"] = if dry {
+                gc.to_preview_json()
+            } else {
+                gc.to_apply_json()
+            };
         }
 
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -903,11 +964,12 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     let (code, _) = download_and_apply_patches(&selected, &params).await;
 
-    // Post-apply GC: prune manifest entries for uninstalled packages,
-    // then sweep orphan blob/diff/package files. Honors `--no-prune`.
-    let gc =
-        run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune).await;
-    if !args.no_prune {
+    // Post-apply GC: only runs when the user opted in via `--prune` or
+    // `--sync`. Default `scan --yes` no longer touches the manifest
+    // beyond what `--apply` added — users wanting to clean up should
+    // run `socket-patch gc` (or `repair`) explicitly.
+    if prune {
+        let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await;
         let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
         if !gc.pruned.is_empty() || total > 0 {
             println!(

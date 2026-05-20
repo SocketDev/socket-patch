@@ -788,7 +788,7 @@ mod tests {
             map.get(&Ecosystem::Npm),
             Some(&vec!["pkg:npm/foo@1.0".to_string()])
         );
-        assert!(map.get(&Ecosystem::Pypi).is_none());
+        assert!(!map.contains_key(&Ecosystem::Pypi));
     }
 
     #[test]
