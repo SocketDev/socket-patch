@@ -94,7 +94,18 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
         let path_str = path.to_string_lossy().to_string();
 
         // Reject absolute paths or any `..` components.
+        //
+        // `Path::is_absolute()` is platform-aware: on Windows it requires
+        // a drive letter or UNC prefix, so a tar entry like `/etc/passwd`
+        // is NOT considered absolute and would slip through. Explicitly
+        // check the leading byte for `/` and `\` so the guard rejects
+        // POSIX-style absolute paths on every platform.
+        let leading_separator = path_str
+            .as_bytes()
+            .first()
+            .is_some_and(|b| *b == b'/' || *b == b'\\');
         if path.is_absolute()
+            || leading_separator
             || path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -269,6 +280,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("arc.tar.gz");
         write_raw_archive(&archive, b"/etc/passwd", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(matches!(err, ArchiveError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn test_read_archive_rejects_backslash_absolute_paths() {
+        // Tar entries with a leading backslash must also be rejected so
+        // the guard behaves consistently across POSIX and Windows.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"\\Windows\\System32\\evil.dll", b"evil");
 
         let err = read_archive_to_map(&archive).unwrap_err();
         assert!(matches!(err, ArchiveError::UnsafePath(_)));
