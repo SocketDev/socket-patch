@@ -145,6 +145,10 @@ jobs:
             suite: e2e_npm
           - os: macos-latest
             suite: e2e_pypi
+          - os: ubuntu-latest
+            suite: e2e_scan
+          - os: macos-latest
+            suite: e2e_scan
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -168,7 +172,7 @@ jobs:
           restore-keys: ${{ matrix.os }}-cargo-e2e-
 
       - name: Setup Node.js
-        if: matrix.suite == 'e2e_npm'
+        if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
