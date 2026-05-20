@@ -521,7 +521,14 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             }
 
-            let selected = match select_patches(&all_search_results, can_access_paid_patches, true) {
+            // For scan-driven bot workflows there's no "specify --id"
+            // option — we're scanning the whole project. When multiple
+            // free patches exist for a PURL, fall back to the
+            // non-TTY auto-select-newest path inside `select_one` rather
+            // than erroring with `selection_required`. Passing
+            // `is_json = false` here means scan never returns that
+            // error variant; bots get forward progress.
+            let selected = match select_patches(&all_search_results, can_access_paid_patches, false) {
                 Ok(s) => s,
                 Err(code) => return code,
             };
