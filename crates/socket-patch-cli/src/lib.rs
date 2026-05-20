@@ -53,12 +53,12 @@ pub enum Commands {
 
     /// Download missing blobs and clean up unused blobs.
     ///
-    /// Deprecated since v3.0: `scan` now performs GC by default;
-    /// prefer `scan` (or `scan --no-prune` to opt out). The `gc` alias
-    /// is preserved for backwards-compat but no longer listed in
-    /// `--help`. The subcommand itself is hidden from top-level help;
-    /// `socket-patch repair --help` still works for direct callers.
-    #[command(alias = "gc", hide = true)]
+    /// `repair` (alias `gc`) is a first-class command for cleaning up
+    /// the `.socket/` directory without running a scan. For the
+    /// combined workflow (discover + apply + GC), use
+    /// `scan --sync --json --yes`. `repair`/`gc` remain useful on
+    /// their own when the user wants to clean up without an apply pass.
+    #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 }
 
