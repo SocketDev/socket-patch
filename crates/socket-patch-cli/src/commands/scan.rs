@@ -2,10 +2,15 @@ use clap::Args;
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
+use socket_patch_core::manifest::operations::{
+    read_manifest, resolve_manifest_path, write_manifest,
+};
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::utils::cleanup_blobs::{
+    cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
+};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
@@ -22,6 +27,132 @@ pub(crate) struct UpdateInfo {
     pub purl: String,
     pub old_uuid: String,
     pub new_uuid: String,
+}
+
+/// Aggregated outcome of a GC pass (or preview). Serialized into the
+/// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
+/// stable schema.
+#[derive(Debug, Default)]
+pub(crate) struct GcSummary {
+    /// PURLs removed from the manifest (apply mode) or eligible to be
+    /// removed (preview mode).
+    pub pruned: Vec<String>,
+    pub blobs: CleanupResult,
+    pub diffs: CleanupResult,
+    pub packages: CleanupResult,
+    /// `true` when `--no-prune` was set; the sub-object only carries the
+    /// `skipped: true` field in that case.
+    pub skipped: bool,
+}
+
+impl GcSummary {
+    fn total_bytes(&self) -> u64 {
+        self.blobs.bytes_freed + self.diffs.bytes_freed + self.packages.bytes_freed
+    }
+
+    /// Serialize for a *mutating* GC pass (post-apply).
+    fn to_apply_json(&self) -> serde_json::Value {
+        if self.skipped {
+            return serde_json::json!({ "skipped": true });
+        }
+        serde_json::json!({
+            "prunedManifestEntries": self.pruned,
+            "removedBlobs": self.blobs.blobs_removed,
+            "removedDiffArchives": self.diffs.blobs_removed,
+            "removedPackageArchives": self.packages.blobs_removed,
+            "bytesFreed": self.total_bytes(),
+        })
+    }
+
+    /// Serialize for a *non-mutating* GC pass (read-only preview).
+    fn to_preview_json(&self) -> serde_json::Value {
+        if self.skipped {
+            return serde_json::json!({ "skipped": true });
+        }
+        serde_json::json!({
+            "prunableManifestEntries": self.pruned,
+            "orphanBlobs": self.blobs.blobs_removed,
+            "orphanDiffArchives": self.diffs.blobs_removed,
+            "orphanPackageArchives": self.packages.blobs_removed,
+            "bytesReclaimable": self.total_bytes(),
+        })
+    }
+}
+
+/// Compute GC actions without performing them. `dry_run = true` for the
+/// preview path; `dry_run = false` for the apply path. The cleanup helpers
+/// from `socket_patch_core::utils::cleanup_blobs` natively support dry-run,
+/// so the same function works for both.
+async fn run_gc(
+    manifest: &PatchManifest,
+    pruned: Vec<String>,
+    socket_dir: &Path,
+    dry_run: bool,
+) -> GcSummary {
+    let blobs = cleanup_unused_blobs(manifest, &socket_dir.join("blobs"), dry_run)
+        .await
+        .unwrap_or_default();
+    let diffs = cleanup_unused_archives(manifest, &socket_dir.join("diffs"), dry_run)
+        .await
+        .unwrap_or_default();
+    let packages = cleanup_unused_archives(manifest, &socket_dir.join("packages"), dry_run)
+        .await
+        .unwrap_or_default();
+    GcSummary {
+        pruned,
+        blobs,
+        diffs,
+        packages,
+        skipped: false,
+    }
+}
+
+/// Apply-mode GC: re-read the manifest written by `download_and_apply_patches`,
+/// prune manifest entries for PURLs not in `scanned_purls`, write the manifest
+/// back, then sweep orphan blob/diff/package files. Honors `no_prune` by
+/// returning an empty `GcSummary { skipped: true }` instead.
+async fn run_apply_gc(
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+    no_prune: bool,
+) -> GcSummary {
+    if no_prune {
+        return GcSummary { skipped: true, ..Default::default() };
+    }
+    // Re-read the just-written manifest (the apply step may have added
+    // or updated entries we now want to consider for pruning).
+    let mut manifest = match read_manifest(manifest_path).await {
+        Ok(Some(m)) => m,
+        _ => return GcSummary::default(),
+    };
+    let prunable = detect_prunable(&manifest, scanned_purls);
+    for purl in &prunable {
+        manifest.patches.remove(purl);
+    }
+    if !prunable.is_empty() {
+        // If pruning failed mid-write the manifest may be stale, but the
+        // file-level cleanup below still operates on the in-memory copy.
+        let _ = write_manifest(manifest_path, &manifest).await;
+    }
+    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/false).await
+}
+
+/// PURL strings present in the manifest but absent from `scanned_purls`.
+/// These are candidates for pruning during `scan`'s GC pass — they
+/// correspond to packages that were once patched but are no longer
+/// installed (or no longer reachable to the crawler). Pure / no I/O so
+/// it's unit-testable.
+pub(crate) fn detect_prunable(
+    manifest: &PatchManifest,
+    scanned_purls: &HashSet<String>,
+) -> Vec<String> {
+    manifest
+        .patches
+        .keys()
+        .filter(|p| !scanned_purls.contains(*p))
+        .cloned()
+        .collect()
 }
 
 /// Cross-reference an existing manifest against discovery results to find
@@ -114,6 +245,15 @@ pub struct ScanArgs {
     /// non-JSON path always prompts the user).
     #[arg(long, default_value_t = false)]
     pub apply: bool,
+
+    /// Disable garbage collection. By default `scan` removes manifest
+    /// entries for packages no longer present in the crawl and deletes
+    /// orphan blob, diff, and package-archive files from `.socket/`.
+    /// Pass `--no-prune` to leave the manifest and `.socket/` directory
+    /// untouched (useful when the absence of a package in the crawl
+    /// reflects a temporary uninstall, not a permanent removal).
+    #[arg(long = "no-prune", default_value_t = false)]
+    pub no_prune: bool,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -176,6 +316,10 @@ pub async fn run(args: ScanArgs) -> i32 {
             eprintln!();
         }
         if args.json {
+            // When the crawler finds nothing, GC is intentionally skipped
+            // — pruning every manifest entry on the assumption that the
+            // user "uninstalled everything" is too destructive. Bots that
+            // need full cleanup can call `repair` explicitly.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -188,6 +332,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                     "canAccessPaidPatches": false,
                     "packages": [],
                     "updates": [],
+                    "gc": { "skipped": true },
                 }))
                 .unwrap()
             );
@@ -320,8 +465,13 @@ pub async fn run(args: ScanArgs) -> i32 {
     // JSON-mode emission (always includes an `updates` array) and the
     // non-JSON table-print path (counts `updates_available`).
     let manifest_path = resolve_manifest_path(&args.cwd, ".socket/manifest.json");
+    let socket_dir = manifest_path.parent().unwrap().to_path_buf();
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
     let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
+
+    // Crawl PURLs as a set for prunable detection (manifest entries whose
+    // PURL is not in the current crawl results).
+    let scanned_purls: HashSet<String> = all_purls.iter().cloned().collect();
 
     if args.json {
         let mut result = serde_json::json!({
@@ -339,6 +489,20 @@ pub async fn run(args: ScanArgs) -> i32 {
                 "newUuid": u.new_uuid,
             })).collect::<Vec<_>>(),
         });
+
+        // Read-only GC preview: compute prunable manifest entries + count
+        // orphan files via the cleanup helpers' dry_run mode. Skipped if
+        // --no-prune or if no manifest exists yet.
+        let preview_gc = if args.no_prune {
+            GcSummary { skipped: true, ..Default::default() }
+        } else if let Some(ref manifest) = existing_manifest {
+            let prunable = detect_prunable(manifest, &scanned_purls);
+            run_gc(manifest, prunable, &socket_dir, /*dry_run=*/true).await
+        } else {
+            // No manifest → nothing to prune, no files to count.
+            GcSummary::default()
+        };
+        result["gc"] = preview_gc.to_preview_json();
 
         // --apply opts JSON callers into the full discover → select → apply
         // pipeline. Without it `scan --json` stays read-only (the prior
@@ -372,6 +536,12 @@ pub async fn run(args: ScanArgs) -> i32 {
                     "updated": 0,
                     "patches": [],
                 });
+                // No patches selected, but GC still runs — the manifest
+                // may have stale entries that need pruning even when no
+                // new patches were added.
+                result["gc"] = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
+                    .await
+                    .to_apply_json();
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
                 return 0;
             }
@@ -398,6 +568,15 @@ pub async fn run(args: ScanArgs) -> i32 {
             if apply_code != 0 {
                 result["status"] = serde_json::json!("partial_failure");
             }
+
+            // Post-apply GC: prune manifest entries for uninstalled
+            // packages, then sweep orphan blob/diff/package files. The
+            // manifest read here is the just-written one from the apply
+            // step. Overrides the read-only preview emitted above.
+            result["gc"] = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
+                .await
+                .to_apply_json();
+
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             return apply_code;
         }
@@ -698,6 +877,25 @@ pub async fn run(args: ScanArgs) -> i32 {
     };
 
     let (code, _) = download_and_apply_patches(&selected, &params).await;
+
+    // Post-apply GC: prune manifest entries for uninstalled packages,
+    // then sweep orphan blob/diff/package files. Honors `--no-prune`.
+    let gc =
+        run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune).await;
+    if !args.no_prune {
+        let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
+        if !gc.pruned.is_empty() || total > 0 {
+            println!(
+                "\nGC: pruned {} manifest entr{} and removed {} orphan file{} ({}).",
+                gc.pruned.len(),
+                if gc.pruned.len() == 1 { "y" } else { "ies" },
+                total,
+                if total == 1 { "" } else { "s" },
+                socket_patch_core::utils::cleanup_blobs::format_bytes(gc.total_bytes()),
+            );
+        }
+    }
+
     code
 }
 
@@ -856,5 +1054,62 @@ mod tests {
         let updates = detect_updates(Some(&m), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    // ---- detect_prunable ---------------------------------------------------
+
+    fn scanned(purls: &[&str]) -> HashSet<String> {
+        purls.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn detect_prunable_empty_manifest_empty_scanned() {
+        let m = PatchManifest::new();
+        assert!(detect_prunable(&m, &scanned(&[])).is_empty());
+    }
+
+    #[test]
+    fn detect_prunable_empty_manifest_nonempty_scanned() {
+        let m = PatchManifest::new();
+        // No manifest entries → nothing to prune even if the crawl found
+        // packages that don't appear in the manifest.
+        assert!(detect_prunable(&m, &scanned(&["pkg:npm/foo@1"])).is_empty());
+    }
+
+    #[test]
+    fn detect_prunable_all_entries_present_in_scan() {
+        let m = manifest_with(&[
+            ("pkg:npm/foo@1.0", "uuid-a"),
+            ("pkg:npm/bar@2.0", "uuid-b"),
+        ]);
+        let s = scanned(&["pkg:npm/foo@1.0", "pkg:npm/bar@2.0"]);
+        assert!(detect_prunable(&m, &s).is_empty());
+    }
+
+    #[test]
+    fn detect_prunable_returns_missing_entries() {
+        let m = manifest_with(&[
+            ("pkg:npm/foo@1.0", "uuid-a"),
+            ("pkg:npm/bar@2.0", "uuid-b"),
+        ]);
+        // foo is still installed, bar is gone.
+        let s = scanned(&["pkg:npm/foo@1.0"]);
+        let mut out = detect_prunable(&m, &s);
+        out.sort();
+        assert_eq!(out, vec!["pkg:npm/bar@2.0".to_string()]);
+    }
+
+    #[test]
+    fn detect_prunable_returns_everything_when_scan_is_empty() {
+        let m = manifest_with(&[
+            ("pkg:npm/foo@1.0", "uuid-a"),
+            ("pkg:npm/bar@2.0", "uuid-b"),
+        ]);
+        let mut out = detect_prunable(&m, &scanned(&[]));
+        out.sort();
+        assert_eq!(
+            out,
+            vec!["pkg:npm/bar@2.0".to_string(), "pkg:npm/foo@1.0".to_string()],
+        );
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-darwin-x64",
-  "version": "2.1.4",
+  "version": "3.0.0",
   "description": "socket-patch binary for macOS x64",
   "os": [
     "darwin"

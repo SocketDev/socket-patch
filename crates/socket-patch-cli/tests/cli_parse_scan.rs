@@ -56,6 +56,7 @@ fn defaults_match_contract() {
     assert_eq!(args.api_token, None);
     assert_eq!(args.ecosystems, None);
     assert!(!args.apply, "--apply default is false (scan --json stays read-only)");
+    assert!(!args.no_prune, "--no-prune default is false (GC is on by default in v3.0)");
 }
 
 #[test]
@@ -225,6 +226,23 @@ fn apply_flag_combines_with_json_and_yes() {
     assert!(args.apply);
     assert!(args.json);
     assert!(args.yes);
+}
+
+// --- `--no-prune` flag (v3.0 GC opt-out) ----------------------------------
+
+#[test]
+fn no_prune_flag_long_form() {
+    let args = parse_scan(&["--no-prune"]);
+    assert!(args.no_prune);
+}
+
+#[test]
+fn no_prune_combines_with_apply_and_json() {
+    let args = parse_scan(&["--apply", "--json", "--yes", "--no-prune"]);
+    assert!(args.apply);
+    assert!(args.json);
+    assert!(args.yes);
+    assert!(args.no_prune);
 }
 
 #[test]

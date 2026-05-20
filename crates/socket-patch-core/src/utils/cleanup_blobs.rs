@@ -5,7 +5,7 @@ use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
 
 /// Result of a blob cleanup operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CleanupResult {
     pub blobs_checked: usize,
     pub blobs_removed: usize,

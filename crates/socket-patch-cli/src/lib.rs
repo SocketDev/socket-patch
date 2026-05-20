@@ -51,8 +51,14 @@ pub enum Commands {
     /// Configure package.json postinstall scripts to apply patches
     Setup(commands::setup::SetupArgs),
 
-    /// Download missing blobs and clean up unused blobs
-    #[command(visible_alias = "gc")]
+    /// Download missing blobs and clean up unused blobs.
+    ///
+    /// Deprecated since v3.0: `scan` now performs GC by default;
+    /// prefer `scan` (or `scan --no-prune` to opt out). The `gc` alias
+    /// is preserved for backwards-compat but no longer listed in
+    /// `--help`. The subcommand itself is hidden from top-level help;
+    /// `socket-patch repair --help` still works for direct callers.
+    #[command(alias = "gc", hide = true)]
     Repair(commands::repair::RepairArgs),
 }
 

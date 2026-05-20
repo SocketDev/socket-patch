@@ -153,3 +153,64 @@ fn repair_unknown_flag_is_unknown_argument_error() {
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
+
+// --- v3.0 deprecation: hide repair/gc from top-level --help ----------------
+//
+// `scan` now performs GC by default, so `repair`/`gc` is demoted from a
+// first-class command to a hidden one. The subcommand still works (so
+// existing scripts don't break), but it should not be listed in
+// `socket-patch --help` or as an alias hint. These tests lock that
+// contract — flipping `hide = true` back to `false` or restoring
+// `visible_alias = "gc"` will fail here.
+
+fn top_level_help() -> String {
+    match Cli::try_parse_from(["socket-patch", "--help"]) {
+        Ok(_) => panic!("--help should return a clap error (DisplayHelp)"),
+        Err(e) => format!("{e}"),
+    }
+}
+
+#[test]
+fn repair_is_hidden_from_top_level_help() {
+    let help = top_level_help();
+    assert!(
+        !help.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("repair ") || t.starts_with("repair\t")
+        }),
+        "`repair` should not appear in --help output:\n{help}"
+    );
+}
+
+#[test]
+fn gc_alias_is_hidden_from_top_level_help() {
+    let help = top_level_help();
+    assert!(
+        !help.contains("[aliases: gc]") && !help.contains("[alias: gc]"),
+        "`gc` alias should not appear in --help output:\n{help}"
+    );
+}
+
+#[test]
+fn gc_alias_still_parses_for_backwards_compat() {
+    // Even though the alias is hidden from help, scripts that use
+    // `socket-patch gc` must keep working. We can't `unwrap` because Cli
+    // doesn't derive Debug; pattern-match on the result instead.
+    match Cli::try_parse_from(["socket-patch", "gc"]) {
+        Ok(cli) => assert!(
+            matches!(cli.command, Commands::Repair(_)),
+            "gc should still resolve to Repair"
+        ),
+        Err(e) => panic!("gc alias should parse: {e}"),
+    }
+}
+
+#[test]
+fn repair_subcommand_help_still_works_directly() {
+    // `--help` on the hidden subcommand itself must still show usage —
+    // hiding only suppresses it from the *parent* help, not its own.
+    match Cli::try_parse_from(["socket-patch", "repair", "--help"]) {
+        Ok(_) => panic!("--help should produce a clap error (DisplayHelp)"),
+        Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp),
+    }
+}
