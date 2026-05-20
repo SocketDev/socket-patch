@@ -55,6 +55,7 @@ fn defaults_match_contract() {
     assert_eq!(args.api_url, None);
     assert_eq!(args.api_token, None);
     assert_eq!(args.ecosystems, None);
+    assert!(!args.apply, "--apply default is false (scan --json stays read-only)");
 }
 
 #[test]
@@ -203,4 +204,71 @@ fn unknown_flag_fails() {
         Err(e) => e,
     };
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+// --- `--apply` flag and JSON shape ----------------------------------------
+//
+// `--apply` opts JSON callers into the full discover → select → apply
+// pipeline (read-only stays the default for backwards compatibility). The
+// subprocess test below also locks in the new `updates` key that bots rely
+// on to summarize what would change.
+
+#[test]
+fn apply_flag_long_form() {
+    let args = parse_scan(&["--apply"]);
+    assert!(args.apply);
+}
+
+#[test]
+fn apply_flag_combines_with_json_and_yes() {
+    let args = parse_scan(&["--apply", "--json", "--yes"]);
+    assert!(args.apply);
+    assert!(args.json);
+    assert!(args.yes);
+}
+
+#[test]
+fn scan_json_empty_cwd_emits_updates_key() {
+    // Spawn the compiled binary against an empty tempdir so no API call
+    // happens (no packages found → early return with all-zero summary).
+    // This locks in the new `updates: []` field in the JSON contract.
+    let bin = env!("CARGO_BIN_EXE_socket-patch");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = std::process::Command::new(bin)
+        .args(["scan", "--json", "--cwd"])
+        .arg(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_API_URL")
+        .output()
+        .expect("spawn socket-patch");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("scan emitted valid JSON");
+
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["scannedPackages"], 0);
+    assert_eq!(v["packagesWithPatches"], 0);
+    assert_eq!(v["totalPatches"], 0);
+    assert!(
+        v["packages"].is_array(),
+        "packages must be an array, got {}",
+        v["packages"]
+    );
+    assert!(
+        v["updates"].is_array(),
+        "updates key must be present and an array — locks contract",
+    );
+    assert_eq!(
+        v["updates"].as_array().unwrap().len(),
+        0,
+        "updates is empty when no packages were scanned"
+    );
 }

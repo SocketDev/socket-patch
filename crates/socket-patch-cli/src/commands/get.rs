@@ -16,6 +16,36 @@ use std::path::PathBuf;
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{confirm, select_one, SelectError};
 
+/// Per-patch outcome reported in the JSON output of `download_and_apply_patches`.
+/// `Updated` carries the previous UUID so a bot can diff a manifest update against
+/// what was there before — see CLI_CONTRACT.md for the stable vocabulary.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum PatchAction {
+    /// Patch did not exist in the manifest at this PURL.
+    Added,
+    /// Patch existed under this PURL with a different UUID; the new UUID
+    /// replaces the old one. `old_uuid` is the UUID being overwritten.
+    Updated { old_uuid: String },
+    /// Patch already exists with the same UUID; download is a no-op.
+    Skipped,
+}
+
+/// Classify what `download_and_apply_patches` will do to a given PURL based on
+/// the manifest state *before* any insert. Pure / no I/O so it's unit-testable.
+pub(crate) fn decide_patch_action(
+    manifest: &PatchManifest,
+    purl: &str,
+    new_uuid: &str,
+) -> PatchAction {
+    match manifest.patches.get(purl) {
+        Some(existing) if existing.uuid == new_uuid => PatchAction::Skipped,
+        Some(existing) => PatchAction::Updated {
+            old_uuid: existing.uuid.clone(),
+        },
+        None => PatchAction::Added,
+    }
+}
+
 #[derive(Args)]
 pub struct GetArgs {
     /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name)
@@ -335,12 +365,11 @@ pub async fn download_and_apply_patches(
             .await
         {
             Ok(Some(patch)) => {
-                // Check if already in manifest with same UUID
-                if manifest
-                    .patches
-                    .get(&patch.purl)
-                    .is_some_and(|p| p.uuid == patch.uuid)
-                {
+                // Classify against the manifest state BEFORE we touch it.
+                // `Skipped` early-returns; `Updated` is preserved so the
+                // per-patch JSON record below can include `oldUuid`.
+                let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
+                if let PatchAction::Skipped = action {
                     if !params.json && !params.silent {
                         eprintln!("  [skip] {} (already in manifest)", patch.purl);
                     }
@@ -458,14 +487,30 @@ pub async fn download_and_apply_patches(
                     },
                 );
 
-                if !params.json && !params.silent {
-                    eprintln!("  [add] {}", patch.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "added",
-                }));
+                let action_record = match &action {
+                    PatchAction::Updated { old_uuid } => {
+                        if !params.json && !params.silent {
+                            eprintln!("  [update] {}", patch.purl);
+                        }
+                        serde_json::json!({
+                            "purl": patch.purl,
+                            "uuid": patch.uuid,
+                            "action": "updated",
+                            "oldUuid": old_uuid,
+                        })
+                    }
+                    _ => {
+                        if !params.json && !params.silent {
+                            eprintln!("  [add] {}", patch.purl);
+                        }
+                        serde_json::json!({
+                            "purl": patch.purl,
+                            "uuid": patch.uuid,
+                            "action": "added",
+                        })
+                    }
+                };
+                downloaded_patches.push(action_record);
                 patches_added += 1;
             }
             Ok(None) => {
@@ -1450,5 +1495,67 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "free");
         assert_eq!(out[0].tier, "free");
+    }
+
+    // --- decide_patch_action ---------------------------------------------
+    // Locks in the per-patch action vocabulary surfaced by
+    // download_and_apply_patches in JSON mode. See CLI_CONTRACT.md.
+
+    fn manifest_with_entry(purl: &str, uuid: &str) -> PatchManifest {
+        let mut m = PatchManifest::new();
+        m.patches.insert(
+            purl.to_string(),
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: "free".to_string(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn decide_patch_action_added_when_purl_absent() {
+        let manifest = PatchManifest::new();
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-a"),
+            PatchAction::Added,
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_skipped_when_same_uuid() {
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-a"),
+            PatchAction::Skipped,
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_updated_when_different_uuid() {
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-b"),
+            PatchAction::Updated {
+                old_uuid: "uuid-a".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_added_for_different_purl_even_with_overlapping_manifest() {
+        // Ensure update detection keys on PURL, not UUID. A new PURL with a
+        // UUID that happens to match an existing entry under a different
+        // PURL must still be `Added`.
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/bar@2.0", "uuid-a"),
+            PatchAction::Added,
+        );
     }
 }

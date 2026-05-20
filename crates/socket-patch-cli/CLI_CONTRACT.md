@@ -83,6 +83,9 @@ The hidden alias `--no-apply` on `--save-only` is **part of the contract** — i
 | `--api-token` | — | (none) | string |
 | `--ecosystems` | — | (none) | CSV → `Vec<String>` |
 | `--download-mode` | — | **`diff`** | string |
+| `--apply` | — | `false` | bool |
+
+`--apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively. Designed for unattended workflows (cron jobs, bots that open PRs).
 
 ### `list`
 
@@ -212,6 +215,71 @@ When `--json` is set, commands print a single JSON object to stdout. The schemas
 }
 ```
 
+### `scan` — discovery (read-only, default `--json` mode)
+
+```json
+{
+  "status": "success",
+  "scannedPackages": 42,
+  "packagesWithPatches": 3,
+  "totalPatches": 5,
+  "freePatches": 4,
+  "paidPatches": 1,
+  "canAccessPaidPatches": false,
+  "packages": [
+    {
+      "purl": "pkg:npm/minimist@1.2.2",
+      "patches": [
+        { "uuid": "…", "purl": "pkg:npm/minimist@1.2.2", "tier": "free", "cveIds": ["CVE-…"], "ghsaIds": [], "severity": "high", "title": "…" }
+      ]
+    }
+  ],
+  "updates": [
+    { "purl": "pkg:npm/foo@1.0", "oldUuid": "<previous>", "newUuid": "<newest>" }
+  ]
+}
+```
+
+The `updates` array lists PURLs where the newest available patch UUID differs from the one currently recorded in `.socket/manifest.json`. Bots use this to drive "what would change" summaries without mutating anything.
+
+### `scan` — `--apply` mode
+
+When invoked as `scan --json --apply`, the discovery object above is augmented with a top-level `apply` sub-object reporting per-patch outcomes from the download + manifest write:
+
+```json
+{
+  "status": "success",                  // or "partial_failure"
+  "scannedPackages": 42,
+  // … all discovery fields above …
+  "updates": [ … ],
+  "apply": {
+    "found": 3,
+    "downloaded": 2,
+    "skipped": 1,
+    "failed": 0,
+    "applied": 2,
+    "updated": 1,
+    "patches": [
+      { "purl": "pkg:npm/foo@1.0", "uuid": "<new>", "action": "added" },
+      { "purl": "pkg:npm/bar@2.0", "uuid": "<new>", "action": "updated", "oldUuid": "<previous>" },
+      { "purl": "pkg:npm/baz@3.0", "uuid": "<existing>", "action": "skipped" },
+      { "purl": "pkg:npm/qux@4.0", "uuid": "<attempted>", "action": "failed", "error": "…" }
+    ]
+  }
+}
+```
+
+Per-patch `action` vocabulary is stable:
+
+| `action` | Meaning |
+|---|---|
+| `"added"` | PURL was not in the manifest before. |
+| `"updated"` | PURL was in the manifest with a different UUID. `oldUuid` is included. |
+| `"skipped"` | PURL was in the manifest with the same UUID. No work was done. |
+| `"failed"` | The patch could not be downloaded or saved. `error` is included. |
+
+Exit code follows the apply outcome: `0` if every selected patch was added, updated, or skipped; `1` if any `failed` record is present (and `status` becomes `"partial_failure"`).
+
 ## Exit codes
 
 | Code | Meaning |
@@ -235,11 +303,13 @@ Versioning lives in **`Cargo.toml`** at the workspace root (`version = "..."`) a
 | Change an exit code's meaning or add a new non-zero code with different semantics | **MAJOR** |
 | Rename a JSON output key or change a `status` string | **MAJOR** |
 | Remove a JSON output key | **MAJOR** |
+| Rename or remove a per-patch `action` value (`added`/`updated`/`skipped`/`failed`) | **MAJOR** |
 | Drop the bare-UUID fallback | **MAJOR** |
 | Add a *required* new flag | **MAJOR** |
 | Add a new subcommand | **MINOR** |
 | Add a new optional flag | **MINOR** |
 | Add a new optional JSON output key (additive) | **MINOR** |
+| Add a new value to a per-patch `action` enum (additive) | **MINOR** |
 | Add a new visible alias to an existing subcommand | **MINOR** |
 | Fix a bug without changing any of the above | **PATCH** |
 

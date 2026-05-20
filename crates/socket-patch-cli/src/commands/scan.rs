@@ -2,7 +2,8 @@ use clap::Args;
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
+use socket_patch_core::manifest::schema::PatchManifest;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -12,6 +13,49 @@ use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tt
 use super::get::{download_and_apply_patches, select_patches, DownloadParams};
 
 const DEFAULT_BATCH_SIZE: usize = 100;
+
+/// Surfaced in `scan --json` output. Tells a bot which PURLs in the discovery
+/// would replace an existing manifest entry with a newer UUID. Stable schema —
+/// see CLI_CONTRACT.md (`scan` JSON output / `updates` field).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct UpdateInfo {
+    pub purl: String,
+    pub old_uuid: String,
+    pub new_uuid: String,
+}
+
+/// Cross-reference an existing manifest against discovery results to find
+/// PURLs whose newest available patch UUID differs from the locally-recorded
+/// one. Used by both the discovery JSON path and the table-print path.
+/// Pure / no I/O so it's unit-testable.
+pub(crate) fn detect_updates(
+    existing_manifest: Option<&PatchManifest>,
+    packages: &[BatchPackagePatches],
+) -> Vec<UpdateInfo> {
+    let Some(manifest) = existing_manifest else {
+        return Vec::new();
+    };
+    let mut updates = Vec::new();
+    for pkg in packages {
+        let Some(existing) = manifest.patches.get(&pkg.purl) else {
+            continue;
+        };
+        // Treat the first patch in the batch as the candidate the apply path
+        // would resolve to (mirrors `select_patches` ordering — newest-first
+        // for paid users, single-patch auto-select for free).
+        let Some(candidate) = pkg.patches.first() else {
+            continue;
+        };
+        if candidate.uuid != existing.uuid {
+            updates.push(UpdateInfo {
+                purl: pkg.purl.clone(),
+                old_uuid: existing.uuid.clone(),
+                new_uuid: candidate.uuid.clone(),
+            });
+        }
+    }
+    updates
+}
 
 #[derive(Args)]
 pub struct ScanArgs {
@@ -60,6 +104,16 @@ pub struct ScanArgs {
     /// tarball; `file` falls back to legacy per-file blob downloads.
     #[arg(long = "download-mode", default_value = "diff")]
     pub download_mode: String,
+
+    /// Download and apply selected patches in JSON mode (non-interactive).
+    /// Without this flag, `scan --json` is read-only — it lists available
+    /// patches plus an `updates` array but does not mutate the manifest.
+    /// Designed for unattended workflows (cron jobs, bots that open PRs);
+    /// pair with `--yes` for clarity though `--json` already implies non-
+    /// interactive confirmation. No effect outside `--json` mode (the
+    /// non-JSON path always prompts the user).
+    #[arg(long, default_value_t = false)]
+    pub apply: bool,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -133,6 +187,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                     "paidPatches": 0,
                     "canAccessPaidPatches": false,
                     "packages": [],
+                    "updates": [],
                 }))
                 .unwrap()
             );
@@ -261,8 +316,15 @@ pub async fn run(args: ScanArgs) -> i32 {
     }
     let total_patches = free_patches + paid_patches;
 
+    // Read existing manifest once for update detection. Used by both the
+    // JSON-mode emission (always includes an `updates` array) and the
+    // non-JSON table-print path (counts `updates_available`).
+    let manifest_path = resolve_manifest_path(&args.cwd, ".socket/manifest.json");
+    let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
+    let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
+
     if args.json {
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
             "packagesWithPatches": all_packages_with_patches.len(),
@@ -271,7 +333,75 @@ pub async fn run(args: ScanArgs) -> i32 {
             "paidPatches": paid_patches,
             "canAccessPaidPatches": can_access_paid_patches,
             "packages": all_packages_with_patches,
+            "updates": updates.iter().map(|u| serde_json::json!({
+                "purl": u.purl,
+                "oldUuid": u.old_uuid,
+                "newUuid": u.new_uuid,
+            })).collect::<Vec<_>>(),
         });
+
+        // --apply opts JSON callers into the full discover → select → apply
+        // pipeline. Without it `scan --json` stays read-only (the prior
+        // contract). When --apply is set we delegate to the same selection
+        // and download path the non-JSON branch uses below, then graft the
+        // apply summary onto the discovery result as a sub-object.
+        if args.apply && !all_packages_with_patches.is_empty() {
+            let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+            for pkg in &all_packages_with_patches {
+                match api_client
+                    .search_patches_by_package(effective_org_slug, &pkg.purl)
+                    .await
+                {
+                    Ok(response) => all_search_results.extend(response.patches),
+                    Err(_) => continue,
+                }
+            }
+
+            let selected = match select_patches(&all_search_results, can_access_paid_patches, true) {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+
+            if selected.is_empty() {
+                result["apply"] = serde_json::json!({
+                    "found": 0,
+                    "downloaded": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "applied": 0,
+                    "updated": 0,
+                    "patches": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                return 0;
+            }
+
+            let params = DownloadParams {
+                cwd: args.cwd.clone(),
+                org: args.org.clone(),
+                save_only: false,
+                one_off: false,
+                global: args.global,
+                global_prefix: args.global_prefix.clone(),
+                json: true,
+                silent: true,
+                download_mode: args.download_mode.clone(),
+            };
+            let (apply_code, apply_json) = download_and_apply_patches(&selected, &params).await;
+            // Strip the `status` field — the outer scan JSON owns it. Keep
+            // everything else so bots can summarize per-patch outcomes.
+            let mut apply_obj = apply_json;
+            if let Some(obj) = apply_obj.as_object_mut() {
+                obj.remove("status");
+            }
+            result["apply"] = apply_obj;
+            if apply_code != 0 {
+                result["status"] = serde_json::json!("partial_failure");
+            }
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            return apply_code;
+        }
+
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         return 0;
     }
@@ -283,9 +413,6 @@ pub async fn run(args: ScanArgs) -> i32 {
         return 0;
     }
 
-    // Check manifest for existing patches (update detection)
-    let manifest_path = args.cwd.join(".socket").join("manifest.json");
-    let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
     let mut updates_available = 0usize;
 
     // Print table
@@ -574,12 +701,160 @@ pub async fn run(args: ScanArgs) -> i32 {
     code
 }
 
-fn severity_order(s: &str) -> u8 {
+pub(crate) fn severity_order(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
         "critical" => 0,
         "high" => 1,
         "medium" => 2,
         "low" => 3,
         _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::api::types::{BatchPackagePatches, BatchPatchInfo};
+    use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+    use std::collections::HashMap;
+
+    // ---- severity_order ----------------------------------------------------
+
+    #[test]
+    fn severity_order_critical_is_zero() {
+        assert_eq!(severity_order("critical"), 0);
+    }
+
+    #[test]
+    fn severity_order_is_case_insensitive() {
+        assert_eq!(severity_order("Critical"), 0);
+        assert_eq!(severity_order("CRITICAL"), 0);
+        assert_eq!(severity_order("High"), 1);
+    }
+
+    #[test]
+    fn severity_order_known_levels() {
+        assert_eq!(severity_order("high"), 1);
+        assert_eq!(severity_order("medium"), 2);
+        assert_eq!(severity_order("low"), 3);
+    }
+
+    #[test]
+    fn severity_order_unknown_is_four() {
+        assert_eq!(severity_order("unknown"), 4);
+        assert_eq!(severity_order(""), 4);
+        assert_eq!(severity_order("informational"), 4);
+    }
+
+    // ---- detect_updates -----------------------------------------------------
+
+    fn manifest_with(entries: &[(&str, &str)]) -> PatchManifest {
+        let mut m = PatchManifest::new();
+        for (purl, uuid) in entries {
+            m.patches.insert(
+                (*purl).to_string(),
+                PatchRecord {
+                    uuid: (*uuid).to_string(),
+                    exported_at: String::new(),
+                    files: HashMap::new(),
+                    vulnerabilities: HashMap::new(),
+                    description: String::new(),
+                    license: String::new(),
+                    tier: "free".to_string(),
+                },
+            );
+        }
+        m
+    }
+
+    fn batch_with(purl: &str, uuids: &[&str]) -> BatchPackagePatches {
+        BatchPackagePatches {
+            purl: purl.to_string(),
+            patches: uuids
+                .iter()
+                .map(|u| BatchPatchInfo {
+                    uuid: (*u).to_string(),
+                    purl: purl.to_string(),
+                    tier: "free".to_string(),
+                    cve_ids: Vec::new(),
+                    ghsa_ids: Vec::new(),
+                    severity: None,
+                    title: String::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn detect_updates_returns_empty_when_no_manifest() {
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
+        assert!(detect_updates(None, &pkgs).is_empty());
+    }
+
+    #[test]
+    fn detect_updates_returns_empty_for_empty_packages() {
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        assert!(detect_updates(Some(&m), &[]).is_empty());
+    }
+
+    #[test]
+    fn detect_updates_returns_empty_when_no_overlap() {
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:npm/bar@2.0", &["uuid-z"])];
+        assert!(detect_updates(Some(&m), &pkgs).is_empty());
+    }
+
+    #[test]
+    fn detect_updates_skips_same_uuid() {
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
+        assert!(detect_updates(Some(&m), &pkgs).is_empty());
+    }
+
+    #[test]
+    fn detect_updates_flags_different_uuid() {
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-b"])];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].purl, "pkg:npm/foo@1.0");
+        assert_eq!(updates[0].old_uuid, "uuid-a");
+        assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    #[test]
+    fn detect_updates_reports_multiple_updates() {
+        let m = manifest_with(&[
+            ("pkg:npm/foo@1.0", "uuid-a"),
+            ("pkg:npm/bar@2.0", "uuid-c"),
+        ]);
+        let pkgs = vec![
+            batch_with("pkg:npm/foo@1.0", &["uuid-b"]),
+            batch_with("pkg:npm/bar@2.0", &["uuid-d"]),
+        ];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
+    fn detect_updates_skips_packages_with_empty_patch_list() {
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        // No candidate patches means we can't tell what the new UUID would
+        // be, so there's nothing to compare against. Correct behavior is to
+        // skip these silently.
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &[])];
+        assert!(detect_updates(Some(&m), &pkgs).is_empty());
+    }
+
+    #[test]
+    fn detect_updates_uses_first_patch_as_candidate() {
+        // `detect_updates` mirrors `select_patches` by picking the first
+        // patch in the batch as the candidate UUID. Locking this in so a
+        // future select_patches refactor doesn't silently drift the two.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-b", "uuid-c"])];
+        let updates = detect_updates(Some(&m), &pkgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].new_uuid, "uuid-b");
     }
 }
