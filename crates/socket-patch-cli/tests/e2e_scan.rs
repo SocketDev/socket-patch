@@ -1,15 +1,17 @@
 //! End-to-end tests for the `scan` subcommand against the real Socket API.
 //!
-//! Exercises the `scan --apply` + GC pipeline introduced in v3.0:
+//! Exercises the `scan --apply` + opt-in GC pipeline introduced in v3.0:
 //!
 //! * `scan --json --apply --yes` adds, updates, and skips patches based on
 //!   the existing manifest, emitting the `apply.patches[]` action vocabulary
 //!   (`"added"`, `"updated"`, `"skipped"`).
 //! * Read-only `scan --json` emits the `updates` array (PURLs whose UUID
-//!   would change) and a non-mutating `gc` preview.
-//! * GC runs by default after apply — prunes manifest entries for
-//!   uninstalled packages, sweeps orphan blob files.
-//! * `--no-prune` opts out of all GC.
+//!   would change) and does NOT emit a `gc` field by default.
+//! * `--prune` opts into garbage collection (manifest pruning + orphan
+//!   file cleanup). Without it, scan leaves the manifest alone.
+//! * `--sync` is sugar for `--apply --prune` — the canonical bot mode.
+//! * `--dry-run` previews `--apply` / `--prune` / `--sync` actions
+//!   without mutating disk.
 //!
 //! Uses the same minimist@1.2.2 patch fixture as `e2e_npm.rs`. Tests are
 //! marked `#[ignore]` so they only run with `--ignored`, matching the
@@ -375,12 +377,13 @@ fn test_scan_json_read_only_no_mutation() {
     );
 }
 
-/// When a previously-patched package is uninstalled, the next
-/// `scan --apply --yes` should prune its manifest entry and sweep the
-/// orphan blobs. JSON output reports it in `gc.prunedManifestEntries`.
+/// When a previously-patched package is uninstalled, passing `--prune`
+/// (or `--sync`) on the next `scan --apply --yes` prunes its manifest
+/// entry and sweeps the orphan blobs. JSON output reports it in
+/// `gc.prunedManifestEntries`.
 #[test]
 #[ignore]
-fn test_scan_apply_prunes_uninstalled_package_by_default() {
+fn test_scan_apply_prune_prunes_uninstalled_package() {
     if !has_command("npm") {
         eprintln!("SKIP: npm not found on PATH");
         return;
@@ -390,20 +393,19 @@ fn test_scan_apply_prunes_uninstalled_package_by_default() {
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
-    // First run — patch is added.
+    // First run — patch is added (no --prune needed for the apply step).
     assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
     assert!(cwd.join(".socket/manifest.json").exists());
 
-    // Simulate uninstall: drop minimist from package.json + node_modules.
     npm_run(cwd, &["uninstall", "minimist"]);
     // Reinstall a placeholder package so the crawl still finds *something*
-    // (`scan` with zero scanned packages skips GC entirely).
+    // (scan with zero scanned packages skips GC entirely).
     npm_run(cwd, &["install", "left-pad@1.3.0"]);
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
-        "scan after uninstall",
+        &["scan", "--json", "--apply", "--yes", "--prune"],
+        "scan with --prune after uninstall",
     );
     let v = parse_scan_json(&stdout);
 
@@ -422,12 +424,12 @@ fn test_scan_apply_prunes_uninstalled_package_by_default() {
     );
 }
 
-/// `--no-prune` opts out of GC entirely: manifest entries for
-/// uninstalled packages survive, and the `gc` sub-object reports
-/// `skipped: true`.
+/// Default `scan --apply --yes` (no `--prune`) leaves manifest entries
+/// for uninstalled packages alone. The `gc` field is omitted entirely
+/// from JSON output — users wanting cleanup must opt in.
 #[test]
 #[ignore]
-fn test_scan_apply_no_prune_keeps_uninstalled_entries() {
+fn test_scan_apply_default_keeps_uninstalled_entries() {
     if !has_command("npm") {
         eprintln!("SKIP: npm not found on PATH");
         return;
@@ -443,25 +445,30 @@ fn test_scan_apply_no_prune_keeps_uninstalled_entries() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes", "--no-prune"],
-        "scan with --no-prune",
+        &["scan", "--json", "--apply", "--yes"],
+        "scan without --prune",
     );
     let v = parse_scan_json(&stdout);
 
-    assert_eq!(v["gc"]["skipped"], true, "gc should report skipped: true");
+    assert!(
+        v.get("gc").is_none() || v["gc"].is_null(),
+        "gc field must be omitted when --prune is not set; got {}",
+        v["gc"]
+    );
 
     let manifest = read_manifest_file(cwd);
     assert!(
         !manifest["patches"][NPM_PURL].is_null(),
-        "minimist entry should survive when --no-prune is set"
+        "minimist entry must survive when --prune is not set"
     );
 }
 
 /// Even without manifest changes, a stray orphan blob file in
-/// `.socket/blobs/` is removed by the next `scan --apply --yes`.
+/// `.socket/blobs/` is removed by the next `scan --apply --yes --prune`
+/// (GC must be opt-in via `--prune` or `--sync`).
 #[test]
 #[ignore]
-fn test_scan_apply_cleans_orphan_blobs() {
+fn test_scan_apply_prune_cleans_orphan_blobs() {
     if !has_command("npm") {
         eprintln!("SKIP: npm not found on PATH");
         return;
@@ -482,8 +489,8 @@ fn test_scan_apply_cleans_orphan_blobs() {
 
     let (stdout, _) = assert_run_ok(
         cwd,
-        &["scan", "--json", "--apply", "--yes"],
-        "scan with orphan blob present",
+        &["scan", "--json", "--apply", "--yes", "--prune"],
+        "scan --prune with orphan blob present",
     );
     let v = parse_scan_json(&stdout);
 
@@ -497,13 +504,70 @@ fn test_scan_apply_cleans_orphan_blobs() {
     assert!(!orphan.exists(), "orphan blob should be deleted");
 }
 
-/// Read-only `scan --json` previews GC actions without performing them:
-/// the `gc.prunableManifestEntries` lists what *would* be pruned, and
-/// `gc.orphanBlobs` counts what *would* be reaped. Nothing changes on
-/// disk afterward.
+/// `scan --json --dry-run --sync --yes` previews the full sync action:
+/// `apply.patches[]` is populated with would-be actions and `gc`
+/// reports `prunable*`/`orphan*` counts, but nothing on disk changes.
 #[test]
 #[ignore]
-fn test_scan_json_read_only_gc_preview() {
+fn test_scan_dry_run_sync_previews_apply_and_gc() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+    // Set up: apply once to create a manifest, then uninstall + plant
+    // an orphan so there's prune + cleanup work to preview.
+    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+
+    npm_run(cwd, &["uninstall", "minimist"]);
+    npm_run(cwd, &["install", "left-pad@1.3.0"]);
+
+    let blobs_dir = cwd.join(".socket/blobs");
+    let orphan = blobs_dir.join(FAKE_ORPHAN_HASH);
+    std::fs::write(&orphan, b"junk").expect("plant orphan");
+
+    // Capture pre-state to verify dry-run is non-mutating.
+    let pre_manifest = read_manifest_file(cwd);
+
+    let (stdout, _) = assert_run_ok(
+        cwd,
+        &["scan", "--json", "--dry-run", "--sync", "--yes"],
+        "scan --dry-run --sync",
+    );
+    let v = parse_scan_json(&stdout);
+
+    // Preview output present.
+    let prunable = v["gc"]["prunableManifestEntries"]
+        .as_array()
+        .expect("gc.prunableManifestEntries array");
+    assert!(
+        prunable.iter().any(|p| p == NPM_PURL),
+        "preview should list minimist as prunable; got {prunable:?}"
+    );
+    assert!(
+        v["gc"]["orphanBlobs"].as_u64().unwrap_or(0) >= 1,
+        "preview should count at least 1 orphan blob"
+    );
+    assert_eq!(v["apply"]["dryRun"], true);
+
+    // Verify non-mutation.
+    assert!(orphan.exists(), "dry-run must not delete orphan blob");
+    let post_manifest = read_manifest_file(cwd);
+    assert_eq!(
+        pre_manifest, post_manifest,
+        "dry-run must leave manifest exactly as it was"
+    );
+}
+
+/// `scan --json` (no `--prune`/`--sync`) emits NO `gc` field, even when
+/// the manifest has prunable entries and there are orphan files on
+/// disk. GC information is opt-in per the v3.0 contract.
+#[test]
+#[ignore]
+fn test_scan_json_no_gc_field_without_prune() {
     if !has_command("npm") {
         eprintln!("SKIP: npm not found on PATH");
         return;
@@ -521,30 +585,73 @@ fn test_scan_json_read_only_gc_preview() {
     let orphan = blobs_dir.join(FAKE_ORPHAN_HASH);
     std::fs::write(&orphan, b"junk").expect("plant orphan");
 
-    let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (preview)");
+    let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no prune)");
     let v = parse_scan_json(&stdout);
 
-    let prunable = v["gc"]["prunableManifestEntries"]
+    assert!(
+        v.get("gc").is_none() || v["gc"].is_null(),
+        "scan --json must NOT emit gc when --prune is not set; got {}",
+        v["gc"]
+    );
+}
+
+/// `scan --json --sync --yes` does the full sync — discover + apply +
+/// prune + sweep — in one invocation. Mirrors what an auto-update bot
+/// would run as the single command.
+#[test]
+#[ignore]
+fn test_scan_sync_yes_full_lifecycle() {
+    if !has_command("npm") {
+        eprintln!("SKIP: npm not found on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    write_package_json(cwd);
+    npm_run(cwd, &["install", "minimist@1.2.2"]);
+
+    // Run 1: --sync adds the patch (no prior state to prune).
+    let (stdout1, _) = assert_run_ok(
+        cwd,
+        &["scan", "--json", "--sync", "--yes"],
+        "first --sync apply",
+    );
+    let v1 = parse_scan_json(&stdout1);
+    let patches = v1["apply"]["patches"]
         .as_array()
-        .expect("gc.prunableManifestEntries array");
+        .expect("first sync should populate apply.patches");
     assert!(
-        prunable.iter().any(|p| p == NPM_PURL),
-        "preview should list minimist as prunable; got {prunable:?}"
+        patches.iter().any(|p| p["purl"] == NPM_PURL && p["action"] == "added"),
+        "first sync should add the minimist patch"
     );
+    // gc field should be present (--sync implies --prune) but empty.
+    assert!(v1["gc"].is_object(), "gc must be emitted under --sync");
 
-    let orphan_blobs = v["gc"]["orphanBlobs"]
-        .as_u64()
-        .expect("gc.orphanBlobs is a count");
+    // Uninstall + plant orphan, then run --sync again.
+    npm_run(cwd, &["uninstall", "minimist"]);
+    npm_run(cwd, &["install", "left-pad@1.3.0"]);
+    let blobs_dir = cwd.join(".socket/blobs");
+    let orphan = blobs_dir.join(FAKE_ORPHAN_HASH);
+    std::fs::write(&orphan, b"junk").expect("plant orphan");
+
+    // Run 2: --sync prunes minimist + sweeps the orphan.
+    let (stdout2, _) = assert_run_ok(
+        cwd,
+        &["scan", "--json", "--sync", "--yes"],
+        "second --sync after uninstall",
+    );
+    let v2 = parse_scan_json(&stdout2);
+    let pruned = v2["gc"]["prunedManifestEntries"]
+        .as_array()
+        .expect("gc.prunedManifestEntries array");
     assert!(
-        orphan_blobs >= 1,
-        "preview should count at least 1 orphan blob, got {orphan_blobs}"
+        pruned.iter().any(|p| p == NPM_PURL),
+        "minimist should be pruned by --sync after uninstall; got {pruned:?}"
     );
-
-    // Preview is non-mutating: orphan + manifest entry must still be there.
-    assert!(orphan.exists(), "preview must not delete orphan blob");
+    assert!(!orphan.exists(), "orphan should be reaped");
     let manifest = read_manifest_file(cwd);
     assert!(
-        !manifest["patches"][NPM_PURL].is_null(),
-        "preview must not prune the manifest"
+        manifest["patches"][NPM_PURL].is_null(),
+        "manifest must not retain minimist after --sync prune"
     );
 }

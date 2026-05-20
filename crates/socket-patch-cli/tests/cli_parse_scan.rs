@@ -56,7 +56,9 @@ fn defaults_match_contract() {
     assert_eq!(args.api_token, None);
     assert_eq!(args.ecosystems, None);
     assert!(!args.apply, "--apply default is false (scan --json stays read-only)");
-    assert!(!args.no_prune, "--no-prune default is false (GC is on by default in v3.0)");
+    assert!(!args.prune, "--prune default is false (GC is opt-in in v3.0)");
+    assert!(!args.sync, "--sync default is false");
+    assert!(!args.dry_run, "--dry-run default is false");
 }
 
 #[test]
@@ -228,21 +230,54 @@ fn apply_flag_combines_with_json_and_yes() {
     assert!(args.yes);
 }
 
-// --- `--no-prune` flag (v3.0 GC opt-out) ----------------------------------
+// --- `--prune` / `--sync` / `--dry-run` flags (v3.0 GC opt-in) ------------
+//
+// `--prune` opts into GC. `--sync` is sugar for `--apply --prune`.
+// `--dry-run` (`-d`) previews what those flags would do without mutating.
 
 #[test]
-fn no_prune_flag_long_form() {
-    let args = parse_scan(&["--no-prune"]);
-    assert!(args.no_prune);
+fn prune_flag_long_form() {
+    let args = parse_scan(&["--prune"]);
+    assert!(args.prune);
 }
 
 #[test]
-fn no_prune_combines_with_apply_and_json() {
-    let args = parse_scan(&["--apply", "--json", "--yes", "--no-prune"]);
+fn prune_combines_with_apply_and_json() {
+    let args = parse_scan(&["--apply", "--json", "--yes", "--prune"]);
     assert!(args.apply);
     assert!(args.json);
     assert!(args.yes);
-    assert!(args.no_prune);
+    assert!(args.prune);
+}
+
+#[test]
+fn sync_flag_long_form() {
+    let args = parse_scan(&["--sync"]);
+    assert!(args.sync);
+    // --sync alone doesn't set --apply or --prune (the derivation
+    // happens inside scan::run, not at parser time).
+    assert!(!args.apply);
+    assert!(!args.prune);
+}
+
+#[test]
+fn sync_combines_with_json_and_yes() {
+    let args = parse_scan(&["--json", "--sync", "--yes"]);
+    assert!(args.json);
+    assert!(args.sync);
+    assert!(args.yes);
+}
+
+#[test]
+fn dry_run_long_form() {
+    let args = parse_scan(&["--dry-run"]);
+    assert!(args.dry_run);
+}
+
+#[test]
+fn dry_run_short_form() {
+    let args = parse_scan(&["-d"]);
+    assert!(args.dry_run);
 }
 
 #[test]
