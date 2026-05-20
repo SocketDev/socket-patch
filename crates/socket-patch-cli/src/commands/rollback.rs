@@ -5,7 +5,7 @@ use socket_patch_core::api::blob_fetcher::{
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::CrawlerOptions;
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
@@ -212,11 +212,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         return 1;
     }
 
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.json {
@@ -530,4 +526,72 @@ pub async fn rollback_patches(
         verbose: false,
     };
     rollback_patches_inner(&args, manifest_path).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+    use std::collections::HashMap;
+
+    fn make_record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "test patch".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    fn make_manifest() -> PatchManifest {
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        patches.insert("pkg:npm/bar@2.0".to_string(), make_record("uuid-bar"));
+        patches.insert("pkg:pypi/baz@3.0".to_string(), make_record("uuid-baz"));
+        PatchManifest { patches }
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_none_returns_all() {
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, None);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_purl_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_purl_no_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_uuid_match() {
+        let manifest = make_manifest();
+        let result = find_patches_to_rollback(&manifest, Some("uuid-bar"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].patch.uuid, "uuid-bar");
+        assert_eq!(result[0].purl, "pkg:npm/bar@2.0");
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_uuid_no_match() {
+        let manifest = make_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
+        assert!(result.is_empty());
+    }
 }

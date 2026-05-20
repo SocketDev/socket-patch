@@ -704,3 +704,128 @@ pub async fn find_packages_for_rollback(
 
     all_packages
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partition_purls_no_filter_single_npm() {
+        let purls = vec!["pkg:npm/foo@1.0".to_string()];
+        let map = partition_purls(&purls, None);
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&Ecosystem::Npm),
+            Some(&vec!["pkg:npm/foo@1.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn partition_purls_no_filter_mixed_ecosystems() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:pypi/bar@2.0".to_string(),
+            "pkg:cargo/baz@3.0".to_string(),
+        ];
+        let map = partition_purls(&purls, None);
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            map.get(&Ecosystem::Npm),
+            Some(&vec!["pkg:npm/foo@1.0".to_string()])
+        );
+        assert_eq!(
+            map.get(&Ecosystem::Pypi),
+            Some(&vec!["pkg:pypi/bar@2.0".to_string()])
+        );
+        #[cfg(feature = "cargo")]
+        assert_eq!(
+            map.get(&Ecosystem::Cargo),
+            Some(&vec!["pkg:cargo/baz@3.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn partition_purls_no_filter_empty_input() {
+        let purls: Vec<String> = Vec::new();
+        let map = partition_purls(&purls, None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn partition_purls_no_filter_duplicate_purls_preserved() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:npm/foo@1.0".to_string(),
+        ];
+        let map = partition_purls(&purls, None);
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&Ecosystem::Npm),
+            Some(&vec![
+                "pkg:npm/foo@1.0".to_string(),
+                "pkg:npm/foo@1.0".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn partition_purls_no_filter_unknown_ecosystem_dropped() {
+        let purls = vec!["pkg:weirdo/x@1".to_string()];
+        let map = partition_purls(&purls, None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn partition_purls_allow_list_excludes_one() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:pypi/bar@2.0".to_string(),
+        ];
+        let allowed = vec!["npm".to_string()];
+        let map = partition_purls(&purls, Some(allowed.as_slice()));
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get(&Ecosystem::Npm),
+            Some(&vec!["pkg:npm/foo@1.0".to_string()])
+        );
+        assert!(map.get(&Ecosystem::Pypi).is_none());
+    }
+
+    #[test]
+    fn partition_purls_allow_list_matches_none() {
+        let purls = vec!["pkg:npm/foo@1.0".to_string()];
+        let allowed = vec!["pypi".to_string()];
+        let map = partition_purls(&purls, Some(allowed.as_slice()));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn partition_purls_allow_list_matches_all() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:pypi/bar@2.0".to_string(),
+        ];
+        let allowed = vec!["npm".to_string(), "pypi".to_string()];
+        let map = partition_purls(&purls, Some(allowed.as_slice()));
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get(&Ecosystem::Npm),
+            Some(&vec!["pkg:npm/foo@1.0".to_string()])
+        );
+        assert_eq!(
+            map.get(&Ecosystem::Pypi),
+            Some(&vec!["pkg:pypi/bar@2.0".to_string()])
+        );
+    }
+
+    #[test]
+    fn partition_purls_empty_allow_list_matches_nothing() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:pypi/bar@2.0".to_string(),
+        ];
+        let allowed: Vec<String> = Vec::new();
+        let map = partition_purls(&purls, Some(allowed.as_slice()));
+        assert!(map.is_empty());
+    }
+}

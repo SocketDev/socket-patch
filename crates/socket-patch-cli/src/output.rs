@@ -95,3 +95,162 @@ pub fn select_one(prompt: &str, options: &[String], is_json: bool) -> Result<usi
         None => Err(SelectError::Cancelled),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- format_severity ----
+
+    #[test]
+    fn format_severity_critical_with_color() {
+        let out = format_severity("critical", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("critical"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("31"), "expected red code 31: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_high_with_color() {
+        let out = format_severity("high", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("high"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_medium_with_color() {
+        let out = format_severity("medium", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("medium"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("33"), "expected yellow code 33: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_low_with_color() {
+        let out = format_severity("low", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("low"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("36"), "expected cyan code 36: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_case_insensitive_critical_uppercase() {
+        let out = format_severity("CRITICAL", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("CRITICAL"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("31"), "expected red code 31: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_case_insensitive_critical_titlecase() {
+        let out = format_severity("Critical", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("Critical"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("31"), "expected red code 31: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_case_insensitive_high_lowercase() {
+        let out = format_severity("high", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("high"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_case_insensitive_high_uppercase() {
+        let out = format_severity("HIGH", true);
+        assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
+        assert!(out.contains("HIGH"), "expected input verbatim: {out:?}");
+        assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
+        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
+    }
+
+    #[test]
+    fn format_severity_unknown_passes_through_with_color() {
+        let out = format_severity("unknown", true);
+        assert_eq!(out, "unknown");
+    }
+
+    #[test]
+    fn format_severity_critical_no_color() {
+        assert_eq!(format_severity("critical", false), "critical");
+    }
+
+    #[test]
+    fn format_severity_high_no_color() {
+        assert_eq!(format_severity("high", false), "high");
+    }
+
+    #[test]
+    fn format_severity_medium_no_color() {
+        assert_eq!(format_severity("medium", false), "medium");
+    }
+
+    #[test]
+    fn format_severity_low_no_color() {
+        assert_eq!(format_severity("low", false), "low");
+    }
+
+    #[test]
+    fn format_severity_unknown_no_color() {
+        assert_eq!(format_severity("unknown", false), "unknown");
+    }
+
+    #[test]
+    fn format_severity_empty_with_color_passes_through() {
+        let out = format_severity("", true);
+        assert_eq!(out, "");
+    }
+
+    // ---- color ----
+
+    #[test]
+    fn color_with_color_on() {
+        assert_eq!(color("hi", "31", true), "\x1b[31mhi\x1b[0m");
+    }
+
+    #[test]
+    fn color_with_color_off() {
+        assert_eq!(color("hi", "31", false), "hi");
+    }
+
+    #[test]
+    fn color_with_empty_text_and_color_on() {
+        assert_eq!(color("", "1;32", true), "\x1b[1;32m\x1b[0m");
+    }
+
+    // ---- confirm ----
+
+    #[test]
+    fn confirm_skip_prompt_returns_default_yes_true() {
+        assert!(confirm("?", true, true, false));
+    }
+
+    #[test]
+    fn confirm_skip_prompt_returns_default_yes_false() {
+        assert!(!confirm("?", false, true, false));
+    }
+
+    #[test]
+    fn confirm_is_json_returns_default_yes_true() {
+        assert!(confirm("?", true, false, true));
+    }
+
+    #[test]
+    fn confirm_is_json_returns_default_yes_false() {
+        assert!(!confirm("?", false, false, true));
+    }
+
+    #[test]
+    fn confirm_skip_prompt_and_is_json_both_set_returns_default_yes() {
+        assert!(confirm("?", true, true, true));
+    }
+}
