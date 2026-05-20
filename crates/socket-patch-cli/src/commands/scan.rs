@@ -508,7 +508,25 @@ pub async fn run(args: ScanArgs) -> i32 {
         // pipeline. Without it `scan --json` stays read-only (the prior
         // contract). When --apply is set we delegate to the same selection
         // and download path the non-JSON branch uses below, then graft the
-        // apply summary onto the discovery result as a sub-object.
+        // apply summary onto the discovery result as a sub-object. GC
+        // *always* runs in apply mode — even when no new patches are
+        // available — so an uninstalled package gets pruned from the
+        // manifest on a subsequent scan.
+        if args.apply && all_packages_with_patches.is_empty() {
+            // Apply mode with nothing to download: still emit an `apply`
+            // sub-object for shape stability + run mutating GC.
+            result["apply"] = serde_json::json!({
+                "found": 0, "downloaded": 0, "skipped": 0,
+                "failed": 0, "applied": 0, "updated": 0,
+                "patches": [],
+            });
+            result["gc"] =
+                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, args.no_prune)
+                    .await
+                    .to_apply_json();
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            return 0;
+        }
         if args.apply && !all_packages_with_patches.is_empty() {
             let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
             for pkg in &all_packages_with_patches {

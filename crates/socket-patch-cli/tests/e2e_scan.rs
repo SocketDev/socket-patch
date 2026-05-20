@@ -35,14 +35,13 @@ use sha2::{Digest, Sha256};
 // that the existing suite explicitly avoided).
 // ---------------------------------------------------------------------------
 
-const NPM_UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 
 /// Git SHA-256 of the *unpatched* `index.js` shipped with minimist 1.2.2.
+/// Used to assert "file was patched" (no longer matches BEFORE_HASH).
+/// The specific `AFTER_HASH` isn't pinned here because the upstream API
+/// can serve multiple free patches over time with different fix bytes.
 const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe385e838b67a10";
-
-/// Git SHA-256 of the *patched* `index.js` after the security fix.
-const AFTER_HASH: &str = "043f04d19e884aa5f8371428718d2a3f27a0d231afe77a2620ac6312f80aaa28";
 
 /// 64-hex-char placeholder used for orphan-blob fixtures. Not a real
 /// blob hash — picked so it can't accidentally collide with anything
