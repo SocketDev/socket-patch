@@ -1,7 +1,18 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchManifest;
+
+/// Resolve a manifest path: absolute paths are returned as-is, relative paths
+/// are joined to `cwd`. Centralizes the duplicate block previously inlined in
+/// apply/rollback/list/remove/repair commands.
+pub fn resolve_manifest_path(cwd: &Path, manifest_path: &str) -> PathBuf {
+    if Path::new(manifest_path).is_absolute() {
+        PathBuf::from(manifest_path)
+    } else {
+        cwd.join(manifest_path)
+    }
+}
 
 /// Get all blob hashes referenced by a manifest (both beforeHash and afterHash).
 /// Used for garbage collection and validation.
@@ -456,5 +467,31 @@ mod tests {
         assert!(read_back.is_some());
         let read_back = read_back.unwrap();
         assert_eq!(read_back.patches.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_manifest_path_relative_joins_cwd() {
+        let cwd = Path::new("/tmp/proj");
+        let resolved = resolve_manifest_path(cwd, ".socket/manifest.json");
+        assert_eq!(resolved, PathBuf::from("/tmp/proj/.socket/manifest.json"));
+    }
+
+    #[test]
+    fn test_resolve_manifest_path_absolute_unchanged() {
+        let cwd = Path::new("/tmp/proj");
+        let absolute = if cfg!(windows) {
+            r"C:\custom\manifest.json"
+        } else {
+            "/etc/custom/manifest.json"
+        };
+        let resolved = resolve_manifest_path(cwd, absolute);
+        assert_eq!(resolved, PathBuf::from(absolute));
+    }
+
+    #[test]
+    fn test_resolve_manifest_path_relative_dotted() {
+        let cwd = Path::new("/tmp/proj");
+        let resolved = resolve_manifest_path(cwd, "../manifest.json");
+        assert_eq!(resolved, PathBuf::from("/tmp/proj/../manifest.json"));
     }
 }

@@ -1,7 +1,7 @@
 use clap::Args;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::manifest::operations::read_manifest;
-use std::path::{Path, PathBuf};
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -19,11 +19,7 @@ pub struct ListArgs {
 }
 
 pub async fn run(args: ListArgs) -> i32 {
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     // Check if manifest exists
     if tokio::fs::metadata(&manifest_path).await.is_err() {

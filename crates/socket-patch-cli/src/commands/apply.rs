@@ -6,7 +6,7 @@ use socket_patch_core::api::blob_fetcher::{
 use socket_patch_core::api::client::get_api_client_from_env;
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
@@ -113,11 +113,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    let manifest_path = if Path::new(&args.manifest_path).is_absolute() {
-        PathBuf::from(&args.manifest_path)
-    } else {
-        args.cwd.join(&args.manifest_path)
-    };
+    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {
@@ -621,4 +617,185 @@ async fn apply_patches_inner(
     }
 
     Ok((!has_errors, results, unmatched))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-helper tests for the `apply` subcommand. These pin the JSON
+    //! key shape produced by `result_to_json` and the lowercase string
+    //! tags emitted by `verify_status_str` — both part of the public
+    //! contract documented in `CLI_CONTRACT.md`.
+    use super::*;
+    use socket_patch_core::patch::apply::{
+        ApplyResult, AppliedVia, VerifyResult, VerifyStatus,
+    };
+
+    // -----------------------------------------------------------------
+    // verify_status_str — every VerifyStatus variant must map to the
+    // exact lowercase tag documented in the JSON contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verify_status_str_ready() {
+        assert_eq!(verify_status_str(&VerifyStatus::Ready), "ready");
+    }
+
+    #[test]
+    fn verify_status_str_already_patched() {
+        assert_eq!(
+            verify_status_str(&VerifyStatus::AlreadyPatched),
+            "already_patched"
+        );
+    }
+
+    #[test]
+    fn verify_status_str_hash_mismatch() {
+        assert_eq!(
+            verify_status_str(&VerifyStatus::HashMismatch),
+            "hash_mismatch"
+        );
+    }
+
+    #[test]
+    fn verify_status_str_not_found() {
+        assert_eq!(verify_status_str(&VerifyStatus::NotFound), "not_found");
+    }
+
+    // -----------------------------------------------------------------
+    // result_to_json — top-level keys and filesVerified[0] keys are part
+    // of the JSON output contract. Wrappers and CI scripts read these.
+    // -----------------------------------------------------------------
+
+    /// Build an `ApplyResult` with a single fully-populated VerifyResult
+    /// so we can exercise every JSON key in one shot.
+    fn sample_result_with_verify(status: VerifyStatus) -> ApplyResult {
+        ApplyResult {
+            package_key: "pkg:npm/minimist@1.2.2".to_string(),
+            package_path: "/tmp/node_modules/minimist".to_string(),
+            success: true,
+            files_verified: vec![VerifyResult {
+                file: "package/index.js".to_string(),
+                status,
+                message: Some("ok".to_string()),
+                current_hash: Some("aaa".to_string()),
+                expected_hash: Some("bbb".to_string()),
+                target_hash: Some("ccc".to_string()),
+            }],
+            files_patched: vec!["package/index.js".to_string()],
+            applied_via: HashMap::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn result_to_json_top_level_keys() {
+        let result = sample_result_with_verify(VerifyStatus::Ready);
+        let v = result_to_json(&result);
+        let obj = v.as_object().expect("top-level must be a JSON object");
+
+        // The exact set of top-level keys is contract; any addition or
+        // rename here is a breaking change for downstream wrappers.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "appliedVia",
+                "error",
+                "filesPatched",
+                "filesVerified",
+                "path",
+                "purl",
+                "success",
+            ]
+        );
+
+        // Spot-check value mapping for the simple scalar fields.
+        assert_eq!(v["purl"], "pkg:npm/minimist@1.2.2");
+        assert_eq!(v["path"], "/tmp/node_modules/minimist");
+        assert_eq!(v["success"], true);
+        assert_eq!(v["error"], serde_json::Value::Null);
+        assert_eq!(v["filesPatched"][0], "package/index.js");
+    }
+
+    #[test]
+    fn result_to_json_files_verified_entry_keys() {
+        let result = sample_result_with_verify(VerifyStatus::Ready);
+        let v = result_to_json(&result);
+        let entry = v["filesVerified"][0]
+            .as_object()
+            .expect("filesVerified[0] must be a JSON object");
+
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "currentHash",
+                "expectedHash",
+                "file",
+                "message",
+                "status",
+                "targetHash",
+            ]
+        );
+
+        assert_eq!(v["filesVerified"][0]["file"], "package/index.js");
+        assert_eq!(v["filesVerified"][0]["status"], "ready");
+        assert_eq!(v["filesVerified"][0]["message"], "ok");
+        assert_eq!(v["filesVerified"][0]["currentHash"], "aaa");
+        assert_eq!(v["filesVerified"][0]["expectedHash"], "bbb");
+        assert_eq!(v["filesVerified"][0]["targetHash"], "ccc");
+    }
+
+    #[test]
+    fn result_to_json_hash_mismatch_status_tag() {
+        // The `hash_mismatch` snake_case tag is the contract value.
+        // `verify_status_str` produces it; verify it survives the round
+        // trip through `result_to_json`.
+        let result = sample_result_with_verify(VerifyStatus::HashMismatch);
+        let v = result_to_json(&result);
+        assert_eq!(v["filesVerified"][0]["status"], "hash_mismatch");
+    }
+
+    #[test]
+    fn result_to_json_applied_via_uses_camel_case_key() {
+        // `appliedVia` must be camelCase in JSON output, not snake_case
+        // `applied_via`. This is divergent from the Rust struct field
+        // name and is part of the contract — wrappers parse this key.
+        let mut applied_via = HashMap::new();
+        applied_via.insert("package/index.js".to_string(), AppliedVia::Diff);
+        applied_via.insert("package/lib/foo.js".to_string(), AppliedVia::Package);
+
+        let result = ApplyResult {
+            package_key: "pkg:npm/minimist@1.2.2".to_string(),
+            package_path: "/tmp/node_modules/minimist".to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: vec![
+                "package/index.js".to_string(),
+                "package/lib/foo.js".to_string(),
+            ],
+            applied_via,
+            error: None,
+        };
+        let v = result_to_json(&result);
+
+        // Key must be `appliedVia`, not `applied_via`.
+        assert!(v.get("appliedVia").is_some());
+        assert!(v.get("applied_via").is_none());
+
+        // Value must serialize as a JSON object map (not array).
+        let map = v["appliedVia"]
+            .as_object()
+            .expect("appliedVia must serialize as a JSON object");
+        assert_eq!(map.len(), 2);
+        // The lowercase tags from `AppliedVia::as_tag` are themselves
+        // contract values (`diff`, `package`, `blob`).
+        assert_eq!(map.get("package/index.js").and_then(|v| v.as_str()), Some("diff"));
+        assert_eq!(
+            map.get("package/lib/foo.js").and_then(|v| v.as_str()),
+            Some("package"),
+        );
+    }
 }
