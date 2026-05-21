@@ -19,9 +19,7 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
-          components: clippy
+        # toolchain version + components are read from rust-toolchain.toml.
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -50,8 +48,7 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # toolchain version is read from rust-toolchain.toml (exact-pinned).
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -79,8 +76,7 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # toolchain version is read from rust-toolchain.toml (exact-pinned).
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -95,6 +91,81 @@ jobs:
       - name: Run tests (release)
         run: cargo test --workspace --all-features --release
 
+  coverage:
+    # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
+    # Reports as a markdown table in the job summary and uploads the raw
+    # lcov.info file as a workflow artifact. No threshold gating — this is
+    # report-only so contributors get visibility without flaky CI when
+    # coverage shifts naturally with test edits.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          # `llvm-tools-preview` is what cargo-llvm-cov uses to merge
+          # `.profraw` files and emit lcov. The toolchain channel itself
+          # is read from `rust-toolchain.toml`.
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        # taiki-e/install-action ships precompiled binaries — much faster
+        # than `cargo install` and avoids a per-CI-run compile.
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-latest-cargo-coverage-
+
+      - name: Run tests with coverage
+        # Two-step pattern: `--no-report` runs instrumented tests and
+        # collects the raw profile data, then the two `report` calls
+        # emit lcov + summary from the same data. Avoids re-running
+        # tests twice. The output filename matches the `*.lcov`
+        # gitignore pattern so a stray local run can't accidentally
+        # commit a 600 KB report.
+        run: |
+          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+
+      - name: Publish coverage summary to job summary
+        # Render the per-file table cargo-llvm-cov prints as a fenced
+        # block in the GitHub Actions job summary so reviewers don't
+        # need to crack open the artifact for a quick look.
+        run: |
+          {
+            echo "## Coverage summary"
+            echo ""
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+            echo ""
+            echo "Full LCOV report uploaded as the \`coverage-lcov\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: coverage.lcov
+          if-no-files-found: error
+          retention-days: 30
+
   dispatch-tests:
     runs-on: ubuntu-latest
     steps:
@@ -106,7 +177,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '20.20.2'
 
       - name: Run npm dispatch tests
         run: node --test npm/socket-patch/bin/socket-patch.test.mjs
@@ -114,7 +185,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.13'
 
       - name: Run pypi dispatch tests
         run: python pypi/socket-patch/test_dispatch.py
@@ -158,8 +229,7 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # toolchain version is read from rust-toolchain.toml (exact-pinned).
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -175,20 +245,87 @@ jobs:
         if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: '20.20.2'
 
       - name: Setup Python
         if: matrix.suite == 'e2e_pypi'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: '3.12.13'
 
       - name: Setup Ruby
         if: matrix.suite == 'e2e_gem'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.2.11'
           bundler-cache: false
 
       - name: Run e2e tests
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored
+
+  # ----------------------------------------------------------------------
+  # Docker-driven real-package e2e suite.
+  #
+  # For each ecosystem, builds the shared base image (multi-stage:
+  # Rust → debian + compiled socket-patch) and the per-ecosystem layer,
+  # then runs the matching `docker_e2e_<eco>` test binary inside the
+  # repo's checkout. Tests install real packages via real package
+  # managers and run socket-patch against a wiremock-served fixture —
+  # no real Socket API contact. Hermetic, reproducible.
+  #
+  # Triggered on every PR. The existing `e2e` job above stays for
+  # `--ignored` real-API smoke runs (manual / scheduled).
+  # ----------------------------------------------------------------------
+  e2e-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        # toolchain version is read from rust-toolchain.toml.
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cargo-e2e-docker-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-latest-cargo-e2e-docker-
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+          cache-from: type=gha,scope=test-base
+          cache-to: type=gha,scope=test-base,mode=max
+
+      - name: Build ${{ matrix.ecosystem }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
+          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
+          load: true
+          cache-from: type=gha,scope=test-${{ matrix.ecosystem }}
+          cache-to: type=gha,scope=test-${{ matrix.ecosystem }},mode=max
+
+      - name: Run ${{ matrix.ecosystem }} Docker e2e test
+        run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}
