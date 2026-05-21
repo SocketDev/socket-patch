@@ -18,12 +18,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel. The SHA-pinned
-          # action can't read action_ref for the toolchain (it's a
-          # SHA, not a channel name) so we have to be explicit.
-          toolchain: "1.93.1"
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -51,12 +50,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel. The SHA-pinned
-          # action can't read action_ref for the toolchain (it's a
-          # SHA, not a channel name) so we have to be explicit.
-          toolchain: "1.93.1"
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -83,12 +81,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel. The SHA-pinned
-          # action can't read action_ref for the toolchain (it's a
-          # SHA, not a channel name) so we have to be explicit.
-          toolchain: "1.93.1"
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -119,13 +116,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel.
-          toolchain: "1.93.1"
-          # `llvm-tools-preview` is what cargo-llvm-cov uses to merge
-          # `.profraw` files and emit lcov.
-          components: llvm-tools-preview
+        # `rustup show` installs the rust-toolchain.toml channel + listed
+        # components; `rustup component add` adds the llvm-tools-preview
+        # bits cargo-llvm-cov needs to merge .profraw files into lcov.
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         # taiki-e/install-action ships precompiled binaries — much faster
@@ -214,11 +210,11 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel.
-          toolchain: "1.93.1"
-          components: llvm-tools-preview
+        # `rustup show` consumes rust-toolchain.toml; the explicit
+        # `component add` covers llvm-tools-preview for cargo-llvm-cov.
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
@@ -410,12 +406,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel. The SHA-pinned
-          # action can't read action_ref for the toolchain (it's a
-          # SHA, not a channel name) so we have to be explicit.
-          toolchain: "1.93.1"
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -480,10 +475,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # Must match rust-toolchain.toml's channel.
-          toolchain: "1.93.1"
+        run: rustup show
 
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit.
