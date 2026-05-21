@@ -126,12 +126,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
-          toolchain: stable
+          # toolchain version is read from rust-toolchain.toml (exact-pinned).
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.build-tool == 'cross'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install --locked --version =0.2.5 cross
 
       - name: Build (cargo)
         if: matrix.build-tool == 'cargo'
@@ -181,6 +181,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          # Hash every release artifact (tar.gz + zip) so install.sh can verify
+          # the binary before extraction. Sorted output keeps the file stable.
+          sha256sum *.tar.gz *.zip 2>/dev/null | sort > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -206,8 +214,7 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # toolchain version is read from rust-toolchain.toml (exact-pinned).
 
       - name: Authenticate with crates.io
         id: crates-io-auth
@@ -258,7 +265,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm for trusted publishing
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.15.0
 
       - name: Stage binaries into platform packages
         run: |
@@ -341,7 +348,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.13'
 
       - name: Copy README for PyPI package
         run: cp README.md pypi/socket-patch/README.md
