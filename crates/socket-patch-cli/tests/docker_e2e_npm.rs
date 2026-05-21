@@ -47,6 +47,32 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Coverage instrumentation hook. The CI coverage-docker job sets
+/// SOCKET_PATCH_COV_BIN (host path to an llvm-cov-instrumented
+/// socket-patch binary) and SOCKET_PATCH_COV_PROFRAW_DIR (host dir
+/// for in-container *.profraw output). When both are set, the docker
+/// run mounts the instrumented binary over the image's baked-in
+/// /usr/local/bin/socket-patch and points LLVM_PROFILE_FILE into a
+/// host-visible volume so the in-container code paths contribute to
+/// the host's lcov merge. Empty Vec when unset → tests use the
+/// image's stock binary.
+fn cov_docker_args() -> Vec<String> {
+    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
+        return Vec::new();
+    };
+    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
+        return Vec::new();
+    };
+    vec![
+        "-v".into(),
+        format!("{bin}:/usr/local/bin/socket-patch:ro"),
+        "-v".into(),
+        format!("{dir}:/coverage"),
+        "-e".into(),
+        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
+    ]
+}
+
 fn host_mode() -> bool {
     std::env::var("SOCKET_PATCH_TEST_HOST")
         .map(|v| v == "1")
@@ -279,19 +305,16 @@ exit 0
 }
 
 fn run_in_container(script: &str) -> std::process::Output {
-    Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--add-host=host.docker.internal:host-gateway",
-            "-i",
-            "socket-patch-test-npm:latest",
-            "bash",
-            "-c",
-            script,
-        ])
-        .output()
-        .expect("docker run failed to spawn")
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "--rm",
+        "--add-host=host.docker.internal:host-gateway",
+        "-i",
+    ])
+    .args(cov_docker_args())
+    .args(["socket-patch-test-npm:latest", "bash", "-c", script]);
+    cmd.output().expect("docker run failed to spawn")
 }
 
 fn run_on_host(script: &str) -> std::process::Output {

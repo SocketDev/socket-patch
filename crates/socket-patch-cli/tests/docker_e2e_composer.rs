@@ -28,6 +28,26 @@ const PATCHED_PHP: &[u8] = b"<?php\n\
                              namespace Monolog;\n\
                              class Logger {\n  public const VERSION = '3.5.0-patched';\n}\n";
 
+/// See docker_e2e_npm.rs::cov_docker_args for the coverage hook
+/// semantics. The CI coverage-docker job sets the env vars; locally
+/// they're unset and this returns an empty Vec.
+fn cov_docker_args() -> Vec<String> {
+    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
+        return Vec::new();
+    };
+    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
+        return Vec::new();
+    };
+    vec![
+        "-v".into(),
+        format!("{bin}:/usr/local/bin/socket-patch:ro"),
+        "-v".into(),
+        format!("{dir}:/coverage"),
+        "-e".into(),
+        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
+    ]
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -190,19 +210,16 @@ fn assert_image() {
 }
 
 fn run_container(script: &str) -> std::process::Output {
-    Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--add-host=host.docker.internal:host-gateway",
-            "-i",
-            "socket-patch-test-composer:latest",
-            "bash",
-            "-c",
-            script,
-        ])
-        .output()
-        .expect("docker run")
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "--rm",
+        "--add-host=host.docker.internal:host-gateway",
+        "-i",
+    ])
+    .args(cov_docker_args())
+    .args(["socket-patch-test-composer:latest", "bash", "-c", script]);
+    cmd.output().expect("docker run")
 }
 
 #[tokio::test]

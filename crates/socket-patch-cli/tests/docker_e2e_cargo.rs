@@ -24,6 +24,26 @@ const PATCHED_RS: &[u8] = b"// SOCKET-PATCH-E2E-MARKER\n\
                             #[macro_export]\n\
                             macro_rules! cfg_if {\n    ($($t:tt)*) => {};\n}\n";
 
+/// See docker_e2e_npm.rs::cov_docker_args for the coverage hook
+/// semantics. The CI coverage-docker job sets the env vars; locally
+/// they're unset and this returns an empty Vec.
+fn cov_docker_args() -> Vec<String> {
+    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
+        return Vec::new();
+    };
+    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
+        return Vec::new();
+    };
+    vec![
+        "-v".into(),
+        format!("{bin}:/usr/local/bin/socket-patch:ro"),
+        "-v".into(),
+        format!("{dir}:/coverage"),
+        "-e".into(),
+        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
+    ]
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -168,19 +188,21 @@ async fn cargo_fetch_full_apply_chain() {
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
     assert_image();
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--add-host=host.docker.internal:host-gateway",
-            "-i",
-            "socket-patch-test-cargo:latest",
-            "bash",
-            "-c",
-            &local_script(&api_url),
-        ])
-        .output()
-        .expect("docker run");
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "--rm",
+        "--add-host=host.docker.internal:host-gateway",
+        "-i",
+    ])
+    .args(cov_docker_args())
+    .args([
+        "socket-patch-test-cargo:latest",
+        "bash",
+        "-c",
+        &local_script(&api_url),
+    ]);
+    let out = cmd.output().expect("docker run");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

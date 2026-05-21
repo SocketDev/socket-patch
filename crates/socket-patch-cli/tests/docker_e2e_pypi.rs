@@ -34,6 +34,31 @@ const PATCHED_PY: &[u8] = b"# SOCKET-PATCH-E2E-MARKER\n\
                             # six.py replaced by socket-patch e2e fixture\n\
                             __version__ = \"1.16.0-patched\"\n";
 
+/// Coverage instrumentation hook. The CI coverage-docker job sets
+/// SOCKET_PATCH_COV_BIN (host path to an llvm-cov-instrumented
+/// socket-patch binary) and SOCKET_PATCH_COV_PROFRAW_DIR (host dir
+/// for in-container *.profraw output). When both are set, the docker
+/// run mounts the instrumented binary over the image's baked-in
+/// /usr/local/bin/socket-patch and points LLVM_PROFILE_FILE into a
+/// host-visible volume so in-container code paths contribute to the
+/// host's lcov merge. Empty Vec when unset.
+fn cov_docker_args() -> Vec<String> {
+    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
+        return Vec::new();
+    };
+    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
+        return Vec::new();
+    };
+    vec![
+        "-v".into(),
+        format!("{bin}:/usr/local/bin/socket-patch:ro"),
+        "-v".into(),
+        format!("{dir}:/coverage"),
+        "-e".into(),
+        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
+    ]
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -221,19 +246,16 @@ fn assert_image_present() {
 }
 
 fn run_container(_api_url: &str, script: &str) -> std::process::Output {
-    Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--add-host=host.docker.internal:host-gateway",
-            "-i",
-            "socket-patch-test-pypi:latest",
-            "bash",
-            "-c",
-            script,
-        ])
-        .output()
-        .expect("docker run")
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "run",
+        "--rm",
+        "--add-host=host.docker.internal:host-gateway",
+        "-i",
+    ])
+    .args(cov_docker_args())
+    .args(["socket-patch-test-pypi:latest", "bash", "-c", script]);
+    cmd.output().expect("docker run")
 }
 
 #[tokio::test]

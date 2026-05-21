@@ -138,9 +138,16 @@ jobs:
         # tests twice. The output filename matches the `*.lcov`
         # gitignore pattern so a stray local run can't accidentally
         # commit a 600 KB report.
+        #
+        # Explicit feature list (instead of --all-features) excludes the
+        # docker-e2e feature — those tests need Docker images this job
+        # doesn't build. The coverage-docker matrix covers them
+        # separately, and coverage-merge stitches everything together.
         run: |
-          cargo llvm-cov --workspace --all-features --no-report
-          cargo llvm-cov report --lcov --output-path coverage.lcov
+          cargo llvm-cov --workspace \
+            --features cargo,golang,maven,composer,nuget \
+            --no-report
+          cargo llvm-cov report --lcov --output-path coverage-host.lcov
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
 
       - name: Publish coverage summary to job summary
@@ -149,16 +156,180 @@ jobs:
         # need to crack open the artifact for a quick look.
         run: |
           {
-            echo "## Coverage summary"
+            echo "## Host coverage summary"
+            echo ""
+            echo "(In-process tests only. See coverage-merge for the"
+            echo "full picture including docker-e2e binary coverage.)"
             echo ""
             echo '```'
             cat coverage-summary.txt
             echo '```'
-            echo ""
-            echo "Full LCOV report uploaded as the \`coverage-lcov\` artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload LCOV artifact
+      - name: Upload host LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-host
+          path: coverage-host.lcov
+          if-no-files-found: error
+          retention-days: 30
+
+  coverage-docker:
+    # Per-ecosystem coverage for the Docker-driven e2e suite. Mirrors
+    # the e2e-docker matrix but builds an instrumented socket-patch
+    # binary and mounts it into the container along with a host-
+    # visible profraw directory, so the in-container code paths
+    # contribute to the lcov merge.
+    #
+    # Hooks: docker_e2e_<eco>.rs reads SOCKET_PATCH_COV_BIN +
+    # SOCKET_PATCH_COV_PROFRAW_DIR. Both unset is the no-op default
+    # (used by the e2e-docker matrix above).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cargo-coverage-docker-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-latest-cargo-coverage-docker-
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+          cache-from: type=gha,scope=test-base
+          cache-to: type=gha,scope=test-base,mode=max
+
+      - name: Build ${{ matrix.ecosystem }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
+          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
+          load: true
+          cache-from: type=gha,scope=test-${{ matrix.ecosystem }}
+          cache-to: type=gha,scope=test-${{ matrix.ecosystem }},mode=max
+
+      - name: Build instrumented socket-patch binary
+        # Source `cargo llvm-cov show-env` into the current shell so this
+        # `cargo build` picks up RUSTC_WRAPPER=cargo-llvm-cov and the
+        # same RUSTFLAGS that the subsequent `cargo llvm-cov` test step
+        # will use. The bin we build ends up byte-compatible with the
+        # test binaries — same source hashes → unified coverage map at
+        # report time. Env stays scoped to this step (intentional;
+        # cargo llvm-cov manages its own env in the test step).
+        run: |
+          eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
+          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget
+
+      - name: Configure docker-e2e coverage hooks
+        run: |
+          echo "SOCKET_PATCH_COV_BIN=$PWD/target/debug/socket-patch" >> "$GITHUB_ENV"
+          # Profraw files from the in-container binary land here.
+          # cargo-llvm-cov scans target/ for *.profraw at report time.
+          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
+        run: |
+          cargo llvm-cov \
+            --features docker-e2e,cargo,golang,maven,composer,nuget \
+            --no-report \
+            --test docker_e2e_${{ matrix.ecosystem }}
+
+      - name: Generate per-ecosystem lcov
+        run: |
+          cargo llvm-cov report \
+            --lcov \
+            --output-path coverage-docker-${{ matrix.ecosystem }}.lcov
+
+      - name: Upload per-ecosystem LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-docker-${{ matrix.ecosystem }}
+          path: coverage-docker-${{ matrix.ecosystem }}.lcov
+          if-no-files-found: error
+          retention-days: 30
+
+  coverage-merge:
+    # Merge the host coverage and per-ecosystem docker coverage into a
+    # single lcov.info. lcov(1) handles the union — same files are
+    # summed line-by-line so a line covered by ANY test counts.
+    needs: [coverage, coverage-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: coverage-artifacts
+          pattern: coverage-*
+
+      - name: Merge LCOV files
+        # `--add-tracefile` is repeated per input. lcov sums hit counts
+        # for identical source/line keys, so files covered by both host
+        # and docker tests report the higher (union) count.
+        # `find` (not bash globstar) for portability across runners.
+        run: |
+          set -e
+          ARGS=()
+          while IFS= read -r f; do
+            ARGS+=(--add-tracefile "$f")
+          done < <(find coverage-artifacts -name '*.lcov' -type f)
+          if [ ${#ARGS[@]} -eq 0 ]; then
+            echo "No lcov files found to merge" >&2
+            exit 1
+          fi
+          lcov "${ARGS[@]}" --output-file coverage.lcov
+
+      - name: Render summary
+        # `lcov --summary` prints a per-file rollup we tee into the job
+        # summary, same shape as cargo-llvm-cov's own.
+        run: |
+          {
+            echo "## Coverage (host + docker-e2e merged)"
+            echo ""
+            echo '```'
+            lcov --summary coverage.lcov 2>&1 | tail -20
+            echo '```'
+            echo ""
+            echo "Full merged LCOV uploaded as the \`coverage-lcov\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload merged LCOV artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-lcov
