@@ -210,15 +210,11 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.8.7
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-cargo-coverage-docker-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-latest-cargo-coverage-docker-
+      # No `actions/cache` here intentionally. This job builds Docker
+      # images and would be flagged by zizmor's cache-poisoning audit
+      # (a PR-poisoned cargo cache could compromise the instrumented
+      # binary we mount into the container). The Docker buildx
+      # cache-from: type=gha below still accelerates image rebuilds.
 
       - name: Build base image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -468,15 +464,10 @@ jobs:
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         # toolchain version is read from rust-toolchain.toml.
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ubuntu-latest-cargo-e2e-docker-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ubuntu-latest-cargo-e2e-docker-
+      # No `actions/cache` here intentionally. This job builds Docker
+      # images and would be flagged by zizmor's cache-poisoning audit.
+      # The Docker buildx cache-from: type=gha below still accelerates
+      # image rebuilds.
 
       - name: Build base image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
