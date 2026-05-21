@@ -19,7 +19,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version + components are read from rust-toolchain.toml.
+        with:
+          # Must match rust-toolchain.toml's channel. The SHA-pinned
+          # action can't read action_ref for the toolchain (it's a
+          # SHA, not a channel name) so we have to be explicit.
+          toolchain: "1.93.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -48,7 +52,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml (exact-pinned).
+        with:
+          # Must match rust-toolchain.toml's channel. The SHA-pinned
+          # action can't read action_ref for the toolchain (it's a
+          # SHA, not a channel name) so we have to be explicit.
+          toolchain: "1.93.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -76,7 +84,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml (exact-pinned).
+        with:
+          # Must match rust-toolchain.toml's channel. The SHA-pinned
+          # action can't read action_ref for the toolchain (it's a
+          # SHA, not a channel name) so we have to be explicit.
+          toolchain: "1.93.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -109,9 +121,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
+          # Must match rust-toolchain.toml's channel.
+          toolchain: "1.93.1"
           # `llvm-tools-preview` is what cargo-llvm-cov uses to merge
-          # `.profraw` files and emit lcov. The toolchain channel itself
-          # is read from `rust-toolchain.toml`.
+          # `.profraw` files and emit lcov.
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -203,6 +216,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
         with:
+          # Must match rust-toolchain.toml's channel.
+          toolchain: "1.93.1"
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -396,7 +411,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml (exact-pinned).
+        with:
+          # Must match rust-toolchain.toml's channel. The SHA-pinned
+          # action can't read action_ref for the toolchain (it's a
+          # SHA, not a channel name) so we have to be explicit.
+          toolchain: "1.93.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -462,7 +481,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml.
+        with:
+          # Must match rust-toolchain.toml's channel.
+          toolchain: "1.93.1"
 
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit.
