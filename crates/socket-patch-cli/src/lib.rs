@@ -7,6 +7,7 @@
 
 pub mod commands;
 pub mod ecosystem_dispatch;
+pub mod json_envelope;
 pub mod output;
 
 use clap::{Parser, Subcommand};

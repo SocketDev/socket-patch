@@ -12,6 +12,8 @@ use socket_patch_core::utils::cleanup_blobs::{
 };
 use std::path::{Path, PathBuf};
 
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
+
 #[derive(Args)]
 pub struct RepairArgs {
     /// Working directory
@@ -50,11 +52,13 @@ pub async fn run(args: RepairArgs) -> i32 {
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "Manifest not found",
-                "path": manifest_path.display().to_string(),
-            })).unwrap());
+            let mut env = Envelope::new(Command::Repair);
+            env.dry_run = args.dry_run;
+            env.mark_error(EnvelopeError::new(
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            ));
+            println!("{}", env.to_pretty_json());
         } else {
             eprintln!("Manifest not found at {}", manifest_path.display());
         }
@@ -62,18 +66,18 @@ pub async fn run(args: RepairArgs) -> i32 {
     }
 
     match repair_inner(&args, &manifest_path).await {
-        Ok(result) => {
+        Ok(env) => {
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                println!("{}", env.to_pretty_json());
             }
             0
         }
         Err(e) => {
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e,
-                })).unwrap());
+                let mut env = Envelope::new(Command::Repair);
+                env.dry_run = args.dry_run;
+                env.mark_error(EnvelopeError::new("repair_failed", e));
+                println!("{}", env.to_pretty_json());
             } else {
                 eprintln!("Error: {e}");
             }
@@ -82,7 +86,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     }
 }
 
-async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<serde_json::Value, String> {
+async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<Envelope, String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -258,13 +262,48 @@ async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<serde_j
         println!("\nRepair complete.");
     }
 
-    Ok(serde_json::json!({
-        "status": "success",
-        "dryRun": args.dry_run,
-        "missingBlobs": missing_count,
-        "downloaded": downloaded_count,
-        "downloadFailed": download_failed_count,
-        "blobsChecked": blobs_checked,
-        "blobsCleaned": blobs_cleaned,
-    }))
+    // Translate the aggregate counts into envelope events. `repair`
+    // operates on artifacts (not specific patches), so events use the
+    // `PatchEvent::artifact` form (no PURL/UUID).
+    let mut env = Envelope::new(Command::Repair);
+    env.dry_run = args.dry_run;
+    let action_for_repair = if args.dry_run {
+        PatchAction::Verified
+    } else {
+        PatchAction::Downloaded
+    };
+    if downloaded_count > 0 || (args.dry_run && missing_count > 0) {
+        let count = if args.dry_run {
+            missing_count
+        } else {
+            downloaded_count
+        };
+        env.record(
+            PatchEvent::artifact(action_for_repair).with_details(serde_json::json!({
+                "count": count,
+                "mode": download_mode.as_tag(),
+            })),
+        );
+    }
+    if download_failed_count > 0 {
+        env.record(
+            PatchEvent::artifact(PatchAction::Failed).with_error(
+                "download_failed",
+                format!("{} artifact(s) failed to download", download_failed_count),
+            ),
+        );
+        env.mark_partial_failure();
+    }
+    if blobs_cleaned > 0 {
+        let cleanup_action = if args.dry_run {
+            PatchAction::Verified
+        } else {
+            PatchAction::Removed
+        };
+        env.record(PatchEvent::artifact(cleanup_action).with_details(serde_json::json!({
+            "count": blobs_cleaned,
+            "checked": blobs_checked,
+        })));
+    }
+    Ok(env)
 }

@@ -277,7 +277,6 @@ pub fn select_patches(
 }
 
 /// Download parameters shared between get and scan commands.
-#[allow(dead_code)]
 pub struct DownloadParams {
     pub cwd: PathBuf,
     pub org: Option<String>,

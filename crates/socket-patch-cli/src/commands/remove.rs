@@ -9,7 +9,22 @@ use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remov
 use std::path::{Path, PathBuf};
 
 use super::rollback::rollback_patches;
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status,
+};
 use crate::output::confirm;
+
+/// Emit a `remove` error envelope and return. Used by the many error
+/// paths in `run` so they all share the same JSON shape.
+fn emit_error_envelope(json: bool, code: &str, message: String) {
+    if json {
+        let mut env = Envelope::new(Command::Remove);
+        env.mark_error(EnvelopeError::new(code, message));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error: {message}");
+    }
+}
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -54,15 +69,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "Manifest not found",
-                "path": manifest_path.display().to_string(),
-            })).unwrap());
-        } else {
-            eprintln!("Manifest not found at {}", manifest_path.display());
-        }
+        emit_error_envelope(
+            args.json,
+            "manifest_not_found",
+            format!("Manifest not found at {}", manifest_path.display()),
+        );
         return 1;
     }
 
@@ -70,25 +81,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": "Invalid manifest",
-                })).unwrap());
-            } else {
-                eprintln!("Invalid manifest at {}", manifest_path.display());
-            }
+            emit_error_envelope(args.json, "manifest_invalid", "Invalid manifest".to_string());
             return 1;
         }
         Err(e) => {
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e.to_string(),
-                })).unwrap());
-            } else {
-                eprintln!("Error reading manifest: {e}");
-            }
+            emit_error_envelope(args.json, "manifest_unreadable", e.to_string());
             return 1;
         }
     };
@@ -110,19 +107,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
         };
 
     if matching.is_empty() {
-        track_patch_remove_failed(
-            &format!("No patch found matching identifier: {}", args.identifier),
-            api_token.as_deref(),
-            org_slug.as_deref(),
-        )
-        .await;
+        let msg = format!("No patch found matching identifier: {}", args.identifier);
+        track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "not_found",
-                "error": format!("No patch found matching identifier: {}", args.identifier),
-                "removed": 0,
-                "purls": [],
-            })).unwrap());
+            let mut env = Envelope::new(Command::Remove);
+            env.status = Status::NotFound;
+            env.error = Some(EnvelopeError::new("not_found", msg));
+            println!("{}", env.to_pretty_json());
         } else {
             eprintln!(
                 "No patch found matching identifier: {}",
@@ -180,14 +171,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         org_slug.as_deref(),
                     )
                     .await;
-                    if args.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "error",
-                            "error": "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.",
-                        })).unwrap());
-                    } else {
-                        eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
-                    }
+                    emit_error_envelope(
+                        args.json,
+                        "rollback_failed",
+                        "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.".to_string(),
+                    );
                     return 1;
                 }
 
@@ -221,15 +209,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-                if args.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "error",
-                        "error": format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
-                    })).unwrap());
-                } else {
-                    eprintln!("Error during rollback: {e}");
-                    eprintln!("\nRollback failed. Use --skip-rollback to remove from manifest without restoring files.");
-                }
+                emit_error_envelope(
+                    args.json,
+                    "rollback_failed",
+                    format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
+                );
                 return 1;
             }
         }
@@ -239,19 +223,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
     match remove_patch_from_manifest(&args.identifier, &manifest_path).await {
         Ok((removed, manifest)) => {
             if removed.is_empty() {
-                track_patch_remove_failed(
-                    &format!("No patch found matching identifier: {}", args.identifier),
-                    api_token.as_deref(),
-                    org_slug.as_deref(),
-                )
-                .await;
+                let msg = format!("No patch found matching identifier: {}", args.identifier);
+                track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
                 if args.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "not_found",
-                        "error": format!("No patch found matching identifier: {}", args.identifier),
-                        "removed": 0,
-                        "purls": [],
-                    })).unwrap());
+                    let mut env = Envelope::new(Command::Remove);
+                    env.status = Status::NotFound;
+                    env.error = Some(EnvelopeError::new("not_found", msg));
+                    println!("{}", env.to_pretty_json());
                 } else {
                     eprintln!(
                         "No patch found matching identifier: {}",
@@ -281,13 +259,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
 
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "success",
-                    "removed": removed.len(),
-                    "rolledBack": rollback_count,
-                    "blobsCleaned": blobs_removed,
-                    "purls": removed,
-                })).unwrap());
+                let mut env = Envelope::new(Command::Remove);
+                // One Removed event per purl whose manifest entry was deleted.
+                for purl in &removed {
+                    env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                }
+                // One artifact-level Removed event covering swept blobs.
+                if blobs_removed > 0 {
+                    env.record(
+                        PatchEvent::artifact(PatchAction::Removed).with_details(serde_json::json!({
+                            "blobsRemoved": blobs_removed,
+                            "rolledBack": rollback_count,
+                        })),
+                    );
+                }
+                println!("{}", env.to_pretty_json());
             }
 
             track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
@@ -295,14 +281,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e,
-                })).unwrap());
-            } else {
-                eprintln!("Error: {e}");
-            }
+            emit_error_envelope(args.json, "remove_failed", e);
             1
         }
     }

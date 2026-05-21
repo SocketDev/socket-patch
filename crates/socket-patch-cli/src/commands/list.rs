@@ -3,6 +3,10 @@ use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
 use std::path::PathBuf;
 
+use crate::json_envelope::{
+    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
+};
+
 #[derive(Args)]
 pub struct ListArgs {
     /// Working directory
@@ -18,23 +22,28 @@ pub struct ListArgs {
     pub json: bool,
 }
 
+/// Emit the top-level envelope for `list` in error states. Used for the
+/// "manifest not found" and "manifest unreadable" paths so they share
+/// the same JSON shape as a successful list.
+fn emit_error(args: &ListArgs, code: &str, message: String) {
+    if args.json {
+        let mut env = Envelope::new(Command::List);
+        env.mark_error(EnvelopeError::new(code, message));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error: {message}");
+    }
+}
+
 pub async fn run(args: ListArgs) -> i32 {
     let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
 
-    // Check if manifest exists
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": "Manifest not found",
-                    "path": manifest_path.display().to_string()
-                })).unwrap()
-            );
-        } else {
-            eprintln!("Manifest not found at {}", manifest_path.display());
-        }
+        emit_error(
+            &args,
+            "manifest_not_found",
+            format!("Manifest not found at {}", manifest_path.display()),
+        );
         return 1;
     }
 
@@ -42,43 +51,49 @@ pub async fn run(args: ListArgs) -> i32 {
         Ok(Some(manifest)) => {
             let patch_entries: Vec<_> = manifest.patches.iter().collect();
 
-            if patch_entries.is_empty() {
-                if args.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "success", "patches": [] })).unwrap());
-                } else {
-                    println!("No patches found in manifest.");
-                }
-                return 0;
-            }
-
             if args.json {
-                let json_output = serde_json::json!({
-                    "status": "success",
-                    "patches": patch_entries.iter().map(|(purl, patch)| {
-                        serde_json::json!({
-                            "purl": purl,
-                            "uuid": patch.uuid,
-                            "exportedAt": patch.exported_at,
-                            "tier": patch.tier,
-                            "license": patch.license,
-                            "description": patch.description,
-                            "files": patch.files.keys().collect::<Vec<_>>(),
-                            "vulnerabilities": patch.vulnerabilities.iter().map(|(id, vuln)| {
-                                serde_json::json!({
-                                    "id": id,
-                                    "cves": vuln.cves,
-                                    "summary": vuln.summary,
-                                    "severity": vuln.severity,
-                                    "description": vuln.description,
-                                })
-                            }).collect::<Vec<_>>(),
+                let mut env = Envelope::new(Command::List);
+                for (purl, patch) in &patch_entries {
+                    // `list` emits one `Discovered` event per manifest
+                    // entry. The rich metadata (vulnerabilities, tier,
+                    // license, description, exportedAt) lives under
+                    // `details` per the per-command extension convention.
+                    let files = patch
+                        .files
+                        .keys()
+                        .map(|p| PatchEventFile {
+                            path: p.clone(),
+                            verified: false,
+                            applied_via: None,
                         })
-                    }).collect::<Vec<_>>()
-                });
-                println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+                        .collect();
+                    let details = serde_json::json!({
+                        "exportedAt": patch.exported_at,
+                        "tier": patch.tier,
+                        "license": patch.license,
+                        "description": patch.description,
+                        "vulnerabilities": patch.vulnerabilities.iter().map(|(id, vuln)| {
+                            serde_json::json!({
+                                "id": id,
+                                "cves": vuln.cves,
+                                "summary": vuln.summary,
+                                "severity": vuln.severity,
+                                "description": vuln.description,
+                            })
+                        }).collect::<Vec<_>>(),
+                    });
+                    env.record(
+                        PatchEvent::new(PatchAction::Discovered, (*purl).clone())
+                            .with_uuid(patch.uuid.clone())
+                            .with_files(files)
+                            .with_details(details),
+                    );
+                }
+                println!("{}", env.to_pretty_json());
+            } else if patch_entries.is_empty() {
+                println!("No patches found in manifest.");
             } else {
                 println!("Found {} patch(es):\n", patch_entries.len());
-
                 for (purl, patch) in &patch_entries {
                     println!("Package: {purl}");
                     println!("  UUID: {}", patch.uuid);
@@ -120,20 +135,138 @@ pub async fn run(args: ListArgs) -> i32 {
             0
         }
         Ok(None) => {
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "error", "error": "Invalid manifest" })).unwrap());
-            } else {
-                eprintln!("Error: Invalid manifest at {}", manifest_path.display());
-            }
+            emit_error(&args, "manifest_invalid", "Invalid manifest".to_string());
             1
         }
         Err(e) => {
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "status": "error", "error": e.to_string() })).unwrap());
-            } else {
-                eprintln!("Error: {e}");
-            }
+            emit_error(&args, "manifest_unreadable", e.to_string());
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for `list` JSON output. Pin the new envelope shape
+    //! so downstream consumers (PR bots, dashboards) can rely on it.
+    use super::*;
+    use socket_patch_core::manifest::schema::{
+        PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
+    };
+    use std::collections::HashMap;
+
+    fn sample_manifest() -> PatchManifest {
+        let mut files = HashMap::new();
+        files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "b".repeat(64),
+                after_hash: "a".repeat(64),
+            },
+        );
+
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-xyz-1234".to_string(),
+            VulnerabilityInfo {
+                cves: vec!["CVE-2024-12345".to_string()],
+                summary: "Prototype Pollution".to_string(),
+                severity: "high".to_string(),
+                description: "Some description".to_string(),
+            },
+        );
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/minimist@1.2.2".to_string(),
+            PatchRecord {
+                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: vulns,
+                description: "Fixes prototype pollution".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+
+        PatchManifest { patches }
+    }
+
+    /// Build the envelope the same way `run` would for the given manifest.
+    /// Keeps the test free of binary-spawn overhead while still pinning
+    /// the exact event shape `list --json` produces.
+    fn build_envelope(manifest: &PatchManifest) -> Envelope {
+        let mut env = Envelope::new(Command::List);
+        for (purl, patch) in &manifest.patches {
+            let files = patch
+                .files
+                .keys()
+                .map(|p| PatchEventFile {
+                    path: p.clone(),
+                    verified: false,
+                    applied_via: None,
+                })
+                .collect();
+            let details = serde_json::json!({
+                "exportedAt": patch.exported_at,
+                "tier": patch.tier,
+                "license": patch.license,
+                "description": patch.description,
+                "vulnerabilities": patch.vulnerabilities.iter().map(|(id, vuln)| {
+                    serde_json::json!({
+                        "id": id,
+                        "cves": vuln.cves,
+                        "summary": vuln.summary,
+                        "severity": vuln.severity,
+                        "description": vuln.description,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            env.record(
+                PatchEvent::new(PatchAction::Discovered, purl.clone())
+                    .with_uuid(patch.uuid.clone())
+                    .with_files(files)
+                    .with_details(details),
+            );
+        }
+        env
+    }
+
+    #[test]
+    fn list_emits_discovered_event_per_patch() {
+        let env = build_envelope(&sample_manifest());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["command"], "list");
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["summary"]["discovered"], 1);
+        let events = v["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["action"], "discovered");
+        assert_eq!(events[0]["purl"], "pkg:npm/minimist@1.2.2");
+        assert_eq!(events[0]["uuid"], "11111111-1111-4111-8111-111111111111");
+    }
+
+    #[test]
+    fn list_event_carries_vulnerability_details() {
+        let env = build_envelope(&sample_manifest());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        let event = &v["events"][0];
+        assert_eq!(event["details"]["tier"], "free");
+        assert_eq!(event["details"]["license"], "MIT");
+        let vulns = event["details"]["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["id"], "GHSA-xyz-1234");
+        assert_eq!(vulns[0]["severity"], "high");
+        assert_eq!(vulns[0]["cves"][0], "CVE-2024-12345");
+    }
+
+    #[test]
+    fn empty_manifest_emits_empty_events() {
+        let env = build_envelope(&PatchManifest::new());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["events"].as_array().unwrap().len(), 0);
+        assert_eq!(v["summary"]["discovered"], 0);
     }
 }

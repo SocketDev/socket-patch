@@ -10,11 +10,48 @@ use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_pa
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
-use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+use crate::json_envelope::{
+    AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
+};
+
+/// Overlay every regular file from `src` into `dst` via hard link (falling
+/// back to copy if hard linking fails — e.g. cross-filesystem, permission
+/// quirk). Skips files that already exist at `dst`. Silently no-ops if
+/// `src` doesn't exist so fresh projects with no `.socket/` cache work.
+///
+/// Used by `apply` to stage a transient overlay of the persistent
+/// `.socket/` cache inside a tempdir so the apply pipeline can read
+/// pre-cached artifacts and freshly-fetched ones from the same path
+/// without ever mutating `.socket/`.
+async fn overlay_dir(src: &Path, dst: &Path) {
+    let mut entries = match tokio::fs::read_dir(src).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_type = match entry.file_type().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if tokio::fs::metadata(&to).await.is_ok() {
+            continue;
+        }
+        if tokio::fs::hard_link(&from, &to).await.is_err() {
+            let _ = tokio::fs::copy(&from, &to).await;
+        }
+    }
+}
 
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
@@ -36,7 +73,11 @@ pub struct ApplyArgs {
     #[arg(short = 'm', long = "manifest-path", default_value = DEFAULT_PATCH_MANIFEST_PATH)]
     pub manifest_path: String,
 
-    /// Do not download missing blobs, fail if any are missing
+    /// Strict-airgap mode: never contact the network. Apply fails fast if
+    /// any patch source is missing from `.socket/`. Without this flag, the
+    /// default behavior is to read from `.socket/` first and transparently
+    /// fetch any missing artifacts into a temporary directory for the
+    /// duration of the run — `.socket/` itself is never modified by apply.
     #[arg(long, default_value_t = false)]
     pub offline: bool,
 
@@ -73,39 +114,71 @@ pub struct ApplyArgs {
     pub download_mode: String,
 }
 
-fn verify_status_str(status: &VerifyStatus) -> &'static str {
-    match status {
-        VerifyStatus::Ready => "ready",
-        VerifyStatus::AlreadyPatched => "already_patched",
-        VerifyStatus::HashMismatch => "hash_mismatch",
-        VerifyStatus::NotFound => "not_found",
+/// Translate the core engine's per-package [`ApplyResult`] into a single
+/// patch-level [`PatchEvent`] for the unified envelope.
+///
+/// Action mapping (in priority order):
+///   * `!result.success`                         → `Failed`
+///   * `dry_run` and any file was Ready/Patched → `Verified`
+///   * all `files_verified` are AlreadyPatched   → `Skipped` (already_patched)
+///   * something was actually patched on disk    → `Applied`
+///
+/// `files` enumerates only the files that participated in the action —
+/// for `Applied`, the patched ones with their `applied_via` strategy;
+/// for `Verified`, every file the engine confirmed could be patched.
+pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent {
+    let purl = result.package_key.clone();
+    if !result.success {
+        return PatchEvent::new(PatchAction::Failed, purl).with_error(
+            "apply_failed",
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string()),
+        );
     }
-}
 
-fn result_to_json(result: &ApplyResult) -> serde_json::Value {
-    let applied_via: HashMap<&String, &str> = result
-        .applied_via
-        .iter()
-        .map(|(k, v)| (k, v.as_tag()))
-        .collect();
-    serde_json::json!({
-        "purl": result.package_key,
-        "path": result.package_path,
-        "success": result.success,
-        "error": result.error,
-        "filesPatched": result.files_patched,
-        "appliedVia": applied_via,
-        "filesVerified": result.files_verified.iter().map(|f| {
-            serde_json::json!({
-                "file": f.file,
-                "status": verify_status_str(&f.status),
-                "message": f.message,
-                "currentHash": f.current_hash,
-                "expectedHash": f.expected_hash,
-                "targetHash": f.target_hash,
+    let all_already_patched = !result.files_verified.is_empty()
+        && result
+            .files_verified
+            .iter()
+            .all(|f| f.status == VerifyStatus::AlreadyPatched);
+
+    if all_already_patched {
+        return PatchEvent::new(PatchAction::Skipped, purl)
+            .with_reason("already_patched", "All files already match afterHash");
+    }
+
+    if dry_run {
+        let files = result
+            .files_verified
+            .iter()
+            .filter(|f| {
+                f.status == VerifyStatus::Ready || f.status == VerifyStatus::AlreadyPatched
             })
-        }).collect::<Vec<_>>(),
-    })
+            .map(|f| PatchEventFile {
+                path: f.file.clone(),
+                verified: true,
+                applied_via: None,
+            })
+            .collect();
+        return PatchEvent::new(PatchAction::Verified, purl).with_files(files);
+    }
+
+    let files = result
+        .files_patched
+        .iter()
+        .map(|f| PatchEventFile {
+            path: f.clone(),
+            verified: true,
+            applied_via: result
+                .applied_via
+                .get(f)
+                .copied()
+                .map(AppliedVia::from_core),
+        })
+        .collect();
+    PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
@@ -118,14 +191,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "no_manifest",
-                "patchesApplied": 0,
-                "alreadyPatched": 0,
-                "failed": 0,
-                "dryRun": args.dry_run,
-                "results": [],
-            })).unwrap());
+            let mut env = Envelope::new(Command::Apply);
+            env.status = Status::NoManifest;
+            env.dry_run = args.dry_run;
+            println!("{}", env.to_pretty_json());
         } else if !args.silent {
             println!("No .socket folder found, skipping patch application.");
         }
@@ -138,27 +207,28 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 .iter()
                 .filter(|r| r.success && !r.files_patched.is_empty())
                 .count();
-            let already_patched_count = results
-                .iter()
-                .filter(|r| {
-                    r.files_verified
-                        .iter()
-                        .all(|f| f.status == VerifyStatus::AlreadyPatched)
-                })
-                .count();
-            let failed_count = results.iter().filter(|r| !r.success).count();
 
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": if success { "success" } else { "partial_failure" },
-                    "patchesApplied": patched_count,
-                    "alreadyPatched": already_patched_count,
-                    "failed": failed_count,
-                    "unmatchedPatches": unmatched.len(),
-                    "unmatchedPurls": unmatched,
-                    "dryRun": args.dry_run,
-                    "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
-                })).unwrap());
+                let mut env = Envelope::new(Command::Apply);
+                env.dry_run = args.dry_run;
+                for result in &results {
+                    env.record(result_to_event(result, args.dry_run));
+                }
+                // Manifest entries that targeted in-scope ecosystems but
+                // had no installed package on disk — emit one Skipped
+                // event per purl so downstream consumers can surface them.
+                for purl in &unmatched {
+                    env.record(
+                        PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                            "package_not_installed",
+                            "No installed package matches this PURL",
+                        ),
+                    );
+                }
+                if !success {
+                    env.mark_partial_failure();
+                }
+                println!("{}", env.to_pretty_json());
             } else if !args.silent && !results.is_empty() {
                 let patched: Vec<_> = results.iter().filter(|r| r.success).collect();
                 let already_patched: Vec<_> = results
@@ -248,15 +318,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
         Err(e) => {
             track_patch_apply_failed(&e, args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e,
-                    "patchesApplied": 0,
-                    "alreadyPatched": 0,
-                    "failed": 0,
-                    "dryRun": args.dry_run,
-                    "results": [],
-                })).unwrap());
+                let mut env = Envelope::new(Command::Apply);
+                env.dry_run = args.dry_run;
+                env.mark_error(EnvelopeError::new("apply_failed", e.clone()));
+                println!("{}", env.to_pretty_json());
             } else if !args.silent {
                 eprintln!("Error: {e}");
             }
@@ -274,22 +339,22 @@ async fn apply_patches_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
+    // The persistent cache directories under `.socket/`. Apply only ever
+    // *reads* from these — writes (downloads, cleanup) happen against a
+    // transient overlay tempdir constructed below when fetching is needed.
     let socket_dir = manifest_path.parent().unwrap();
-    let blobs_path = socket_dir.join("blobs");
-    let diffs_path = socket_dir.join("diffs");
-    let packages_path = socket_dir.join("packages");
-    tokio::fs::create_dir_all(&blobs_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let socket_blobs_path = socket_dir.join("blobs");
+    let socket_diffs_path = socket_dir.join("diffs");
+    let socket_packages_path = socket_dir.join("packages");
 
     let download_mode = DownloadMode::parse(&args.download_mode).map_err(|e| e.to_string())?;
 
     // Compute per-patch source availability so both the offline guard
     // (next block) and the `download_needed` decision below share the
-    // same notion of what's already on disk.
-    let missing_blobs = get_missing_blobs(&manifest, &blobs_path).await;
-    let missing_diff_archives = get_missing_archives(&manifest, &diffs_path).await;
-    let missing_package_archives = get_missing_archives(&manifest, &packages_path).await;
+    // same notion of what's already on disk. These probes are read-only.
+    let missing_blobs = get_missing_blobs(&manifest, &socket_blobs_path).await;
+    let missing_diff_archives = get_missing_archives(&manifest, &socket_diffs_path).await;
+    let missing_package_archives = get_missing_archives(&manifest, &socket_packages_path).await;
 
     // A patch is "locally applicable" iff at least one of:
     //   - every `after_hash` blob it references is on disk, OR
@@ -353,7 +418,37 @@ async fn apply_patches_inner(
             DownloadMode::Package => !missing_package_archives.is_empty(),
         };
 
-    if download_needed {
+    // Determine where the apply pipeline should read patch sources from.
+    //
+    // - If nothing needs downloading (offline mode, or every required
+    //   artifact is already in `.socket/`), read straight from `.socket/`.
+    //   Apply is purely read-only against the persistent cache.
+    // - Otherwise, stage a transient overlay tempdir that hardlinks every
+    //   existing `.socket/` artifact and receives fresh downloads. Apply
+    //   reads exclusively from the tempdir; `.socket/` is never mutated.
+    //
+    // `_stage_dir` keeps the `TempDir` handle alive for the rest of this
+    // function — on drop the OS removes the directory and any downloaded
+    // bytes go with it.
+    let (blobs_path, diffs_path, packages_path, _stage_dir): (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        Option<TempDir>,
+    ) = if download_needed {
+        let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let stage_blobs = stage.path().join("blobs");
+        let stage_diffs = stage.path().join("diffs");
+        let stage_packages = stage.path().join("packages");
+        for dir in [&stage_blobs, &stage_diffs, &stage_packages] {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        overlay_dir(&socket_blobs_path, &stage_blobs).await;
+        overlay_dir(&socket_diffs_path, &stage_diffs).await;
+        overlay_dir(&socket_packages_path, &stage_packages).await;
+
         if !args.silent && !args.json {
             println!(
                 "Downloading missing patch artifacts (mode: {})...",
@@ -363,9 +458,9 @@ async fn apply_patches_inner(
 
         let (client, _) = get_api_client_from_env(None).await;
         let sources = PatchSources {
-            blobs_path: &blobs_path,
-            packages_path: Some(&packages_path),
-            diffs_path: Some(&diffs_path),
+            blobs_path: &stage_blobs,
+            packages_path: Some(&stage_packages),
+            diffs_path: Some(&stage_diffs),
         };
         let fetch_result =
             fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
@@ -378,7 +473,7 @@ async fn apply_patches_inner(
         // blobs as a fallback. Patches that lack the requested mode on
         // the server will still apply via the legacy blob path.
         if download_mode != DownloadMode::File {
-            let still_missing_blobs = get_missing_blobs(&manifest, &blobs_path).await;
+            let still_missing_blobs = get_missing_blobs(&manifest, &stage_blobs).await;
             if !still_missing_blobs.is_empty() {
                 if !args.silent && !args.json {
                     println!(
@@ -387,7 +482,7 @@ async fn apply_patches_inner(
                     );
                 }
                 let blob_result =
-                    fetch_missing_blobs(&manifest, &blobs_path, &client, None).await;
+                    fetch_missing_blobs(&manifest, &stage_blobs, &client, None).await;
                 if !args.silent && !args.json {
                     println!("{}", format_fetch_result(&blob_result));
                 }
@@ -404,7 +499,16 @@ async fn apply_patches_inner(
             }
             return Ok((false, Vec::new(), Vec::new()));
         }
-    }
+
+        (stage_blobs, stage_diffs, stage_packages, Some(stage))
+    } else {
+        (
+            socket_blobs_path.clone(),
+            socket_diffs_path.clone(),
+            socket_packages_path.clone(),
+            None,
+        )
+    };
 
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
@@ -607,68 +711,31 @@ async fn apply_patches_inner(
         );
     }
 
-    // Clean up unused blobs
-    if !args.silent && !args.json {
-        if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, args.dry_run).await {
-            if cleanup_result.blobs_removed > 0 {
-                println!("\n{}", format_cleanup_result(&cleanup_result, args.dry_run));
-            }
-        }
-    }
+    // Note: `apply` deliberately does NOT garbage-collect unused blobs in
+    // `.socket/`. GC is the responsibility of `socket-patch repair` /
+    // `gc` / `scan --prune`. Keeping apply read-only against `.socket/`
+    // means it can run repeatedly (CI dry-runs, deploy hooks) without
+    // mutating patch state.
 
     Ok((!has_errors, results, unmatched))
 }
 
 #[cfg(test)]
 mod tests {
-    //! Pure-helper tests for the `apply` subcommand. These pin the JSON
-    //! key shape produced by `result_to_json` and the lowercase string
-    //! tags emitted by `verify_status_str` — both part of the public
-    //! contract documented in `CLI_CONTRACT.md`.
+    //! Tests for `result_to_event` — the per-package → per-patch event
+    //! translator that feeds apply's unified JSON envelope. Every
+    //! contract value here (action tags, `errorCode` reasons, `files[].path`
+    //! shape) is documented in `CLI_CONTRACT.md`.
     use super::*;
     use socket_patch_core::patch::apply::{
-        ApplyResult, AppliedVia, VerifyResult, VerifyStatus,
+        AppliedVia as CoreAppliedVia, ApplyResult, VerifyResult, VerifyStatus,
     };
 
-    // -----------------------------------------------------------------
-    // verify_status_str — every VerifyStatus variant must map to the
-    // exact lowercase tag documented in the JSON contract.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn verify_status_str_ready() {
-        assert_eq!(verify_status_str(&VerifyStatus::Ready), "ready");
-    }
-
-    #[test]
-    fn verify_status_str_already_patched() {
-        assert_eq!(
-            verify_status_str(&VerifyStatus::AlreadyPatched),
-            "already_patched"
-        );
-    }
-
-    #[test]
-    fn verify_status_str_hash_mismatch() {
-        assert_eq!(
-            verify_status_str(&VerifyStatus::HashMismatch),
-            "hash_mismatch"
-        );
-    }
-
-    #[test]
-    fn verify_status_str_not_found() {
-        assert_eq!(verify_status_str(&VerifyStatus::NotFound), "not_found");
-    }
-
-    // -----------------------------------------------------------------
-    // result_to_json — top-level keys and filesVerified[0] keys are part
-    // of the JSON output contract. Wrappers and CI scripts read these.
-    // -----------------------------------------------------------------
-
-    /// Build an `ApplyResult` with a single fully-populated VerifyResult
-    /// so we can exercise every JSON key in one shot.
-    fn sample_result_with_verify(status: VerifyStatus) -> ApplyResult {
+    /// Build a successful `ApplyResult` with one patched file and one
+    /// verified file. Used as the base for action-routing tests.
+    fn sample_applied(status: VerifyStatus) -> ApplyResult {
+        let mut applied_via = HashMap::new();
+        applied_via.insert("package/index.js".to_string(), CoreAppliedVia::Diff);
         ApplyResult {
             package_key: "pkg:npm/minimist@1.2.2".to_string(),
             package_path: "/tmp/node_modules/minimist".to_string(),
@@ -676,126 +743,101 @@ mod tests {
             files_verified: vec![VerifyResult {
                 file: "package/index.js".to_string(),
                 status,
-                message: Some("ok".to_string()),
-                current_hash: Some("aaa".to_string()),
-                expected_hash: Some("bbb".to_string()),
-                target_hash: Some("ccc".to_string()),
+                message: None,
+                current_hash: None,
+                expected_hash: None,
+                target_hash: None,
             }],
             files_patched: vec!["package/index.js".to_string()],
-            applied_via: HashMap::new(),
+            applied_via,
             error: None,
         }
     }
 
     #[test]
-    fn result_to_json_top_level_keys() {
-        let result = sample_result_with_verify(VerifyStatus::Ready);
-        let v = result_to_json(&result);
-        let obj = v.as_object().expect("top-level must be a JSON object");
+    fn failed_result_maps_to_failed_action() {
+        let mut result = sample_applied(VerifyStatus::Ready);
+        result.success = false;
+        result.error = Some("hash mismatch".into());
 
-        // The exact set of top-level keys is contract; any addition or
-        // rename here is a breaking change for downstream wrappers.
-        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "appliedVia",
-                "error",
-                "filesPatched",
-                "filesVerified",
-                "path",
-                "purl",
-                "success",
-            ]
-        );
+        let event = result_to_event(&result, false);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "failed");
+        assert_eq!(v["errorCode"], "apply_failed");
+        assert_eq!(v["error"], "hash mismatch");
+    }
 
-        // Spot-check value mapping for the simple scalar fields.
+    #[test]
+    fn all_already_patched_maps_to_skipped() {
+        let result = sample_applied(VerifyStatus::AlreadyPatched);
+        let event = result_to_event(&result, false);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "skipped");
+        assert_eq!(v["errorCode"], "already_patched");
+    }
+
+    #[test]
+    fn dry_run_maps_to_verified() {
+        let result = sample_applied(VerifyStatus::Ready);
+        let event = result_to_event(&result, true);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "verified");
+        // Dry-run events list verified files but never an `appliedVia`
+        // — nothing was actually written.
+        assert_eq!(v["files"][0]["path"], "package/index.js");
+        assert!(v["files"][0].as_object().unwrap().get("appliedVia").is_none());
+    }
+
+    #[test]
+    fn successful_apply_maps_to_applied_with_files() {
+        let result = sample_applied(VerifyStatus::Ready);
+        let event = result_to_event(&result, false);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "applied");
         assert_eq!(v["purl"], "pkg:npm/minimist@1.2.2");
-        assert_eq!(v["path"], "/tmp/node_modules/minimist");
-        assert_eq!(v["success"], true);
-        assert_eq!(v["error"], serde_json::Value::Null);
-        assert_eq!(v["filesPatched"][0], "package/index.js");
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "package/index.js");
+        assert_eq!(files[0]["verified"], true);
+        // `appliedVia` is camelCase + lowercase tag — contract value.
+        assert_eq!(files[0]["appliedVia"], "diff");
     }
 
     #[test]
-    fn result_to_json_files_verified_entry_keys() {
-        let result = sample_result_with_verify(VerifyStatus::Ready);
-        let v = result_to_json(&result);
-        let entry = v["filesVerified"][0]
-            .as_object()
-            .expect("filesVerified[0] must be a JSON object");
-
-        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                "currentHash",
-                "expectedHash",
-                "file",
-                "message",
-                "status",
-                "targetHash",
-            ]
-        );
-
-        assert_eq!(v["filesVerified"][0]["file"], "package/index.js");
-        assert_eq!(v["filesVerified"][0]["status"], "ready");
-        assert_eq!(v["filesVerified"][0]["message"], "ok");
-        assert_eq!(v["filesVerified"][0]["currentHash"], "aaa");
-        assert_eq!(v["filesVerified"][0]["expectedHash"], "bbb");
-        assert_eq!(v["filesVerified"][0]["targetHash"], "ccc");
-    }
-
-    #[test]
-    fn result_to_json_hash_mismatch_status_tag() {
-        // The `hash_mismatch` snake_case tag is the contract value.
-        // `verify_status_str` produces it; verify it survives the round
-        // trip through `result_to_json`.
-        let result = sample_result_with_verify(VerifyStatus::HashMismatch);
-        let v = result_to_json(&result);
-        assert_eq!(v["filesVerified"][0]["status"], "hash_mismatch");
-    }
-
-    #[test]
-    fn result_to_json_applied_via_uses_camel_case_key() {
-        // `appliedVia` must be camelCase in JSON output, not snake_case
-        // `applied_via`. This is divergent from the Rust struct field
-        // name and is part of the contract — wrappers parse this key.
+    fn applied_event_emits_one_file_entry_per_patched_file() {
         let mut applied_via = HashMap::new();
-        applied_via.insert("package/index.js".to_string(), AppliedVia::Diff);
-        applied_via.insert("package/lib/foo.js".to_string(), AppliedVia::Package);
-
+        applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Diff);
+        applied_via.insert("package/b.js".to_string(), CoreAppliedVia::Package);
+        applied_via.insert("package/c.js".to_string(), CoreAppliedVia::Blob);
         let result = ApplyResult {
-            package_key: "pkg:npm/minimist@1.2.2".to_string(),
-            package_path: "/tmp/node_modules/minimist".to_string(),
+            package_key: "pkg:npm/foo@1.0.0".to_string(),
+            package_path: "/tmp/foo".to_string(),
             success: true,
             files_verified: Vec::new(),
             files_patched: vec![
-                "package/index.js".to_string(),
-                "package/lib/foo.js".to_string(),
+                "package/a.js".to_string(),
+                "package/b.js".to_string(),
+                "package/c.js".to_string(),
             ],
             applied_via,
             error: None,
         };
-        let v = result_to_json(&result);
 
-        // Key must be `appliedVia`, not `applied_via`.
-        assert!(v.get("appliedVia").is_some());
-        assert!(v.get("applied_via").is_none());
-
-        // Value must serialize as a JSON object map (not array).
-        let map = v["appliedVia"]
-            .as_object()
-            .expect("appliedVia must serialize as a JSON object");
-        assert_eq!(map.len(), 2);
-        // The lowercase tags from `AppliedVia::as_tag` are themselves
-        // contract values (`diff`, `package`, `blob`).
-        assert_eq!(map.get("package/index.js").and_then(|v| v.as_str()), Some("diff"));
-        assert_eq!(
-            map.get("package/lib/foo.js").and_then(|v| v.as_str()),
-            Some("package"),
-        );
+        let event = result_to_event(&result, false);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        let by_path: std::collections::HashMap<String, &serde_json::Value> = files
+            .iter()
+            .map(|f| (f["path"].as_str().unwrap().to_string(), f))
+            .collect();
+        assert_eq!(by_path["package/a.js"]["appliedVia"], "diff");
+        assert_eq!(by_path["package/b.js"]["appliedVia"], "package");
+        assert_eq!(by_path["package/c.js"]["appliedVia"], "blob");
     }
 }

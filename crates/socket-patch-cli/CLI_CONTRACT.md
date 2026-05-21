@@ -149,176 +149,155 @@ Required positional `identifier`. Flags:
 
 ## JSON output shapes
 
-When `--json` is set, commands print a single JSON object to stdout. The schemas below are stable.
+Every `--json` invocation emits a single JSON object that follows the **unified envelope** below. The envelope was introduced in v3.0; older per-command shapes are deprecated. See `src/json_envelope.rs` for the source of truth and `tests/cli_parse_*.rs` for snapshot tests that lock the shape.
 
-### Missing-manifest error (`apply`/`list`/`remove`/`repair`/`rollback`)
+### Envelope shape
 
-```json
+```jsonc
 {
-  "status": "error",
-  "error": "Manifest not found",
-  "path": "<absolute path that was looked up>"
+  "command":  "apply" | "rollback" | "get" | "scan" | "list" | "remove" | "repair" | "setup",
+  "status":   "success" | "partialFailure" | "error" | "noManifest" | "paidRequired" | "notFound",
+  "dryRun":   false,
+  "events":   [ <PatchEvent>, ... ],
+  "summary":  {
+    "discovered":      0,
+    "downloaded":      0,
+    "applied":         0,
+    "updated":         0,
+    "skipped":         0,
+    "failed":          0,
+    "removed":         0,
+    "verified":        0,
+    "bytesDownloaded": 0,
+    "bytesFreed":      0
+  },
+  "error":    { "code": "...", "message": "..." }   // only on status=error
 }
 ```
 
-### Invalid-manifest error
+`events` is the load-bearing payload. `summary` is pre-computed from `events` so consumers don't have to walk the array. `error` is set only on top-level failures (e.g. `manifest_not_found`); per-patch failures appear as `events[*]` with `action: "failed"`.
 
-```json
-{ "status": "error", "error": "Invalid manifest" }
-```
+### `PatchEvent` shape
 
-### Generic error
-
-```json
-{ "status": "error", "error": "<message>" }
-```
-
-### `list` success — empty manifest
-
-```json
-{ "status": "success", "patches": [] }
-```
-
-### `list` success — populated
-
-```json
+```jsonc
 {
-  "status": "success",
-  "patches": [
+  "action":    "discovered" | "downloaded" | "applied" | "updated" | "skipped" | "failed" | "removed" | "verified",
+  "purl":      "pkg:npm/foo@1.2.3",        // omitted on artifact-level events
+  "uuid":      "<patch uuid>",              // optional
+  "oldUuid":   "<previous uuid>",           // only when action=updated
+  "files": [
     {
-      "purl": "pkg:npm/foo@1.2.3",
-      "uuid": "…",
-      "exportedAt": "…",
-      "tier": "free|paid",
-      "license": "…",
-      "description": "…",
-      "files": ["…"],
-      "vulnerabilities": [
-        { "id": "…", "cves": ["…"], "summary": "…", "severity": "…", "description": "…" }
-      ]
-    }
-  ]
-}
-```
-
-### `setup` — no package.json files found
-
-```json
-{
-  "status": "no_files",
-  "updated": 0,
-  "alreadyConfigured": 0,
-  "errors": 0,
-  "files": []
-}
-```
-
-### `get` — multiple-patch selection required (JSON mode)
-
-```json
-{
-  "status": "selection_required",
-  "error": "Multiple patches available for <purl>. Specify --id <UUID> to select one.",
-  "purl": "<purl>",
-  "options": [
-    { "uuid": "…", "tier": "…", "published_at": "…", "description": "…", "vulnerabilities": [ … ] }
-  ]
-}
-```
-
-### `scan` — discovery (read-only, default `--json` mode)
-
-```json
-{
-  "status": "success",
-  "scannedPackages": 42,
-  "packagesWithPatches": 3,
-  "totalPatches": 5,
-  "freePatches": 4,
-  "paidPatches": 1,
-  "canAccessPaidPatches": false,
-  "packages": [
-    {
-      "purl": "pkg:npm/minimist@1.2.2",
-      "patches": [
-        { "uuid": "…", "purl": "pkg:npm/minimist@1.2.2", "tier": "free", "cveIds": ["CVE-…"], "ghsaIds": [], "severity": "high", "title": "…" }
-      ]
+      "path":        "package/index.js",
+      "verified":    true,
+      "appliedVia":  "package" | "diff" | "blob"   // only on action=applied
     }
   ],
-  "updates": [
-    { "purl": "pkg:npm/foo@1.0", "oldUuid": "<previous>", "newUuid": "<newest>" }
-  ]
+  "bytes":      1234,                       // optional (downloaded/removed)
+  "reason":     "Files match afterHash",    // human-readable explanation (skipped)
+  "errorCode":  "already_patched",          // stable snake_case routing tag
+  "error":      "<message>",                // only when action=failed
+  "details":    { ... }                     // command-specific extras (see below)
 }
 ```
 
-The `updates` array lists PURLs where the newest available patch UUID differs from the one currently recorded in `.socket/manifest.json`. Bots use this to drive "what would change" summaries without mutating anything.
+`details` is intentionally schemaless — different subcommands attach different keys. Consumers MUST treat unknown keys as best-effort metadata and must not break on absence.
 
-**The `gc` sub-object is omitted entirely when `--prune` (or `--sync`) is not set.** GC information is opt-in — `scan --json` alone is purely about patch discovery and update detection.
+### `PatchAction` vocabulary
 
-### `scan` — `--apply` mode
+| Action       | Emitted by                            | Meaning |
+|--------------|---------------------------------------|---------|
+| `discovered` | `scan`, `list`                        | Patch exists upstream / in the manifest — no work taken. |
+| `downloaded` | `get`, `repair`, `scan --apply`       | Patch bytes were fetched from the registry. `bytes` set. |
+| `applied`    | `apply`, `scan --sync`                | Patch was written to disk. `files` enumerates what changed. |
+| `updated`    | `apply`, `scan --sync`, `get`         | A different UUID replaced an older one for this PURL. `oldUuid` set. |
+| `skipped`    | every command                         | No-op — already patched, not in scope, filtered, etc. `errorCode` carries the reason. |
+| `failed`     | every command                         | A specific patch attempt failed. `errorCode` + `error` set. |
+| `removed`    | `gc`/`repair`, `remove`, `rollback`   | Data was removed from `.socket/` (or files rolled back). `bytes` optional. |
+| `verified`   | `apply --dry-run`, `scan --dry-run`   | The patch *would* apply cleanly. `files` lists previewed changes. |
 
-When invoked as `scan --json --apply`, the discovery object above is augmented with a top-level `apply` sub-object reporting per-patch outcomes from the download + manifest write. The `gc` sub-object is added only when `--prune` (or `--sync`, which implies it) is also set:
+### Stable `errorCode` tags
 
-```json
-{
-  "status": "success",                  // or "partial_failure"
-  "scannedPackages": 42,
-  // … all discovery fields above …
-  "updates": [ … ],
-  "apply": {
-    "found": 3,
-    "downloaded": 2,
-    "skipped": 1,
-    "failed": 0,
-    "applied": 2,
-    "updated": 1,
-    "patches": [
-      { "purl": "pkg:npm/foo@1.0", "uuid": "<new>", "action": "added" },
-      { "purl": "pkg:npm/bar@2.0", "uuid": "<new>", "action": "updated", "oldUuid": "<previous>" },
-      { "purl": "pkg:npm/baz@3.0", "uuid": "<existing>", "action": "skipped" },
-      { "purl": "pkg:npm/qux@4.0", "uuid": "<attempted>", "action": "failed", "error": "…" }
-    ]
-  },
-  "gc": {
-    "prunedManifestEntries": ["pkg:npm/uninstalled@1.0"],
-    "removedBlobs": 3,
-    "removedDiffArchives": 1,
-    "removedPackageArchives": 0,
-    "bytesFreed": 8421
-  }
-}
-```
+| Tag                       | Action(s)        | Context |
+|---------------------------|------------------|---------|
+| `already_patched`         | `skipped`        | apply: every file's hash already matches `afterHash`. |
+| `package_not_installed`   | `skipped`        | apply: manifest entry has no matching installed package. |
+| `apply_failed`            | `failed`         | apply: hash mismatch, write error, archive read error. |
+| `no_local_source`         | `skipped`/`failed` | `--offline` and the patch is missing from `.socket/`. |
+| `paid_required`           | `failed` / status=`paidRequired` | get/scan: patch needs a paid plan and the caller's token isn't entitled. |
+| `download_failed`         | `failed`         | repair/get: network or 404 on patch fetch. |
+| `rollback_failed`         | `failed`         | remove/rollback: file restore could not complete. |
 
-Without `--prune` or `--sync`, the `gc` field is **omitted entirely** from the output. When `--prune` is set without `--dry-run`, `gc` uses the apply-mode field names (`prunedManifestEntries`, `removedBlobs`, `removedDiffArchives`, `removedPackageArchives`, `bytesFreed`). With `--dry-run`, it uses preview-mode field names (`prunableManifestEntries`, `orphanBlobs`, `orphanDiffArchives`, `orphanPackageArchives`, `bytesReclaimable`) and nothing is mutated. Bots should branch on which field set is present, not assume a single shape.
+### Top-level `EnvelopeError` codes
 
-### `scan` — `--sync` (bot mode)
+| Code                  | Subcommands                      | Meaning |
+|-----------------------|----------------------------------|---------|
+| `manifest_not_found`  | list, remove, repair, rollback   | `.socket/manifest.json` doesn't exist. |
+| `manifest_invalid`    | list, remove                     | Manifest exists but is unparseable. |
+| `manifest_unreadable` | list, remove                     | I/O error reading manifest. |
+| `apply_failed`        | apply                            | apply pipeline error before any patch ran. |
+| `repair_failed`       | repair                           | repair pipeline error. |
+| `remove_failed`       | remove                           | Could not write the modified manifest. |
 
-`scan --json --sync --yes` is sugar for `scan --json --apply --prune --yes` — the canonical single-command auto-update workflow. Output is the full discovery + `apply` + `gc` shape above. Pipe it into PR-creation tooling:
+### Per-subcommand action matrix
+
+| Subcommand   | Emits |
+|--------------|---|
+| `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed) · `Failed` · `Verified` (dry-run) |
+| `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`) |
+| `repair`/`gc`| `Downloaded` (or `Verified` on dry-run) · `Removed` (or `Verified`) · `Failed` artifact events |
+| `remove`     | `Removed` (per purl) · artifact-level `Removed` event (with `details.blobsRemoved`, `details.rolledBack`) |
+
+### Migration status (v3.0)
+
+The unified envelope is the v3.0 contract. As of this release, these commands emit the envelope and have snapshot-test coverage:
+
+- ✅ `apply`
+- ✅ `list`
+- ✅ `repair` / `gc`
+- ✅ `remove`
+
+The remaining commands still emit their pre-v3.0 ad-hoc JSON shapes and will migrate in a follow-up PR. Until then, downstream consumers should branch on the `command` field (envelope) vs the legacy shape (no `command` field, `status` in snake_case):
+
+- ⏳ `scan` — still emits the discovery + `apply.patches[*]` + `gc.*` shape documented in earlier drafts of this file.
+- ⏳ `get` — still emits per-patch action arrays.
+- ⏳ `rollback` — still emits per-package result records.
+- ⏳ `setup` — still emits `{ status, updated, alreadyConfigured, errors, files }`.
+
+### `jq` recipes for PR-comment bots
+
+Applied + updated patches (envelope shape):
 
 ```bash
-socket-patch scan --json --sync --yes | jq '{
-  applied: [.apply.patches[] | select(.action == "added" or .action == "updated") | .purl],
-  pruned:  .gc.prunedManifestEntries,
-  bytes_freed: .gc.bytesFreed
+socket-patch apply --json | jq '
+  .events[]
+  | select(.action == "applied" or .action == "updated")
+  | { purl, uuid, oldUuid, files: [.files[].path] }
+'
+```
+
+GC summary (after `repair --json`):
+
+```bash
+socket-patch repair --json | jq '{
+  removed:     .summary.removed,
+  bytesFreed:  .summary.bytesFreed,
+  failed:      .summary.failed
 }'
 ```
 
-Exit `0` on success, `1` if any `apply.patches[*].action == "failed"` (top-level `status` becomes `"partial_failure"`).
+Combined apply summary for a PR description:
 
-### `scan` — `--dry-run`
+```bash
+socket-patch apply --json | jq '
+  .summary
+  | "Applied \(.applied) patches, updated \(.updated), skipped \(.skipped), failed \(.failed)."
+'
+```
 
-When combined with `--apply`, `--prune`, or `--sync`, `--dry-run` (`-d`) populates `apply.patches[*]` and `gc.prunable*` / `gc.orphan*` fields with the *would-be* actions without touching disk. The `apply` sub-object in dry-run mode includes a `"dryRun": true` field for bots that need an explicit signal. Without one of the mutating flags, `--dry-run` is a no-op (discovery is already non-mutating).
+### Exit code semantics
 
-Per-patch `action` vocabulary is stable:
-
-| `action` | Meaning |
-|---|---|
-| `"added"` | PURL was not in the manifest before. |
-| `"updated"` | PURL was in the manifest with a different UUID. `oldUuid` is included. |
-| `"skipped"` | PURL was in the manifest with the same UUID. No work was done. |
-| `"failed"` | The patch could not be downloaded or saved. `error` is included. |
-
-Exit code follows the apply outcome: `0` if every selected patch was added, updated, or skipped; `1` if any `failed` record is present (and `status` becomes `"partial_failure"`).
+Exit `0` when `status` is `success`, `noManifest`, or `notFound`-with-zero-failed.
+Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) or `error`.
 
 ## Exit codes
 
