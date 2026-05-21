@@ -1,0 +1,12 @@
+# nuget (.NET) ecosystem test image.
+#
+# The official `mcr.microsoft.com/dotnet/sdk:8.0` image is the simplest
+# way to get a working .NET SDK across architectures (the apt + dotnet-
+# install paths both have arm64 issues on bookworm). We COPY socket-patch
+# in from our base image.
+FROM socket-patch-test-base:latest AS sptool
+
+FROM mcr.microsoft.com/dotnet/sdk:8.0
+COPY --from=sptool /usr/local/bin/socket-patch /usr/local/bin/socket-patch
+RUN socket-patch --version && dotnet --version
+WORKDIR /workspace

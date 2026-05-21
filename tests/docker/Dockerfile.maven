@@ -1,0 +1,9 @@
+# maven ecosystem test image: base + JDK + Maven.
+FROM socket-patch-test-base:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      default-jdk-headless \
+      maven \
+ && rm -rf /var/lib/apt/lists/* \
+ && java -version && mvn -version
