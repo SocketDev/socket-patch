@@ -1,0 +1,15 @@
+# npm ecosystem test image: base + Node.js + npm.
+#
+# Pinned to Node 20 LTS via the NodeSource apt repo. The setup_20.x script
+# installs the latest 20.x at image-build time; for reproducibility CI
+# rebuilds the image whenever this Dockerfile or the base changes.
+FROM socket-patch-test-base:latest
+
+# Install Node.js 20 LTS from NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# Verify versions are sane at image-build time so a broken NodeSource setup
+# fails the image build rather than every downstream test.
+RUN node --version && npm --version && socket-patch --version
