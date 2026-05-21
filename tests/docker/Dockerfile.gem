@@ -1,0 +1,11 @@
+# gem (Ruby) ecosystem test image: base + Ruby + bundler.
+FROM socket-patch-test-base:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ruby \
+      ruby-dev \
+      build-essential \
+ && rm -rf /var/lib/apt/lists/* \
+ && gem install bundler --no-document \
+ && ruby --version && gem --version && bundle --version
