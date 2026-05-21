@@ -235,6 +235,49 @@ exit 0
     )
 }
 
+/// Driver script for the `npm install -g` variant. Installs minimist
+/// globally (into `$(npm root -g)`), runs scan + apply with `--global`,
+/// and verifies the marker landed in the global node_modules tree.
+fn make_global_script(api_url: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
+
+# Global install — populates $(npm root -g)/minimist/.
+npm install -g --silent --no-audit --no-fund minimist@1.2.2 > /tmp/install.log 2>&1 || {{
+  cat /tmp/install.log >&2; exit 1
+}}
+
+NPM_GLOBAL_ROOT=$(npm root -g)
+GLOBAL_FILE="$NPM_GLOBAL_ROOT/minimist/index.js"
+[ -f "$GLOBAL_FILE" ] || {{ echo "FAIL: $GLOBAL_FILE missing" >&2; ls "$NPM_GLOBAL_ROOT" >&2 || true; exit 1; }}
+echo "Global-installed at: $GLOBAL_FILE" >&2
+
+# scan + apply run from an empty workspace; --global tells the crawler
+# to look at $(npm root -g) instead of cwd-relative node_modules.
+mkdir -p /workspace/proj && cd /workspace/proj
+
+socket-patch scan --json --sync --yes --global "${{COMMON_ARGS[@]}}" \
+  --ecosystems npm 2>/tmp/sync.err
+cat /tmp/sync.err >&2
+
+socket-patch apply --json --force --offline --global --ecosystems npm 2>/tmp/apply.err
+cat /tmp/apply.err >&2
+
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GLOBAL_FILE"; then
+  echo "FAIL: marker not in $GLOBAL_FILE" >&2
+  head -3 "$GLOBAL_FILE" >&2
+  exit 1
+fi
+
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    )
+}
+
 fn run_in_container(script: &str) -> std::process::Output {
     Command::new("docker")
         .args([
@@ -331,6 +374,31 @@ async fn npm_install_scan_apply_rollback_cycle() {
             .any(|r| r.url.path().contains("/patches/batch")),
         "scan should have called /patches/batch; received={received:#?}"
     );
+}
+
+#[tokio::test]
+async fn npm_global_install_full_apply_chain() {
+    // PURL must be the lowercased form scan's crawler emits — see the
+    // nuget docker test for the same constraint. (npm names are already
+    // lowercase in practice; we use the canonical form here for clarity.)
+    let after_hash = git_sha256(PATCHED_BYTES);
+    let server = make_mock_server(&after_hash).await;
+    if host_mode() {
+        // Host mode doesn't have a global npm prefix we can safely
+        // mutate, so skip silently. Docker mode is the canonical run.
+        return;
+    }
+    assert_docker_image_present();
+    let api = api_url_for_container(&server);
+    let out = run_in_container(&make_global_script(&api));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "npm global apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 
 /// Smoke test: verify the test infrastructure starts up correctly. This
