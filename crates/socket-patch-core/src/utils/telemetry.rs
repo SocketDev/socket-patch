@@ -316,23 +316,6 @@ pub async fn track_patch_event(options: TrackPatchEventOptions) {
     .await;
 }
 
-/// Fire-and-forget version of `track_patch_event` that spawns the request
-/// on a background task so it never blocks the caller.
-pub fn track_patch_event_fire_and_forget(options: TrackPatchEventOptions) {
-    if is_telemetry_disabled() {
-        debug_log("Telemetry is disabled, skipping event");
-        return;
-    }
-
-    let event = build_telemetry_event(&options);
-    let api_token = options.api_token.clone();
-    let org_slug = options.org_slug.clone();
-
-    tokio::spawn(async move {
-        send_telemetry_event(&event, api_token.as_deref(), org_slug.as_deref()).await;
-    });
-}
-
 // ---------------------------------------------------------------------------
 // Convenience functions
 //
