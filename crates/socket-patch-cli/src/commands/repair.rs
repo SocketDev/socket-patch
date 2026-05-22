@@ -12,6 +12,7 @@ use socket_patch_core::utils::cleanup_blobs::{
 use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 #[derive(Args)]
@@ -60,6 +61,20 @@ pub async fn run(args: RepairArgs) -> i32 {
         }
         return 1;
     }
+
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. See `apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let _lock = match acquire_or_emit(
+        socket_dir,
+        Command::Repair,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+    ) {
+        Ok(guard) => guard,
+        Err(code) => return code,
+    };
 
     match repair_inner(&args, &manifest_path).await {
         Ok(env) => {

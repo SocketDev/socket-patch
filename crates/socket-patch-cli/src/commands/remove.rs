@@ -8,6 +8,7 @@ use std::path::Path;
 
 use super::rollback::rollback_patches;
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status,
 };
@@ -55,6 +56,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         );
         return 1;
     }
+
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. Note: `rollback_patches` (which
+    // `remove` calls into) does NOT acquire the lock — that would
+    // self-deadlock — so the outer remove invocation holds it for
+    // both the rollback and the manifest mutation.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let _lock = match acquire_or_emit(
+        socket_dir,
+        Command::Remove,
+        args.common.json,
+        false, // remove has no --silent on its own; use false
+        false, // remove has no --dry-run
+    ) {
+        Ok(guard) => guard,
+        Err(code) => return code,
+    };
 
     // Read manifest to show what will be removed and confirm
     let manifest = match read_manifest(&manifest_path).await {

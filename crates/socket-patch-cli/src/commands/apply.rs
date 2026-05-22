@@ -4,11 +4,15 @@ use socket_patch_core::api::blob_fetcher::{
     get_missing_blobs, DownloadMode,
 };
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::crawlers::{
+    detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
+};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
+
+use crate::commands::lock_cli::acquire_or_emit;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
@@ -129,7 +133,36 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
                 .map(AppliedVia::from_core),
         })
         .collect();
-    PatchEvent::new(PatchAction::Applied, purl).with_files(files)
+    let mut event = PatchEvent::new(PatchAction::Applied, purl).with_files(files);
+    // Carry ecosystem sidecar fixup outcomes under `details` —
+    // narrower JSON contract than first-class fields (see plan).
+    // Consumers read `event.details.sidecarsUpdated` and
+    // `event.details.sidecarAdvisory`. Only attach when either is
+    // non-empty so events for ecosystems with no sidecar (npm,
+    // yarn) stay quiet.
+    if !result.sidecars_updated.is_empty() || result.sidecar_advisory.is_some() {
+        let mut details = serde_json::Map::new();
+        if !result.sidecars_updated.is_empty() {
+            details.insert(
+                "sidecarsUpdated".to_string(),
+                serde_json::Value::Array(
+                    result
+                        .sidecars_updated
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(ref advisory) = result.sidecar_advisory {
+            details.insert(
+                "sidecarAdvisory".to_string(),
+                serde_json::Value::String(advisory.clone()),
+            );
+        }
+        event = event.with_details(serde_json::Value::Object(details));
+    }
+    event
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
@@ -152,6 +185,60 @@ pub async fn run(args: ApplyArgs) -> i32 {
             println!("No .socket folder found, skipping patch application.");
         }
         return 0;
+    }
+
+    // Serialize against concurrent socket-patch runs targeting the same
+    // `.socket/` directory. The guard releases on function return; see
+    // `socket_patch_core::patch::apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let _lock = match acquire_or_emit(
+        socket_dir,
+        Command::Apply,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+    ) {
+        Ok(guard) => guard,
+        Err(code) => return code,
+    };
+
+    // Package-manager layout detection. yarn-berry PnP keeps packages
+    // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
+    // the npm crawler can't reach them and rewriting zips is a
+    // different operation entirely. Refuse with a clear pointer to
+    // `yarn patch`. pnpm gets an informational event; the CoW guard
+    // in `apply_file_patch` does the substantive safety work.
+    let pkg_manager = detect_npm_pkg_manager(&args.common.cwd);
+    match pkg_manager {
+        NpmPkgManager::YarnBerryPnP => {
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.dry_run = args.common.dry_run;
+                env.mark_error(EnvelopeError::new(
+                    "yarn_pnp_unsupported",
+                    "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
+                ));
+                println!("{}", env.to_pretty_json());
+            } else if !args.common.silent {
+                eprintln!("Error: yarn-berry Plug'n'Play layout is not supported.");
+                eprintln!(
+                    "  Packages live inside .yarn/cache/*.zip — socket-patch cannot rewrite them in place."
+                );
+                eprintln!("  Use `yarn patch <pkg>` instead.");
+            }
+            return 1;
+        }
+        NpmPkgManager::Pnpm => {
+            if !args.common.json && !args.common.silent {
+                eprintln!(
+                    "Note: pnpm layout detected. Copy-on-write will keep the global store untouched."
+                );
+            }
+            // Non-fatal — CoW handles the safety. JSON consumers see
+            // the layout-detected info in the apply envelope's
+            // existing events (no separate event added here yet).
+        }
+        _ => {}
     }
 
     match apply_patches_inner(&args, &manifest_path).await {
@@ -705,6 +792,8 @@ mod tests {
             files_patched: vec!["package/index.js".to_string()],
             applied_via,
             error: None,
+            sidecars_updated: Vec::new(),
+            sidecar_advisory: None,
         }
     }
 
@@ -779,6 +868,8 @@ mod tests {
             ],
             applied_via,
             error: None,
+            sidecars_updated: Vec::new(),
+            sidecar_advisory: None,
         };
 
         let event = result_to_event(&result, false);

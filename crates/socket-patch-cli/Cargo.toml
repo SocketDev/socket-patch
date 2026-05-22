@@ -49,3 +49,8 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+# Used by `tests/e2e_safety_lock.rs` to externally hold the same
+# `.socket/apply.lock` the binary takes, then spawn the binary and
+# assert the lock_held exit-code contract. Same crate the binary
+# uses internally (`socket-patch-core::patch::apply_lock`).
+fs2 = { workspace = true }

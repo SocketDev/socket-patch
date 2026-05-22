@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::json_envelope::Command as EnvelopeCommand;
 
 #[derive(Args)]
 pub struct RollbackArgs {
@@ -172,6 +174,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
         return 1;
     }
+
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. See
+    // `socket_patch_core::patch::apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let _lock = match acquire_or_emit(
+        socket_dir,
+        EnvelopeCommand::Rollback,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+    ) {
+        Ok(guard) => guard,
+        Err(code) => return code,
+    };
 
     match rollback_patches_inner(&args, &manifest_path).await {
         Ok((success, results)) => {
