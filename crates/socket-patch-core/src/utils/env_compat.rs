@@ -67,14 +67,6 @@ pub fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
 
 /// Read the new env var; if it isn't set, also probe the legacy name and
 /// surface a deprecation warning when the legacy name is set. Returns the
-/// new-name value when set, otherwise the legacy value (or `None`).
-///
-/// Same behavior as `read_env_with_legacy` but exposed as a separate name to
-/// emphasize that the caller wants the *value* and accepts either source.
-pub fn read_env_either(new_name: &'static str, legacy_name: &'static str) -> Option<String> {
-    read_env_with_legacy(new_name, legacy_name)
-}
-
 /// Renamed env vars whose legacy `SOCKET_PATCH_*` names are still honored.
 ///
 /// First entry of each tuple is the new name (what clap and current code
