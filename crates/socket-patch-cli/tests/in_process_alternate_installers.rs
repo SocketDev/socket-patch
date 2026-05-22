@@ -32,18 +32,21 @@ fn has(cmd: &str) -> bool {
 
 fn default_apply(cwd: &Path) -> ApplyArgs {
     ApplyArgs {
-        cwd: cwd.to_path_buf(),
-        dry_run: false,
-        silent: true,
-        manifest_path: ".socket/manifest.json".to_string(),
-        offline: true,
-        global: false,
-        global_prefix: None,
-        ecosystems: Some(vec!["npm".to_string()]),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            ecosystems: Some(vec!["npm".to_string()]),
+            json: true,
+            verbose: false,
+            download_mode: "diff".to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         force: false,
-        json: true,
-        verbose: false,
-        download_mode: "diff".to_string(),
     }
 }
 
@@ -346,7 +349,7 @@ gem 'colorize', '1.1.0'
     std::fs::write(blobs.join(&after_hash), &patched).unwrap();
 
     let mut args = default_apply(tmp.path());
-    args.ecosystems = Some(vec!["gem".to_string()]);
+    args.common.ecosystems = Some(vec!["gem".to_string()]);
     let code = apply_run(args).await;
     assert_eq!(code, 0, "bundler-installed gem must be patchable");
     let after = std::fs::read(&lib_file).expect("read patched");

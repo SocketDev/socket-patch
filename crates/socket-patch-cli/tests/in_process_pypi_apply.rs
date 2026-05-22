@@ -181,21 +181,24 @@ async fn pypi_install_scan_sync_patches_real_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let mut args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["pypi".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: true,
-        dry_run: false,
     };
     // Avoid borrow problem with into_iter
     let _ = &mut args;
@@ -238,39 +241,45 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
 
     // 1. scan --sync to write the manifest + blob.
     let scan_args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["pypi".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: true,
-        dry_run: false,
     };
     let _ = scan_run(scan_args).await;
 
     // 2. Now run apply --offline --force separately. Exercises the
     // read-only-cache path in apply.rs.
     let apply_args = ApplyArgs {
-        cwd: tmp.path().to_path_buf(),
-        dry_run: false,
-        silent: true,
-        manifest_path: ".socket/manifest.json".to_string(),
-        offline: true,
-        global: false,
-        global_prefix: None,
-        ecosystems: Some(vec!["pypi".to_string()]),
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            ecosystems: Some(vec!["pypi".to_string()]),
+            json: true,
+            verbose: false,
+            download_mode: "diff".to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         force: true,
-        json: true,
-        verbose: false,
-        download_mode: "diff".to_string(),
     };
     let _ = apply_run(apply_args).await;
 
@@ -306,21 +315,24 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     setup_pypi_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
     let scan_args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["pypi".to_string()]),
-        download_mode: "diff".to_string(),
         apply: true,
         prune: false,
         sync: false,
-        dry_run: true,
     };
     let _ = scan_run(scan_args).await;
 
@@ -377,21 +389,24 @@ async fn pypi_crawler_finds_real_installed_six() {
         .await;
 
     let args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["pypi".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: false,
-        dry_run: false,
     };
     assert_eq!(scan_run(args).await, 0);
 }

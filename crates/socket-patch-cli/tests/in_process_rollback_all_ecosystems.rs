@@ -58,21 +58,23 @@ fn write_manifest_with_patch(
 
 fn default_rollback_args(cwd: &Path, eco: &str) -> RollbackArgs {
     RollbackArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            org: None,
+                        api_token: None,
+            ecosystems: Some(vec![eco.to_string()]),
+            json: true,
+            verbose: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: None,
-        cwd: cwd.to_path_buf(),
-        dry_run: false,
-        silent: true,
-        manifest_path: ".socket/manifest.json".to_string(),
-        offline: true,
-        global: false,
-        global_prefix: None,
         one_off: false,
-        org: None,
-        api_url: None,
-        api_token: None,
-        ecosystems: Some(vec![eco.to_string()]),
-        json: true,
-        verbose: false,
     }
 }
 
@@ -293,7 +295,7 @@ async fn rollback_golang_restores_original_content() {
 
     std::env::set_var("GOMODCACHE", tmp.path());
     let mut args = default_rollback_args(tmp.path(), "golang");
-    args.global = true;
+    args.common.global = true;
     let _ = rollback_run(args).await;
     std::env::remove_var("GOMODCACHE");
 
@@ -336,7 +338,7 @@ async fn rollback_maven_restores_original_content() {
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
     let mut args = default_rollback_args(tmp.path(), "maven");
-    args.global = true;
+    args.common.global = true;
     let _ = rollback_run(args).await;
     std::env::remove_var("MAVEN_REPO_LOCAL");
 
@@ -425,7 +427,7 @@ async fn rollback_nuget_restores_original_content() {
 
     std::env::set_var("NUGET_PACKAGES", &packages);
     let mut args = default_rollback_args(tmp.path(), "nuget");
-    args.global = true;
+    args.common.global = true;
     let _ = rollback_run(args).await;
     std::env::remove_var("NUGET_PACKAGES");
 

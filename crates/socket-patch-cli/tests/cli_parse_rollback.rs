@@ -26,20 +26,20 @@ fn parse_rollback(extra: &[&str]) -> RollbackArgs {
 fn defaults_no_positional() {
     let args = parse_rollback(&[]);
     assert_eq!(args.identifier, None);
-    assert_eq!(args.cwd, PathBuf::from("."));
-    assert!(!args.dry_run);
-    assert!(!args.silent);
-    assert_eq!(args.manifest_path, ".socket/manifest.json");
-    assert!(!args.offline);
-    assert!(!args.global);
-    assert_eq!(args.global_prefix, None);
+    assert_eq!(args.common.cwd, PathBuf::from("."));
+    assert!(!args.common.dry_run);
+    assert!(!args.common.silent);
+    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
+    assert!(!args.common.offline);
+    assert!(!args.common.global);
+    assert_eq!(args.common.global_prefix, None);
     assert!(!args.one_off);
-    assert_eq!(args.org, None);
-    assert_eq!(args.api_url, None);
-    assert_eq!(args.api_token, None);
-    assert_eq!(args.ecosystems, None);
-    assert!(!args.json);
-    assert!(!args.verbose);
+    assert_eq!(args.common.org, None);
+    assert_eq!(args.common.api_url, "https://api.socket.dev");
+    assert_eq!(args.common.api_token, None);
+    assert_eq!(args.common.ecosystems, None);
+    assert!(!args.common.json);
+    assert!(!args.common.verbose);
 }
 
 #[test]
@@ -60,85 +60,85 @@ fn positional_identifier_purl() {
 #[test]
 fn dry_run_short() {
     let args = parse_rollback(&["-d"]);
-    assert!(args.dry_run);
+    assert!(args.common.dry_run);
 }
 
 #[test]
 fn dry_run_long() {
     let args = parse_rollback(&["--dry-run"]);
-    assert!(args.dry_run);
+    assert!(args.common.dry_run);
 }
 
 #[test]
 fn silent_short() {
     let args = parse_rollback(&["-s"]);
-    assert!(args.silent);
+    assert!(args.common.silent);
 }
 
 #[test]
 fn silent_long() {
     let args = parse_rollback(&["--silent"]);
-    assert!(args.silent);
+    assert!(args.common.silent);
 }
 
 #[test]
 fn manifest_path_short() {
     let args = parse_rollback(&["-m", "custom.json"]);
-    assert_eq!(args.manifest_path, "custom.json");
+    assert_eq!(args.common.manifest_path, "custom.json");
 }
 
 #[test]
 fn manifest_path_long() {
     let args = parse_rollback(&["--manifest-path", "custom.json"]);
-    assert_eq!(args.manifest_path, "custom.json");
+    assert_eq!(args.common.manifest_path, "custom.json");
 }
 
 #[test]
 fn global_short() {
     let args = parse_rollback(&["-g"]);
-    assert!(args.global);
+    assert!(args.common.global);
 }
 
 #[test]
 fn global_long() {
     let args = parse_rollback(&["--global"]);
-    assert!(args.global);
+    assert!(args.common.global);
 }
 
 #[test]
 fn verbose_short() {
     let args = parse_rollback(&["-v"]);
-    assert!(args.verbose);
+    assert!(args.common.verbose);
 }
 
 #[test]
 fn verbose_long() {
     let args = parse_rollback(&["--verbose"]);
-    assert!(args.verbose);
+    assert!(args.common.verbose);
 }
 
 #[test]
 fn cwd_long() {
     let args = parse_rollback(&["--cwd", "/tmp/x"]);
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
 }
 
 #[test]
 fn offline_long() {
     let args = parse_rollback(&["--offline"]);
-    assert!(args.offline);
+    assert!(args.common.offline);
 }
 
 #[test]
 fn json_long() {
     let args = parse_rollback(&["--json"]);
-    assert!(args.json);
+    assert!(args.common.json);
 }
 
 #[test]
 fn global_prefix_long() {
     let args = parse_rollback(&["--global-prefix", "/foo"]);
-    assert_eq!(args.global_prefix, Some(PathBuf::from("/foo")));
+    assert_eq!(args.common.global_prefix, Some(PathBuf::from("/foo")));
 }
 
 #[test]
@@ -150,26 +150,26 @@ fn one_off_long() {
 #[test]
 fn org_long() {
     let args = parse_rollback(&["--org", "myorg"]);
-    assert_eq!(args.org, Some("myorg".to_string()));
+    assert_eq!(args.common.org, Some("myorg".to_string()));
 }
 
 #[test]
 fn api_url_long() {
     let args = parse_rollback(&["--api-url", "https://api"]);
-    assert_eq!(args.api_url, Some("https://api".to_string()));
+    assert_eq!(args.common.api_url, "https://api");
 }
 
 #[test]
 fn api_token_long() {
     let args = parse_rollback(&["--api-token", "tok"]);
-    assert_eq!(args.api_token, Some("tok".to_string()));
+    assert_eq!(args.common.api_token, Some("tok".to_string()));
 }
 
 #[test]
 fn ecosystems_csv_split() {
     let args = parse_rollback(&["--ecosystems", "npm,pypi"]);
     assert_eq!(
-        args.ecosystems,
+        args.common.ecosystems,
         Some(vec!["npm".to_string(), "pypi".to_string()])
     );
 }
@@ -178,8 +178,8 @@ fn ecosystems_csv_split() {
 fn positional_plus_flags() {
     let args = parse_rollback(&["pkg:npm/foo@1", "--dry-run", "--json"]);
     assert_eq!(args.identifier, Some("pkg:npm/foo@1".to_string()));
-    assert!(args.dry_run);
-    assert!(args.json);
+    assert!(args.common.dry_run);
+    assert!(args.common.json);
 }
 
 #[test]

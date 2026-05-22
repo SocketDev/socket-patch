@@ -5,6 +5,7 @@
 //! is a thin wrapper that delegates to [`parse_with_uuid_fallback`] and the
 //! `run` function on each command's `Args`.
 
+pub mod args;
 pub mod commands;
 pub mod ecosystem_dispatch;
 pub mod json_envelope;
@@ -204,7 +205,7 @@ mod tests {
         match cli.command {
             Commands::Get(args) => {
                 assert_eq!(args.identifier, UUID);
-                assert!(args.json, "--json should be forwarded to get");
+                assert!(args.common.json, "--json should be forwarded to get");
             }
             _ => panic!("expected Commands::Get"),
         }

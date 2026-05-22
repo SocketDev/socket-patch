@@ -8,12 +8,14 @@ use crate::api::types::*;
 use crate::constants::{
     DEFAULT_PATCH_API_PROXY_URL, DEFAULT_SOCKET_API_URL, USER_AGENT as USER_AGENT_VALUE,
 };
+use crate::utils::env_compat::read_env_with_legacy;
 
-/// Check if debug mode is enabled via SOCKET_PATCH_DEBUG env.
+/// Check if debug mode is enabled via SOCKET_DEBUG env (falling back to the
+/// legacy SOCKET_PATCH_DEBUG name with a one-shot deprecation warning).
 fn is_debug_enabled() -> bool {
-    match std::env::var("SOCKET_PATCH_DEBUG") {
-        Ok(val) => val == "1" || val == "true",
-        Err(_) => false,
+    match read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG") {
+        Some(val) => val == "1" || val == "true",
+        None => false,
     }
 }
 
@@ -511,8 +513,9 @@ impl ApiClient {
                 );
                 (u, true)
             } else {
-                let proxy_url = std::env::var("SOCKET_PATCH_PROXY_URL")
-                    .unwrap_or_else(|_| DEFAULT_PATCH_API_PROXY_URL.to_string());
+                let proxy_url =
+                    read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                        .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
                 let u = format!(
                     "{}/patch/{}/{}",
                     proxy_url.trim_end_matches('/'),
@@ -588,6 +591,19 @@ impl ApiClient {
 
 // ── Free functions ────────────────────────────────────────────────────
 
+/// Explicit overrides for environment-based API client construction.
+///
+/// Each `Some(value)` wins over the corresponding env var; `None` falls
+/// back to env-var lookup (with the legacy `SOCKET_PATCH_*` shim where
+/// applicable).
+#[derive(Debug, Clone, Default)]
+pub struct ApiClientEnvOverrides {
+    pub api_url: Option<String>,
+    pub api_token: Option<String>,
+    pub org_slug: Option<String>,
+    pub proxy_url: Option<String>,
+}
+
 /// Get an API client configured from environment variables.
 ///
 /// If `SOCKET_API_TOKEN` is not set, the client will use the public patch
@@ -604,21 +620,39 @@ impl ApiClient {
 /// |---|---|
 /// | `SOCKET_API_URL` | Override the API URL (default `https://api.socket.dev`) |
 /// | `SOCKET_API_TOKEN` | API token for authenticated access |
-/// | `SOCKET_PATCH_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`) |
+/// | `SOCKET_PROXY_URL` | Override the public proxy URL (default `https://patches-api.socket.dev`). Legacy: `SOCKET_PATCH_PROXY_URL`. |
 /// | `SOCKET_ORG_SLUG` | Organization slug |
 ///
 /// Returns `(client, use_public_proxy)`.
 pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool) {
-    let api_token = std::env::var("SOCKET_API_TOKEN")
-        .ok()
+    get_api_client_with_overrides(ApiClientEnvOverrides {
+        org_slug: org_slug.map(String::from),
+        ..ApiClientEnvOverrides::default()
+    })
+    .await
+}
+
+/// Like [`get_api_client_from_env`] but with explicit overrides for every
+/// env-driven knob. Each `Some(value)` in `overrides` wins over the
+/// corresponding env var. Used by CLI commands that expose `--api-url`,
+/// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
+/// CLI crate.
+pub async fn get_api_client_with_overrides(
+    overrides: ApiClientEnvOverrides,
+) -> (ApiClient, bool) {
+    let api_token = overrides
+        .api_token
+        .or_else(|| std::env::var("SOCKET_API_TOKEN").ok())
         .filter(|t| !t.is_empty());
-    let resolved_org_slug = org_slug
-        .map(String::from)
+    let resolved_org_slug = overrides
+        .org_slug
         .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok());
 
     if api_token.is_none() {
-        let proxy_url = std::env::var("SOCKET_PATCH_PROXY_URL")
-            .unwrap_or_else(|_| DEFAULT_PATCH_API_PROXY_URL.to_string());
+        let proxy_url = overrides.proxy_url.unwrap_or_else(|| {
+            read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
+        });
         eprintln!(
             "No SOCKET_API_TOKEN set. Using public patch API proxy (free patches only)."
         );
@@ -631,8 +665,10 @@ pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool
         return (client, true);
     }
 
-    let api_url =
-        std::env::var("SOCKET_API_URL").unwrap_or_else(|_| DEFAULT_SOCKET_API_URL.to_string());
+    let api_url = overrides
+        .api_url
+        .or_else(|| std::env::var("SOCKET_API_URL").ok())
+        .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string());
 
     // Auto-resolve org slug if not provided
     let final_org_slug = if resolved_org_slug.is_some() {

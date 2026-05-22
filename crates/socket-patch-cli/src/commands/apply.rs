@@ -3,10 +3,9 @@ use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
     get_missing_blobs, DownloadMode,
 };
-use socket_patch_core::api::client::get_api_client_from_env;
-use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
+use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
+use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
@@ -16,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
 };
@@ -57,61 +57,12 @@ use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
 #[derive(Args)]
 pub struct ApplyArgs {
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 
-    /// Verify patches can be applied without modifying files
-    #[arg(short = 'd', long = "dry-run", default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Only output errors
-    #[arg(short = 's', long, default_value_t = false)]
-    pub silent: bool,
-
-    /// Path to patch manifest file
-    #[arg(short = 'm', long = "manifest-path", default_value = DEFAULT_PATCH_MANIFEST_PATH)]
-    pub manifest_path: String,
-
-    /// Strict-airgap mode: never contact the network. Apply fails fast if
-    /// any patch source is missing from `.socket/`. Without this flag, the
-    /// default behavior is to read from `.socket/` first and transparently
-    /// fetch any missing artifacts into a temporary directory for the
-    /// duration of the run — `.socket/` itself is never modified by apply.
-    #[arg(long, default_value_t = false)]
-    pub offline: bool,
-
-    /// Apply patches to globally installed npm packages
-    #[arg(short = 'g', long, default_value_t = false)]
-    pub global: bool,
-
-    /// Custom path to global node_modules
-    #[arg(long = "global-prefix")]
-    pub global_prefix: Option<PathBuf>,
-
-    /// Restrict patching to specific ecosystems
-    #[arg(long, value_delimiter = ',')]
-    pub ecosystems: Option<Vec<String>>,
-
-    /// Skip pre-application hash verification (apply even if package version differs)
-    #[arg(short = 'f', long, default_value_t = false)]
+    /// Skip pre-application hash verification (apply even if package version differs).
+    #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
     pub force: bool,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
-    /// Show detailed per-file verification information
-    #[arg(short = 'v', long, default_value_t = false)]
-    pub verbose: bool,
-
-    /// Which kind of patch artifact to download when local files are
-    /// missing. `diff` (default) fetches the smallest delta archive;
-    /// `package` fetches a full per-package tarball; `file` falls back to
-    /// the legacy per-file blob behavior. The apply pipeline always tries
-    /// already-downloaded sources in the order package → diff → blob.
-    #[arg(long = "download-mode", default_value = "diff")]
-    pub download_mode: String,
 }
 
 /// Translate the core engine's per-package [`ApplyResult`] into a single
@@ -182,20 +133,22 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
-    let (telemetry_client, _) = get_api_client_from_env(None).await;
+    apply_env_toggles(&args.common);
+    let (telemetry_client, _) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
+    let manifest_path = args.common.resolved_manifest_path();
 
     // Check if manifest exists - exit successfully if no .socket folder is set up
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if args.json {
+        if args.common.json {
             let mut env = Envelope::new(Command::Apply);
             env.status = Status::NoManifest;
-            env.dry_run = args.dry_run;
+            env.dry_run = args.common.dry_run;
             println!("{}", env.to_pretty_json());
-        } else if !args.silent {
+        } else if !args.common.silent {
             println!("No .socket folder found, skipping patch application.");
         }
         return 0;
@@ -208,11 +161,11 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 .filter(|r| r.success && !r.files_patched.is_empty())
                 .count();
 
-            if args.json {
+            if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.dry_run;
+                env.dry_run = args.common.dry_run;
                 for result in &results {
-                    env.record(result_to_event(result, args.dry_run));
+                    env.record(result_to_event(result, args.common.dry_run));
                 }
                 // Manifest entries that targeted in-scope ecosystems but
                 // had no installed package on disk — emit one Skipped
@@ -229,7 +182,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     env.mark_partial_failure();
                 }
                 println!("{}", env.to_pretty_json());
-            } else if !args.silent && !results.is_empty() {
+            } else if !args.common.silent && !results.is_empty() {
                 let patched: Vec<_> = results.iter().filter(|r| r.success).collect();
                 let already_patched: Vec<_> = results
                     .iter()
@@ -240,7 +193,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     })
                     .collect();
 
-                if args.dry_run {
+                if args.common.dry_run {
                     println!("\nPatch verification complete:");
                     println!("  {} package(s) can be patched", patched.len());
                     if !already_patched.is_empty() {
@@ -275,7 +228,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     }
                 }
 
-                if args.verbose {
+                if args.common.verbose {
                     println!("\nDetailed verification:");
                     for result in &results {
                         println!("  {}:", result.package_key);
@@ -290,7 +243,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             if let Some(ref msg) = f.message {
                                 println!("      message: {msg}");
                             }
-                            if args.verbose {
+                            if args.common.verbose {
                                 if let Some(ref h) = f.current_hash {
                                     println!("      current:  {h}");
                                 }
@@ -308,21 +261,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
             // Track telemetry
             if success {
-                track_patch_applied(patched_count, args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_applied(patched_count, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
             } else {
-                track_patch_apply_failed("One or more patches failed to apply", args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_apply_failed("One or more patches failed to apply", args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
             }
 
             if success { 0 } else { 1 }
         }
         Err(e) => {
-            track_patch_apply_failed(&e, args.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
-            if args.json {
+            track_patch_apply_failed(&e, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+            if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.dry_run;
+                env.dry_run = args.common.dry_run;
                 env.mark_error(EnvelopeError::new("apply_failed", e.clone()));
                 println!("{}", env.to_pretty_json());
-            } else if !args.silent {
+            } else if !args.common.silent {
                 eprintln!("Error: {e}");
             }
             1
@@ -347,7 +300,7 @@ async fn apply_patches_inner(
     let socket_diffs_path = socket_dir.join("diffs");
     let socket_packages_path = socket_dir.join("packages");
 
-    let download_mode = DownloadMode::parse(&args.download_mode).map_err(|e| e.to_string())?;
+    let download_mode = DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
 
     // Compute per-patch source availability so both the offline guard
     // (next block) and the `download_needed` decision below share the
@@ -379,13 +332,13 @@ async fn apply_patches_inner(
         })
         .collect();
 
-    if args.offline {
+    if args.common.offline {
         // Offline: bail only if some patch has no usable local source.
         // Note: with `--force`, the apply pipeline can short-circuit
         // verification on its own; we still surface the no-source
         // diagnosis so the user runs `repair` before retrying.
         if !patches_without_source.is_empty() {
-            if !args.silent && !args.json {
+            if !args.common.silent && !args.common.json {
                 eprintln!(
                     "Error: {} patch(es) have no local source and --offline is set:",
                     patches_without_source.len()
@@ -410,7 +363,7 @@ async fn apply_patches_inner(
     // entirely when all file blobs are already present locally —
     // apply will succeed via the blob path, and the archive endpoints
     // would just 404 (current server doesn't serve them yet).
-    let download_needed = !args.offline
+    let download_needed = !args.common.offline
         && match download_mode {
             DownloadMode::File => !missing_blobs.is_empty(),
             DownloadMode::Diff | DownloadMode::Package if missing_blobs.is_empty() => false,
@@ -449,14 +402,15 @@ async fn apply_patches_inner(
         overlay_dir(&socket_diffs_path, &stage_diffs).await;
         overlay_dir(&socket_packages_path, &stage_packages).await;
 
-        if !args.silent && !args.json {
+        if !args.common.silent && !args.common.json {
             println!(
                 "Downloading missing patch artifacts (mode: {})...",
                 download_mode.as_tag()
             );
         }
 
-        let (client, _) = get_api_client_from_env(None).await;
+        let (client, _) =
+            get_api_client_with_overrides(args.common.api_client_overrides()).await;
         let sources = PatchSources {
             blobs_path: &stage_blobs,
             packages_path: Some(&stage_packages),
@@ -465,7 +419,7 @@ async fn apply_patches_inner(
         let fetch_result =
             fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
 
-        if !args.silent && !args.json {
+        if !args.common.silent && !args.common.json {
             println!("{}", format_fetch_result(&fetch_result));
         }
 
@@ -475,7 +429,7 @@ async fn apply_patches_inner(
         if download_mode != DownloadMode::File {
             let still_missing_blobs = get_missing_blobs(&manifest, &stage_blobs).await;
             if !still_missing_blobs.is_empty() {
-                if !args.silent && !args.json {
+                if !args.common.silent && !args.common.json {
                     println!(
                         "Falling back to per-file blob downloads for {} blob(s)...",
                         still_missing_blobs.len()
@@ -483,18 +437,18 @@ async fn apply_patches_inner(
                 }
                 let blob_result =
                     fetch_missing_blobs(&manifest, &stage_blobs, &client, None).await;
-                if !args.silent && !args.json {
+                if !args.common.silent && !args.common.json {
                     println!("{}", format_fetch_result(&blob_result));
                 }
                 if blob_result.failed > 0 && fetch_result.failed > 0 {
-                    if !args.silent && !args.json {
+                    if !args.common.silent && !args.common.json {
                         eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
                     }
                     return Ok((false, Vec::new(), Vec::new()));
                 }
             }
         } else if fetch_result.failed > 0 {
-            if !args.silent && !args.json {
+            if !args.common.silent && !args.common.json {
                 eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
             }
             return Ok((false, Vec::new(), Vec::new()));
@@ -513,7 +467,7 @@ async fn apply_patches_inner(
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
     let partitioned =
-        partition_purls(&manifest_purls, args.ecosystems.as_deref());
+        partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
 
     let target_manifest_purls: HashSet<String> = partitioned
         .values()
@@ -521,20 +475,20 @@ async fn apply_patches_inner(
         .collect();
 
     let crawler_options = CrawlerOptions {
-        cwd: args.cwd.clone(),
-        global: args.global,
-        global_prefix: args.global_prefix.clone(),
+        cwd: args.common.cwd.clone(),
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
         batch_size: 100,
     };
 
     let all_packages =
-        find_packages_for_purls(&partitioned, &crawler_options, args.silent || args.json).await;
+        find_packages_for_purls(&partitioned, &crawler_options, args.common.silent || args.common.json).await;
 
     let has_any_purls = !partitioned.is_empty();
 
     if all_packages.is_empty() && !has_any_purls {
-        if !args.silent && !args.json {
-            if args.global || args.global_prefix.is_some() {
+        if !args.common.silent && !args.common.json {
+            if args.common.global || args.common.global_prefix.is_some() {
                 eprintln!("No global packages found");
             } else {
                 eprintln!("No package directories found");
@@ -544,7 +498,7 @@ async fn apply_patches_inner(
     }
 
     if all_packages.is_empty() {
-        if !args.silent && !args.json {
+        if !args.common.silent && !args.common.json {
             eprintln!("Warning: No packages found that match available patches");
             eprintln!(
                 "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
@@ -615,7 +569,7 @@ async fn apply_patches_inner(
                     &patch.files,
                     &sources,
                     Some(&patch.uuid),
-                    args.dry_run,
+                    args.common.dry_run,
                     args.force,
                 )
                 .await;
@@ -633,7 +587,7 @@ async fn apply_patches_inner(
 
             if !applied {
                 has_errors = true;
-                if !args.silent && !args.json {
+                if !args.common.silent && !args.common.json {
                     eprintln!("Failed to patch {base_purl}: no matching variant found");
                 }
             }
@@ -655,14 +609,14 @@ async fn apply_patches_inner(
                 &patch.files,
                 &sources,
                 Some(&patch.uuid),
-                args.dry_run,
+                args.common.dry_run,
                 args.force,
             )
             .await;
 
             if !result.success {
                 has_errors = true;
-                if !args.silent && !args.json {
+                if !args.common.silent && !args.common.json {
                     eprintln!(
                         "Failed to patch {}: {}",
                         purl,
@@ -682,7 +636,7 @@ async fn apply_patches_inner(
         .cloned()
         .collect();
 
-    if !unmatched.is_empty() && !args.silent && !args.json {
+    if !unmatched.is_empty() && !args.common.silent && !args.common.json {
         eprintln!("\nWarning: {} manifest patch(es) had no matching installed package:", unmatched.len());
         for purl in &unmatched {
             eprintln!("  - {}", purl);
@@ -690,14 +644,14 @@ async fn apply_patches_inner(
     }
 
     if !target_manifest_purls.is_empty() && matched_manifest_purls.is_empty() && !all_packages.is_empty() {
-        if !args.silent && !args.json {
+        if !args.common.silent && !args.common.json {
             eprintln!("Warning: None of the targeted manifest patches matched installed packages.");
         }
         has_errors = true;
     }
 
     // Post-apply summary
-    if !args.silent && !args.json {
+    if !args.common.silent && !args.common.json {
         let applied_count = results.iter().filter(|r| r.success && !r.files_patched.is_empty()).count();
         let already_count = results.iter().filter(|r| {
             r.files_verified.iter().all(|f| f.status == VerifyStatus::AlreadyPatched)

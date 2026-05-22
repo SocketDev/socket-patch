@@ -1,14 +1,13 @@
 use clap::Args;
-use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::manifest::operations::{
-    read_manifest, resolve_manifest_path, write_manifest,
-};
+use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remove_failed};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::rollback::rollback_patches;
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status,
 };
@@ -28,49 +27,29 @@ fn emit_error_envelope(json: bool, code: &str, message: String) {
 
 #[derive(Args)]
 pub struct RemoveArgs {
-    /// Package PURL or patch UUID
+    /// Package PURL or patch UUID.
     pub identifier: String,
 
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 
-    /// Path to patch manifest file
-    #[arg(short = 'm', long = "manifest-path", default_value = DEFAULT_PATCH_MANIFEST_PATH)]
-    pub manifest_path: String,
-
-    /// Skip rolling back files before removing (only update manifest)
-    #[arg(long = "skip-rollback", default_value_t = false)]
+    /// Skip rolling back files before removing (only update manifest).
+    #[arg(long = "skip-rollback", env = "SOCKET_SKIP_ROLLBACK", default_value_t = false)]
     pub skip_rollback: bool,
-
-    /// Skip confirmation prompts
-    #[arg(short = 'y', long, default_value_t = false)]
-    pub yes: bool,
-
-    /// Remove patches from globally installed npm packages
-    #[arg(short = 'g', long, default_value_t = false)]
-    pub global: bool,
-
-    /// Custom path to global node_modules
-    #[arg(long = "global-prefix")]
-    pub global_prefix: Option<PathBuf>,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
 }
 
 pub async fn run(args: RemoveArgs) -> i32 {
+    apply_env_toggles(&args.common);
     let (telemetry_client, _) =
-        socket_patch_core::api::client::get_api_client_from_env(None).await;
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
+    let manifest_path = args.common.resolved_manifest_path();
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         emit_error_envelope(
-            args.json,
+            args.common.json,
             "manifest_not_found",
             format!("Manifest not found at {}", manifest_path.display()),
         );
@@ -81,11 +60,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            emit_error_envelope(args.json, "manifest_invalid", "Invalid manifest".to_string());
+            emit_error_envelope(args.common.json, "manifest_invalid", "Invalid manifest".to_string());
             return 1;
         }
         Err(e) => {
-            emit_error_envelope(args.json, "manifest_unreadable", e.to_string());
+            emit_error_envelope(args.common.json, "manifest_unreadable", e.to_string());
             return 1;
         }
     };
@@ -109,7 +88,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if matching.is_empty() {
         let msg = format!("No patch found matching identifier: {}", args.identifier);
         track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-        if args.json {
+        if args.common.json {
             let mut env = Envelope::new(Command::Remove);
             env.status = Status::NotFound;
             env.error = Some(EnvelopeError::new("not_found", msg));
@@ -124,7 +103,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     }
 
     // Show what will be removed and confirm
-    if !args.json {
+    if !args.common.json {
         eprintln!("The following patch(es) will be removed:");
         for (purl, patch) in &matching {
             let file_count = patch.files.len();
@@ -137,8 +116,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
         "Remove {} patch(es) and rollback files?",
         matching.len()
     );
-    if !confirm(&prompt, true, args.yes, args.json) {
-        if !args.json {
+    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json {
             println!("Removal cancelled.");
         }
         return 0;
@@ -147,18 +126,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // First, rollback the patch if not skipped
     let mut rollback_count = 0;
     if !args.skip_rollback {
-        if !args.json {
+        if !args.common.json {
             println!("Rolling back patch before removal...");
         }
         match rollback_patches(
-            &args.cwd,
+            &args.common.cwd,
             &manifest_path,
             Some(&args.identifier),
             false,
-            args.json, // silent when JSON
+            args.common.json, // silent when JSON
             false,
-            args.global,
-            args.global_prefix.clone(),
+            args.common.global,
+            args.common.global_prefix.clone(),
             None,
         )
         .await
@@ -172,7 +151,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     )
                     .await;
                     emit_error_envelope(
-                        args.json,
+                        args.common.json,
                         "rollback_failed",
                         "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.".to_string(),
                     );
@@ -194,7 +173,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     })
                     .count();
 
-                if !args.json {
+                if !args.common.json {
                     if rollback_count > 0 {
                         println!("Rolled back {rollback_count} package(s)");
                     }
@@ -210,7 +189,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
                 emit_error_envelope(
-                    args.json,
+                    args.common.json,
                     "rollback_failed",
                     format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
                 );
@@ -225,7 +204,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             if removed.is_empty() {
                 let msg = format!("No patch found matching identifier: {}", args.identifier);
                 track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-                if args.json {
+                if args.common.json {
                     let mut env = Envelope::new(Command::Remove);
                     env.status = Status::NotFound;
                     env.error = Some(EnvelopeError::new("not_found", msg));
@@ -239,7 +218,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 return 1;
             }
 
-            if !args.json {
+            if !args.common.json {
                 println!("Removed {} patch(es) from manifest:", removed.len());
                 for purl in &removed {
                     println!("  - {purl}");
@@ -253,12 +232,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
             let mut blobs_removed = 0;
             if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
                 blobs_removed = cleanup_result.blobs_removed;
-                if !args.json && cleanup_result.blobs_removed > 0 {
+                if !args.common.json && cleanup_result.blobs_removed > 0 {
                     println!("\n{}", format_cleanup_result(&cleanup_result, false));
                 }
             }
 
-            if args.json {
+            if args.common.json {
                 let mut env = Envelope::new(Command::Remove);
                 // One Removed event per purl whose manifest entry was deleted.
                 for purl in &removed {
@@ -281,7 +260,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_error_envelope(args.json, "remove_failed", e);
+            emit_error_envelope(args.common.json, "remove_failed", e);
             1
         }
     }

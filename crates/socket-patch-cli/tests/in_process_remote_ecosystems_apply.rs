@@ -34,21 +34,25 @@ fn git_sha256(content: &[u8]) -> String {
 
 fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
     ScanArgs {
-        cwd: cwd.to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: true, // bypass per-ecosystem project-marker check
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: true,
+            // bypass per-ecosystem project-marker check
+            global_prefix: None,
+            api_url,
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec![eco.to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(api_url),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec![eco.to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: true,
-        dry_run: false,
     }
 }
 
@@ -275,7 +279,7 @@ async fn composer_handcrafted_install_apply_patches_file() {
     // composer doesn't need --global; the composer.json marker + vendor/
     // is enough. Use the default args but flip global=false.
     let mut args = default_scan_args(tmp.path(), "composer", server.uri());
-    args.global = false;
+    args.common.global = false;
     let code = scan_run(args).await;
     assert!(code == 0 || code == 1, "scan --sync exit: {code}");
 

@@ -22,22 +22,24 @@ const PURL: &str = "pkg:npm/in-process-test@1.0.0";
 
 fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
     GetArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            org: Some(ORG.to_string()),
+            cwd: cwd.to_path_buf(),
+            yes: true,
+                        api_token: Some("fake-token-for-tests".to_string()),
+            global: false,
+            global_prefix: None,
+            json: true,
+            download_mode: "diff".to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: identifier.to_string(),
-        org: Some(ORG.to_string()),
-        cwd: cwd.to_path_buf(),
         id: false,
         cve: false,
         ghsa: false,
         package: false,
-        yes: true,
-        api_url: None,
-        api_token: Some("fake-token-for-tests".to_string()),
         save_only: true,
-        global: false,
-        global_prefix: None,
         one_off: false,
-        json: true,
-        download_mode: "diff".to_string(),
     }
 }
 
@@ -113,7 +115,7 @@ async fn get_by_uuid_save_only_writes_manifest() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0, "expected exit 0");
@@ -134,7 +136,7 @@ async fn get_by_uuid_writes_blob_to_socket_dir() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0);
@@ -157,7 +159,7 @@ async fn get_by_uuid_404_emits_not_found() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0, "not_found is reported via JSON, not via exit code 1");
@@ -179,7 +181,7 @@ async fn get_by_uuid_500_handled_gracefully() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     // 500 is treated as a fetch error — exit 1 or 0 both acceptable, just
@@ -200,7 +202,7 @@ async fn get_by_cve_resolves_and_saves() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args("CVE-2024-12345", tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0);
@@ -215,7 +217,7 @@ async fn get_by_cve_no_match_no_manifest_written() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args("CVE-2099-99999", tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let _ = run(args).await;
     assert!(
@@ -234,7 +236,7 @@ async fn get_by_ghsa_resolves_and_saves() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(ghsa, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0);
@@ -255,7 +257,7 @@ async fn get_by_purl_single_patch_auto_selects() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(PURL, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert_eq!(code, 0);
@@ -290,7 +292,7 @@ async fn get_by_purl_multi_patch_in_json_mode_errors() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(purl, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
 
     let code = run(args).await;
     assert!(code == 0 || code == 1, "exit was {code}");
@@ -308,7 +310,7 @@ async fn get_with_id_flag_forces_uuid_path() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
     args.id = true;
 
     let code = run(args).await;
@@ -329,7 +331,7 @@ async fn get_with_explicit_cve_flag() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(cve, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
     args.cve = true;
 
     assert_eq!(run(args).await, 0);
@@ -345,7 +347,7 @@ async fn get_with_explicit_ghsa_flag() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(ghsa, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
     args.ghsa = true;
 
     assert_eq!(run(args).await, 0);
@@ -361,7 +363,7 @@ async fn get_with_explicit_package_flag() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(name, tmp.path());
-    args.api_url = Some(url);
+    args.common.api_url = url;
     args.package = true;
 
     assert_eq!(run(args).await, 0);
@@ -376,7 +378,7 @@ async fn get_with_explicit_package_flag() {
 async fn get_one_off_with_save_only_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some("http://127.0.0.1:1".to_string()); // unreachable
+    args.common.api_url = "http://127.0.0.1:1".to_string(); // unreachable
     args.one_off = true;
     args.save_only = true;
 
@@ -392,7 +394,7 @@ async fn get_one_off_without_identifier_validation() {
     // The one-off mode is currently a stub that always errors.
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some("http://127.0.0.1:1".to_string());
+    args.common.api_url = "http://127.0.0.1:1".to_string();
     args.one_off = true;
     args.save_only = false;
 
@@ -410,7 +412,7 @@ async fn get_one_off_without_identifier_validation() {
 async fn get_unreachable_api_handled_gracefully() {
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some("http://127.0.0.1:1".to_string()); // unreachable
+    args.common.api_url = "http://127.0.0.1:1".to_string(); // unreachable
     let code = run(args).await;
     // Network error → exit 0 or 1, but no panic.
     assert!(code == 0 || code == 1);
@@ -428,8 +430,8 @@ async fn get_uuid_non_json_save_only() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
-    args.json = false;
+    args.common.api_url = url;
+    args.common.json = false;
 
     assert_eq!(run(args).await, 0);
     assert!(tmp.path().join(".socket/manifest.json").exists());
@@ -447,8 +449,8 @@ async fn get_download_mode_package() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
-    args.download_mode = "package".to_string();
+    args.common.api_url = url;
+    args.common.download_mode = "package".to_string();
     assert_eq!(run(args).await, 0);
 }
 
@@ -460,8 +462,8 @@ async fn get_download_mode_file() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
-    args.download_mode = "file".to_string();
+    args.common.api_url = url;
+    args.common.download_mode = "file".to_string();
     assert_eq!(run(args).await, 0);
 }
 
@@ -473,8 +475,8 @@ async fn get_invalid_download_mode_handled() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
-    args.api_url = Some(url);
-    args.download_mode = "nonsense".to_string();
+    args.common.api_url = url;
+    args.common.download_mode = "nonsense".to_string();
     let _ = run(args).await; // Validates inside save_and_apply; either passes or errors.
 }
 

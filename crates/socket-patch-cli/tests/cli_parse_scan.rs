@@ -41,84 +41,84 @@ fn defaults_match_contract() {
     // Critical load-bearing defaults.
     assert_eq!(args.batch_size, 100, "--batch-size default is 100");
     assert_eq!(
-        args.download_mode, "diff",
+        args.common.download_mode, "diff",
         "--download-mode default is \"diff\""
     );
 
     // All other defaults from the scan table.
-    assert_eq!(args.cwd, std::path::PathBuf::from("."));
-    assert_eq!(args.org, None);
-    assert!(!args.json);
-    assert!(!args.yes);
-    assert!(!args.global);
-    assert_eq!(args.global_prefix, None);
-    assert_eq!(args.api_url, None);
-    assert_eq!(args.api_token, None);
-    assert_eq!(args.ecosystems, None);
+    assert_eq!(args.common.cwd, std::path::PathBuf::from("."));
+    assert_eq!(args.common.org, None);
+    assert!(!args.common.json);
+    assert!(!args.common.yes);
+    assert!(!args.common.global);
+    assert_eq!(args.common.global_prefix, None);
+    assert_eq!(args.common.api_url, "https://api.socket.dev");
+    assert_eq!(args.common.api_token, None);
+    assert_eq!(args.common.ecosystems, None);
     assert!(!args.apply, "--apply default is false (scan --json stays read-only)");
     assert!(!args.prune, "--prune default is false (GC is opt-in in v3.0)");
     assert!(!args.sync, "--sync default is false");
-    assert!(!args.dry_run, "--dry-run default is false");
+    assert!(!args.common.dry_run, "--dry-run default is false");
 }
 
 #[test]
 fn yes_short_flag() {
     let args = parse_scan(&["-y"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn yes_long_flag() {
     let args = parse_scan(&["--yes"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn global_short_flag() {
     let args = parse_scan(&["-g"]);
-    assert!(args.global);
+    assert!(args.common.global);
 }
 
 #[test]
 fn global_long_flag() {
     let args = parse_scan(&["--global"]);
-    assert!(args.global);
+    assert!(args.common.global);
 }
 
 #[test]
 fn cwd_flag() {
     let args = parse_scan(&["--cwd", "/tmp/x"]);
-    assert_eq!(args.cwd, std::path::PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.cwd, std::path::PathBuf::from("/tmp/x"));
 }
 
 #[test]
 fn org_flag() {
     let args = parse_scan(&["--org", "myorg"]);
-    assert_eq!(args.org.as_deref(), Some("myorg"));
+    assert_eq!(args.common.org.as_deref(), Some("myorg"));
 }
 
 #[test]
 fn json_flag() {
     let args = parse_scan(&["--json"]);
-    assert!(args.json);
+    assert!(args.common.json);
 }
 
 #[test]
 fn global_prefix_flag() {
     let args = parse_scan(&["--global-prefix", "/foo"]);
-    assert_eq!(args.global_prefix, Some(std::path::PathBuf::from("/foo")));
+    assert_eq!(args.common.global_prefix, Some(std::path::PathBuf::from("/foo")));
 }
 
 #[test]
 fn api_url_flag() {
     let args = parse_scan(&["--api-url", "https://api"]);
-    assert_eq!(args.api_url.as_deref(), Some("https://api"));
+    assert_eq!(args.common.api_url, "https://api");
 }
 
 #[test]
 fn api_token_flag() {
     let args = parse_scan(&["--api-token", "tok"]);
-    assert_eq!(args.api_token.as_deref(), Some("tok"));
+    assert_eq!(args.common.api_token.as_deref(), Some("tok"));
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn batch_size_negative_fails() {
 fn ecosystems_csv_multi() {
     let args = parse_scan(&["--ecosystems", "npm,pypi,cargo,maven"]);
     assert_eq!(
-        args.ecosystems,
+        args.common.ecosystems,
         Some(vec![
             "npm".to_string(),
             "pypi".to_string(),
@@ -179,25 +179,25 @@ fn ecosystems_csv_multi() {
 #[test]
 fn ecosystems_csv_single() {
     let args = parse_scan(&["--ecosystems", "npm"]);
-    assert_eq!(args.ecosystems, Some(vec!["npm".to_string()]));
+    assert_eq!(args.common.ecosystems, Some(vec!["npm".to_string()]));
 }
 
 #[test]
 fn download_mode_diff() {
     let args = parse_scan(&["--download-mode", "diff"]);
-    assert_eq!(args.download_mode, "diff");
+    assert_eq!(args.common.download_mode, "diff");
 }
 
 #[test]
 fn download_mode_package() {
     let args = parse_scan(&["--download-mode", "package"]);
-    assert_eq!(args.download_mode, "package");
+    assert_eq!(args.common.download_mode, "package");
 }
 
 #[test]
 fn download_mode_file() {
     let args = parse_scan(&["--download-mode", "file"]);
-    assert_eq!(args.download_mode, "file");
+    assert_eq!(args.common.download_mode, "file");
 }
 
 #[test]
@@ -226,8 +226,8 @@ fn apply_flag_long_form() {
 fn apply_flag_combines_with_json_and_yes() {
     let args = parse_scan(&["--apply", "--json", "--yes"]);
     assert!(args.apply);
-    assert!(args.json);
-    assert!(args.yes);
+    assert!(args.common.json);
+    assert!(args.common.yes);
 }
 
 // --- `--prune` / `--sync` / `--dry-run` flags (v3.0 GC opt-in) ------------
@@ -245,8 +245,8 @@ fn prune_flag_long_form() {
 fn prune_combines_with_apply_and_json() {
     let args = parse_scan(&["--apply", "--json", "--yes", "--prune"]);
     assert!(args.apply);
-    assert!(args.json);
-    assert!(args.yes);
+    assert!(args.common.json);
+    assert!(args.common.yes);
     assert!(args.prune);
 }
 
@@ -263,21 +263,21 @@ fn sync_flag_long_form() {
 #[test]
 fn sync_combines_with_json_and_yes() {
     let args = parse_scan(&["--json", "--sync", "--yes"]);
-    assert!(args.json);
+    assert!(args.common.json);
     assert!(args.sync);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn dry_run_long_form() {
     let args = parse_scan(&["--dry-run"]);
-    assert!(args.dry_run);
+    assert!(args.common.dry_run);
 }
 
 #[test]
 fn dry_run_short_form() {
     let args = parse_scan(&["-d"]);
-    assert!(args.dry_run);
+    assert!(args.common.dry_run);
 }
 
 #[test]

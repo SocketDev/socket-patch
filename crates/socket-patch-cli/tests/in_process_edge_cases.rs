@@ -44,18 +44,21 @@ fn write_manifest(socket: &Path, body: &str) {
 
 fn default_apply(cwd: &Path) -> ApplyArgs {
     ApplyArgs {
-        cwd: cwd.to_path_buf(),
-        dry_run: false,
-        silent: true,
-        manifest_path: ".socket/manifest.json".to_string(),
-        offline: true,
-        global: false,
-        global_prefix: None,
-        ecosystems: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            ecosystems: None,
+            json: true,
+            verbose: false,
+            download_mode: "diff".to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         force: false,
-        json: true,
-        verbose: false,
-        download_mode: "diff".to_string(),
     }
 }
 
@@ -454,21 +457,23 @@ async fn rollback_already_original_short_circuits() {
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
     let args = RollbackArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            org: None,
+                        api_token: None,
+            ecosystems: Some(vec!["npm".to_string()]),
+            json: true,
+            verbose: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: None,
-        cwd: tmp.path().to_path_buf(),
-        dry_run: false,
-        silent: true,
-        manifest_path: ".socket/manifest.json".to_string(),
-        offline: true,
-        global: false,
-        global_prefix: None,
         one_off: false,
-        org: None,
-        api_url: None,
-        api_token: None,
-        ecosystems: Some(vec!["npm".to_string()]),
-        json: true,
-        verbose: false,
     };
     assert_eq!(rollback_run(args).await, 0);
     // File unchanged.

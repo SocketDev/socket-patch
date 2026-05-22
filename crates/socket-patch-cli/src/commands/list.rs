@@ -1,32 +1,22 @@
 use clap::Args;
-use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
-use socket_patch_core::manifest::operations::{read_manifest, resolve_manifest_path};
-use std::path::PathBuf;
+use socket_patch_core::manifest::operations::read_manifest;
 
+use crate::args::GlobalArgs;
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
 };
 
 #[derive(Args)]
 pub struct ListArgs {
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
-
-    /// Path to patch manifest file
-    #[arg(short = 'm', long = "manifest-path", default_value = DEFAULT_PATCH_MANIFEST_PATH)]
-    pub manifest_path: String,
-
-    /// Output as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 }
 
 /// Emit the top-level envelope for `list` in error states. Used for the
 /// "manifest not found" and "manifest unreadable" paths so they share
 /// the same JSON shape as a successful list.
 fn emit_error(args: &ListArgs, code: &str, message: String) {
-    if args.json {
+    if args.common.json {
         let mut env = Envelope::new(Command::List);
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
@@ -36,7 +26,7 @@ fn emit_error(args: &ListArgs, code: &str, message: String) {
 }
 
 pub async fn run(args: ListArgs) -> i32 {
-    let manifest_path = resolve_manifest_path(&args.cwd, &args.manifest_path);
+    let manifest_path = args.common.resolved_manifest_path();
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         emit_error(
@@ -51,7 +41,7 @@ pub async fn run(args: ListArgs) -> i32 {
         Ok(Some(manifest)) => {
             let patch_entries: Vec<_> = manifest.patches.iter().collect();
 
-            if args.json {
+            if args.common.json {
                 let mut env = Envelope::new(Command::List);
                 for (purl, patch) in &patch_entries {
                     // `list` emits one `Discovered` event per manifest

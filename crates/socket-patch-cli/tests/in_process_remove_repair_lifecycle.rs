@@ -87,14 +87,17 @@ async fn remove_with_rollback_full_chain() {
     std::fs::write(blobs.join(&after_hash), patched).unwrap();
 
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: "pkg:npm/remove-target@1.0.0".to_string(),
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: false,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     let code = remove_run(args).await;
     assert_eq!(code, 0, "remove with rollback must succeed");
@@ -143,14 +146,17 @@ async fn remove_by_uuid_finds_correct_purl() {
     .unwrap();
 
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: uuid.to_string(),
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     assert_eq!(remove_run(args).await, 0);
     let m: serde_json::Value =
@@ -168,14 +174,17 @@ async fn remove_no_matching_purl_exits_not_found() {
     std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#).unwrap();
 
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: "pkg:npm/does-not-exist@9.9.9".to_string(),
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     assert_eq!(remove_run(args).await, 1);
 }
@@ -189,14 +198,17 @@ async fn remove_invalid_manifest_emits_error() {
     std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
 
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: "pkg:npm/anything@1.0.0".to_string(),
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     assert_eq!(remove_run(args).await, 1);
 }
@@ -206,14 +218,17 @@ async fn remove_invalid_manifest_emits_error() {
 async fn remove_no_manifest_emits_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: "pkg:npm/anything@1.0.0".to_string(),
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     assert_eq!(remove_run(args).await, 1);
 }
@@ -224,13 +239,16 @@ async fn remove_no_manifest_emits_not_found() {
 
 fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
     RepairArgs {
-        cwd: cwd.to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
-        dry_run: false,
-        offline: false,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            dry_run: false,
+            offline: false,
+            json: true,
+            download_mode: mode.to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         download_only: false,
-        json: true,
-        download_mode: mode.to_string(),
     }
 }
 
@@ -421,8 +439,8 @@ async fn repair_dry_run_does_not_download() {
     .unwrap();
 
     let mut args = make_repair_args(tmp.path(), "file");
-    args.dry_run = true;
-    args.offline = true;
+    args.common.dry_run = true;
+    args.common.offline = true;
     assert_eq!(repair_run(args).await, 0);
     // Nothing should be downloaded.
     assert!(
@@ -470,6 +488,6 @@ async fn repair_offline_with_present_blobs_succeeds() {
     std::fs::write(blobs.join(&hash), blob).unwrap();
 
     let mut args = make_repair_args(tmp.path(), "file");
-    args.offline = true;
+    args.common.offline = true;
     assert_eq!(repair_run(args).await, 0);
 }

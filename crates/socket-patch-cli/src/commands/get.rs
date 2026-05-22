@@ -1,6 +1,6 @@
 use clap::Args;
 use regex::Regex;
-use socket_patch_core::api::client::get_api_client_from_env;
+use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::api::types::{PatchSearchResult, SearchResponse};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{confirm, select_one, SelectError};
 
@@ -48,70 +49,35 @@ pub(crate) fn decide_patch_action(
 
 #[derive(Args)]
 pub struct GetArgs {
-    /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name)
+    /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name).
     pub identifier: String,
 
-    /// Organization slug
-    #[arg(long)]
-    pub org: Option<String>,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
-
-    /// Force identifier to be treated as a patch UUID
+    /// Force identifier to be treated as a patch UUID.
     #[arg(long, default_value_t = false)]
     pub id: bool,
 
-    /// Force identifier to be treated as a CVE ID
+    /// Force identifier to be treated as a CVE ID.
     #[arg(long, default_value_t = false)]
     pub cve: bool,
 
-    /// Force identifier to be treated as a GHSA ID
+    /// Force identifier to be treated as a GHSA ID.
     #[arg(long, default_value_t = false)]
     pub ghsa: bool,
 
-    /// Force identifier to be treated as a package name
+    /// Force identifier to be treated as a package name.
     #[arg(short = 'p', long = "package", default_value_t = false)]
     pub package: bool,
 
-    /// Skip confirmation prompt for multiple patches
-    #[arg(short = 'y', long, default_value_t = false)]
-    pub yes: bool,
-
-    /// Socket API URL (overrides SOCKET_API_URL env var)
-    #[arg(long = "api-url")]
-    pub api_url: Option<String>,
-
-    /// Socket API token (overrides SOCKET_API_TOKEN env var)
-    #[arg(long = "api-token")]
-    pub api_token: Option<String>,
-
-    /// Download patch without applying it
-    #[arg(long = "save-only", alias = "no-apply", default_value_t = false)]
+    /// Download patch without applying it.
+    #[arg(long = "save-only", alias = "no-apply", env = "SOCKET_SAVE_ONLY", default_value_t = false)]
     pub save_only: bool,
 
-    /// Apply patch to globally installed npm packages
-    #[arg(short = 'g', long, default_value_t = false)]
-    pub global: bool,
-
-    /// Custom path to global node_modules
-    #[arg(long = "global-prefix")]
-    pub global_prefix: Option<PathBuf>,
-
-    /// Apply patch immediately without saving to .socket folder
-    #[arg(long = "one-off", default_value_t = false)]
+    /// Apply patch immediately without saving to .socket folder.
+    #[arg(long = "one-off", env = "SOCKET_ONE_OFF", default_value_t = false)]
     pub one_off: bool,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
-    /// Which kind of patch artifact to download. `diff` (default) fetches
-    /// the smallest delta archive; `package` fetches a full per-package
-    /// tarball; `file` falls back to legacy per-file blob downloads.
-    #[arg(long = "download-mode", default_value = "diff")]
-    pub download_mode: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -288,6 +254,11 @@ pub struct DownloadParams {
     pub silent: bool,
     /// `--download-mode` value forwarded to the apply step.
     pub download_mode: String,
+    /// API client overrides — propagates the caller's CLI flags
+    /// (`--api-url`, `--api-token`, `--proxy-url`) into the nested API
+    /// client constructed here. Without this, `download_and_apply_patches`
+    /// would only honor env vars and ignore the user's flags.
+    pub api_overrides: socket_patch_core::api::client::ApiClientEnvOverrides,
 }
 
 /// Download and apply a set of selected patches.
@@ -297,7 +268,12 @@ pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value) {
-    let (api_client, _) = get_api_client_from_env(params.org.as_deref()).await;
+    let mut overrides = params.api_overrides.clone();
+    if overrides.org_slug.is_none() {
+        overrides.org_slug = params.org.clone();
+    }
+    let (api_client, _) =
+        socket_patch_core::api::client::get_api_client_with_overrides(overrides).await;
     let effective_org: Option<&str> = None;
 
     let socket_dir = params.cwd.join(".socket");
@@ -574,18 +550,16 @@ pub async fn download_and_apply_patches(
             eprintln!("\nApplying patches...");
         }
         let apply_args = super::apply::ApplyArgs {
-            cwd: params.cwd.clone(),
-            dry_run: false,
-            silent: params.json || params.silent,
-            manifest_path: manifest_path.display().to_string(),
-            offline: false,
-            global: params.global,
-            global_prefix: params.global_prefix.clone(),
-            ecosystems: None,
+            common: crate::args::GlobalArgs {
+                cwd: params.cwd.clone(),
+                manifest_path: manifest_path.display().to_string(),
+                global: params.global,
+                global_prefix: params.global_prefix.clone(),
+                silent: params.json || params.silent,
+                download_mode: params.download_mode.clone(),
+                ..crate::args::GlobalArgs::default()
+            },
             force: false,
-            json: false,
-            verbose: false,
-            download_mode: params.download_mode.clone(),
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
@@ -616,7 +590,7 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": "Only one of --id, --cve, --ghsa, or --package can be specified",
@@ -627,7 +601,7 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
     if args.one_off && args.save_only {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": "--one-off and --save-only cannot be used together",
@@ -638,15 +612,9 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
 
-    // Override env vars
-    if let Some(ref url) = args.api_url {
-        std::env::set_var("SOCKET_API_URL", url);
-    }
-    if let Some(ref token) = args.api_token {
-        std::env::set_var("SOCKET_API_TOKEN", token);
-    }
-
-    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
+    apply_env_toggles(&args.common);
+    let (api_client, use_public_proxy) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -664,7 +632,7 @@ pub async fn run(args: GetArgs) -> i32 {
         match detect_identifier_type(&args.identifier) {
             Some(t) => t,
             None => {
-                if !args.json {
+                if !args.common.json {
                     println!("Treating \"{}\" as a package name search", args.identifier);
                 }
                 IdentifierType::Package
@@ -674,7 +642,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Handle UUID: fetch and download directly
     if id_type == IdentifierType::Uuid {
-        if !args.json {
+        if !args.common.json {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
         match api_client
@@ -683,7 +651,7 @@ pub async fn run(args: GetArgs) -> i32 {
         {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "paid_required",
                             "found": 1,
@@ -709,7 +677,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     .await;
             }
             Ok(None) => {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "not_found",
                         "found": 0,
@@ -723,7 +691,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
             Err(e) => {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
                         "error": e.to_string(),
@@ -739,7 +707,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // For CVE/GHSA/PURL/package, search first
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for CVE: {}", args.identifier);
             }
             match api_client
@@ -748,7 +716,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -761,7 +729,7 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Ghsa => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for GHSA: {}", args.identifier);
             }
             match api_client
@@ -770,7 +738,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -783,7 +751,7 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Purl => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for PURL: {}", args.identifier);
             }
             match api_client
@@ -792,7 +760,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -805,19 +773,19 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Package => {
-            if !args.json {
+            if !args.common.json {
                 println!("Enumerating packages...");
             }
             let crawler_options = CrawlerOptions {
-                cwd: args.cwd.clone(),
-                global: args.global,
-                global_prefix: args.global_prefix.clone(),
+                cwd: args.common.cwd.clone(),
+                global: args.common.global,
+                global_prefix: args.common.global_prefix.clone(),
                 batch_size: 100,
             };
             let (all_packages, _) = crawl_all_ecosystems(&crawler_options).await;
 
             if all_packages.is_empty() {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "no_packages",
                         "found": 0,
@@ -825,7 +793,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         "applied": 0,
                         "patches": [],
                     })).unwrap());
-                } else if args.global {
+                } else if args.common.global {
                     println!("No global packages found.");
                 } else {
                     #[allow(unused_mut)]
@@ -843,14 +811,14 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            if !args.json {
+            if !args.common.json {
                 println!("Found {} packages", all_packages.len());
             }
 
             let matches = fuzzy_match_packages(&args.identifier, &all_packages, 20);
 
             if matches.is_empty() {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "no_match",
                         "found": 0,
@@ -864,7 +832,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            if !args.json {
+            if !args.common.json {
                 println!(
                     "Found {} matching package(s), checking for available patches...",
                     matches.len()
@@ -879,7 +847,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -895,7 +863,7 @@ pub async fn run(args: GetArgs) -> i32 {
     };
 
     if search_response.patches.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "not_found",
                 "found": 0,
@@ -912,7 +880,7 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    if !args.json {
+    if !args.common.json {
         display_search_results(&search_response.patches, search_response.can_access_paid_patches);
     }
 
@@ -925,7 +893,7 @@ pub async fn run(args: GetArgs) -> i32 {
         .collect();
 
     if accessible.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "paid_required",
                 "found": search_response.patches.len(),
@@ -948,14 +916,14 @@ pub async fn run(args: GetArgs) -> i32 {
     let selected = match select_patches(
         &accessible,
         search_response.can_access_paid_patches,
-        args.json,
+        args.common.json,
     ) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
     if selected.is_empty() {
-        if !args.json {
+        if !args.common.json {
             println!("No patches selected.");
         }
         return 0;
@@ -963,8 +931,8 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Confirm before downloading (default YES)
     let prompt = format!("Download {} patch(es)?", selected.len());
-    if !confirm(&prompt, true, args.yes, args.json) {
-        if !args.json {
+    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json {
             println!("Download cancelled.");
         }
         return 0;
@@ -972,20 +940,21 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Download and apply
     let params = DownloadParams {
-        cwd: args.cwd.clone(),
-        org: args.org.clone(),
+        cwd: args.common.cwd.clone(),
+        org: args.common.org.clone(),
         save_only: args.save_only,
         one_off: args.one_off,
-        global: args.global,
-        global_prefix: args.global_prefix.clone(),
-        json: args.json,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json: args.common.json,
         silent: false,
-        download_mode: args.download_mode.clone(),
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
     };
 
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
 
-    if args.json {
+    if args.common.json {
         println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
     }
 
@@ -1045,13 +1014,14 @@ async fn save_and_apply_patch(
     _org_slug: Option<&str>,
 ) -> i32 {
     // For UUID mode, fetch and save
-    let (api_client, _) = get_api_client_from_env(args.org.as_deref()).await;
+    let (api_client, _) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let effective_org: Option<&str> = None; // org slug is already stored in the client
 
     let patch = match api_client.fetch_patch(effective_org, uuid).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            if args.json {
+            if args.common.json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "status": "not_found",
                     "found": 0,
@@ -1065,7 +1035,7 @@ async fn save_and_apply_patch(
             return 0;
         }
         Err(e) => {
-            if args.json {
+            if args.common.json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "status": "error",
                     "error": e.to_string(),
@@ -1077,12 +1047,12 @@ async fn save_and_apply_patch(
         }
     };
 
-    let socket_dir = args.cwd.join(".socket");
+    let socket_dir = args.common.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
     let manifest_path = socket_dir.join("manifest.json");
 
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": format!("Failed to create blobs directory: {}", e),
@@ -1120,7 +1090,7 @@ async fn save_and_apply_patch(
             match base64_decode(blob_content) {
                 Ok(decoded) => {
                     if let Err(e) = tokio::fs::write(blobs_dir.join(after_hash), &decoded).await {
-                        if !args.json {
+                        if !args.common.json {
                             eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
                         }
                         blob_failed = true;
@@ -1128,7 +1098,7 @@ async fn save_and_apply_patch(
                     }
                 }
                 Err(e) => {
-                    if !args.json {
+                    if !args.common.json {
                         eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
                     }
                     blob_failed = true;
@@ -1143,7 +1113,7 @@ async fn save_and_apply_patch(
             match base64_decode(before_blob) {
                 Ok(decoded) => {
                     if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
-                        if !args.json {
+                        if !args.common.json {
                             eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
                         }
                         blob_failed = true;
@@ -1151,7 +1121,7 @@ async fn save_and_apply_patch(
                     }
                 }
                 Err(e) => {
-                    if !args.json {
+                    if !args.common.json {
                         eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
                     }
                     blob_failed = true;
@@ -1162,7 +1132,7 @@ async fn save_and_apply_patch(
     }
 
     if blob_failed {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "found": 1,
@@ -1217,7 +1187,7 @@ async fn save_and_apply_patch(
     );
 
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": format!("Error writing manifest: {e}"),
@@ -1228,7 +1198,7 @@ async fn save_and_apply_patch(
         return 1;
     }
 
-    if !args.json {
+    if !args.common.json {
         println!("\nPatch saved to {}", manifest_path.display());
         if added {
             println!("  Added: 1");
@@ -1239,31 +1209,29 @@ async fn save_and_apply_patch(
 
     let mut apply_succeeded = false;
     if !args.save_only && added {
-        if !args.json {
+        if !args.common.json {
             println!("\nApplying patches...");
         }
         let apply_args = super::apply::ApplyArgs {
-            cwd: args.cwd.clone(),
-            dry_run: false,
-            silent: args.json,
-            manifest_path: manifest_path.display().to_string(),
-            offline: false,
-            global: args.global,
-            global_prefix: args.global_prefix.clone(),
-            download_mode: args.download_mode.clone(),
-            ecosystems: None,
+            common: crate::args::GlobalArgs {
+                cwd: args.common.cwd.clone(),
+                manifest_path: manifest_path.display().to_string(),
+                global: args.common.global,
+                global_prefix: args.common.global_prefix.clone(),
+                silent: args.common.json,
+                download_mode: args.common.download_mode.clone(),
+                ..crate::args::GlobalArgs::default()
+            },
             force: false,
-            json: false,
-            verbose: false,
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
-        if code != 0 && !args.json {
+        if code != 0 && !args.common.json {
             eprintln!("\nSome patches could not be applied.");
         }
     }
 
-    if args.json {
+    if args.common.json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "status": "success",
             "found": 1,

@@ -5,35 +5,23 @@ use socket_patch_core::package_json::find::{
 };
 use socket_patch_core::package_json::update::{update_package_json, UpdateStatus};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::args::GlobalArgs;
 use crate::output::stdin_is_tty;
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
-
-    /// Preview changes without modifying files
-    #[arg(short = 'd', long = "dry-run", default_value_t = false)]
-    pub dry_run: bool,
-
-    /// Skip confirmation prompt
-    #[arg(short = 'y', long, default_value_t = false)]
-    pub yes: bool,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 }
 
 pub async fn run(args: SetupArgs) -> i32 {
-    if !args.json {
+    if !args.common.json {
         println!("Searching for package.json files...");
     }
 
-    let find_result = find_package_json_files(&args.cwd).await;
+    let find_result = find_package_json_files(&args.common.cwd).await;
 
     // For pnpm monorepos, only update root package.json.
     // pnpm runs root postinstall on `pnpm install`, so workspace-level
@@ -51,7 +39,7 @@ pub async fn run(args: SetupArgs) -> i32 {
     };
 
     if package_json_files.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "no_files",
                 "updated": 0,
@@ -66,9 +54,9 @@ pub async fn run(args: SetupArgs) -> i32 {
     }
 
     // Detect package manager from lockfiles in the project root.
-    let pm = detect_package_manager(&args.cwd).await;
+    let pm = detect_package_manager(&args.common.cwd).await;
 
-    if !args.json {
+    if !args.common.json {
         println!("Found {} package.json file(s)", package_json_files.len());
         if pm == PackageManager::Pnpm {
             println!("Detected pnpm project (using pnpm dlx)");
@@ -96,13 +84,13 @@ pub async fn run(args: SetupArgs) -> i32 {
         .filter(|r| r.status == UpdateStatus::Error)
         .collect();
 
-    if !args.json {
+    if !args.common.json {
         println!("\nPackage.json files to be updated:\n");
 
         if !to_update.is_empty() {
             println!("Will update:");
             for result in &to_update {
-                let rel_path = pathdiff(&result.path, &args.cwd);
+                let rel_path = pathdiff(&result.path, &args.common.cwd);
                 println!("  + {rel_path}");
                 if result.old_script.is_empty() {
                     println!("    postinstall:   (no script)");
@@ -126,7 +114,7 @@ pub async fn run(args: SetupArgs) -> i32 {
         if !already_configured.is_empty() {
             println!("Already configured (will skip):");
             for result in &already_configured {
-                let rel_path = pathdiff(&result.path, &args.cwd);
+                let rel_path = pathdiff(&result.path, &args.common.cwd);
                 println!("  = {rel_path}");
             }
             println!();
@@ -135,7 +123,7 @@ pub async fn run(args: SetupArgs) -> i32 {
         if !errors.is_empty() {
             println!("Errors:");
             for result in &errors {
-                let rel_path = pathdiff(&result.path, &args.cwd);
+                let rel_path = pathdiff(&result.path, &args.common.cwd);
                 println!(
                     "  ! {}: {}",
                     rel_path,
@@ -147,7 +135,7 @@ pub async fn run(args: SetupArgs) -> i32 {
     }
 
     if to_update.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "already_configured",
                 "updated": 0,
@@ -172,8 +160,8 @@ pub async fn run(args: SetupArgs) -> i32 {
     }
 
     // If not dry-run, ask for confirmation
-    if !args.dry_run {
-        if !args.yes && !args.json {
+    if !args.common.dry_run {
+        if !args.common.yes && !args.common.json {
             if !stdin_is_tty() {
                 // Non-interactive: default to yes with warning
                 eprintln!("Non-interactive mode detected, proceeding automatically.");
@@ -190,7 +178,7 @@ pub async fn run(args: SetupArgs) -> i32 {
             }
         }
 
-        if !args.json {
+        if !args.common.json {
             println!("\nApplying changes...");
         }
         let mut results = Vec::new();
@@ -203,7 +191,7 @@ pub async fn run(args: SetupArgs) -> i32 {
         let already = results.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count();
         let errs = results.iter().filter(|r| r.status == UpdateStatus::Error).count();
 
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": if errs > 0 { "partial_failure" } else { "success" },
                 "updated": updated,
@@ -240,7 +228,7 @@ pub async fn run(args: SetupArgs) -> i32 {
         let already = preview_results.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count();
         let errs = preview_results.iter().filter(|r| r.status == UpdateStatus::Error).count();
 
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "dry_run",
                 "wouldUpdate": updated,

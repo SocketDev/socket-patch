@@ -19,21 +19,23 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn default_args(cwd: &Path) -> ScanArgs {
     ScanArgs {
-        cwd: cwd.to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+                        api_token: Some("fake".to_string()),
+            ecosystems: None,
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: None,
-        api_token: Some("fake".to_string()),
-        ecosystems: None,
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: false,
-        dry_run: false,
     }
 }
 
@@ -133,7 +135,7 @@ async fn scan_empty_project_json() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
 
     assert_eq!(run(args).await, 0);
 }
@@ -148,7 +150,7 @@ async fn scan_installed_package_discovers_patch() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
 
     assert_eq!(run(args).await, 0);
 }
@@ -168,9 +170,9 @@ async fn scan_apply_dry_run_does_not_write() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.apply = true;
-    args.dry_run = true;
+    args.common.dry_run = true;
 
     assert_eq!(run(args).await, 0);
     assert!(
@@ -191,7 +193,7 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.apply = true;
 
     let code = run(args).await;
@@ -235,9 +237,9 @@ async fn scan_prune_only_dry_run_reports_orphans() {
     .unwrap();
 
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.prune = true;
-    args.dry_run = true;
+    args.common.dry_run = true;
 
     assert_eq!(run(args).await, 0);
     // Dry-run preserves the manifest unchanged.
@@ -270,7 +272,7 @@ async fn scan_prune_only_wet_removes_orphans() {
     .unwrap();
 
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.prune = true;
 
     assert_eq!(run(args).await, 0);
@@ -295,7 +297,7 @@ async fn scan_sync_full_cycle_against_clean_project() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.sync = true;
 
     let code = run(args).await;
@@ -320,7 +322,7 @@ async fn scan_small_batch_size_chunks_requests() {
     write_npm_package(tmp.path(), "pkg-c", "3.0.0");
 
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
     args.batch_size = 1; // force 3 separate API calls
     assert_eq!(run(args).await, 0);
 }
@@ -340,8 +342,8 @@ async fn scan_ecosystems_filter_excludes_others() {
     write_npm_package(tmp.path(), "npm-pkg", "1.0.0");
 
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
-    args.ecosystems = Some(vec!["pypi".to_string()]);
+    args.common.api_url = server.uri();
+    args.common.ecosystems = Some(vec!["pypi".to_string()]);
     assert_eq!(run(args).await, 0);
 }
 
@@ -359,8 +361,8 @@ async fn scan_non_json_with_patches_prints_table() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
-    args.json = false;
+    args.common.api_url = server.uri();
+    args.common.json = false;
 
     let code = run(args).await;
     assert!(code == 0 || code == 1, "got {code}");
@@ -375,8 +377,8 @@ async fn scan_non_json_empty_project_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
     write_root_package_json(tmp.path());
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
-    args.json = false;
+    args.common.api_url = server.uri();
+    args.common.json = false;
 
     assert_eq!(run(args).await, 0);
 }
@@ -399,7 +401,7 @@ async fn scan_api_500_does_not_panic() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some(server.uri());
+    args.common.api_url = server.uri();
 
     let code = run(args).await;
     assert!(code == 0 || code == 1);
@@ -412,7 +414,7 @@ async fn scan_unreachable_api_does_not_panic() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
     let mut args = default_args(tmp.path());
-    args.api_url = Some("http://127.0.0.1:1".to_string());
+    args.common.api_url = "http://127.0.0.1:1".to_string();
 
     let code = run(args).await;
     assert!(code == 0 || code == 1);

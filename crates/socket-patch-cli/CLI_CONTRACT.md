@@ -19,129 +19,98 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive). See [`src/lib.rs::looks_like_uuid`](src/lib.rs).
 
-## Flags — long and short forms
+## Global arguments
 
-Every flag below is part of the contract. The default values are pinned by parser tests.
+In v3.0 every subcommand accepts the same set of "global" flags via a single shared `GlobalArgs` struct that's `#[command(flatten)]`-ed into each per-command struct (`crates/socket-patch-cli/src/args.rs`). Subcommands that don't actually consume a given flag accept it silently — e.g. `list --global` parses fine and is a no-op. Every flag also has an environment-variable binding; precedence is **CLI arg > env var > default**.
 
-### `apply`
+| Long | Short | Env var | Default | Type | Semantic |
+|---|---|---|---|---|---|
+| `--cwd` | — | `SOCKET_CWD` | `.` | path | Working directory |
+| `--manifest-path` | `-m` | `SOCKET_MANIFEST_PATH` | `.socket/manifest.json` | path | Manifest location (resolved relative to `--cwd`) |
+| `--api-url` | — | `SOCKET_API_URL` | `https://api.socket.dev` | string | Authenticated API endpoint |
+| `--api-token` | — | `SOCKET_API_TOKEN` | (none) | string | Auth token (absence selects the public proxy) |
+| `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug |
+| `--proxy-url` | — | `SOCKET_PROXY_URL` | `https://patches-api.socket.dev` | string | Public proxy when no token |
+| `--ecosystems` | `-e` | `SOCKET_ECOSYSTEMS` | (all) | CSV → `Vec<String>` | Restrict to these ecosystems |
+| `--download-mode` | — | `SOCKET_DOWNLOAD_MODE` | **`diff`** | enum: `diff` \| `package` \| `file` | Patch artifact format |
+| `--offline` | — | `SOCKET_OFFLINE` | `false` | bool | **Strict airgap on every command** — never contact the network |
+| `--global` | `-g` | `SOCKET_GLOBAL` | `false` | bool | Operate on globally-installed packages |
+| `--global-prefix` | — | `SOCKET_GLOBAL_PREFIX` | (auto) | path | Override global packages root |
+| `--json` | `-j` | `SOCKET_JSON` | `false` | bool | Machine-readable output |
+| `--verbose` | `-v` | `SOCKET_VERBOSE` | `false` | bool | Extra detail |
+| `--silent` | `-s` | `SOCKET_SILENT` | `false` | bool | Errors only |
+| `--dry-run` | `-d` | `SOCKET_DRY_RUN` | `false` | bool | Preview, no mutations |
+| `--yes` | `-y` | `SOCKET_YES` | `false` | bool | Skip prompts |
+| `--debug` | — | `SOCKET_DEBUG` | `false` | bool | Verbose debug logs to stderr |
+| `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable anonymous usage telemetry |
 
-| Long | Short | Default | Type |
+The `--offline` semantics unified in v3.0. Previously `apply` enforced strict airgap, `repair` skipped network ops, and `rollback` failed when blobs were missing. All three now mean the same thing: never contact the network, fail loudly when a required local source is missing. On `repair`, `--offline` and `--download-only` are mutually exclusive.
+
+## Per-subcommand arguments
+
+Beyond the globals above, each subcommand defines a small set of local arguments.
+
+| Subcommand | Local arg | Env var | Purpose |
 |---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--dry-run` | `-d` | `false` | bool |
-| `--silent` | `-s` | `false` | bool |
-| `--manifest-path` | `-m` | `.socket/manifest.json` | string |
-| `--offline` | — | `false` | bool |
-| `--global` | `-g` | `false` | bool |
-| `--global-prefix` | — | (none) | path |
-| `--ecosystems` | — | (none) | CSV → `Vec<String>` |
-| `--force` | `-f` | `false` | bool |
-| `--json` | — | `false` | bool |
-| `--verbose` | `-v` | `false` | bool |
-| `--download-mode` | — | **`diff`** | string |
+| `apply` | `--force` / `-f` | `SOCKET_FORCE` | Bypass beforeHash check |
+| `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune) |
+| `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size (default `100`) |
+| `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
+| `remove` | positional `identifier`; `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Manifest entry removal |
+| `rollback` | optional positional `identifier`; `--one-off` | `SOCKET_ONE_OFF` | Rollback target |
+| `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`) |
+| `setup` | (none beyond globals) | — | — |
 
-### `rollback`
+`scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
 
-Same as `apply` plus: `--one-off` (bool), `--org` (string), `--api-url` (string), `--api-token` (string). Positional `identifier` is **optional** (omit to rollback everything).
+`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state.
 
-### `get`
+`scan --sync` is sugar for `--apply --prune` — the canonical single-flag bot invocation. `scan --json --sync --yes` discovers, applies, and reconciles state in one pass.
 
-Required positional `identifier`. Flags:
+`--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts.
 
-| Long | Short | Alias | Default | Type |
-|---|---|---|---|---|
-| `--org` | — | — | (none) | string |
-| `--cwd` | — | — | `.` | path |
-| `--id` | — | — | `false` | bool |
-| `--cve` | — | — | `false` | bool |
-| `--ghsa` | — | — | `false` | bool |
-| `--package` | `-p` | — | `false` | bool |
-| `--yes` | `-y` | — | `false` | bool |
-| `--api-url` | — | — | (none) | string |
-| `--api-token` | — | — | (none) | string |
-| `--save-only` | — | **`--no-apply`** | `false` | bool |
-| `--global` | `-g` | — | `false` | bool |
-| `--global-prefix` | — | — | (none) | path |
-| `--one-off` | — | — | `false` | bool |
-| `--json` | — | — | `false` | bool |
-| `--download-mode` | — | — | **`diff`** | string |
+The hidden alias `--no-apply` on `get --save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
 
-The hidden alias `--no-apply` on `--save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
+`repair` keeps its `gc` visible alias.
 
-### `scan`
+## Environment variables
 
-| Long | Short | Default | Type |
+All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names are still honored at runtime for compatibility: on first read of any of the three the binary emits a one-shot deprecation warning to stderr (the warning fires unconditionally — even under `--silent` / `--json` — because it's a transition signal users need to see). The legacy names will be removed in the next major release.
+
+| Env var | CLI equivalent | Default | Notes |
 |---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--org` | — | (none) | string |
-| `--json` | — | `false` | bool |
-| `--yes` | `-y` | `false` | bool |
-| `--global` | `-g` | `false` | bool |
-| `--global-prefix` | — | (none) | path |
-| `--batch-size` | — | **`100`** | usize |
-| `--api-url` | — | (none) | string |
-| `--api-token` | — | (none) | string |
-| `--ecosystems` | — | (none) | CSV → `Vec<String>` |
-| `--download-mode` | — | **`diff`** | string |
-| `--apply` | — | `false` | bool |
-| `--prune` | — | `false` | bool |
-| `--sync` | — | `false` | bool |
-| `--dry-run` | `-d` | `false` | bool |
+| `SOCKET_CWD` | `--cwd` | `.` | — |
+| `SOCKET_MANIFEST_PATH` | `--manifest-path` / `-m` | `.socket/manifest.json` | — |
+| `SOCKET_API_URL` | `--api-url` | `https://api.socket.dev` | — |
+| `SOCKET_API_TOKEN` | `--api-token` | (none) | Absence selects the public proxy. |
+| `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | — |
+| `SOCKET_PROXY_URL` | `--proxy-url` | `https://patches-api.socket.dev` | **Renamed in v3.0** (was `SOCKET_PATCH_PROXY_URL`). |
+| `SOCKET_ECOSYSTEMS` | `--ecosystems` / `-e` | (all) | Comma-separated list. |
+| `SOCKET_DOWNLOAD_MODE` | `--download-mode` | `diff` | One of `diff` / `package` / `file`. |
+| `SOCKET_OFFLINE` | `--offline` | `false` | — |
+| `SOCKET_GLOBAL` | `--global` / `-g` | `false` | — |
+| `SOCKET_GLOBAL_PREFIX` | `--global-prefix` | (auto) | — |
+| `SOCKET_JSON` | `--json` / `-j` | `false` | — |
+| `SOCKET_VERBOSE` | `--verbose` / `-v` | `false` | — |
+| `SOCKET_SILENT` | `--silent` / `-s` | `false` | — |
+| `SOCKET_DRY_RUN` | `--dry-run` / `-d` | `false` | — |
+| `SOCKET_YES` | `--yes` / `-y` | `false` | — |
+| `SOCKET_DEBUG` | `--debug` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_DEBUG`). |
+| `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_TELEMETRY_DISABLED`). |
+| `SOCKET_FORCE` | `apply --force` / `-f` | `false` | Local to `apply`. |
+| `SOCKET_BATCH_SIZE` | `scan --batch-size` | `100` | Local to `scan`. |
+| `SOCKET_SAVE_ONLY` | `get --save-only` | `false` | Local to `get`. |
+| `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. |
+| `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
+| `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
 
-`--apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively. Designed for unattended workflows (cron jobs, bots that open PRs).
+### Deprecated env vars
 
-`--prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. Pair with `--apply` (or use `--sync`) for the auto-update workflow.
-
-`--sync` is sugar for `--apply --prune` — the canonical single-flag bot invocation. `scan --json --sync --yes` discovers, applies, and reconciles state in one pass.
-
-`--dry-run` (`-d`) previews what `--apply` / `--prune` / `--sync` would do without mutating disk. In JSON mode, `apply.patches[*]` is populated with would-be actions (computed via `decide_patch_action` against the current manifest) and `gc.prunable*` / `gc.orphan*` fields report counts via the cleanup helpers' built-in dry-run mode. No effect without at least one of `--apply`, `--prune`, or `--sync`.
-
-### `list`
-
-| Long | Short | Default | Type |
-|---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--manifest-path` | `-m` | `.socket/manifest.json` | string |
-| `--json` | — | `false` | bool |
-
-### `remove`
-
-Required positional `identifier`. Flags:
-
-| Long | Short | Default | Type |
-|---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--manifest-path` | `-m` | `.socket/manifest.json` | string |
-| `--skip-rollback` | — | `false` | bool |
-| `--yes` | `-y` | `false` | bool |
-| `--global` | `-g` | `false` | bool |
-| `--global-prefix` | — | (none) | path |
-| `--json` | — | `false` | bool |
-
-### `setup`
-
-| Long | Short | Default | Type |
-|---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--dry-run` | `-d` | `false` | bool |
-| `--yes` | `-y` | `false` | bool |
-| `--json` | — | `false` | bool |
-
-### `repair`
-
-`repair` (alias `gc`) is a first-class command for cleaning up the `.socket/` directory without running a scan. For the combined discover-and-apply workflow with GC, use `scan --sync --json --yes`; for cleanup alone, use `repair` (or `gc`) directly. The `gc` visible alias is part of the contract — removing or demoting it is a MAJOR bump.
-
-| Long | Short | Default | Type |
-|---|---|---|---|
-| `--cwd` | — | `.` | path |
-| `--manifest-path` | `-m` | `.socket/manifest.json` | string |
-| `--dry-run` | `-d` | `false` | bool |
-| `--offline` | — | `false` | bool |
-| `--download-only` | — | `false` | bool |
-| `--json` | — | `false` | bool |
-| `--download-mode` | — | **`file`** | string |
-
-**Note:** `repair`'s `--download-mode` default differs from every other command (`file` vs `diff`). This is intentional — repair restores legacy per-file blobs needed to apply any patch.
+| Legacy | Renamed to | Status |
+|---|---|---|
+| `SOCKET_PATCH_PROXY_URL` | `SOCKET_PROXY_URL` | Honored with warning; remove in next major. |
+| `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` | Honored with warning; remove in next major. |
+| `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` | Honored with warning; remove in next major. |
 
 ## CSV value parsing
 

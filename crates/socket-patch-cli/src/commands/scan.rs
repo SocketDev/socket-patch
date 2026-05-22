@@ -1,17 +1,16 @@
 use clap::Args;
-use socket_patch_core::api::client::get_api_client_from_env;
+use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::{
-    read_manifest, resolve_manifest_path, write_manifest,
-};
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
 
@@ -203,51 +202,12 @@ pub(crate) fn detect_updates(
 
 #[derive(Args)]
 pub struct ScanArgs {
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 
-    /// Organization slug
-    #[arg(long)]
-    pub org: Option<String>,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
-    /// Skip confirmation prompts
-    #[arg(short = 'y', long, default_value_t = false)]
-    pub yes: bool,
-
-    /// Scan globally installed npm packages
-    #[arg(short = 'g', long, default_value_t = false)]
-    pub global: bool,
-
-    /// Custom path to global node_modules
-    #[arg(long = "global-prefix")]
-    pub global_prefix: Option<PathBuf>,
-
-    /// Number of packages to query per API request
-    #[arg(long = "batch-size", default_value_t = DEFAULT_BATCH_SIZE)]
+    /// Number of packages to query per API request.
+    #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
     pub batch_size: usize,
-
-    /// Socket API URL (overrides SOCKET_API_URL env var)
-    #[arg(long = "api-url")]
-    pub api_url: Option<String>,
-
-    /// Socket API token (overrides SOCKET_API_TOKEN env var)
-    #[arg(long = "api-token")]
-    pub api_token: Option<String>,
-
-    /// Restrict scanning to specific ecosystems (comma-separated: npm,pypi,cargo,maven)
-    #[arg(long, value_delimiter = ',')]
-    pub ecosystems: Option<Vec<String>>,
-
-    /// Which kind of patch artifact to download. `diff` (default) fetches
-    /// the smallest delta archive; `package` fetches a full per-package
-    /// tarball; `file` falls back to legacy per-file blob downloads.
-    #[arg(long = "download-mode", default_value = "diff")]
-    pub download_mode: String,
 
     /// Download and apply selected patches in JSON mode (non-interactive).
     /// Without this flag, `scan --json` is read-only — it lists available
@@ -274,18 +234,11 @@ pub struct ScanArgs {
     /// fully-reconciled state in one invocation.
     #[arg(long, default_value_t = false)]
     pub sync: bool,
-
-    /// Show what `--apply` / `--prune` / `--sync` would do without
-    /// mutating the manifest, downloading patches, or deleting files.
-    /// In dry-run mode the JSON output's `apply.patches[*]` and
-    /// `gc.prunable*` / `gc.orphan*` fields are populated with the
-    /// would-be actions, but no I/O is performed. No effect without
-    /// at least one of `--apply`, `--prune`, or `--sync`.
-    #[arg(short = 'd', long = "dry-run", default_value_t = false)]
-    pub dry_run: bool,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
+    apply_env_toggles(&args.common);
+
     // `--sync` is sugar for `--apply --prune`. Derive locals once and
     // use them everywhere downstream so the flag interactions are
     // expressed in one place. `--apply --prune --sync` is redundant
@@ -293,33 +246,26 @@ pub async fn run(args: ScanArgs) -> i32 {
     let apply = args.apply || args.sync;
     let prune = args.prune || args.sync;
 
-    // Override env vars if CLI options provided
-    if let Some(ref url) = args.api_url {
-        std::env::set_var("SOCKET_API_URL", url);
-    }
-    if let Some(ref token) = args.api_token {
-        std::env::set_var("SOCKET_API_TOKEN", token);
-    }
-
-    let (api_client, _use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
+    let (api_client, _use_public_proxy) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
 
     let crawler_options = CrawlerOptions {
-        cwd: args.cwd.clone(),
-        global: args.global,
-        global_prefix: args.global_prefix.clone(),
+        cwd: args.common.cwd.clone(),
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
         batch_size: args.batch_size,
     };
 
-    let scan_target = if args.global || args.global_prefix.is_some() {
+    let scan_target = if args.common.global || args.common.global_prefix.is_some() {
         "global packages"
     } else {
         "packages"
     };
 
-    let show_progress = !args.json && stderr_is_tty();
+    let show_progress = !args.common.json && stderr_is_tty();
 
     if show_progress {
         eprint!("Scanning {scan_target}...");
@@ -329,7 +275,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     let (all_crawled, eco_counts) = crawl_all_ecosystems(&crawler_options).await;
 
     // Filter by --ecosystems if provided
-    let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.ecosystems {
+    let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
         all_crawled
             .into_iter()
             .filter(|pkg| {
@@ -351,7 +297,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         if show_progress {
             eprintln!();
         }
-        if args.json {
+        if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
             // user "uninstalled everything" is too destructive. Bots
@@ -372,7 +318,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }))
                 .unwrap()
             );
-        } else if args.global || args.global_prefix.is_some() {
+        } else if args.common.global || args.common.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
             #[allow(unused_mut)]
@@ -393,7 +339,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Build ecosystem summary
     let mut eco_parts = Vec::new();
     for eco in Ecosystem::all() {
-        let count = if args.ecosystems.is_some() {
+        let count = if args.common.ecosystems.is_some() {
             // When filtering, count the filtered packages
             filtered_crawled.iter().filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco)).count()
         } else {
@@ -409,7 +355,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         format!(" ({})", eco_parts.join(", "))
     };
 
-    if !args.json {
+    if !args.common.json {
         if show_progress {
             eprintln!("\rFound {package_count} packages{eco_summary}");
         } else {
@@ -451,7 +397,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             }
             Err(e) => {
-                if !args.json {
+                if !args.common.json {
                     eprintln!("\nError querying batch {}: {e}", batch_idx + 1);
                 }
             }
@@ -463,7 +409,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         .map(|p| p.patches.len())
         .sum();
 
-    if !args.json {
+    if !args.common.json {
         if total_patches_found > 0 {
             if show_progress {
                 eprintln!(
@@ -500,7 +446,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
     // non-JSON table-print path (counts `updates_available`).
-    let manifest_path = resolve_manifest_path(&args.cwd, ".socket/manifest.json");
+    let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path.parent().unwrap().to_path_buf();
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
     let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
@@ -509,7 +455,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // PURL is not in the current crawl results).
     let scanned_purls: HashSet<String> = all_purls.iter().cloned().collect();
 
-    if args.json {
+    if args.common.json {
         let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
@@ -530,7 +476,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         // (factoring in --sync, which implies both). They're independent
         // here: a bot can `--apply` without `--prune`, or `--prune`
         // without `--apply` (just GC-sweep), or both (full sync).
-        let dry = args.dry_run;
+        let dry = args.common.dry_run;
 
         // --- Apply path (if requested) -----------------------------------
         if apply {
@@ -613,15 +559,16 @@ pub async fn run(args: ScanArgs) -> i32 {
                 });
             } else {
                 let params = DownloadParams {
-                    cwd: args.cwd.clone(),
-                    org: args.org.clone(),
+                    cwd: args.common.cwd.clone(),
+                    org: args.common.org.clone(),
                     save_only: false,
                     one_off: false,
-                    global: args.global,
-                    global_prefix: args.global_prefix.clone(),
+                    global: args.common.global,
+                    global_prefix: args.common.global_prefix.clone(),
                     json: true,
                     silent: true,
-                    download_mode: args.download_mode.clone(),
+                    download_mode: args.common.download_mode.clone(),
+                    api_overrides: args.common.api_client_overrides(),
                 };
                 let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
                 apply_code = code;
@@ -942,7 +889,7 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     // Prompt to download
     let prompt = format!("Download and apply {} patch(es)?", selected.len());
-    if !confirm(&prompt, true, args.yes, args.json) {
+    if !confirm(&prompt, true, args.common.yes, args.common.json) {
         println!("\nTo apply a patch, run:");
         println!("  socket-patch get <package-name-or-purl>");
         println!("  socket-patch get <CVE-ID>");
@@ -951,15 +898,16 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     // Download and apply
     let params = DownloadParams {
-        cwd: args.cwd.clone(),
-        org: args.org.clone(),
+        cwd: args.common.cwd.clone(),
+        org: args.common.org.clone(),
         save_only: false,
         one_off: false,
-        global: args.global,
-        global_prefix: args.global_prefix.clone(),
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
         json: false,
         silent: false,
-        download_mode: args.download_mode.clone(),
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
     };
 
     let (code, _) = download_and_apply_patches(&selected, &params).await;

@@ -49,21 +49,24 @@ async fn mock_batch_empty(server: &MockServer) {
 
 fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
-        cwd: cwd.to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: api_url,
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["pypi".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(api_url),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["pypi".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: false,
-        dry_run: false,
     }
 }
 

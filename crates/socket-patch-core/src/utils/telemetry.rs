@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use crate::constants::{DEFAULT_PATCH_API_PROXY_URL, DEFAULT_SOCKET_API_URL, USER_AGENT};
+use crate::utils::env_compat::read_env_with_legacy;
 
 // ---------------------------------------------------------------------------
 // Session ID — generated once per process invocation
@@ -99,21 +100,26 @@ pub struct TrackPatchEventOptions {
 /// Check if telemetry is disabled via environment variables.
 ///
 /// Telemetry is disabled when:
-/// - `SOCKET_PATCH_TELEMETRY_DISABLED` is `"1"` or `"true"`
+/// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
+///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
 /// - `VITEST` is `"true"` (test environment)
+///
+/// Note that the CLI also exposes a `--no-telemetry` flag; when that flag
+/// is set the CLI dispatcher sets `SOCKET_TELEMETRY_DISABLED=1` for the
+/// duration of the process so this check stays the single source of truth.
 pub fn is_telemetry_disabled() -> bool {
-    matches!(
-        std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED")
-            .unwrap_or_default()
-            .as_str(),
-        "1" | "true"
-    ) || std::env::var("VITEST").unwrap_or_default() == "true"
+    let env_value =
+        read_env_with_legacy("SOCKET_TELEMETRY_DISABLED", "SOCKET_PATCH_TELEMETRY_DISABLED")
+            .unwrap_or_default();
+    matches!(env_value.as_str(), "1" | "true")
+        || std::env::var("VITEST").unwrap_or_default() == "true"
 }
 
-/// Check if debug mode is enabled.
+/// Check if debug mode is enabled. Reads `SOCKET_DEBUG` (with legacy
+/// `SOCKET_PATCH_DEBUG` shim).
 fn is_debug_enabled() -> bool {
     matches!(
-        std::env::var("SOCKET_PATCH_DEBUG")
+        read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG")
             .unwrap_or_default()
             .as_str(),
         "1" | "true"
@@ -238,8 +244,9 @@ async fn send_telemetry_event(
             (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
         }
         _ => {
-            let proxy_url = std::env::var("SOCKET_PATCH_PROXY_URL")
-                .unwrap_or_else(|_| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            let proxy_url =
+                read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                    .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
             (format!("{proxy_url}/patch/telemetry"), false)
         }
     };
@@ -471,27 +478,38 @@ mod tests {
     use super::*;
 
     /// Combined into a single test to avoid env-var races across parallel tests.
+    /// Exercises both the new `SOCKET_TELEMETRY_DISABLED` name and the
+    /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` shim.
     #[test]
     fn test_is_telemetry_disabled() {
         // Save originals
-        let orig_disabled = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+        let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
+        let orig_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
         let orig_vitest = std::env::var("VITEST").ok();
 
         // Default: not disabled
+        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
         std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
         std::env::remove_var("VITEST");
         assert!(!is_telemetry_disabled());
 
-        // Disabled via "1"
+        // Disabled via new var "1"
+        std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+        assert!(is_telemetry_disabled());
+        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+
+        // Disabled via legacy var (with deprecation warning)
         std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "1");
         assert!(is_telemetry_disabled());
-
-        // Disabled via "true"
         std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "true");
         assert!(is_telemetry_disabled());
 
         // Restore originals
-        match orig_disabled {
+        match orig_new {
+            Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
+            None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
+        }
+        match orig_legacy {
             Some(v) => std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v),
             None => std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED"),
         }

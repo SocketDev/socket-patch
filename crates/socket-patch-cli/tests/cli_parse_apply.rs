@@ -32,18 +32,18 @@ fn parse_apply(extra: &[&str]) -> ApplyArgs {
 #[test]
 fn defaults_match_contract() {
     let a = parse_apply(&[]);
-    assert_eq!(a.cwd, PathBuf::from("."));
-    assert!(!a.dry_run);
-    assert!(!a.silent);
-    assert_eq!(a.manifest_path, ".socket/manifest.json");
-    assert!(!a.offline);
-    assert!(!a.global);
-    assert_eq!(a.global_prefix, None);
-    assert_eq!(a.ecosystems, None);
+    assert_eq!(a.common.cwd, PathBuf::from("."));
+    assert!(!a.common.dry_run);
+    assert!(!a.common.silent);
+    assert_eq!(a.common.manifest_path, ".socket/manifest.json");
+    assert!(!a.common.offline);
+    assert!(!a.common.global);
+    assert_eq!(a.common.global_prefix, None);
+    assert_eq!(a.common.ecosystems, None);
     assert!(!a.force);
-    assert!(!a.json);
-    assert!(!a.verbose);
-    assert_eq!(a.download_mode, "diff");
+    assert!(!a.common.json);
+    assert!(!a.common.verbose);
+    assert_eq!(a.common.download_mode, "diff");
 }
 
 /// The `download_mode` default is pinned separately — it's the one
@@ -51,14 +51,14 @@ fn defaults_match_contract() {
 /// so we assert it explicitly to catch drift.
 #[test]
 fn default_download_mode_is_diff() {
-    assert_eq!(parse_apply(&[]).download_mode, "diff");
+    assert_eq!(parse_apply(&[]).common.download_mode, "diff");
 }
 
 /// The `manifest_path` default is contract — many scripts hard-code
 /// `.socket/manifest.json` as the canonical location.
 #[test]
 fn default_manifest_path_is_dot_socket_manifest_json() {
-    assert_eq!(parse_apply(&[]).manifest_path, ".socket/manifest.json");
+    assert_eq!(parse_apply(&[]).common.manifest_path, ".socket/manifest.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -67,32 +67,32 @@ fn default_manifest_path_is_dot_socket_manifest_json() {
 
 #[test]
 fn dry_run_long() {
-    assert!(parse_apply(&["--dry-run"]).dry_run);
+    assert!(parse_apply(&["--dry-run"]).common.dry_run);
 }
 
 #[test]
 fn dry_run_short() {
-    assert!(parse_apply(&["-d"]).dry_run);
+    assert!(parse_apply(&["-d"]).common.dry_run);
 }
 
 #[test]
 fn silent_long() {
-    assert!(parse_apply(&["--silent"]).silent);
+    assert!(parse_apply(&["--silent"]).common.silent);
 }
 
 #[test]
 fn silent_short() {
-    assert!(parse_apply(&["-s"]).silent);
+    assert!(parse_apply(&["-s"]).common.silent);
 }
 
 #[test]
 fn global_long() {
-    assert!(parse_apply(&["--global"]).global);
+    assert!(parse_apply(&["--global"]).common.global);
 }
 
 #[test]
 fn global_short() {
-    assert!(parse_apply(&["-g"]).global);
+    assert!(parse_apply(&["-g"]).common.global);
 }
 
 #[test]
@@ -107,22 +107,22 @@ fn force_short() {
 
 #[test]
 fn verbose_long() {
-    assert!(parse_apply(&["--verbose"]).verbose);
+    assert!(parse_apply(&["--verbose"]).common.verbose);
 }
 
 #[test]
 fn verbose_short() {
-    assert!(parse_apply(&["-v"]).verbose);
+    assert!(parse_apply(&["-v"]).common.verbose);
 }
 
 #[test]
 fn offline_long() {
-    assert!(parse_apply(&["--offline"]).offline);
+    assert!(parse_apply(&["--offline"]).common.offline);
 }
 
 #[test]
 fn json_long() {
-    assert!(parse_apply(&["--json"]).json);
+    assert!(parse_apply(&["--json"]).common.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,26 +131,26 @@ fn json_long() {
 
 #[test]
 fn cwd_long() {
-    assert_eq!(parse_apply(&["--cwd", "/tmp/x"]).cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(parse_apply(&["--cwd", "/tmp/x"]).common.cwd, PathBuf::from("/tmp/x"));
 }
 
 #[test]
 fn manifest_path_long() {
     assert_eq!(
-        parse_apply(&["--manifest-path", "custom.json"]).manifest_path,
+        parse_apply(&["--manifest-path", "custom.json"]).common.manifest_path,
         "custom.json"
     );
 }
 
 #[test]
 fn manifest_path_short() {
-    assert_eq!(parse_apply(&["-m", "custom.json"]).manifest_path, "custom.json");
+    assert_eq!(parse_apply(&["-m", "custom.json"]).common.manifest_path, "custom.json");
 }
 
 #[test]
 fn global_prefix_long() {
     assert_eq!(
-        parse_apply(&["--global-prefix", "/foo"]).global_prefix,
+        parse_apply(&["--global-prefix", "/foo"]).common.global_prefix,
         Some(PathBuf::from("/foo"))
     );
 }
@@ -163,7 +163,7 @@ fn global_prefix_long() {
 #[test]
 fn ecosystems_csv_splits_into_vec() {
     assert_eq!(
-        parse_apply(&["--ecosystems", "npm,pypi,cargo"]).ecosystems,
+        parse_apply(&["--ecosystems", "npm,pypi,cargo"]).common.ecosystems,
         Some(vec!["npm".to_string(), "pypi".to_string(), "cargo".to_string()])
     );
 }
@@ -171,7 +171,7 @@ fn ecosystems_csv_splits_into_vec() {
 #[test]
 fn ecosystems_single_value() {
     assert_eq!(
-        parse_apply(&["--ecosystems", "npm"]).ecosystems,
+        parse_apply(&["--ecosystems", "npm"]).common.ecosystems,
         Some(vec!["npm".to_string()])
     );
 }
@@ -182,20 +182,20 @@ fn ecosystems_single_value() {
 
 #[test]
 fn download_mode_diff() {
-    assert_eq!(parse_apply(&["--download-mode", "diff"]).download_mode, "diff");
+    assert_eq!(parse_apply(&["--download-mode", "diff"]).common.download_mode, "diff");
 }
 
 #[test]
 fn download_mode_package() {
     assert_eq!(
-        parse_apply(&["--download-mode", "package"]).download_mode,
+        parse_apply(&["--download-mode", "package"]).common.download_mode,
         "package"
     );
 }
 
 #[test]
 fn download_mode_file() {
-    assert_eq!(parse_apply(&["--download-mode", "file"]).download_mode, "file");
+    assert_eq!(parse_apply(&["--download-mode", "file"]).common.download_mode, "file");
 }
 
 // ---------------------------------------------------------------------------

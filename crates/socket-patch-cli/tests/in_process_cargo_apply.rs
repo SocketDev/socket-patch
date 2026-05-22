@@ -199,21 +199,25 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
     make_writable(&lib_file);
 
     let args = ScanArgs {
-        cwd: tmp.path().join("proj"),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: true, // use global registry; cargo crawler then probes CARGO_HOME
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().join("proj"),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: true,
+            // use global registry; cargo crawler then probes CARGO_HOME
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["cargo".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["cargo".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: true,
-        dry_run: false,
     };
     // CARGO_HOME must be set in this process's env so the cargo crawler
     // probes the isolated location (not the developer's real ~/.cargo).
@@ -267,21 +271,24 @@ async fn cargo_crawler_finds_real_fetched_crate() {
 
     std::env::set_var("CARGO_HOME", &cargo_home);
     let args = ScanArgs {
-        cwd: tmp.path().join("proj"),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: true,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().join("proj"),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: true,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["cargo".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["cargo".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: false,
-        dry_run: false,
     };
     assert_eq!(scan_run(args).await, 0);
     std::env::remove_var("CARGO_HOME");

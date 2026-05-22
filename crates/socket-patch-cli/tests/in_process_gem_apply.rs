@@ -185,21 +185,24 @@ async fn gem_install_scan_sync_patches_real_file() {
     .await;
 
     let args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["gem".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["gem".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: true,
-        dry_run: false,
     };
     let code = scan_run(args).await;
     assert!(code == 0 || code == 1, "scan --sync exit: {code}");
@@ -241,21 +244,24 @@ async fn gem_crawler_finds_real_installed_gem() {
         .await;
 
     let args = ScanArgs {
-        cwd: tmp.path().to_path_buf(),
-        org: Some(ORG.to_string()),
-        json: true,
-        yes: true,
-        global: false,
-        global_prefix: None,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: false,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["gem".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         batch_size: 100,
-        api_url: Some(server.uri()),
-        api_token: Some("fake".to_string()),
-        ecosystems: Some(vec!["gem".to_string()]),
-        download_mode: "diff".to_string(),
         apply: false,
         prune: false,
         sync: false,
-        dry_run: false,
     };
     assert_eq!(scan_run(args).await, 0);
 }
