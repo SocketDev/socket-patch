@@ -135,8 +135,22 @@ async fn rollback_npm_restores_original_content() {
 async fn rollback_pypi_restores_original_content() {
     let tmp = tempfile::tempdir().unwrap();
     // Pypi crawler probes .venv-style layouts. Set one up by hand —
-    // create site-packages with a dist-info dir.
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    // create site-packages with a dist-info dir. The layout differs
+    // per platform (PEP-405): Unix puts site-packages under
+    // `lib/python<MAJOR>.<MINOR>/`, Windows puts it under `Lib/`
+    // with no version subdirectory. The crawler at
+    // crates/socket-patch-core/src/crawlers/python_crawler.rs:182
+    // already branches on cfg!(windows); mirror that here so the
+    // crawler actually finds the synthetic package on every runner.
+    let site = if cfg!(windows) {
+        tmp.path().join(".venv").join("Lib").join("site-packages")
+    } else {
+        tmp.path()
+            .join(".venv")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages")
+    };
     std::fs::create_dir_all(&site).unwrap();
     let dist_info = site.join("rbpypi-1.0.0.dist-info");
     std::fs::create_dir_all(&dist_info).unwrap();
