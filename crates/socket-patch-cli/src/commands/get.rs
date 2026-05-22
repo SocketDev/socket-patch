@@ -1,7 +1,9 @@
 use clap::Args;
 use regex::Regex;
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::api::types::{PatchSearchResult, SearchResponse};
+use socket_patch_core::api::types::{
+    PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
+};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
@@ -44,6 +46,102 @@ pub(crate) fn decide_patch_action(
             old_uuid: existing.uuid.clone(),
         },
         None => PatchAction::Added,
+    }
+}
+
+/// Ordinal rank for severity strings. Higher = worse. Unknown labels
+/// (including GHSA's `moderate` which maps to `medium`) get sensible
+/// defaults so the max-severity selector still works.
+pub(crate) fn severity_rank(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        // GHSA emits `moderate`; treat it as the medium-tier signal.
+        "moderate" | "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Return the highest-severity label from a vulnerabilities map.
+/// Returns `None` when the map is empty or every entry's severity is
+/// unrecognized.
+pub(crate) fn max_vuln_severity(
+    vulns: &HashMap<String, VulnerabilityResponse>,
+) -> Option<String> {
+    vulns
+        .values()
+        .max_by_key(|v| severity_rank(&v.severity))
+        .map(|v| v.severity.clone())
+}
+
+/// Build the metadata payload spliced into per-patch JSON action records
+/// (`added` / `updated`). Surfaces what consumers need to render a patch
+/// to end users: human-readable description, license, tier, exportedAt;
+/// a top-level severity computed as the max across all vulnerabilities;
+/// and a flattened vulnerability list with the canonical advisory IDs
+/// (GHSA, CVE) front and center so consumers can route on severity or
+/// open a specific advisory.
+///
+/// Output keys are JSON-camelCase to match the rest of the envelope.
+/// The vulnerability list is sorted by ID for stable test snapshots.
+pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
+    let mut vulns: Vec<serde_json::Value> = patch
+        .vulnerabilities
+        .iter()
+        .map(|(id, v)| {
+            serde_json::json!({
+                "id": id,
+                "cves": v.cves,
+                "severity": v.severity,
+                "summary": v.summary,
+                "description": v.description,
+            })
+        })
+        .collect();
+    // Stable ordering — HashMap iteration is otherwise nondeterministic
+    // and consumers diff this output in CI logs.
+    vulns.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["id"].as_str().unwrap_or(""))
+    });
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "description".into(),
+        serde_json::Value::String(patch.description.clone()),
+    );
+    meta.insert(
+        "license".into(),
+        serde_json::Value::String(patch.license.clone()),
+    );
+    meta.insert(
+        "tier".into(),
+        serde_json::Value::String(patch.tier.clone()),
+    );
+    meta.insert(
+        "exportedAt".into(),
+        serde_json::Value::String(patch.published_at.clone()),
+    );
+    if let Some(sev) = max_vuln_severity(&patch.vulnerabilities) {
+        meta.insert("severity".into(), serde_json::Value::String(sev));
+    }
+    meta.insert("vulnerabilities".into(), serde_json::Value::Array(vulns));
+    serde_json::Value::Object(meta)
+}
+
+/// Merge a metadata object (from [`patch_event_metadata`]) into a
+/// per-patch action record. Convenience wrapper that handles the
+/// unwrap of `Value::Object`.
+fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
+    if let (Some(record_obj), serde_json::Value::Object(meta_obj)) =
+        (record.as_object_mut(), meta)
+    {
+        for (k, v) in meta_obj {
+            record_obj.insert(k, v);
+        }
     }
 }
 
@@ -462,7 +560,7 @@ pub async fn download_and_apply_patches(
                     },
                 );
 
-                let action_record = match &action {
+                let mut action_record = match &action {
                     PatchAction::Updated { old_uuid } => {
                         if !params.json && !params.silent {
                             eprintln!("  [update] {}", patch.purl);
@@ -485,6 +583,11 @@ pub async fn download_and_apply_patches(
                         })
                     }
                 };
+                // Splice description / severity / vulnerability IDs into
+                // the per-patch record so PR-comment bots, dashboards, and
+                // CLI consumers can render the patch without a second
+                // round-trip to the API.
+                merge_metadata(&mut action_record, patch_event_metadata(&patch));
                 downloaded_patches.push(action_record);
                 patches_added += 1;
             }
@@ -1232,16 +1335,22 @@ async fn save_and_apply_patch(
     }
 
     if args.common.json {
+        let mut patch_record = serde_json::json!({
+            "purl": patch.purl,
+            "uuid": patch.uuid,
+            "action": if added { "added" } else { "skipped" },
+        });
+        if added {
+            // Only enrich when the patch was actually added — a `skipped`
+            // record means the consumer already saw the metadata last time.
+            merge_metadata(&mut patch_record, patch_event_metadata(&patch));
+        }
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "status": "success",
             "found": 1,
             "downloaded": if added { 1 } else { 0 },
             "applied": if apply_succeeded { 1 } else { 0 },
-            "patches": [{
-                "purl": patch.purl,
-                "uuid": patch.uuid,
-                "action": if added { "added" } else { "skipped" },
-            }],
+            "patches": [patch_record],
         })).unwrap());
     }
 
@@ -1524,5 +1633,156 @@ mod tests {
             decide_patch_action(&manifest, "pkg:npm/bar@2.0", "uuid-a"),
             PatchAction::Added,
         );
+    }
+
+    // --- severity_rank / max_vuln_severity / patch_event_metadata --------
+    // Pins the JSON shape of the metadata spliced into `added` / `updated`
+    // per-patch records by `download_and_apply_patches`. PR-comment bots
+    // rely on these fields — see CLI_CONTRACT.md (`get` / `scan` JSON
+    // output, patches array).
+
+    #[test]
+    fn severity_rank_orders_canonical_labels() {
+        assert!(severity_rank("critical") > severity_rank("high"));
+        assert!(severity_rank("high") > severity_rank("medium"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+        // GHSA's `moderate` is treated as medium.
+        assert_eq!(severity_rank("moderate"), severity_rank("medium"));
+        // Unknown / blank labels rank below all known severities.
+        assert!(severity_rank("low") > severity_rank(""));
+        assert!(severity_rank("low") > severity_rank("unknown"));
+    }
+
+    #[test]
+    fn max_vuln_severity_picks_highest() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-low".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-low".into()],
+                summary: String::new(),
+                severity: "low".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-crit".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-crit".into()],
+                summary: String::new(),
+                severity: "critical".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-mod".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-mod".into()],
+                summary: String::new(),
+                severity: "moderate".into(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(max_vuln_severity(&vulns).as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn max_vuln_severity_returns_none_for_empty() {
+        assert_eq!(max_vuln_severity(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn patch_event_metadata_includes_all_keys() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-aaaa-bbbb-cccc".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-2024-12345".into()],
+                summary: "Prototype Pollution".into(),
+                severity: "high".into(),
+                description: "merge() does not check Object.prototype".into(),
+            },
+        );
+        let patch = PatchResponse {
+            uuid: "11111111-1111-4111-8111-111111111111".into(),
+            purl: "pkg:npm/minimist@1.2.2".into(),
+            published_at: "2024-01-01T00:00:00Z".into(),
+            files: HashMap::new(),
+            vulnerabilities: vulns,
+            description: "Fixes prototype pollution in minimist".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let meta = patch_event_metadata(&patch);
+        assert_eq!(meta["description"], "Fixes prototype pollution in minimist");
+        assert_eq!(meta["license"], "MIT");
+        assert_eq!(meta["tier"], "free");
+        assert_eq!(meta["exportedAt"], "2024-01-01T00:00:00Z");
+        assert_eq!(meta["severity"], "high");
+        let vulns_out = meta["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns_out.len(), 1);
+        assert_eq!(vulns_out[0]["id"], "GHSA-aaaa-bbbb-cccc");
+        assert_eq!(vulns_out[0]["cves"][0], "CVE-2024-12345");
+        assert_eq!(vulns_out[0]["severity"], "high");
+        assert_eq!(vulns_out[0]["summary"], "Prototype Pollution");
+    }
+
+    #[test]
+    fn patch_event_metadata_sorts_vulnerabilities_by_id() {
+        // HashMap iteration is otherwise nondeterministic — verify the
+        // output is stable so test snapshots and consumer diffs don't
+        // flap.
+        let mut vulns = HashMap::new();
+        for id in ["GHSA-zzz", "GHSA-aaa", "GHSA-mmm"] {
+            vulns.insert(
+                id.into(),
+                VulnerabilityResponse {
+                    cves: Vec::new(),
+                    summary: String::new(),
+                    severity: "low".into(),
+                    description: String::new(),
+                },
+            );
+        }
+        let patch = PatchResponse {
+            uuid: String::new(),
+            purl: String::new(),
+            published_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: vulns,
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let meta = patch_event_metadata(&patch);
+        let ids: Vec<&str> = meta["vulnerabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["GHSA-aaa", "GHSA-mmm", "GHSA-zzz"]);
+    }
+
+    #[test]
+    fn patch_event_metadata_omits_severity_when_no_vulns() {
+        let patch = PatchResponse {
+            uuid: String::new(),
+            purl: String::new(),
+            published_at: "ts".into(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "desc".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let meta = patch_event_metadata(&patch);
+        // `severity` is intentionally omitted (not null) when there
+        // aren't any vulnerabilities to derive it from — consumers
+        // should treat absence as "no severity available".
+        assert!(meta.as_object().unwrap().get("severity").is_none());
+        // The empty vulnerabilities array is still present so the
+        // shape stays consistent.
+        assert_eq!(meta["vulnerabilities"].as_array().unwrap().len(), 0);
     }
 }

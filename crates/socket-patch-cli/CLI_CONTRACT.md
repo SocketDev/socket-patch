@@ -232,6 +232,53 @@ The remaining commands still emit their pre-v3.0 ad-hoc JSON shapes and will mig
 - ⏳ `rollback` — still emits per-package result records.
 - ⏳ `setup` — still emits `{ status, updated, alreadyConfigured, errors, files }`.
 
+### `patches[]` entry shape for `get` and `scan --apply`
+
+Per-patch records emitted in `patches[]` (and in `scan --apply`'s
+`apply.patches[*]`) carry the same metadata regardless of which command
+produced them — both flow through `download_and_apply_patches` in
+`src/commands/get.rs`. The shape is stable as of v3.0; consumers can
+rely on these keys.
+
+```jsonc
+{
+  "purl":        "pkg:npm/minimist@1.2.2",
+  "uuid":        "11111111-1111-4111-8111-111111111111",
+  "action":      "added" | "updated" | "skipped" | "failed",
+  "oldUuid":     "<previous uuid>",          // only on action=updated
+
+  // ----- patch metadata (only on action=added | updated) -----
+  "description": "Fixes prototype pollution in minimist",
+  "license":     "MIT",
+  "tier":        "free" | "paid",
+  "exportedAt":  "2024-01-01T00:00:00Z",     // publishedAt from API
+  "severity":    "critical" | "high" | "medium" | "low",  // max across all vulnerabilities; omitted when no vulns
+  "vulnerabilities": [
+    {
+      "id":          "GHSA-xvch-5gv4-984h",  // GHSA/CVE/etc — the canonical advisory ID
+      "cves":        ["CVE-2024-12345"],
+      "severity":    "high",
+      "summary":     "Prototype Pollution",
+      "description": "merge() does not check Object.prototype"
+    }
+    // … one entry per advisory the patch addresses, sorted by `id`
+  ],
+
+  // ----- failure path (only on action=failed) -----
+  "error":       "could not fetch details"
+}
+```
+
+The metadata block (`description`, `license`, `tier`, `exportedAt`,
+`severity`, `vulnerabilities[]`) is intentionally **omitted on
+`skipped`** — those records mean "already in manifest, no work taken",
+and the consumer already saw the metadata when the patch was first
+added. It's also omitted on `failed`.
+
+`vulnerabilities[]` is always sorted by `id` so consumer diffs and
+test snapshots are stable. `severity` at the top level is the max
+across the array using the ordering `critical > high > medium = moderate > low > (unknown)`.
+
 ### `jq` recipes for PR-comment bots
 
 Applied + updated patches (envelope shape):
