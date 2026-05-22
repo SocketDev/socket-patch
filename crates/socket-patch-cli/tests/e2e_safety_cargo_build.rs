@@ -569,6 +569,148 @@ fn apply_with_missing_files_field_reports_sidecar_fixup_failed() {
     );
 }
 
+/// Cargo sidecar write-error path: `.cargo-checksum.json` is
+/// valid JSON (so `read_to_string` succeeds, parse succeeds,
+/// update succeeds in memory) but the file is read-only, so the
+/// final `tokio::fs::write` returns `EACCES`. The fixup wraps
+/// that as `SidecarError::Io` and the boundary surfaces it as
+/// `sidecar_fixup_failed` severity error.
+///
+/// Covers lines 94-99 of cargo.rs (the write `map_err`) — a
+/// region the parse/read/no-files-field tests cannot reach.
+///
+/// Skipped when running as root (chmod 0444 is bypassed by uid 0,
+/// which collapses this test into the success path and produces a
+/// false negative). On normal dev/CI the test fires fully.
+#[cfg(unix)]
+#[test]
+fn apply_with_readonly_checksum_reports_sidecar_fixup_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    if uid_is_root() {
+        eprintln!("SKIP: chmod 0444 negative tests no-op as root");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    stage_socket_manifest(&consumer);
+
+    // Source file write doesn't touch the checksum, so locking the
+    // checksum down to 0444 (r--r--r--) only blocks the sidecar's
+    // final rewrite — exactly the path we want to exercise.
+    let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
+    let mut perms = std::fs::metadata(&checksum).unwrap().permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(&checksum, perms).unwrap();
+
+    let (_code, stdout, _stderr) = run(
+        &consumer,
+        &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+    );
+
+    // Restore writable perms so tempdir cleanup can unlink.
+    let mut restore = std::fs::metadata(&checksum).unwrap().permissions();
+    restore.set_mode(0o644);
+    let _ = std::fs::set_permissions(&checksum, restore);
+
+    // Patch landed — source file is in a writable subdir.
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        PATCHED_LIB_RS,
+    );
+
+    let env = parse_json_envelope(&stdout);
+    let cargo = env["sidecars"]
+        .as_array()
+        .expect("sidecars array")
+        .iter()
+        .find(|s| s["ecosystem"] == "cargo")
+        .expect("cargo record");
+    let advisory = cargo.get("advisory").expect("advisory");
+    assert_eq!(advisory["code"], "sidecar_fixup_failed");
+    assert_eq!(advisory["severity"], "error");
+}
+
+/// Helper: detect uid 0 without pulling in `libc`. Tests that rely
+/// on chmod 0444 being honored must short-circuit under root
+/// because the kernel grants uid 0 implicit write permission
+/// regardless of mode bits.
+///
+/// Uses `id -u` rather than a direct `getuid` syscall to avoid a
+/// `libc` dev-dep just for this one detection. Falls back to
+/// "not root" if `id` is missing or its output is garbled — better
+/// to attempt the test (and possibly false-pass) than to skip it
+/// silently because of a missing helper binary.
+#[cfg(unix)]
+fn uid_is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8(o.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .map(|s| s == "0")
+        .unwrap_or(false)
+}
+
+/// Third Malformed branch: when `.cargo-checksum.json` exists but
+/// is a *directory* rather than a file. `tokio::fs::read_to_string`
+/// returns an I/O error with kind `IsADirectory` (Linux) /
+/// `InvalidInput` (macOS) — NOT `NotFound` — so the fixup hits the
+/// generic `Err(source)` arm in cargo.rs (lines 61-65) and returns
+/// `SidecarError::Io`. The boundary converts that to a
+/// `sidecar_fixup_failed` advisory.
+///
+/// Picks the "directory in place of file" route over chmod tricks
+/// because chmod-based negative tests silently no-op when run as
+/// root (CI containers, dev sandboxes), while a directory-as-file
+/// race fails the same way for every uid.
+#[test]
+fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    stage_socket_manifest(&consumer);
+
+    // Replace the regular `.cargo-checksum.json` file with a
+    // directory of the same name. `read_to_string` will refuse to
+    // treat it as a string.
+    let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
+    std::fs::remove_file(&checksum).unwrap();
+    std::fs::create_dir(&checksum).unwrap();
+
+    let (_code, stdout, _stderr) = run(
+        &consumer,
+        &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+    );
+
+    // Source write still succeeded — the directory-as-file ruse
+    // only affects the sidecar's read step.
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        PATCHED_LIB_RS,
+    );
+
+    let env = parse_json_envelope(&stdout);
+    let cargo = env["sidecars"]
+        .as_array()
+        .expect("sidecars array")
+        .iter()
+        .find(|s| s["ecosystem"] == "cargo")
+        .expect("cargo record");
+    let advisory = cargo.get("advisory").expect("advisory");
+    assert_eq!(advisory["code"], "sidecar_fixup_failed");
+    assert_eq!(advisory["severity"], "error");
+    // Message must reference the checksum path so operators can
+    // locate the problem on disk.
+    let msg = advisory["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(".cargo-checksum.json"),
+        "advisory message must reference the checksum path; got {msg:?}"
+    );
+}
+
 /// Cargo sidecar no-op: no `.cargo-checksum.json` present at all.
 /// The fixup returns `Ok(None)` (lines 56-60 of cargo.rs) and the
 /// envelope carries no cargo record at all — apply still succeeds

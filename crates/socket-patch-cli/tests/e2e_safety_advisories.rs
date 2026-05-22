@@ -394,6 +394,84 @@ fn nuget_apply_deletes_metadata_and_records_files() {
     );
 }
 
+/// NuGet sidecar I/O-error boundary: when `.nupkg.metadata` exists
+/// as a *directory* (not a file), `tokio::fs::remove_file` fails
+/// with a non-NotFound error and `nuget::fixup` returns
+/// `SidecarError::Io`. The boundary in `apply_package_patch`
+/// converts that into a `sidecar_fixup_failed` advisory.
+///
+/// Covers the non-NotFound arm of the remove_file match in
+/// `sidecars/nuget.rs` (lines 50-54) — the path the existing
+/// success and signed-package tests can't reach. As with the
+/// cargo equivalent, the directory-as-file ruse beats chmod
+/// because it fails uniformly across uids and platforms.
+#[cfg(feature = "nuget")]
+#[test]
+fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let packages = cwd.join("nuget-packages");
+    let pkg_dir = packages.join("newtonsoft.json").join("13.0.3");
+    std::fs::create_dir_all(pkg_dir.join("lib")).unwrap();
+    // `.nupkg.metadata` as a non-empty directory. remove_file
+    // refuses to unlink a directory; that's an EISDIR-class I/O
+    // error, not NotFound.
+    std::fs::create_dir(pkg_dir.join(".nupkg.metadata")).unwrap();
+    std::fs::write(
+        pkg_dir.join(".nupkg.metadata").join("placeholder"),
+        b"non-empty so the dir can't be remove_file-removed even on permissive platforms",
+    )
+    .unwrap();
+
+    let target = pkg_dir.join("payload.txt");
+    let original = b"hello\n";
+    std::fs::write(&target, original).unwrap();
+    let patched = b"hello patched\n";
+    let before = git_sha256(original);
+    let after = git_sha256(patched);
+
+    let socket_dir = cwd.join(".socket");
+    write_minimal_manifest(
+        &socket_dir,
+        "pkg:nuget/Newtonsoft.Json@13.0.3",
+        "20000006-0000-4006-8006-000000000006",
+        &[PatchEntry {
+            file_name: "package/payload.txt",
+            before_hash: &before,
+            after_hash: &after,
+        }],
+    );
+    write_blob(&socket_dir, &after, patched);
+
+    let env = apply_and_parse(
+        cwd,
+        &packages,
+        &[
+            ("NUGET_PACKAGES", packages.to_str().unwrap()),
+            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
+        ],
+    );
+
+    // Patch landed (atomic write commits before the sidecar runs).
+    assert_eq!(std::fs::read(&target).unwrap(), patched);
+
+    let record = find_sidecar_record(&env, "nuget");
+    let advisory = record.get("advisory").expect("advisory");
+    assert_eq!(advisory["code"], "sidecar_fixup_failed");
+    assert_eq!(advisory["severity"], "error");
+    let msg = advisory["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(".nupkg.metadata"),
+        "advisory message must reference the metadata path; got {msg:?}"
+    );
+    // Boundary contract: failure path emits NO files[] entries.
+    let files = record["files"].as_array().expect("files array");
+    assert!(
+        files.is_empty(),
+        "failed fixup must not report any deleted files; got {record}"
+    );
+}
+
 /// NuGet (signed): when the package also carries a `.nupkg.sha512`
 /// signature sidecar, the typed payload surfaces BOTH the metadata-
 /// deleted file entry AND a `nuget_signed_package_tampered` advisory
