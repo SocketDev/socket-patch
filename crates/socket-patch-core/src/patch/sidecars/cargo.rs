@@ -85,10 +85,15 @@ pub(crate) async fn fixup(
     // Pretty-print with two-space indent — matches what cargo
     // itself writes. Not strictly required (cargo accepts any
     // formatting) but keeps diffs reviewable.
-    let mut out = serde_json::to_vec_pretty(&json).map_err(|e| SidecarError::Malformed {
-        path: checksum_path.display().to_string(),
-        detail: e.to_string(),
-    })?;
+    //
+    // `to_vec_pretty` is total over `serde_json::Value` — the only
+    // way it can fail is if a custom `Serialize` impl errors, and
+    // we're serializing a Value built entirely from string/object
+    // primitives. `.expect()` rather than `.map_err()` because
+    // making this an `Err` path produces dead code (uncoverable
+    // from any input, by serde's contract).
+    let mut out = serde_json::to_vec_pretty(&json)
+        .expect("serializing a Value just deserialized from valid JSON must succeed");
     out.push(b'\n');
 
     tokio::fs::write(&checksum_path, out).await.map_err(|source| {

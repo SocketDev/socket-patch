@@ -58,6 +58,87 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
     assert!(out.is_none(), "unknown ecosystem must short-circuit to None");
 }
 
+/// `dispatch_fixup` cargo path with a `patched` entry that points
+/// at a file that doesn't exist on disk exercises the
+/// `sha256_file` error arm inside `update_entries`
+/// (cargo.rs:131-133). In the apply-CLI flow this is race-only
+/// (apply atomically wrote the file before dispatch_fixup is
+/// called), so direct invocation is the only way to drive it
+/// from outside the engine.
+///
+/// The setup: a valid `.cargo-checksum.json` on disk + a `patched`
+/// entry naming a file that doesn't exist. cargo::fixup parses the
+/// checksum, then `update_entries` walks `patched`, calls
+/// `sha256_file(on_disk)`, and the open fails with NotFound. The
+/// `.map_err(|source| SidecarError::Io { ... })?` wraps it; the
+/// dispatcher returns `Err(SidecarError::Io)`.
+#[cfg(feature = "cargo")]
+#[tokio::test]
+async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
+    use socket_patch_core::patch::sidecars::SidecarError;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path();
+    // Valid checksum so cargo::fixup gets past the parse step.
+    std::fs::write(
+        pkg.join(".cargo-checksum.json"),
+        r#"{"files":{"a.txt":"deadbeef"},"package":"00"}"#,
+    )
+    .unwrap();
+    // Note: we DO NOT create "missing-on-disk.txt" — that's
+    // exactly the condition that fires the sha256_file Err arm.
+
+    let result = dispatch_fixup(
+        "pkg:cargo/anything@1.0.0",
+        pkg,
+        &["package/missing-on-disk.txt".to_string()],
+        &HashMap::new(),
+    )
+    .await;
+
+    let err = result.expect_err("missing file in patched list must surface as Err");
+    match err {
+        SidecarError::Io { path, .. } => {
+            assert!(
+                path.contains("missing-on-disk.txt"),
+                "Io error path must reference the missing file; got {path:?}"
+            );
+        }
+        other => panic!("expected SidecarError::Io, got {other:?}"),
+    }
+}
+
+/// `dispatch_fixup` against a non-existent `pkg_path` exercises
+/// the nuget side: `remove_file(.nupkg.metadata)` returns NotFound
+/// (already covered by the success-path tests), then
+/// `has_signed_marker` runs and its `read_dir(pkg_path)` ALSO
+/// fails — non-existent dir hits the `Err(_) => return false`
+/// fallback at nuget.rs:86. The fixup then returns `Ok(None)`.
+///
+/// Together with the no-metadata + signed-marker tests this nails
+/// down every branch in `has_signed_marker`'s setup.
+#[cfg(feature = "nuget")]
+#[tokio::test]
+async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let absent = tmp.path().join("does-not-exist");
+
+    let out = dispatch_fixup(
+        "pkg:nuget/Anything@1.0.0",
+        &absent,
+        &["package/file.txt".to_string()],
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    // No metadata removed (NotFound), no signed marker found
+    // (read_dir failed → false), advisory absent → Ok(None).
+    assert!(
+        out.is_none(),
+        "non-existent pkg_path must yield no sidecar record"
+    );
+}
+
 // ── cow.rs guards ─────────────────────────────────────────────────────
 
 /// `break_hardlink_if_needed` on a path that doesn't exist returns
@@ -132,39 +213,100 @@ async fn cow_lstat_permission_denied_propagates_io_error() {
     );
 }
 
-/// `break_hardlink_if_needed` failure-cleanup arm: when the rename
-/// step inside `write_via_stage_rename` fails, the function must
-/// remove the just-written stage file before propagating the error.
-/// Covers `cow.rs:116, 119, 120`.
+/// `break_hardlink_if_needed` failure-cleanup arm (cow.rs:116-120):
+/// when `rename(stage, path)` inside `write_via_stage_rename`
+/// fails, the function must `remove_file(stage)` before
+/// propagating the error so we don't leak a `.socket-cow-…`
+/// turd in the package directory.
 ///
-/// To trigger rename failure cleanly: pre-create a directory at the
-/// target path. `rename(stage_file, existing_directory)` fails on
-/// every Unix because POSIX forbids renaming a regular file onto a
-/// non-empty directory (and even an empty one in most kernels).
+/// macOS-only: we use BSD-style `chflags uchg <path>` to set the
+/// user-immutable flag on the cow target. The kernel then refuses
+/// `rename(stage, target)` with EPERM even though the user owns
+/// the file — the cow code's lstat/read/remove flow upstream
+/// works fine (reads succeed on immutable files, hardlink creation
+/// doesn't touch them), but the final stage→target rename hits the
+/// kernel's immutable-bit refusal. After the test, we clear the
+/// flag so tempdir cleanup can recurse.
 ///
-/// We bypass the `if nlink > 1` branch of cow by going through the
-/// symlink branch instead: stage a symlink, then `chmod 0000` the
-/// target directory below the symlink so the read-through works
-/// but the eventual rename target is "the symlink path, which is
-/// now a directory" — actually let's take a simpler route. We
-/// stage a symlink that resolves to a regular file (so cow takes
-/// the symlink branch), then replace the symlink path itself with
-/// a directory just before the rename hits. Since cow does
-/// `tokio::fs::remove_file(path)` before staging, the directory
-/// would be removed by remove_file (which fails on a directory!).
-///
-/// Simpler: stage a hardlinked file, then between the nlink check
-/// and the rename, swap `path` to be a directory. We can't
-/// intervene mid-flight in async land, so this test is currently
-/// unreachable without a behavior toggle.
-///
-/// Skip with a `#[ignore]` until we expose a test seam — see
-/// follow-up in the commit message.
-#[cfg(unix)]
+/// Linux's analogue is `chattr +i`, but that requires CAP_LINUX_IMMUTABLE
+/// (root in most setups), so the Linux variant lives outside the
+/// integration suite. On macOS dev/CI uid=0 also bypasses uchg, so
+/// skip there too.
+#[cfg(target_os = "macos")]
 #[tokio::test]
-#[ignore = "rename-failure cleanup arm needs a test seam; lib unit tests already cover the write_via_stage_rename function in isolation via cow's tests module"]
 async fn cow_rename_failure_runs_stage_cleanup() {
-    // Placeholder for the seam-based test. Documented here so the
-    // reason the lines remain uncovered from integration is visible
-    // alongside the other cow tests.
+    use std::os::unix::fs::MetadataExt;
+    use std::process::Command;
+
+    if Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: root bypasses chflags uchg restrictions");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("file.txt");
+    std::fs::write(&target, b"original").unwrap();
+
+    // Create a hardlink so cow takes the nlink>1 branch (which
+    // calls write_via_stage_rename without first remove_file'ing
+    // the target — exactly the rename-collision-into-target
+    // shape we want).
+    let link = tmp.path().join("hardlink.txt");
+    std::fs::hard_link(&target, &link).unwrap();
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().nlink(),
+        2,
+        "test setup: target must have nlink=2 to drive cow's hardlink branch"
+    );
+
+    // Make `target` immutable so the final rename(stage, target)
+    // fails. `chflags` is the only way to set BSD file flags from
+    // the shell — there's no portable Rust API.
+    let chflags_status = Command::new("chflags")
+        .arg("uchg")
+        .arg(&target)
+        .status()
+        .expect("chflags binary must exist on macOS");
+    assert!(
+        chflags_status.success(),
+        "chflags uchg must succeed for a file we own"
+    );
+
+    let cow_result = break_hardlink_if_needed(&target).await;
+
+    // Restore the flag so tempdir cleanup can unlink the file.
+    let _ = Command::new("chflags").arg("nouchg").arg(&target).status();
+
+    // The cow attempt itself returned the rename error — that's the
+    // contract: when stage commit fails, the caller learns of the
+    // failure rather than silently succeeding on a half-state.
+    let err = cow_result.expect_err("immutable target must cause rename failure");
+    assert_ne!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "expected EPERM-class error, got {err:?}"
+    );
+
+    // The cleanup arm (cow.rs:117-119) ran: no `.socket-cow-…`
+    // file should be left behind in the package directory.
+    let leftover_stages: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".socket-cow-")
+        })
+        .collect();
+    assert!(
+        leftover_stages.is_empty(),
+        "stage cleanup must remove all .socket-cow-* turds; found {leftover_stages:?}"
+    );
 }
