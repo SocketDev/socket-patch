@@ -42,6 +42,19 @@ fn has_python3() -> bool {
         .unwrap_or(false)
 }
 
+/// `install_six` + `find_site_packages` assume a Unix-style venv layout
+/// (`bin/pip`, `lib/pythonX.Y/site-packages/`). On Windows the layout is
+/// `Scripts\pip.exe` + `Lib\site-packages\`. Rather than fork the helpers
+/// per platform we skip the whole file on Windows — the same coverage is
+/// available via the Linux test runner and the docker_e2e_pypi suite.
+fn skip_unsupported_platform() -> bool {
+    if cfg!(windows) {
+        eprintln!("skipping: in-process pypi tests assume a Unix venv layout");
+        return true;
+    }
+    false
+}
+
 /// Install the test package in a venv inside `tmp`. Returns the path
 /// to the installed `six.py` file.
 fn install_six(tmp: &Path) -> PathBuf {
@@ -164,6 +177,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
+    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -227,6 +241,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
+    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -302,6 +317,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
+    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -354,6 +370,7 @@ async fn pypi_crawler_finds_real_installed_six() {
         println!("SKIP: python3 not on PATH");
         return;
     }
+    if skip_unsupported_platform() { return; }
     let tmp = tempfile::tempdir().expect("tempdir");
     let _ = install_six(tmp.path());
 
