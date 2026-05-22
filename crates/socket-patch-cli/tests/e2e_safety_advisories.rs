@@ -394,6 +394,98 @@ fn nuget_apply_deletes_metadata_and_records_files() {
     );
 }
 
+/// NuGet `has_signed_marker` non-UTF8 filename skip: dropping a
+/// file with a non-UTF8 name into the package directory exercises
+/// the `entry.file_name().to_str()` None arm of
+/// `has_signed_marker`'s iteration (line 93). The fixup then
+/// continues — the sha512 marker isn't present, no advisory; the
+/// `.nupkg.metadata` deletion still fires because we stage it too.
+///
+/// Linux-only (`OsStr::from_bytes` is Unix-gated; macOS HFS+/APFS
+/// also accept arbitrary byte sequences in filenames). Falls back
+/// to a portable shape on other Unices where the filesystem
+/// rejects non-UTF8 names.
+#[cfg(all(unix, feature = "nuget"))]
+#[test]
+fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let packages = cwd.join("nuget-packages");
+    let pkg_dir = packages.join("newtonsoft.json").join("13.0.3");
+    std::fs::create_dir_all(pkg_dir.join("lib")).unwrap();
+    std::fs::write(
+        pkg_dir.join(".nupkg.metadata"),
+        r#"{"contentHash":"deadbeef"}"#,
+    )
+    .unwrap();
+    // Drop a file with a non-UTF8 name into the package dir. The
+    // sidecar's `has_signed_marker` iteration calls
+    // `entry.file_name().to_str()` on each entry; this one returns
+    // None and the iteration skips past it (covering line 93 of
+    // nuget.rs).
+    //
+    // APFS/HFS+/ext4 all accept arbitrary byte sequences in
+    // filenames; some networked filesystems may reject. If the
+    // filesystem rejects, skip — the iteration arm is exercised on
+    // the runners where it can run.
+    let bad_name = OsStr::from_bytes(&[0xff, 0xfe, b'-', b'b', b'a', b'd']);
+    let bad_path = pkg_dir.join(bad_name);
+    if std::fs::write(&bad_path, b"binary").is_err() {
+        eprintln!("SKIP: filesystem rejects non-UTF8 filenames");
+        return;
+    }
+
+    let target = pkg_dir.join("payload.txt");
+    let original = b"hello\n";
+    std::fs::write(&target, original).unwrap();
+    let patched = b"hello patched\n";
+    let before = git_sha256(original);
+    let after = git_sha256(patched);
+
+    let socket_dir = cwd.join(".socket");
+    write_minimal_manifest(
+        &socket_dir,
+        "pkg:nuget/Newtonsoft.Json@13.0.3",
+        "20000007-0000-4007-8007-000000000007",
+        &[PatchEntry {
+            file_name: "package/payload.txt",
+            before_hash: &before,
+            after_hash: &after,
+        }],
+    );
+    write_blob(&socket_dir, &after, patched);
+
+    let env = apply_and_parse(
+        cwd,
+        &packages,
+        &[
+            ("NUGET_PACKAGES", packages.to_str().unwrap()),
+            ("SOCKET_EXPERIMENTAL_NUGET", "1"),
+        ],
+    );
+
+    // Patch landed and .nupkg.metadata removal succeeded; the
+    // non-UTF8 file didn't trip the sidecar (the implicit-skip arm
+    // is what we're locking in).
+    assert_eq!(std::fs::read(&target).unwrap(), patched);
+    assert!(!pkg_dir.join(".nupkg.metadata").exists());
+
+    let record = find_sidecar_record(&env, "nuget");
+    let files = record["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "metadata deletion expected");
+    assert_eq!(files[0]["path"], ".nupkg.metadata");
+    // No advisory — the non-UTF8 file is NOT a `.nupkg.sha512`
+    // marker (its name isn't even valid UTF-8), so the signed-
+    // package branch stays cold.
+    assert!(
+        record.get("advisory").is_none() || record["advisory"].is_null(),
+        "non-UTF8 file must not trigger the signed-marker advisory; got {record}"
+    );
+}
+
 /// NuGet sidecar I/O-error boundary: when `.nupkg.metadata` exists
 /// as a *directory* (not a file), `tokio::fs::remove_file` fails
 /// with a non-NotFound error and `nuget::fixup` returns
