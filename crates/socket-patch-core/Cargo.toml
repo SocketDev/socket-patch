@@ -22,6 +22,8 @@ once_cell = { workspace = true }
 qbsdiff = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
+fs2 = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

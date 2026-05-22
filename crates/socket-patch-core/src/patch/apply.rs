@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
+use crate::patch::cow::break_hardlink_if_needed;
 use crate::patch::diff::apply_diff;
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_filtered;
@@ -91,6 +92,15 @@ pub struct ApplyResult {
     /// populated for files in `files_patched`.
     pub applied_via: HashMap<String, AppliedVia>,
     pub error: Option<String>,
+    /// Ecosystem sidecar files that were rewritten or deleted as part
+    /// of this apply (e.g. `.cargo-checksum.json`, `.nupkg.metadata`).
+    /// Paths are relative to `pkg_path`. Empty when no sidecar
+    /// applied or when the ecosystem only emits an advisory.
+    pub sidecars_updated: Vec<String>,
+    /// One-line advisory for the operator about post-apply tooling
+    /// behavior (e.g. "PyPI: pip check may flag RECORD inconsistency").
+    /// None when no advisory applies.
+    pub sidecar_advisory: Option<String>,
 }
 
 /// Normalize file path by removing the "package/" prefix if present.
@@ -232,9 +242,26 @@ pub async fn apply_file_patch(
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
 
-    // Snapshot pre-patch metadata so we can restore mode + ownership
-    // after the write. `None` means the file is being created by this
-    // patch — that path is handled below in the platform blocks.
+    // Hash-check the in-memory content BEFORE touching disk. Removes
+    // the prior "wrote bytes, then post-write verify failed, can't
+    // restore" failure mode — if the upstream blob is corrupt we
+    // error out before any disk write.
+    let content_hash = compute_git_sha256_from_bytes(patched_content);
+    if content_hash != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Hash verification failed before patch. Expected: {}, Got: {}",
+                expected_hash, content_hash
+            ),
+        ));
+    }
+
+    // Snapshot pre-patch metadata so `restore_file_permissions` can
+    // re-apply the original mode + uid/gid to the post-rename inode.
+    // `None` means the file is being created by this patch — the
+    // new-file branch of restore_file_permissions inherits from the
+    // parent dir.
     let existing_meta = tokio::fs::metadata(&filepath).await.ok();
 
     // Create parent directories if needed (e.g., new files added by a patch).
@@ -242,52 +269,78 @@ pub async fn apply_file_patch(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Temporarily grant owner-write if the existing file is read-only,
-    // so the upcoming overwrite succeeds. The restore step below puts
-    // the original mode back unconditionally — re-applying the exact
-    // mode is idempotent, so we don't need to track whether we bumped it.
-    #[cfg(unix)]
-    if let Some(meta) = existing_meta.as_ref() {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = meta.permissions();
-        if perms.readonly() {
-            let mode = perms.mode();
-            let mut new_perms = perms.clone();
-            new_perms.set_mode(mode | 0o200);
-            tokio::fs::set_permissions(&filepath, new_perms).await?;
-        }
-    }
-    #[cfg(windows)]
-    if let Some(meta) = existing_meta.as_ref() {
-        let perms = meta.permissions();
-        if perms.readonly() {
-            let mut new_perms = perms.clone();
-            new_perms.set_readonly(false);
-            tokio::fs::set_permissions(&filepath, new_perms).await?;
-        }
-    }
+    // Copy-on-write defense against pnpm / bazel / nix shared inodes.
+    // If `filepath` is a symlink into a content store, or a hardlink
+    // shared with other projects, give this project a private inode
+    // before we mutate. No-op on regular private files (single
+    // syscall). See `patch::cow`.
+    break_hardlink_if_needed(&filepath).await?;
 
-    // Write the patched content.
-    tokio::fs::write(&filepath, patched_content).await?;
+    // Atomic write: stage in the parent directory, fsync, rename onto
+    // the target. POSIX `rename(2)` is atomic — observers see either
+    // the old bytes or the new bytes, never a truncated half-write.
+    //
+    // The stage file is created with the user's umask defaults
+    // (typically 0o644) — that's how we sidestep the "existing file
+    // is 0o444" problem the old in-place write had: we rename a fresh
+    // user-writable inode over the target instead of trying to open
+    // a read-only file for write. `restore_file_permissions` then
+    // re-applies the pre-patch mode + uid/gid to the new inode.
+    write_atomic(&filepath, patched_content).await?;
 
-    // Restore (or set) the final permissions. On Unix this includes
-    // chown back to the pre-patch uid/gid (or to the parent dir's
-    // uid/gid for new files); on Windows we only manage the readonly
-    // attribute.
+    // Restore (or set) the final permissions on the post-rename inode.
+    // On Unix this includes chown back to the pre-patch uid/gid (or
+    // to the parent dir's uid/gid for new files); on Windows we only
+    // manage the readonly attribute.
     restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
 
-    // Verify the hash after writing.
-    let verify_hash = compute_file_git_sha256(&filepath).await?;
-    if verify_hash != expected_hash {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Hash verification failed after patch. Expected: {}, Got: {}",
-                expected_hash, verify_hash
-            ),
-        ));
-    }
+    Ok(())
+}
 
+/// Write `content` to `target` atomically via stage + rename.
+///
+/// Two-phase commit:
+///   1. Create `<parent>/.socket-stage-<filename>-<uuid>` (leading dot
+///      so editor globs ignore it; uuid suffix so concurrent callers
+///      never collide — defense in depth on top of the apply lock).
+///   2. `write_all` the content, then `sync_all()` so the bytes are
+///      durably on disk before the rename.
+///   3. `rename(stage, target)` — atomic on POSIX, best-effort on
+///      Windows. On failure unlink the stage so we don't leave a
+///      dotfile behind in the package directory.
+async fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "anon".to_string());
+    let stage = parent.join(format!(
+        ".socket-stage-{}-{}",
+        stem,
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, target).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -403,6 +456,8 @@ pub async fn apply_package_patch(
         files_patched: Vec::new(),
         applied_via: HashMap::new(),
         error: None,
+        sidecars_updated: Vec::new(),
+        sidecar_advisory: None,
     };
 
     // First, verify all files
@@ -570,6 +625,36 @@ pub async fn apply_package_patch(
         result
             .applied_via
             .insert(file_name.clone(), AppliedVia::Blob);
+    }
+
+    // Ecosystem sidecar fixup. Best-effort: a failing sidecar does
+    // NOT undo the patch (the bytes were committed atomically via
+    // stage+rename; nothing to roll back). Errors surface as an
+    // advisory string so the CLI envelope can carry them under
+    // `event.details`.
+    if !result.files_patched.is_empty() {
+        match crate::patch::sidecars::dispatch_fixup(
+            package_key,
+            pkg_path,
+            &result.files_patched,
+            files,
+        )
+        .await
+        {
+            Ok(crate::patch::sidecars::SidecarOutcome::Updated(touched)) => {
+                result.sidecars_updated = touched;
+            }
+            Ok(crate::patch::sidecars::SidecarOutcome::Advisory(msg)) => {
+                result.sidecar_advisory = Some(msg);
+            }
+            Ok(crate::patch::sidecars::SidecarOutcome::None) => {}
+            Err(e) => {
+                result.sidecar_advisory = Some(format!(
+                    "sidecar fixup failed (patch still applied): {}",
+                    e
+                ));
+            }
+        }
     }
 
     result.success = true;
@@ -829,6 +914,65 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Hash verification failed"));
+    }
+
+    /// Atomic-write contract: if the apply errors mid-flight (here:
+    /// in-memory hash mismatch, which fires BEFORE any disk write),
+    /// the target file is byte-identical to its pre-call state AND
+    /// no `.socket-stage-*` file is left in the parent directory.
+    #[tokio::test]
+    async fn test_apply_file_patch_hash_mismatch_leaves_original_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.js");
+        tokio::fs::write(&path, b"original").await.unwrap();
+
+        let result = apply_file_patch(dir.path(), "index.js", b"patched", "deadbeef").await;
+        assert!(result.is_err());
+
+        // Original content untouched.
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+
+        // No stage litter (stage files are named `.socket-stage-*`).
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "stage file leaked into parent dir: {name}"
+            );
+        }
+    }
+
+    /// Apply against a hardlink (the pnpm content-store case) must
+    /// only mutate this project's view. The sibling link — which
+    /// represents another project's `node_modules/<pkg>` or the
+    /// global store entry — must keep the original bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_does_not_propagate_to_hardlinked_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project-b").join("foo.js");
+        let store = dir.path().join("store-a.js");
+        tokio::fs::create_dir_all(project.parent().unwrap())
+            .await
+            .unwrap();
+
+        // Pre-existing store entry; both project and store point at
+        // the same inode (this is what pnpm produces with
+        // `package-import-method=hardlink`).
+        tokio::fs::write(&store, b"original").await.unwrap();
+        tokio::fs::hard_link(&store, &project).await.unwrap();
+
+        let patched = b"patched";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+        apply_file_patch(project.parent().unwrap(), "foo.js", patched, &patched_hash)
+            .await
+            .unwrap();
+
+        // Project sees the patched bytes.
+        assert_eq!(tokio::fs::read(&project).await.unwrap(), b"patched");
+        // Store entry is untouched — the headline pnpm invariant.
+        assert_eq!(tokio::fs::read(&store).await.unwrap(), b"original");
     }
 
     /// Existing read-only file: temporarily made writable for the
