@@ -75,9 +75,18 @@ fn write_project(root: &Path) {
 /// Recursive, stable hash of every regular file under `dir`. Combines
 /// each file's relative path and bytes into a single SHA-256 so any
 /// change — adding, removing, or rewriting a file — flips the digest.
+///
+/// Excludes `apply.lock` (advisory lock file created by `apply` /
+/// `rollback` / `repair` / `remove`). That file is deliberate
+/// ephemeral session state — not patch content — and persists by
+/// design so subsequent runs can re-flock the same inode without a
+/// create race. The "apply is read-only against .socket/" invariant
+/// is about the patch payload (manifest, blobs, diffs, packages),
+/// not session metadata.
 fn dir_hash(dir: &Path) -> String {
     let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     collect_files(dir, dir, &mut files);
+    files.retain(|(rel, _)| rel.file_name().and_then(|n| n.to_str()) != Some("apply.lock"));
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (rel, bytes) in files {
