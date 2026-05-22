@@ -136,21 +136,19 @@ async fn update_entries(
     Ok(())
 }
 
-/// Compute the lowercase-hex SHA256 of the file at `path`. Streamed —
-/// no in-memory copy of the whole file. (Cargo source files are
-/// usually small, but defensive.)
+/// Compute the lowercase-hex SHA256 of the file at `path`.
+///
+/// Loads the whole file into memory and hashes in one go.
+/// Cargo source files are bounded (the registry rejects crates
+/// whose `.crate` tarball exceeds ~10MB unpacked), so a single
+/// `read()` is cheaper than the streaming-loop dance and
+/// collapses the open + read into one `?` arm — which the
+/// `dispatch_fixup_cargo_sha256_file_failure_arm` integration
+/// test drives via a non-existent path.
 async fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let bytes = tokio::fs::read(path).await?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    use tokio::io::AsyncReadExt;
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
 }
 

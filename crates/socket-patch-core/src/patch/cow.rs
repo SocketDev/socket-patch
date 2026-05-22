@@ -94,7 +94,17 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
 /// `path`. Cross-FS-safe because the stage lives in the same
 /// directory as the target, so `rename(2)` is intra-filesystem.
 async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // Preconditions: cow callers always pass a real file path
+    // inside a package directory, so `path.parent()` and
+    // `path.file_name()` are guaranteed `Some`. The previous
+    // `unwrap_or_else` defaults only fired on `path == "/"`,
+    // which cow can never reach (lstat on "/" returns a directory,
+    // and the hardlink branch's `read("/")` errors out long
+    // before we get here). Using `.expect()` documents the
+    // invariant and eliminates the dead defensive default.
+    let parent = path
+        .parent()
+        .expect("cow stage path always has a parent — callers pass package-internal files");
     // Stage filename: leading dot so editors / globs don't pick it
     // up as a real file; uuid suffix so concurrent calls don't
     // collide. (The apply lock makes that practically impossible,
@@ -102,7 +112,7 @@ async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()
     let stem = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "anon".to_string());
+        .expect("cow stage path always has a file_name — callers pass package-internal files");
     let stage: PathBuf = parent.join(format!(
         ".socket-cow-{}-{}",
         stem,
