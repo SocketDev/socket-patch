@@ -202,6 +202,26 @@ pub async fn verify_file_patch(
 }
 
 /// Apply a patch to a single file.
+///
+/// **Permission policy** (per the user-visible contract — patched
+/// files must look identical to pre-patch perms-wise):
+///
+/// 1. **Existing file**. Snapshot mode + owner + group before writing.
+///    If the file is read-only, temporarily grant owner-write so the
+///    overwrite succeeds (e.g. Go's module cache marks sources read-only).
+///    After the write, restore the **exact** original mode and chown
+///    back to the pre-patch uid/gid. Owners stay put even when
+///    `tokio::fs::write` truncates and rewrites.
+///
+/// 2. **New file** (created by the patch). Inherit owner + group from
+///    the parent directory and force mode `0o444` (read-only for all).
+///    Mirrors how an unpacked tarball treats new package files —
+///    consumers expect package sources to be read-only by default.
+///
+/// On Windows there is no `uid`/`gid`, so the owner/group step is a
+/// no-op; the read-only attribute is preserved on existing files and
+/// set on new files to honor the read-only-by-default policy.
+///
 /// Writes the patched content and verifies the resulting hash.
 pub async fn apply_file_patch(
     pkg_path: &Path,
@@ -212,28 +232,51 @@ pub async fn apply_file_patch(
     let normalized = normalize_file_path(file_name);
     let filepath = pkg_path.join(normalized);
 
-    // Create parent directories if needed (e.g., new files added by a patch)
+    // Snapshot pre-patch metadata so we can restore mode + ownership
+    // after the write. `None` means the file is being created by this
+    // patch — that path is handled below in the platform blocks.
+    let existing_meta = tokio::fs::metadata(&filepath).await.ok();
+
+    // Create parent directories if needed (e.g., new files added by a patch).
     if let Some(parent) = filepath.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Make file writable if it exists and is read-only (e.g. Go module cache)
+    // Temporarily grant owner-write if the existing file is read-only,
+    // so the upcoming overwrite succeeds. The restore step below puts
+    // the original mode back unconditionally — re-applying the exact
+    // mode is idempotent, so we don't need to track whether we bumped it.
     #[cfg(unix)]
-    if let Ok(meta) = tokio::fs::metadata(&filepath).await {
+    if let Some(meta) = existing_meta.as_ref() {
         use std::os::unix::fs::PermissionsExt;
         let perms = meta.permissions();
         if perms.readonly() {
             let mode = perms.mode();
-            let mut new_perms = perms;
+            let mut new_perms = perms.clone();
             new_perms.set_mode(mode | 0o200);
             tokio::fs::set_permissions(&filepath, new_perms).await?;
         }
     }
+    #[cfg(windows)]
+    if let Some(meta) = existing_meta.as_ref() {
+        let perms = meta.permissions();
+        if perms.readonly() {
+            let mut new_perms = perms.clone();
+            new_perms.set_readonly(false);
+            tokio::fs::set_permissions(&filepath, new_perms).await?;
+        }
+    }
 
-    // Write the patched content
+    // Write the patched content.
     tokio::fs::write(&filepath, patched_content).await?;
 
-    // Verify the hash after writing
+    // Restore (or set) the final permissions. On Unix this includes
+    // chown back to the pre-patch uid/gid (or to the parent dir's
+    // uid/gid for new files); on Windows we only manage the readonly
+    // attribute.
+    restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
+
+    // Verify the hash after writing.
     let verify_hash = compute_file_git_sha256(&filepath).await?;
     if verify_hash != expected_hash {
         return Err(std::io::Error::new(
@@ -246,6 +289,89 @@ pub async fn apply_file_patch(
     }
 
     Ok(())
+}
+
+/// Restore the post-write permission state on `filepath`.
+///
+/// * `pre_patch` = `Some(meta)` → the file existed before the patch;
+///   restore its exact mode + uid/gid.
+/// * `pre_patch` = `None` → the file is new; inherit owner/group from
+///   the parent dir and set mode `0o444`.
+///
+/// Split out of `apply_file_patch` to keep that function readable and
+/// to make the platform branching unit-testable.
+async fn restore_file_permissions(
+    filepath: &Path,
+    pre_patch: Option<&std::fs::Metadata>,
+) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        match pre_patch {
+            Some(meta) => {
+                // Existing file: re-apply the original mode + ownership.
+                let restored = std::fs::Permissions::from_mode(meta.mode());
+                tokio::fs::set_permissions(filepath, restored).await?;
+                let uid = meta.uid();
+                let gid = meta.gid();
+                chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid)).await?;
+            }
+            None => {
+                // New file. Inherit owner/group from the parent dir.
+                if let Some(parent) = filepath.parent() {
+                    if let Ok(parent_meta) = tokio::fs::metadata(parent).await {
+                        let uid = parent_meta.uid();
+                        let gid = parent_meta.gid();
+                        chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid))
+                            .await?;
+                    }
+                }
+                // Default new-file mode: read-only for all.
+                let readonly = std::fs::Permissions::from_mode(0o444);
+                tokio::fs::set_permissions(filepath, readonly).await?;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        match pre_patch {
+            Some(meta) => {
+                // Re-apply the pre-patch readonly state; tokio::fs::write
+                // does not preserve it across the truncate+rewrite.
+                let perms = meta.permissions();
+                tokio::fs::set_permissions(filepath, perms).await?;
+            }
+            None => {
+                // New file: read-only by default.
+                if let Ok(meta) = tokio::fs::metadata(filepath).await {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(true);
+                    tokio::fs::set_permissions(filepath, perms).await?;
+                }
+            }
+        }
+    }
+
+    let _ = filepath;
+    let _ = pre_patch;
+    Ok(())
+}
+
+/// Synchronous `chown` wrapped to run on the blocking pool so we don't
+/// stall the async runtime. `std::os::unix::fs::chown` is a thin
+/// syscall wrapper — fast in the no-op case (uid/gid already match)
+/// but still nominally blocking.
+#[cfg(unix)]
+async fn chown_blocking(
+    path: std::path::PathBuf,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), std::io::Error> {
+    tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&path, uid, gid))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 /// Verify and apply patches for a single package.
@@ -703,6 +829,129 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Hash verification failed"));
+    }
+
+    /// Existing read-only file: temporarily made writable for the
+    /// overwrite, restored to read-only afterward, content updated.
+    /// Mirrors the Go module cache scenario.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_preserves_readonly_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.js");
+        let original = b"original";
+        let patched = b"patched content";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(&path, original).await.unwrap();
+        // 0o444 = r--r--r--. Owner has no write bit.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "index.js", patched, &patched_hash)
+            .await
+            .unwrap();
+
+        // Content updated.
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, patched);
+        // Mode preserved bit-for-bit.
+        let mode_after = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+            & 0o7777;
+        assert_eq!(
+            mode_after, 0o444,
+            "mode must be restored to the pre-patch value after the write"
+        );
+    }
+
+    /// Non-default mode (e.g. 0o755 for an executable script) survives
+    /// the patch round-trip unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_preserves_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bin.sh");
+        let original = b"#!/bin/sh\necho old\n";
+        let patched = b"#!/bin/sh\necho new\n";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(&path, original).await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "bin.sh", patched, &patched_hash)
+            .await
+            .unwrap();
+
+        let mode_after = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+            & 0o7777;
+        assert_eq!(mode_after, 0o755);
+    }
+
+    /// New file created by the patch: default mode is read-only (0o444)
+    /// and the parent directory's uid/gid get inherited (the uid/gid
+    /// check is a smoke test — running as a regular user the new file
+    /// would already inherit the user's uid, but the test still locks
+    /// in that the new file's uid matches the parent's, which is what
+    /// the chown call enforces).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_new_file_is_readonly_and_inherits_dir_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = "new-dir/new.js";
+        let patched = b"brand new file content\n";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        // File does not yet exist — this is the new-file path.
+        apply_file_patch(dir.path(), nested, patched, &patched_hash)
+            .await
+            .unwrap();
+
+        let path = dir.path().join(nested);
+        // Default new-file mode is 0o444.
+        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+            & 0o7777;
+        assert_eq!(mode, 0o444, "new files default to read-only");
+
+        // uid/gid inherited from the parent directory.
+        let parent_meta = tokio::fs::metadata(path.parent().unwrap()).await.unwrap();
+        let file_meta = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(file_meta.uid(), parent_meta.uid());
+        assert_eq!(file_meta.gid(), parent_meta.gid());
+    }
+
+    /// Existing patched file's uid/gid survive the round-trip. We can
+    /// only verify "uid stays the same" without root, but that's
+    /// enough to catch a regression that accidentally clobbered ownership.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_preserves_uid_gid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.js");
+        let original = b"orig";
+        let patched = b"new";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(&path, original).await.unwrap();
+        let pre = tokio::fs::metadata(&path).await.unwrap();
+
+        apply_file_patch(dir.path(), "index.js", patched, &patched_hash)
+            .await
+            .unwrap();
+
+        let post = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(pre.uid(), post.uid());
+        assert_eq!(pre.gid(), post.gid());
     }
 
     #[tokio::test]
