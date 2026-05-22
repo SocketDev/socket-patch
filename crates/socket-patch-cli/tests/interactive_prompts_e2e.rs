@@ -17,9 +17,27 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
-/// Spawn the socket-patch binary inside a PTY, send `input` after a
-/// short delay, then collect output for up to `timeout`. Returns
-/// `(exit_code, output)`.
+/// Spawn the socket-patch binary inside a PTY, send `input`, and
+/// collect all output until the child exits. Returns `(exit_code,
+/// output)`. The timeout is enforced via a watchdog thread that
+/// kills the child if it doesn't exit in time.
+///
+/// Three pieces compose:
+///   * **Reader thread**: `read_to_end` on the master side.
+///     Blocks until EOF, which the kernel sends once both the
+///     slave fd (dropped here) and the child's last open fd are
+///     closed.
+///   * **Watchdog thread**: sleeps `timeout` then sends SIGKILL
+///     via a cloned ChildKiller. Detaches; no join needed since
+///     the killer is idempotent and the child either exits
+///     normally first (kill is a no-op) or is killed (we proceed).
+///   * **Main thread**: writes input, closes the writer (sends
+///     EOF on the child's stdin), blocks on `child.wait()`, then
+///     joins the reader.
+///
+/// No polling loops, no mpsc channels, no fixed-duration sleeps
+/// before sending input — the PTY buffers the input until the
+/// child reads it, so timing-coupling isn't needed.
 fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -42,56 +60,49 @@ fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32
         .slave
         .spawn_command(cmd)
         .expect("spawn socket-patch in PTY");
-    // Drop the slave so it doesn't keep the file descriptor open after
-    // the child exits — without this the reader on the master side
-    // blocks forever waiting for EOF.
+    // Drop the slave so the master sees EOF once the child closes its
+    // own copy of the slave fd on exit.
     drop(pair.slave);
 
-    // Reader thread: drain the master output continuously until EOF.
+    // Reader: a single `read_to_end` is sufficient — it blocks until
+    // EOF, which arrives when (a) the master is dropped (we do that
+    // below) or (b) the child has exited and its end of the slave is
+    // closed. The previous design used a chunked read+mpsc loop
+    // because it interleaved with a try_wait poll; the simplified
+    // design serializes wait → drop master → read_to_end joins.
     let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let reader_handle = std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        buf
     });
 
-    // Writer: send the input after a short pause to give the binary
-    // time to render the prompt.
+    // Watchdog: detach a thread that kills the child after `timeout`.
+    // The cloned ChildKiller is independent of the main `child`
+    // handle, so the watchdog can fire without coordinating with the
+    // main thread. If the child exits naturally first, the kill is a
+    // no-op against a dead pid.
+    let mut killer = child.clone_killer();
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        let _ = killer.kill();
+    });
+
+    // Writer: send input then close. PTY buffers absorb the write so
+    // no pre-sleep is needed — dialoguer/rustyline will read it when
+    // their prompt loop polls stdin.
     let mut writer = pair.master.take_writer().expect("take writer");
-    std::thread::sleep(Duration::from_millis(300));
     let _ = writer.write_all(input.as_bytes());
     let _ = writer.flush();
     drop(writer);
 
-    // Wait for child to exit, bounded by `timeout`.
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            break child.wait().expect("wait after kill");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    // Block until the child exits (watchdog enforces the timeout).
+    let status = child.wait().expect("child.wait");
+    // Drop the master so the reader's `read_to_end` sees EOF and
+    // returns.
     drop(pair.master);
-    let _ = reader_handle.join();
 
-    let mut output = Vec::new();
-    while let Ok(chunk) = rx.try_recv() {
-        output.extend(chunk);
-    }
+    let output = reader_handle.join().expect("reader thread join");
     let code = status.exit_code() as i32;
     (code, String::from_utf8_lossy(&output).to_string())
 }

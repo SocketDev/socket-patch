@@ -13,6 +13,13 @@
 //! produce. The Docker e2e tests verify that real installers produce
 //! the same layouts.
 
+// Each test is feature-gated on its ecosystem (e.g. `cfg(feature =
+// "golang")` for the gin tests). With default features (no ecosystems
+// enabled) every test and helper compiles out — quiet the resulting
+// dead-code/unused-import noise so non-feature builds stay warning-
+// clean.
+#![allow(dead_code, unused_imports)]
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -123,6 +130,7 @@ async fn setup_apply_mock(
 // golang
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_install_apply_patches_file() {
@@ -174,6 +182,7 @@ async fn golang_handcrafted_install_apply_patches_file() {
 // maven
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_install_apply_patches_file() {
@@ -236,6 +245,7 @@ async fn maven_handcrafted_install_apply_patches_file() {
 // composer
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn composer_handcrafted_install_apply_patches_file() {
@@ -300,6 +310,7 @@ async fn composer_handcrafted_install_apply_patches_file() {
 // nuget
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_install_apply_patches_file() {
@@ -360,6 +371,7 @@ async fn nuget_handcrafted_install_apply_patches_file() {
 // Discovery-only tests for each handcrafted layout
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_discovery() {
@@ -390,6 +402,7 @@ async fn golang_handcrafted_discovery() {
     std::env::remove_var("GOMODCACHE");
 }
 
+#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_discovery() {
@@ -417,6 +430,7 @@ async fn maven_handcrafted_discovery() {
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
+#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_discovery() {

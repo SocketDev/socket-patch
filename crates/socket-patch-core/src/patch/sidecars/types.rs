@@ -56,15 +56,15 @@ pub struct SidecarFile {
 /// What the fixup did with a sidecar file. Stable snake_case JSON
 /// tag — consumers branch on this without parsing free-form text.
 ///
-/// `Created` is reserved: no current ecosystem produces a created
-/// sidecar, but the variant lives in the enum so future ecosystems
-/// (e.g. a "patched-by" marker) don't require a contract change.
+/// Variants are added only when an ecosystem actually produces them
+/// (rather than reserved up front). Adding a variant is a
+/// non-breaking change to the JSON contract; renaming or removing
+/// one is breaking.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SidecarFileAction {
     Rewritten,
     Deleted,
-    Created,
 }
 
 /// Structured operator advisory. Replaces the previous free-form
@@ -173,7 +173,6 @@ mod tests {
         let cases = [
             (SidecarFileAction::Rewritten, "rewritten"),
             (SidecarFileAction::Deleted, "deleted"),
-            (SidecarFileAction::Created, "created"),
         ];
         for (variant, expected) in cases {
             let v = serde_json::to_value(variant).unwrap();

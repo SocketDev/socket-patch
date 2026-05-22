@@ -49,12 +49,24 @@ pub fn has_command(cmd: &str) -> bool {
 /// environment so apply paths default to the public proxy and tests
 /// don't accidentally exercise authed endpoints.
 pub fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-    let out: Output = Command::new(binary())
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("failed to execute socket-patch binary");
+    run_with_env(cwd, args, &[])
+}
+
+/// `run` + child-only env-var injection. Useful for tests that need
+/// to flip the per-ecosystem runtime gates (`SOCKET_EXPERIMENTAL_NUGET`)
+/// or override discovery roots (`NUGET_PACKAGES`, `GOMODCACHE`) without
+/// touching the parent process's environment — keeps tests parallel-safe.
+pub fn run_with_env(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd).env_remove("SOCKET_API_TOKEN");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out: Output = cmd.output().expect("failed to execute socket-patch binary");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
