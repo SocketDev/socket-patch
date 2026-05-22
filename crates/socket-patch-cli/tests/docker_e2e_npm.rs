@@ -444,9 +444,13 @@ async fn npm_test_infrastructure_smoke() {
     let after_hash = git_sha256(PATCHED_BYTES);
     let server = make_mock_server(&after_hash).await;
     // Just hit one of the mock endpoints to confirm wiremock is up.
+    // Connect via 127.0.0.1, not the server's bound IP — wiremock
+    // binds to 0.0.0.0 (the wildcard), which is a valid bind address
+    // but is NOT a valid destination address on Windows (WSAEADDRNOTAVAIL
+    // / WSA error 10049). Linux/macOS quietly route 0.0.0.0 → loopback;
+    // Windows doesn't.
     let url = format!(
-        "http://{}:{}/v0/orgs/{ORG}/patches/blob/{after_hash}",
-        server.address().ip(),
+        "http://127.0.0.1:{}/v0/orgs/{ORG}/patches/blob/{after_hash}",
         server.address().port()
     );
     let body = reqwest::get(&url)
