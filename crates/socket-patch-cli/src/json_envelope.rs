@@ -96,7 +96,7 @@ impl Envelope {
     /// the "events list must agree with summary counts" invariant so per-
     /// command code can't drift.
     pub fn record(&mut self, event: PatchEvent) {
-        self.summary.bump(event.action, event.bytes.unwrap_or(0));
+        self.summary.bump(event.action);
         self.events.push(event);
     }
 
@@ -142,18 +142,10 @@ pub struct PatchEvent {
     /// many patches at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
-    /// For `action = Updated`: the UUID this patch replaced. None
-    /// otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub old_uuid: Option<String>,
     /// Files touched by an `Applied` / `Verified` / `Removed` event.
     /// Empty for actions that don't operate on files (e.g. `Downloaded`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<PatchEventFile>,
-    /// Byte size relevant to this event — fetched bytes for `Downloaded`,
-    /// reclaimed bytes for `Removed`. None for non-byte-sized actions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
     /// Human-readable explanation for `Skipped` or `Failed` events.
     /// Machine consumers should prefer `error_code` for routing decisions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -183,9 +175,7 @@ impl PatchEvent {
             action,
             purl: Some(purl.into()),
             uuid: None,
-            old_uuid: None,
             files: Vec::new(),
-            bytes: None,
             reason: None,
             error_code: None,
             error: None,
@@ -200,9 +190,7 @@ impl PatchEvent {
             action,
             purl: None,
             uuid: None,
-            old_uuid: None,
             files: Vec::new(),
-            bytes: None,
             reason: None,
             error_code: None,
             error: None,
@@ -215,18 +203,8 @@ impl PatchEvent {
         self
     }
 
-    pub fn with_old_uuid(mut self, old_uuid: impl Into<String>) -> Self {
-        self.old_uuid = Some(old_uuid.into());
-        self
-    }
-
     pub fn with_files(mut self, files: Vec<PatchEventFile>) -> Self {
         self.files = files;
-        self
-    }
-
-    pub fn with_bytes(mut self, bytes: u64) -> Self {
-        self.bytes = Some(bytes);
         self
     }
 
@@ -311,22 +289,6 @@ pub enum PatchAction {
     Verified,
 }
 
-impl PatchAction {
-    /// Stable lowercase tag (matches the JSON serialization).
-    pub fn as_tag(self) -> &'static str {
-        match self {
-            PatchAction::Discovered => "discovered",
-            PatchAction::Downloaded => "downloaded",
-            PatchAction::Applied => "applied",
-            PatchAction::Updated => "updated",
-            PatchAction::Skipped => "skipped",
-            PatchAction::Failed => "failed",
-            PatchAction::Removed => "removed",
-            PatchAction::Verified => "verified",
-        }
-    }
-}
-
 /// Patch-source strategy used to apply a file. Mirrors the existing
 /// `socket_patch_core::patch::apply::AppliedVia` enum, but lives here so
 /// the JSON layer doesn't depend on core internals.
@@ -363,20 +325,6 @@ pub enum Command {
     Setup,
 }
 
-impl Command {
-    pub fn as_tag(self) -> &'static str {
-        match self {
-            Command::Apply => "apply",
-            Command::Rollback => "rollback",
-            Command::Get => "get",
-            Command::Scan => "scan",
-            Command::List => "list",
-            Command::Remove => "remove",
-            Command::Repair => "repair",
-            Command::Setup => "setup",
-        }
-    }
-}
 
 /// Top-level status. Serializes camelCase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -411,28 +359,18 @@ pub struct Summary {
     pub failed: u32,
     pub removed: u32,
     pub verified: u32,
-    /// Sum of `bytes` across `Downloaded` events.
-    pub bytes_downloaded: u64,
-    /// Sum of `bytes` across `Removed` events.
-    pub bytes_freed: u64,
 }
 
 impl Summary {
-    fn bump(&mut self, action: PatchAction, bytes: u64) {
+    fn bump(&mut self, action: PatchAction) {
         match action {
             PatchAction::Discovered => self.discovered += 1,
-            PatchAction::Downloaded => {
-                self.downloaded += 1;
-                self.bytes_downloaded += bytes;
-            }
+            PatchAction::Downloaded => self.downloaded += 1,
             PatchAction::Applied => self.applied += 1,
             PatchAction::Updated => self.updated += 1,
             PatchAction::Skipped => self.skipped += 1,
             PatchAction::Failed => self.failed += 1,
-            PatchAction::Removed => {
-                self.removed += 1;
-                self.bytes_freed += bytes;
-            }
+            PatchAction::Removed => self.removed += 1,
             PatchAction::Verified => self.verified += 1,
         }
     }
@@ -469,7 +407,8 @@ mod tests {
 
     #[test]
     fn action_tags_round_trip() {
-        // Each variant's `as_tag()` must equal its serde representation.
+        // Each variant's serde representation must match the
+        // documented snake_case tag.
         for (action, tag) in [
             (PatchAction::Discovered, "discovered"),
             (PatchAction::Downloaded, "downloaded"),
@@ -480,7 +419,6 @@ mod tests {
             (PatchAction::Removed, "removed"),
             (PatchAction::Verified, "verified"),
         ] {
-            assert_eq!(action.as_tag(), tag);
             let serialized = serde_json::to_string(&action).unwrap();
             assert_eq!(serialized, format!("\"{tag}\""));
         }
@@ -504,9 +442,7 @@ mod tests {
     fn record_keeps_summary_in_sync() {
         let mut env = Envelope::new(Command::Apply);
         env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/foo@1.0.0"));
-        env.record(
-            PatchEvent::new(PatchAction::Downloaded, "pkg:npm/foo@1.0.0").with_bytes(2048),
-        );
+        env.record(PatchEvent::new(PatchAction::Downloaded, "pkg:npm/foo@1.0.0"));
         env.record(
             PatchEvent::new(PatchAction::Skipped, "pkg:npm/bar@2.0.0")
                 .with_reason("already_patched", "Files match afterHash"),
@@ -515,7 +451,6 @@ mod tests {
         assert_eq!(env.summary.applied, 1);
         assert_eq!(env.summary.downloaded, 1);
         assert_eq!(env.summary.skipped, 1);
-        assert_eq!(env.summary.bytes_downloaded, 2048);
         assert_eq!(env.events.len(), 3);
     }
 
@@ -531,17 +466,6 @@ mod tests {
         assert!(!obj.contains_key("error"));
         assert_eq!(obj.get("errorCode").and_then(|v| v.as_str()), Some("package_not_installed"));
         assert_eq!(obj.get("reason").and_then(|v| v.as_str()), Some("no matching package on disk"));
-    }
-
-    #[test]
-    fn updated_event_serializes_old_uuid() {
-        let event = PatchEvent::new(PatchAction::Updated, "pkg:npm/foo@1.0.0")
-            .with_uuid("new-uuid-1111")
-            .with_old_uuid("old-uuid-0000");
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
-        assert_eq!(v["action"], "updated");
-        assert_eq!(v["uuid"], "new-uuid-1111");
-        assert_eq!(v["oldUuid"], "old-uuid-0000");
     }
 
     #[test]
@@ -602,12 +526,11 @@ mod tests {
     fn artifact_event_omits_purl() {
         // GC sweep events aren't scoped to a single PURL.
         let event = PatchEvent::artifact(PatchAction::Removed)
-            .with_bytes(4096)
             .with_reason("orphan_blob", "Blob not referenced by any manifest entry");
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("purl"));
         assert_eq!(obj["action"], "removed");
-        assert_eq!(obj["bytes"], 4096);
+        assert_eq!(obj["errorCode"], "orphan_blob");
     }
 }
