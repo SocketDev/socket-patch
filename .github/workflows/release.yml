@@ -36,6 +36,21 @@ jobs:
             exit 1
           fi
 
+      - name: Check CHANGELOG.md has entry for version
+        run: |
+          VERSION="${{ steps.read.outputs.VERSION }}"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md does not exist at the repository root."
+            exit 1
+          fi
+          # Accept either `## [X.Y.Z]` or `## X.Y.Z` headings, with an
+          # optional trailing space (followed by `— DATE`) or end-of-line.
+          if ! grep -qE "^## \[?${VERSION}\]?( |$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing an entry for version ${VERSION}."
+            echo "::error::Add a heading like \`## [${VERSION}] — $(date +%Y-%m-%d)\` describing the release before re-running."
+            exit 1
+          fi
+
   tag:
     needs: version
     if: ${{ !inputs.dry-run }}
