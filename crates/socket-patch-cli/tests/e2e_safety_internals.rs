@@ -213,6 +213,173 @@ async fn cow_lstat_permission_denied_propagates_io_error() {
     );
 }
 
+/// Symlink branch read-fails-fast (cow.rs:66): when the symlink
+/// target doesn't exist, the read-through propagates NotFound
+/// rather than entering the remove/rewrite dance. Covers the
+/// symlink-branch `?` propagation on the read step.
+#[cfg(unix)]
+#[tokio::test]
+async fn cow_symlink_to_missing_target_propagates_read_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("dangling");
+    let absent = tmp.path().join("does-not-exist");
+    std::os::unix::fs::symlink(&absent, &link).unwrap();
+
+    let err = break_hardlink_if_needed(&link)
+        .await
+        .expect_err("read through dangling symlink must propagate the error");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// Symlink branch remove-fails arm (cow.rs:70): when the symlink
+/// itself carries the `uchg` (user-immutable) flag, `read(path)`
+/// follows the link and succeeds, but `remove_file(path)` cannot
+/// unlink the immutable symlink. The error propagates before the
+/// stage-rename step.
+///
+/// macOS-only: BSD `chflags -h` is the only userspace tool that
+/// can set flags on a symlink without dereferencing. Linux's
+/// `chattr +i` only works on regular files and needs root.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cow_symlink_unremovable_propagates_remove_error() {
+    use std::process::Command;
+    if Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: root bypasses chflags uchg restrictions");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("real-file.txt");
+    std::fs::write(&target, b"content").unwrap();
+    let link = tmp.path().join("immutable-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    // -h applies the flag to the symlink itself, not its target.
+    // Without it, chflags follows the link and sets uchg on the
+    // regular file — wrong test.
+    let status = Command::new("chflags")
+        .arg("-h")
+        .arg("uchg")
+        .arg(&link)
+        .status()
+        .expect("chflags");
+    assert!(status.success());
+
+    let result = break_hardlink_if_needed(&link).await;
+
+    // Clear so tempdir cleanup can recurse.
+    let _ = Command::new("chflags").arg("-h").arg("nouchg").arg(&link).status();
+
+    let err = result.expect_err("remove of immutable symlink must propagate EPERM");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// Hardlink branch read-fails arm (cow.rs:84): a hardlinked file
+/// chmod'd to 0000 fails the read step. break_hardlink_if_needed
+/// gets past lstat (mode bits don't affect lstat results) and the
+/// `nlink > 1` check, then `read(path)` returns EACCES.
+///
+/// Skipped under uid 0 — root bypasses mode-bit access checks.
+#[cfg(unix)]
+#[tokio::test]
+async fn cow_hardlink_unreadable_propagates_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    if Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: root bypasses chmod 0000 restrictions");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, b"data").unwrap();
+    let b = tmp.path().join("b.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    // chmod 0000 on either link affects the inode (both fail).
+    let mut p = std::fs::metadata(&a).unwrap().permissions();
+    p.set_mode(0o000);
+    std::fs::set_permissions(&a, p).unwrap();
+
+    let result = break_hardlink_if_needed(&b).await;
+
+    // Restore so tempdir cleanup can read+unlink.
+    let mut restore = std::fs::metadata(&a).unwrap().permissions();
+    restore.set_mode(0o644);
+    let _ = std::fs::set_permissions(&a, restore);
+
+    let err = result.expect_err("read of unreadable hardlinked file must propagate");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// `write_via_stage_rename` stage-write failure (cow.rs:111): the
+/// hardlink branch reads the file content successfully, then
+/// `tokio::fs::write(&stage, bytes)` fails because the parent
+/// directory is r-x-only (write permission revoked after setup).
+///
+/// Goes through the nlink>1 path so we don't touch the symlink
+/// branch's remove_file (which would also fail on a no-write
+/// parent, taking us down a different code path).
+///
+/// Skipped under uid 0.
+#[cfg(unix)]
+#[tokio::test]
+async fn cow_stage_write_failure_propagates() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    if Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: root bypasses chmod 0500 restrictions");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("pkg");
+    std::fs::create_dir(&dir).unwrap();
+    let a = dir.join("orig.txt");
+    std::fs::write(&a, b"content").unwrap();
+    let b = dir.join("link.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    // Drop write permission on the parent so stage-file creation
+    // (parent/.socket-cow-*) fails — keeping read+execute so
+    // lstat, the nlink check, and `read(path)` all succeed first.
+    let mut p = std::fs::metadata(&dir).unwrap().permissions();
+    p.set_mode(0o500);
+    std::fs::set_permissions(&dir, p).unwrap();
+
+    let result = break_hardlink_if_needed(&b).await;
+
+    // Restore so tempdir cleanup works.
+    let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(0o755);
+    let _ = std::fs::set_permissions(&dir, restore);
+
+    let err = result.expect_err("stage write into read-only parent must fail");
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
 /// `break_hardlink_if_needed` failure-cleanup arm (cow.rs:116-120):
 /// when `rename(stage, path)` inside `write_via_stage_rename`
 /// fails, the function must `remove_file(stage)` before
