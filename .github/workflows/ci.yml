@@ -451,7 +451,9 @@ jobs:
         if: matrix.suite == 'e2e_gem'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
-          ruby-version: '3.2.11'
+          # 3.2.11 was removed from setup-ruby's catalog; 3.2.10 is the
+          # newest 3.2.x available on the GitHub-hosted runner.
+          ruby-version: '3.2.10'
           bundler-cache: false
 
       - name: Run e2e tests
