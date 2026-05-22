@@ -338,20 +338,28 @@ fn run_on_host(script: &str) -> std::process::Output {
         .expect("bash failed to spawn")
 }
 
-fn assert_docker_image_present() {
-    let out = Command::new("docker")
+/// Returns `true` when the test should skip (docker missing, image
+/// missing). Prints a skip notice to stderr — the test still reports as
+/// `ok` because Rust integration tests have no native "skipped" outcome.
+///
+/// Note that npm e2e also supports `SOCKET_PATCH_TEST_HOST=1` (see
+/// [`host_mode`]) to run the test against host toolchains instead of
+/// Docker; that's checked independently in the test body before this
+/// helper runs.
+#[must_use]
+fn skip_if_no_docker_image() -> bool {
+    let Ok(out) = Command::new("docker")
         .args(["image", "inspect", "socket-patch-test-npm:latest"])
         .output()
-        .expect("docker not on PATH or daemon unreachable");
+    else {
+        eprintln!("skipping: `docker` not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on the host)");
+        return true;
+    };
     if !out.status.success() {
-        panic!(
-            "docker image `socket-patch-test-npm:latest` not found.\n\
-             Build it from the repo root:\n  \
-             docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .\n  \
-             docker build -f tests/docker/Dockerfile.npm  -t socket-patch-test-npm:latest .\n\
-             Or set SOCKET_PATCH_TEST_HOST=1 to run against host toolchains."
-        );
+        eprintln!("skipping: docker image `socket-patch-test-npm:latest` not present");
+        return true;
     }
+    false
 }
 
 #[tokio::test]
@@ -363,7 +371,9 @@ async fn npm_install_scan_apply_rollback_cycle() {
         let api = format!("http://127.0.0.1:{}", server.address().port());
         run_on_host(&make_container_script(&api))
     } else {
-        assert_docker_image_present();
+        if skip_if_no_docker_image() {
+            return;
+        }
         let api = api_url_for_container(&server);
         run_in_container(&make_container_script(&api))
     };
@@ -411,7 +421,9 @@ async fn npm_global_install_full_apply_chain() {
         // mutate, so skip silently. Docker mode is the canonical run.
         return;
     }
-    assert_docker_image_present();
+    if skip_if_no_docker_image() {
+        return;
+    }
     let api = api_url_for_container(&server);
     let out = run_in_container(&make_global_script(&api));
     let stdout = String::from_utf8_lossy(&out.stdout);

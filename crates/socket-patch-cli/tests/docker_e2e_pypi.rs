@@ -231,18 +231,23 @@ exit 0
     )
 }
 
-fn assert_image_present() {
-    let out = Command::new("docker")
+/// Returns `true` when the test should skip (docker missing, image
+/// missing). Prints a skip notice to stderr — the test still reports as
+/// `ok` because Rust integration tests have no native "skipped" outcome.
+#[must_use]
+fn skip_if_no_image() -> bool {
+    let Ok(out) = Command::new("docker")
         .args(["image", "inspect", "socket-patch-test-pypi:latest"])
         .output()
-        .expect("docker not on PATH");
+    else {
+        eprintln!("skipping: `docker` not on PATH");
+        return true;
+    };
     if !out.status.success() {
-        panic!(
-            "docker image `socket-patch-test-pypi:latest` not found.\n\
-             Build it: docker build -f tests/docker/Dockerfile.pypi \
-             -t socket-patch-test-pypi:latest ."
-        );
+        eprintln!("skipping: docker image `socket-patch-test-pypi:latest` not present");
+        return true;
     }
+    false
 }
 
 fn run_container(_api_url: &str, script: &str) -> std::process::Output {
@@ -263,7 +268,9 @@ async fn pypi_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    assert_image_present();
+    if skip_if_no_image() {
+        return;
+    }
     let out = run_container(&api_url, &local_script(&api_url));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -280,7 +287,9 @@ async fn pypi_global_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    assert_image_present();
+    if skip_if_no_image() {
+        return;
+    }
     let out = run_container(&api_url, &global_script(&api_url));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

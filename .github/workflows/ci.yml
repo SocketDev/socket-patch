@@ -207,7 +207,18 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
+        # `driver: docker` makes buildx use the host docker daemon directly
+        # rather than running BuildKit in its own container. This is what
+        # lets the per-ecosystem image build see the locally-tagged
+        # `socket-patch-test-base:latest` from the previous step (with the
+        # default container driver, BuildKit runs in a sandbox that cannot
+        # see the host daemon's image store and tries to pull base from
+        # docker.io, which fails). The trade-off is that `type=gha` cache
+        # exports aren't supported under the docker driver — we accept
+        # rebuilding the images per job for correctness.
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
 
       - name: Install Rust
         # `rustup show` consumes rust-toolchain.toml; the explicit
@@ -224,8 +235,7 @@ jobs:
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit
       # (a PR-poisoned cargo cache could compromise the instrumented
-      # binary we mount into the container). The Docker buildx
-      # cache-from: type=gha below still accelerates image rebuilds.
+      # binary we mount into the container).
 
       - name: Build base image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -234,8 +244,6 @@ jobs:
           file: tests/docker/Dockerfile.base
           tags: socket-patch-test-base:latest
           load: true
-          cache-from: type=gha,scope=test-base
-          cache-to: type=gha,scope=test-base,mode=max
 
       - name: Build ${{ matrix.ecosystem }} image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -244,8 +252,6 @@ jobs:
           file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
-          cache-from: type=gha,scope=test-${{ matrix.ecosystem }}
-          cache-to: type=gha,scope=test-${{ matrix.ecosystem }},mode=max
 
       - name: Build instrumented socket-patch binary
         # Source `cargo llvm-cov show-env` into the current shell so this
@@ -472,15 +478,19 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
+        # `driver: docker` — see the coverage-docker matching step above
+        # for the rationale (the per-ecosystem image's `FROM
+        # socket-patch-test-base:latest` only resolves when buildx talks
+        # directly to the host docker daemon).
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
 
       - name: Install Rust
         run: rustup show
 
       # No `actions/cache` here intentionally. This job builds Docker
       # images and would be flagged by zizmor's cache-poisoning audit.
-      # The Docker buildx cache-from: type=gha below still accelerates
-      # image rebuilds.
 
       - name: Build base image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -489,8 +499,6 @@ jobs:
           file: tests/docker/Dockerfile.base
           tags: socket-patch-test-base:latest
           load: true
-          cache-from: type=gha,scope=test-base
-          cache-to: type=gha,scope=test-base,mode=max
 
       - name: Build ${{ matrix.ecosystem }} image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -499,8 +507,6 @@ jobs:
           file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
           tags: socket-patch-test-${{ matrix.ecosystem }}:latest
           load: true
-          cache-from: type=gha,scope=test-${{ matrix.ecosystem }}
-          cache-to: type=gha,scope=test-${{ matrix.ecosystem }},mode=max
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test
         run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}

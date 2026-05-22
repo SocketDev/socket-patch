@@ -172,18 +172,25 @@ exit 0
     )
 }
 
-fn assert_image() {
-    let out = Command::new("docker")
+/// Returns `true` when the test should skip (docker missing, image
+/// missing). Prints a skip notice to stderr — the test still reports
+/// as `ok` because Rust integration tests have no native "skipped"
+/// outcome. Build locally with
+/// `docker build -f tests/docker/Dockerfile.maven -t socket-patch-test-maven:latest .`
+#[must_use]
+fn skip_if_no_image() -> bool {
+    let Ok(out) = Command::new("docker")
         .args(["image", "inspect", "socket-patch-test-maven:latest"])
         .output()
-        .expect("docker");
+    else {
+        eprintln!("skipping: `docker` not on PATH");
+        return true;
+    };
     if !out.status.success() {
-        panic!(
-            "socket-patch-test-maven:latest missing. Build: \
-             docker build -f tests/docker/Dockerfile.maven \
-             -t socket-patch-test-maven:latest ."
-        );
+        eprintln!("skipping: docker image `socket-patch-test-maven:latest` not present");
+        return true;
     }
+    false
 }
 
 #[tokio::test]
@@ -191,7 +198,9 @@ async fn maven_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_POM);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    assert_image();
+    if skip_if_no_image() {
+        return;
+    }
     let mut cmd = Command::new("docker");
     cmd.args([
         "run",

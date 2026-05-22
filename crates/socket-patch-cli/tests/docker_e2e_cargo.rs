@@ -168,18 +168,29 @@ exit 0
     )
 }
 
-fn assert_image() {
-    let out = Command::new("docker")
+/// Returns `true` when the test should skip (docker missing, image
+/// missing). Prints a skip notice to stderr in that case so the test
+/// log shows *why* the test did nothing — the test still reports as
+/// `ok` because Rust integration tests have no native "skipped" outcome.
+///
+/// Local devs: build the image with
+/// `docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .`
+/// then
+/// `docker build -f tests/docker/Dockerfile.cargo -t socket-patch-test-cargo:latest .`
+#[must_use]
+fn skip_if_no_image() -> bool {
+    let Ok(out) = Command::new("docker")
         .args(["image", "inspect", "socket-patch-test-cargo:latest"])
         .output()
-        .expect("docker");
+    else {
+        eprintln!("skipping: `docker` not on PATH");
+        return true;
+    };
     if !out.status.success() {
-        panic!(
-            "socket-patch-test-cargo:latest missing. Build: \
-             docker build -f tests/docker/Dockerfile.cargo \
-             -t socket-patch-test-cargo:latest ."
-        );
+        eprintln!("skipping: docker image `socket-patch-test-cargo:latest` not present");
+        return true;
     }
+    false
 }
 
 #[tokio::test]
@@ -187,7 +198,9 @@ async fn cargo_fetch_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_RS);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    assert_image();
+    if skip_if_no_image() {
+        return;
+    }
     let mut cmd = Command::new("docker");
     cmd.args([
         "run",

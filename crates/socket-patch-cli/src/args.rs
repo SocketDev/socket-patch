@@ -171,20 +171,22 @@ impl GlobalArgs {
         )
     }
 
-    /// Build [`ApiClientEnvOverrides`] from the CLI flags. Every override
-    /// is populated unconditionally — clap's `env = ".."` attribute has
-    /// already resolved CLI > env > default for each field, so passing
-    /// the resolved value through as `Some(_)` is correct.
+    /// Build [`ApiClientEnvOverrides`] from the CLI flags.
     ///
-    /// `api_token` and `org` remain `Option<String>` (they have no
-    /// default), so the override is `None` exactly when the user did not
-    /// provide one via CLI or env.
+    /// `api_token` and `org` are forwarded as `Some(_)` only when set.
+    /// `api_url` and `proxy_url` are forwarded only when non-empty;
+    /// `GlobalArgs::default()` leaves both empty so integration tests
+    /// that mutate env vars *after* constructing args still get env-var
+    /// resolution from `get_api_client_with_overrides`. In production
+    /// clap always populates them with either the CLI value, the env
+    /// value, or the clap-declared default — all non-empty — so the
+    /// resolved value still flows through.
     pub fn api_client_overrides(&self) -> ApiClientEnvOverrides {
         ApiClientEnvOverrides {
-            api_url: Some(self.api_url.clone()),
+            api_url: Some(self.api_url.clone()).filter(|s| !s.is_empty()),
             api_token: self.api_token.clone().filter(|s| !s.is_empty()),
             org_slug: self.org.clone().filter(|s| !s.is_empty()),
-            proxy_url: Some(self.proxy_url.clone()),
+            proxy_url: Some(self.proxy_url.clone()).filter(|s| !s.is_empty()),
         }
     }
 }
@@ -203,18 +205,28 @@ pub fn apply_env_toggles(common: &GlobalArgs) {
 }
 
 impl Default for GlobalArgs {
-    /// Defaults that match the clap-derived defaults exactly.
+    /// Defaults intended for **test struct literals** (e.g. `..GlobalArgs::default()`).
     ///
-    /// Available outside `#[cfg(test)]` because integration tests in
-    /// `tests/` are external crates and can't see `cfg(test)` items.
+    /// In production every field is populated by clap (with the
+    /// `default_value = ".."` attribute providing the documented defaults
+    /// when neither CLI flag nor env var is set), so this `Default` is
+    /// only reached from tests building `GlobalArgs` directly.
+    ///
+    /// `api_url` and `proxy_url` are intentionally **empty** here (not
+    /// the production default URLs). That lets tests set
+    /// `SOCKET_API_URL` / `SOCKET_PROXY_URL` via `std::env::set_var`
+    /// *after* constructing the args struct and have those env vars
+    /// flow through to the API client — `api_client_overrides` skips
+    /// empty values so the underlying `get_api_client_with_overrides`
+    /// falls back to env-var resolution.
     fn default() -> Self {
         Self {
             cwd: PathBuf::from("."),
             manifest_path: DEFAULT_PATCH_MANIFEST_PATH.to_string(),
-            api_url: DEFAULT_SOCKET_API_URL.to_string(),
+            api_url: String::new(),
             api_token: None,
             org: None,
-            proxy_url: DEFAULT_PATCH_API_PROXY_URL.to_string(),
+            proxy_url: String::new(),
             ecosystems: None,
             download_mode: "diff".to_string(),
             offline: false,

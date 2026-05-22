@@ -202,14 +202,29 @@ fn repair_dry_run_does_not_remove_orphan_blob() {
 fn repair_download_only_skips_cleanup() {
     // `--download-only` skips the cleanup pass. An orphan that would
     // normally be removed should still be on disk afterward.
+    //
+    // We can't use `run_repair` here because it injects `--offline`,
+    // and `--offline` is mutually exclusive with `--download-only`
+    // (offline = strict airgap, download-only = network-only). Invoke
+    // the binary directly. The manifest already references every
+    // patched blob, so even without `--offline` there's nothing
+    // missing for the download phase to actually fetch — the test
+    // stays hermetic.
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
     let orphan_hash = "feedface".repeat(8);
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
-    let (code, _stdout) = run_repair(tmp.path(), &["--download-only"]);
-    assert_eq!(code, 0, "expected exit 0");
+    let out = Command::new(binary())
+        .args(["repair", "--json", "--download-only"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
     assert!(
         socket.join("blobs").join(&orphan_hash).exists(),
         "--download-only must skip cleanup; orphan should still exist"
