@@ -193,7 +193,14 @@ jobs:
     # Hooks: docker_e2e_<eco>.rs reads SOCKET_PATCH_COV_BIN +
     # SOCKET_PATCH_COV_PROFRAW_DIR. Both unset is the no-op default
     # (used by the e2e-docker matrix above).
-    runs-on: ubuntu-latest
+    #
+    # Pin to ubuntu-22.04 (glibc 2.35) instead of ubuntu-latest
+    # (currently 24.04, glibc 2.39). The instrumented binary built
+    # here gets mounted into the debian:12-slim test container
+    # (glibc 2.36); a binary linked against a newer glibc than the
+    # container ships fails to load. ubuntu-22.04's older glibc is
+    # the highest base that's forward-compatible with debian:12.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     strategy:
