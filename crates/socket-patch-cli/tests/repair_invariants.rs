@@ -118,6 +118,58 @@ fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
     );
 }
 
+/// `--offline` (strict airgap, no network) and `--download-only`
+/// (network-only, skip cleanup) are mutually exclusive — the
+/// command rejects the combination up-front with exit code 2 and
+/// an `invalid_args` error in JSON mode. Covers the early-exit
+/// branch at the top of `commands::repair::run`.
+#[test]
+fn repair_offline_and_download_only_are_mutually_exclusive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args(["repair", "--json", "--offline", "--download-only"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 for invalid flag combo; stdout=\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error"]["code"], "invalid_args");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mutually exclusive"),
+        "error message should mention 'mutually exclusive'; got {v}"
+    );
+}
+
+/// Same flag-combo rejection in the non-JSON (human text) path —
+/// exit 2 with a stderr error message.
+#[test]
+fn repair_offline_and_download_only_human_mode_errors_to_stderr() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args(["repair", "--offline", "--download-only"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "stderr should mention 'mutually exclusive'; got {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup paths
 // ---------------------------------------------------------------------------
