@@ -58,6 +58,29 @@ async fn fetch_blobs_by_hash_empty_set_short_circuits() {
     assert!(result.results.is_empty());
 }
 
+/// `fetch_blobs_by_hash` with a hash whose blob is already on disk
+/// short-circuits the network call and reports `skipped: 1`. Covers
+/// the `skip if already on disk` branch (~L200-220).
+#[tokio::test]
+async fn fetch_blobs_by_hash_skips_existing_blobs() {
+    use std::collections::HashSet;
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+    let hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    std::fs::write(blobs.join(hash), b"already here").unwrap();
+    let mut hashes = HashSet::new();
+    hashes.insert(hash.to_string());
+
+    let client = dummy_client();
+    let result = fetch_blobs_by_hash(&hashes, &blobs, &client, None).await;
+    assert_eq!(result.total, 1, "one hash requested");
+    assert_eq!(result.downloaded, 0, "already-on-disk needs no download");
+    assert_eq!(result.skipped, 1, "exactly one skipped");
+    assert_eq!(result.failed, 0);
+    assert!(result.results.iter().any(|r| r.success && r.hash == hash));
+}
+
 /// `get_missing_blobs` against a manifest that lists no patches
 /// returns the empty set. Covers the early-return inside the
 /// function — the existing apply tests always stage at least one
