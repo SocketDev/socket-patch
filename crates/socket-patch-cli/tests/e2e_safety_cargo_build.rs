@@ -372,8 +372,17 @@ fn apply_then_cargo_check_succeeds() {
 }
 
 /// JSON envelope sanity check on the same scenario: assert apply
-/// reports the sidecar in `sidecarsUpdated`. Locked in as part of
-/// the JSON contract.
+/// reports the cargo sidecar in the new top-level `envelope.sidecars[]`
+/// list with the structured shape.
+///
+/// Locks in the typed JSON contract that downstream consumers
+/// (jq pipelines, dashboards, telemetry) rely on:
+///   envelope.sidecars[].ecosystem == "cargo"
+///   envelope.sidecars[].files[i].path == ".cargo-checksum.json"
+///   envelope.sidecars[].files[i].action == "rewritten"
+///
+/// If a refactor flips key names or moves the data elsewhere, this
+/// test fires loudly.
 #[test]
 #[ignore]
 fn apply_reports_cargo_checksum_in_sidecars_updated() {
@@ -392,14 +401,38 @@ fn apply_reports_cargo_checksum_in_sidecars_updated() {
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
     );
 
-    // Apply may exit 0 (success) or surface a warning event; the
-    // contract we pin here is "the per-package result reports the
-    // cargo checksum file under sidecarsUpdated".
     let env = parse_json_envelope(&stdout);
-    let serialized = serde_json::to_string(&env).unwrap();
+    let sidecars = env["sidecars"]
+        .as_array()
+        .unwrap_or_else(|| panic!(
+            "envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    let cargo_record = sidecars
+        .iter()
+        .find(|s| s["ecosystem"] == "cargo")
+        .unwrap_or_else(|| panic!(
+            "envelope.sidecars must contain a record with ecosystem=cargo.\nstdout:\n{stdout}"
+        ));
+    let files = cargo_record["files"].as_array().expect("files array");
     assert!(
-        serialized.contains(".cargo-checksum.json"),
-        "apply --json should mention .cargo-checksum.json in sidecarsUpdated.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        files.iter().any(|f| {
+            f["path"] == ".cargo-checksum.json" && f["action"] == "rewritten"
+        }),
+        "expected files[] to contain {{path:.cargo-checksum.json, action:rewritten}}; got {cargo_record}"
+    );
+    // No advisory expected for the cargo success path.
+    assert!(
+        cargo_record.get("advisory").is_none()
+            || cargo_record["advisory"].is_null(),
+        "cargo success path should not carry an advisory; got {cargo_record}"
+    );
+    // PURL is denormalized into the record for jq filtering.
+    assert!(
+        cargo_record["purl"]
+            .as_str()
+            .map(|p| p.starts_with("pkg:cargo/"))
+            .unwrap_or(false),
+        "sidecar record must carry the PURL; got {cargo_record}"
     );
 }
 

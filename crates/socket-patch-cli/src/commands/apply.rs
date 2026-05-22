@@ -133,36 +133,12 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
                 .map(AppliedVia::from_core),
         })
         .collect();
-    let mut event = PatchEvent::new(PatchAction::Applied, purl).with_files(files);
-    // Carry ecosystem sidecar fixup outcomes under `details` —
-    // narrower JSON contract than first-class fields (see plan).
-    // Consumers read `event.details.sidecarsUpdated` and
-    // `event.details.sidecarAdvisory`. Only attach when either is
-    // non-empty so events for ecosystems with no sidecar (npm,
-    // yarn) stay quiet.
-    if !result.sidecars_updated.is_empty() || result.sidecar_advisory.is_some() {
-        let mut details = serde_json::Map::new();
-        if !result.sidecars_updated.is_empty() {
-            details.insert(
-                "sidecarsUpdated".to_string(),
-                serde_json::Value::Array(
-                    result
-                        .sidecars_updated
-                        .iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect(),
-                ),
-            );
-        }
-        if let Some(ref advisory) = result.sidecar_advisory {
-            details.insert(
-                "sidecarAdvisory".to_string(),
-                serde_json::Value::String(advisory.clone()),
-            );
-        }
-        event = event.with_details(serde_json::Value::Object(details));
-    }
-    event
+    // Sidecar data is NOT attached here — it's surfaced at the
+    // envelope level under `Envelope.sidecars[]` by the run loop.
+    // See `Envelope::record_sidecar`. Keeping events clean of
+    // sidecar info means each event describes only the apply
+    // action; sidecar reporting is a separate, JOIN-able list.
+    PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
 pub async fn run(args: ApplyArgs) -> i32 {
@@ -253,6 +229,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 env.dry_run = args.common.dry_run;
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
+                    // Sidecar records live on the envelope, not on
+                    // individual events. Consumers iterate
+                    // `envelope.sidecars[]` and JOIN against
+                    // `events[]` by `purl` for per-package context.
+                    if let Some(ref sidecar) = result.sidecar {
+                        env.record_sidecar(sidecar.clone());
+                    }
                 }
                 // Manifest entries that targeted in-scope ecosystems but
                 // had no installed package on disk — emit one Skipped
@@ -792,8 +775,7 @@ mod tests {
             files_patched: vec!["package/index.js".to_string()],
             applied_via,
             error: None,
-            sidecars_updated: Vec::new(),
-            sidecar_advisory: None,
+            sidecar: None,
         }
     }
 
@@ -868,8 +850,7 @@ mod tests {
             ],
             applied_via,
             error: None,
-            sidecars_updated: Vec::new(),
-            sidecar_advisory: None,
+            sidecar: None,
         };
 
         let event = result_to_event(&result, false);

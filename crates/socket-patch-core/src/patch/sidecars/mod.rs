@@ -15,11 +15,15 @@
 //! - **NuGet** ([`nuget::fixup`]): delete `.nupkg.metadata` (we
 //!   cannot honestly recompute `contentHash` without the original
 //!   `.nupkg`; deletion is the "unknown" state vs. tampering-flag
-//!   for a stale hash).
-//! - **PyPI / gem / go**: advisory only — emit a one-line warning so
-//!   the operator knows to expect downstream tooling complaints.
-//!   Full sidecar rewrites need more careful path-mapping work and
-//!   land in a follow-up.
+//!   for a stale hash). A signed-package `.nupkg.sha512` marker
+//!   surfaces an advisory ALONGSIDE the metadata deletion.
+//! - **PyPI / gem / Go**: advisory only — emit a structured
+//!   advisory so downstream tooling consequences are programmatic.
+//!   Full sidecar rewrites land in follow-ups.
+//!
+//! All ecosystems return a [`SidecarRecord`] via [`dispatch_fixup`].
+//! The record is the canonical JSON-envelope shape — see
+//! [`types`] for field documentation and stability guarantees.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,24 +31,32 @@ use std::path::Path;
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchFileInfo;
 
-pub mod cargo;
-pub mod nuget;
+#[cfg(feature = "cargo")]
+pub(crate) mod cargo;
+#[cfg(feature = "nuget")]
+pub(crate) mod nuget;
+pub mod types;
 
-/// What the sidecar dispatcher did for this package.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SidecarOutcome {
-    /// Sidecar files were touched. Paths are relative to `pkg_path`.
-    Updated(Vec<String>),
-    /// No sidecar file changed, but the operator should be told.
-    /// The string is a one-line advisory (no formatting).
-    Advisory(String),
-    /// Nothing applicable for this ecosystem.
-    None,
+pub use types::{
+    SidecarAdvisory, SidecarAdvisoryCode, SidecarFile, SidecarFileAction, SidecarRecord,
+    SidecarSeverity,
+};
+
+/// Intermediate payload returned by per-ecosystem fixups. The
+/// wrapper [`dispatch_fixup`] adds `purl` + `ecosystem` to form a
+/// full [`SidecarRecord`]. Per-ecosystem code doesn't need to know
+/// PURL parsing.
+#[derive(Debug, Clone)]
+pub(crate) struct SidecarPayload {
+    pub files: Vec<SidecarFile>,
+    pub advisory: Option<SidecarAdvisory>,
 }
 
 /// Errors a sidecar fixup can return. Each is best-effort: a failing
 /// sidecar does NOT undo the patch (the patched bytes are already on
-/// disk). The CLI surfaces the error as a warning event and proceeds.
+/// disk). The boundary in `apply_package_patch` converts these to
+/// a [`SidecarRecord`] carrying `SidecarAdvisoryCode::SidecarFixupFailed`
+/// so consumers see a uniform shape.
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarError {
     #[error("sidecar I/O error at {path}: {source}")]
@@ -57,47 +69,85 @@ pub enum SidecarError {
     Malformed { path: String, detail: String },
 }
 
+/// Helper for advisory-only ecosystems (PyPI / gem / Go) — builds a
+/// payload with no touched files and a single structured advisory.
+pub(crate) fn advisory_only_payload(
+    code: SidecarAdvisoryCode,
+    severity: SidecarSeverity,
+    message: &str,
+) -> SidecarPayload {
+    SidecarPayload {
+        files: Vec::new(),
+        advisory: Some(SidecarAdvisory {
+            code,
+            severity,
+            message: message.to_string(),
+        }),
+    }
+}
+
 /// Run the post-apply integrity fixup for the package's ecosystem.
 ///
-/// `package_key` is the PURL (used to pick the ecosystem).
-/// `pkg_path` is the package directory on disk.
-/// `patched` lists the patch-file keys that were actually written
-/// (using the same convention as `apply_package_patch.files_patched`).
-/// `files` is the original patch file map (used to distinguish new
-/// files from modified files via `before_hash.is_empty()`).
+/// Returns a fully-formed [`SidecarRecord`] (PURL + ecosystem +
+/// payload) when the ecosystem produced any output, `None` when
+/// the ecosystem has no sidecar contract at all (e.g. npm), or
+/// `Err(SidecarError)` when the fixup tried to do something and
+/// failed mid-flight. The caller is responsible for converting
+/// the error case into an `Error`-severity record.
+///
+/// `package_key` is the PURL. `pkg_path` is the package directory
+/// on disk. `patched` lists the patch-file keys that were actually
+/// written (same convention as `apply_package_patch.files_patched`).
+/// `files` is reserved for future use (currently unread).
 #[allow(unused_variables)] // `pkg_path` is feature-gated below
 pub async fn dispatch_fixup(
     package_key: &str,
     pkg_path: &Path,
     patched: &[String],
     _files: &HashMap<String, PatchFileInfo>,
-) -> Result<SidecarOutcome, SidecarError> {
+) -> Result<Option<SidecarRecord>, SidecarError> {
     if patched.is_empty() {
-        return Ok(SidecarOutcome::None);
+        return Ok(None);
     }
-    match Ecosystem::from_purl(package_key) {
+
+    let ecosystem = match Ecosystem::from_purl(package_key) {
+        Some(eco) => eco,
+        None => return Ok(None),
+    };
+
+    let payload: Option<SidecarPayload> = match ecosystem {
         #[cfg(feature = "cargo")]
-        Some(Ecosystem::Cargo) => cargo::fixup(pkg_path, patched).await,
+        Ecosystem::Cargo => cargo::fixup(pkg_path, patched).await?,
         #[cfg(feature = "nuget")]
-        Some(Ecosystem::Nuget) => nuget::fixup(pkg_path).await,
-        Some(Ecosystem::Pypi) => Ok(SidecarOutcome::Advisory(
+        Ecosystem::Nuget => nuget::fixup(pkg_path).await?,
+        Ecosystem::Pypi => Some(advisory_only_payload(
+            SidecarAdvisoryCode::PypiRecordStale,
+            SidecarSeverity::Warning,
             "PyPI: run `pip check` to verify .dist-info/RECORD consistency. \
-             A `pip install --force-reinstall` will revert these patches."
-                .to_string(),
+             A `pip install --force-reinstall` will revert these patches.",
         )),
-        Some(Ecosystem::Gem) => Ok(SidecarOutcome::Advisory(
+        Ecosystem::Gem => Some(advisory_only_payload(
+            SidecarAdvisoryCode::GemBundleInstallReverts,
+            SidecarSeverity::Warning,
             "Ruby gem: `bundle install --redownload` will revert these \
-             patches by reinstalling from the cached .gem."
-                .to_string(),
+             patches by reinstalling from the cached .gem.",
         )),
         #[cfg(feature = "golang")]
-        Some(Ecosystem::Golang) => Ok(SidecarOutcome::Advisory(
+        Ecosystem::Golang => Some(advisory_only_payload(
+            SidecarAdvisoryCode::GoModVerifyFails,
+            SidecarSeverity::Warning,
             "Go: `go mod verify` will report a checksum mismatch against \
-             go.sum. `go build` works as long as the module cache stays warm."
-                .to_string(),
+             go.sum. `go build` works as long as the module cache stays warm.",
         )),
-        _ => Ok(SidecarOutcome::None),
-    }
+        _ => None,
+    };
+
+    Ok(payload.map(|p| SidecarRecord {
+        purl: package_key.to_string(),
+        ecosystem: ecosystem.cli_name().to_string(),
+        files: p.files,
+        advisory: p.advisory,
+    }))
 }
 
 #[cfg(test)]
@@ -114,7 +164,7 @@ mod tests {
         let out = dispatch_fixup("pkg:npm/anything@1.0.0", d.path(), &[], &empty_files())
             .await
             .unwrap();
-        assert_eq!(out, SidecarOutcome::None);
+        assert!(out.is_none());
     }
 
     #[tokio::test]
@@ -128,11 +178,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, SidecarOutcome::None);
+        assert!(out.is_none());
     }
 
     #[tokio::test]
-    async fn pypi_returns_advisory() {
+    async fn pypi_returns_structured_advisory() {
         let d = tempfile::tempdir().unwrap();
         let out = dispatch_fixup(
             "pkg:pypi/requests@2.28.0",
@@ -142,16 +192,18 @@ mod tests {
         )
         .await
         .unwrap();
-        match out {
-            SidecarOutcome::Advisory(s) => {
-                assert!(s.contains("pip"), "advisory should mention pip: {s}");
-            }
-            other => panic!("expected Advisory, got {other:?}"),
-        }
+        let record = out.expect("pypi should return a record");
+        assert_eq!(record.ecosystem, "pypi");
+        assert_eq!(record.purl, "pkg:pypi/requests@2.28.0");
+        assert!(record.files.is_empty());
+        let advisory = record.advisory.expect("pypi must carry an advisory");
+        assert_eq!(advisory.code, SidecarAdvisoryCode::PypiRecordStale);
+        assert_eq!(advisory.severity, SidecarSeverity::Warning);
+        assert!(advisory.message.contains("pip"));
     }
 
     #[tokio::test]
-    async fn gem_returns_advisory() {
+    async fn gem_returns_structured_advisory() {
         let d = tempfile::tempdir().unwrap();
         let out = dispatch_fixup(
             "pkg:gem/rails@7.1.0",
@@ -161,9 +213,27 @@ mod tests {
         )
         .await
         .unwrap();
-        match out {
-            SidecarOutcome::Advisory(s) => assert!(s.contains("bundle")),
-            other => panic!("expected Advisory, got {other:?}"),
-        }
+        let record = out.expect("gem should return a record");
+        assert_eq!(record.ecosystem, "gem");
+        let advisory = record.advisory.expect("gem must carry an advisory");
+        assert_eq!(
+            advisory.code,
+            SidecarAdvisoryCode::GemBundleInstallReverts
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_ecosystem_returns_none() {
+        // PURL has no recognized prefix → dispatcher bails with None.
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup(
+            "pkg:weirdo/x@1",
+            d.path(),
+            &["x".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
     }
 }

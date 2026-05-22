@@ -33,25 +33,30 @@ use sha2::{Digest, Sha256};
 
 use crate::patch::apply::normalize_file_path;
 
-use super::{SidecarError, SidecarOutcome};
+use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
 const CHECKSUM_FILE: &str = ".cargo-checksum.json";
 
 /// Rewrite `<pkg_path>/.cargo-checksum.json` so each entry for a
-/// patched file reflects the on-disk SHA256. Returns the relative
-/// path(s) of the sidecar file(s) we touched (always exactly one
-/// when present).
-pub async fn fixup(
+/// patched file reflects the on-disk SHA256.
+///
+/// Returns:
+///   * `Ok(Some(payload))` with one `SidecarFile{path: ".cargo-checksum.json", action: Rewritten}`
+///     when the file existed and was rewritten;
+///   * `Ok(None)` when there's no `.cargo-checksum.json` to fix up
+///     (some local-path deps don't ship one);
+///   * `Err(SidecarError)` on I/O or JSON parse failure.
+pub(crate) async fn fixup(
     pkg_path: &Path,
     patched: &[String],
-) -> Result<SidecarOutcome, SidecarError> {
+) -> Result<Option<SidecarPayload>, SidecarError> {
     let checksum_path = pkg_path.join(CHECKSUM_FILE);
 
     // Read the existing file. NotFound is fine — no checksums to update.
     let raw = match tokio::fs::read_to_string(&checksum_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SidecarOutcome::None);
+            return Ok(None);
         }
         Err(source) => {
             return Err(SidecarError::Io {
@@ -93,7 +98,13 @@ pub async fn fixup(
         }
     })?;
 
-    Ok(SidecarOutcome::Updated(vec![CHECKSUM_FILE.to_string()]))
+    Ok(Some(SidecarPayload {
+        files: vec![SidecarFile {
+            path: CHECKSUM_FILE.to_string(),
+            action: SidecarFileAction::Rewritten,
+        }],
+        advisory: None,
+    }))
 }
 
 /// For each patched entry, recompute the on-disk SHA256 and write it
@@ -178,10 +189,11 @@ mod tests {
         .unwrap();
 
         let out = fixup(pkg, &["src/lib.rs".to_string()]).await.unwrap();
-        assert_eq!(
-            out,
-            SidecarOutcome::Updated(vec![CHECKSUM_FILE.to_string()])
-        );
+        let payload = out.expect("checksum file existed, fixup should return a payload");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].path, CHECKSUM_FILE);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Rewritten);
+        assert!(payload.advisory.is_none());
 
         // Read back and assert.
         let post: serde_json::Value = serde_json::from_str(
@@ -280,7 +292,7 @@ mod tests {
     async fn missing_checksum_file_is_noop() {
         let d = tempfile::tempdir().unwrap();
         let out = fixup(d.path(), &["src/lib.rs".to_string()]).await.unwrap();
-        assert_eq!(out, SidecarOutcome::None);
+        assert!(out.is_none());
     }
 
     /// Malformed JSON produces a clean error (caller surfaces as a

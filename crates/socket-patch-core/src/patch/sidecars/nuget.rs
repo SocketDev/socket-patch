@@ -14,24 +14,38 @@
 //! metadata as "unknown state, accept the install" rather than
 //! "checksum mismatch, refuse". A signed-package detail tag
 //! (`<name>.<ver>.nupkg.sha512`) — if present — still flags
-//! tampering at the package-archive level; we leave that alone and
-//! surface a warning so the operator knows what to expect.
+//! tampering at the package-archive level; the new typed surface
+//! carries that as an advisory ALONGSIDE the metadata-deleted file
+//! entry (no longer collapsed).
 
 use std::path::Path;
 
-use super::{SidecarError, SidecarOutcome};
+use super::{
+    SidecarAdvisory, SidecarAdvisoryCode, SidecarError, SidecarFile, SidecarFileAction,
+    SidecarPayload, SidecarSeverity,
+};
 
 const METADATA_FILE: &str = ".nupkg.metadata";
 
 /// Delete `.nupkg.metadata` if present, and surface an advisory if
 /// the package also carries a `.nupkg.sha512` signature sidecar
 /// that we cannot honestly fix.
-pub async fn fixup(pkg_path: &Path) -> Result<SidecarOutcome, SidecarError> {
-    let mut touched: Vec<String> = Vec::new();
+///
+/// Returns:
+///   * `Ok(Some(payload))` carrying any combination of the
+///     metadata-deleted file entry and the signed-package advisory;
+///   * `Ok(None)` when there's no metadata and no signature
+///     (nothing to report);
+///   * `Err(SidecarError)` on I/O failure.
+pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, SidecarError> {
+    let mut files = Vec::new();
 
     let metadata_path = pkg_path.join(METADATA_FILE);
     match tokio::fs::remove_file(&metadata_path).await {
-        Ok(()) => touched.push(METADATA_FILE.to_string()),
+        Ok(()) => files.push(SidecarFile {
+            path: METADATA_FILE.to_string(),
+            action: SidecarFileAction::Deleted,
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* nothing to do */ }
         Err(source) => {
             return Err(SidecarError::Io {
@@ -42,30 +56,26 @@ pub async fn fixup(pkg_path: &Path) -> Result<SidecarOutcome, SidecarError> {
     }
 
     // If a `*.nupkg.sha512` sibling exists, the package is signed at
-    // the archive level. We can't fix that. Surface the warning by
-    // appending to the outcome — but the metadata deletion (if any)
-    // is still the actionable thing we did.
-    let signed = has_signed_marker(pkg_path).await;
+    // the archive level. We can't fix that. Surface a structured
+    // advisory regardless of whether we also deleted metadata — the
+    // old design's lossy collapse hid this when both fired.
+    let advisory = if has_signed_marker(pkg_path).await {
+        Some(SidecarAdvisory {
+            code: SidecarAdvisoryCode::NugetSignedPackageTampered,
+            severity: SidecarSeverity::Warning,
+            message: "NuGet: package has a .nupkg.sha512 signature sidecar — \
+                      NuGet may flag this install as tampered. No safe recovery."
+                .to_string(),
+        })
+    } else {
+        None
+    };
 
-    if touched.is_empty() {
-        if signed {
-            return Ok(SidecarOutcome::Advisory(
-                "NuGet: package has a .nupkg.sha512 signature sidecar — \
-                 NuGet may flag this install as tampered. No safe recovery."
-                    .to_string(),
-            ));
-        }
-        return Ok(SidecarOutcome::None);
+    if files.is_empty() && advisory.is_none() {
+        return Ok(None);
     }
 
-    if signed {
-        // We did delete metadata, but still warn about the signature.
-        // Return Updated so the caller sees the actionable change; the
-        // CLI envelope can layer an advisory event on top.
-        return Ok(SidecarOutcome::Updated(touched));
-    }
-
-    Ok(SidecarOutcome::Updated(touched))
+    Ok(Some(SidecarPayload { files, advisory }))
 }
 
 /// Return true if the directory contains any `*.nupkg.sha512` file —
@@ -97,10 +107,11 @@ mod tests {
             .unwrap();
 
         let out = fixup(d.path()).await.unwrap();
-        assert_eq!(
-            out,
-            SidecarOutcome::Updated(vec![METADATA_FILE.to_string()])
-        );
+        let payload = out.expect("metadata existed, expect a payload");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].path, METADATA_FILE);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Deleted);
+        assert!(payload.advisory.is_none());
         // File is gone.
         assert!(tokio::fs::metadata(d.path().join(METADATA_FILE))
             .await
@@ -111,30 +122,31 @@ mod tests {
     async fn no_metadata_yields_none() {
         let d = tempfile::tempdir().unwrap();
         let out = fixup(d.path()).await.unwrap();
-        assert_eq!(out, SidecarOutcome::None);
+        assert!(out.is_none());
     }
 
     /// Signed package (sha512 sidecar present) but no metadata to
-    /// delete: surface the advisory so the operator knows.
+    /// delete: payload carries an advisory only.
     #[tokio::test]
-    async fn signed_without_metadata_returns_advisory() {
+    async fn signed_without_metadata_returns_advisory_only() {
         let d = tempfile::tempdir().unwrap();
         tokio::fs::write(d.path().join("pkg.1.0.0.nupkg.sha512"), b"hash")
             .await
             .unwrap();
 
         let out = fixup(d.path()).await.unwrap();
-        match out {
-            SidecarOutcome::Advisory(s) => assert!(s.contains("sha512")),
-            other => panic!("expected Advisory, got {other:?}"),
-        }
+        let payload = out.expect("signed package expects a payload");
+        assert!(payload.files.is_empty());
+        let adv = payload.advisory.expect("expected advisory");
+        assert_eq!(adv.code, SidecarAdvisoryCode::NugetSignedPackageTampered);
+        assert_eq!(adv.severity, SidecarSeverity::Warning);
     }
 
-    /// Signed package WITH metadata: we delete metadata and report
-    /// Updated. (A separate advisory event for the signature is up
-    /// to the CLI layer to emit.)
+    /// Signed package WITH metadata: the typed payload now carries
+    /// BOTH the file entry and the advisory — the lossy collapse
+    /// from the old design is fixed.
     #[tokio::test]
-    async fn signed_with_metadata_deletes_and_reports() {
+    async fn signed_with_metadata_carries_files_and_advisory() {
         let d = tempfile::tempdir().unwrap();
         tokio::fs::write(d.path().join(METADATA_FILE), b"{}")
             .await
@@ -144,10 +156,13 @@ mod tests {
             .unwrap();
 
         let out = fixup(d.path()).await.unwrap();
-        match out {
-            SidecarOutcome::Updated(v) => assert_eq!(v, vec![METADATA_FILE.to_string()]),
-            other => panic!("expected Updated, got {other:?}"),
-        }
+        let payload = out.expect("expect a payload");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Deleted);
+        let adv = payload
+            .advisory
+            .expect("signed-package case must surface advisory alongside the file entry");
+        assert_eq!(adv.code, SidecarAdvisoryCode::NugetSignedPackageTampered);
         assert!(tokio::fs::metadata(d.path().join(METADATA_FILE))
             .await
             .is_err());

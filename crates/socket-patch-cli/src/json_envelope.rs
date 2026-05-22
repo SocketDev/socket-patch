@@ -26,6 +26,11 @@
 
 use serde::Serialize;
 
+pub use socket_patch_core::patch::sidecars::{
+    SidecarAdvisory, SidecarAdvisoryCode, SidecarFile, SidecarFileAction, SidecarRecord,
+    SidecarSeverity,
+};
+
 /// Top-level JSON envelope emitted by every `--json` invocation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +58,22 @@ pub struct Envelope {
     /// mode, etc.). Implies `events` is empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<EnvelopeError>,
+    /// Per-package sidecar fixup records. Each entry describes what
+    /// the post-apply integrity fixup did for one package — rewriting
+    /// `.cargo-checksum.json`, deleting `.nupkg.metadata`, surfacing
+    /// an advisory for PyPI / gem / Go, etc.
+    ///
+    /// Top-level (not per-event) so consumers can iterate sidecar
+    /// outcomes directly with `jq '.sidecars[]'`. Records carry
+    /// `purl` so a consumer that needs the matching apply event can
+    /// JOIN against `events[]`.
+    ///
+    /// Empty (and omitted from JSON via `skip_serializing_if`) for
+    /// commands that don't produce sidecar work — `rollback`,
+    /// `repair`, `list`, etc. — and for apply runs against ecosystems
+    /// with no sidecar contract (e.g. npm).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<SidecarRecord>,
 }
 
 impl Envelope {
@@ -67,6 +88,7 @@ impl Envelope {
             events: Vec::new(),
             summary: Summary::default(),
             error: None,
+            sidecars: Vec::new(),
         }
     }
 
@@ -76,6 +98,13 @@ impl Envelope {
     pub fn record(&mut self, event: PatchEvent) {
         self.summary.bump(event.action, event.bytes.unwrap_or(0));
         self.events.push(event);
+    }
+
+    /// Append a sidecar fixup record. Called once per `ApplyResult`
+    /// whose `sidecar` field is `Some`. Order matches the order
+    /// `apply` processed packages, which is best-effort.
+    pub fn record_sidecar(&mut self, sidecar: SidecarRecord) {
+        self.sidecars.push(sidecar);
     }
 
     /// Mark the run as a partial failure. Idempotent.

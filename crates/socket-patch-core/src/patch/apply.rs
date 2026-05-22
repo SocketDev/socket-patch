@@ -92,15 +92,15 @@ pub struct ApplyResult {
     /// populated for files in `files_patched`.
     pub applied_via: HashMap<String, AppliedVia>,
     pub error: Option<String>,
-    /// Ecosystem sidecar files that were rewritten or deleted as part
-    /// of this apply (e.g. `.cargo-checksum.json`, `.nupkg.metadata`).
-    /// Paths are relative to `pkg_path`. Empty when no sidecar
-    /// applied or when the ecosystem only emits an advisory.
-    pub sidecars_updated: Vec<String>,
-    /// One-line advisory for the operator about post-apply tooling
-    /// behavior (e.g. "PyPI: pip check may flag RECORD inconsistency").
-    /// None when no advisory applies.
-    pub sidecar_advisory: Option<String>,
+    /// Ecosystem sidecar fixup outcome — a typed
+    /// [`SidecarRecord`](crate::patch::sidecars::SidecarRecord) carrying
+    /// per-file actions (rewritten / deleted / created) and an
+    /// optional structured advisory. `None` when no sidecar
+    /// applied (e.g. npm) or when no files were patched.
+    ///
+    /// Surfaced in the CLI JSON envelope under
+    /// `Envelope.sidecars[]` (top-level, not per-event).
+    pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
 }
 
 /// Normalize file path by removing the "package/" prefix if present.
@@ -456,8 +456,7 @@ pub async fn apply_package_patch(
         files_patched: Vec::new(),
         applied_via: HashMap::new(),
         error: None,
-        sidecars_updated: Vec::new(),
-        sidecar_advisory: None,
+        sidecar: None,
     };
 
     // First, verify all files
@@ -629,30 +628,32 @@ pub async fn apply_package_patch(
 
     // Ecosystem sidecar fixup. Best-effort: a failing sidecar does
     // NOT undo the patch (the bytes were committed atomically via
-    // stage+rename; nothing to roll back). Errors surface as an
-    // advisory string so the CLI envelope can carry them under
-    // `event.details`.
+    // stage+rename; nothing to roll back). The error path is
+    // converted at this boundary into a `SidecarRecord` carrying
+    // `SidecarAdvisoryCode::SidecarFixupFailed` so downstream
+    // consumers see a uniform shape regardless of whether the
+    // fixup succeeded, was advisory-only, or raised an error.
     if !result.files_patched.is_empty() {
-        match crate::patch::sidecars::dispatch_fixup(
-            package_key,
-            pkg_path,
-            &result.files_patched,
-            files,
-        )
-        .await
-        {
-            Ok(crate::patch::sidecars::SidecarOutcome::Updated(touched)) => {
-                result.sidecars_updated = touched;
-            }
-            Ok(crate::patch::sidecars::SidecarOutcome::Advisory(msg)) => {
-                result.sidecar_advisory = Some(msg);
-            }
-            Ok(crate::patch::sidecars::SidecarOutcome::None) => {}
+        use crate::patch::sidecars::{
+            dispatch_fixup, SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord, SidecarSeverity,
+        };
+        match dispatch_fixup(package_key, pkg_path, &result.files_patched, files).await {
+            Ok(Some(record)) => result.sidecar = Some(record),
+            Ok(None) => {}
             Err(e) => {
-                result.sidecar_advisory = Some(format!(
-                    "sidecar fixup failed (patch still applied): {}",
-                    e
-                ));
+                let ecosystem = crate::crawlers::Ecosystem::from_purl(package_key)
+                    .map(|eco| eco.cli_name().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                result.sidecar = Some(SidecarRecord {
+                    purl: package_key.to_string(),
+                    ecosystem,
+                    files: Vec::new(),
+                    advisory: Some(SidecarAdvisory {
+                        code: SidecarAdvisoryCode::SidecarFixupFailed,
+                        severity: SidecarSeverity::Error,
+                        message: format!("sidecar fixup failed (patch still applied): {}", e),
+                    }),
+                });
             }
         }
     }
