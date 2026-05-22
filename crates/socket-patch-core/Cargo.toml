@@ -36,3 +36,4 @@ nuget = []
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+serial_test = { workspace = true }
