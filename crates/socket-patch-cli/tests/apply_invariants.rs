@@ -192,3 +192,36 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
         "apply must not mutate .socket/ on the no-match path; hash changed"
     );
 }
+
+/// Apply against a directory with NO `.socket/` folder at all
+/// emits a `status: "noManifest"` envelope in JSON mode and exits
+/// 0 (not an error — there's just nothing to do). Covers the
+/// early-return branch at the top of `commands::apply::run`.
+#[test]
+fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Note: NO .socket/ directory at all — completely fresh tree.
+    let (code, stdout) = run_apply(tmp.path(), &[]);
+    assert_eq!(code, 0, "no-manifest is not an error; stdout=\n{stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("envelope must be valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(v["status"], "noManifest");
+}
+
+/// Non-JSON / silent flag: same no-manifest case but in human
+/// (non-JSON) mode with `--silent` suppresses the friendly
+/// message. Exit still 0. Locks the silent-mode short-circuit.
+#[test]
+fn apply_with_no_socket_dir_silent_emits_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args(["apply", "--silent"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(), "silent must produce no stdout; got {stdout:?}");
+}
