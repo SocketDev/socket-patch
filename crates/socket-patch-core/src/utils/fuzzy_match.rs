@@ -13,8 +13,12 @@ use crate::crawlers::types::CrawledPackage;
 /// 4. Prefix match on package name
 /// 5. Contains match on full name
 /// 6. Contains match on package name
+///
+/// Internal to this module — `fuzzy_match_packages` is the only
+/// external entry point and it returns plain `Vec<CrawledPackage>`
+/// (sorted), so callers never see the match-type tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MatchType {
+enum MatchType {
     /// Exact match on full name (including namespace).
     ExactFull = 0,
     /// Exact match on package name only.
@@ -136,16 +140,6 @@ pub fn fuzzy_match_packages(
         .collect()
 }
 
-/// Check if a string looks like a PURL.
-pub fn is_purl(s: &str) -> bool {
-    s.starts_with("pkg:")
-}
-
-/// Check if a string looks like a scoped npm package name.
-pub fn is_scoped_package(s: &str) -> bool {
-    s.starts_with('@') && s.contains('/')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,19 +242,4 @@ mod tests {
         assert_eq!(results.len(), 10);
     }
 
-    #[test]
-    fn test_is_purl() {
-        assert!(is_purl("pkg:npm/lodash@4.17.21"));
-        assert!(is_purl("pkg:pypi/requests@2.28.0"));
-        assert!(!is_purl("lodash"));
-        assert!(!is_purl("@types/node"));
-    }
-
-    #[test]
-    fn test_is_scoped_package() {
-        assert!(is_scoped_package("@types/node"));
-        assert!(is_scoped_package("@scope/pkg"));
-        assert!(!is_scoped_package("lodash"));
-        assert!(!is_scoped_package("@scope"));
-    }
 }
