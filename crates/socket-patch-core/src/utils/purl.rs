@@ -182,14 +182,6 @@ pub fn is_purl(s: &str) -> bool {
     s.starts_with("pkg:")
 }
 
-/// Build an npm PURL from components.
-pub fn build_npm_purl(namespace: Option<&str>, name: &str, version: &str) -> String {
-    match namespace {
-        Some(ns) => format!("pkg:npm/{}/{name}@{version}", ns),
-        None => format!("pkg:npm/{name}@{version}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,18 +219,6 @@ mod tests {
         assert!(is_purl("pkg:pypi/requests@2.28.0"));
         assert!(!is_purl("lodash"));
         assert!(!is_purl("CVE-2024-1234"));
-    }
-
-    #[test]
-    fn test_build_npm_purl() {
-        assert_eq!(
-            build_npm_purl(None, "lodash", "4.17.21"),
-            "pkg:npm/lodash@4.17.21"
-        );
-        assert_eq!(
-            build_npm_purl(Some("@types"), "node", "20.0.0"),
-            "pkg:npm/@types/node@20.0.0"
-        );
     }
 
     #[cfg(feature = "cargo")]
