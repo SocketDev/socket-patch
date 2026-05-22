@@ -32,40 +32,54 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn has_python3() -> bool {
-    Command::new("python3")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Resolve an available Python executable. Tries `python3` (Unix
+/// convention) first, then `python` (the canonical Windows name —
+/// `python3` is uncommon on Windows installs) and finally `py` (the
+/// Windows launcher). Mirrors `find_python_command` in the core
+/// crawler so the test environment matches what the crawler probes.
+fn find_python() -> Option<&'static str> {
+    for cmd in ["python3", "python", "py"] {
+        let ok = Command::new(cmd)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(cmd);
+        }
+    }
+    None
 }
 
-/// `install_six` + `find_site_packages` assume a Unix-style venv layout
-/// (`bin/pip`, `lib/pythonX.Y/site-packages/`). On Windows the layout is
-/// `Scripts\pip.exe` + `Lib\site-packages\`. Rather than fork the helpers
-/// per platform we skip the whole file on Windows — the same coverage is
-/// available via the Linux test runner and the docker_e2e_pypi suite.
-fn skip_unsupported_platform() -> bool {
+fn has_python3() -> bool {
+    find_python().is_some()
+}
+
+/// Path to `pip` inside the given venv. PEP-405 mandates a different
+/// layout per platform: `Scripts\pip.exe` on Windows,
+/// `bin/pip` on Unix.
+fn venv_pip(venv: &Path) -> PathBuf {
     if cfg!(windows) {
-        eprintln!("skipping: in-process pypi tests assume a Unix venv layout");
-        return true;
+        venv.join("Scripts").join("pip.exe")
+    } else {
+        venv.join("bin").join("pip")
     }
-    false
 }
 
 /// Install the test package in a venv inside `tmp`. Returns the path
 /// to the installed `six.py` file.
 fn install_six(tmp: &Path) -> PathBuf {
     let venv = tmp.join(".venv");
-    let status = Command::new("python3")
+    let python = find_python().expect("python interpreter not on PATH");
+    let status = Command::new(python)
         .args(["-m", "venv", venv.to_str().unwrap()])
         .status()
-        .expect("python3 venv");
+        .expect("python venv");
     assert!(status.success(), "failed to create venv");
 
-    let pip = venv.join("bin/pip");
+    let pip = venv_pip(&venv);
     let status = Command::new(&pip)
         .args([
             "install",
@@ -78,28 +92,39 @@ fn install_six(tmp: &Path) -> PathBuf {
         .expect("pip install");
     assert!(status.success(), "failed to install {PYPI_PACKAGE}");
 
-    // Find the installed six.py file. Layout: .venv/lib/python3.X/site-packages/six.py
-    // We don't know the exact python version, so glob it.
-    let lib = venv.join("lib");
-    let entries = std::fs::read_dir(&lib).expect("lib dir");
-    for entry in entries.flatten() {
-        let candidate = entry.path().join("site-packages").join("six.py");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    panic!("six.py not found under {}", lib.display());
+    let candidate = find_site_packages(&venv).join("six.py");
+    assert!(
+        candidate.exists(),
+        "six.py not found at {} after pip install",
+        candidate.display()
+    );
+    candidate
 }
 
+/// Locate the venv's `site-packages` directory. The layout depends on
+/// platform per PEP-405:
+///  * Unix: `<venv>/lib/python<MAJOR>.<MINOR>/site-packages/` — the
+///    interpreter version is part of the path so we glob it.
+///  * Windows: `<venv>\Lib\site-packages\` — no version subdirectory.
 fn find_site_packages(venv: &Path) -> PathBuf {
-    let lib = venv.join("lib");
-    for entry in std::fs::read_dir(&lib).expect("lib dir").flatten() {
-        let sp = entry.path().join("site-packages");
-        if sp.exists() {
-            return sp;
+    if cfg!(windows) {
+        let sp = venv.join("Lib").join("site-packages");
+        assert!(
+            sp.exists(),
+            "Windows venv site-packages not found at {}",
+            sp.display()
+        );
+        sp
+    } else {
+        let lib = venv.join("lib");
+        for entry in std::fs::read_dir(&lib).expect("lib dir").flatten() {
+            let sp = entry.path().join("site-packages");
+            if sp.exists() {
+                return sp;
+            }
         }
+        panic!("site-packages not found under {}", lib.display());
     }
-    panic!("site-packages not found");
 }
 
 async fn setup_pypi_apply_mock(
@@ -177,7 +202,6 @@ async fn pypi_install_scan_sync_patches_real_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
-    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -241,7 +265,6 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
-    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -317,7 +340,6 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         println!("SKIP: python3 not on PATH");
         return;
     }
-    if skip_unsupported_platform() { return; }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let six_path = install_six(tmp.path());
@@ -370,7 +392,6 @@ async fn pypi_crawler_finds_real_installed_six() {
         println!("SKIP: python3 not on PATH");
         return;
     }
-    if skip_unsupported_platform() { return; }
     let tmp = tempfile::tempdir().expect("tempdir");
     let _ = install_six(tmp.path());
 
