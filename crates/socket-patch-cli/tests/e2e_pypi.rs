@@ -242,14 +242,21 @@ fn test_pypi_full_lifecycle() {
     }
 
     // -- LIST: verify JSON output ------------------------------------------
+    // v3.0 envelope: `list --json` emits {command,status,events,summary}
+    // with one `discovered` event per manifest entry. Vulnerabilities
+    // live under `details.vulnerabilities[]`.
     let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
     let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let patches = list["patches"].as_array().expect("patches array");
+    let events = list["events"].as_array().expect("envelope events array");
+    let patches: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["action"] == "discovered")
+        .collect();
     assert_eq!(patches.len(), 1, "should have exactly one patch");
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), PYPI_UUID);
 
     // Verify vulnerability
-    let vulns = patches[0]["vulnerabilities"]
+    let vulns = patches[0]["details"]["vulnerabilities"]
         .as_array()
         .expect("vulnerabilities array");
     assert!(!vulns.is_empty(), "should have vulnerability info");

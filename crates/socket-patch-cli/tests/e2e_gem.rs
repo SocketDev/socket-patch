@@ -332,14 +332,21 @@ fn test_gem_full_lifecycle() {
     assert_after_hashes(&gem_dir, files);
 
     // -- LIST: verify JSON output ---------------------------------------------
+    // v3.0 envelope: `list --json` emits {command,status,events,summary}
+    // with one `discovered` event per manifest entry. Vulnerabilities
+    // live under `details.vulnerabilities[]`.
     let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
     let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let patches = list["patches"].as_array().expect("patches should be an array");
+    let events = list["events"].as_array().expect("envelope events array");
+    let patches: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["action"] == "discovered")
+        .collect();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), GEM_UUID);
     assert_eq!(patches[0]["purl"].as_str().unwrap(), GEM_PURL);
 
-    let vulns = patches[0]["vulnerabilities"]
+    let vulns = patches[0]["details"]["vulnerabilities"]
         .as_array()
         .expect("vulnerabilities array");
     assert!(!vulns.is_empty(), "patch should report at least one vulnerability");
