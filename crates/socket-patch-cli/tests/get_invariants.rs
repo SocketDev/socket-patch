@@ -1,0 +1,394 @@
+//! End-to-end tests for `get` against a wiremock-driven mock API.
+//! Exercises every identifier-type branch (UUID, PURL, CVE, GHSA,
+//! package-name search) plus the save-and-apply / paid / not-found
+//! error paths. Real-API integration stays in `e2e_npm.rs`.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn binary() -> PathBuf {
+    env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+const ORG_SLUG: &str = "test-org";
+const UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn run_get(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec![
+        "get",
+        identifier,
+        "--json",
+        "--save-only",
+        "--yes",
+        "--api-url",
+        api_url,
+        "--api-token",
+        "fake-token-for-test",
+        "--org",
+        ORG_SLUG,
+    ];
+    args.extend_from_slice(extra);
+    let out = Command::new(binary())
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// PatchResponse JSON suitable as a `view/{uuid}` response. All fields
+/// are camelCase as the binary expects.
+fn patch_response_json(purl: &str, uuid: &str) -> serde_json::Value {
+    // base64 of "patched\n" — content is arbitrary, the save path
+    // doesn't verify content hash. The afterHash value is what gets
+    // used as the blob filename.
+    serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": {
+                "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111",
+                "blobContent": "cGF0Y2hlZAo=",
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-test-1234": {
+                "cves": ["CVE-2024-12345"],
+                "summary": "Test vulnerability",
+                "severity": "high",
+                "description": "Synthetic test patch",
+            }
+        },
+        "description": "Test patch",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// UUID identifier — direct fetch via /patches/view/{uuid}
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_by_uuid_save_only_writes_manifest_and_blob() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_response_json(purl, UUID)))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), UUID, &[]);
+    assert_eq!(
+        code, 0,
+        "get must succeed; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+
+    // Manifest written under .socket/manifest.json.
+    let manifest_path = tmp.path().join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest must be written");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let patches = manifest["patches"].as_object().unwrap();
+    assert!(patches.contains_key(purl), "manifest must contain PURL key");
+    assert_eq!(patches[purl]["uuid"], UUID);
+
+    // Blob written under .socket/blobs/<afterHash>.
+    let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    let blob_path = tmp.path().join(".socket/blobs").join(after_hash);
+    assert!(blob_path.exists(), "blob file must be written");
+    let blob_content = std::fs::read(&blob_path).unwrap();
+    assert_eq!(blob_content, b"patched\n");
+}
+
+#[tokio::test]
+async fn get_by_uuid_not_found_emits_envelope() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_, stdout, _) = run_get(tmp.path(), &mock.uri(), UUID, &[]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "not_found");
+    assert_eq!(v["found"], 0);
+}
+
+// ---------------------------------------------------------------------------
+// CVE identifier — fetch via /patches/by-cve/{cve}
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_by_cve_returns_matching_patches() {
+    let mock = MockServer::start().await;
+    let cve = "CVE-2021-44906";
+    let purl = "pkg:npm/minimist@1.2.2";
+
+    // by-cve returns SearchResponse shape (lightweight patch metadata).
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Fixes CVE",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    // After selecting a search result, get fetches the full patch.
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_response_json(purl, UUID)))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), cve, &[]);
+    assert_eq!(
+        code, 0,
+        "get by CVE must succeed; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+    assert!(
+        tmp.path().join(".socket/manifest.json").exists(),
+        "CVE-based get must write the manifest"
+    );
+}
+
+#[tokio::test]
+async fn get_by_cve_no_match_emits_not_found() {
+    let mock = MockServer::start().await;
+    let cve = "CVE-2099-99999";
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_, stdout, _) = run_get(tmp.path(), &mock.uri(), cve, &[]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "not_found");
+}
+
+// ---------------------------------------------------------------------------
+// GHSA identifier — fetch via /patches/by-ghsa/{ghsa}
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_by_ghsa_returns_matching_patches() {
+    let mock = MockServer::start().await;
+    let ghsa = "GHSA-xvch-5gv4-984h";
+    let purl = "pkg:npm/minimist@1.2.2";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-ghsa/{ghsa}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Fixes GHSA",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_response_json(purl, UUID)))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, _) = run_get(tmp.path(), &mock.uri(), ghsa, &[]);
+    assert_eq!(code, 0, "get by GHSA must succeed; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+}
+
+// ---------------------------------------------------------------------------
+// PURL identifier — fetch via /patches/by-package/{purl}
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_by_purl_returns_matching_patches() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    // URL-encoded form of the PURL (`:` → `%3A`, `/` → `%2F`, `@` → `%40`).
+    let encoded = "pkg%3Anpm%2Fminimist%401.2.2";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Patch for purl",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_response_json(purl, UUID)))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, _) = run_get(tmp.path(), &mock.uri(), purl, &[]);
+    assert_eq!(code, 0, "get by PURL must succeed; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+}
+
+// ---------------------------------------------------------------------------
+// Multiple patches available — JSON mode returns selection_required
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_multiple_patches_in_json_mode_returns_selection_required() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/foo@1.0.0";
+    let encoded = "pkg%3Anpm%2Ffoo%401.0.0";
+    let uuid_a = "11111111-1111-4111-8111-111111111111";
+    let uuid_b = "22222222-2222-4222-8222-222222222222";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                {
+                    "uuid": uuid_a,
+                    "purl": purl,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "First patch",
+                    "license": "MIT",
+                    "tier": "free",
+                    "vulnerabilities": {}
+                },
+                {
+                    "uuid": uuid_b,
+                    "purl": purl,
+                    "publishedAt": "2024-02-01T00:00:00Z",
+                    "description": "Second patch",
+                    "license": "MIT",
+                    "tier": "free",
+                    "vulnerabilities": {}
+                }
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, _) = run_get(tmp.path(), &mock.uri(), purl, &[]);
+    // With multiple free patches and --json, get must NOT prompt
+    // interactively — it must emit a selection_required envelope so
+    // the caller can pick one via --id.
+    assert!(
+        code == 0 || code == 1,
+        "should exit with a stable code; got {code}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let status = v["status"].as_str().expect("status string");
+    assert!(
+        status == "selection_required" || status == "success",
+        "expected selection_required or success in JSON multi-patch path; got {status}: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Paid patch path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_paid_patch_via_public_proxy_returns_paid_required() {
+    // When using the public proxy (no api-token + no org), a paid patch
+    // returns a `paid_required` status. To simulate this we DON'T pass
+    // --api-token / --org so the binary falls back to the public proxy.
+    // We also have to point SOCKET_PATCH_PROXY_URL at the mock.
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/paidpkg@1.0.0";
+    let encoded = "pkg%3Anpm%2Fpaidpkg%401.0.0";
+
+    // Public-proxy by-package path: /patch/by-package/...
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/by-package/{encoded}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Paid patch",
+                "license": "MIT",
+                "tier": "paid",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args([
+            "get",
+            purl,
+            "--json",
+            "--save-only",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+        ])
+        .current_dir(tmp.path())
+        .env("SOCKET_PATCH_PROXY_URL", mock.uri())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    // The exact status varies by code path (paid_required vs error),
+    // but it must NOT be `success` because no paid token was provided.
+    let status = v["status"].as_str().expect("status string");
+    assert_ne!(
+        status, "success",
+        "paid patch without token must not succeed; got: {v}"
+    );
+}

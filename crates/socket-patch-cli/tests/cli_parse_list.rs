@@ -42,33 +42,27 @@ fn parse_list(extra: &[&str]) -> ListArgs {
 #[test]
 fn defaults_match_contract() {
     let args = parse_list(&[]);
-    assert_eq!(args.cwd, PathBuf::from("."));
-    assert_eq!(args.manifest_path, ".socket/manifest.json");
-    assert!(!args.json);
-}
-
-#[test]
-fn manifest_path_short_form() {
-    let args = parse_list(&["-m", "custom.json"]);
-    assert_eq!(args.manifest_path, "custom.json");
+    assert_eq!(args.common.cwd, PathBuf::from("."));
+    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
+    assert!(!args.common.json);
 }
 
 #[test]
 fn manifest_path_long_form() {
     let args = parse_list(&["--manifest-path", "custom.json"]);
-    assert_eq!(args.manifest_path, "custom.json");
+    assert_eq!(args.common.manifest_path, "custom.json");
 }
 
 #[test]
 fn cwd_long_form() {
     let args = parse_list(&["--cwd", "/tmp/x"]);
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
 }
 
 #[test]
 fn json_flag_sets_true() {
     let args = parse_list(&["--json"]);
-    assert!(args.json);
+    assert!(args.common.json);
 }
 
 #[test]
@@ -130,9 +124,12 @@ fn populated_manifest() -> PatchManifest {
 async fn missing_manifest_returns_1_plain() {
     let tmp = tempfile::tempdir().unwrap();
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: false,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 1);
 }
@@ -141,9 +138,12 @@ async fn missing_manifest_returns_1_plain() {
 async fn missing_manifest_returns_1_json() {
     let tmp = tempfile::tempdir().unwrap();
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: true,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 1);
 }
@@ -160,9 +160,12 @@ async fn empty_manifest_returns_0_plain() {
         .unwrap();
 
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: false,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 0);
 }
@@ -179,9 +182,12 @@ async fn empty_manifest_returns_0_json() {
         .unwrap();
 
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: true,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 0);
 }
@@ -198,9 +204,12 @@ async fn populated_manifest_returns_0_plain() {
         .unwrap();
 
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: false,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 0);
 }
@@ -217,9 +226,12 @@ async fn populated_manifest_returns_0_json() {
         .unwrap();
 
     let args = ListArgs {
-        cwd: tmp.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".into(),
-        json: true,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".into(),
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 0);
 }
@@ -238,9 +250,12 @@ async fn absolute_manifest_path_wins_over_cwd() {
         .unwrap();
 
     let args = ListArgs {
-        cwd: tmp_cwd.path().to_path_buf(),
-        manifest_path: abs_path.to_string_lossy().into_owned(),
-        json: false,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp_cwd.path().to_path_buf(),
+            manifest_path: abs_path.to_string_lossy().into_owned(),
+            json: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     assert_eq!(run(args).await, 0);
 }
@@ -251,6 +266,9 @@ async fn absolute_manifest_path_wins_over_cwd() {
 
 #[test]
 fn missing_manifest_json_status_is_error_via_binary() {
+    // Pins the new unified envelope shape for `list --json` when the
+    // manifest doesn't exist. Top-level keys: command, status, error
+    // (object with code + message), plus the usual envelope fields.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
         .args([
@@ -272,18 +290,12 @@ fn missing_manifest_json_status_is_error_via_binary() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-    assert_eq!(
-        parsed.get("status").and_then(|v| v.as_str()),
-        Some("error"),
-        "status must be \"error\", got {parsed}"
-    );
-    assert_eq!(
-        parsed.get("error").and_then(|v| v.as_str()),
-        Some("Manifest not found"),
-        "error message must be exact, got {parsed}"
-    );
+    assert_eq!(parsed["command"], "list");
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["error"]["code"], "manifest_not_found");
+    let msg = parsed["error"]["message"].as_str().expect("error message");
     assert!(
-        parsed.get("path").and_then(|v| v.as_str()).is_some(),
-        "missing-manifest JSON must include `path` key, got {parsed}"
+        msg.contains("Manifest not found"),
+        "error.message must include 'Manifest not found', got: {msg}"
     );
 }

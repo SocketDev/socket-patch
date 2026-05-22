@@ -1,0 +1,19 @@
+# cargo (Rust) ecosystem test image: base already has Rust via the base
+# layer's builder stage, but the runtime stage doesn't keep the toolchain.
+# Install Rust here so tests can `cargo build` real crates.
+FROM socket-patch-test-base:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      pkg-config \
+      libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install rustup-managed Rust toolchain. Same channel as the base
+# builder for consistency. `-y` for non-interactive.
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH=$CARGO_HOME/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.1 --profile minimal \
+ && rustc --version && cargo --version

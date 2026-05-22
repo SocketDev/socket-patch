@@ -28,27 +28,27 @@ fn parse_get(extra: &[&str]) -> GetArgs {
 fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
     assert_eq!(a.identifier, "some-id");
-    assert_eq!(a.org, None);
-    assert_eq!(a.cwd, PathBuf::from("."));
+    assert_eq!(a.common.org, None);
+    assert_eq!(a.common.cwd, PathBuf::from("."));
     assert!(!a.id);
     assert!(!a.cve);
     assert!(!a.ghsa);
     assert!(!a.package);
-    assert!(!a.yes);
-    assert_eq!(a.api_url, None);
-    assert_eq!(a.api_token, None);
+    assert!(!a.common.yes);
+    assert_eq!(a.common.api_url, "https://api.socket.dev");
+    assert_eq!(a.common.api_token, None);
     assert!(!a.save_only);
-    assert!(!a.global);
-    assert_eq!(a.global_prefix, None);
+    assert!(!a.common.global);
+    assert_eq!(a.common.global_prefix, None);
     assert!(!a.one_off);
-    assert!(!a.json);
-    assert_eq!(a.download_mode, "diff");
+    assert!(!a.common.json);
+    assert_eq!(a.common.download_mode, "diff");
 }
 
 #[test]
 fn default_download_mode_is_diff() {
     let a = parse_get(&["some-id"]);
-    assert_eq!(a.download_mode, "diff");
+    assert_eq!(a.common.download_mode, "diff");
 }
 
 // --- Positional --------------------------------------------------------------
@@ -76,25 +76,25 @@ fn long_package_sets_package() {
 #[test]
 fn short_y_sets_yes() {
     let a = parse_get(&["some-id", "-y"]);
-    assert!(a.yes);
+    assert!(a.common.yes);
 }
 
 #[test]
 fn long_yes_sets_yes() {
     let a = parse_get(&["some-id", "--yes"]);
-    assert!(a.yes);
+    assert!(a.common.yes);
 }
 
 #[test]
 fn short_g_sets_global() {
     let a = parse_get(&["some-id", "-g"]);
-    assert!(a.global);
+    assert!(a.common.global);
 }
 
 #[test]
 fn long_global_sets_global() {
     let a = parse_get(&["some-id", "--global"]);
-    assert!(a.global);
+    assert!(a.common.global);
 }
 
 // --- Long-only flags ---------------------------------------------------------
@@ -102,13 +102,13 @@ fn long_global_sets_global() {
 #[test]
 fn cwd_flag_sets_cwd() {
     let a = parse_get(&["some-id", "--cwd", "/tmp/project"]);
-    assert_eq!(a.cwd, PathBuf::from("/tmp/project"));
+    assert_eq!(a.common.cwd, PathBuf::from("/tmp/project"));
 }
 
 #[test]
 fn org_flag_sets_org() {
     let a = parse_get(&["some-id", "--org", "acme"]);
-    assert_eq!(a.org.as_deref(), Some("acme"));
+    assert_eq!(a.common.org.as_deref(), Some("acme"));
 }
 
 #[test]
@@ -132,19 +132,19 @@ fn ghsa_flag_sets_ghsa() {
 #[test]
 fn api_url_flag_sets_api_url() {
     let a = parse_get(&["some-id", "--api-url", "https://api.example.com"]);
-    assert_eq!(a.api_url.as_deref(), Some("https://api.example.com"));
+    assert_eq!(a.common.api_url, "https://api.example.com");
 }
 
 #[test]
 fn api_token_flag_sets_api_token() {
     let a = parse_get(&["some-id", "--api-token", "sktsec_abc"]);
-    assert_eq!(a.api_token.as_deref(), Some("sktsec_abc"));
+    assert_eq!(a.common.api_token.as_deref(), Some("sktsec_abc"));
 }
 
 #[test]
 fn global_prefix_flag_sets_global_prefix() {
     let a = parse_get(&["some-id", "--global-prefix", "/usr/local/lib"]);
-    assert_eq!(a.global_prefix, Some(PathBuf::from("/usr/local/lib")));
+    assert_eq!(a.common.global_prefix, Some(PathBuf::from("/usr/local/lib")));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn one_off_flag_sets_one_off() {
 #[test]
 fn json_flag_sets_json() {
     let a = parse_get(&["some-id", "--json"]);
-    assert!(a.json);
+    assert!(a.common.json);
 }
 
 // --- save-only / --no-apply alias -------------------------------------------
@@ -181,19 +181,19 @@ fn no_apply_hidden_alias_sets_save_only() {
 #[test]
 fn download_mode_package() {
     let a = parse_get(&["some-id", "--download-mode", "package"]);
-    assert_eq!(a.download_mode, "package");
+    assert_eq!(a.common.download_mode, "package");
 }
 
 #[test]
 fn download_mode_diff() {
     let a = parse_get(&["some-id", "--download-mode", "diff"]);
-    assert_eq!(a.download_mode, "diff");
+    assert_eq!(a.common.download_mode, "diff");
 }
 
 #[test]
 fn download_mode_file() {
     let a = parse_get(&["some-id", "--download-mode", "file"]);
-    assert_eq!(a.download_mode, "file");
+    assert_eq!(a.common.download_mode, "file");
 }
 
 // --- `download` visible alias for `get` -------------------------------------

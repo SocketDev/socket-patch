@@ -1,0 +1,13 @@
+# composer (PHP) ecosystem test image: base + PHP + Composer.
+FROM socket-patch-test-base:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      php-cli \
+      php-curl \
+      php-xml \
+      php-mbstring \
+      unzip \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
+ && php --version && composer --version

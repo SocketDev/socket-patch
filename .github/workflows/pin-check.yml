@@ -1,0 +1,52 @@
+name: Pin check
+
+# Fail-closed lint that prevents unpinned action references from sneaking back
+# into CI. Every `uses:` entry must reference a 40-character commit SHA (not a
+# tag, branch, or @latest). The repo's hardening policy is to consume third-
+# party actions only by immutable digest.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify all `uses:` references are SHA-pinned
+        run: |
+          set -eu
+          # Match any `uses:` line that does NOT reference @<40-char-hex>.
+          # Allowlist:
+          #   - local actions referenced by `uses: ./.github/actions/foo`
+          #   - `uses: docker://image@sha256:<digest>`
+          violations="$(
+            grep -rEn '^\s*uses:\s*' .github/workflows .github/actions 2>/dev/null \
+              | grep -vE 'uses:\s*\./' \
+              | grep -vE 'uses:\s*docker://[^[:space:]]+@sha256:[0-9a-f]{64}' \
+              | grep -vE 'uses:\s*[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$|#)' \
+              || true
+          )"
+          if [ -n "$violations" ]; then
+            echo "::error::Unpinned action references found. Pin to a 40-char commit SHA."
+            echo "$violations"
+            exit 1
+          fi
+          echo "All action references are SHA-pinned."

@@ -34,10 +34,10 @@ fn parse_setup(extra: &[&str]) -> SetupArgs {
 #[test]
 fn defaults_with_no_flags() {
     let args = parse_setup(&[]);
-    assert_eq!(args.cwd, PathBuf::from("."));
-    assert!(!args.dry_run);
-    assert!(!args.yes);
-    assert!(!args.json);
+    assert_eq!(args.common.cwd, PathBuf::from("."));
+    assert!(!args.common.dry_run);
+    assert!(!args.common.yes);
+    assert!(!args.common.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -45,48 +45,42 @@ fn defaults_with_no_flags() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dry_run_short_form() {
-    let args = parse_setup(&["-d"]);
-    assert!(args.dry_run);
-}
-
-#[test]
 fn dry_run_long_form() {
     let args = parse_setup(&["--dry-run"]);
-    assert!(args.dry_run);
+    assert!(args.common.dry_run);
 }
 
 #[test]
 fn yes_short_form() {
     let args = parse_setup(&["-y"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn yes_long_form() {
     let args = parse_setup(&["--yes"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn cwd_long_form() {
     let args = parse_setup(&["--cwd", "/tmp/x"]);
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
 }
 
 #[test]
 fn json_long_form() {
     let args = parse_setup(&["--json"]);
-    assert!(args.json);
+    assert!(args.common.json);
 }
 
 #[test]
 fn all_flags_combined() {
-    let args = parse_setup(&["--cwd", "/tmp/x", "-d", "-y", "--json"]);
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
-    assert!(args.dry_run);
-    assert!(args.yes);
-    assert!(args.json);
+    let args = parse_setup(&["--cwd", "/tmp/x", "--dry-run", "-y", "--json"]);
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
+    assert!(args.common.dry_run);
+    assert!(args.common.yes);
+    assert!(args.common.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,10 +105,13 @@ fn unknown_flag_is_error() {
 async fn run_empty_tempdir_exits_zero() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let args = SetupArgs {
-        cwd: tempdir.path().to_path_buf(),
-        dry_run: false,
-        yes: true,
-        json: true,
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tempdir.path().to_path_buf(),
+            dry_run: false,
+            yes: true,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
     };
     let exit = run(args).await;
     assert_eq!(

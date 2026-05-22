@@ -1,0 +1,15 @@
+# pypi ecosystem test image: base + Python 3.11 + pip + venv.
+#
+# Debian 12 ships Python 3.11. We use a venv inside each test to keep
+# pip from needing `--break-system-packages` and to match real-world
+# user flow.
+FROM socket-patch-test-base:latest
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 \
+      python3-pip \
+      python3-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 --version \
+ && pip3 --version

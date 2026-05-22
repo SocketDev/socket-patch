@@ -2,10 +2,15 @@
 set -eu
 
 # Socket Patch installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/SocketDev/socket-patch/main/scripts/install.sh | sh
+#
+# Override the version that gets installed by exporting SOCKET_PATCH_VERSION:
+#   curl -fsSL .../install.sh | SOCKET_PATCH_VERSION=3.0.0 sh
 
 REPO="SocketDev/socket-patch"
 BINARY="socket-patch"
+VERSION="${SOCKET_PATCH_VERSION:-latest}"
 
 # Detect platform
 OS="$(uname -s)"
@@ -63,6 +68,16 @@ else
   exit 1
 fi
 
+# Locate a SHA-256 implementation. shasum and sha256sum cover macOS + Linux.
+if command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | awk '{print $1}'; }
+else
+  echo "Error: shasum or sha256sum is required for integrity verification" >&2
+  exit 1
+fi
+
 # Pick install directory
 if [ -w /usr/local/bin ]; then
   INSTALL_DIR="/usr/local/bin"
@@ -75,14 +90,44 @@ fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Download and extract
-URL="https://github.com/${REPO}/releases/latest/download/${BINARY}-${TARGET}.tar.gz"
-echo "Downloading ${BINARY} for ${TARGET}..."
-download "$TMPDIR/${BINARY}.tar.gz" "$URL"
-tar xzf "$TMPDIR/${BINARY}.tar.gz" -C "$TMPDIR"
+# Pick the release path. "latest" resolves on GitHub's side; tagged versions are
+# served from /releases/download/v<version>/.
+if [ "$VERSION" = "latest" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+else
+  BASE_URL="https://github.com/${REPO}/releases/download/v${VERSION#v}"
+fi
+
+ARCHIVE="${BINARY}-${TARGET}.tar.gz"
+ARCHIVE_URL="${BASE_URL}/${ARCHIVE}"
+SHA_URL="${BASE_URL}/SHA256SUMS"
+
+echo "Downloading ${ARCHIVE}..."
+download "${TMPDIR}/${ARCHIVE}" "${ARCHIVE_URL}"
+
+echo "Downloading SHA256SUMS..."
+download "${TMPDIR}/SHA256SUMS" "${SHA_URL}"
+
+# Verify the tarball matches the published checksum before extraction. The
+# SHA256SUMS file follows the standard "<hex>  <filename>" format, one line
+# per release artifact.
+EXPECTED="$(awk -v a="${ARCHIVE}" '$2 == a || $2 == "*"a {print $1; exit}' "${TMPDIR}/SHA256SUMS")"
+if [ -z "${EXPECTED}" ]; then
+  echo "Error: no checksum entry for ${ARCHIVE} in SHA256SUMS" >&2
+  exit 1
+fi
+ACTUAL="$(sha256 "${TMPDIR}/${ARCHIVE}")"
+if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+  echo "Error: checksum mismatch for ${ARCHIVE}" >&2
+  echo "  expected: ${EXPECTED}" >&2
+  echo "  actual:   ${ACTUAL}" >&2
+  exit 1
+fi
+
+tar xzf "${TMPDIR}/${ARCHIVE}" -C "${TMPDIR}"
 
 # Install
-install -m 755 "$TMPDIR/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+install -m 755 "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
 echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
 
 # Print version

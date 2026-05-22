@@ -1,0 +1,47 @@
+# Base image for socket-patch's Docker-driven e2e tests.
+#
+# Multi-stage build:
+#   Stage 1 (`builder`): rust:1.93-slim compiles socket-patch from source
+#       once. Subsequent ecosystem images share this layer via FROM.
+#   Stage 2 (`runtime`): debian:12-slim + the compiled binary at
+#       /usr/local/bin/socket-patch. Per-ecosystem Dockerfiles extend this.
+#
+# Pinning: both base images are pinned by sha256 digest per the repo's
+# Docker pin policy.
+
+# ----------------------------------------------------------------------
+# Stage 1: builder
+# ----------------------------------------------------------------------
+FROM rust@sha256:5b9332190bb3b9ece73b810cd1f1e9f06343b294ce184bcb067f0747d7d333ea AS builder
+
+WORKDIR /src
+
+# Copy the workspace manifest first to maximize Docker's build cache:
+# changes to source files don't bust the dep-compile layer.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+
+# Build all features so every ecosystem dispatch path compiles into the
+# binary. `--locked` enforces Cargo.lock is honored exactly.
+RUN cargo build --release --workspace --all-features --locked --bin socket-patch \
+ && cp target/release/socket-patch /out-socket-patch
+
+# ----------------------------------------------------------------------
+# Stage 2: runtime
+# ----------------------------------------------------------------------
+FROM debian@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb
+
+# Common runtime utilities every ecosystem test needs.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      tar \
+      gzip \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /out-socket-patch /usr/local/bin/socket-patch
+RUN chmod +x /usr/local/bin/socket-patch && socket-patch --version
+
+WORKDIR /workspace

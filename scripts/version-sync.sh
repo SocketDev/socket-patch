@@ -9,8 +9,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$REPO_ROOT/Cargo.toml"
 rm -f "$REPO_ROOT/Cargo.toml.bak"
 
-# Update socket-patch-core workspace dependency version (needed for cargo publish)
-sed -i.bak "s/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \".*\" }/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \"$VERSION\" }/" "$REPO_ROOT/Cargo.toml"
+# Update socket-patch-core workspace dependency version (needed for cargo publish).
+# The version spec is exact-pinned with a leading "=" per the repo's pinning policy.
+sed -i.bak "s/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \".*\" }/socket-patch-core = { path = \"crates\/socket-patch-core\", version = \"=$VERSION\" }/" "$REPO_ROOT/Cargo.toml"
 rm -f "$REPO_ROOT/Cargo.toml.bak"
 
 # Update npm main package version and optionalDependencies versions
@@ -26,6 +27,14 @@ node -e "
   }
   fs.writeFileSync('$pkg_json', JSON.stringify(pkg, null, 2) + '\n');
 "
+
+# Refresh the npm wrapper lockfile so package-lock.json stays in sync with the
+# bumped package.json (own version, optionalDependencies). Uses --package-lock-only
+# so node_modules is untouched.
+(
+  cd "$REPO_ROOT/npm/socket-patch"
+  npm install --package-lock-only --ignore-scripts >/dev/null
+)
 
 # Update all per-platform npm package versions
 for platform_dir in "$REPO_ROOT"/npm/socket-patch-*/; do

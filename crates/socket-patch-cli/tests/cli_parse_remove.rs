@@ -30,13 +30,13 @@ fn parse_remove(extra: &[&str]) -> RemoveArgs {
 fn defaults_with_purl_positional() {
     let args = parse_remove(&["pkg:npm/foo@1"]);
     assert_eq!(args.identifier, "pkg:npm/foo@1");
-    assert_eq!(args.cwd, PathBuf::from("."));
-    assert_eq!(args.manifest_path, ".socket/manifest.json");
+    assert_eq!(args.common.cwd, PathBuf::from("."));
+    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
     assert!(!args.skip_rollback);
-    assert!(!args.yes);
-    assert!(!args.global);
-    assert_eq!(args.global_prefix, None);
-    assert!(!args.json);
+    assert!(!args.common.yes);
+    assert!(!args.common.global);
+    assert_eq!(args.common.global_prefix, None);
+    assert!(!args.common.json);
 }
 
 #[test]
@@ -46,13 +46,13 @@ fn positional_uuid_stored_in_identifier() {
     // Everything else still at default — `remove` does not auto-detect the
     // identifier shape at parse time; the runtime branch on `pkg:` happens
     // inside `run()`.
-    assert_eq!(args.cwd, PathBuf::from("."));
-    assert_eq!(args.manifest_path, ".socket/manifest.json");
+    assert_eq!(args.common.cwd, PathBuf::from("."));
+    assert_eq!(args.common.manifest_path, ".socket/manifest.json");
     assert!(!args.skip_rollback);
-    assert!(!args.yes);
-    assert!(!args.global);
-    assert_eq!(args.global_prefix, None);
-    assert!(!args.json);
+    assert!(!args.common.yes);
+    assert!(!args.common.global);
+    assert_eq!(args.common.global_prefix, None);
+    assert!(!args.common.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -62,31 +62,25 @@ fn positional_uuid_stored_in_identifier() {
 #[test]
 fn yes_short_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "-y"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn yes_long_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "--yes"]);
-    assert!(args.yes);
+    assert!(args.common.yes);
 }
 
 #[test]
 fn global_short_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "-g"]);
-    assert!(args.global);
+    assert!(args.common.global);
 }
 
 #[test]
 fn global_long_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "--global"]);
-    assert!(args.global);
-}
-
-#[test]
-fn manifest_path_short_form() {
-    let args = parse_remove(&["pkg:npm/foo@1", "-m", "custom/manifest.json"]);
-    assert_eq!(args.manifest_path, "custom/manifest.json");
+    assert!(args.common.global);
 }
 
 #[test]
@@ -96,13 +90,13 @@ fn manifest_path_long_form() {
         "--manifest-path",
         "custom/manifest.json",
     ]);
-    assert_eq!(args.manifest_path, "custom/manifest.json");
+    assert_eq!(args.common.manifest_path, "custom/manifest.json");
 }
 
 #[test]
 fn cwd_long_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "--cwd", "/tmp/x"]);
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
 }
 
 #[test]
@@ -114,7 +108,7 @@ fn skip_rollback_long_form() {
 #[test]
 fn json_long_form() {
     let args = parse_remove(&["pkg:npm/foo@1", "--json"]);
-    assert!(args.json);
+    assert!(args.common.json);
 }
 
 #[test]
@@ -124,7 +118,7 @@ fn global_prefix_long_form() {
         "--global-prefix",
         "/opt/node-global",
     ]);
-    assert_eq!(args.global_prefix, Some(PathBuf::from("/opt/node-global")));
+    assert_eq!(args.common.global_prefix, Some(PathBuf::from("/opt/node-global")));
 }
 
 #[test]
@@ -133,7 +127,7 @@ fn all_flags_combined() {
         "pkg:npm/foo@1",
         "--cwd",
         "/tmp/x",
-        "-m",
+        "--manifest-path",
         "custom/manifest.json",
         "--skip-rollback",
         "-y",
@@ -143,13 +137,13 @@ fn all_flags_combined() {
         "--json",
     ]);
     assert_eq!(args.identifier, "pkg:npm/foo@1");
-    assert_eq!(args.cwd, PathBuf::from("/tmp/x"));
-    assert_eq!(args.manifest_path, "custom/manifest.json");
+    assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(args.common.manifest_path, "custom/manifest.json");
     assert!(args.skip_rollback);
-    assert!(args.yes);
-    assert!(args.global);
-    assert_eq!(args.global_prefix, Some(PathBuf::from("/opt/node-global")));
-    assert!(args.json);
+    assert!(args.common.yes);
+    assert!(args.common.global);
+    assert_eq!(args.common.global_prefix, Some(PathBuf::from("/opt/node-global")));
+    assert!(args.common.json);
 }
 
 // ---------------------------------------------------------------------------
@@ -189,14 +183,17 @@ fn unknown_flag_is_error() {
 async fn run_missing_manifest_exits_one() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tempdir.path().to_path_buf(),
+            manifest_path: ".socket/manifest.json".to_string(),
+            yes: true,
+            global: false,
+            global_prefix: None,
+            json: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
         identifier: "pkg:npm/foo@1".to_string(),
-        cwd: tempdir.path().to_path_buf(),
-        manifest_path: ".socket/manifest.json".to_string(),
         skip_rollback: false,
-        yes: true,
-        global: false,
-        global_prefix: None,
-        json: true,
     };
     let exit = run(args).await;
     assert_eq!(exit, 1, "missing manifest must exit 1");

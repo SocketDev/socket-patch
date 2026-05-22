@@ -163,14 +163,21 @@ fn test_npm_full_lifecycle() {
     );
 
     // -- LIST: verify JSON output ------------------------------------------
+    // v3.0 envelope: `list --json` emits {command,status,events,summary}
+    // with one `discovered` event per manifest entry. Patch metadata
+    // (vulnerabilities, tier, license, etc.) lives under `details`.
     let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
     let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let patches = list["patches"].as_array().expect("patches should be an array");
+    let events = list["events"].as_array().expect("envelope events array");
+    let patches: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["action"] == "discovered")
+        .collect();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), NPM_UUID);
     assert_eq!(patches[0]["purl"].as_str().unwrap(), NPM_PURL);
 
-    let vulns = patches[0]["vulnerabilities"]
+    let vulns = patches[0]["details"]["vulnerabilities"]
         .as_array()
         .expect("vulnerabilities array");
     assert!(!vulns.is_empty(), "patch should report at least one vulnerability");
@@ -342,9 +349,14 @@ fn test_npm_global_lifecycle() {
     );
 
     // -- LIST: verify patch in output ----------------------------------------
+    // v3.0 envelope shape — see the main lifecycle test for details.
     let (stdout, _) = assert_run_ok(cwd, &["list", "--json"], "list --json");
     let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let patches = list["patches"].as_array().expect("patches array");
+    let events = list["events"].as_array().expect("envelope events array");
+    let patches: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["action"] == "discovered")
+        .collect();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), NPM_UUID);
 

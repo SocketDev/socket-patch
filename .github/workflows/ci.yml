@@ -18,10 +18,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
-          components: clippy
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -49,9 +50,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -78,9 +81,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -95,6 +100,263 @@ jobs:
       - name: Run tests (release)
         run: cargo test --workspace --all-features --release
 
+  coverage:
+    # Code coverage via cargo-llvm-cov (LLVM source-based instrumentation).
+    # Reports as a markdown table in the job summary and uploads the raw
+    # lcov.info file as a workflow artifact. No threshold gating — this is
+    # report-only so contributors get visibility without flaky CI when
+    # coverage shifts naturally with test edits.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        # `rustup show` installs the rust-toolchain.toml channel + listed
+        # components; `rustup component add` adds the llvm-tools-preview
+        # bits cargo-llvm-cov needs to merge .profraw files into lcov.
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        # taiki-e/install-action ships precompiled binaries — much faster
+        # than `cargo install` and avoids a per-CI-run compile.
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-latest-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-latest-cargo-coverage-
+
+      - name: Run tests with coverage
+        # Two-step pattern: `--no-report` runs instrumented tests and
+        # collects the raw profile data, then the two `report` calls
+        # emit lcov + summary from the same data. Avoids re-running
+        # tests twice. The output filename matches the `*.lcov`
+        # gitignore pattern so a stray local run can't accidentally
+        # commit a 600 KB report.
+        #
+        # Explicit feature list (instead of --all-features) excludes the
+        # docker-e2e feature — those tests need Docker images this job
+        # doesn't build. The coverage-docker matrix covers them
+        # separately, and coverage-merge stitches everything together.
+        run: |
+          cargo llvm-cov --workspace \
+            --features cargo,golang,maven,composer,nuget \
+            --no-report
+          cargo llvm-cov report --lcov --output-path coverage-host.lcov
+          cargo llvm-cov report --summary-only | tee coverage-summary.txt
+
+      - name: Publish coverage summary to job summary
+        # Render the per-file table cargo-llvm-cov prints as a fenced
+        # block in the GitHub Actions job summary so reviewers don't
+        # need to crack open the artifact for a quick look.
+        run: |
+          {
+            echo "## Host coverage summary"
+            echo ""
+            echo "(In-process tests only. See coverage-merge for the"
+            echo "full picture including docker-e2e binary coverage.)"
+            echo ""
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload host LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-host
+          path: coverage-host.lcov
+          if-no-files-found: error
+          retention-days: 30
+
+  coverage-docker:
+    # Per-ecosystem coverage for the Docker-driven e2e suite. Mirrors
+    # the e2e-docker matrix but builds an instrumented socket-patch
+    # binary and mounts it into the container along with a host-
+    # visible profraw directory, so the in-container code paths
+    # contribute to the lcov merge.
+    #
+    # Hooks: docker_e2e_<eco>.rs reads SOCKET_PATCH_COV_BIN +
+    # SOCKET_PATCH_COV_PROFRAW_DIR. Both unset is the no-op default
+    # (used by the e2e-docker matrix above).
+    #
+    # Pin to ubuntu-22.04 (glibc 2.35) instead of ubuntu-latest
+    # (currently 24.04, glibc 2.39). The instrumented binary built
+    # here gets mounted into the debian:12-slim test container
+    # (glibc 2.36); a binary linked against a newer glibc than the
+    # container ships fails to load. ubuntu-22.04's older glibc is
+    # the highest base that's forward-compatible with debian:12.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # `driver: docker` makes buildx use the host docker daemon directly
+        # rather than running BuildKit in its own container. This is what
+        # lets the per-ecosystem image build see the locally-tagged
+        # `socket-patch-test-base:latest` from the previous step (with the
+        # default container driver, BuildKit runs in a sandbox that cannot
+        # see the host daemon's image store and tries to pull base from
+        # docker.io, which fails). The trade-off is that `type=gha` cache
+        # exports aren't supported under the docker driver — we accept
+        # rebuilding the images per job for correctness.
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
+
+      - name: Install Rust
+        # `rustup show` consumes rust-toolchain.toml; the explicit
+        # `component add` covers llvm-tools-preview for cargo-llvm-cov.
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 # v2.79.3
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      # No `actions/cache` here intentionally. This job builds Docker
+      # images and would be flagged by zizmor's cache-poisoning audit
+      # (a PR-poisoned cargo cache could compromise the instrumented
+      # binary we mount into the container).
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+
+      - name: Build ${{ matrix.ecosystem }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
+          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
+          load: true
+
+      - name: Build instrumented socket-patch binary
+        # Source `cargo llvm-cov show-env` into the current shell so this
+        # `cargo build` picks up RUSTC_WRAPPER=cargo-llvm-cov and the
+        # same RUSTFLAGS that the subsequent `cargo llvm-cov` test step
+        # will use. The bin we build ends up byte-compatible with the
+        # test binaries — same source hashes → unified coverage map at
+        # report time. Env stays scoped to this step (intentional;
+        # cargo llvm-cov manages its own env in the test step).
+        run: |
+          eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
+          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget
+
+      - name: Configure docker-e2e coverage hooks
+        run: |
+          echo "SOCKET_PATCH_COV_BIN=$PWD/target/debug/socket-patch" >> "$GITHUB_ENV"
+          # Profraw files from the in-container binary land here.
+          # cargo-llvm-cov scans target/ for *.profraw at report time.
+          echo "SOCKET_PATCH_COV_PROFRAW_DIR=$PWD/target" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
+        run: |
+          cargo llvm-cov \
+            --features docker-e2e,cargo,golang,maven,composer,nuget \
+            --no-report \
+            --test docker_e2e_${{ matrix.ecosystem }}
+
+      - name: Generate per-ecosystem lcov
+        run: |
+          cargo llvm-cov report \
+            --lcov \
+            --output-path coverage-docker-${{ matrix.ecosystem }}.lcov
+
+      - name: Upload per-ecosystem LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-docker-${{ matrix.ecosystem }}
+          path: coverage-docker-${{ matrix.ecosystem }}.lcov
+          if-no-files-found: error
+          retention-days: 30
+
+  coverage-merge:
+    # Merge the host coverage and per-ecosystem docker coverage into a
+    # single lcov.info. lcov(1) handles the union — same files are
+    # summed line-by-line so a line covered by ANY test counts.
+    needs: [coverage, coverage-docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: coverage-artifacts
+          pattern: coverage-*
+
+      - name: Merge LCOV files
+        # `--add-tracefile` is repeated per input. lcov sums hit counts
+        # for identical source/line keys, so files covered by both host
+        # and docker tests report the higher (union) count.
+        # `find` (not bash globstar) for portability across runners.
+        run: |
+          set -e
+          ARGS=()
+          while IFS= read -r f; do
+            ARGS+=(--add-tracefile "$f")
+          done < <(find coverage-artifacts -name '*.lcov' -type f)
+          if [ ${#ARGS[@]} -eq 0 ]; then
+            echo "No lcov files found to merge" >&2
+            exit 1
+          fi
+          lcov "${ARGS[@]}" --output-file coverage.lcov
+
+      - name: Render summary
+        # `lcov --summary` prints a per-file rollup we tee into the job
+        # summary, same shape as cargo-llvm-cov's own.
+        run: |
+          {
+            echo "## Coverage (host + docker-e2e merged)"
+            echo ""
+            echo '```'
+            lcov --summary coverage.lcov 2>&1 | tail -20
+            echo '```'
+            echo ""
+            echo "Full merged LCOV uploaded as the \`coverage-lcov\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload merged LCOV artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: coverage.lcov
+          if-no-files-found: error
+          retention-days: 30
+
   dispatch-tests:
     runs-on: ubuntu-latest
     steps:
@@ -106,7 +368,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          node-version: '20.20.2'
 
       - name: Run npm dispatch tests
         run: node --test npm/socket-patch/bin/socket-patch.test.mjs
@@ -114,7 +376,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version: '3.12.x'
 
       - name: Run pypi dispatch tests
         run: python pypi/socket-patch/test_dispatch.py
@@ -145,6 +407,10 @@ jobs:
             suite: e2e_npm
           - os: macos-latest
             suite: e2e_pypi
+          - os: ubuntu-latest
+            suite: e2e_scan
+          - os: macos-latest
+            suite: e2e_scan
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -153,9 +419,11 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          toolchain: stable
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. No third-party
+        # action dependency needed for toolchain setup.
+        run: rustup show
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -168,23 +436,90 @@ jobs:
           restore-keys: ${{ matrix.os }}-cargo-e2e-
 
       - name: Setup Node.js
-        if: matrix.suite == 'e2e_npm'
+        if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: '20.20.2'
 
       - name: Setup Python
         if: matrix.suite == 'e2e_pypi'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: '3.12.x'
 
       - name: Setup Ruby
         if: matrix.suite == 'e2e_gem'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
-          ruby-version: '3.2'
+          # setup-ruby does NOT support `3.2.x` wildcard pinning the
+          # way setup-python does — it errors with "Unknown version
+          # 3.2.x for ruby on ubuntu-24.04". Pin to an exact patch
+          # that's currently in the catalog. If the action drops this
+          # patch in the future, bump to whatever's available — see
+          # https://github.com/ruby/setup-ruby for the supported list.
+          ruby-version: '3.2.10'
           bundler-cache: false
 
       - name: Run e2e tests
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored
+
+  # ----------------------------------------------------------------------
+  # Docker-driven real-package e2e suite.
+  #
+  # For each ecosystem, builds the shared base image (multi-stage:
+  # Rust → debian + compiled socket-patch) and the per-ecosystem layer,
+  # then runs the matching `docker_e2e_<eco>` test binary inside the
+  # repo's checkout. Tests install real packages via real package
+  # managers and run socket-patch against a wiremock-served fixture —
+  # no real Socket API contact. Hermetic, reproducible.
+  #
+  # Triggered on every PR. The existing `e2e` job above stays for
+  # `--ignored` real-API smoke runs (manual / scheduled).
+  # ----------------------------------------------------------------------
+  e2e-docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # `driver: docker` — see the coverage-docker matching step above
+        # for the rationale (the per-ecosystem image's `FROM
+        # socket-patch-test-base:latest` only resolves when buildx talks
+        # directly to the host docker daemon).
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
+
+      - name: Install Rust
+        run: rustup show
+
+      # No `actions/cache` here intentionally. This job builds Docker
+      # images and would be flagged by zizmor's cache-poisoning audit.
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+
+      - name: Build ${{ matrix.ecosystem }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
+          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
+          load: true
+
+      - name: Run ${{ matrix.ecosystem }} Docker e2e test
+        run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}

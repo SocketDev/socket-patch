@@ -1,7 +1,9 @@
 use clap::Args;
 use regex::Regex;
-use socket_patch_core::api::client::get_api_client_from_env;
-use socket_patch_core::api::types::{PatchSearchResult, SearchResponse};
+use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::types::{
+    PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
+};
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
@@ -13,75 +15,167 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{confirm, select_one, SelectError};
 
+/// Per-patch outcome reported in the JSON output of `download_and_apply_patches`.
+/// `Updated` carries the previous UUID so a bot can diff a manifest update against
+/// what was there before — see CLI_CONTRACT.md for the stable vocabulary.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum PatchAction {
+    /// Patch did not exist in the manifest at this PURL.
+    Added,
+    /// Patch existed under this PURL with a different UUID; the new UUID
+    /// replaces the old one. `old_uuid` is the UUID being overwritten.
+    Updated { old_uuid: String },
+    /// Patch already exists with the same UUID; download is a no-op.
+    Skipped,
+}
+
+/// Classify what `download_and_apply_patches` will do to a given PURL based on
+/// the manifest state *before* any insert. Pure / no I/O so it's unit-testable.
+pub(crate) fn decide_patch_action(
+    manifest: &PatchManifest,
+    purl: &str,
+    new_uuid: &str,
+) -> PatchAction {
+    match manifest.patches.get(purl) {
+        Some(existing) if existing.uuid == new_uuid => PatchAction::Skipped,
+        Some(existing) => PatchAction::Updated {
+            old_uuid: existing.uuid.clone(),
+        },
+        None => PatchAction::Added,
+    }
+}
+
+/// Ordinal rank for severity strings. Higher = worse. Unknown labels
+/// (including GHSA's `moderate` which maps to `medium`) get sensible
+/// defaults so the max-severity selector still works.
+pub(crate) fn severity_rank(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        // GHSA emits `moderate`; treat it as the medium-tier signal.
+        "moderate" | "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// Return the highest-severity label from a vulnerabilities map.
+/// Returns `None` when the map is empty or every entry's severity is
+/// unrecognized.
+pub(crate) fn max_vuln_severity(
+    vulns: &HashMap<String, VulnerabilityResponse>,
+) -> Option<String> {
+    vulns
+        .values()
+        .max_by_key(|v| severity_rank(&v.severity))
+        .map(|v| v.severity.clone())
+}
+
+/// Build the metadata payload spliced into per-patch JSON action records
+/// (`added` / `updated`). Surfaces what consumers need to render a patch
+/// to end users: human-readable description, license, tier, exportedAt;
+/// a top-level severity computed as the max across all vulnerabilities;
+/// and a flattened vulnerability list with the canonical advisory IDs
+/// (GHSA, CVE) front and center so consumers can route on severity or
+/// open a specific advisory.
+///
+/// Output keys are JSON-camelCase to match the rest of the envelope.
+/// The vulnerability list is sorted by ID for stable test snapshots.
+pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
+    let mut vulns: Vec<serde_json::Value> = patch
+        .vulnerabilities
+        .iter()
+        .map(|(id, v)| {
+            serde_json::json!({
+                "id": id,
+                "cves": v.cves,
+                "severity": v.severity,
+                "summary": v.summary,
+                "description": v.description,
+            })
+        })
+        .collect();
+    // Stable ordering — HashMap iteration is otherwise nondeterministic
+    // and consumers diff this output in CI logs.
+    vulns.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["id"].as_str().unwrap_or(""))
+    });
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "description".into(),
+        serde_json::Value::String(patch.description.clone()),
+    );
+    meta.insert(
+        "license".into(),
+        serde_json::Value::String(patch.license.clone()),
+    );
+    meta.insert(
+        "tier".into(),
+        serde_json::Value::String(patch.tier.clone()),
+    );
+    meta.insert(
+        "exportedAt".into(),
+        serde_json::Value::String(patch.published_at.clone()),
+    );
+    if let Some(sev) = max_vuln_severity(&patch.vulnerabilities) {
+        meta.insert("severity".into(), serde_json::Value::String(sev));
+    }
+    meta.insert("vulnerabilities".into(), serde_json::Value::Array(vulns));
+    serde_json::Value::Object(meta)
+}
+
+/// Merge a metadata object (from [`patch_event_metadata`]) into a
+/// per-patch action record. Convenience wrapper that handles the
+/// unwrap of `Value::Object`.
+fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
+    if let (Some(record_obj), serde_json::Value::Object(meta_obj)) =
+        (record.as_object_mut(), meta)
+    {
+        for (k, v) in meta_obj {
+            record_obj.insert(k, v);
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct GetArgs {
-    /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name)
+    /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name).
     pub identifier: String,
 
-    /// Organization slug
-    #[arg(long)]
-    pub org: Option<String>,
+    #[command(flatten)]
+    pub common: GlobalArgs,
 
-    /// Working directory
-    #[arg(long, default_value = ".")]
-    pub cwd: PathBuf,
-
-    /// Force identifier to be treated as a patch UUID
+    /// Force identifier to be treated as a patch UUID.
     #[arg(long, default_value_t = false)]
     pub id: bool,
 
-    /// Force identifier to be treated as a CVE ID
+    /// Force identifier to be treated as a CVE ID.
     #[arg(long, default_value_t = false)]
     pub cve: bool,
 
-    /// Force identifier to be treated as a GHSA ID
+    /// Force identifier to be treated as a GHSA ID.
     #[arg(long, default_value_t = false)]
     pub ghsa: bool,
 
-    /// Force identifier to be treated as a package name
+    /// Force identifier to be treated as a package name.
     #[arg(short = 'p', long = "package", default_value_t = false)]
     pub package: bool,
 
-    /// Skip confirmation prompt for multiple patches
-    #[arg(short = 'y', long, default_value_t = false)]
-    pub yes: bool,
-
-    /// Socket API URL (overrides SOCKET_API_URL env var)
-    #[arg(long = "api-url")]
-    pub api_url: Option<String>,
-
-    /// Socket API token (overrides SOCKET_API_TOKEN env var)
-    #[arg(long = "api-token")]
-    pub api_token: Option<String>,
-
-    /// Download patch without applying it
-    #[arg(long = "save-only", alias = "no-apply", default_value_t = false)]
+    /// Download patch without applying it.
+    #[arg(long = "save-only", alias = "no-apply", env = "SOCKET_SAVE_ONLY", default_value_t = false)]
     pub save_only: bool,
 
-    /// Apply patch to globally installed npm packages
-    #[arg(short = 'g', long, default_value_t = false)]
-    pub global: bool,
-
-    /// Custom path to global node_modules
-    #[arg(long = "global-prefix")]
-    pub global_prefix: Option<PathBuf>,
-
-    /// Apply patch immediately without saving to .socket folder
-    #[arg(long = "one-off", default_value_t = false)]
+    /// Apply patch immediately without saving to .socket folder.
+    #[arg(long = "one-off", env = "SOCKET_ONE_OFF", default_value_t = false)]
     pub one_off: bool,
-
-    /// Output results as JSON
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-
-    /// Which kind of patch artifact to download. `diff` (default) fetches
-    /// the smallest delta archive; `package` fetches a full per-package
-    /// tarball; `file` falls back to legacy per-file blob downloads.
-    #[arg(long = "download-mode", default_value = "diff")]
-    pub download_mode: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -247,7 +341,6 @@ pub fn select_patches(
 }
 
 /// Download parameters shared between get and scan commands.
-#[allow(dead_code)]
 pub struct DownloadParams {
     pub cwd: PathBuf,
     pub org: Option<String>,
@@ -259,6 +352,11 @@ pub struct DownloadParams {
     pub silent: bool,
     /// `--download-mode` value forwarded to the apply step.
     pub download_mode: String,
+    /// API client overrides — propagates the caller's CLI flags
+    /// (`--api-url`, `--api-token`, `--proxy-url`) into the nested API
+    /// client constructed here. Without this, `download_and_apply_patches`
+    /// would only honor env vars and ignore the user's flags.
+    pub api_overrides: socket_patch_core::api::client::ApiClientEnvOverrides,
 }
 
 /// Download and apply a set of selected patches.
@@ -268,7 +366,12 @@ pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value) {
-    let (api_client, _) = get_api_client_from_env(params.org.as_deref()).await;
+    let mut overrides = params.api_overrides.clone();
+    if overrides.org_slug.is_none() {
+        overrides.org_slug = params.org.clone();
+    }
+    let (api_client, _) =
+        socket_patch_core::api::client::get_api_client_with_overrides(overrides).await;
     let effective_org: Option<&str> = None;
 
     let socket_dir = params.cwd.join(".socket");
@@ -335,12 +438,11 @@ pub async fn download_and_apply_patches(
             .await
         {
             Ok(Some(patch)) => {
-                // Check if already in manifest with same UUID
-                if manifest
-                    .patches
-                    .get(&patch.purl)
-                    .is_some_and(|p| p.uuid == patch.uuid)
-                {
+                // Classify against the manifest state BEFORE we touch it.
+                // `Skipped` early-returns; `Updated` is preserved so the
+                // per-patch JSON record below can include `oldUuid`.
+                let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
+                if let PatchAction::Skipped = action {
                     if !params.json && !params.silent {
                         eprintln!("  [skip] {} (already in manifest)", patch.purl);
                     }
@@ -458,14 +560,35 @@ pub async fn download_and_apply_patches(
                     },
                 );
 
-                if !params.json && !params.silent {
-                    eprintln!("  [add] {}", patch.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "added",
-                }));
+                let mut action_record = match &action {
+                    PatchAction::Updated { old_uuid } => {
+                        if !params.json && !params.silent {
+                            eprintln!("  [update] {}", patch.purl);
+                        }
+                        serde_json::json!({
+                            "purl": patch.purl,
+                            "uuid": patch.uuid,
+                            "action": "updated",
+                            "oldUuid": old_uuid,
+                        })
+                    }
+                    _ => {
+                        if !params.json && !params.silent {
+                            eprintln!("  [add] {}", patch.purl);
+                        }
+                        serde_json::json!({
+                            "purl": patch.purl,
+                            "uuid": patch.uuid,
+                            "action": "added",
+                        })
+                    }
+                };
+                // Splice description / severity / vulnerability IDs into
+                // the per-patch record so PR-comment bots, dashboards, and
+                // CLI consumers can render the patch without a second
+                // round-trip to the API.
+                merge_metadata(&mut action_record, patch_event_metadata(&patch));
+                downloaded_patches.push(action_record);
                 patches_added += 1;
             }
             Ok(None) => {
@@ -530,18 +653,16 @@ pub async fn download_and_apply_patches(
             eprintln!("\nApplying patches...");
         }
         let apply_args = super::apply::ApplyArgs {
-            cwd: params.cwd.clone(),
-            dry_run: false,
-            silent: params.json || params.silent,
-            manifest_path: manifest_path.display().to_string(),
-            offline: false,
-            global: params.global,
-            global_prefix: params.global_prefix.clone(),
-            ecosystems: None,
+            common: crate::args::GlobalArgs {
+                cwd: params.cwd.clone(),
+                manifest_path: manifest_path.display().to_string(),
+                global: params.global,
+                global_prefix: params.global_prefix.clone(),
+                silent: params.json || params.silent,
+                download_mode: params.download_mode.clone(),
+                ..crate::args::GlobalArgs::default()
+            },
             force: false,
-            json: false,
-            verbose: false,
-            download_mode: params.download_mode.clone(),
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
@@ -572,7 +693,7 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": "Only one of --id, --cve, --ghsa, or --package can be specified",
@@ -583,7 +704,7 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
     if args.one_off && args.save_only {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": "--one-off and --save-only cannot be used together",
@@ -594,15 +715,9 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
 
-    // Override env vars
-    if let Some(ref url) = args.api_url {
-        std::env::set_var("SOCKET_API_URL", url);
-    }
-    if let Some(ref token) = args.api_token {
-        std::env::set_var("SOCKET_API_TOKEN", token);
-    }
-
-    let (api_client, use_public_proxy) = get_api_client_from_env(args.org.as_deref()).await;
+    apply_env_toggles(&args.common);
+    let (api_client, use_public_proxy) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -620,7 +735,7 @@ pub async fn run(args: GetArgs) -> i32 {
         match detect_identifier_type(&args.identifier) {
             Some(t) => t,
             None => {
-                if !args.json {
+                if !args.common.json {
                     println!("Treating \"{}\" as a package name search", args.identifier);
                 }
                 IdentifierType::Package
@@ -630,7 +745,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Handle UUID: fetch and download directly
     if id_type == IdentifierType::Uuid {
-        if !args.json {
+        if !args.common.json {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
         match api_client
@@ -639,7 +754,7 @@ pub async fn run(args: GetArgs) -> i32 {
         {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "paid_required",
                             "found": 1,
@@ -665,7 +780,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     .await;
             }
             Ok(None) => {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "not_found",
                         "found": 0,
@@ -679,7 +794,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
             Err(e) => {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
                         "error": e.to_string(),
@@ -695,7 +810,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // For CVE/GHSA/PURL/package, search first
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for CVE: {}", args.identifier);
             }
             match api_client
@@ -704,7 +819,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -717,7 +832,7 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Ghsa => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for GHSA: {}", args.identifier);
             }
             match api_client
@@ -726,7 +841,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -739,7 +854,7 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Purl => {
-            if !args.json {
+            if !args.common.json {
                 println!("Searching patches for PURL: {}", args.identifier);
             }
             match api_client
@@ -748,7 +863,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -761,19 +876,19 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Package => {
-            if !args.json {
+            if !args.common.json {
                 println!("Enumerating packages...");
             }
             let crawler_options = CrawlerOptions {
-                cwd: args.cwd.clone(),
-                global: args.global,
-                global_prefix: args.global_prefix.clone(),
+                cwd: args.common.cwd.clone(),
+                global: args.common.global,
+                global_prefix: args.common.global_prefix.clone(),
                 batch_size: 100,
             };
             let (all_packages, _) = crawl_all_ecosystems(&crawler_options).await;
 
             if all_packages.is_empty() {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "no_packages",
                         "found": 0,
@@ -781,7 +896,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         "applied": 0,
                         "patches": [],
                     })).unwrap());
-                } else if args.global {
+                } else if args.common.global {
                     println!("No global packages found.");
                 } else {
                     #[allow(unused_mut)]
@@ -799,14 +914,14 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            if !args.json {
+            if !args.common.json {
                 println!("Found {} packages", all_packages.len());
             }
 
             let matches = fuzzy_match_packages(&args.identifier, &all_packages, 20);
 
             if matches.is_empty() {
-                if args.json {
+                if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "no_match",
                         "found": 0,
@@ -820,7 +935,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            if !args.json {
+            if !args.common.json {
                 println!(
                     "Found {} matching package(s), checking for available patches...",
                     matches.len()
@@ -835,7 +950,7 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    if args.json {
+                    if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string(),
@@ -851,7 +966,7 @@ pub async fn run(args: GetArgs) -> i32 {
     };
 
     if search_response.patches.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "not_found",
                 "found": 0,
@@ -868,7 +983,7 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    if !args.json {
+    if !args.common.json {
         display_search_results(&search_response.patches, search_response.can_access_paid_patches);
     }
 
@@ -881,7 +996,7 @@ pub async fn run(args: GetArgs) -> i32 {
         .collect();
 
     if accessible.is_empty() {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "paid_required",
                 "found": search_response.patches.len(),
@@ -904,14 +1019,14 @@ pub async fn run(args: GetArgs) -> i32 {
     let selected = match select_patches(
         &accessible,
         search_response.can_access_paid_patches,
-        args.json,
+        args.common.json,
     ) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
     if selected.is_empty() {
-        if !args.json {
+        if !args.common.json {
             println!("No patches selected.");
         }
         return 0;
@@ -919,8 +1034,8 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Confirm before downloading (default YES)
     let prompt = format!("Download {} patch(es)?", selected.len());
-    if !confirm(&prompt, true, args.yes, args.json) {
-        if !args.json {
+    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json {
             println!("Download cancelled.");
         }
         return 0;
@@ -928,20 +1043,21 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Download and apply
     let params = DownloadParams {
-        cwd: args.cwd.clone(),
-        org: args.org.clone(),
+        cwd: args.common.cwd.clone(),
+        org: args.common.org.clone(),
         save_only: args.save_only,
         one_off: args.one_off,
-        global: args.global,
-        global_prefix: args.global_prefix.clone(),
-        json: args.json,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json: args.common.json,
         silent: false,
-        download_mode: args.download_mode.clone(),
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
     };
 
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
 
-    if args.json {
+    if args.common.json {
         println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
     }
 
@@ -1001,13 +1117,14 @@ async fn save_and_apply_patch(
     _org_slug: Option<&str>,
 ) -> i32 {
     // For UUID mode, fetch and save
-    let (api_client, _) = get_api_client_from_env(args.org.as_deref()).await;
+    let (api_client, _) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let effective_org: Option<&str> = None; // org slug is already stored in the client
 
     let patch = match api_client.fetch_patch(effective_org, uuid).await {
         Ok(Some(p)) => p,
         Ok(None) => {
-            if args.json {
+            if args.common.json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "status": "not_found",
                     "found": 0,
@@ -1021,7 +1138,7 @@ async fn save_and_apply_patch(
             return 0;
         }
         Err(e) => {
-            if args.json {
+            if args.common.json {
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "status": "error",
                     "error": e.to_string(),
@@ -1033,12 +1150,12 @@ async fn save_and_apply_patch(
         }
     };
 
-    let socket_dir = args.cwd.join(".socket");
+    let socket_dir = args.common.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
     let manifest_path = socket_dir.join("manifest.json");
 
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": format!("Failed to create blobs directory: {}", e),
@@ -1076,7 +1193,7 @@ async fn save_and_apply_patch(
             match base64_decode(blob_content) {
                 Ok(decoded) => {
                     if let Err(e) = tokio::fs::write(blobs_dir.join(after_hash), &decoded).await {
-                        if !args.json {
+                        if !args.common.json {
                             eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
                         }
                         blob_failed = true;
@@ -1084,7 +1201,7 @@ async fn save_and_apply_patch(
                     }
                 }
                 Err(e) => {
-                    if !args.json {
+                    if !args.common.json {
                         eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
                     }
                     blob_failed = true;
@@ -1099,7 +1216,7 @@ async fn save_and_apply_patch(
             match base64_decode(before_blob) {
                 Ok(decoded) => {
                     if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
-                        if !args.json {
+                        if !args.common.json {
                             eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
                         }
                         blob_failed = true;
@@ -1107,7 +1224,7 @@ async fn save_and_apply_patch(
                     }
                 }
                 Err(e) => {
-                    if !args.json {
+                    if !args.common.json {
                         eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
                     }
                     blob_failed = true;
@@ -1118,7 +1235,7 @@ async fn save_and_apply_patch(
     }
 
     if blob_failed {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "found": 1,
@@ -1173,7 +1290,7 @@ async fn save_and_apply_patch(
     );
 
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        if args.json {
+        if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "status": "error",
                 "error": format!("Error writing manifest: {e}"),
@@ -1184,7 +1301,7 @@ async fn save_and_apply_patch(
         return 1;
     }
 
-    if !args.json {
+    if !args.common.json {
         println!("\nPatch saved to {}", manifest_path.display());
         if added {
             println!("  Added: 1");
@@ -1195,41 +1312,45 @@ async fn save_and_apply_patch(
 
     let mut apply_succeeded = false;
     if !args.save_only && added {
-        if !args.json {
+        if !args.common.json {
             println!("\nApplying patches...");
         }
         let apply_args = super::apply::ApplyArgs {
-            cwd: args.cwd.clone(),
-            dry_run: false,
-            silent: args.json,
-            manifest_path: manifest_path.display().to_string(),
-            offline: false,
-            global: args.global,
-            global_prefix: args.global_prefix.clone(),
-            download_mode: args.download_mode.clone(),
-            ecosystems: None,
+            common: crate::args::GlobalArgs {
+                cwd: args.common.cwd.clone(),
+                manifest_path: manifest_path.display().to_string(),
+                global: args.common.global,
+                global_prefix: args.common.global_prefix.clone(),
+                silent: args.common.json,
+                download_mode: args.common.download_mode.clone(),
+                ..crate::args::GlobalArgs::default()
+            },
             force: false,
-            json: false,
-            verbose: false,
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
-        if code != 0 && !args.json {
+        if code != 0 && !args.common.json {
             eprintln!("\nSome patches could not be applied.");
         }
     }
 
-    if args.json {
+    if args.common.json {
+        let mut patch_record = serde_json::json!({
+            "purl": patch.purl,
+            "uuid": patch.uuid,
+            "action": if added { "added" } else { "skipped" },
+        });
+        if added {
+            // Only enrich when the patch was actually added — a `skipped`
+            // record means the consumer already saw the metadata last time.
+            merge_metadata(&mut patch_record, patch_event_metadata(&patch));
+        }
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "status": "success",
             "found": 1,
             "downloaded": if added { 1 } else { 0 },
             "applied": if apply_succeeded { 1 } else { 0 },
-            "patches": [{
-                "purl": patch.purl,
-                "uuid": patch.uuid,
-                "action": if added { "added" } else { "skipped" },
-            }],
+            "patches": [patch_record],
         })).unwrap());
     }
 
@@ -1450,5 +1571,218 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "free");
         assert_eq!(out[0].tier, "free");
+    }
+
+    // --- decide_patch_action ---------------------------------------------
+    // Locks in the per-patch action vocabulary surfaced by
+    // download_and_apply_patches in JSON mode. See CLI_CONTRACT.md.
+
+    fn manifest_with_entry(purl: &str, uuid: &str) -> PatchManifest {
+        let mut m = PatchManifest::new();
+        m.patches.insert(
+            purl.to_string(),
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: "free".to_string(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn decide_patch_action_added_when_purl_absent() {
+        let manifest = PatchManifest::new();
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-a"),
+            PatchAction::Added,
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_skipped_when_same_uuid() {
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-a"),
+            PatchAction::Skipped,
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_updated_when_different_uuid() {
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/foo@1.0", "uuid-b"),
+            PatchAction::Updated {
+                old_uuid: "uuid-a".to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn decide_patch_action_added_for_different_purl_even_with_overlapping_manifest() {
+        // Ensure update detection keys on PURL, not UUID. A new PURL with a
+        // UUID that happens to match an existing entry under a different
+        // PURL must still be `Added`.
+        let manifest = manifest_with_entry("pkg:npm/foo@1.0", "uuid-a");
+        assert_eq!(
+            decide_patch_action(&manifest, "pkg:npm/bar@2.0", "uuid-a"),
+            PatchAction::Added,
+        );
+    }
+
+    // --- severity_rank / max_vuln_severity / patch_event_metadata --------
+    // Pins the JSON shape of the metadata spliced into `added` / `updated`
+    // per-patch records by `download_and_apply_patches`. PR-comment bots
+    // rely on these fields — see CLI_CONTRACT.md (`get` / `scan` JSON
+    // output, patches array).
+
+    #[test]
+    fn severity_rank_orders_canonical_labels() {
+        assert!(severity_rank("critical") > severity_rank("high"));
+        assert!(severity_rank("high") > severity_rank("medium"));
+        assert!(severity_rank("medium") > severity_rank("low"));
+        // GHSA's `moderate` is treated as medium.
+        assert_eq!(severity_rank("moderate"), severity_rank("medium"));
+        // Unknown / blank labels rank below all known severities.
+        assert!(severity_rank("low") > severity_rank(""));
+        assert!(severity_rank("low") > severity_rank("unknown"));
+    }
+
+    #[test]
+    fn max_vuln_severity_picks_highest() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-low".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-low".into()],
+                summary: String::new(),
+                severity: "low".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-crit".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-crit".into()],
+                summary: String::new(),
+                severity: "critical".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-mod".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-mod".into()],
+                summary: String::new(),
+                severity: "moderate".into(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(max_vuln_severity(&vulns).as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn max_vuln_severity_returns_none_for_empty() {
+        assert_eq!(max_vuln_severity(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn patch_event_metadata_includes_all_keys() {
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-aaaa-bbbb-cccc".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-2024-12345".into()],
+                summary: "Prototype Pollution".into(),
+                severity: "high".into(),
+                description: "merge() does not check Object.prototype".into(),
+            },
+        );
+        let patch = PatchResponse {
+            uuid: "11111111-1111-4111-8111-111111111111".into(),
+            purl: "pkg:npm/minimist@1.2.2".into(),
+            published_at: "2024-01-01T00:00:00Z".into(),
+            files: HashMap::new(),
+            vulnerabilities: vulns,
+            description: "Fixes prototype pollution in minimist".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let meta = patch_event_metadata(&patch);
+        assert_eq!(meta["description"], "Fixes prototype pollution in minimist");
+        assert_eq!(meta["license"], "MIT");
+        assert_eq!(meta["tier"], "free");
+        assert_eq!(meta["exportedAt"], "2024-01-01T00:00:00Z");
+        assert_eq!(meta["severity"], "high");
+        let vulns_out = meta["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns_out.len(), 1);
+        assert_eq!(vulns_out[0]["id"], "GHSA-aaaa-bbbb-cccc");
+        assert_eq!(vulns_out[0]["cves"][0], "CVE-2024-12345");
+        assert_eq!(vulns_out[0]["severity"], "high");
+        assert_eq!(vulns_out[0]["summary"], "Prototype Pollution");
+    }
+
+    #[test]
+    fn patch_event_metadata_sorts_vulnerabilities_by_id() {
+        // HashMap iteration is otherwise nondeterministic — verify the
+        // output is stable so test snapshots and consumer diffs don't
+        // flap.
+        let mut vulns = HashMap::new();
+        for id in ["GHSA-zzz", "GHSA-aaa", "GHSA-mmm"] {
+            vulns.insert(
+                id.into(),
+                VulnerabilityResponse {
+                    cves: Vec::new(),
+                    summary: String::new(),
+                    severity: "low".into(),
+                    description: String::new(),
+                },
+            );
+        }
+        let patch = PatchResponse {
+            uuid: String::new(),
+            purl: String::new(),
+            published_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: vulns,
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let meta = patch_event_metadata(&patch);
+        let ids: Vec<&str> = meta["vulnerabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["GHSA-aaa", "GHSA-mmm", "GHSA-zzz"]);
+    }
+
+    #[test]
+    fn patch_event_metadata_omits_severity_when_no_vulns() {
+        let patch = PatchResponse {
+            uuid: String::new(),
+            purl: String::new(),
+            published_at: "ts".into(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "desc".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let meta = patch_event_metadata(&patch);
+        // `severity` is intentionally omitted (not null) when there
+        // aren't any vulnerabilities to derive it from — consumers
+        // should treat absence as "no severity available".
+        assert!(meta.as_object().unwrap().get("severity").is_none());
+        // The empty vulnerabilities array is still present so the
+        // shape stays consistent.
+        assert_eq!(meta["vulnerabilities"].as_array().unwrap().len(), 0);
     }
 }

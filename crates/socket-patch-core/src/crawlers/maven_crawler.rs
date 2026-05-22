@@ -141,12 +141,6 @@ fn group_id_to_path(group_id: &str) -> String {
     group_id.replace('.', "/")
 }
 
-/// Convert a path segment back to a Maven groupId (e.g. `org/apache/commons` -> `org.apache.commons`).
-#[allow(dead_code)]
-fn path_to_group_id(path: &str) -> String {
-    path.replace('/', ".")
-}
-
 /// Extract Maven coordinates from a directory path relative to the repository root.
 ///
 /// The Maven repository layout is: `<groupId-as-path>/<artifactId>/<version>/`
@@ -564,19 +558,13 @@ mod tests {
         assert_eq!(extract_xml_value("  <groupId></groupId>", "groupId"), None);
     }
 
-    // ---- group_id_to_path / path_to_group_id tests ----
+    // ---- group_id_to_path tests ----
 
     #[test]
     fn test_group_id_to_path() {
         assert_eq!(group_id_to_path("org.apache.commons"), "org/apache/commons");
         assert_eq!(group_id_to_path("com.google.guava"), "com/google/guava");
         assert_eq!(group_id_to_path("single"), "single");
-    }
-
-    #[test]
-    fn test_path_to_group_id() {
-        assert_eq!(path_to_group_id("org/apache/commons"), "org.apache.commons");
-        assert_eq!(path_to_group_id("com/google/guava"), "com.google.guava");
     }
 
     // ---- parse_path_coordinates tests ----

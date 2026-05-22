@@ -1,0 +1,14 @@
+# golang ecosystem test image: base + Go toolchain.
+FROM socket-patch-test-base:latest
+
+# Debian 12 ships Go 1.19. For more modern modules support we install
+# Go 1.21 from the official tarball. Pinned by URL — the file is content-
+# addressed by golang.org's distribution, but in a hardened CI a sha256
+# verify step would be ideal here.
+ENV GO_VERSION=1.21.13
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" \
+    | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH
+ENV GOPATH=/root/go
+ENV GOMODCACHE=/root/go/pkg/mod
+RUN go version

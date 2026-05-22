@@ -137,7 +137,7 @@ socket-patch get CVE-2024-12345 --json -y
 
 ### `scan`
 
-Scan installed packages for available security patches.
+Scan installed packages for available security patches. Since v3.0 `scan --sync` is the single command bots need for full auto-update: it discovers patches, applies them, and garbage-collects orphan blob files plus manifest entries for uninstalled packages — all in one invocation.
 
 **Usage:**
 ```bash
@@ -147,23 +147,41 @@ socket-patch scan [options]
 **Options:**
 | Flag | Description |
 |------|-------------|
+| `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. |
+| `--prune` | Garbage-collect after the scan: remove manifest entries for uninstalled packages and orphan blob/diff/package-archive files. Off by default. |
+| `--sync` | Sugar for `--apply --prune`. The canonical bot-mode flag. |
+| `-d, --dry-run` | Preview what `--apply`/`--prune`/`--sync` would do without mutating disk. |
 | `--org <slug>` | Organization slug |
 | `--json` | Output results as JSON |
+| `-y, --yes` | Skip confirmation prompts |
 | `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
 | `-g, --global` | Scan globally installed packages |
 | `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
+| `--download-mode <mode>` | `diff` (default), `package`, or `file` |
 | `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
 | `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
 | `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
 ```bash
-# Scan local project
+# Scan local project (interactive prompt to apply)
 socket-patch scan
 
-# Scan with JSON output
+# Scan with JSON output (discover + updates, no mutation)
 socket-patch scan --json
+
+# Bot mode: discover, apply, prune, sweep — all in one
+socket-patch scan --json --sync --yes
+
+# Apply without pruning manifest entries (default)
+socket-patch scan --apply --yes
+
+# Apply + prune explicitly (equivalent to --sync)
+socket-patch scan --json --apply --prune --yes
+
+# Preview a full sync without mutating disk
+socket-patch scan --json --sync --yes --dry-run
 
 # Scan only npm packages
 socket-patch scan --ecosystems npm
@@ -337,6 +355,45 @@ socket-patch remove "pkg:npm/lodash@4.17.20" --skip-rollback
 socket-patch remove "pkg:npm/lodash@4.17.20" --json
 ```
 
+### `repair`
+
+Download missing blobs and clean up unused blobs.
+
+Alias: `gc`
+
+`repair` cleans up the `.socket/` directory without running a scan — useful when you've manually adjusted the manifest, recovered from a partial-failure state, or just want to free space. For the combined workflow (discover + apply + GC in one pass), use `scan --sync --json --yes` instead.
+
+**Usage:**
+```bash
+socket-patch repair [options]
+```
+
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `-d, --dry-run` | Show what would be done without doing it |
+| `--offline` | Skip network operations (cleanup only) |
+| `--download-only` | Only download missing blobs, do not clean up |
+| `--json` | Output results as JSON |
+| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
+| `--cwd <dir>` | Working directory (default: `.`) |
+| `--download-mode <mode>` | `file` (default), `diff`, or `package` |
+
+**Examples:**
+```bash
+# Full repair (download missing + clean up unused)
+socket-patch repair
+
+# Cleanup only, no downloads
+socket-patch repair --offline
+
+# Download missing blobs only
+socket-patch repair --download-only
+
+# JSON output for scripting
+socket-patch repair --json
+```
+
 ### `setup`
 
 Configure `package.json` postinstall scripts to automatically apply patches after `npm install`.
@@ -369,50 +426,22 @@ socket-patch setup --dry-run
 socket-patch setup --json -y
 ```
 
-### `repair`
-
-Download missing blobs and clean up unused blobs.
-
-Alias: `gc`
-
-**Usage:**
-```bash
-socket-patch repair [options]
-```
-
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `-d, --dry-run` | Show what would be done without doing it |
-| `--offline` | Skip network operations (cleanup only) |
-| `--download-only` | Only download missing blobs, do not clean up |
-| `--json` | Output results as JSON |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
-
-**Examples:**
-```bash
-# Repair (download missing + clean up unused)
-socket-patch repair
-
-# Cleanup only, no downloads
-socket-patch repair --offline
-
-# Download missing blobs only
-socket-patch repair --download-only
-
-# JSON output
-socket-patch repair --json
-```
-
 ## Scripting & CI/CD
 
 All commands support `--json` for machine-readable output. JSON responses always include a `"status"` field for easy error detection:
 
 ```bash
-# Check for available patches in CI
+# Check for available patches in CI (read-only)
 result=$(socket-patch scan --json --ecosystems npm)
 patches=$(echo "$result" | jq '.totalPatches')
+
+# Auto-update bot mode: discover, apply, prune, sweep in one pass
+socket-patch scan --json --sync --yes | jq '{
+  applied:     [.apply.patches[] | select(.action == "added" or .action == "updated") | .purl],
+  pruned:      .gc.prunedManifestEntries,
+  bytes_freed: .gc.bytesFreed
+}'
+# Pipe this into peter-evans/create-pull-request to open a PR with the changes.
 
 # Apply patches and check result
 socket-patch apply --json | jq '.status'

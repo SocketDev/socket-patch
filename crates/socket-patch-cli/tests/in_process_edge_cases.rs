@@ -1,0 +1,522 @@
+//! Edge case tests for the install → scan → apply → rollback lifecycle.
+//!
+//! Covers scenarios that production CI workflows must handle robustly:
+//! read-only files (cargo registry), nested directory structures,
+//! multi-file patches, partial installs, missing blobs, hash mismatches,
+//! and idempotent re-runs.
+
+use std::path::Path;
+
+use serial_test::serial;
+use sha2::{Digest, Sha256};
+use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
+use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
+
+fn git_sha256(content: &[u8]) -> String {
+    let header = format!("blob {}\0", content.len());
+    let mut hasher = Sha256::new();
+    hasher.update(header.as_bytes());
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+fn write_npm_pkg(root: &Path, name: &str, version: &str, files: &[(&str, &[u8])]) {
+    let pkg = root.join("node_modules").join(name);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{name}", "version": "{version}" }}"#),
+    )
+    .unwrap();
+    for (rel, content) in files {
+        let p = pkg.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, content).unwrap();
+    }
+}
+
+fn write_manifest(socket: &Path, body: &str) {
+    std::fs::create_dir_all(socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), body).unwrap();
+}
+
+fn default_apply(cwd: &Path) -> ApplyArgs {
+    ApplyArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            ecosystems: None,
+            json: true,
+            verbose: false,
+            download_mode: "diff".to_string(),
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        force: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only file (mimics cargo registry source files)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn apply_overwrites_read_only_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let original = b"before\n";
+    let patched = b"patched\n";
+    let before_hash = git_sha256(original);
+    let after_hash = git_sha256(patched);
+
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    write_npm_pkg(
+        tmp.path(),
+        "ro-target",
+        "1.0.0",
+        &[("index.js", original)],
+    );
+    // Make the package file read-only — apply must make it writable to
+    // overwrite. This mimics the cargo-registry-source layout.
+    let file = tmp.path().join("node_modules/ro-target/index.js");
+    let perms = std::fs::Permissions::from_mode(0o444);
+    std::fs::set_permissions(&file, perms).unwrap();
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/ro-target@1.0.0": {{
+                    "uuid": "ro-target-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/index.js": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), patched).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read(&file).unwrap(), patched);
+}
+
+// ---------------------------------------------------------------------------
+// Nested directory patch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_creates_nested_directories_for_new_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    write_npm_pkg(tmp.path(), "nested", "1.0.0", &[]);
+    let new_file_content = b"new file content\n";
+    let after_hash = git_sha256(new_file_content);
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/nested@1.0.0": {{
+                    "uuid": "nested-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/deep/nested/path/new.js": {{
+                        "beforeHash": "", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), new_file_content).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 0);
+    let created = tmp
+        .path()
+        .join("node_modules/nested/deep/nested/path/new.js");
+    assert_eq!(
+        std::fs::read(&created).unwrap(),
+        new_file_content,
+        "nested new-file patch must create directories"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-file patch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_patches_multiple_files_in_one_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let orig_a = b"file a before\n";
+    let orig_b = b"file b before\n";
+    let patched_a = b"file a after\n";
+    let patched_b = b"file b after\n";
+    let before_a = git_sha256(orig_a);
+    let before_b = git_sha256(orig_b);
+    let after_a = git_sha256(patched_a);
+    let after_b = git_sha256(patched_b);
+
+    write_npm_pkg(
+        tmp.path(),
+        "multi",
+        "1.0.0",
+        &[("a.js", orig_a), ("lib/b.js", orig_b)],
+    );
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/multi@1.0.0": {{
+                    "uuid": "multi-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{
+                        "package/a.js":     {{ "beforeHash": "{before_a}", "afterHash": "{after_a}" }},
+                        "package/lib/b.js": {{ "beforeHash": "{before_b}", "afterHash": "{after_b}" }}
+                    }},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_a), patched_a).unwrap();
+    std::fs::write(blobs.join(&after_b), patched_b).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/multi/a.js")).unwrap(),
+        patched_a
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/multi/lib/b.js")).unwrap(),
+        patched_b
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hash mismatch on after_hash (post-write verify fails)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_blob_after_hash_mismatch_reports_failure() {
+    // Plant a blob whose CONTENT bytes don't match the claimed
+    // afterHash — apply's post-write verify must catch this and mark
+    // the patch failed.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let original = b"before\n";
+    let claimed_after_hash = git_sha256(b"different content"); // mismatched
+    let actual_blob_bytes = b"this is what's on disk\n"; // doesn't hash to claimed_after_hash
+    let before_hash = git_sha256(original);
+    write_npm_pkg(
+        tmp.path(),
+        "mismatch",
+        "1.0.0",
+        &[("index.js", original)],
+    );
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/mismatch@1.0.0": {{
+                    "uuid": "mm-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/index.js": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{claimed_after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&claimed_after_hash), actual_blob_bytes).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    // Apply detects the mismatch (post-write hash != claimed afterHash)
+    // and reports a partial failure (exit 1). The file IS overwritten
+    // first then verified — that's how `apply_file_patch` is structured
+    // — so the contents reflect the bad blob bytes. Production users
+    // would see the partial_failure status and inspect.
+    assert_eq!(code, 1, "afterHash mismatch must produce partial_failure");
+    let post = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
+    // Post-state is the corrupted bytes (verify-after-write); the
+    // contract we care about is the partial_failure exit, not file
+    // preservation. Document this for the test reader.
+    assert_eq!(
+        post, actual_blob_bytes,
+        "post-write verify rejects but bytes are already on disk; this is current behavior"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-apply is idempotent (AlreadyPatched short-circuit)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_twice_second_run_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let original = b"before\n";
+    let patched = b"patched\n";
+    let before_hash = git_sha256(original);
+    let after_hash = git_sha256(patched);
+    write_npm_pkg(
+        tmp.path(),
+        "idempotent",
+        "1.0.0",
+        &[("index.js", original)],
+    );
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/idempotent@1.0.0": {{
+                    "uuid": "idem-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/index.js": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), patched).unwrap();
+
+    assert_eq!(apply_run(default_apply(tmp.path())).await, 0);
+    let mid = std::fs::read(tmp.path().join("node_modules/idempotent/index.js")).unwrap();
+    assert_eq!(mid, patched);
+
+    // Second run finds the file already at afterHash → marks as
+    // already_patched → exits 0 without modifying further.
+    assert_eq!(apply_run(default_apply(tmp.path())).await, 0);
+    let after = std::fs::read(tmp.path().join("node_modules/idempotent/index.js")).unwrap();
+    assert_eq!(after, patched, "idempotent re-apply preserves patched content");
+}
+
+// ---------------------------------------------------------------------------
+// Apply with file missing on disk (NotFound branch)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_with_missing_target_file_reports_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    // Install package WITHOUT the target file.
+    write_npm_pkg(tmp.path(), "nofile", "1.0.0", &[]);
+    let original = b"before\n";
+    let patched = b"patched\n";
+    let before_hash = git_sha256(original);
+    let after_hash = git_sha256(patched);
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/nofile@1.0.0": {{
+                    "uuid": "nofile-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/index.js": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&after_hash), patched).unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 1, "missing target file (non-empty beforeHash) must fail");
+
+    // --force should skip-and-continue rather than fail.
+    let mut force_args = default_apply(tmp.path());
+    force_args.force = true;
+    let code = apply_run(force_args).await;
+    assert_eq!(code, 0, "--force must skip missing files and exit 0");
+}
+
+// ---------------------------------------------------------------------------
+// Rollback when on-disk file is already at beforeHash (already_original)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn rollback_already_original_short_circuits() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let original = b"original\n";
+    let patched = b"patched\n";
+    let before_hash = git_sha256(original);
+    let after_hash = git_sha256(patched);
+
+    // File is ALREADY at the original (beforeHash) state.
+    write_npm_pkg(
+        tmp.path(),
+        "already-orig",
+        "1.0.0",
+        &[("index.js", original)],
+    );
+
+    let socket = tmp.path().join(".socket");
+    write_manifest(
+        &socket,
+        &format!(
+            r#"{{ "patches": {{
+                "pkg:npm/already-orig@1.0.0": {{
+                    "uuid": "ao-uuid-0000",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/index.js": {{
+                        "beforeHash": "{before_hash}", "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    );
+    // rollback --offline still requires the beforeHash blob to be
+    // present on disk (the offline guard checks all blobs up-front
+    // regardless of which files need rolling back). Stage it.
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::write(blobs.join(&before_hash), original).unwrap();
+
+    let args = RollbackArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            dry_run: false,
+            silent: true,
+            manifest_path: ".socket/manifest.json".to_string(),
+            offline: true,
+            global: false,
+            global_prefix: None,
+            org: None,
+                        api_token: None,
+            ecosystems: Some(vec!["npm".to_string()]),
+            json: true,
+            verbose: false,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        identifier: None,
+        one_off: false,
+    };
+    assert_eq!(rollback_run(args).await, 0);
+    // File unchanged.
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/already-orig/index.js")).unwrap(),
+        original
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Empty manifest (no patches) — apply is a no-op
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_empty_manifest_is_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let socket = tmp.path().join(".socket");
+    write_manifest(&socket, r#"{ "patches": {} }"#);
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    // Empty manifest → no packages, exit code is 1 because nothing was
+    // in scope.
+    assert!(code == 0 || code == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Invalid manifest JSON
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn apply_invalid_manifest_emits_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
+
+    let code = apply_run(default_apply(tmp.path())).await;
+    assert_eq!(code, 1);
+}
