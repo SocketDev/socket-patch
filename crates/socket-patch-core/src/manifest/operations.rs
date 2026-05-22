@@ -14,21 +14,6 @@ pub fn resolve_manifest_path(cwd: &Path, manifest_path: &str) -> PathBuf {
     }
 }
 
-/// Get all blob hashes referenced by a manifest (both beforeHash and afterHash).
-/// Used for garbage collection and validation.
-pub fn get_referenced_blobs(manifest: &PatchManifest) -> HashSet<String> {
-    let mut blobs = HashSet::new();
-
-    for record in manifest.patches.values() {
-        for file_info in record.files.values() {
-            blobs.insert(file_info.before_hash.clone());
-            blobs.insert(file_info.after_hash.clone());
-        }
-    }
-
-    blobs
-}
-
 /// Get only afterHash blobs referenced by a manifest.
 /// Used for apply operations -- we only need the patched file content, not the original.
 /// This saves disk space since beforeHash blobs are not needed for applying patches.
@@ -56,55 +41,6 @@ pub fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
     }
 
     blobs
-}
-
-/// Differences between two manifests.
-#[derive(Debug, Clone)]
-pub struct ManifestDiff {
-    /// PURLs present in new but not old.
-    pub added: HashSet<String>,
-    /// PURLs present in old but not new.
-    pub removed: HashSet<String>,
-    /// PURLs present in both but with different UUIDs.
-    pub modified: HashSet<String>,
-}
-
-/// Calculate differences between two manifests.
-/// Patches are compared by UUID: if the PURL exists in both manifests but the
-/// UUID changed, the patch is considered modified.
-pub fn diff_manifests(old_manifest: &PatchManifest, new_manifest: &PatchManifest) -> ManifestDiff {
-    let old_purls: HashSet<&String> = old_manifest.patches.keys().collect();
-    let new_purls: HashSet<&String> = new_manifest.patches.keys().collect();
-
-    let mut added = HashSet::new();
-    let mut removed = HashSet::new();
-    let mut modified = HashSet::new();
-
-    // Find added and modified
-    for purl in &new_purls {
-        if !old_purls.contains(purl) {
-            added.insert((*purl).clone());
-        } else {
-            let old_patch = &old_manifest.patches[*purl];
-            let new_patch = &new_manifest.patches[*purl];
-            if old_patch.uuid != new_patch.uuid {
-                modified.insert((*purl).clone());
-            }
-        }
-    }
-
-    // Find removed
-    for purl in &old_purls {
-        if !new_purls.contains(purl) {
-            removed.insert((*purl).clone());
-        }
-    }
-
-    ManifestDiff {
-        added,
-        removed,
-        modified,
-    }
 }
 
 /// Validate a parsed JSON value as a PatchManifest.
@@ -233,65 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_referenced_blobs_returns_all() {
-        let manifest = create_test_manifest();
-        let blobs = get_referenced_blobs(&manifest);
-
-        assert_eq!(blobs.len(), 6);
-        assert!(blobs.contains(BEFORE_HASH_1));
-        assert!(blobs.contains(AFTER_HASH_1));
-        assert!(blobs.contains(BEFORE_HASH_2));
-        assert!(blobs.contains(AFTER_HASH_2));
-        assert!(blobs.contains(BEFORE_HASH_3));
-        assert!(blobs.contains(AFTER_HASH_3));
-    }
-
-    #[test]
-    fn test_get_referenced_blobs_empty_manifest() {
-        let manifest = PatchManifest::new();
-        let blobs = get_referenced_blobs(&manifest);
-        assert_eq!(blobs.len(), 0);
-    }
-
-    #[test]
-    fn test_get_referenced_blobs_deduplicates() {
-        let mut files = HashMap::new();
-        files.insert(
-            "package/file1.js".to_string(),
-            PatchFileInfo {
-                before_hash: BEFORE_HASH_1.to_string(),
-                after_hash: AFTER_HASH_1.to_string(),
-            },
-        );
-        files.insert(
-            "package/file2.js".to_string(),
-            PatchFileInfo {
-                before_hash: BEFORE_HASH_1.to_string(), // same as file1
-                after_hash: AFTER_HASH_2.to_string(),
-            },
-        );
-
-        let mut patches = HashMap::new();
-        patches.insert(
-            "pkg:npm/pkg-a@1.0.0".to_string(),
-            PatchRecord {
-                uuid: TEST_UUID_1.to_string(),
-                exported_at: "2024-01-01T00:00:00Z".to_string(),
-                files,
-                vulnerabilities: HashMap::new(),
-                description: "Test".to_string(),
-                license: "MIT".to_string(),
-                tier: "free".to_string(),
-            },
-        );
-
-        let manifest = PatchManifest { patches };
-        let blobs = get_referenced_blobs(&manifest);
-        // 3 unique hashes, not 4
-        assert_eq!(blobs.len(), 3);
-    }
-
-    #[test]
     fn test_get_after_hash_blobs() {
         let manifest = create_test_manifest();
         let blobs = get_after_hash_blobs(&manifest);
@@ -333,74 +210,6 @@ mod tests {
         assert_eq!(blobs.len(), 0);
     }
 
-    #[test]
-    fn test_after_plus_before_equals_all() {
-        let manifest = create_test_manifest();
-        let all_blobs = get_referenced_blobs(&manifest);
-        let after_blobs = get_after_hash_blobs(&manifest);
-        let before_blobs = get_before_hash_blobs(&manifest);
-
-        let union: HashSet<String> = after_blobs.union(&before_blobs).cloned().collect();
-        assert_eq!(union.len(), all_blobs.len());
-        for blob in &all_blobs {
-            assert!(union.contains(blob));
-        }
-    }
-
-    #[test]
-    fn test_diff_manifests_added() {
-        let old = PatchManifest::new();
-        let new_manifest = create_test_manifest();
-
-        let diff = diff_manifests(&old, &new_manifest);
-        assert_eq!(diff.added.len(), 2);
-        assert!(diff.added.contains("pkg:npm/pkg-a@1.0.0"));
-        assert!(diff.added.contains("pkg:npm/pkg-b@2.0.0"));
-        assert_eq!(diff.removed.len(), 0);
-        assert_eq!(diff.modified.len(), 0);
-    }
-
-    #[test]
-    fn test_diff_manifests_removed() {
-        let old = create_test_manifest();
-        let new_manifest = PatchManifest::new();
-
-        let diff = diff_manifests(&old, &new_manifest);
-        assert_eq!(diff.added.len(), 0);
-        assert_eq!(diff.removed.len(), 2);
-        assert!(diff.removed.contains("pkg:npm/pkg-a@1.0.0"));
-        assert!(diff.removed.contains("pkg:npm/pkg-b@2.0.0"));
-        assert_eq!(diff.modified.len(), 0);
-    }
-
-    #[test]
-    fn test_diff_manifests_modified() {
-        let old = create_test_manifest();
-        let mut new_manifest = create_test_manifest();
-        // Change UUID of pkg-a
-        new_manifest
-            .patches
-            .get_mut("pkg:npm/pkg-a@1.0.0")
-            .unwrap()
-            .uuid = "33333333-3333-4333-8333-333333333333".to_string();
-
-        let diff = diff_manifests(&old, &new_manifest);
-        assert_eq!(diff.added.len(), 0);
-        assert_eq!(diff.removed.len(), 0);
-        assert_eq!(diff.modified.len(), 1);
-        assert!(diff.modified.contains("pkg:npm/pkg-a@1.0.0"));
-    }
-
-    #[test]
-    fn test_diff_manifests_same() {
-        let old = create_test_manifest();
-        let new_manifest = create_test_manifest();
-
-        let diff = diff_manifests(&old, &new_manifest);
-        assert_eq!(diff.added.len(), 0);
-        assert_eq!(diff.removed.len(), 0);
-        assert_eq!(diff.modified.len(), 0);
-    }
 
     #[test]
     fn test_validate_manifest_valid() {
