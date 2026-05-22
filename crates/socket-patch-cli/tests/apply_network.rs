@@ -81,20 +81,8 @@ fn write_manifest_with_patch(socket: &Path, purl: &str, uuid: &str, before_hash:
 }
 
 fn run_apply(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
-    let mut args = vec![
-        "apply",
-        "--json",
-        "--api-token",
-        "fake-token-for-test",
-        "--api-url",
-        api_url,
-        "--org",
-        ORG_SLUG,
-    ];
     // CLI rejects --api-token / --api-url / --org on apply (those are
     // rollback-only flags) — apply respects them via env vars instead.
-    // Strip them and pass via env.
-    let _ = args;
     let mut argv: Vec<&str> = vec!["apply", "--json"];
     argv.extend_from_slice(extra);
     let out = Command::new(binary())

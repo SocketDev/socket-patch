@@ -257,7 +257,7 @@ fn make_repair_args(cwd: &Path, mode: &str) -> RepairArgs {
 async fn repair_diff_mode_downloads_diff_archives() {
     let tmp = tempfile::tempdir().unwrap();
     let uuid = "12121212-1212-4121-8121-121212121212";
-    let after_hash = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1";
+    let _after_hash = "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1";
 
     let server = MockServer::start().await;
     // Diff mode fetches /v0/orgs/<org>/patches/diff/<uuid> → tar.gz body.
@@ -320,7 +320,7 @@ async fn repair_diff_mode_downloads_diff_archives() {
 async fn repair_package_mode_downloads_package_archives() {
     let tmp = tempfile::tempdir().unwrap();
     let uuid = "13131313-1313-4131-8131-131313131313";
-    let after_hash = "def456def456def456def456def456def456def456def456def456def456def4";
+    let _after_hash = "def456def456def456def456def456def456def456def456def456def456def4";
 
     let server = MockServer::start().await;
     let archive_bytes = b"fake package archive bytes";

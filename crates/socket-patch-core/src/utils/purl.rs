@@ -322,8 +322,6 @@ mod tests {
         assert_eq!(version, "32.1.3-jre");
     }
 
-    #[cfg(feature = "maven")]
-    #[test]
     #[cfg(feature = "golang")]
     #[test]
     fn test_parse_golang_purl() {
