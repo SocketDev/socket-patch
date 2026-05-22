@@ -396,59 +396,6 @@ async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Parse `<id>` and `<version>` from `.nuspec` XML content.
-///
-/// Uses simple string matching — the nuspec format always has these
-/// elements on separate lines.
-pub fn parse_nuspec_id_version(content: &str) -> Option<(String, String)> {
-    let mut id = None;
-    let mut version = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if id.is_none() {
-            if let Some(value) = extract_xml_element(trimmed, "id") {
-                id = Some(value);
-            }
-        }
-
-        if version.is_none() {
-            if let Some(value) = extract_xml_element(trimmed, "version") {
-                version = Some(value);
-            }
-        }
-
-        if id.is_some() && version.is_some() {
-            break;
-        }
-    }
-
-    match (id, version) {
-        (Some(id), Some(version)) if !id.is_empty() && !version.is_empty() => {
-            Some((id, version))
-        }
-        _ => None,
-    }
-}
-
-/// Extract the text content of a simple XML element like `<tag>value</tag>`.
-fn extract_xml_element(line: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-
-    let start = line.find(&open)?;
-    let after_open = start + open.len();
-    let end = line[after_open..].find(&close)?;
-    let value = &line[after_open..after_open + end];
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 /// Discover additional package paths from `obj/project.assets.json` files.
 async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -539,42 +486,6 @@ mod tests {
         );
         assert!(parse_legacy_dir_name("no-version-here").is_none());
         assert!(parse_legacy_dir_name("justtext").is_none());
-    }
-
-    #[test]
-    fn test_parse_nuspec_id_version() {
-        let nuspec = r#"<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
-  <metadata>
-    <id>Newtonsoft.Json</id>
-    <version>13.0.3</version>
-    <authors>James Newton-King</authors>
-  </metadata>
-</package>"#;
-        assert_eq!(
-            parse_nuspec_id_version(nuspec),
-            Some(("Newtonsoft.Json".to_string(), "13.0.3".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_nuspec_empty() {
-        assert!(parse_nuspec_id_version("").is_none());
-        assert!(parse_nuspec_id_version("<metadata></metadata>").is_none());
-    }
-
-    #[test]
-    fn test_extract_xml_element() {
-        assert_eq!(
-            extract_xml_element("    <id>Newtonsoft.Json</id>", "id"),
-            Some("Newtonsoft.Json".to_string())
-        );
-        assert_eq!(
-            extract_xml_element("    <version>13.0.3</version>", "version"),
-            Some("13.0.3".to_string())
-        );
-        assert_eq!(extract_xml_element("<id></id>", "id"), None);
-        assert_eq!(extract_xml_element("no tags here", "id"), None);
     }
 
     #[tokio::test]

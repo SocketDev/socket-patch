@@ -108,20 +108,6 @@ pub async fn update_package_json(
     }
 }
 
-/// Update multiple package.json files.
-pub async fn update_multiple_package_jsons(
-    paths: &[&Path],
-    dry_run: bool,
-    pm: PackageManager,
-) -> Vec<UpdateResult> {
-    let mut results = Vec::new();
-    for path in paths {
-        let result = update_package_json(path, dry_run, pm).await;
-        results.push(result);
-    }
-    results
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,29 +213,4 @@ mod tests {
         assert!(content.contains("dependencies"));
     }
 
-    #[tokio::test]
-    async fn test_update_multiple_mixed() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let p1 = dir.path().join("a.json");
-        fs::write(&p1, r#"{"name":"a"}"#).await.unwrap();
-
-        let p2 = dir.path().join("b.json");
-        fs::write(
-            &p2,
-            r#"{"name":"b","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm","dependencies":"npx @socketsecurity/socket-patch apply --silent --ecosystems npm"}}"#,
-        )
-        .await
-        .unwrap();
-
-        let p3 = dir.path().join("c.json");
-        // Don't create p3 — file not found
-
-        let paths: Vec<&Path> = vec![p1.as_path(), p2.as_path(), p3.as_path()];
-        let results = update_multiple_package_jsons(&paths, false, PackageManager::Npm).await;
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].status, UpdateStatus::Updated);
-        assert_eq!(results[1].status, UpdateStatus::AlreadyConfigured);
-        assert_eq!(results[2].status, UpdateStatus::Error);
-    }
 }
