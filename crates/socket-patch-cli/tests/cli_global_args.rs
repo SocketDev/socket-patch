@@ -89,19 +89,21 @@ fn every_global_flag_parses_on_every_subcommand() {
     }
 }
 
-/// Short forms (`-d`, `-s`, `-y`, etc.) are part of the contract too.
+/// Short forms (`-s`, `-y`, etc.) are part of the contract too. `-d`
+/// and `-m` were dropped after v3.0 (they were reserved as aliases for
+/// `--dry-run` and `--manifest-path` but we want those letters free
+/// for future flags); the corresponding rejection check lives in
+/// `reserved_short_forms_are_not_assigned` below.
 #[test]
 fn every_global_short_form_parses_on_every_subcommand() {
     // (short, requires_value) — only flags that actually have a short.
     let shorts: &[(&str, bool)] = &[
-        ("-m", true),  // --manifest-path
         ("-o", true),  // --org
         ("-e", true),  // --ecosystems
         ("-g", false), // --global
         ("-j", false), // --json
         ("-v", false), // --verbose
         ("-s", false), // --silent
-        ("-d", false), // --dry-run
         ("-y", false), // --yes
     ];
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
@@ -127,6 +129,42 @@ fn every_global_short_form_parses_on_every_subcommand() {
                 subcommand,
                 short,
                 result.err().map(|e| e.to_string()).unwrap_or_default(),
+            );
+        }
+    }
+}
+
+/// `-d` and `-m` were intentionally dropped (formerly aliases for
+/// `--dry-run` and `--manifest-path`) so those letters stay free for
+/// future flags. Lock that in: clap must reject the bare shorts on
+/// every subcommand. The long forms still work and are exercised by
+/// `every_global_flag_parses_on_every_subcommand` above.
+#[test]
+fn reserved_short_forms_are_not_assigned() {
+    let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
+        .iter()
+        .chain(SUBCOMMANDS_WITH_IDENTIFIER.iter())
+        .copied()
+        .collect();
+    for &subcommand in &all_subcommands {
+        for short in ["-d", "-m"] {
+            let result = try_parse(subcommand, &[short]);
+            assert!(
+                result.is_err(),
+                "`{}` should NOT accept the reserved short `{}` — \
+                 if you bound it intentionally, update this test and \
+                 the corresponding `--help` docs.",
+                subcommand,
+                short,
+            );
+            let err = result.err().unwrap();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "expected UnknownArgument when `{}` is passed to `{}`; got {:?}",
+                short,
+                subcommand,
+                err.kind(),
             );
         }
     }

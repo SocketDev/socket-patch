@@ -48,12 +48,6 @@ fn defaults_match_contract() {
 }
 
 #[test]
-fn manifest_path_short_form() {
-    let args = parse_list(&["-m", "custom.json"]);
-    assert_eq!(args.common.manifest_path, "custom.json");
-}
-
-#[test]
 fn manifest_path_long_form() {
     let args = parse_list(&["--manifest-path", "custom.json"]);
     assert_eq!(args.common.manifest_path, "custom.json");

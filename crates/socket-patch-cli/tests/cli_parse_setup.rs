@@ -45,12 +45,6 @@ fn defaults_with_no_flags() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dry_run_short_form() {
-    let args = parse_setup(&["-d"]);
-    assert!(args.common.dry_run);
-}
-
-#[test]
 fn dry_run_long_form() {
     let args = parse_setup(&["--dry-run"]);
     assert!(args.common.dry_run);
@@ -82,7 +76,7 @@ fn json_long_form() {
 
 #[test]
 fn all_flags_combined() {
-    let args = parse_setup(&["--cwd", "/tmp/x", "-d", "-y", "--json"]);
+    let args = parse_setup(&["--cwd", "/tmp/x", "--dry-run", "-y", "--json"]);
     assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
     assert!(args.common.dry_run);
     assert!(args.common.yes);

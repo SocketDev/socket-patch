@@ -36,7 +36,6 @@ pub struct GlobalArgs {
     /// Path to patch manifest file (resolved relative to --cwd).
     #[arg(
         long = "manifest-path",
-        short = 'm',
         env = "SOCKET_MANIFEST_PATH",
         default_value = DEFAULT_PATCH_MANIFEST_PATH,
     )]
@@ -133,7 +132,6 @@ pub struct GlobalArgs {
     /// Preview the operation without making any mutations.
     #[arg(
         long = "dry-run",
-        short = 'd',
         env = "SOCKET_DRY_RUN",
         default_value_t = false,
     )]

@@ -54,21 +54,9 @@ fn repair_defaults_match_contract() {
 }
 
 #[test]
-fn repair_dry_run_short_flag() {
-    let args = parse_repair(&["-d"]);
-    assert!(args.common.dry_run);
-}
-
-#[test]
 fn repair_dry_run_long_flag() {
     let args = parse_repair(&["--dry-run"]);
     assert!(args.common.dry_run);
-}
-
-#[test]
-fn repair_manifest_path_short_flag() {
-    let args = parse_repair(&["-m", "custom.json"]);
-    assert_eq!(args.common.manifest_path, "custom.json");
 }
 
 #[test]

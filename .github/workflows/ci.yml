@@ -376,7 +376,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12.13'
+          python-version: '3.12.x'
 
       - name: Run pypi dispatch tests
         run: python pypi/socket-patch/test_dispatch.py
@@ -445,15 +445,16 @@ jobs:
         if: matrix.suite == 'e2e_pypi'
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12.13'
+          python-version: '3.12.x'
 
       - name: Setup Ruby
         if: matrix.suite == 'e2e_gem'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
-          # 3.2.11 was removed from setup-ruby's catalog; 3.2.10 is the
-          # newest 3.2.x available on the GitHub-hosted runner.
-          ruby-version: '3.2.10'
+          # Pin to minor.x so setup-ruby auto-resolves to the latest
+          # available 3.2.x patch — exact patch pins kept dropping out
+          # of the catalog as new releases landed.
+          ruby-version: '3.2.x'
           bundler-cache: false
 
       - name: Run e2e tests

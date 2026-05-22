@@ -26,7 +26,7 @@ In v3.0 every subcommand accepts the same set of "global" flags via a single sha
 | Long | Short | Env var | Default | Type | Semantic |
 |---|---|---|---|---|---|
 | `--cwd` | — | `SOCKET_CWD` | `.` | path | Working directory |
-| `--manifest-path` | `-m` | `SOCKET_MANIFEST_PATH` | `.socket/manifest.json` | path | Manifest location (resolved relative to `--cwd`) |
+| `--manifest-path` | — | `SOCKET_MANIFEST_PATH` | `.socket/manifest.json` | path | Manifest location (resolved relative to `--cwd`) |
 | `--api-url` | — | `SOCKET_API_URL` | `https://api.socket.dev` | string | Authenticated API endpoint |
 | `--api-token` | — | `SOCKET_API_TOKEN` | (none) | string | Auth token (absence selects the public proxy) |
 | `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug |
@@ -39,7 +39,7 @@ In v3.0 every subcommand accepts the same set of "global" flags via a single sha
 | `--json` | `-j` | `SOCKET_JSON` | `false` | bool | Machine-readable output |
 | `--verbose` | `-v` | `SOCKET_VERBOSE` | `false` | bool | Extra detail |
 | `--silent` | `-s` | `SOCKET_SILENT` | `false` | bool | Errors only |
-| `--dry-run` | `-d` | `SOCKET_DRY_RUN` | `false` | bool | Preview, no mutations |
+| `--dry-run` | — | `SOCKET_DRY_RUN` | `false` | bool | Preview, no mutations |
 | `--yes` | `-y` | `SOCKET_YES` | `false` | bool | Skip prompts |
 | `--debug` | — | `SOCKET_DEBUG` | `false` | bool | Verbose debug logs to stderr |
 | `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable anonymous usage telemetry |
@@ -80,7 +80,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | Env var | CLI equivalent | Default | Notes |
 |---|---|---|---|
 | `SOCKET_CWD` | `--cwd` | `.` | — |
-| `SOCKET_MANIFEST_PATH` | `--manifest-path` / `-m` | `.socket/manifest.json` | — |
+| `SOCKET_MANIFEST_PATH` | `--manifest-path` | `.socket/manifest.json` | — |
 | `SOCKET_API_URL` | `--api-url` | `https://api.socket.dev` | — |
 | `SOCKET_API_TOKEN` | `--api-token` | (none) | Absence selects the public proxy. |
 | `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | — |
@@ -93,7 +93,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_JSON` | `--json` / `-j` | `false` | — |
 | `SOCKET_VERBOSE` | `--verbose` / `-v` | `false` | — |
 | `SOCKET_SILENT` | `--silent` / `-s` | `false` | — |
-| `SOCKET_DRY_RUN` | `--dry-run` / `-d` | `false` | — |
+| `SOCKET_DRY_RUN` | `--dry-run` | `false` | — |
 | `SOCKET_YES` | `--yes` / `-y` | `false` | — |
 | `SOCKET_DEBUG` | `--debug` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_DEBUG`). |
 | `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | **Renamed in v3.0** (was `SOCKET_PATCH_TELEMETRY_DISABLED`). |

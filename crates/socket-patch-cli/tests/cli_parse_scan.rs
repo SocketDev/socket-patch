@@ -275,12 +275,6 @@ fn dry_run_long_form() {
 }
 
 #[test]
-fn dry_run_short_form() {
-    let args = parse_scan(&["-d"]);
-    assert!(args.common.dry_run);
-}
-
-#[test]
 fn scan_json_empty_cwd_emits_updates_key() {
     // Spawn the compiled binary against an empty tempdir so no API call
     // happens (no packages found → early return with all-zero summary).

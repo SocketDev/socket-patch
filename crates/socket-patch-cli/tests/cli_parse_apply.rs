@@ -71,11 +71,6 @@ fn dry_run_long() {
 }
 
 #[test]
-fn dry_run_short() {
-    assert!(parse_apply(&["-d"]).common.dry_run);
-}
-
-#[test]
 fn silent_long() {
     assert!(parse_apply(&["--silent"]).common.silent);
 }
@@ -140,11 +135,6 @@ fn manifest_path_long() {
         parse_apply(&["--manifest-path", "custom.json"]).common.manifest_path,
         "custom.json"
     );
-}
-
-#[test]
-fn manifest_path_short() {
-    assert_eq!(parse_apply(&["-m", "custom.json"]).common.manifest_path, "custom.json");
 }
 
 #[test]

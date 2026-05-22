@@ -58,12 +58,6 @@ fn positional_identifier_purl() {
 }
 
 #[test]
-fn dry_run_short() {
-    let args = parse_rollback(&["-d"]);
-    assert!(args.common.dry_run);
-}
-
-#[test]
 fn dry_run_long() {
     let args = parse_rollback(&["--dry-run"]);
     assert!(args.common.dry_run);
@@ -79,12 +73,6 @@ fn silent_short() {
 fn silent_long() {
     let args = parse_rollback(&["--silent"]);
     assert!(args.common.silent);
-}
-
-#[test]
-fn manifest_path_short() {
-    let args = parse_rollback(&["-m", "custom.json"]);
-    assert_eq!(args.common.manifest_path, "custom.json");
 }
 
 #[test]

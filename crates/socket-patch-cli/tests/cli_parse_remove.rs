@@ -84,12 +84,6 @@ fn global_long_form() {
 }
 
 #[test]
-fn manifest_path_short_form() {
-    let args = parse_remove(&["pkg:npm/foo@1", "-m", "custom/manifest.json"]);
-    assert_eq!(args.common.manifest_path, "custom/manifest.json");
-}
-
-#[test]
 fn manifest_path_long_form() {
     let args = parse_remove(&[
         "pkg:npm/foo@1",
@@ -133,7 +127,7 @@ fn all_flags_combined() {
         "pkg:npm/foo@1",
         "--cwd",
         "/tmp/x",
-        "-m",
+        "--manifest-path",
         "custom/manifest.json",
         "--skip-rollback",
         "-y",
