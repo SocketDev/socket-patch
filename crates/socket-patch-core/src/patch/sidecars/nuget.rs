@@ -80,16 +80,26 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
 
 /// Return true if the directory contains any `*.nupkg.sha512` file —
 /// a NuGet content-signing marker.
+///
+/// Matches against `OsStr::as_encoded_bytes()` rather than
+/// `to_str()`. The `.nupkg.sha512` suffix is pure ASCII, so a byte-
+/// level `ends_with` is exactly as correct as the str check would
+/// be — and it naturally handles non-UTF-8 filenames (ext4, NTFS
+/// junk left over from corrupt installs) without an implicit-else
+/// arm that coverage can never reach on filesystems that reject
+/// non-UTF-8 bytes at creation time (APFS).
 async fn has_signed_marker(pkg_path: &Path) -> bool {
     let mut entries = match tokio::fs::read_dir(pkg_path).await {
         Ok(rd) => rd,
         Err(_) => return false,
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.ends_with(".nupkg.sha512") {
-                return true;
-            }
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .ends_with(b".nupkg.sha512")
+        {
+            return true;
         }
     }
     false

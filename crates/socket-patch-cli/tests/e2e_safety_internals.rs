@@ -380,6 +380,71 @@ async fn cow_stage_write_failure_propagates() {
     assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
+/// Symlink-branch write_via_stage_rename failure arm (cow.rs:71):
+/// after `read(symlink)` and `remove_file(symlink)` both succeed,
+/// the subsequent `write_via_stage_rename` fails to create its
+/// `.socket-cow-*` stage file because the parent directory has a
+/// macOS ACL that denies `add_file` while still allowing
+/// `delete_child` — a state POSIX mode bits can't express
+/// (write perm on a dir is monolithic for create+delete).
+///
+/// This is the only filesystem state that lets remove succeed but
+/// the next write fail in the same parent dir, which is required
+/// to reach the `?` Err arm on cow.rs:71. macOS-only because BSD
+/// extended ACLs (`chmod +a`) are the only userspace mechanism
+/// for this kind of fine-grained denial. Linux's POSIX.1e ACLs
+/// can't split create-vs-delete on directories.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cow_symlink_stage_write_failure_propagates() {
+    use std::process::Command;
+
+    if Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+    {
+        eprintln!("SKIP: root bypasses ACL deny entries");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("pkg");
+    std::fs::create_dir(&dir).unwrap();
+    let target = dir.join("orig.txt");
+    std::fs::write(&target, b"shared bytes").unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    // Get the current user name for the ACL entry.
+    let user = std::env::var("USER").unwrap_or_else(|_| "$(id -un)".to_string());
+
+    // Add a deny-add_file ACL: blocks creation of new files in `dir`
+    // while leaving `delete_child` (remove_file) intact. POSIX mode
+    // bits couldn't express this — `chmod 0500` would block both.
+    let status = Command::new("chmod")
+        .arg("+a")
+        .arg(format!("{user} deny add_file"))
+        .arg(&dir)
+        .status()
+        .expect("chmod +a");
+    assert!(status.success(), "ACL set must succeed");
+
+    let result = break_hardlink_if_needed(&link).await;
+
+    // Strip the ACL so tempdir cleanup works.
+    let _ = Command::new("chmod").arg("-a#").arg("0").arg(&dir).status();
+
+    let err = result.expect_err(
+        "with deny-add_file ACL, write_via_stage_rename's stage create must fail \
+         AFTER read + remove succeeded, hitting cow.rs:71's `?` Err arm",
+    );
+    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
 /// `break_hardlink_if_needed` failure-cleanup arm (cow.rs:116-120):
 /// when `rename(stage, path)` inside `write_via_stage_rename`
 /// fails, the function must `remove_file(stage)` before
