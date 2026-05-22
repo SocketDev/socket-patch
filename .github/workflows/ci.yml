@@ -451,10 +451,13 @@ jobs:
         if: matrix.suite == 'e2e_gem'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
-          # Pin to minor.x so setup-ruby auto-resolves to the latest
-          # available 3.2.x patch — exact patch pins kept dropping out
-          # of the catalog as new releases landed.
-          ruby-version: '3.2.x'
+          # setup-ruby does NOT support `3.2.x` wildcard pinning the
+          # way setup-python does — it errors with "Unknown version
+          # 3.2.x for ruby on ubuntu-24.04". Pin to an exact patch
+          # that's currently in the catalog. If the action drops this
+          # patch in the future, bump to whatever's available — see
+          # https://github.com/ruby/setup-ruby for the supported list.
+          ruby-version: '3.2.10'
           bundler-cache: false
 
       - name: Run e2e tests
