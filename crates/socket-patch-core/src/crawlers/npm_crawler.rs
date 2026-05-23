@@ -359,7 +359,8 @@ impl NpmCrawler {
         }
 
         // macOS-specific fallback paths
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             let home = std::env::var("HOME").unwrap_or_default();
 
             // Homebrew Apple Silicon

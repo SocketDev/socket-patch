@@ -179,9 +179,12 @@ pub async fn find_site_packages_under(
     base_dir: &Path,
     sub_dir_type: &str, // "site-packages" or "dist-packages"
 ) -> Vec<PathBuf> {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         find_python_dirs(base_dir, &["Lib", sub_dir_type]).await
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         find_python_dirs(base_dir, &["lib", "python3.*", sub_dir_type]).await
     }
 }
@@ -283,7 +286,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    if !cfg!(windows) {
+    #[cfg(not(windows))]
+    {
         // Debian/Ubuntu
         scan_well_known(Path::new("/usr"), "dist-packages", &mut seen, &mut results).await;
         scan_well_known(Path::new("/usr"), "site-packages", &mut seen, &mut results).await;
@@ -308,7 +312,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // macOS-specific
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         scan_well_known(
             Path::new("/opt/homebrew"),
             "site-packages",
@@ -338,7 +343,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // Windows-specific
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         // pip --user on Windows: %APPDATA%\Python\PythonXY\site-packages
         if let Ok(appdata) = std::env::var("APPDATA") {
             let appdata_python = PathBuf::from(&appdata).join("Python");
@@ -383,7 +389,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // pyenv (works on macOS and Linux)
-    if !cfg!(windows) {
+    #[cfg(not(windows))]
+    {
         let pyenv_root = std::env::var("PYENV_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home_dir).join(".pyenv"));
@@ -404,8 +411,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let miniconda = PathBuf::from(&home_dir).join("miniconda3");
     scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
 
-    // uv tools
-    if cfg!(target_os = "macos") {
+    // uv tools — platform-specific install root.
+    #[cfg(target_os = "macos")]
+    {
         let uv_base = PathBuf::from(&home_dir)
             .join("Library")
             .join("Application Support")
@@ -416,7 +424,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         for m in uv_matches {
             add_path(m, &mut seen, &mut results);
         }
-    } else if cfg!(windows) {
+    }
+    #[cfg(windows)]
+    {
         // %LOCALAPPDATA%\uv\tools
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let uv_base = PathBuf::from(local).join("uv").join("tools");
@@ -426,7 +436,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
                 add_path(m, &mut seen, &mut results);
             }
         }
-    } else {
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
         let uv_base = PathBuf::from(&home_dir)
             .join(".local")
             .join("share")
@@ -787,11 +799,10 @@ mod tests {
     async fn test_crawl_all_python() {
         let dir = tempfile::tempdir().unwrap();
         let venv = dir.path().join(".venv");
-        let sp = if cfg!(windows) {
-            venv.join("Lib").join("site-packages")
-        } else {
-            venv.join("lib").join("python3.11").join("site-packages")
-        };
+        #[cfg(windows)]
+        let sp = venv.join("Lib").join("site-packages");
+        #[cfg(not(windows))]
+        let sp = venv.join("lib").join("python3.11").join("site-packages");
         tokio::fs::create_dir_all(&sp).await.unwrap();
 
         // Create a dist-info dir with METADATA
