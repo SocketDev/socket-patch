@@ -225,6 +225,67 @@ fn helper_lock_is_actually_exclusive() {
     );
 }
 
+/// `apply --break-lock` against a pre-staged lock file (no live
+/// holder) removes the file before acquisition and proceeds with
+/// the apply pass. The JSON envelope must surface the
+/// `lock_broken` warning event so the action is auditable.
+///
+/// Setup mirrors the OS-level scenario: a previous run crashed and
+/// left `apply.lock` behind, but the OS-level flock was released
+/// (so a fresh acquire would succeed even without --break-lock).
+/// The --break-lock path is the safe-by-design version of `rm`.
+#[test]
+fn break_lock_removes_stale_file_and_records_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    setup_socket_dir(&socket_dir);
+    // Pre-stage a lock file but DON'T hold an OS lock — simulates
+    // the post-crash scenario where the file lingers but flock was
+    // released. Without --break-lock the binary would still
+    // acquire fine (`acquire` re-opens the file); with --break-lock
+    // we additionally get the audit event.
+    std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
+
+    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
+    let env = parse_json_envelope(&stdout);
+    let events = env["events"].as_array().expect("events array");
+    let has_lock_broken = events.iter().any(|e| {
+        e.get("action").and_then(|v| v.as_str()) == Some("skipped")
+            && e.get("errorCode").and_then(|v| v.as_str()) == Some("lock_broken")
+    });
+    assert!(
+        has_lock_broken,
+        "apply --break-lock should emit a lock_broken skipped event.\nstdout:\n{stdout}"
+    );
+}
+
+/// `apply --lock-timeout=1` against a held lock waits up to 1s
+/// before reporting `lock_held`. Confirms the wait knob is wired
+/// end-to-end through the CLI surface.
+///
+/// Lower bound: the apply call must take at least ~700ms because
+/// the wait budget is ~1s with 100ms backoff slop. Upper bound is
+/// not asserted because CI hosts have varying schedule jitter.
+#[test]
+fn lock_timeout_waits_then_reports_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    setup_socket_dir(&socket_dir);
+    let _external = take_external_lock(&socket_dir);
+
+    let start = std::time::Instant::now();
+    let (code, stdout, _stderr) = run(dir.path(), &["apply", "--json", "--lock-timeout=1"]);
+    let elapsed = start.elapsed();
+    assert_eq!(code, 1);
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(envelope_error_code(&env), Some("lock_held"));
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "expected at least ~700ms wait under --lock-timeout=1, got {:?}",
+        elapsed
+    );
+}
+
 /// Compile-time witness: the helper signature stays stable.
 /// `fs2::FileExt` import gets pulled in once so failing to import it
 /// (e.g. fs2 dev-dep dropped from Cargo.toml) is caught at build

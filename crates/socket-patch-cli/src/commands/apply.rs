@@ -12,11 +12,12 @@ use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
 
-use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -167,16 +168,20 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // `.socket/` directory. The guard releases on function return; see
     // `socket_patch_core::patch::apply_lock`.
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let _lock = match acquire_or_emit(
+    let acquired = match acquire_or_emit(
         socket_dir,
         Command::Apply,
         args.common.json,
         args.common.silent,
         args.common.dry_run,
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        args.common.break_lock,
     ) {
-        Ok(guard) => guard,
+        Ok(acquired) => acquired,
         Err(code) => return code,
     };
+    let _lock = acquired.guard;
+    let lock_was_broken = acquired.broke_lock;
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -237,6 +242,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
+                if lock_was_broken {
+                    env.record(lock_broken_event(socket_dir));
+                }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
                     // Sidecar records live on the envelope, not on

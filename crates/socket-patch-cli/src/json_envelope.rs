@@ -323,6 +323,7 @@ pub enum Command {
     Remove,
     Repair,
     Setup,
+    Unlock,
 }
 
 

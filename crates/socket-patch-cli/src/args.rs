@@ -146,6 +146,26 @@ pub struct GlobalArgs {
     )]
     pub yes: bool,
 
+    /// Seconds to wait for `<.socket>/apply.lock` before giving up.
+    /// Default (`None`) and `0` both mean a single non-blocking try
+    /// — failing immediately if another process holds the lock. A
+    /// positive value retries with a 100 ms backoff until the lock
+    /// frees or the budget elapses. Only meaningful for the mutating
+    /// subcommands (`apply`, `rollback`, `repair`, `remove`); other
+    /// commands accept it silently.
+    #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
+    pub lock_timeout: Option<u64>,
+
+    /// Force-remove `<.socket>/apply.lock` before attempting
+    /// acquisition. Use when you are certain no other socket-patch
+    /// process is running (e.g. a previous run crashed in a way that
+    /// stripped the OS lock but left the file). Emits a
+    /// `lock_broken` warning event in the JSON envelope so the
+    /// action is auditable. Only meaningful for mutating
+    /// subcommands; other commands accept it silently.
+    #[arg(long = "break-lock", env = "SOCKET_BREAK_LOCK", default_value_t = false)]
+    pub break_lock: bool,
+
     /// Emit verbose debug logs to stderr.
     #[arg(long = "debug", env = "SOCKET_DEBUG", default_value_t = false)]
     pub debug: bool,
@@ -235,6 +255,8 @@ impl Default for GlobalArgs {
             silent: false,
             dry_run: false,
             yes: false,
+            lock_timeout: None,
+            break_lock: false,
             debug: false,
             no_telemetry: false,
         }

@@ -62,6 +62,12 @@ pub enum Commands {
     /// their own when the user wants to clean up without an apply pass.
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
+
+    /// Inspect (and optionally release) the `<.socket>/apply.lock`
+    /// advisory file lock used by mutating subcommands. Exits 0
+    /// when free, 1 when held. Pass `--release` to also delete the
+    /// lock file when it is free.
+    Unlock(commands::unlock::UnlockArgs),
 }
 
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
