@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, parse_package_name, read_package_json,
+    build_npm_purl, parse_bun_bin_output, parse_package_name, read_package_json,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -117,6 +117,32 @@ async fn read_package_json_missing_version_returns_none() {
 
     let result = read_package_json(&pkg).await;
     assert_eq!(result, None);
+}
+
+// ── parse_bun_bin_output ───────────────────────────────────────
+
+/// Bun's global node_modules lives at `<bun-root>/install/global/node_modules`
+/// — the parser strips the trailing `bin` segment and joins the well-known
+/// suffix.
+#[test]
+fn parse_bun_bin_output_well_formed_unix() {
+    let parsed = parse_bun_bin_output("/home/foo/.bun/bin\n");
+    assert_eq!(
+        parsed.as_deref(),
+        Some("/home/foo/.bun/install/global/node_modules")
+    );
+}
+
+#[test]
+fn parse_bun_bin_output_empty_returns_none() {
+    assert_eq!(parse_bun_bin_output(""), None);
+    assert_eq!(parse_bun_bin_output("   \n  "), None);
+}
+
+/// Root-only path has no parent — must yield None instead of panicking.
+#[test]
+fn parse_bun_bin_output_root_path_returns_none() {
+    assert_eq!(parse_bun_bin_output("/"), None);
 }
 
 // ── find_by_purls ──────────────────────────────────────────────

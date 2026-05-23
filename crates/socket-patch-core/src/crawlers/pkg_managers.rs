@@ -44,19 +44,6 @@ pub enum NpmPkgManager {
     Unknown,
 }
 
-impl NpmPkgManager {
-    /// Short lowercase tag, suitable for JSON output.
-    pub fn as_tag(&self) -> &'static str {
-        match self {
-            NpmPkgManager::Npm => "npm",
-            NpmPkgManager::Pnpm => "pnpm",
-            NpmPkgManager::YarnClassic => "yarn-classic",
-            NpmPkgManager::YarnBerryPnP => "yarn-berry-pnp",
-            NpmPkgManager::Unknown => "unknown",
-        }
-    }
-}
-
 /// Detect the package manager that produced the layout under
 /// `project_root`. Inspection is purely path-based — no shell-outs,
 /// no parsing — so the detector is fast and side-effect-free.
@@ -173,13 +160,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn as_tag_values() {
-        // Pin the tag strings — they're part of the JSON envelope contract.
-        assert_eq!(NpmPkgManager::Npm.as_tag(), "npm");
-        assert_eq!(NpmPkgManager::Pnpm.as_tag(), "pnpm");
-        assert_eq!(NpmPkgManager::YarnClassic.as_tag(), "yarn-classic");
-        assert_eq!(NpmPkgManager::YarnBerryPnP.as_tag(), "yarn-berry-pnp");
-        assert_eq!(NpmPkgManager::Unknown.as_tag(), "unknown");
-    }
 }

@@ -70,6 +70,81 @@ fn parse_cargo_toml_malformed_returns_none() {
     assert_eq!(parse_cargo_toml_name_version(toml), None);
 }
 
+/// Parser must stop scanning when it leaves the `[package]` table.
+/// A `name =` or `version =` line under a later table must NOT be
+/// picked up. Covers the "left package section" early-break arm
+/// (cargo_crawler.rs:34-36).
+#[test]
+fn parse_cargo_toml_stops_at_next_section() {
+    let toml = "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n\n[dependencies]\nname = \"bar\"\n";
+    assert_eq!(
+        parse_cargo_toml_name_version(toml),
+        Some(("foo".to_string(), "1.0.0".to_string()))
+    );
+}
+
+/// Parser must ignore key=value lines that appear BEFORE [package]
+/// (e.g. inside an earlier [profile.release] table).
+#[test]
+fn parse_cargo_toml_ignores_lines_before_package_section() {
+    let toml = "[profile.release]\nname = \"wrong\"\n\n[package]\nname = \"foo\"\nversion = \"1.0.0\"\n";
+    assert_eq!(
+        parse_cargo_toml_name_version(toml),
+        Some(("foo".to_string(), "1.0.0".to_string()))
+    );
+}
+
+/// CargoCrawler's `Default` impl forwards to `new`. Exercise both
+/// for symmetry.
+#[test]
+fn cargo_crawler_default_and_new_construct_cleanly() {
+    let _a = CargoCrawler::default();
+    let _b = CargoCrawler::new();
+}
+
+/// `cargo_home` fallback to `$HOME/.cargo` when CARGO_HOME is unset.
+/// Exercised via `get_crate_source_paths(global=true)` which calls
+/// `Self::get_registry_src_paths` → `cargo_home` internally.
+#[tokio::test]
+#[serial_test::serial]
+async fn cargo_home_fallback_to_home_dot_cargo() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stage a fake registry tree at $HOME/.cargo/registry/src/.
+    let stamp_dir = tmp
+        .path()
+        .join(".cargo")
+        .join("registry")
+        .join("src")
+        .join("index.crates.io-1949cf8c6b5b557f");
+    tokio::fs::create_dir_all(&stamp_dir).await.unwrap();
+
+    let prev_cargo = std::env::var("CARGO_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("CARGO_HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_crate_source_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_cargo {
+        std::env::set_var("CARGO_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &stamp_dir),
+        "HOME/.cargo fallback registry must be discovered; got {paths:?}"
+    );
+}
+
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]

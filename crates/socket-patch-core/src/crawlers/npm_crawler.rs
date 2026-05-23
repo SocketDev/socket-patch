@@ -155,8 +155,18 @@ pub fn get_bun_global_prefix() -> Option<String> {
     if !output.status.success() {
         return None;
     }
+    parse_bun_bin_output(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let bin_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `bun pm bin -g` stdout. Extracted so the
+/// derive-the-global-node_modules-path logic is unit-testable
+/// without shelling out.
+///
+/// Given output like `"/Users/foo/.bun/bin\n"` returns
+/// `Some("/Users/foo/.bun/install/global/node_modules")`. Returns
+/// `None` on empty input or a root-only path with no parent.
+pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
+    let bin_path = stdout.trim().to_string();
     if bin_path.is_empty() {
         return None;
     }
