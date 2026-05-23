@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, parse_bun_bin_output, parse_package_name, parse_pnpm_root_output,
+    build_npm_purl, get_bun_global_prefix, get_npm_global_prefix, get_pnpm_global_prefix,
+    get_yarn_global_prefix, parse_bun_bin_output, parse_package_name, parse_pnpm_root_output,
     parse_yarn_dir_output, read_package_json,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -209,6 +210,58 @@ fn parse_bun_bin_output_empty_returns_none() {
 #[test]
 fn parse_bun_bin_output_root_path_returns_none() {
     assert_eq!(parse_bun_bin_output("/"), None);
+}
+
+// ── shell-out wrappers via PATH stubbing ──────────────────────
+
+/// Sub-helper: temporarily set `PATH` to a directory that does NOT
+/// contain `npm`, `yarn`, `pnpm`, or `bun`, run the callback, then
+/// restore. Used to force the `.output().ok()?` Err arm in each
+/// global-prefix wrapper without depending on whether the dev host
+/// has those binaries installed.
+fn with_empty_path<F: FnOnce()>(f: F) {
+    let prev = std::env::var("PATH").ok();
+    let empty = tempfile::tempdir().unwrap();
+    std::env::set_var("PATH", empty.path());
+    f();
+    if let Some(v) = prev {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn get_npm_global_prefix_returns_err_when_npm_not_on_path() {
+    with_empty_path(|| {
+        let result = get_npm_global_prefix();
+        assert!(result.is_err(), "npm-not-on-PATH must return Err; got {result:?}");
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn get_yarn_global_prefix_returns_none_when_yarn_not_on_path() {
+    with_empty_path(|| {
+        assert_eq!(get_yarn_global_prefix(), None);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn get_pnpm_global_prefix_returns_none_when_pnpm_not_on_path() {
+    with_empty_path(|| {
+        assert_eq!(get_pnpm_global_prefix(), None);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn get_bun_global_prefix_returns_none_when_bun_not_on_path() {
+    with_empty_path(|| {
+        assert_eq!(get_bun_global_prefix(), None);
+    });
 }
 
 // ── parse_yarn_dir_output ──────────────────────────────────────
