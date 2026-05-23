@@ -427,7 +427,70 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // uv-managed Python interpreters (`uv python install 3.X`) live at:
+    //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
+    //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
+    // The typical flow is `uv venv` + `uv pip install`, where the venv layout
+    // is already covered by `find_local_venv_site_packages`. But power users
+    // can install packages directly into the managed interpreter (e.g. via
+    // `<uv-python>/bin/pip install ...`), and globally-discovered crawls
+    // should surface those.
+    #[cfg(not(windows))]
+    {
+        let uv_python = PathBuf::from(&home_dir)
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("python");
+        let uv_matches =
+            find_python_dirs(&uv_python, &["*", "lib", "python3.*", "site-packages"]).await;
+        for m in uv_matches {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let uv_python = PathBuf::from(local).join("uv").join("python");
+            let uv_matches =
+                find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
+            for m in uv_matches {
+                add_path(m, &mut seen, &mut results);
+            }
+        }
+    }
+
     results
+}
+
+/// Returns true if `cwd` looks like a Python project root.
+///
+/// Used by `PythonCrawler::get_site_packages_paths` to decide
+/// whether to fall back to the global-discovery path when no venv
+/// was found. Mirrors `is_dotnet_project` in nuget_crawler and the
+/// `has_gemfile || has_gemfile_lock` check in ruby_crawler.
+///
+/// The list intentionally covers all major Python toolchains:
+///   * `pyproject.toml` — PEP 518 / 621 (poetry, hatch, uv, flit,
+///     setuptools-PEP-517, pdm, etc. — anything modern)
+///   * `setup.py` / `setup.cfg` — legacy setuptools
+///   * `requirements.txt` — pip-compile / bare requirements
+///   * `uv.lock` — uv-managed projects (PEP 751 export sibling is
+///     `pylock.toml` but in practice `uv.lock` is what ships)
+async fn is_python_project(cwd: &Path) -> bool {
+    let markers = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "uv.lock",
+    ];
+    for m in &markers {
+        if tokio::fs::metadata(cwd.join(m)).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +507,21 @@ impl PythonCrawler {
     }
 
     /// Get `site-packages` paths based on options.
+    ///
+    /// Local-mode discovery has two stages:
+    ///   1. `find_local_venv_site_packages` — handles `VIRTUAL_ENV`,
+    ///      `.venv`, and `venv` directories (covers the common case
+    ///      of an activated or project-local venv).
+    ///   2. If no venv was found AND the cwd looks like a Python
+    ///      project (`pyproject.toml`, `setup.py`, `setup.cfg`,
+    ///      `requirements.txt`, or `uv.lock` present), fall through
+    ///      to `get_global_python_site_packages`. This mirrors the
+    ///      cargo / ruby / go pattern where a project marker
+    ///      indicates "scan this ecosystem globally for this project".
+    ///
+    /// Without the marker fallback, a fresh clone with
+    /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
+    /// return zero packages.
     pub async fn get_site_packages_paths(&self, options: &CrawlerOptions) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
@@ -451,7 +529,14 @@ impl PythonCrawler {
             }
             return Ok(get_global_python_site_packages().await);
         }
-        Ok(find_local_venv_site_packages(&options.cwd).await)
+        let venv_paths = find_local_venv_site_packages(&options.cwd).await;
+        if !venv_paths.is_empty() {
+            return Ok(venv_paths);
+        }
+        if is_python_project(&options.cwd).await {
+            return Ok(get_global_python_site_packages().await);
+        }
+        Ok(Vec::new())
     }
 
     /// Crawl all discovered `site-packages` and return every package found.

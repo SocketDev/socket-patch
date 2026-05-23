@@ -123,8 +123,9 @@ pub async fn dispatch_fixup(
         Ecosystem::Pypi => Some(advisory_only_payload(
             SidecarAdvisoryCode::PypiRecordStale,
             SidecarSeverity::Warning,
-            "PyPI: run `pip check` to verify .dist-info/RECORD consistency. \
-             A `pip install --force-reinstall` will revert these patches.",
+            "PyPI: run `pip check` (or `uv pip check`) to verify \
+             .dist-info/RECORD consistency. `pip install --force-reinstall` \
+             or `uv pip install --reinstall` will revert these patches.",
         )),
         Ecosystem::Gem => Some(advisory_only_payload(
             SidecarAdvisoryCode::GemBundleInstallReverts,
