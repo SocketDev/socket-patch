@@ -304,6 +304,99 @@ exit 0
     )
 }
 
+/// Driver script for the `bun install` variant. Distinct from
+/// `make_container_script` because bun hard-links from
+/// `~/.bun/install/cache/` into `node_modules/` by default (Linux
+/// backend), and this test additionally proves the apply pipeline's
+/// CoW guard (`break_hardlink_if_needed`) preserves cache integrity.
+///
+/// Mirror of `pypi_uv_venv_install_full_apply_chain`'s assertion
+/// pattern: prewarm cache → install → snapshot inode + cache twin
+/// SHA256 → apply → assert (a) venv file got the marker AND (b)
+/// cache twin's bytes are unchanged.
+fn make_bun_script(api_url: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
+
+# 1. Pre-warm bun's cache (~/.bun/install/cache/) by installing the
+#    target package in a throwaway project first. Guarantees the
+#    cache contains minimist before the test install, so the test
+#    install can hard-link from it.
+mkdir -p /tmp/prewarm && cd /tmp/prewarm
+echo '{{"name":"prewarm","version":"0.0.0"}}' > package.json
+bun install --silent --no-summary minimist@1.2.2 >/dev/null 2>&1 || true
+
+# 2. Real install into the test project. By default bun's Linux
+#    backend hard-links from ~/.bun/install/cache/ into node_modules.
+mkdir -p /workspace/proj && cd /workspace/proj
+echo '{{"name":"e2e-proj","version":"0.0.0"}}' > package.json
+bun install --silent --no-summary minimist@1.2.2
+
+# 3. Locate the installed file and record inode + nlink.
+TARGET=node_modules/minimist/index.js
+TARGET_INODE_BEFORE=$(stat -c %i "$TARGET")
+TARGET_NLINK_BEFORE=$(stat -c %h "$TARGET")
+echo "bun target inode_before=$TARGET_INODE_BEFORE nlink_before=$TARGET_NLINK_BEFORE" >&2
+
+# Locate the cache twin via inode if nlink > 1.
+CACHE_TWIN=""
+CACHE_HASH_BEFORE=""
+if [ "$TARGET_NLINK_BEFORE" -gt 1 ]; then
+  CACHE_TWIN=$(find /root/.bun/install/cache -inum "$TARGET_INODE_BEFORE" 2>/dev/null | head -1 || true)
+  if [ -n "$CACHE_TWIN" ] && [ -f "$CACHE_TWIN" ]; then
+    CACHE_HASH_BEFORE=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
+    echo "bun cache twin: $CACHE_TWIN hash=$CACHE_HASH_BEFORE" >&2
+  fi
+fi
+
+# 4. scan --sync.
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" 2>/tmp/sync.err
+echo "sync exit=$?" >&2
+cat /tmp/sync.err >&2 || true
+
+# 5. apply --force --offline.
+socket-patch apply --json --force --offline 2>/tmp/apply.err
+echo "apply exit=$?" >&2
+cat /tmp/apply.err >&2 || true
+
+# 6. Marker must be in the on-disk file.
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
+  echo "FAIL: marker not in $TARGET" >&2
+  head -3 "$TARGET" >&2
+  exit 1
+fi
+
+# 7. If the install hard-linked from cache, the apply must have
+#    isolated the venv copy via CoW. The cache twin's bytes must be
+#    unchanged.
+if [ "$TARGET_NLINK_BEFORE" -gt 1 ] && [ -n "$CACHE_TWIN" ] && [ -f "$CACHE_TWIN" ]; then
+  CACHE_HASH_AFTER=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
+  if [ "$CACHE_HASH_AFTER" != "$CACHE_HASH_BEFORE" ]; then
+    echo "FAIL: bun cache content CORRUPTED — CoW didn't isolate the venv copy!" >&2
+    echo "  before=$CACHE_HASH_BEFORE" >&2
+    echo "  after =$CACHE_HASH_AFTER" >&2
+    echo "  path  =$CACHE_TWIN" >&2
+    head -3 "$CACHE_TWIN" >&2
+    exit 1
+  fi
+  if grep -q 'SOCKET-PATCH-E2E-MARKER' "$CACHE_TWIN"; then
+    echo "FAIL: bun cache twin contains the marker — patch leaked into ~/.bun/install/cache/" >&2
+    exit 1
+  fi
+  echo "bun cache integrity PRESERVED: $CACHE_TWIN unchanged" >&2
+else
+  echo "(bun did not hard-link in this environment; CoW path was a no-op)" >&2
+fi
+
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    )
+}
+
 fn run_in_container(script: &str) -> std::process::Output {
     let mut cmd = Command::new("docker");
     cmd.args([
@@ -431,6 +524,33 @@ async fn npm_global_install_full_apply_chain() {
     assert!(
         out.status.success(),
         "npm global apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+}
+
+/// Bun-managed install + apply, with CoW-isolation assertion. See
+/// `make_bun_script` for the inode/cache-twin/SHA256 gate that proves
+/// `break_hardlink_if_needed` in `patch/cow.rs` correctly isolates
+/// the test venv's copy of the package from `~/.bun/install/cache/`.
+#[tokio::test]
+async fn npm_bun_install_full_apply_chain() {
+    let after_hash = git_sha256(PATCHED_BYTES);
+    let server = make_mock_server(&after_hash).await;
+    if host_mode() {
+        // Host mode would need bun installed locally; skip for now.
+        return;
+    }
+    if skip_if_no_docker_image() {
+        return;
+    }
+    let api = api_url_for_container(&server);
+    let out = run_in_container(&make_bun_script(&api));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bun install apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");

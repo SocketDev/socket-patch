@@ -16,6 +16,14 @@ pub enum Ecosystem {
     Composer,
     #[cfg(feature = "nuget")]
     Nuget,
+    /// Deno's JSR registry. PURL form
+    /// `pkg:jsr/<scope>/<name>@<version>`. Note: Deno's `deno install`
+    /// flow also produces standard `node_modules/` trees full of
+    /// `pkg:npm/...` packages — those route through `Ecosystem::Npm`
+    /// unchanged. Only JSR (the deno-native registry) gets its own
+    /// variant.
+    #[cfg(feature = "deno")]
+    Deno,
 }
 
 impl Ecosystem {
@@ -35,6 +43,8 @@ impl Ecosystem {
             Ecosystem::Composer,
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget,
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno,
         ]
     }
 
@@ -63,6 +73,10 @@ impl Ecosystem {
         if purl.starts_with("pkg:nuget/") {
             return Some(Ecosystem::Nuget);
         }
+        #[cfg(feature = "deno")]
+        if purl.starts_with("pkg:jsr/") {
+            return Some(Ecosystem::Deno);
+        }
         if purl.starts_with("pkg:npm/") {
             Some(Ecosystem::Npm)
         } else if purl.starts_with("pkg:pypi/") {
@@ -88,6 +102,8 @@ impl Ecosystem {
             Ecosystem::Composer => "composer",
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno => "deno",
         }
     }
 
@@ -107,6 +123,8 @@ impl Ecosystem {
             Ecosystem::Composer => "php",
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno => "deno",
         }
     }
 }

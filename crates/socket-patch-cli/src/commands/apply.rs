@@ -214,6 +214,16 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // the layout-detected info in the apply envelope's
             // existing events (no separate event added here yet).
         }
+        NpmPkgManager::Bun => {
+            if !args.common.json && !args.common.silent {
+                eprintln!(
+                    "Note: bun layout detected. Copy-on-write will keep ~/.bun/install/cache/ untouched."
+                );
+            }
+            // Same shape as pnpm: bun hard-links from its global
+            // install cache by default. The CoW guard handles the
+            // safety; this is informational only.
+        }
         _ => {}
     }
 

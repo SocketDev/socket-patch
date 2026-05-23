@@ -132,6 +132,49 @@ pub fn build_composer_purl(namespace: &str, name: &str, version: &str) -> String
     format!("pkg:composer/{namespace}/{name}@{version}")
 }
 
+/// Parse a JSR PURL to extract scope, name, and version.
+///
+/// JSR (https://jsr.io) is Deno's package registry. Packages are
+/// always scoped (`@scope/name`). PURL form:
+/// `pkg:jsr/<scope>/<name>@<version>` — e.g.
+/// `"pkg:jsr/@std/path@0.220.0"` -> `Some((("@std", "path"), "0.220.0"))`.
+///
+/// `pkg:jsr/` isn't a standardized purl-type upstream as of writing,
+/// but the convention is informally adopted by some Deno tooling.
+/// We follow the same shape as `parse_composer_purl` since both
+/// have a `<scope>/<name>` namespace structure. The leading `@` on
+/// the scope is preserved (matching npm's `@scope/name` convention).
+#[cfg(feature = "deno")]
+pub fn parse_jsr_purl(purl: &str) -> Option<((&str, &str), &str)> {
+    let base = strip_purl_qualifiers(purl);
+    let rest = base.strip_prefix("pkg:jsr/")?;
+    let at_idx = rest.rfind('@')?;
+    let name_part = &rest[..at_idx];
+    let version = &rest[at_idx + 1..];
+
+    if name_part.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    let slash_idx = name_part.find('/')?;
+    let scope = &name_part[..slash_idx];
+    let name = &name_part[slash_idx + 1..];
+
+    // Scope must be `@<non-empty>`. The bare `@` (length 1) is
+    // invalid — there's no actual scope after the marker.
+    if name.is_empty() || !scope.starts_with('@') || scope.len() < 2 {
+        return None;
+    }
+
+    Some(((scope, name), version))
+}
+
+/// Build a JSR PURL from components.
+#[cfg(feature = "deno")]
+pub fn build_jsr_purl(scope: &str, name: &str, version: &str) -> String {
+    format!("pkg:jsr/{scope}/{name}@{version}")
+}
+
 /// Parse a NuGet PURL to extract name and version.
 ///
 /// e.g., `"pkg:nuget/Newtonsoft.Json@13.0.3"` -> `Some(("Newtonsoft.Json", "13.0.3"))`
@@ -380,6 +423,46 @@ mod tests {
             build_composer_purl("monolog", "monolog", "3.5.0"),
             "pkg:composer/monolog/monolog@3.5.0"
         );
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_parse_jsr_purl() {
+        assert_eq!(
+            parse_jsr_purl("pkg:jsr/@std/path@0.220.0"),
+            Some((("@std", "path"), "0.220.0"))
+        );
+        assert_eq!(
+            parse_jsr_purl("pkg:jsr/@luca/flag@1.0.0"),
+            Some((("@luca", "flag"), "1.0.0"))
+        );
+        // Scope must start with `@`.
+        assert_eq!(parse_jsr_purl("pkg:jsr/std/path@0.220.0"), None);
+        // Empty pieces.
+        assert_eq!(parse_jsr_purl("pkg:jsr/@/path@0.220.0"), None);
+        assert_eq!(parse_jsr_purl("pkg:jsr/@std/@0.220.0"), None);
+        assert_eq!(parse_jsr_purl("pkg:jsr/@std/path@"), None);
+        // Wrong scheme.
+        assert_eq!(parse_jsr_purl("pkg:npm/@std/path@0.220.0"), None);
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_build_jsr_purl() {
+        assert_eq!(
+            build_jsr_purl("@std", "path", "0.220.0"),
+            "pkg:jsr/@std/path@0.220.0"
+        );
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_jsr_purl_round_trip() {
+        let purl = build_jsr_purl("@std", "path", "0.220.0");
+        let ((scope, name), version) = parse_jsr_purl(&purl).unwrap();
+        assert_eq!(scope, "@std");
+        assert_eq!(name, "path");
+        assert_eq!(version, "0.220.0");
     }
 
     #[cfg(feature = "composer")]

@@ -1,15 +1,26 @@
-# npm ecosystem test image: base + Node.js + npm.
+# npm ecosystem test image: base + Node.js + npm + bun.
 #
 # Pinned to Node 20 LTS via the NodeSource apt repo. The setup_20.x script
 # installs the latest 20.x at image-build time; for reproducibility CI
 # rebuilds the image whenever this Dockerfile or the base changes.
+#
+# bun is installed via the official install script (the Debian apt repo
+# isn't published reliably). The script downloads a self-contained
+# binary into /root/.bun/bin/bun — we symlink to /usr/local/bin/ so
+# test scripts can call `bun` without PATH gymnastics.
 FROM socket-patch-test-base:latest
 
 # Install Node.js 20 LTS from NodeSource.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get install -y --no-install-recommends nodejs \
+ && apt-get install -y --no-install-recommends nodejs unzip \
  && rm -rf /var/lib/apt/lists/*
+
+# Install bun. Default install of latest stable. The script sets
+# BUN_INSTALL=~/.bun by default; we symlink the binary onto PATH so
+# every test can call it directly.
+RUN curl -fsSL https://bun.sh/install | bash \
+ && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
 # Verify versions are sane at image-build time so a broken NodeSource setup
 # fails the image build rather than every downstream test.
-RUN node --version && npm --version && socket-patch --version
+RUN node --version && npm --version && bun --version && socket-patch --version

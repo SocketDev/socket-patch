@@ -40,6 +40,14 @@ pub enum NpmPkgManager {
     /// yarn-berry with Plug'n'Play (`.pnp.cjs` present). Packages
     /// live inside `.yarn/cache/*.zip`. Apply must refuse.
     YarnBerryPnP,
+    /// bun-managed project — `bun.lock` (text, current default) or
+    /// `bun.lockb` (binary, legacy) at the project root. Bun
+    /// hard-links from `~/.bun/install/cache/` into `node_modules/`
+    /// by default on Linux/macOS, so apply must CoW the link before
+    /// rewriting (handled generically by `break_hardlink_if_needed`).
+    /// The operator gets a heads-up event so it's clear which package
+    /// manager the patch landed against.
+    Bun,
     /// No discernible package manager — empty or non-Node project.
     Unknown,
 }
@@ -51,10 +59,16 @@ pub enum NpmPkgManager {
 /// Precedence (first match wins):
 ///
 /// 1. `.pnp.cjs` or `.pnp.loader.mjs` → yarn-berry PnP.
-/// 2. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
-/// 3. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
-/// 4. `node_modules/` exists → npm.
-/// 5. Otherwise → unknown.
+/// 2. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
+/// 3. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
+/// 4. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
+/// 5. `node_modules/` exists → npm.
+/// 6. Otherwise → unknown.
+///
+/// Bun comes before pnpm in the precedence because bun's isolated
+/// linker (v1.3.2+ default) populates `node_modules/.bun/` which
+/// superficially resembles pnpm's `.pnpm/` content store. The
+/// lockfile filename disambiguates cleanly.
 pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     // 1. yarn-berry PnP — highest priority because it determines
     //    whether the npm crawler can find anything at all.
@@ -64,15 +78,26 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::YarnBerryPnP;
     }
 
-    // 2. pnpm — markers live inside node_modules/.
+    // 2. bun — `bun.lock` (text, current default in v1.2+) or
+    //    `bun.lockb` (binary, legacy). Like the yarn-classic check
+    //    below, we require `node_modules/` to actually exist —
+    //    a bare lockfile without an install is a fresh checkout.
     let node_modules = project_root.join("node_modules");
+    if (project_root.join("bun.lock").is_file()
+        || project_root.join("bun.lockb").is_file())
+        && node_modules.is_dir()
+    {
+        return NpmPkgManager::Bun;
+    }
+
+    // 3. pnpm — markers live inside node_modules/.
     if node_modules.join(".modules.yaml").is_file()
         || node_modules.join(".pnpm").is_dir()
     {
         return NpmPkgManager::Pnpm;
     }
 
-    // 3. yarn classic — yarn.lock + node_modules. We only return
+    // 4. yarn classic — yarn.lock + node_modules. We only return
     //    YarnClassic if node_modules actually exists, because a bare
     //    yarn.lock without node_modules is a fresh checkout where
     //    nothing has been installed yet.
@@ -80,7 +105,7 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
         return NpmPkgManager::YarnClassic;
     }
 
-    // 4. npm — any node_modules/ at all.
+    // 5. npm — any node_modules/ at all.
     if node_modules.is_dir() {
         return NpmPkgManager::Npm;
     }
@@ -160,4 +185,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bun_via_text_lockfile() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+    }
+
+    #[test]
+    fn bun_via_binary_lockfile() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+    }
+
+    /// `bun.lock` without an installed `node_modules/` is a fresh
+    /// checkout — same pattern as `yarn.lock` alone.
+    #[test]
+    fn bun_requires_installed_node_modules() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+    }
+
+    /// Bun's isolated linker (v1.3.2+ default) creates
+    /// `node_modules/.bun/` which superficially resembles pnpm's
+    /// `.pnpm/`. The lockfile filename disambiguates — `bun.lock`
+    /// wins over the `.pnpm/` heuristic.
+    #[test]
+    fn bun_priority_over_pnpm_when_both_markers_present() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+    }
+
+    /// yarn-berry beats bun (PnP is a structural override of
+    /// everything — packages aren't on disk).
+    #[test]
+    fn yarn_berry_pnp_priority_over_bun() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
 }

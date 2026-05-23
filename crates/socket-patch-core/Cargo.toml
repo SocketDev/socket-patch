@@ -32,6 +32,12 @@ golang = []
 maven = []
 composer = []
 nuget = []
+# Deno covers two surfaces: (1) Deno 2.0's npm-install layouts that
+# produce a standard node_modules/ (handled by NpmCrawler today,
+# triggered here by deno.json / deno.lock project markers) and
+# (2) JSR-registry packages cached at $DENO_DIR/npm/jsr.io/* with
+# `pkg:jsr/<scope>/<name>@<version>` PURLs handled by DenoCrawler.
+deno = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
