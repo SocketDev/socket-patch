@@ -178,6 +178,23 @@ async fn find_python_dirs_literal_segment_descends() {
 
 // ── find_local_venv_site_packages ──────────────────────────────
 
+/// Build the site-packages relative path for the current OS.
+/// Production `find_site_packages_under` looks for `Lib/site-packages`
+/// on Windows and `lib/python3.X/site-packages` on Unix — the test
+/// fixture must stage whichever the production code expects to find.
+fn venv_site_packages_relpath() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        std::path::Path::new("Lib").join("site-packages")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::Path::new("lib")
+            .join("python3.11")
+            .join("site-packages")
+    }
+}
+
 /// VIRTUAL_ENV env var pointing at a real venv layout adds it to
 /// the discovered list. Covers the first arm of
 /// find_local_venv_site_packages.
@@ -186,7 +203,7 @@ async fn find_python_dirs_literal_segment_descends() {
 async fn find_local_venv_site_packages_honors_virtual_env_var() {
     let tmp = tempfile::tempdir().unwrap();
     let venv = tmp.path().join("custom-venv");
-    let sp = venv.join("lib").join("python3.11").join("site-packages");
+    let sp = venv.join(venv_site_packages_relpath());
     tokio::fs::create_dir_all(&sp).await.unwrap();
 
     let prev = std::env::var("VIRTUAL_ENV").ok();
@@ -208,7 +225,7 @@ async fn find_local_venv_site_packages_honors_virtual_env_var() {
 #[serial]
 async fn find_local_venv_site_packages_discovers_dot_venv() {
     let tmp = tempfile::tempdir().unwrap();
-    let sp = tmp.path().join(".venv").join("lib").join("python3.11").join("site-packages");
+    let sp = tmp.path().join(".venv").join(venv_site_packages_relpath());
     tokio::fs::create_dir_all(&sp).await.unwrap();
 
     let prev = std::env::var("VIRTUAL_ENV").ok();
@@ -229,7 +246,7 @@ async fn find_local_venv_site_packages_discovers_dot_venv() {
 #[serial]
 async fn find_local_venv_site_packages_discovers_venv_dir() {
     let tmp = tempfile::tempdir().unwrap();
-    let sp = tmp.path().join("venv").join("lib").join("python3.11").join("site-packages");
+    let sp = tmp.path().join("venv").join(venv_site_packages_relpath());
     tokio::fs::create_dir_all(&sp).await.unwrap();
 
     let prev = std::env::var("VIRTUAL_ENV").ok();
