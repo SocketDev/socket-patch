@@ -438,26 +438,28 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
 
 /// METADATA with extra header lines AFTER the blank line should NOT be
 /// parsed — the parser must stop at the first blank line after
-/// collecting name+version. Covers `python_crawler.rs:80-81`.
+/// collecting name+version. Covers `python_crawler.rs:80-81` (the
+/// blank-line break path that fires before both fields are set).
 #[tokio::test]
 async fn read_python_metadata_stops_at_blank_line_after_headers() {
     let tmp = tempfile::tempdir().unwrap();
     let dist = tmp.path().join("requests-2.28.0.dist-info");
     tokio::fs::create_dir(&dist).await.unwrap();
-    // Headers block, then blank line, then garbage that would otherwise
-    // (re-)set Name to something else — the parser must NOT pick it up.
+    // Only `Name` is set when we hit the blank line — version is still
+    // None, so the early both-set break (L71-72) does NOT fire. Instead
+    // we must take the blank-line break at L80-81. After break, the
+    // final-match arm returns None because version was never set.
     tokio::fs::write(
         dist.join("METADATA"),
-        "Name: requests\nVersion: 2.28.0\n\nName: would-be-overwritten\nVersion: 9.9.9\n",
+        "Name: requests\n\nVersion: 2.28.0\n",
     )
     .await
     .unwrap();
 
     let result = read_python_metadata(&dist).await;
     assert_eq!(
-        result,
-        Some(("requests".to_string(), "2.28.0".to_string())),
-        "parser must stop at first blank line; got {result:?}"
+        result, None,
+        "blank-line break must fire before Version is read; got {result:?}"
     );
 }
 
