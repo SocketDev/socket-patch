@@ -16,6 +16,8 @@ use socket_patch_core::crawlers::MavenCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
 #[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
+#[cfg(feature = "deno")]
+use socket_patch_core::crawlers::DenoCrawler;
 
 /// Runtime opt-in gate for experimental Maven support.
 ///
@@ -399,6 +401,42 @@ pub async fn find_packages_for_purls(
         }
     }
 
+    // deno — JSR registry packages cached under DENO_DIR/npm/jsr.io/.
+    #[cfg(feature = "deno")]
+    if let Some(deno_purls) = partitioned.get(&Ecosystem::Deno) {
+        if !deno_purls.is_empty() {
+            let deno_crawler = DenoCrawler;
+            match deno_crawler.get_jsr_cache_paths(options).await {
+                Ok(cache_paths) => {
+                    if (options.global || options.global_prefix.is_some()) && !silent {
+                        if let Some(first) = cache_paths.first() {
+                            println!("Using Deno JSR cache at: {}", first.display());
+                        }
+                    }
+                    for cache_path in &cache_paths {
+                        match deno_crawler.find_by_purls(cache_path, deno_purls).await {
+                            Ok(packages) => {
+                                for (purl, pkg) in packages {
+                                    all_packages.entry(purl).or_insert(pkg.path);
+                                }
+                            }
+                            Err(e) => {
+                                if !silent {
+                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !silent {
+                        eprintln!("Failed to find Deno JSR packages: {e}");
+                    }
+                }
+            }
+        }
+    }
+
     all_packages
 }
 
@@ -468,6 +506,14 @@ pub async fn crawl_all_ecosystems(
         let nuget_packages = nuget_crawler.crawl_all(options).await;
         counts.insert(Ecosystem::Nuget, nuget_packages.len());
         all_packages.extend(nuget_packages);
+    }
+
+    #[cfg(feature = "deno")]
+    {
+        let deno_crawler = DenoCrawler;
+        let deno_packages = deno_crawler.crawl_all(options).await;
+        counts.insert(Ecosystem::Deno, deno_packages.len());
+        all_packages.extend(deno_packages);
     }
 
     (all_packages, counts)

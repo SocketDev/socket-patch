@@ -1,30 +1,42 @@
 //! Deno ecosystem crawler.
 //!
-//! Deno is a JavaScript/TypeScript runtime with two distinct package
-//! surfaces:
+//! Deno has two package surfaces, only ONE of which fits the
+//! patch-by-PURL model:
 //!
-//!   1. **`deno install` with a `package.json`** — populates a
-//!      standard `node_modules/` directory at the project root.
-//!      These packages are real npm packages from registry.npmjs.org;
-//!      they're enumerated by the existing `NpmCrawler` and surface
-//!      as `pkg:npm/<name>@<version>` PURLs. This crawler does NOT
-//!      duplicate that work — when scan is invoked against a Deno
-//!      project that has run `deno install`, the npm crawler handles
-//!      the node_modules tree.
+//!   1. **`deno install` with a `package.json`** (PATCHABLE) —
+//!      populates a standard `node_modules/` directory at the
+//!      project root. These packages are real npm packages from
+//!      registry.npmjs.org and surface as `pkg:npm/<name>@<version>`
+//!      PURLs handled by `NpmCrawler`. The DenoCrawler does NOT
+//!      duplicate that walk — it just gates discovery on
+//!      `deno.json` / `deno.jsonc` / `deno.lock` project markers so
+//!      `socket-patch scan` from a Deno project root finds the
+//!      node_modules tree.
 //!
-//!   2. **JSR registry packages** — Deno's native registry
-//!      (https://jsr.io). Cached at `$DENO_DIR/npm/jsr.io/@<scope>/
-//!      <name>/<version>/` (yes, under `npm/` — JSR-published
-//!      packages are transparently materialized as npm-compatible
-//!      tarballs in the cache for editor / `node_modules` compat).
-//!      These surface as `pkg:jsr/<scope>/<name>@<version>` PURLs
-//!      and this crawler enumerates them.
+//!   2. **JSR registry packages** (LIMITED) — Deno's native registry
+//!      (https://jsr.io). Real Deno (as of v2.x) caches JSR packages
+//!      content-addressed at `$DENO_DIR/remote/https/jsr.io/<sha256>`
+//!      with no scope/name/version structure on disk. The PURL
+//!      `pkg:jsr/<scope>/<name>@<version>` cannot be mapped to a
+//!      cache file by walking the filesystem — you'd need to compute
+//!      SHA256 of `https://jsr.io/<scope>/<name>/<version>/<file>`
+//!      and look up by content hash, which is fragile.
+//!
+//!      This crawler walks an *expected* layout of
+//!      `<root>/<scope>/<name>/<version>/` so that:
+//!        (a) synthetic test fixtures (`tests/crawler_deno_e2e.rs`)
+//!            can stage scannable JSR-shaped trees, and
+//!        (b) any future Deno that adopts a stable scope/name/version
+//!            layout (or a third-party tool that materializes JSR
+//!            packages this way) gets picked up automatically.
+//!
+//!      In the meantime, `socket-patch scan --global --ecosystems
+//!      deno --global-prefix <path>` is what real users would invoke
+//!      against a directory they've explicitly populated.
 //!
 //! HTTPS URL imports (`import "https://deno.land/..."`) are out of
-//! scope: no upstream PURL convention exists, and Deno's cache layout
-//! at `$DENO_DIR/deps/https/<host>/<sha256>` is content-addressed
-//! without a stable name+version, so they don't fit the patch-by-PURL
-//! model.
+//! scope: same content-addressed-by-hash storage as JSR, plus no
+//! upstream PURL convention.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

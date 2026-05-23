@@ -34,6 +34,7 @@ golang = ["socket-patch-core/golang"]
 maven = ["socket-patch-core/maven"]
 composer = ["socket-patch-core/composer"]
 nuget = ["socket-patch-core/nuget"]
+deno = ["socket-patch-core/deno"]
 # Enables the Docker-driven real-package e2e test suite under
 # `tests/docker_e2e_*.rs`. Tests in this suite require either a running
 # Docker daemon OR `SOCKET_PATCH_TEST_HOST=1` (host-toolchain mode).

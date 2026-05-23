@@ -154,7 +154,7 @@ jobs:
         # separately, and coverage-merge stitches everything together.
         run: |
           cargo llvm-cov --workspace \
-            --features cargo,golang,maven,composer,nuget \
+            --features cargo,golang,maven,composer,nuget,deno \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
@@ -206,7 +206,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -270,7 +270,7 @@ jobs:
         # cargo llvm-cov manages its own env in the test step).
         run: |
           eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
-          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget
+          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget,deno
 
       - name: Configure docker-e2e coverage hooks
         run: |
@@ -282,7 +282,7 @@ jobs:
       - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
         run: |
           cargo llvm-cov \
-            --features docker-e2e,cargo,golang,maven,composer,nuget \
+            --features docker-e2e,cargo,golang,maven,composer,nuget,deno \
             --no-report \
             --test docker_e2e_${{ matrix.ecosystem }}
 
@@ -516,7 +516,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

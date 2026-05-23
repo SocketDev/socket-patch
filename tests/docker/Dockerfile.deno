@@ -1,0 +1,28 @@
+# Deno ecosystem test image: base + Node.js (for the `deno install`
+# variant that produces a node_modules tree) + Deno.
+#
+# Deno is installed from the official install script — the
+# Debian/Ubuntu apt repos for Deno aren't reliably published. The
+# script drops a single self-contained binary at /root/.deno/bin/deno;
+# we symlink onto /usr/local/bin so test scripts can call `deno`
+# without PATH gymnastics.
+#
+# Tests cover two surfaces:
+#   * `deno install` against a package.json — populates
+#     `node_modules/`, which the existing NpmCrawler discovers.
+#   * `deno cache <jsr-import>` — populates `$DENO_DIR/npm/jsr.io/...`
+#     which the DenoCrawler discovers via the `pkg:jsr/...` PURL.
+FROM socket-patch-test-base:latest
+
+# Node + npm needed for the deno-install-package-json variant of the
+# test (deno install reuses npm semantics under the hood).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs unzip \
+ && rm -rf /var/lib/apt/lists/*
+
+# Deno install script defaults to ~/.deno/bin. Symlink onto PATH so
+# `deno` works from any shell (test scripts use bash -c).
+RUN curl -fsSL https://deno.land/install.sh | sh -s -- -y \
+ && ln -s /root/.deno/bin/deno /usr/local/bin/deno
+
+RUN node --version && deno --version && socket-patch --version
