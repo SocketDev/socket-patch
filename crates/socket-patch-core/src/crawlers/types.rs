@@ -232,6 +232,10 @@ mod tests {
         {
             expected += 1;
         }
+        #[cfg(feature = "deno")]
+        {
+            expected += 1;
+        }
         assert_eq!(all.len(), expected);
     }
 
