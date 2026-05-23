@@ -209,3 +209,80 @@ async fn get_crate_source_paths_no_cargo_project_returns_empty() {
     let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
     assert!(paths.is_empty(), "non-Cargo dir must return empty paths");
 }
+
+// ── parse_dir_name_version fallback (via crawl_all) ────────────
+
+/// Crate directory whose Cargo.toml has `version.workspace = true`
+/// (no concrete `version =` field) — the crawler must fall back to
+/// parsing `<name>-<version>` from the directory name. Exercises
+/// `parse_dir_name_version` (cargo_crawler.rs:357-372).
+#[tokio::test]
+async fn crawl_all_falls_back_to_dir_name_when_workspace_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    // <name>-<version> directory; Cargo.toml has workspace version.
+    let pkg_dir = tmp.path().join("serde_json-1.0.120");
+    tokio::fs::create_dir(&pkg_dir).await.unwrap();
+    tokio::fs::write(
+        pkg_dir.join("Cargo.toml"),
+        "[package]\nname = \"serde_json\"\nversion.workspace = true\nedition = \"2021\"\n",
+    )
+    .await
+    .unwrap();
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "serde_json");
+    assert_eq!(result[0].version, "1.0.120");
+}
+
+#[tokio::test]
+async fn crawl_all_skips_dir_without_cargo_toml() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Directory shaped like a crate but no Cargo.toml — must be skipped.
+    let pkg_dir = tmp.path().join("not_a_crate-1.0.0");
+    tokio::fs::create_dir(&pkg_dir).await.unwrap();
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert!(result.is_empty(), "dir without Cargo.toml must be skipped");
+}
+
+/// `verify_crate_at_path`'s fallback path: Cargo.toml has workspace
+/// version, find_by_purls compares dir name. Exercises the
+/// fallback arm in `verify_crate_at_path` (L335-L348).
+#[tokio::test]
+async fn find_by_purls_verify_fallback_via_dir_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("workspace-crate-0.1.0");
+    tokio::fs::create_dir(&pkg).await.unwrap();
+    // Cargo.toml has workspace version → triggers fallback.
+    tokio::fs::write(
+        pkg.join("Cargo.toml"),
+        "[package]\nname = \"workspace-crate\"\nversion.workspace = true\n",
+    )
+    .await
+    .unwrap();
+
+    let crawler = CargoCrawler;
+    let result = crawler
+        .find_by_purls(
+            tmp.path(),
+            &["pkg:cargo/workspace-crate@0.1.0".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1, "verify must fall back to dir name");
+}
