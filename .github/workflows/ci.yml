@@ -407,10 +407,14 @@ jobs:
             suite: e2e_npm
           - os: macos-latest
             suite: e2e_pypi
-          - os: ubuntu-latest
-            suite: e2e_scan
-          - os: macos-latest
-            suite: e2e_scan
+          # `e2e_scan` is intentionally NOT in the PR matrix — it
+          # depends on the live public proxy at
+          # patches-api.socket.dev serving real patch data for
+          # `minimist@1.2.2`, which is subject to rate-limiting
+          # ("Service temporarily over capacity") and other
+          # availability quirks outside this repo's control. Run on
+          # demand with
+          # `cargo test -p socket-patch-cli --test e2e_scan -- --ignored`.
           # Safety-hardening e2e suites. The fast non-ignored ones
           # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
           # standard `test` job above on all three platforms, so no
