@@ -228,6 +228,77 @@ fn ruby_crawler_default_and_new_construct_cleanly() {
     let _b = RubyCrawler::new();
 }
 
+/// With a Gemfile present and `gem` not on PATH, the local-mode
+/// `gem env gemdir` fallback at L56-64 must short-circuit cleanly
+/// (run_gem_env returns None via the `.output().ok()?` arm). The
+/// crawler then exits the if-block and returns an empty Vec.
+#[tokio::test]
+#[serial]
+async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("Gemfile"), b"source 'https://rubygems.org'\n").await.unwrap();
+
+    let empty_path = tempfile::tempdir().unwrap();
+    let prev = std::env::var("PATH").ok();
+    std::env::set_var("PATH", empty_path.path());
+
+    let crawler = RubyCrawler;
+    let paths = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+
+    if let Some(v) = prev {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    assert!(paths.is_empty(), "no gem binary + no vendor must yield empty");
+}
+
+/// Global mode with `gem` not on PATH and HOME pointing at a tempdir
+/// containing no gem layouts at all must yield an empty result. This
+/// drives the `run_gem_env` Err arms for both `gemdir` and `gempath`,
+/// and the fallback_globs loop's read_dir-Err arm for each candidate.
+#[tokio::test]
+#[serial]
+async fn global_gem_discovery_no_binary_no_home_layout_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let prev_path = std::env::var("PATH").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("PATH", empty_path.path());
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = RubyCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_gem_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    // The crawler also probes system paths like /usr/local/lib/ruby/gems;
+    // those may or may not exist on the test host. The contract here is
+    // that the crawler does not panic and returns *no* paths sourced from
+    // HOME (which had nothing staged).
+    assert!(
+        paths.iter().all(|p| !p.starts_with(tmp.path())),
+        "no HOME-derived path should be returned; got {paths:?}"
+    );
+}
+
 /// `~/.rvm/gems/<set>/gems` layout — exercises the third fallback in
 /// the rbenv/rvm/gem fallback_globs loop.
 #[tokio::test]

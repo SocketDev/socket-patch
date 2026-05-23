@@ -341,6 +341,47 @@ async fn find_by_purls_with_lib_dir_marker_succeeds() {
     assert_eq!(result.len(), 1);
 }
 
+/// `scan_package_dir` skips entries that are not directories — covers
+/// the `if !ft.is_dir()` continue arm at L183. Drive this by staging
+/// a plain file alongside a valid global-cache package.
+#[tokio::test]
+async fn crawl_all_skips_files_at_top_level() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stage a real package so the scan actually runs.
+    let _pkg = stage_global_cache_pkg(tmp.path(), "newtonsoft.json", "13.0.3").await;
+    // Plain file at the top level — must be skipped.
+    tokio::fs::write(tmp.path().join("readme.txt"), b"not a package").await.unwrap();
+
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("newtonsoft.json")));
+    assert_eq!(result.len(), 1, "plain file must be skipped");
+}
+
+/// `scan_package_dir` short-circuits when the package dir doesn't
+/// exist — covers `read_dir(...).await` Err arm at L169.
+#[tokio::test]
+async fn crawl_all_missing_pkg_path_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        // Point global_prefix at a non-existent dir.
+        global_prefix: Some(tmp.path().join("does-not-exist")),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert!(result.is_empty());
+}
+
 // Marker so ORG_PURL_B import isn't unused.
 #[allow(dead_code)]
 fn _used_in_doc() -> &'static str {

@@ -331,6 +331,52 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
     );
 }
 
+/// `get_composer_home` returns `None` when COMPOSER_HOME is unset,
+/// `composer` is not on PATH, and HOME points at a tempdir without
+/// either `.composer/` or `.config/composer/`. Covers the L194-207
+/// shell-out failure path (via PATH stubbing) plus the final L226
+/// `None` arm.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    let prev_path = std::env::var("PATH").ok();
+    std::env::remove_var("COMPOSER_HOME");
+    // HOME is set, but the temp HOME has no .composer / .config/composer.
+    std::env::set_var("HOME", tmp.path());
+    // PATH stubbed so the composer CLI cannot be spawned.
+    std::env::set_var("PATH", empty_path.path());
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    assert!(paths.is_empty(), "no composer source anywhere must yield empty; got {paths:?}");
+}
+
 /// `crawl_all` should dedup packages discovered across multiple
 /// vendor paths sharing the same installed package — exercises the
 /// `seen.contains` early-continue arm.
