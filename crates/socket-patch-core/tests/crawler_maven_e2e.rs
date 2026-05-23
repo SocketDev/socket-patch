@@ -157,6 +157,34 @@ fn parse_pom_property_reference_version_returns_none() {
 /// `<parent><groupId>${prop}</groupId></parent>` is a parent property
 /// reference — must NOT be accepted as a fallback groupId (line 86-87
 /// skip arm).
+#[test]
+fn parse_pom_missing_artifactId_returns_none() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.apache.commons</groupId>
+  <version>3.12.0</version>
+</project>"#;
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
+/// An XML element rendered across two lines (open on one, close on
+/// another) — `extract_xml_value` returns None for both, the parser
+/// can't extract a value, and the function returns None. Drives
+/// `extract_xml_value` line 16 (close-tag not found on same line).
+#[test]
+fn parse_pom_split_tag_returns_none() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.apache
+  </groupId>
+  <artifactId>commons-lang3</artifactId>
+  <version>3.12.0</version>
+</project>"#;
+    // groupId line doesn't have a closing tag — extract returns None.
+    // Without top-level groupId and no <parent>, the function returns None.
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
 /// `MavenCrawler::default()` should forward to `new()`.
 #[test]
 fn maven_crawler_default_and_new_construct_cleanly() {

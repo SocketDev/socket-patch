@@ -485,6 +485,70 @@ async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
     );
 }
 
+/// `scan_crate_source` must skip plain-file entries inside the source
+/// path — covers `!ft.is_dir()` continue arm (cargo_crawler.rs:266).
+#[tokio::test]
+async fn crawl_all_skips_top_level_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_registry_crate(tmp.path(), "real-crate", "1.0.0").await;
+    tokio::fs::write(tmp.path().join("README"), b"not a crate").await.unwrap();
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "real-crate");
+}
+
+/// A crate directory with a broken `Cargo.toml` AND a non-conforming
+/// directory name → `parse_cargo_toml_name_version` returns None
+/// (broken toml) AND `parse_dir_name_version` returns None (no `-`
+/// followed by digit), so the chain short-circuits at line 304 and
+/// the package is silently skipped.
+#[tokio::test]
+async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("no-version-suffix");
+    tokio::fs::create_dir(&bad).await.unwrap();
+    tokio::fs::write(bad.join("Cargo.toml"), b"this is not valid toml").await.unwrap();
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert!(result.is_empty(), "unparseable + no-version dir name must be skipped");
+}
+
+/// `verify_crate_at_path` returns false when neither the Cargo.toml
+/// parses NOR the dir-name parses — exercises the `else { false }`
+/// arm at line 345-346.
+#[tokio::test]
+async fn find_by_purls_verify_fails_when_both_parsers_fail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("not-cargo-like-at-all");
+    tokio::fs::create_dir(&bad).await.unwrap();
+    tokio::fs::write(bad.join("Cargo.toml"), b"this is not toml").await.unwrap();
+
+    let crawler = CargoCrawler;
+    // The strict registry dir for `pkg:cargo/foo@1.0.0` is
+    // `tmp/foo-1.0.0/` (doesn't exist). The vendor dir `tmp/foo/`
+    // also doesn't exist. So neither layout matches and we get empty.
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:cargo/foo@1.0.0".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
 /// Same as above but with a registry/src tree staged — the discovered
 /// index dirs must surface. Covers lines 228-235 (entry walk).
 #[tokio::test]
