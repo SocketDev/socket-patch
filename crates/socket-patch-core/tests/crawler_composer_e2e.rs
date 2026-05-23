@@ -377,6 +377,38 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     assert!(paths.is_empty(), "no composer source anywhere must yield empty; got {paths:?}");
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `read_installed_json` short-circuits when the file can't be read —
+/// chmod 000 the installed.json and assert the crawler returns empty
+/// rather than panicking.
+#[cfg(unix)]
+#[tokio::test]
+async fn find_by_purls_handles_unreadable_installed_json() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor = tmp.path().join("vendor");
+    let composer = vendor.join("composer");
+    tokio::fs::create_dir_all(&composer).await.unwrap();
+    let installed = composer.join("installed.json");
+    tokio::fs::write(&installed, r#"{"packages":[]}"#).await.unwrap();
+    common::chmod_unreadable(&installed);
+
+    let crawler = ComposerCrawler;
+    let result = crawler
+        .find_by_purls(&vendor, &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    common::chmod_readable(&installed);
+
+    assert!(result.is_empty(), "unreadable installed.json must yield empty");
+}
+
 /// `crawl_all` should dedup packages discovered across multiple
 /// vendor paths sharing the same installed package — exercises the
 /// `seen.contains` early-continue arm.

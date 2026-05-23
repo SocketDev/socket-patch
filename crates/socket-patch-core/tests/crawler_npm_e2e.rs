@@ -507,6 +507,61 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
     assert!(!names.contains(&"also-not"), "SKIP_DIRS dir must be skipped");
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `scan_node_modules` short-circuits when read_dir returns Err.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_node_modules() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "would-be-found", "1.0.0").await;
+    common::chmod_unreadable(&nm);
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&nm);
+
+    assert!(result.is_empty(), "unreadable node_modules must yield empty");
+}
+
+/// `find_workspace_node_modules` short-circuits cleanly when it
+/// encounters an unreadable workspace subdir — drives the read_dir
+/// Err arm at npm_crawler.rs:440-441 by chmod 000-ing one workspace
+/// while leaving a readable one alongside.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_workspace_dir() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // Readable workspace.
+    stage_npm_pkg(&tmp.path().join("readable").join("node_modules"), "ok", "1.0.0").await;
+    // Unreadable workspace.
+    let blocked = tmp.path().join("blocked");
+    tokio::fs::create_dir(&blocked).await.unwrap();
+    stage_npm_pkg(&blocked.join("node_modules"), "hidden", "2.0.0").await;
+    common::chmod_unreadable(&blocked);
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&blocked);
+
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"ok"));
+    assert!(!names.contains(&"hidden"), "unreadable workspace must be skipped");
+}
+
 /// Drives scoped-package scanning + nested node_modules recursion +
 /// the hidden-and-file-entries skip arms inside `scan_scoped_packages`
 /// and `scan_nested_node_modules`. Covers L552, 581-604, 619-665.

@@ -221,6 +221,38 @@ async fn global_gem_discovery_via_home_dotgem_layout() {
     );
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `scan_gem_dir` short-circuits when the gem path is unreadable —
+/// drives ruby_crawler.rs:270 read_dir Err arm.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_gem_dir() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let gem_dir = tmp.path().join("blocked-gems");
+    tokio::fs::create_dir(&gem_dir).await.unwrap();
+    let _ = stage_gem(&gem_dir, "rails", "7.1.0").await;
+    common::chmod_unreadable(&gem_dir);
+
+    let crawler = RubyCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(gem_dir.clone()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&gem_dir);
+
+    assert!(result.is_empty(), "unreadable gem dir must yield empty");
+}
+
 /// `RubyCrawler::default()` should forward to `new()`.
 #[test]
 fn ruby_crawler_default_and_new_construct_cleanly() {

@@ -341,6 +341,65 @@ async fn find_by_purls_with_lib_dir_marker_succeeds() {
     assert_eq!(result.len(), 1);
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `scan_package_dir` short-circuits when read_dir returns Err.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_pkg_path() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("blocked");
+    tokio::fs::create_dir(&pkg).await.unwrap();
+    let _ = stage_global_cache_pkg(&pkg, "newtonsoft.json", "13.0.3").await;
+    common::chmod_unreadable(&pkg);
+
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(pkg.clone()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&pkg);
+
+    assert!(result.is_empty(), "unreadable pkg_path must yield empty");
+}
+
+/// `scan_global_cache_package` returns None when the per-name version
+/// directory is unreadable — drives the inner read_dir Err arm at
+/// nuget_crawler.rs:236.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_version_dir() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg_name_dir = tmp.path().join("blocked-name");
+    tokio::fs::create_dir(&pkg_name_dir).await.unwrap();
+    common::chmod_unreadable(&pkg_name_dir);
+
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&pkg_name_dir);
+
+    assert!(result.is_empty(), "unreadable version dir must yield empty");
+}
+
 /// `scan_package_dir` skips entries that are not directories — covers
 /// the `if !ft.is_dir()` continue arm at L183. Drive this by staging
 /// a plain file alongside a valid global-cache package.

@@ -275,6 +275,61 @@ async fn read_python_metadata_missing_name_returns_none() {
     assert_eq!(result, None);
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `find_by_purls` short-circuits when the site-packages dir is
+/// unreadable. Drives the python_crawler.rs:530 read_dir Err arm.
+#[cfg(unix)]
+#[tokio::test]
+async fn find_by_purls_handles_unreadable_site_packages() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let site_packages = tmp.path().join("sp");
+    tokio::fs::create_dir(&site_packages).await.unwrap();
+    common::chmod_unreadable(&site_packages);
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(&site_packages, &["pkg:pypi/requests@2.28.0".to_string()])
+        .await
+        .unwrap();
+    common::chmod_readable(&site_packages);
+
+    assert!(result.is_empty());
+}
+
+/// `scan_site_packages` short-circuits when site-packages is
+/// unreadable — drives python_crawler.rs:584 read_dir Err arm.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_site_packages() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let site_packages = tmp.path().join("sp");
+    tokio::fs::create_dir(&site_packages).await.unwrap();
+    common::chmod_unreadable(&site_packages);
+
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(site_packages.clone()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&site_packages);
+
+    assert!(result.is_empty());
+}
+
 /// `PythonCrawler::default()` should forward to `new()`.
 #[test]
 fn python_crawler_default_and_new_construct_cleanly() {

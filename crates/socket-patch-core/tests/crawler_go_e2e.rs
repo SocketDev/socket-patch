@@ -178,6 +178,37 @@ async fn get_module_cache_paths_with_go_mod_returns_cache() {
     );
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `scan_dir_recursive` short-circuits when read_dir returns Err.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_cache_path() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("blocked-cache");
+    tokio::fs::create_dir(&cache).await.unwrap();
+    let _ = stage_go_module(&cache, "github.com/foo/bar", "v1.0.0").await;
+    common::chmod_unreadable(&cache);
+
+    let crawler = GoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(cache.clone()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&cache);
+
+    assert!(result.is_empty(), "unreadable cache must yield empty");
+}
+
 /// `GoCrawler::default()` should forward to `new()`.
 #[test]
 fn go_crawler_default_and_new_construct_cleanly() {

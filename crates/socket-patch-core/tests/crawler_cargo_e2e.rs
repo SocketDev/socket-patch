@@ -528,6 +528,41 @@ async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
     assert!(result.is_empty(), "unparseable + no-version dir name must be skipped");
 }
 
+#[cfg(unix)]
+#[path = "common/mod.rs"]
+mod common;
+
+/// `scan_crate_source` short-circuits when `read_dir` returns Err.
+/// Drive by chmod 000-ing a tempdir then asking the crawler to scan
+/// it. Skipped under root because chmod has no effect on uid 0.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_handles_unreadable_src_path() {
+    if common::uid_is_root() {
+        eprintln!("SKIP: chmod 000 is a no-op under root");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let unreadable = tmp.path().join("blocked");
+    tokio::fs::create_dir_all(&unreadable).await.unwrap();
+    // Put a "crate" inside so we can prove the scan really stopped at
+    // the unreadable barrier rather than just finding nothing.
+    stage_registry_crate(&unreadable, "would-be-found", "1.0.0").await;
+    common::chmod_unreadable(&unreadable);
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(unreadable.clone()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    common::chmod_readable(&unreadable);
+
+    assert!(result.is_empty(), "unreadable src_path must yield empty");
+}
+
 /// `verify_crate_at_path` returns false when neither the Cargo.toml
 /// parses NOR the dir-name parses — exercises the `else { false }`
 /// arm at line 345-346.
