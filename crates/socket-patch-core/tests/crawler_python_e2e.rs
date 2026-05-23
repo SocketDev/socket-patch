@@ -18,6 +18,8 @@ use socket_patch_core::crawlers::python_crawler::{
     find_local_venv_site_packages, find_python_dirs, get_global_python_site_packages,
     read_python_metadata,
 };
+use socket_patch_core::crawlers::types::CrawlerOptions;
+use socket_patch_core::crawlers::PythonCrawler;
 
 /// Helper: stage a fake `python3.X/lib/python3.X/site-packages` tree
 /// under `root` so `find_python_dirs(root, ["python3.*", "lib",
@@ -271,6 +273,192 @@ async fn read_python_metadata_missing_name_returns_none() {
 
     let result = read_python_metadata(&dist_info).await;
     assert_eq!(result, None);
+}
+
+/// `PythonCrawler::default()` should forward to `new()`.
+#[test]
+fn python_crawler_default_and_new_construct_cleanly() {
+    let _a = PythonCrawler::default();
+    let _b = PythonCrawler::new();
+}
+
+// ── find_by_purls + crawl_all over a staged site-packages ─────
+
+/// Helper: stage a well-formed `<pkg>-<version>.dist-info/METADATA`
+/// inside a fake site-packages directory.
+async fn stage_dist_info(site_packages: &Path, raw_name: &str, version: &str) {
+    let dist = site_packages.join(format!("{raw_name}-{version}.dist-info"));
+    tokio::fs::create_dir_all(&dist).await.unwrap();
+    let metadata = format!("Metadata-Version: 2.1\nName: {raw_name}\nVersion: {version}\n");
+    tokio::fs::write(dist.join("METADATA"), metadata).await.unwrap();
+}
+
+#[tokio::test]
+async fn find_by_purls_matches_canonicalized_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    // PEP 503 canonicalization: "Requests" -> "requests"
+    stage_dist_info(tmp.path(), "Requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:pypi/requests@2.28.0".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1, "canonical lookup must hit");
+}
+
+#[tokio::test]
+async fn find_by_purls_strips_qualifiers() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(
+            tmp.path(),
+            &["pkg:pypi/requests@2.28.0?extension=tar.gz".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1, "qualifiers must be stripped before lookup");
+}
+
+#[tokio::test]
+async fn find_by_purls_empty_purls_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler.find_by_purls(tmp.path(), &[]).await.unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn find_by_purls_missing_site_packages_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crawler = PythonCrawler;
+    // site_packages_path doesn't exist — read_dir Err arm must yield empty.
+    let result = crawler
+        .find_by_purls(
+            &tmp.path().join("no-such-dir"),
+            &["pkg:pypi/requests@2.28.0".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn find_by_purls_invalid_purl_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:not-pypi/foo@1.0".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn find_by_purls_version_mismatch_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:pypi/requests@99.99.99".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn crawl_all_via_site_packages_finds_dist_info_packages() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "Requests", "2.28.0").await;
+    stage_dist_info(tmp.path(), "urllib3", "2.0.0").await;
+    // A non-dist-info dir should be skipped.
+    tokio::fs::create_dir_all(tmp.path().join("ignore-me")).await.unwrap();
+
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"requests"));
+    assert!(names.contains(&"urllib3"));
+    assert_eq!(result.len(), 2);
+}
+
+#[tokio::test]
+async fn crawl_all_with_corrupt_metadata_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist = tmp.path().join("broken-1.0.0.dist-info");
+    tokio::fs::create_dir_all(&dist).await.unwrap();
+    // Empty METADATA — read_python_metadata returns None.
+    tokio::fs::write(dist.join("METADATA"), b"").await.unwrap();
+
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert!(result.is_empty(), "broken METADATA must be skipped");
+}
+
+/// `get_site_packages_paths` with `global_prefix` set returns just that
+/// prefix — exercises the early-return arm at python_crawler.rs:473-474.
+#[tokio::test]
+async fn get_site_packages_paths_with_global_prefix_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let custom = tmp.path().join("custom-sp");
+    tokio::fs::create_dir_all(&custom).await.unwrap();
+
+    let crawler = PythonCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(custom.clone()),
+        batch_size: 100,
+    };
+    let paths = crawler.get_site_packages_paths(&opts).await.unwrap();
+    assert_eq!(paths, vec![custom]);
+}
+
+// ── METADATA early-break arm ───────────────────────────────────
+
+/// METADATA with extra header lines AFTER the blank line should NOT be
+/// parsed — the parser must stop at the first blank line after
+/// collecting name+version. Covers `python_crawler.rs:80-81`.
+#[tokio::test]
+async fn read_python_metadata_stops_at_blank_line_after_headers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dist = tmp.path().join("requests-2.28.0.dist-info");
+    tokio::fs::create_dir(&dist).await.unwrap();
+    // Headers block, then blank line, then garbage that would otherwise
+    // (re-)set Name to something else — the parser must NOT pick it up.
+    tokio::fs::write(
+        dist.join("METADATA"),
+        "Name: requests\nVersion: 2.28.0\n\nName: would-be-overwritten\nVersion: 9.9.9\n",
+    )
+    .await
+    .unwrap();
+
+    let result = read_python_metadata(&dist).await;
+    assert_eq!(
+        result,
+        Some(("requests".to_string(), "2.28.0".to_string())),
+        "parser must stop at first blank line; got {result:?}"
+    );
 }
 
 /// METADATA missing Version field → None.

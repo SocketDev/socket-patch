@@ -361,3 +361,152 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
         .unwrap();
     assert_eq!(result.len(), 1, "verify must fall back to dir name");
 }
+
+/// `version.workspace = true` in a top-level `[package]` block must
+/// bail (line 49-52): the crawler can't infer the actual version from
+/// just this file. `find_by_purls` then has to fall back to dir-name
+/// parsing — but `parse_cargo_toml_name_version` itself must return
+/// None up front.
+#[test]
+fn parse_cargo_toml_version_workspace_returns_none() {
+    let toml = "[package]\nname = \"foo\"\nversion.workspace = true\n";
+    assert_eq!(parse_cargo_toml_name_version(toml), None);
+}
+
+/// `verify_crate_at_path` with a dir-name-only match (workspace
+/// version) but a mismatched purl name — must return false. Exercises
+/// the `parsed_name == name && parsed_version == version` false arm
+/// (cargo_crawler.rs:344-346).
+#[tokio::test]
+async fn find_by_purls_verify_fallback_dir_name_mismatch_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("real-crate-1.0.0");
+    tokio::fs::create_dir(&pkg).await.unwrap();
+    tokio::fs::write(
+        pkg.join("Cargo.toml"),
+        "[package]\nname = \"real-crate\"\nversion.workspace = true\n",
+    )
+    .await
+    .unwrap();
+
+    let crawler = CargoCrawler;
+    // Ask for a name that doesn't match the dir layout.
+    let result = crawler
+        .find_by_purls(tmp.path(), &["pkg:cargo/other-crate@1.0.0".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty(), "dir-name mismatch must reject");
+}
+
+/// Hidden directory entries inside the crate source root must be
+/// skipped by `scan_crate_source` (line 274).
+#[tokio::test]
+async fn crawl_all_skips_hidden_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stage a hidden dir that looks like a registry crate — must be skipped.
+    let hidden = tmp.path().join(".hidden-crate-1.0.0");
+    tokio::fs::create_dir(&hidden).await.unwrap();
+    tokio::fs::write(
+        hidden.join("Cargo.toml"),
+        "[package]\nname = \"hidden-crate\"\nversion = \"1.0.0\"\n",
+    )
+    .await
+    .unwrap();
+    // Also stage a real one to confirm the scan actually runs.
+    stage_registry_crate(tmp.path(), "real-crate", "1.0.0").await;
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"real-crate"));
+    assert!(!names.contains(&"hidden-crate"), "hidden dir must be skipped");
+}
+
+/// `read_crate_cargo_toml` early-returns when the purl has already
+/// been recorded in `seen` (line 310-311). Drive this by staging two
+/// registry dirs for the same crate — the second one is deduped.
+#[tokio::test]
+async fn crawl_all_dedups_same_purl() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Two physical dirs with identical Cargo.toml -> same purl.
+    stage_registry_crate(tmp.path(), "foo", "1.0.0").await;
+    let dup = tmp.path().join("dup-mirror");
+    tokio::fs::create_dir(&dup).await.unwrap();
+    tokio::fs::write(
+        dup.join("Cargo.toml"),
+        "[package]\nname = \"foo\"\nversion = \"1.0.0\"\n",
+    )
+    .await
+    .unwrap();
+
+    let crawler = CargoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1, "duplicate purls must dedup; got {result:?}");
+}
+
+/// `get_crate_source_paths` in local mode without a vendor dir but
+/// with a Cargo.toml falls through to `get_registry_src_paths`. With
+/// CARGO_HOME pointed at an empty tempdir, the registry/src subdir
+/// doesn't exist → returns empty. Covers line 130.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n").await.unwrap();
+    // CARGO_HOME points at an empty tempdir → no registry/src to scan.
+    let cargo_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var("CARGO_HOME").ok();
+    std::env::set_var("CARGO_HOME", cargo_home.path());
+
+    let crawler = CargoCrawler;
+    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+
+    if let Some(v) = prev {
+        std::env::set_var("CARGO_HOME", v);
+    } else {
+        std::env::remove_var("CARGO_HOME");
+    }
+
+    assert!(
+        paths.is_empty(),
+        "missing registry/src must yield empty; got {paths:?}"
+    );
+}
+
+/// Same as above but with a registry/src tree staged — the discovered
+/// index dirs must surface. Covers lines 228-235 (entry walk).
+#[tokio::test]
+#[serial_test::serial]
+async fn get_crate_source_paths_local_cargo_toml_with_registry_src() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n").await.unwrap();
+    let cargo_home = tempfile::tempdir().unwrap();
+    let index_dir = cargo_home.path().join("registry").join("src").join("index.crates.io-stub");
+    tokio::fs::create_dir_all(&index_dir).await.unwrap();
+
+    let prev = std::env::var("CARGO_HOME").ok();
+    std::env::set_var("CARGO_HOME", cargo_home.path());
+
+    let crawler = CargoCrawler;
+    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+
+    if let Some(v) = prev {
+        std::env::set_var("CARGO_HOME", v);
+    } else {
+        std::env::remove_var("CARGO_HOME");
+    }
+
+    assert!(paths.iter().any(|p| p == &index_dir));
+}
