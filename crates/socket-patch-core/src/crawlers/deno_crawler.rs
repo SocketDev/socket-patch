@@ -23,12 +23,12 @@
 //!      and look up by content hash, which is fragile.
 //!
 //!      This crawler walks an *expected* layout of
-//!      `<root>/<scope>/<name>/<version>/` so that:
-//!        (a) synthetic test fixtures (`tests/crawler_deno_e2e.rs`)
-//!            can stage scannable JSR-shaped trees, and
-//!        (b) any future Deno that adopts a stable scope/name/version
-//!            layout (or a third-party tool that materializes JSR
-//!            packages this way) gets picked up automatically.
+//!      `<root>/<scope>/<name>/<version>/` so that (a) synthetic
+//!      test fixtures (`tests/crawler_deno_e2e.rs`) can stage
+//!      scannable JSR-shaped trees, and (b) any future Deno that
+//!      adopts a stable scope/name/version layout (or a third-party
+//!      tool that materializes JSR packages this way) gets picked
+//!      up automatically.
 //!
 //!      In the meantime, `socket-patch scan --global --ecosystems
 //!      deno --global-prefix <path>` is what real users would invoke
