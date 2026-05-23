@@ -6,9 +6,11 @@
 use std::path::Path;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, get_bun_global_prefix, get_npm_global_prefix, get_pnpm_global_prefix,
-    get_yarn_global_prefix, parse_bun_bin_output, parse_package_name, parse_pnpm_root_output,
-    parse_yarn_dir_output, read_package_json,
+    build_npm_purl, get_bun_global_prefix, get_bun_global_prefix_with, get_npm_global_prefix,
+    get_npm_global_prefix_with, get_pnpm_global_prefix, get_pnpm_global_prefix_with,
+    get_yarn_global_prefix, get_yarn_global_prefix_with, parse_bun_bin_output,
+    parse_npm_root_output, parse_package_name, parse_pnpm_root_output, parse_yarn_dir_output,
+    read_package_json,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -264,6 +266,82 @@ fn get_bun_global_prefix_returns_none_when_bun_not_on_path() {
     });
 }
 
+// ── injected-CommandRunner success-arm tests ───────────────────
+
+/// `get_npm_global_prefix_with` drives the success arm: a mock
+/// runner returns canned stdout, and the helper returns the parsed
+/// path. This covers the "binary present, returned valid output"
+/// arm without needing npm on PATH.
+#[test]
+fn get_npm_global_prefix_with_mock_runner_returns_path() {
+    let runner = common::MockCommandRunner::new().with_response(
+        "npm",
+        &["root", "-g"],
+        Some("/usr/local/lib/node_modules\n"),
+    );
+    let result = get_npm_global_prefix_with(&runner);
+    assert_eq!(result, Ok("/usr/local/lib/node_modules".to_string()));
+}
+
+#[test]
+fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
+    let runner =
+        common::MockCommandRunner::new().with_response("npm", &["root", "-g"], Some(""));
+    assert!(get_npm_global_prefix_with(&runner).is_err());
+}
+
+#[test]
+fn get_yarn_global_prefix_with_mock_runner_success() {
+    let runner =
+        common::MockCommandRunner::new().with_response("yarn", &["global", "dir"], Some("/Users/foo/.yarn/global\n"));
+    assert_eq!(
+        get_yarn_global_prefix_with(&runner).as_deref(),
+        Some("/Users/foo/.yarn/global/node_modules")
+    );
+}
+
+#[test]
+fn get_pnpm_global_prefix_with_mock_runner_success() {
+    let runner = common::MockCommandRunner::new().with_response(
+        "pnpm",
+        &["root", "-g"],
+        Some("/Users/foo/.pnpm-global\n"),
+    );
+    assert_eq!(
+        get_pnpm_global_prefix_with(&runner).as_deref(),
+        Some("/Users/foo/.pnpm-global")
+    );
+}
+
+#[test]
+fn get_bun_global_prefix_with_mock_runner_success() {
+    let runner = common::MockCommandRunner::new().with_response(
+        "bun",
+        &["pm", "bin", "-g"],
+        Some("/Users/foo/.bun/bin\n"),
+    );
+    assert_eq!(
+        get_bun_global_prefix_with(&runner).as_deref(),
+        Some("/Users/foo/.bun/install/global/node_modules")
+    );
+}
+
+// ── parse_npm_root_output ──────────────────────────────────────
+
+#[test]
+fn parse_npm_root_output_well_formed() {
+    assert_eq!(
+        parse_npm_root_output("/usr/local/lib/node_modules\n").as_deref(),
+        Some("/usr/local/lib/node_modules")
+    );
+}
+
+#[test]
+fn parse_npm_root_output_empty_returns_none() {
+    assert_eq!(parse_npm_root_output(""), None);
+    assert_eq!(parse_npm_root_output("  \n  "), None);
+}
+
 // ── parse_yarn_dir_output ──────────────────────────────────────
 
 /// yarn global dir prints `<dir>`; we append `/node_modules`.
@@ -507,7 +585,6 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
     assert!(!names.contains(&"also-not"), "SKIP_DIRS dir must be skipped");
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

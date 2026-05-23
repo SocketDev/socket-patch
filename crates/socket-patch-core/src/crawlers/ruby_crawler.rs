@@ -221,21 +221,18 @@ impl RubyCrawler {
 
     /// Run `gem env <key>` and return the trimmed stdout.
     async fn run_gem_env(key: &str) -> Option<String> {
-        let output = std::process::Command::new("gem")
-            .args(["env", key])
-            .output()
-            .ok()?;
+        Self::run_gem_env_with(&crate::utils::process::SystemCommandRunner, key)
+    }
 
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() {
-            None
-        } else {
-            Some(stdout)
-        }
+    /// Version of `run_gem_env` that accepts an injected
+    /// `CommandRunner`. Tests use this with a `MockCommandRunner` to
+    /// exercise the success arm (gem binary present, stdout parsed)
+    /// without requiring ruby on the host's PATH.
+    fn run_gem_env_with(
+        runner: &dyn crate::utils::process::CommandRunner,
+        key: &str,
+    ) -> Option<String> {
+        parse_gem_env_output(runner.run("gem", &["env", key]).as_deref().unwrap_or(""))
     }
 
     /// Scan a gem directory and return all valid gem packages found.
@@ -337,6 +334,18 @@ impl RubyCrawler {
 impl Default for RubyCrawler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Pure parser for `gem env <key>` stdout. Returns the trimmed path
+/// string or `None` on empty input. Extracted so the helper logic is
+/// unit-testable without shelling out to the gem CLI.
+pub fn parse_gem_env_output(stdout: &str) -> Option<String> {
+    let s = stdout.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -478,5 +487,14 @@ mod tests {
 
         let crawler = RubyCrawler::new();
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
+    }
+
+    /// `"-1.0.0"` — match_indices finds `i=0` (followed by `1`),
+    /// split_idx ends up Some(0), name slice is empty. The defensive
+    /// empty-name guard at the bottom of parse_dir_name_version
+    /// rejects rather than producing a `Gem("", "1.0.0")` ghost.
+    #[test]
+    fn test_parse_dir_name_version_empty_name_guard() {
+        assert_eq!(RubyCrawler::parse_dir_name_version("-1.0.0"), None);
     }
 }

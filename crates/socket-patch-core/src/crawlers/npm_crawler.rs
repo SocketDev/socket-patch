@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
 
@@ -80,40 +79,46 @@ pub fn build_npm_purl(namespace: Option<&str>, name: &str, version: &str) -> Str
 // Global prefix detection helpers
 // ---------------------------------------------------------------------------
 
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
+
 /// Get the npm global `node_modules` path via `npm root -g`.
 pub fn get_npm_global_prefix() -> Result<String, String> {
-    let output = Command::new("npm")
-        .args(["root", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run `npm root -g`: {e}"))?;
+    get_npm_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return Err(
+/// Version of `get_npm_global_prefix` that accepts an injected
+/// `CommandRunner`. Tests use this with a `MockCommandRunner` to
+/// exercise the success arm (binary present, stdout parsed) without
+/// requiring npm on the host's PATH.
+pub fn get_npm_global_prefix_with(runner: &dyn CommandRunner) -> Result<String, String> {
+    parse_npm_root_output(runner.run("npm", &["root", "-g"]).as_deref().unwrap_or(""))
+        .ok_or_else(|| {
             "Failed to determine npm global prefix. Ensure npm is installed and in PATH."
-                .to_string(),
-        );
-    }
+                .to_string()
+        })
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Pure parser for `npm root -g` stdout. Returns the trimmed path or
+/// `None` on empty input. Extracted so the helper logic is unit-
+/// testable without shelling out.
+pub fn parse_npm_root_output(stdout: &str) -> Option<String> {
+    let path = stdout.trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Get the yarn global `node_modules` path via `yarn global dir`.
 pub fn get_yarn_global_prefix() -> Option<String> {
-    let output = Command::new("yarn")
-        .args(["global", "dir"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_yarn_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
-    parse_yarn_dir_output(&String::from_utf8_lossy(&output.stdout))
+/// Version of `get_yarn_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_yarn_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_yarn_dir_output(runner.run("yarn", &["global", "dir"]).as_deref().unwrap_or(""))
 }
 
 /// Pure parser for `yarn global dir` stdout. Returns `<dir>/node_modules`
@@ -129,18 +134,13 @@ pub fn parse_yarn_dir_output(stdout: &str) -> Option<String> {
 
 /// Get the pnpm global `node_modules` path via `pnpm root -g`.
 pub fn get_pnpm_global_prefix() -> Option<String> {
-    let output = Command::new("pnpm")
-        .args(["root", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_pnpm_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
-    parse_pnpm_root_output(&String::from_utf8_lossy(&output.stdout))
+/// Version of `get_pnpm_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_pnpm_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_pnpm_root_output(runner.run("pnpm", &["root", "-g"]).as_deref().unwrap_or(""))
 }
 
 /// Pure parser for `pnpm root -g` stdout. Returns the trimmed path or
@@ -155,18 +155,13 @@ pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
 
 /// Get the bun global `node_modules` path via `bun pm bin -g`.
 pub fn get_bun_global_prefix() -> Option<String> {
-    let output = Command::new("bun")
-        .args(["pm", "bin", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_bun_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
-    parse_bun_bin_output(&String::from_utf8_lossy(&output.stdout))
+/// Version of `get_bun_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_bun_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_bun_bin_output(runner.run("bun", &["pm", "bin", "-g"]).as_deref().unwrap_or(""))
 }
 
 /// Pure parser for `bun pm bin -g` stdout. Extracted so the

@@ -390,7 +390,6 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
     assert!(paths.is_empty(), "no composer source anywhere must yield empty; got {paths:?}");
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

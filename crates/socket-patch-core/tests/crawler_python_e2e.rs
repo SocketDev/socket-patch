@@ -15,11 +15,62 @@ use std::path::Path;
 
 use serial_test::serial;
 use socket_patch_core::crawlers::python_crawler::{
-    find_local_venv_site_packages, find_python_dirs, get_global_python_site_packages,
-    read_python_metadata,
+    find_local_venv_site_packages, find_python_command_with, find_python_dirs,
+    get_global_python_site_packages, parse_python_site_packages_output, read_python_metadata,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::PythonCrawler;
+
+#[test]
+fn parse_python_site_packages_output_well_formed() {
+    let stdout = "/usr/local/lib/python3.11/site-packages\n/usr/local/lib/python3.11/dist-packages\n";
+    let paths = parse_python_site_packages_output(stdout);
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0], std::path::PathBuf::from("/usr/local/lib/python3.11/site-packages"));
+}
+
+#[test]
+fn parse_python_site_packages_output_empty_returns_empty() {
+    assert!(parse_python_site_packages_output("").is_empty());
+    assert!(parse_python_site_packages_output("\n  \n").is_empty());
+}
+
+#[test]
+fn parse_python_site_packages_output_trims_and_skips_blanks() {
+    let stdout = "  /a/b  \n\n   \n/c/d\n";
+    let paths = parse_python_site_packages_output(stdout);
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0], std::path::PathBuf::from("/a/b"));
+    assert_eq!(paths[1], std::path::PathBuf::from("/c/d"));
+}
+
+/// `find_python_command_with` with a mock runner that responds
+/// success to `python3 --version` must return `Some("python3")` —
+/// the first-match-wins arm. Lets tests exercise the success arm
+/// without needing python3 on the host's PATH.
+#[test]
+fn find_python_command_with_mock_runner_prefers_python3() {
+    let runner = common::MockCommandRunner::new()
+        .with_response("python3", &["--version"], Some("Python 3.11.5\n"));
+    assert_eq!(find_python_command_with(&runner), Some("python3"));
+}
+
+/// When `python3` is not present but `python` is, the helper should
+/// fall through to the second candidate.
+#[test]
+fn find_python_command_with_mock_runner_falls_through_to_python() {
+    let runner = common::MockCommandRunner::new()
+        .with_response("python", &["--version"], Some("Python 2.7.18\n"));
+    assert_eq!(find_python_command_with(&runner), Some("python"));
+}
+
+/// When none of `python3`/`python`/`py` are present, the helper
+/// returns None.
+#[test]
+fn find_python_command_with_mock_runner_none_when_no_binary() {
+    let runner = common::MockCommandRunner::new();
+    assert_eq!(find_python_command_with(&runner), None);
+}
 
 /// Helper: stage a fake `python3.X/lib/python3.X/site-packages` tree
 /// under `root` so `find_python_dirs(root, ["python3.*", "lib",
@@ -275,7 +326,6 @@ async fn read_python_metadata_missing_name_returns_none() {
     assert_eq!(result, None);
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

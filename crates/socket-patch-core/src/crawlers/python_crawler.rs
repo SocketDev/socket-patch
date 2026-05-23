@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 // ---------------------------------------------------------------------------
 // Python command discovery
@@ -13,15 +13,17 @@ use super::types::{CrawledPackage, CrawlerOptions};
 /// Tries `python3`, `python`, and `py` (Windows launcher) in order,
 /// returning the first one that responds to `--version`.
 pub fn find_python_command() -> Option<&'static str> {
-    ["python3", "python", "py"].into_iter().find(|cmd| {
-        Command::new(cmd)
-            .args(["--version"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_python_command_with(&SystemCommandRunner)
+}
+
+/// Version of `find_python_command` that accepts an injected
+/// `CommandRunner`. Tests inject a `MockCommandRunner` that returns
+/// `Some(...)` for `python3 --version` to exercise the success arm
+/// without a real Python on PATH.
+pub fn find_python_command_with(runner: &dyn CommandRunner) -> Option<&'static str> {
+    ["python3", "python", "py"]
+        .into_iter()
+        .find(|cmd| runner.run(cmd, &["--version"]).is_some())
 }
 
 /// Default batch size for crawling.
@@ -227,24 +229,16 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 
     // 1. Ask Python for site-packages
     if let Some(python_cmd) = find_python_command() {
-        if let Ok(output) = Command::new(python_cmd)
-            .args([
+        let runner = SystemCommandRunner;
+        if let Some(stdout) = runner.run(
+            python_cmd,
+            &[
                 "-c",
                 "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let p = line.trim();
-                    if !p.is_empty() {
-                        add_path(PathBuf::from(p), &mut seen, &mut results);
-                    }
-                }
+            ],
+        ) {
+            for p in parse_python_site_packages_output(&stdout) {
+                add_path(p, &mut seen, &mut results);
             }
         }
     }
@@ -598,6 +592,20 @@ impl Default for PythonCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pure parser for `python -c "import site; print(...);
+/// print(site.getusersitepackages())"` stdout. Splits the output on
+/// newlines, trims each line, discards empty lines, and returns the
+/// remaining lines as `PathBuf`s. Extracted so the path-derivation
+/// logic is unit-testable without a real Python interpreter.
+pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 #[cfg(test)]

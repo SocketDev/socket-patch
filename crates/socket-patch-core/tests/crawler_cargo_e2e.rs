@@ -528,7 +528,6 @@ async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
     assert!(result.is_empty(), "unparseable + no-version dir name must be skipped");
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

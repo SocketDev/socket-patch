@@ -669,4 +669,17 @@ mod tests {
         assert_eq!(home, PathBuf::from(custom));
         std::env::remove_var("NUGET_PACKAGES");
     }
+
+    /// `".1.0.0"` — first match-index of `.` is `i=0` (followed by
+    /// `1`), `i+1 < dir_name.len()` is true, split_idx = Some(0).
+    /// The name slice ends up empty; the defensive guard at the
+    /// bottom of parse_legacy_dir_name rejects rather than producing
+    /// a `("", "1.0.0")` ghost package. (Hidden dirs are skipped
+    /// upstream in scan_package_dir, but the parser is also called
+    /// from find_by_purls without the hidden-dir filter, so the
+    /// guard is real defense-in-depth.)
+    #[test]
+    fn test_parse_legacy_dir_name_empty_name_guard() {
+        assert_eq!(parse_legacy_dir_name(".1.0.0"), None);
+    }
 }

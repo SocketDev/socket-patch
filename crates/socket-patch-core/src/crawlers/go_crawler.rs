@@ -611,4 +611,19 @@ mod tests {
             Some("github.com/Azure".to_string())
         );
     }
+
+    /// `rel_str = "@v1.0.0"` — the dir literally lives at the cache
+    /// root with a leading `@`. `rfind('@')` returns 0,
+    /// `encoded_module_path = ""`. The empty-prefix guard in
+    /// parse_versioned_dir must return None rather than emit a
+    /// `("", "v1.0.0")` ghost package with an empty module path.
+    #[test]
+    fn test_parse_versioned_dir_empty_module_path_guard() {
+        let base = std::path::Path::new("/cache");
+        let dir = std::path::Path::new("/cache/@v1.0.0");
+        let mut seen = HashSet::new();
+        let crawler = GoCrawler;
+        let result = crawler.parse_versioned_dir(base, dir, "@v1.0.0", &mut seen);
+        assert!(result.is_none(), "empty encoded module path must yield None");
+    }
 }

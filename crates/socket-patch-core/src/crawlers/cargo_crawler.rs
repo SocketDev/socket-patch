@@ -626,4 +626,14 @@ version = "fake"
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], vendor);
     }
+
+    /// Dir name `"-1.0.0"` — the loop finds `i=0` (first `-` is at index 0,
+    /// followed by `1`), split_idx = Some(0), name slice = empty string.
+    /// The empty-name guard at the bottom of parse_dir_name_version must
+    /// reject this — the function is defensive against malformed inputs
+    /// even though no normal cargo registry would produce such a name.
+    #[test]
+    fn test_parse_dir_name_version_empty_name_guard() {
+        assert_eq!(CargoCrawler::parse_dir_name_version("-1.0.0"), None);
+    }
 }

@@ -49,3 +49,42 @@ pub fn chmod_readable(path: &std::path::Path) {
     let perms = std::fs::Permissions::from_mode(0o700);
     let _ = std::fs::set_permissions(path, perms);
 }
+
+/// Subprocess stub for the `CommandRunner` trait.
+///
+/// Each test registers a `(bin, args) -> Option<String>` mapping;
+/// `run()` looks up the (bin, args) tuple and returns the canned
+/// response, or `None` if the test didn't register one. Lets crawler
+/// tests drive the "binary present, returned this stdout" arm of
+/// `get_*_global_prefix` / `run_gem_env` / `find_python_command` /
+/// `get_global_python_site_packages` without depending on any
+/// installed CLI.
+#[allow(dead_code)]
+pub struct MockCommandRunner {
+    responses: std::collections::HashMap<(String, Vec<String>), Option<String>>,
+}
+
+#[allow(dead_code)]
+impl MockCommandRunner {
+    pub fn new() -> Self {
+        Self {
+            responses: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a stdout response for the given `(bin, args)`. A
+    /// `Some(stdout)` simulates the binary returning success; a
+    /// `None` simulates spawn failure or non-zero exit.
+    pub fn with_response(mut self, bin: &str, args: &[&str], stdout: Option<&str>) -> Self {
+        let key = (bin.to_string(), args.iter().map(|s| s.to_string()).collect());
+        self.responses.insert(key, stdout.map(|s| s.to_string()));
+        self
+    }
+}
+
+impl socket_patch_core::utils::process::CommandRunner for MockCommandRunner {
+    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
+        let key = (bin.to_string(), args.iter().map(|s| s.to_string()).collect());
+        self.responses.get(&key).cloned().unwrap_or(None)
+    }
+}

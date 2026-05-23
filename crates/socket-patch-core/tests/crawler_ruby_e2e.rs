@@ -7,8 +7,23 @@
 use std::path::Path;
 
 use serial_test::serial;
+use socket_patch_core::crawlers::ruby_crawler::parse_gem_env_output;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::RubyCrawler;
+
+#[test]
+fn parse_gem_env_output_well_formed() {
+    assert_eq!(
+        parse_gem_env_output("/Users/foo/.gem/ruby/3.2.0\n").as_deref(),
+        Some("/Users/foo/.gem/ruby/3.2.0")
+    );
+}
+
+#[test]
+fn parse_gem_env_output_empty_returns_none() {
+    assert_eq!(parse_gem_env_output(""), None);
+    assert_eq!(parse_gem_env_output("   \n  "), None);
+}
 
 const ORG_PURL: &str = "pkg:gem/rails@7.1.0";
 
@@ -221,7 +236,6 @@ async fn global_gem_discovery_via_home_dotgem_layout() {
     );
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

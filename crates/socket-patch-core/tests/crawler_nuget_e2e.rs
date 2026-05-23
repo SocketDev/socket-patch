@@ -341,7 +341,6 @@ async fn find_by_purls_with_lib_dir_marker_succeeds() {
     assert_eq!(result.len(), 1);
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 

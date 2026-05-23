@@ -178,7 +178,6 @@ async fn get_module_cache_paths_with_go_mod_returns_cache() {
     );
 }
 
-#[cfg(unix)]
 #[path = "common/mod.rs"]
 mod common;
 
