@@ -113,8 +113,14 @@ pub fn get_yarn_global_prefix() -> Option<String> {
     if !output.status.success() {
         return None;
     }
+    parse_yarn_dir_output(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `yarn global dir` stdout. Returns `<dir>/node_modules`
+/// or `None` on empty input. Extracted so the path-derivation logic is
+/// unit-testable without shelling out.
+pub fn parse_yarn_dir_output(stdout: &str) -> Option<String> {
+    let dir = stdout.trim().to_string();
     if dir.is_empty() {
         return None;
     }
@@ -134,8 +140,13 @@ pub fn get_pnpm_global_prefix() -> Option<String> {
     if !output.status.success() {
         return None;
     }
+    parse_pnpm_root_output(&String::from_utf8_lossy(&output.stdout))
+}
 
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `pnpm root -g` stdout. Returns the trimmed path or
+/// `None` on empty input.
+pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
+    let path = stdout.trim().to_string();
     if path.is_empty() {
         return None;
     }

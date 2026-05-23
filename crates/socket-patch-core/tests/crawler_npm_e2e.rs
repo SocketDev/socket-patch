@@ -6,7 +6,8 @@
 use std::path::Path;
 
 use socket_patch_core::crawlers::npm_crawler::{
-    build_npm_purl, parse_bun_bin_output, parse_package_name, read_package_json,
+    build_npm_purl, parse_bun_bin_output, parse_package_name, parse_pnpm_root_output,
+    parse_yarn_dir_output, read_package_json,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::NpmCrawler;
@@ -119,6 +120,71 @@ async fn read_package_json_missing_version_returns_none() {
     assert_eq!(result, None);
 }
 
+/// Both fields present but empty strings — parse succeeds but the
+/// downstream is_empty guard must reject.
+#[tokio::test]
+async fn read_package_json_empty_name_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("package.json");
+    tokio::fs::write(&pkg, r#"{"name":"","version":"1.0.0"}"#).await.unwrap();
+    assert_eq!(read_package_json(&pkg).await, None);
+}
+
+#[tokio::test]
+async fn read_package_json_empty_version_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("package.json");
+    tokio::fs::write(&pkg, r#"{"name":"lodash","version":""}"#).await.unwrap();
+    assert_eq!(read_package_json(&pkg).await, None);
+}
+
+// ── NpmCrawler construction ────────────────────────────────────
+
+#[test]
+fn npm_crawler_new_and_default_construct_cleanly() {
+    let _a = NpmCrawler::new();
+    let _b = NpmCrawler::default();
+}
+
+// ── get_node_modules_paths ─────────────────────────────────────
+
+/// `global_prefix` always takes precedence over discovery, even when
+/// `global` flag is also set.
+#[tokio::test]
+async fn get_node_modules_paths_global_prefix_passthrough() {
+    let tmp = tempfile::tempdir().unwrap();
+    let custom = tmp.path().join("custom-nm");
+    tokio::fs::create_dir_all(&custom).await.unwrap();
+
+    let crawler = NpmCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: false,
+        global_prefix: Some(custom.clone()),
+        batch_size: 100,
+    };
+    let paths = crawler.get_node_modules_paths(&opts).await.unwrap();
+    assert_eq!(paths, vec![custom]);
+}
+
+/// `global_prefix` even when only `global` is set without a prefix —
+/// must fall through to `get_global_node_modules_paths()`. Since the
+/// test env may have npm/yarn/pnpm/bun installed, we just assert the
+/// call returns Ok (it can return any set of real or empty paths).
+#[tokio::test]
+async fn get_node_modules_paths_global_mode_no_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let crawler = NpmCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    // Just must not panic — the actual list depends on the host.
+    let _paths = crawler.get_node_modules_paths(&opts).await.unwrap();
+}
+
 // ── parse_bun_bin_output ───────────────────────────────────────
 
 /// Bun's global node_modules lives at `<bun-root>/install/global/node_modules`
@@ -143,6 +209,41 @@ fn parse_bun_bin_output_empty_returns_none() {
 #[test]
 fn parse_bun_bin_output_root_path_returns_none() {
     assert_eq!(parse_bun_bin_output("/"), None);
+}
+
+// ── parse_yarn_dir_output ──────────────────────────────────────
+
+/// yarn global dir prints `<dir>`; we append `/node_modules`.
+#[test]
+fn parse_yarn_dir_output_appends_node_modules() {
+    let parsed = parse_yarn_dir_output("/Users/foo/.yarn/global\n");
+    assert_eq!(
+        parsed.as_deref(),
+        Some("/Users/foo/.yarn/global/node_modules")
+    );
+}
+
+#[test]
+fn parse_yarn_dir_output_empty_returns_none() {
+    assert_eq!(parse_yarn_dir_output(""), None);
+    assert_eq!(parse_yarn_dir_output("\n  \n"), None);
+}
+
+// ── parse_pnpm_root_output ─────────────────────────────────────
+
+#[test]
+fn parse_pnpm_root_output_returns_trimmed_path() {
+    let parsed = parse_pnpm_root_output("/home/foo/.local/share/pnpm/global/5/node_modules\n");
+    assert_eq!(
+        parsed.as_deref(),
+        Some("/home/foo/.local/share/pnpm/global/5/node_modules")
+    );
+}
+
+#[test]
+fn parse_pnpm_root_output_empty_returns_none() {
+    assert_eq!(parse_pnpm_root_output(""), None);
+    assert_eq!(parse_pnpm_root_output("   \n  "), None);
 }
 
 // ── find_by_purls ──────────────────────────────────────────────
@@ -231,6 +332,44 @@ async fn crawl_all_skips_dirs_without_package_json() {
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
+}
+
+/// `find_workspace_node_modules` should recurse into subdirectories
+/// looking for nested `node_modules`, while skipping hidden dirs and
+/// well-known build-output dirs.
+#[tokio::test]
+async fn crawl_all_recurses_into_workspace_packages() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Root has no node_modules but a workspace subdir does.
+    let pkg_dir = tmp.path().join("packages").join("ws-a");
+    stage_npm_pkg(&pkg_dir.join("node_modules"), "lodash", "4.17.21").await;
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(
+        names.contains(&"lodash"),
+        "workspace recursion must discover nested node_modules; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn crawl_all_skips_hidden_and_skip_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Hidden dirs and SKIP_DIRS entries (dist/build/coverage/tmp/...) are skipped.
+    stage_npm_pkg(&tmp.path().join(".hidden").join("node_modules"), "should-not-find", "1.0").await;
+    stage_npm_pkg(&tmp.path().join("dist").join("node_modules"), "also-not", "1.0").await;
+    // But a real workspace dir should be picked up.
+    stage_npm_pkg(&tmp.path().join("real-ws").join("node_modules"), "found-me", "1.0").await;
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"found-me"));
+    assert!(!names.contains(&"should-not-find"), "hidden dir must be skipped");
+    assert!(!names.contains(&"also-not"), "SKIP_DIRS dir must be skipped");
 }
 
 #[tokio::test]

@@ -216,6 +216,147 @@ async fn get_vendor_paths_local_full_setup_returns_vendor() {
     assert_eq!(paths, vec![vendor]);
 }
 
+// ── global mode discovery ──────────────────────────────────────
+
+/// `get_vendor_paths(global=true, global_prefix=None)` falls through to
+/// `get_global_vendor_paths` which checks `COMPOSER_HOME` env var.
+/// Stubbing it to a fixture root with `<root>/vendor/` populated must
+/// surface that path.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_via_composer_home_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let composer_home = tmp.path();
+    let vendor = composer_home.join("vendor");
+    tokio::fs::create_dir_all(&vendor).await.unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    std::env::set_var("COMPOSER_HOME", composer_home);
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    std::env::remove_var("COMPOSER_HOME");
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &vendor),
+        "COMPOSER_HOME-derived vendor dir must be returned; got {paths:?}"
+    );
+}
+
+/// COMPOSER_HOME unset + HOME pointing at a tempdir with `.composer/`
+/// must fall through to the HOME/.composer platform default.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dot_composer = tmp.path().join(".composer");
+    let vendor = dot_composer.join("vendor");
+    tokio::fs::create_dir_all(&vendor).await.unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("COMPOSER_HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &vendor),
+        "HOME/.composer fallback vendor dir must be returned; got {paths:?}"
+    );
+}
+
+/// HOME with `.config/composer/` but no `.composer/` exercises the
+/// second candidate in the platform-default list.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join(".config").join("composer");
+    let vendor = xdg.join("vendor");
+    tokio::fs::create_dir_all(&vendor).await.unwrap();
+
+    let prev_composer = std::env::var("COMPOSER_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("COMPOSER_HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_vendor_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_composer {
+        std::env::set_var("COMPOSER_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &vendor),
+        "HOME/.config/composer fallback vendor dir must be returned; got {paths:?}"
+    );
+}
+
+/// `crawl_all` should dedup packages discovered across multiple
+/// vendor paths sharing the same installed package — exercises the
+/// `seen.contains` early-continue arm.
+#[tokio::test]
+async fn crawl_all_dedups_across_vendor_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let custom_vendor = tmp.path().join("custom-vendor");
+    let composer_dir = custom_vendor.join("composer");
+    tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+    let pkg_dir = custom_vendor.join("monolog").join("monolog");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+    let installed = r#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"},{"name":"monolog/monolog","version":"3.5.0"}]}"#;
+    tokio::fs::write(composer_dir.join("installed.json"), installed).await.unwrap();
+    tokio::fs::write(tmp.path().join("composer.json"), b"{}").await.unwrap();
+
+    let crawler = ComposerCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(custom_vendor),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1, "duplicates inside installed.json must dedup");
+}
+
 #[tokio::test]
 async fn get_vendor_paths_local_with_lock_marker_also_works() {
     let tmp = tempfile::tempdir().unwrap();
