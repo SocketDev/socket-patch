@@ -559,10 +559,16 @@ async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
     let extra_packages = tempfile::tempdir().unwrap();
     let obj = tmp.path().join("obj");
     tokio::fs::create_dir_all(&obj).await.unwrap();
-    let assets = format!(
-        r#"{{"packageFolders":{{ "{}": {{}} }}}}"#,
-        extra_packages.path().display()
+    // Build the assets.json body via serde_json so the path value is
+    // properly escaped — on Windows, raw `format!`-embedded paths
+    // contain unescaped backslashes that make the file invalid JSON,
+    // which the production parser then silently drops.
+    let mut folders = serde_json::Map::new();
+    folders.insert(
+        extra_packages.path().display().to_string(),
+        serde_json::Value::Object(serde_json::Map::new()),
     );
+    let assets = serde_json::json!({ "packageFolders": folders }).to_string();
     tokio::fs::write(obj.join("project.assets.json"), assets).await.unwrap();
     // Also need a project marker to satisfy is_dotnet_project (so the
     // global-cache fallback path runs as well) — but assets discovery
@@ -595,7 +601,14 @@ async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
     let extra = tempfile::tempdir().unwrap();
     let sub_obj = tmp.path().join("WebApp").join("obj");
     tokio::fs::create_dir_all(&sub_obj).await.unwrap();
-    let assets = format!(r#"{{"packageFolders":{{ "{}": {{}} }}}}"#, extra.path().display());
+    // See companion test above — raw `format!` with Path::display()
+    // produces invalid JSON on Windows.
+    let mut folders = serde_json::Map::new();
+    folders.insert(
+        extra.path().display().to_string(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
+    let assets = serde_json::json!({ "packageFolders": folders }).to_string();
     tokio::fs::write(sub_obj.join("project.assets.json"), assets).await.unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
