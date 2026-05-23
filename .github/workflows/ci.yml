@@ -388,33 +388,30 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            suite: e2e_npm
-          - os: ubuntu-latest
-            suite: e2e_pypi
-          - os: ubuntu-latest
             suite: e2e_cargo
           - os: ubuntu-latest
             suite: e2e_golang
           - os: ubuntu-latest
             suite: e2e_maven
           - os: ubuntu-latest
-            suite: e2e_gem
-          - os: ubuntu-latest
             suite: e2e_composer
           - os: ubuntu-latest
             suite: e2e_nuget
-          - os: macos-latest
-            suite: e2e_npm
-          - os: macos-latest
-            suite: e2e_pypi
-          # `e2e_scan` is intentionally NOT in the PR matrix — it
-          # depends on the live public proxy at
-          # patches-api.socket.dev serving real patch data for
-          # `minimist@1.2.2`, which is subject to rate-limiting
-          # ("Service temporarily over capacity") and other
-          # availability quirks outside this repo's control. Run on
-          # demand with
-          # `cargo test -p socket-patch-cli --test e2e_scan -- --ignored`.
+          # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
+          # e2e_scan) are intentionally NOT in the PR matrix — their
+          # `#[ignore]`-gated tests hit the real public proxy at
+          # patches-api.socket.dev, which intermittently returns
+          # 503 "Service temporarily over capacity" outside this
+          # repo's control. Run on demand:
+          #
+          #   cargo test -p socket-patch-cli --test e2e_npm  -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_pypi -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_gem  -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_scan -- --ignored
+          #
+          # PR-time coverage for the same code paths comes from the
+          # `e2e-docker` matrix below, which runs the same flow
+          # against a hermetic wiremock fixture.
           # Safety-hardening e2e suites. The fast non-ignored ones
           # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
           # standard `test` job above on all three platforms, so no
