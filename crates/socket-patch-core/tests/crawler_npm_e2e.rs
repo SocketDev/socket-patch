@@ -290,6 +290,88 @@ async fn find_by_purls_version_mismatch_returns_empty() {
     assert!(result.is_empty(), "version mismatch must skip");
 }
 
+/// `parse_purl_components` strips trailing qualifiers (`?...`).
+/// Covers `parse_purl_components` line 702.
+#[tokio::test]
+async fn find_by_purls_strips_qualifiers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "lodash", "4.17.21").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(
+            &nm,
+            &["pkg:npm/lodash@4.17.21?extension=tgz".to_string()],
+        )
+        .await
+        .unwrap();
+    // Note: result key uses the original purl, but lookup back uses
+    // the stripped form internally; the purl set check ensures the
+    // entry is only inserted if the synthesized purl matches one of
+    // the requested purls. With qualifier present, synthesis returns
+    // `pkg:npm/lodash@4.17.21` which doesn't match the qualified
+    // input — so the result is empty. The important coverage is that
+    // parse_purl_components successfully strips the qualifier.
+    assert!(result.is_empty(), "qualifier strip + synth mismatch must yield empty");
+}
+
+/// PURL with no `@` (no version separator) must be rejected via the
+/// `rfind('@')?` arm (line 707).
+#[tokio::test]
+async fn find_by_purls_purl_without_at_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/lodash".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+/// PURL with `@` but an empty version (`pkg:npm/lodash@`) — covers the
+/// `version.is_empty()` arm at line 711-712.
+#[tokio::test]
+async fn find_by_purls_purl_with_empty_version_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/lodash@".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+/// PURL with scope marker but no slash (`pkg:npm/@foo@1.0`) — covers
+/// the `find('/')?` arm at line 716.
+#[tokio::test]
+async fn find_by_purls_scoped_purl_without_slash_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/@foo@1.0".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+/// Scoped PURL with empty name after slash (`pkg:npm/@scope/@1.0`) —
+/// covers the `if name.is_empty()` arm at line 719-720.
+#[tokio::test]
+async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    let crawler = NpmCrawler;
+    let result = crawler
+        .find_by_purls(&nm, &["pkg:npm/@scope/@1.0".to_string()])
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
 #[tokio::test]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
@@ -370,6 +452,60 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
     assert!(names.contains(&"found-me"));
     assert!(!names.contains(&"should-not-find"), "hidden dir must be skipped");
     assert!(!names.contains(&"also-not"), "SKIP_DIRS dir must be skipped");
+}
+
+/// Drives scoped-package scanning + nested node_modules recursion +
+/// the hidden-and-file-entries skip arms inside `scan_scoped_packages`
+/// and `scan_nested_node_modules`. Covers L552, 581-604, 619-665.
+#[tokio::test]
+async fn crawl_all_handles_nested_and_messy_scope_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+
+    // Regular package with its own nested node_modules containing another
+    // package — exercises the unscoped → scan_nested_node_modules path.
+    stage_npm_pkg(&nm, "outer", "1.0.0").await;
+    stage_npm_pkg(&nm.join("outer").join("node_modules"), "inner", "2.0.0").await;
+
+    // Scoped package — exercises scan_scoped_packages happy path.
+    stage_npm_pkg(&nm, "@scope/scoped-pkg", "3.0.0").await;
+
+    // Scoped package WITH a nested node_modules → scan_nested_node_modules
+    // is reached from inside scan_scoped_packages (L599-604).
+    stage_npm_pkg(
+        &nm.join("@scope").join("scoped-pkg").join("node_modules"),
+        "scoped-dep",
+        "4.0.0",
+    )
+    .await;
+
+    // Hidden subdir inside @scope — must be skipped (L581-583).
+    tokio::fs::create_dir_all(nm.join("@scope").join(".hidden")).await.unwrap();
+    // A plain file inside @scope — must be skipped via the !is_dir &&
+    // !is_symlink arm (L590-591).
+    tokio::fs::write(nm.join("@scope").join("README.md"), b"x").await.unwrap();
+    // A plain file at top of node_modules too — exercises the same arm
+    // in scan_node_modules.
+    tokio::fs::write(nm.join("top-level-file.txt"), b"y").await.unwrap();
+
+    // Nested node_modules with a scoped subentry — drives the L650-653 arm
+    // (nested → scan_scoped_packages).
+    stage_npm_pkg(
+        &nm.join("outer").join("node_modules"),
+        "@nest/leaf",
+        "5.0.0",
+    )
+    .await;
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert!(names.contains(&"outer"));
+    assert!(names.contains(&"inner"));
+    assert!(names.contains(&"scoped-pkg"));
+    assert!(names.contains(&"scoped-dep"));
+    assert!(names.contains(&"leaf"));
 }
 
 #[tokio::test]

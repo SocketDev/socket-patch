@@ -16,6 +16,24 @@ use socket_patch_core::crawlers::MavenCrawler;
 use socket_patch_core::crawlers::NuGetCrawler;
 use std::path::PathBuf;
 
+/// `CrawlerOptions::default()` should populate cwd from
+/// `std::env::current_dir`, default `global` to false, leave
+/// `global_prefix` unset, and set `batch_size` to the documented 100.
+/// Covers types.rs:143-150 (the `Default` impl, which the apply-CLI
+/// tests never exercise because callers always build options
+/// explicitly).
+#[test]
+fn crawler_options_default_populates_fields() {
+    let opts = CrawlerOptions::default();
+    assert!(
+        !opts.cwd.as_os_str().is_empty(),
+        "cwd must default to env::current_dir() result"
+    );
+    assert!(!opts.global);
+    assert!(opts.global_prefix.is_none());
+    assert_eq!(opts.batch_size, 100);
+}
+
 fn options_at(root: &std::path::Path) -> CrawlerOptions {
     CrawlerOptions {
         cwd: root.to_path_buf(),
