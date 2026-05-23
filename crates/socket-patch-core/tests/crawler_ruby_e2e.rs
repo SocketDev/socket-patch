@@ -221,6 +221,47 @@ async fn global_gem_discovery_via_home_dotgem_layout() {
     );
 }
 
+/// `RubyCrawler::default()` should forward to `new()`.
+#[test]
+fn ruby_crawler_default_and_new_construct_cleanly() {
+    let _a = RubyCrawler::default();
+    let _b = RubyCrawler::new();
+}
+
+/// `~/.rvm/gems/<set>/gems` layout — exercises the third fallback in
+/// the rbenv/rvm/gem fallback_globs loop.
+#[tokio::test]
+#[serial]
+async fn global_gem_discovery_via_rvm_layout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gems = tmp
+        .path()
+        .join(".rvm")
+        .join("gems")
+        .join("ruby-3.2.0")
+        .join("gems");
+    tokio::fs::create_dir_all(&gems).await.unwrap();
+
+    let prev = std::env::var("HOME").ok();
+    std::env::set_var("HOME", tmp.path());
+    let crawler = RubyCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_gem_paths(&opts).await.unwrap();
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &gems),
+        "~/.rvm/gems/*/gems must be discovered; got {paths:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn global_gem_discovery_via_rbenv_layout() {

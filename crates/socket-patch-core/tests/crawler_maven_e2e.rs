@@ -92,6 +92,158 @@ fn parse_pom_empty_string_returns_none() {
     assert_eq!(parse_pom_group_artifact_version(""), None);
 }
 
+/// Parent block supplies groupId when the project block doesn't —
+/// exercise the `in_parent` arm that records `parent_group_id` and the
+/// final `group_id.or(parent_group_id)` fallback (maven_crawler.rs:124).
+#[test]
+fn parse_pom_parent_groupid_fallback() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example.parent</groupId>
+    <artifactId>parent-pom</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>child-module</artifactId>
+  <version>2.0.0</version>
+</project>"#;
+    let result = parse_pom_group_artifact_version(pom);
+    assert_eq!(
+        result,
+        Some((
+            "com.example.parent".to_string(),
+            "child-module".to_string(),
+            "2.0.0".to_string()
+        ))
+    );
+}
+
+/// Top-level `<groupId>${env.GROUP_ID}</groupId>` is a property
+/// reference — the parser must bail out instead of treating the
+/// literal placeholder as a value (line 100).
+#[test]
+fn parse_pom_property_reference_groupid_returns_none() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>${env.GROUP_ID}</groupId>
+  <artifactId>commons-lang3</artifactId>
+  <version>3.12.0</version>
+</project>"#;
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
+#[test]
+fn parse_pom_property_reference_artifactid_returns_none() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.apache</groupId>
+  <artifactId>${env.ART}</artifactId>
+  <version>3.12.0</version>
+</project>"#;
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
+#[test]
+fn parse_pom_property_reference_version_returns_none() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <groupId>org.apache</groupId>
+  <artifactId>commons-lang3</artifactId>
+  <version>${revision}</version>
+</project>"#;
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
+/// `<parent><groupId>${prop}</groupId></parent>` is a parent property
+/// reference — must NOT be accepted as a fallback groupId (line 86-87
+/// skip arm).
+/// `MavenCrawler::default()` should forward to `new()`.
+#[test]
+fn maven_crawler_default_and_new_construct_cleanly() {
+    let _a = MavenCrawler::default();
+    let _b = MavenCrawler::new();
+}
+
+/// `m2_repo_path` falls through to `$HOME/.m2/repository` when neither
+/// MAVEN_REPO_LOCAL nor M2_HOME is set. We can't exercise this directly
+/// (private fn) but can drive it via `get_maven_repo_paths` with a
+/// build.gradle marker and both env vars cleared. The crawler should
+/// then point at the staged `<HOME>/.m2/repository`.
+#[tokio::test]
+#[serial]
+async fn get_maven_repo_paths_home_dot_m2_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let m2 = tmp.path().join(".m2").join("repository");
+    tokio::fs::create_dir_all(&m2).await.unwrap();
+    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>").await.unwrap();
+
+    let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
+    let prev_m2 = std::env::var("M2_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("M2_HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = MavenCrawler;
+    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+
+    if let Some(v) = prev_local {
+        std::env::set_var("MAVEN_REPO_LOCAL", v);
+    }
+    if let Some(v) = prev_m2 {
+        std::env::set_var("M2_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        paths.iter().any(|p| p == &m2),
+        "HOME/.m2/repository fallback must be discovered; got {paths:?}"
+    );
+}
+
+/// `find_by_purls` for a version directory that contains a non-`.pom`
+/// file but no `.pom` — exercise the `has_pom_file` return-false arm
+/// (line 405) via verify_maven_at_path.
+#[tokio::test]
+async fn find_by_purls_version_dir_without_pom_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let group_path = "org/apache/commons";
+    let pkg_dir = tmp.path().join(group_path).join("commons-lang3").join("3.12.0");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+    // Put a non-.pom file in there — has_pom_file must reject.
+    tokio::fs::write(pkg_dir.join("commons-lang3-3.12.0.jar"), b"fake jar").await.unwrap();
+
+    let crawler = MavenCrawler;
+    let result = crawler
+        .find_by_purls(
+            tmp.path(),
+            &["pkg:maven/org.apache.commons/commons-lang3@3.12.0".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(result.is_empty(), "missing .pom must skip the package");
+}
+
+#[test]
+fn parse_pom_parent_property_reference_groupid_skipped() {
+    let pom = r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>${env.PARENT_GROUP}</groupId>
+    <artifactId>parent-pom</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>child-module</artifactId>
+  <version>2.0.0</version>
+</project>"#;
+    // No top-level groupId and the parent's is a property ref → bail.
+    assert_eq!(parse_pom_group_artifact_version(pom), None);
+}
+
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]

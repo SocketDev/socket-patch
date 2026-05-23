@@ -346,3 +346,236 @@ async fn find_by_purls_with_lib_dir_marker_succeeds() {
 fn _used_in_doc() -> &'static str {
     ORG_PURL_B
 }
+
+// ── NuGetCrawler construction ─────────────────────────────────
+
+#[test]
+fn nuget_crawler_default_and_new_construct_cleanly() {
+    let _a = NuGetCrawler::default();
+    let _b = NuGetCrawler::new();
+}
+
+// ── global mode ────────────────────────────────────────────────
+
+/// `global=true` with no `global_prefix` falls through to `nuget_home`
+/// which honors NUGET_PACKAGES. When the resulting home exists, the
+/// crawler returns it as the only path (line 38-39).
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_global_mode_returns_nuget_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nuget_root = tempfile::tempdir().unwrap();
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    std::env::set_var("NUGET_PACKAGES", nuget_root.path());
+
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_nuget_package_paths(&opts).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+
+    assert_eq!(paths, vec![nuget_root.path().to_path_buf()]);
+}
+
+/// `global=true` but NUGET_PACKAGES points at a non-existent dir →
+/// `is_dir` check fails and the crawler returns an empty list
+/// (line 41).
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    let prev_home = std::env::var("HOME").ok();
+    // Point both at a path that does not exist.
+    let missing = tmp.path().join("does-not-exist");
+    std::env::set_var("NUGET_PACKAGES", &missing);
+    // HOME also pointed somewhere without .nuget — but NUGET_PACKAGES wins.
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = NuGetCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_nuget_package_paths(&opts).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(paths.is_empty(), "missing global cache dir must yield empty; got {paths:?}");
+}
+
+/// `is_dotnet_project` accepts a NuGet.Config marker without any
+/// project file extensions — covers the L355 `if name == "NuGet.Config"`
+/// branch.
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_with_nuget_config_falls_back_to_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("NuGet.Config"), b"<configuration/>").await.unwrap();
+    let nuget_root = tempfile::tempdir().unwrap();
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    std::env::set_var("NUGET_PACKAGES", nuget_root.path());
+
+    let crawler = NuGetCrawler;
+    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == nuget_root.path()),
+        "NuGet.Config must trigger global-cache fallback"
+    );
+}
+
+// ── project.assets.json discovery ─────────────────────────────
+
+/// A staged `obj/project.assets.json` with a `packageFolders` map
+/// must surface those folders alongside the global cache. Covers
+/// `discover_paths_from_assets` and `parse_project_assets_package_folders`.
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra_packages = tempfile::tempdir().unwrap();
+    let obj = tmp.path().join("obj");
+    tokio::fs::create_dir_all(&obj).await.unwrap();
+    let assets = format!(
+        r#"{{"packageFolders":{{ "{}": {{}} }}}}"#,
+        extra_packages.path().display()
+    );
+    tokio::fs::write(obj.join("project.assets.json"), assets).await.unwrap();
+    // Also need a project marker to satisfy is_dotnet_project (so the
+    // global-cache fallback path runs as well) — but assets discovery
+    // is independent, so this test exercises the obj-path branch even
+    // without a csproj.
+    let nuget_root = tempfile::tempdir().unwrap();
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    std::env::set_var("NUGET_PACKAGES", nuget_root.path());
+
+    let crawler = NuGetCrawler;
+    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == extra_packages.path()),
+        "assets.json packageFolders must be discovered; got {paths:?}"
+    );
+}
+
+/// `project.assets.json` exists in a subdirectory (multi-project
+/// solution) — `discover_paths_from_assets` walks one level deep.
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let sub_obj = tmp.path().join("WebApp").join("obj");
+    tokio::fs::create_dir_all(&sub_obj).await.unwrap();
+    let assets = format!(r#"{{"packageFolders":{{ "{}": {{}} }}}}"#, extra.path().display());
+    tokio::fs::write(sub_obj.join("project.assets.json"), assets).await.unwrap();
+
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    let nuget_root = tempfile::tempdir().unwrap();
+    std::env::set_var("NUGET_PACKAGES", nuget_root.path());
+
+    let crawler = NuGetCrawler;
+    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+
+    assert!(
+        paths.iter().any(|p| p == extra.path()),
+        "subproject obj/project.assets.json must be discovered; got {paths:?}"
+    );
+}
+
+/// Empty `packageFolders` object in assets.json must not surface any
+/// paths (line 447-448 `if result.is_empty()` arm).
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let obj = tmp.path().join("obj");
+    tokio::fs::create_dir_all(&obj).await.unwrap();
+    tokio::fs::write(obj.join("project.assets.json"), br#"{"packageFolders":{}}"#).await.unwrap();
+
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("NUGET_PACKAGES", tmp.path().join("nonexistent-cache"));
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = NuGetCrawler;
+    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(paths.is_empty(), "empty packageFolders must yield no paths");
+}
+
+/// Malformed JSON in project.assets.json must not crash — discovery
+/// just skips it (line 442 `from_str.ok()?` arm).
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_assets_json_malformed_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let obj = tmp.path().join("obj");
+    tokio::fs::create_dir_all(&obj).await.unwrap();
+    tokio::fs::write(obj.join("project.assets.json"), b"this is not json").await.unwrap();
+
+    let prev = std::env::var("NUGET_PACKAGES").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::set_var("NUGET_PACKAGES", tmp.path().join("nonexistent-cache"));
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = NuGetCrawler;
+    // Must succeed with no panic, returning empty.
+    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+
+    std::env::remove_var("NUGET_PACKAGES");
+    if let Some(v) = prev {
+        std::env::set_var("NUGET_PACKAGES", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(paths.is_empty(), "malformed assets.json must be skipped; got {paths:?}");
+}

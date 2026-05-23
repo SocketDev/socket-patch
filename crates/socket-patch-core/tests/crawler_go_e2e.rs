@@ -178,6 +178,98 @@ async fn get_module_cache_paths_with_go_mod_returns_cache() {
     );
 }
 
+/// `GoCrawler::default()` should forward to `new()`.
+#[test]
+fn go_crawler_default_and_new_construct_cleanly() {
+    let _a = GoCrawler::default();
+    let _b = GoCrawler::new();
+}
+
+/// A `module` directive with no path (`module`) must not match — the
+/// guard at line 61 (`!rest.is_empty()`) keeps it from being returned.
+#[test]
+fn parse_go_mod_module_directive_with_empty_path_returns_none() {
+    assert_eq!(parse_go_mod_module("module\n"), None);
+}
+
+/// Quoted module path with whitespace — the strip-quotes branch.
+#[test]
+fn parse_go_mod_module_quoted_path() {
+    assert_eq!(
+        parse_go_mod_module(r#"module "github.com/foo/bar""#),
+        Some("github.com/foo/bar".to_string())
+    );
+}
+
+/// `!` at the end of an encoded path with no following character — the
+/// trailing-`!` arm of decode_module_path silently drops the bang
+/// (line 38 inner `if let Some(next) = chars.next()` false arm).
+#[test]
+fn decode_module_path_trailing_bang_is_dropped() {
+    assert_eq!(decode_module_path("github.com/foo!"), "github.com/foo");
+}
+
+/// `find_by_purls` with a directory matching the module name but the
+/// path missing — exercise the `is_dir(module_dir)` false branch.
+#[tokio::test]
+async fn find_by_purls_module_dir_missing_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Note: stage NO module dir for this purl.
+    let crawler = GoCrawler;
+    let result = crawler
+        .find_by_purls(
+            tmp.path(),
+            &["pkg:golang/github.com/gin-gonic/gin@v1.9.1".to_string()],
+        )
+        .await
+        .unwrap();
+    assert!(result.is_empty());
+}
+
+/// `crawl_all` over a cache with a versioned subdir several levels deep
+/// — exercises the recursive scan + parse_versioned_dir path.
+#[tokio::test]
+#[serial]
+async fn crawl_all_finds_nested_versioned_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stage <cache>/github.com/gin-gonic/gin@v1.9.1/
+    let module_dir = tmp.path().join("github.com").join("gin-gonic").join("gin@v1.9.1");
+    tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+    let crawler = GoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "gin");
+    assert_eq!(result[0].version, "v1.9.1");
+    assert_eq!(result[0].namespace.as_deref(), Some("github.com/gin-gonic"));
+}
+
+/// `cache` directory inside the module cache is metadata, must be
+/// skipped (line 249 second arm).
+#[tokio::test]
+#[serial]
+async fn crawl_all_skips_cache_metadata_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_meta = tmp.path().join("cache");
+    tokio::fs::create_dir_all(cache_meta.join("download").join("module@v1.0.0")).await.unwrap();
+
+    let crawler = GoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert!(result.is_empty(), "cache/ subtree must be skipped; got {result:?}");
+}
+
 #[tokio::test]
 #[serial]
 async fn get_module_cache_paths_gopath_fallback_when_gomodcache_unset() {
