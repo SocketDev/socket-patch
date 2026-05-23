@@ -388,21 +388,16 @@ impl MavenCrawler {
         if !is_dir(path).await {
             return false;
         }
-
-        let mut entries = match tokio::fs::read_dir(path).await {
-            Ok(rd) => rd,
-            Err(_) => return false,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".pom") {
-                    return true;
-                }
-            }
-        }
-
-        false
+        crate::utils::fs::list_dir_entries(path)
+            .await
+            .iter()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".pom"))
+                    .unwrap_or(false)
+            })
     }
 }
 

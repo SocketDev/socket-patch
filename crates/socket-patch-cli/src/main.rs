@@ -23,6 +23,7 @@ async fn main() {
         Commands::Remove(args) => commands::remove::run(args).await,
         Commands::Setup(args) => commands::setup::run(args).await,
         Commands::Repair(args) => commands::repair::run(args).await,
+        Commands::Unlock(args) => commands::unlock::run(args).await,
     };
 
     std::process::exit(exit_code);

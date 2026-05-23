@@ -16,6 +16,14 @@ pub enum Ecosystem {
     Composer,
     #[cfg(feature = "nuget")]
     Nuget,
+    /// Deno's JSR registry. PURL form
+    /// `pkg:jsr/<scope>/<name>@<version>`. Note: Deno's `deno install`
+    /// flow also produces standard `node_modules/` trees full of
+    /// `pkg:npm/...` packages — those route through `Ecosystem::Npm`
+    /// unchanged. Only JSR (the deno-native registry) gets its own
+    /// variant.
+    #[cfg(feature = "deno")]
+    Deno,
 }
 
 impl Ecosystem {
@@ -35,6 +43,8 @@ impl Ecosystem {
             Ecosystem::Composer,
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget,
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno,
         ]
     }
 
@@ -63,31 +73,16 @@ impl Ecosystem {
         if purl.starts_with("pkg:nuget/") {
             return Some(Ecosystem::Nuget);
         }
+        #[cfg(feature = "deno")]
+        if purl.starts_with("pkg:jsr/") {
+            return Some(Ecosystem::Deno);
+        }
         if purl.starts_with("pkg:npm/") {
             Some(Ecosystem::Npm)
         } else if purl.starts_with("pkg:pypi/") {
             Some(Ecosystem::Pypi)
         } else {
             None
-        }
-    }
-
-    /// The PURL prefix for this ecosystem (e.g. `"pkg:npm/"`).
-    pub fn purl_prefix(&self) -> &'static str {
-        match self {
-            Ecosystem::Npm => "pkg:npm/",
-            Ecosystem::Pypi => "pkg:pypi/",
-            #[cfg(feature = "cargo")]
-            Ecosystem::Cargo => "pkg:cargo/",
-            Ecosystem::Gem => "pkg:gem/",
-            #[cfg(feature = "golang")]
-            Ecosystem::Golang => "pkg:golang/",
-            #[cfg(feature = "maven")]
-            Ecosystem::Maven => "pkg:maven/",
-            #[cfg(feature = "composer")]
-            Ecosystem::Composer => "pkg:composer/",
-            #[cfg(feature = "nuget")]
-            Ecosystem::Nuget => "pkg:nuget/",
         }
     }
 
@@ -107,6 +102,8 @@ impl Ecosystem {
             Ecosystem::Composer => "composer",
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno => "deno",
         }
     }
 
@@ -126,6 +123,8 @@ impl Ecosystem {
             Ecosystem::Composer => "php",
             #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
+            #[cfg(feature = "deno")]
+            Ecosystem::Deno => "deno",
         }
     }
 }
@@ -233,6 +232,10 @@ mod tests {
         {
             expected += 1;
         }
+        #[cfg(feature = "deno")]
+        {
+            expected += 1;
+        }
         assert_eq!(all.len(), expected);
     }
 
@@ -248,18 +251,11 @@ mod tests {
         assert_eq!(Ecosystem::Pypi.display_name(), "python");
     }
 
-    #[test]
-    fn test_purl_prefix() {
-        assert_eq!(Ecosystem::Npm.purl_prefix(), "pkg:npm/");
-        assert_eq!(Ecosystem::Pypi.purl_prefix(), "pkg:pypi/");
-    }
-
     #[cfg(feature = "cargo")]
     #[test]
     fn test_cargo_properties() {
         assert_eq!(Ecosystem::Cargo.cli_name(), "cargo");
         assert_eq!(Ecosystem::Cargo.display_name(), "cargo");
-        assert_eq!(Ecosystem::Cargo.purl_prefix(), "pkg:cargo/");
     }
 
     #[test]
@@ -274,7 +270,6 @@ mod tests {
     fn test_gem_properties() {
         assert_eq!(Ecosystem::Gem.cli_name(), "gem");
         assert_eq!(Ecosystem::Gem.display_name(), "ruby");
-        assert_eq!(Ecosystem::Gem.purl_prefix(), "pkg:gem/");
     }
 
     #[cfg(feature = "maven")]
@@ -291,7 +286,6 @@ mod tests {
     fn test_maven_properties() {
         assert_eq!(Ecosystem::Maven.cli_name(), "maven");
         assert_eq!(Ecosystem::Maven.display_name(), "maven");
-        assert_eq!(Ecosystem::Maven.purl_prefix(), "pkg:maven/");
     }
 
     #[cfg(feature = "golang")]
@@ -308,7 +302,6 @@ mod tests {
     fn test_golang_properties() {
         assert_eq!(Ecosystem::Golang.cli_name(), "golang");
         assert_eq!(Ecosystem::Golang.display_name(), "go");
-        assert_eq!(Ecosystem::Golang.purl_prefix(), "pkg:golang/");
     }
 
     #[cfg(feature = "composer")]
@@ -325,7 +318,6 @@ mod tests {
     fn test_composer_properties() {
         assert_eq!(Ecosystem::Composer.cli_name(), "composer");
         assert_eq!(Ecosystem::Composer.display_name(), "php");
-        assert_eq!(Ecosystem::Composer.purl_prefix(), "pkg:composer/");
     }
 
     #[cfg(feature = "nuget")]
@@ -342,6 +334,5 @@ mod tests {
     fn test_nuget_properties() {
         assert_eq!(Ecosystem::Nuget.cli_name(), "nuget");
         assert_eq!(Ecosystem::Nuget.display_name(), "nuget");
-        assert_eq!(Ecosystem::Nuget.purl_prefix(), "pkg:nuget/");
     }
 }

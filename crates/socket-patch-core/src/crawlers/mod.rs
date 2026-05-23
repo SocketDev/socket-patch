@@ -1,4 +1,5 @@
 pub mod npm_crawler;
+pub mod pkg_managers;
 pub mod python_crawler;
 pub mod types;
 #[cfg(feature = "cargo")]
@@ -12,8 +13,11 @@ pub mod maven_crawler;
 pub mod composer_crawler;
 #[cfg(feature = "nuget")]
 pub mod nuget_crawler;
+#[cfg(feature = "deno")]
+pub mod deno_crawler;
 
 pub use npm_crawler::NpmCrawler;
+pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager};
 pub use python_crawler::PythonCrawler;
 pub use types::*;
 #[cfg(feature = "cargo")]
@@ -27,3 +31,5 @@ pub use maven_crawler::MavenCrawler;
 pub use composer_crawler::ComposerCrawler;
 #[cfg(feature = "nuget")]
 pub use nuget_crawler::NuGetCrawler;
+#[cfg(feature = "deno")]
+pub use deno_crawler::DenoCrawler;

@@ -10,9 +10,12 @@ use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult,
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::{acquire_or_emit, LOCK_BROKEN_CODE};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::json_envelope::Command as EnvelopeCommand;
 
 #[derive(Args)]
 pub struct RollbackArgs {
@@ -173,6 +176,25 @@ pub async fn run(args: RollbackArgs) -> i32 {
         return 1;
     }
 
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. See
+    // `socket_patch_core::patch::apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let acquired = match acquire_or_emit(
+        socket_dir,
+        EnvelopeCommand::Rollback,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        args.common.break_lock,
+    ) {
+        Ok(acquired) => acquired,
+        Err(code) => return code,
+    };
+    let _lock = acquired.guard;
+    let lock_was_broken = acquired.broke_lock;
+
     match rollback_patches_inner(&args, &manifest_path).await {
         Ok((success, results)) => {
             let rolled_back_count = results
@@ -191,12 +213,28 @@ pub async fn run(args: RollbackArgs) -> i32 {
             let failed_count = results.iter().filter(|r| !r.success).count();
 
             if args.common.json {
+                // `warnings` carries non-fatal audit info — currently
+                // just the `lock_broken` notice when --break-lock fired.
+                // Empty array stays present in the JSON shape so
+                // consumers can rely on `.warnings[]` without
+                // null-checking.
+                let mut warnings = Vec::new();
+                if lock_was_broken {
+                    warnings.push(serde_json::json!({
+                        "code": LOCK_BROKEN_CODE,
+                        "message": format!(
+                            "--break-lock removed {}/apply.lock before acquisition",
+                            socket_dir.display()
+                        ),
+                    }));
+                }
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                     "status": if success { "success" } else { "partial_failure" },
                     "rolledBack": rolled_back_count,
                     "alreadyOriginal": already_original_count,
                     "failed": failed_count,
                     "dryRun": args.common.dry_run,
+                    "warnings": warnings,
                     "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
                 })).unwrap());
             } else if !args.common.silent && !results.is_empty() {

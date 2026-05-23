@@ -13,6 +13,13 @@
 //! produce. The Docker e2e tests verify that real installers produce
 //! the same layouts.
 
+// Each test is feature-gated on its ecosystem (e.g. `cfg(feature =
+// "golang")` for the gin tests). With default features (no ecosystems
+// enabled) every test and helper compiles out — quiet the resulting
+// dead-code/unused-import noise so non-feature builds stay warning-
+// clean.
+#![allow(dead_code, unused_imports)]
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -123,6 +130,7 @@ async fn setup_apply_mock(
 // golang
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_install_apply_patches_file() {
@@ -174,6 +182,7 @@ async fn golang_handcrafted_install_apply_patches_file() {
 // maven
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_install_apply_patches_file() {
@@ -200,6 +209,10 @@ async fn maven_handcrafted_install_apply_patches_file() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+    // Maven crawler is runtime-gated behind this env var (see
+    // `ecosystem_dispatch::maven_runtime_enabled`). The test
+    // deliberately exercises the Maven apply path, so opt in.
+    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let server = MockServer::start().await;
     setup_apply_mock(
@@ -225,12 +238,14 @@ async fn maven_handcrafted_install_apply_patches_file() {
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
 // ---------------------------------------------------------------------------
 // composer
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn composer_handcrafted_install_apply_patches_file() {
@@ -295,6 +310,7 @@ async fn composer_handcrafted_install_apply_patches_file() {
 // nuget
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_install_apply_patches_file() {
@@ -319,6 +335,10 @@ async fn nuget_handcrafted_install_apply_patches_file() {
     let after_hash = git_sha256(&patched);
 
     std::env::set_var("NUGET_PACKAGES", &packages);
+    // NuGet crawler is runtime-gated behind this env var (see
+    // `ecosystem_dispatch::nuget_runtime_enabled`). The test
+    // deliberately exercises the NuGet apply path, so opt in.
+    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
 
     let server = MockServer::start().await;
     setup_apply_mock(
@@ -344,12 +364,14 @@ async fn nuget_handcrafted_install_apply_patches_file() {
     );
 
     std::env::remove_var("NUGET_PACKAGES");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }
 
 // ---------------------------------------------------------------------------
 // Discovery-only tests for each handcrafted layout
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_discovery() {
@@ -380,6 +402,7 @@ async fn golang_handcrafted_discovery() {
     std::env::remove_var("GOMODCACHE");
 }
 
+#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_discovery() {
@@ -389,6 +412,7 @@ async fn maven_handcrafted_discovery() {
     std::fs::create_dir_all(&version_dir).unwrap();
     std::fs::write(version_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -403,8 +427,10 @@ async fn maven_handcrafted_discovery() {
     args.sync = false;
     assert_eq!(scan_run(args).await, 0);
     std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
+#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_discovery() {
@@ -414,6 +440,7 @@ async fn nuget_handcrafted_discovery() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("foo.nuspec"), "<package/>").unwrap();
     std::env::set_var("NUGET_PACKAGES", &pkgs);
+    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -428,6 +455,7 @@ async fn nuget_handcrafted_discovery() {
     args.sync = false;
     assert_eq!(scan_run(args).await, 0);
     std::env::remove_var("NUGET_PACKAGES");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }
 
 // Helper kept around so `PathBuf` import is used in case of future tests.

@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 // ---------------------------------------------------------------------------
 // Python command discovery
@@ -13,15 +13,17 @@ use super::types::{CrawledPackage, CrawlerOptions};
 /// Tries `python3`, `python`, and `py` (Windows launcher) in order,
 /// returning the first one that responds to `--version`.
 pub fn find_python_command() -> Option<&'static str> {
-    ["python3", "python", "py"].into_iter().find(|cmd| {
-        Command::new(cmd)
-            .args(["--version"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_python_command_with(&SystemCommandRunner)
+}
+
+/// Version of `find_python_command` that accepts an injected
+/// `CommandRunner`. Tests inject a `MockCommandRunner` that returns
+/// `Some(...)` for `python3 --version` to exercise the success arm
+/// without a real Python on PATH.
+pub fn find_python_command_with(runner: &dyn CommandRunner) -> Option<&'static str> {
+    ["python3", "python", "py"]
+        .into_iter()
+        .find(|cmd| runner.run(cmd, &["--version"]).is_some())
 }
 
 /// Default batch size for crawling.
@@ -118,38 +120,13 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
 
     if first == "python3.*" {
         // Wildcard: list directory and match python3.X entries
-        if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("python3.") {
-                    let sub = Box::pin(find_python_dirs(
-                        &base_path.join(entry.file_name()),
-                        rest,
-                    ))
-                    .await;
-                    results.extend(sub);
-                }
+        for entry in crate::utils::fs::list_dir_entries(base_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
+                continue;
             }
-        }
-    } else if first == "*" {
-        // Generic wildcard: match any directory entry
-        if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("python3.") {
                 let sub = Box::pin(find_python_dirs(
                     &base_path.join(entry.file_name()),
                     rest,
@@ -157,6 +134,19 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
                 .await;
                 results.extend(sub);
             }
+        }
+    } else if first == "*" {
+        // Generic wildcard: match any directory entry
+        for entry in crate::utils::fs::list_dir_entries(base_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
+                continue;
+            }
+            let sub = Box::pin(find_python_dirs(
+                &base_path.join(entry.file_name()),
+                rest,
+            ))
+            .await;
+            results.extend(sub);
         }
     } else {
         // Literal segment: just check if it exists
@@ -179,9 +169,12 @@ pub async fn find_site_packages_under(
     base_dir: &Path,
     sub_dir_type: &str, // "site-packages" or "dist-packages"
 ) -> Vec<PathBuf> {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         find_python_dirs(base_dir, &["Lib", sub_dir_type]).await
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         find_python_dirs(base_dir, &["lib", "python3.*", sub_dir_type]).await
     }
 }
@@ -236,24 +229,16 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 
     // 1. Ask Python for site-packages
     if let Some(python_cmd) = find_python_command() {
-        if let Ok(output) = Command::new(python_cmd)
-            .args([
+        let runner = SystemCommandRunner;
+        if let Some(stdout) = runner.run(
+            python_cmd,
+            &[
                 "-c",
                 "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let p = line.trim();
-                    if !p.is_empty() {
-                        add_path(PathBuf::from(p), &mut seen, &mut results);
-                    }
-                }
+            ],
+        ) {
+            for p in parse_python_site_packages_output(&stdout) {
+                add_path(p, &mut seen, &mut results);
             }
         }
     }
@@ -283,7 +268,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    if !cfg!(windows) {
+    #[cfg(not(windows))]
+    {
         // Debian/Ubuntu
         scan_well_known(Path::new("/usr"), "dist-packages", &mut seen, &mut results).await;
         scan_well_known(Path::new("/usr"), "site-packages", &mut seen, &mut results).await;
@@ -308,7 +294,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // macOS-specific
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         scan_well_known(
             Path::new("/opt/homebrew"),
             "site-packages",
@@ -338,52 +325,48 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // Windows-specific
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         // pip --user on Windows: %APPDATA%\Python\PythonXY\site-packages
         if let Ok(appdata) = std::env::var("APPDATA") {
             let appdata_python = PathBuf::from(&appdata).join("Python");
-            if let Ok(mut entries) = tokio::fs::read_dir(&appdata_python).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let p = appdata_python.join(entry.file_name()).join("site-packages");
-                    if tokio::fs::metadata(&p).await.is_ok() {
-                        add_path(p, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(&appdata_python).await {
+                let p = appdata_python.join(entry.file_name()).join("site-packages");
+                if tokio::fs::metadata(&p).await.is_ok() {
+                    add_path(p, &mut seen, &mut results);
                 }
             }
         }
         // Common Windows Python install locations
         for base in &["C:\\Python", "C:\\Program Files\\Python"] {
-            if let Ok(mut entries) = tokio::fs::read_dir(base).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let sp = PathBuf::from(base)
-                        .join(entry.file_name())
-                        .join("Lib")
-                        .join("site-packages");
-                    if tokio::fs::metadata(&sp).await.is_ok() {
-                        add_path(sp, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(Path::new(base)).await {
+                let sp = PathBuf::from(base)
+                    .join(entry.file_name())
+                    .join("Lib")
+                    .join("site-packages");
+                if tokio::fs::metadata(&sp).await.is_ok() {
+                    add_path(sp, &mut seen, &mut results);
                 }
             }
         }
         // Microsoft Store / python.org via LocalAppData
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let programs_python = PathBuf::from(&local).join("Programs").join("Python");
-            if let Ok(mut entries) = tokio::fs::read_dir(&programs_python).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let sp = programs_python
-                        .join(entry.file_name())
-                        .join("Lib")
-                        .join("site-packages");
-                    if tokio::fs::metadata(&sp).await.is_ok() {
-                        add_path(sp, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(&programs_python).await {
+                let sp = programs_python
+                    .join(entry.file_name())
+                    .join("Lib")
+                    .join("site-packages");
+                if tokio::fs::metadata(&sp).await.is_ok() {
+                    add_path(sp, &mut seen, &mut results);
                 }
             }
         }
     }
 
     // pyenv (works on macOS and Linux)
-    if !cfg!(windows) {
+    #[cfg(not(windows))]
+    {
         let pyenv_root = std::env::var("PYENV_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home_dir).join(".pyenv"));
@@ -404,8 +387,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     let miniconda = PathBuf::from(&home_dir).join("miniconda3");
     scan_well_known(&miniconda, "site-packages", &mut seen, &mut results).await;
 
-    // uv tools
-    if cfg!(target_os = "macos") {
+    // uv tools — platform-specific install root.
+    #[cfg(target_os = "macos")]
+    {
         let uv_base = PathBuf::from(&home_dir)
             .join("Library")
             .join("Application Support")
@@ -416,7 +400,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         for m in uv_matches {
             add_path(m, &mut seen, &mut results);
         }
-    } else if cfg!(windows) {
+    }
+    #[cfg(windows)]
+    {
         // %LOCALAPPDATA%\uv\tools
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let uv_base = PathBuf::from(local).join("uv").join("tools");
@@ -426,7 +412,9 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
                 add_path(m, &mut seen, &mut results);
             }
         }
-    } else {
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
         let uv_base = PathBuf::from(&home_dir)
             .join(".local")
             .join("share")
@@ -439,7 +427,70 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
+    // uv-managed Python interpreters (`uv python install 3.X`) live at:
+    //   Linux/macOS: ~/.local/share/uv/python/cpython-3.X.*/lib/python3.X/site-packages/
+    //   Windows:     %LOCALAPPDATA%\uv\python\cpython-3.X.*\Lib\site-packages\
+    // The typical flow is `uv venv` + `uv pip install`, where the venv layout
+    // is already covered by `find_local_venv_site_packages`. But power users
+    // can install packages directly into the managed interpreter (e.g. via
+    // `<uv-python>/bin/pip install ...`), and globally-discovered crawls
+    // should surface those.
+    #[cfg(not(windows))]
+    {
+        let uv_python = PathBuf::from(&home_dir)
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("python");
+        let uv_matches =
+            find_python_dirs(&uv_python, &["*", "lib", "python3.*", "site-packages"]).await;
+        for m in uv_matches {
+            add_path(m, &mut seen, &mut results);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let uv_python = PathBuf::from(local).join("uv").join("python");
+            let uv_matches =
+                find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
+            for m in uv_matches {
+                add_path(m, &mut seen, &mut results);
+            }
+        }
+    }
+
     results
+}
+
+/// Returns true if `cwd` looks like a Python project root.
+///
+/// Used by `PythonCrawler::get_site_packages_paths` to decide
+/// whether to fall back to the global-discovery path when no venv
+/// was found. Mirrors `is_dotnet_project` in nuget_crawler and the
+/// `has_gemfile || has_gemfile_lock` check in ruby_crawler.
+///
+/// The list intentionally covers all major Python toolchains:
+///   * `pyproject.toml` — PEP 518 / 621 (poetry, hatch, uv, flit,
+///     setuptools-PEP-517, pdm, etc. — anything modern)
+///   * `setup.py` / `setup.cfg` — legacy setuptools
+///   * `requirements.txt` — pip-compile / bare requirements
+///   * `uv.lock` — uv-managed projects (PEP 751 export sibling is
+///     `pylock.toml` but in practice `uv.lock` is what ships)
+async fn is_python_project(cwd: &Path) -> bool {
+    let markers = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "uv.lock",
+    ];
+    for m in &markers {
+        if tokio::fs::metadata(cwd.join(m)).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +507,21 @@ impl PythonCrawler {
     }
 
     /// Get `site-packages` paths based on options.
+    ///
+    /// Local-mode discovery has two stages:
+    ///   1. `find_local_venv_site_packages` — handles `VIRTUAL_ENV`,
+    ///      `.venv`, and `venv` directories (covers the common case
+    ///      of an activated or project-local venv).
+    ///   2. If no venv was found AND the cwd looks like a Python
+    ///      project (`pyproject.toml`, `setup.py`, `setup.cfg`,
+    ///      `requirements.txt`, or `uv.lock` present), fall through
+    ///      to `get_global_python_site_packages`. This mirrors the
+    ///      cargo / ruby / go pattern where a project marker
+    ///      indicates "scan this ecosystem globally for this project".
+    ///
+    /// Without the marker fallback, a fresh clone with
+    /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
+    /// return zero packages.
     pub async fn get_site_packages_paths(&self, options: &CrawlerOptions) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
@@ -463,7 +529,14 @@ impl PythonCrawler {
             }
             return Ok(get_global_python_site_packages().await);
         }
-        Ok(find_local_venv_site_packages(&options.cwd).await)
+        let venv_paths = find_local_venv_site_packages(&options.cwd).await;
+        if !venv_paths.is_empty() {
+            return Ok(venv_paths);
+        }
+        if is_python_project(&options.cwd).await {
+            return Ok(get_global_python_site_packages().await);
+        }
+        Ok(Vec::new())
     }
 
     /// Crawl all discovered `site-packages` and return every package found.
@@ -506,19 +579,7 @@ impl PythonCrawler {
         }
 
         // Scan all .dist-info dirs
-        let entries = match tokio::fs::read_dir(site_packages_path).await {
-            Ok(rd) => {
-                let mut entries = rd;
-                let mut v = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    v.push(entry);
-                }
-                v
-            }
-            Err(_) => return Ok(result),
-        };
-
-        for entry in entries {
+        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if !name_str.ends_with(".dist-info") {
@@ -560,19 +621,7 @@ impl PythonCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let entries = match tokio::fs::read_dir(site_packages_path).await {
-            Ok(rd) => {
-                let mut entries = rd;
-                let mut v = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    v.push(entry);
-                }
-                v
-            }
-            Err(_) => return results,
-        };
-
-        for entry in entries {
+        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if !name_str.ends_with(".dist-info") {
@@ -628,6 +677,20 @@ impl Default for PythonCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Pure parser for `python -c "import site; print(...);
+/// print(site.getusersitepackages())"` stdout. Splits the output on
+/// newlines, trims each line, discards empty lines, and returns the
+/// remaining lines as `PathBuf`s. Extracted so the path-derivation
+/// logic is unit-testable without a real Python interpreter.
+pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 #[cfg(test)]
@@ -787,11 +850,10 @@ mod tests {
     async fn test_crawl_all_python() {
         let dir = tempfile::tempdir().unwrap();
         let venv = dir.path().join(".venv");
-        let sp = if cfg!(windows) {
-            venv.join("Lib").join("site-packages")
-        } else {
-            venv.join("lib").join("python3.11").join("site-packages")
-        };
+        #[cfg(windows)]
+        let sp = venv.join("Lib").join("site-packages");
+        #[cfg(not(windows))]
+        let sp = venv.join("lib").join("python3.11").join("site-packages");
         tokio::fs::create_dir_all(&sp).await.unwrap();
 
         // Create a dist-info dir with METADATA

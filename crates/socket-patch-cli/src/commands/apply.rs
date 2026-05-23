@@ -4,15 +4,20 @@ use socket_patch_core::api::blob_fetcher::{
     get_missing_blobs, DownloadMode,
 };
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::crawlers::{
+    detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
+};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
+
+use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -129,6 +134,11 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
                 .map(AppliedVia::from_core),
         })
         .collect();
+    // Sidecar data is NOT attached here — it's surfaced at the
+    // envelope level under `Envelope.sidecars[]` by the run loop.
+    // See `Envelope::record_sidecar`. Keeping events clean of
+    // sidecar info means each event describes only the apply
+    // action; sidecar reporting is a separate, JOIN-able list.
     PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
@@ -154,6 +164,74 @@ pub async fn run(args: ApplyArgs) -> i32 {
         return 0;
     }
 
+    // Serialize against concurrent socket-patch runs targeting the same
+    // `.socket/` directory. The guard releases on function return; see
+    // `socket_patch_core::patch::apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let acquired = match acquire_or_emit(
+        socket_dir,
+        Command::Apply,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        args.common.break_lock,
+    ) {
+        Ok(acquired) => acquired,
+        Err(code) => return code,
+    };
+    let _lock = acquired.guard;
+    let lock_was_broken = acquired.broke_lock;
+
+    // Package-manager layout detection. yarn-berry PnP keeps packages
+    // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
+    // the npm crawler can't reach them and rewriting zips is a
+    // different operation entirely. Refuse with a clear pointer to
+    // `yarn patch`. pnpm gets an informational event; the CoW guard
+    // in `apply_file_patch` does the substantive safety work.
+    let pkg_manager = detect_npm_pkg_manager(&args.common.cwd);
+    match pkg_manager {
+        NpmPkgManager::YarnBerryPnP => {
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                env.dry_run = args.common.dry_run;
+                env.mark_error(EnvelopeError::new(
+                    "yarn_pnp_unsupported",
+                    "yarn-berry Plug'n'Play layout is not supported by socket-patch (packages live inside .yarn/cache zips). Use `yarn patch <pkg>` instead.",
+                ));
+                println!("{}", env.to_pretty_json());
+            } else if !args.common.silent {
+                eprintln!("Error: yarn-berry Plug'n'Play layout is not supported.");
+                eprintln!(
+                    "  Packages live inside .yarn/cache/*.zip — socket-patch cannot rewrite them in place."
+                );
+                eprintln!("  Use `yarn patch <pkg>` instead.");
+            }
+            return 1;
+        }
+        NpmPkgManager::Pnpm => {
+            if !args.common.json && !args.common.silent {
+                eprintln!(
+                    "Note: pnpm layout detected. Copy-on-write will keep the global store untouched."
+                );
+            }
+            // Non-fatal — CoW handles the safety. JSON consumers see
+            // the layout-detected info in the apply envelope's
+            // existing events (no separate event added here yet).
+        }
+        NpmPkgManager::Bun => {
+            if !args.common.json && !args.common.silent {
+                eprintln!(
+                    "Note: bun layout detected. Copy-on-write will keep ~/.bun/install/cache/ untouched."
+                );
+            }
+            // Same shape as pnpm: bun hard-links from its global
+            // install cache by default. The CoW guard handles the
+            // safety; this is informational only.
+        }
+        _ => {}
+    }
+
     match apply_patches_inner(&args, &manifest_path).await {
         Ok((success, results, unmatched)) => {
             let patched_count = results
@@ -164,8 +242,18 @@ pub async fn run(args: ApplyArgs) -> i32 {
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
+                if lock_was_broken {
+                    env.record(lock_broken_event(socket_dir));
+                }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
+                    // Sidecar records live on the envelope, not on
+                    // individual events. Consumers iterate
+                    // `envelope.sidecars[]` and JOIN against
+                    // `events[]` by `purl` for per-package context.
+                    if let Some(ref sidecar) = result.sidecar {
+                        env.record_sidecar(sidecar.clone());
+                    }
                 }
                 // Manifest entries that targeted in-scope ecosystems but
                 // had no installed package on disk — emit one Skipped
@@ -705,6 +793,7 @@ mod tests {
             files_patched: vec!["package/index.js".to_string()],
             applied_via,
             error: None,
+            sidecar: None,
         }
     }
 
@@ -779,6 +868,7 @@ mod tests {
             ],
             applied_via,
             error: None,
+            sidecar: None,
         };
 
         let event = result_to_event(&result, false);

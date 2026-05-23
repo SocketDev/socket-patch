@@ -219,22 +219,11 @@ impl CargoCrawler {
         let registry_src = cargo_home.join("registry").join("src");
 
         let mut paths = Vec::new();
-
-        let mut entries = match tokio::fs::read_dir(&registry_src).await {
-            Ok(rd) => rd,
-            Err(_) => return paths,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(&registry_src).await {
+            if crate::utils::fs::entry_is_dir(&entry).await {
                 paths.push(registry_src.join(entry.file_name()));
             }
         }
-
         paths
     }
 
@@ -247,22 +236,8 @@ impl CargoCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(src_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(src_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
 
@@ -650,5 +625,15 @@ version = "fake"
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], vendor);
+    }
+
+    /// Dir name `"-1.0.0"` — the loop finds `i=0` (first `-` is at index 0,
+    /// followed by `1`), split_idx = Some(0), name slice = empty string.
+    /// The empty-name guard at the bottom of parse_dir_name_version must
+    /// reject this — the function is defensive against malformed inputs
+    /// even though no normal cargo registry would produce such a name.
+    #[test]
+    fn test_parse_dir_name_version_empty_name_guard() {
+        assert_eq!(CargoCrawler::parse_dir_name_version("-1.0.0"), None);
     }
 }

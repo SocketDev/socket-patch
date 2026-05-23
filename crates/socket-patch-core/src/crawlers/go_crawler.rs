@@ -223,22 +223,8 @@ impl GoCrawler {
         results: &'a mut Vec<CrawledPackage>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let mut entries = match tokio::fs::read_dir(current_path).await {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
+            for entry in crate::utils::fs::list_dir_entries(current_path).await {
+                if !crate::utils::fs::entry_is_dir(&entry).await {
                     continue;
                 }
 
@@ -624,5 +610,20 @@ mod tests {
             packages[0].namespace,
             Some("github.com/Azure".to_string())
         );
+    }
+
+    /// `rel_str = "@v1.0.0"` — the dir literally lives at the cache
+    /// root with a leading `@`. `rfind('@')` returns 0,
+    /// `encoded_module_path = ""`. The empty-prefix guard in
+    /// parse_versioned_dir must return None rather than emit a
+    /// `("", "v1.0.0")` ghost package with an empty module path.
+    #[test]
+    fn test_parse_versioned_dir_empty_module_path_guard() {
+        let base = std::path::Path::new("/cache");
+        let dir = std::path::Path::new("/cache/@v1.0.0");
+        let mut seen = HashSet::new();
+        let crawler = GoCrawler;
+        let result = crawler.parse_versioned_dir(base, dir, "@v1.0.0", &mut seen);
+        assert!(result.is_none(), "empty encoded module path must yield None");
     }
 }

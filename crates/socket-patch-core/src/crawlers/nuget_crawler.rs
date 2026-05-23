@@ -164,22 +164,8 @@ impl NuGetCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(pkg_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
 
@@ -231,20 +217,11 @@ impl NuGetCrawler {
         name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<Vec<CrawledPackage>> {
-        let mut version_entries = match tokio::fs::read_dir(name_dir).await {
-            Ok(rd) => rd,
-            Err(_) => return None,
-        };
-
         let mut found_any = false;
         let mut results = Vec::new();
 
-        while let Ok(Some(ver_entry)) = version_entries.next_entry().await {
-            let ft = match ver_entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for ver_entry in crate::utils::fs::list_dir_entries(name_dir).await {
+            if !crate::utils::fs::entry_is_dir(&ver_entry).await {
                 continue;
             }
 
@@ -300,8 +277,7 @@ impl NuGetCrawler {
     ) -> Option<PathBuf> {
         let target = format!("{}.{}", name.to_lowercase(), version.to_lowercase());
 
-        let mut entries = tokio::fs::read_dir(pkg_path).await.ok()?;
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
             if dir_name_str.to_lowercase() == target {
@@ -340,12 +316,7 @@ fn nuget_home() -> PathBuf {
 async fn is_dotnet_project(cwd: &Path) -> bool {
     let extensions = [".csproj", ".fsproj", ".vbproj", ".sln"];
 
-    let mut entries = match tokio::fs::read_dir(cwd).await {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in crate::utils::fs::list_dir_entries(cwd).await {
         if let Some(name) = entry.file_name().to_str() {
             for ext in &extensions {
                 if name.ends_with(ext) {
@@ -357,7 +328,6 @@ async fn is_dotnet_project(cwd: &Path) -> bool {
             }
         }
     }
-
     false
 }
 
@@ -385,8 +355,7 @@ fn parse_legacy_dir_name(dir_name: &str) -> Option<(String, String)> {
 
 /// Find a `.nuspec` file in a directory.
 async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in crate::utils::fs::list_dir_entries(dir).await {
         if let Some(name) = entry.file_name().to_str() {
             if name.ends_with(".nuspec") {
                 return Some(dir.join(name));
@@ -394,59 +363,6 @@ async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Parse `<id>` and `<version>` from `.nuspec` XML content.
-///
-/// Uses simple string matching — the nuspec format always has these
-/// elements on separate lines.
-pub fn parse_nuspec_id_version(content: &str) -> Option<(String, String)> {
-    let mut id = None;
-    let mut version = None;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if id.is_none() {
-            if let Some(value) = extract_xml_element(trimmed, "id") {
-                id = Some(value);
-            }
-        }
-
-        if version.is_none() {
-            if let Some(value) = extract_xml_element(trimmed, "version") {
-                version = Some(value);
-            }
-        }
-
-        if id.is_some() && version.is_some() {
-            break;
-        }
-    }
-
-    match (id, version) {
-        (Some(id), Some(version)) if !id.is_empty() && !version.is_empty() => {
-            Some((id, version))
-        }
-        _ => None,
-    }
-}
-
-/// Extract the text content of a simple XML element like `<tag>value</tag>`.
-fn extract_xml_element(line: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-
-    let start = line.find(&open)?;
-    let after_open = start + open.len();
-    let end = line[after_open..].find(&close)?;
-    let value = &line[after_open..after_open + end];
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
 }
 
 /// Discover additional package paths from `obj/project.assets.json` files.
@@ -462,17 +378,8 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
     }
 
     // Also check subdirectories one level deep for multi-project solutions
-    let mut entries = match tokio::fs::read_dir(cwd).await {
-        Ok(rd) => rd,
-        Err(_) => return paths,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
+    for entry in crate::utils::fs::list_dir_entries(cwd).await {
+        if !crate::utils::fs::entry_is_dir(&entry).await {
             continue;
         }
         let sub_assets = cwd.join(entry.file_name()).join("obj").join("project.assets.json");
@@ -482,7 +389,6 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
-
     paths
 }
 
@@ -539,42 +445,6 @@ mod tests {
         );
         assert!(parse_legacy_dir_name("no-version-here").is_none());
         assert!(parse_legacy_dir_name("justtext").is_none());
-    }
-
-    #[test]
-    fn test_parse_nuspec_id_version() {
-        let nuspec = r#"<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
-  <metadata>
-    <id>Newtonsoft.Json</id>
-    <version>13.0.3</version>
-    <authors>James Newton-King</authors>
-  </metadata>
-</package>"#;
-        assert_eq!(
-            parse_nuspec_id_version(nuspec),
-            Some(("Newtonsoft.Json".to_string(), "13.0.3".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_nuspec_empty() {
-        assert!(parse_nuspec_id_version("").is_none());
-        assert!(parse_nuspec_id_version("<metadata></metadata>").is_none());
-    }
-
-    #[test]
-    fn test_extract_xml_element() {
-        assert_eq!(
-            extract_xml_element("    <id>Newtonsoft.Json</id>", "id"),
-            Some("Newtonsoft.Json".to_string())
-        );
-        assert_eq!(
-            extract_xml_element("    <version>13.0.3</version>", "version"),
-            Some("13.0.3".to_string())
-        );
-        assert_eq!(extract_xml_element("<id></id>", "id"), None);
-        assert_eq!(extract_xml_element("no tags here", "id"), None);
     }
 
     #[tokio::test]
@@ -798,5 +668,18 @@ mod tests {
         let home = nuget_home();
         assert_eq!(home, PathBuf::from(custom));
         std::env::remove_var("NUGET_PACKAGES");
+    }
+
+    /// `".1.0.0"` — first match-index of `.` is `i=0` (followed by
+    /// `1`), `i+1 < dir_name.len()` is true, split_idx = Some(0).
+    /// The name slice ends up empty; the defensive guard at the
+    /// bottom of parse_legacy_dir_name rejects rather than producing
+    /// a `("", "1.0.0")` ghost package. (Hidden dirs are skipped
+    /// upstream in scan_package_dir, but the parser is also called
+    /// from find_by_purls without the hidden-dir filter, so the
+    /// guard is real defense-in-depth.)
+    #[test]
+    fn test_parse_legacy_dir_name_empty_name_guard() {
+        assert_eq!(parse_legacy_dir_name(".1.0.0"), None);
     }
 }

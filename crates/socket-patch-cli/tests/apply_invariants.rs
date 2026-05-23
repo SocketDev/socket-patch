@@ -75,9 +75,18 @@ fn write_project(root: &Path) {
 /// Recursive, stable hash of every regular file under `dir`. Combines
 /// each file's relative path and bytes into a single SHA-256 so any
 /// change — adding, removing, or rewriting a file — flips the digest.
+///
+/// Excludes `apply.lock` (advisory lock file created by `apply` /
+/// `rollback` / `repair` / `remove`). That file is deliberate
+/// ephemeral session state — not patch content — and persists by
+/// design so subsequent runs can re-flock the same inode without a
+/// create race. The "apply is read-only against .socket/" invariant
+/// is about the patch payload (manifest, blobs, diffs, packages),
+/// not session metadata.
 fn dir_hash(dir: &Path) -> String {
     let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     collect_files(dir, dir, &mut files);
+    files.retain(|(rel, _)| rel.file_name().and_then(|n| n.to_str()) != Some("apply.lock"));
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (rel, bytes) in files {
@@ -182,4 +191,37 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
         before, after,
         "apply must not mutate .socket/ on the no-match path; hash changed"
     );
+}
+
+/// Apply against a directory with NO `.socket/` folder at all
+/// emits a `status: "noManifest"` envelope in JSON mode and exits
+/// 0 (not an error — there's just nothing to do). Covers the
+/// early-return branch at the top of `commands::apply::run`.
+#[test]
+fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Note: NO .socket/ directory at all — completely fresh tree.
+    let (code, stdout) = run_apply(tmp.path(), &[]);
+    assert_eq!(code, 0, "no-manifest is not an error; stdout=\n{stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("envelope must be valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(v["status"], "noManifest");
+}
+
+/// Non-JSON / silent flag: same no-manifest case but in human
+/// (non-JSON) mode with `--silent` suppresses the friendly
+/// message. Exit still 0. Locks the silent-mode short-circuit.
+#[test]
+fn apply_with_no_socket_dir_silent_emits_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args(["apply", "--silent"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.trim().is_empty(), "silent must produce no stdout; got {stdout:?}");
 }

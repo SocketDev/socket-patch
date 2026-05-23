@@ -1,18 +1,6 @@
 /// Default path for the patch manifest file relative to the project root.
 pub const DEFAULT_PATCH_MANIFEST_PATH: &str = ".socket/manifest.json";
 
-/// Default folder for storing patched file blobs.
-pub const DEFAULT_BLOB_FOLDER: &str = ".socket/blob";
-
-/// Default folder for storing per-package patched archives (tar.gz).
-pub const DEFAULT_PACKAGES_FOLDER: &str = ".socket/packages";
-
-/// Default folder for storing per-file diff blobs (bsdiff format).
-pub const DEFAULT_DIFFS_FOLDER: &str = ".socket/diffs";
-
-/// Default Socket directory.
-pub const DEFAULT_SOCKET_DIR: &str = ".socket";
-
 /// Default public patch API URL for free patches (no auth required).
 pub const DEFAULT_PATCH_API_PROXY_URL: &str = "https://patches-api.socket.dev";
 

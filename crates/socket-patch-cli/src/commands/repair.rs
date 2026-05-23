@@ -10,8 +10,10 @@ use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
 };
 use std::path::Path;
+use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 #[derive(Args)]
@@ -61,8 +63,33 @@ pub async fn run(args: RepairArgs) -> i32 {
         return 1;
     }
 
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. See `apply_lock`.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let acquired = match acquire_or_emit(
+        socket_dir,
+        Command::Repair,
+        args.common.json,
+        args.common.silent,
+        args.common.dry_run,
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        args.common.break_lock,
+    ) {
+        Ok(acquired) => acquired,
+        Err(code) => return code,
+    };
+    let _lock = acquired.guard;
+    let lock_was_broken = acquired.broke_lock;
+
     match repair_inner(&args, &manifest_path).await {
-        Ok(env) => {
+        Ok(mut env) => {
+            if lock_was_broken {
+                // Audit trail for `--break-lock`. Event ordering is
+                // documented as best-effort; appending keeps the
+                // `Envelope::record` invariant intact (events + summary
+                // stay in sync).
+                env.record(lock_broken_event(socket_dir));
+            }
             if args.common.json {
                 println!("{}", env.to_pretty_json());
             }

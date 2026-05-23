@@ -233,6 +233,7 @@ async fn rollback_gem_restores_original_content() {
 // cargo
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cargo")]
 #[tokio::test]
 #[serial]
 async fn rollback_cargo_restores_original_content() {
@@ -282,6 +283,7 @@ version = "1.0.0"
 // golang
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn rollback_golang_restores_original_content() {
@@ -323,6 +325,7 @@ async fn rollback_golang_restores_original_content() {
 // maven
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn rollback_maven_restores_original_content() {
@@ -351,10 +354,13 @@ async fn rollback_maven_restores_original_content() {
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+    // Maven crawler is runtime-gated; opt in for the test.
+    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
     let mut args = default_rollback_args(tmp.path(), "maven");
     args.common.global = true;
     let _ = rollback_run(args).await;
     std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 
     assert_eq!(
         std::fs::read(version_dir.join("LICENSE.txt")).unwrap(),
@@ -366,6 +372,7 @@ async fn rollback_maven_restores_original_content() {
 // composer
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn rollback_composer_restores_original_content() {
@@ -412,6 +419,7 @@ async fn rollback_composer_restores_original_content() {
 // nuget
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn rollback_nuget_restores_original_content() {
@@ -440,10 +448,13 @@ async fn rollback_nuget_restores_original_content() {
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
     std::env::set_var("NUGET_PACKAGES", &packages);
+    // NuGet crawler is runtime-gated; opt in for the test.
+    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
     let mut args = default_rollback_args(tmp.path(), "nuget");
     args.common.global = true;
     let _ = rollback_run(args).await;
     std::env::remove_var("NUGET_PACKAGES");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 
     assert_eq!(
         std::fs::read(pkg_dir.join("LICENSE.md")).unwrap(),

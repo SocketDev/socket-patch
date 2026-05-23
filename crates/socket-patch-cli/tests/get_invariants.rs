@@ -337,6 +337,67 @@ async fn get_multiple_patches_in_json_mode_returns_selection_required() {
 // Paid patch path
 // ---------------------------------------------------------------------------
 
+/// UUID-by-UUID fetch via public proxy when the patch is paid:
+/// the binary recognises the identifier as a UUID, hits the
+/// `/patch/view/<uuid>` endpoint on the proxy, sees `tier: "paid"`
+/// in the response, and emits a `paid_required` JSON envelope.
+/// Covers the UUID-specific branch of the paid path in
+/// `commands::get::run`.
+#[tokio::test]
+async fn get_uuid_paid_patch_via_public_proxy_emits_paid_required_envelope() {
+    let mock = MockServer::start().await;
+
+    // Public-proxy view-by-UUID endpoint.
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": "pkg:npm/paid-by-uuid@1.0.0",
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "Paid patch fetched by UUID",
+            "license": "MIT",
+            "tier": "paid",
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = Command::new(binary())
+        .args([
+            "get",
+            UUID,
+            "--json",
+            "--save-only",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+        ])
+        .current_dir(tmp.path())
+        .env("SOCKET_PATCH_PROXY_URL", mock.uri())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("invalid JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr))
+    });
+    assert_eq!(
+        v["status"], "paid_required",
+        "UUID-fetched paid patch via public proxy must emit paid_required; got {v}"
+    );
+    assert_eq!(v["found"], 1);
+    assert_eq!(v["downloaded"], 0);
+    assert_eq!(v["applied"], 0);
+    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0]["uuid"], UUID);
+    assert_eq!(patches[0]["tier"], "paid");
+}
+
 #[tokio::test]
 async fn get_paid_patch_via_public_proxy_returns_paid_required() {
     // When using the public proxy (no api-token + no org), a paid patch

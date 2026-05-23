@@ -5,9 +5,11 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remove_failed};
 use std::path::Path;
+use std::time::Duration;
 
 use super::rollback::rollback_patches;
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status,
 };
@@ -55,6 +57,27 @@ pub async fn run(args: RemoveArgs) -> i32 {
         );
         return 1;
     }
+
+    // Serialize against concurrent socket-patch runs targeting the
+    // same `.socket/` directory. Note: `rollback_patches` (which
+    // `remove` calls into) does NOT acquire the lock — that would
+    // self-deadlock — so the outer remove invocation holds it for
+    // both the rollback and the manifest mutation.
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let acquired = match acquire_or_emit(
+        socket_dir,
+        Command::Remove,
+        args.common.json,
+        false, // remove has no --silent on its own; use false
+        false, // remove has no --dry-run
+        Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
+        args.common.break_lock,
+    ) {
+        Ok(acquired) => acquired,
+        Err(code) => return code,
+    };
+    let _lock = acquired.guard;
+    let lock_was_broken = acquired.broke_lock;
 
     // Read manifest to show what will be removed and confirm
     let manifest = match read_manifest(&manifest_path).await {
@@ -239,6 +262,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
             if args.common.json {
                 let mut env = Envelope::new(Command::Remove);
+                if lock_was_broken {
+                    env.record(lock_broken_event(socket_dir));
+                }
                 // One Removed event per purl whose manifest entry was deleted.
                 for purl in &removed {
                     env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));

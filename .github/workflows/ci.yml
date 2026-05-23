@@ -154,7 +154,7 @@ jobs:
         # separately, and coverage-merge stitches everything together.
         run: |
           cargo llvm-cov --workspace \
-            --features cargo,golang,maven,composer,nuget \
+            --features cargo,golang,maven,composer,nuget,deno \
             --no-report
           cargo llvm-cov report --lcov --output-path coverage-host.lcov
           cargo llvm-cov report --summary-only | tee coverage-summary.txt
@@ -206,7 +206,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -270,7 +270,7 @@ jobs:
         # cargo llvm-cov manages its own env in the test step).
         run: |
           eval "$(cargo llvm-cov show-env --export-prefix 2>/dev/null)"
-          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget
+          cargo build --bin socket-patch --features cargo,golang,maven,composer,nuget,deno
 
       - name: Configure docker-e2e coverage hooks
         run: |
@@ -282,7 +282,7 @@ jobs:
       - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
         run: |
           cargo llvm-cov \
-            --features docker-e2e,cargo,golang,maven,composer,nuget \
+            --features docker-e2e,cargo,golang,maven,composer,nuget,deno \
             --no-report \
             --test docker_e2e_${{ matrix.ecosystem }}
 
@@ -388,29 +388,54 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            suite: e2e_npm
-          - os: ubuntu-latest
-            suite: e2e_pypi
-          - os: ubuntu-latest
             suite: e2e_cargo
           - os: ubuntu-latest
             suite: e2e_golang
           - os: ubuntu-latest
             suite: e2e_maven
           - os: ubuntu-latest
-            suite: e2e_gem
-          - os: ubuntu-latest
             suite: e2e_composer
           - os: ubuntu-latest
             suite: e2e_nuget
-          - os: macos-latest
-            suite: e2e_npm
-          - os: macos-latest
-            suite: e2e_pypi
+          # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
+          # e2e_scan) are intentionally NOT in the PR matrix — their
+          # `#[ignore]`-gated tests hit the real public proxy at
+          # patches-api.socket.dev, which intermittently returns
+          # 503 "Service temporarily over capacity" outside this
+          # repo's control. Run on demand:
+          #
+          #   cargo test -p socket-patch-cli --test e2e_npm  -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_pypi -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_gem  -- --ignored
+          #   cargo test -p socket-patch-cli --test e2e_scan -- --ignored
+          #
+          # PR-time coverage for the same code paths comes from the
+          # `e2e-docker` matrix below, which runs the same flow
+          # against a hermetic wiremock fixture.
+          # Safety-hardening e2e suites. The fast non-ignored ones
+          # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
+          # standard `test` job above on all three platforms, so no
+          # matrix entry is needed for them. The two below need real
+          # toolchains and are #[ignore]-gated.
           - os: ubuntu-latest
-            suite: e2e_scan
+            suite: e2e_safety_cargo_build
           - os: macos-latest
-            suite: e2e_scan
+            suite: e2e_safety_cargo_build
+          - os: windows-latest
+            suite: e2e_safety_cargo_build
+          - os: ubuntu-latest
+            suite: e2e_safety_pnpm
+          - os: macos-latest
+            suite: e2e_safety_pnpm
+          # pnpm-on-Windows uses junctions for symlinks and copies
+          # (not hardlinks) by default, so the CoW invariant holds
+          # vacuously. Test still runs to verify apply doesn't error
+          # on Windows — semantic Windows nlink coverage is a
+          # follow-up (`std::fs::Metadata` doesn't expose nlink on
+          # Windows; needs `GetFileInformationByHandle` via
+          # `windows-sys`).
+          - os: windows-latest
+            suite: e2e_safety_pnpm
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -436,10 +461,19 @@ jobs:
           restore-keys: ${{ matrix.os }}-cargo-e2e-
 
       - name: Setup Node.js
-        if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan'
+        if: matrix.suite == 'e2e_npm' || matrix.suite == 'e2e_scan' || matrix.suite == 'e2e_safety_pnpm'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.20.2'
+
+      - name: Setup pnpm
+        if: matrix.suite == 'e2e_safety_pnpm'
+        # Pin the major version so the store layout the test
+        # asserts on stays stable. `npm install -g` is the simplest
+        # cross-platform install path (works on ubuntu, macos,
+        # windows-runners — they all ship a usable npm via
+        # actions/setup-node).
+        run: npm install -g pnpm@10
 
       - name: Setup Python
         if: matrix.suite == 'e2e_pypi'
@@ -483,7 +517,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget]
+        ecosystem: [npm, pypi, gem, cargo, golang, maven, composer, nuget, deno]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

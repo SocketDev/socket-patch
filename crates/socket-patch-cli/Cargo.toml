@@ -34,6 +34,7 @@ golang = ["socket-patch-core/golang"]
 maven = ["socket-patch-core/maven"]
 composer = ["socket-patch-core/composer"]
 nuget = ["socket-patch-core/nuget"]
+deno = ["socket-patch-core/deno"]
 # Enables the Docker-driven real-package e2e test suite under
 # `tests/docker_e2e_*.rs`. Tests in this suite require either a running
 # Docker daemon OR `SOCKET_PATCH_TEST_HOST=1` (host-toolchain mode).
@@ -49,3 +50,8 @@ base64 = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
+# Used by `tests/e2e_safety_lock.rs` to externally hold the same
+# `.socket/apply.lock` the binary takes, then spawn the binary and
+# assert the lock_held exit-code contract. Same crate the binary
+# uses internally (`socket-patch-core::patch::apply_lock`).
+fs2 = { workspace = true }

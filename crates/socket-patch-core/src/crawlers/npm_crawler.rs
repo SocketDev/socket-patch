@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
 
@@ -80,41 +79,53 @@ pub fn build_npm_purl(namespace: Option<&str>, name: &str, version: &str) -> Str
 // Global prefix detection helpers
 // ---------------------------------------------------------------------------
 
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
+
 /// Get the npm global `node_modules` path via `npm root -g`.
 pub fn get_npm_global_prefix() -> Result<String, String> {
-    let output = Command::new("npm")
-        .args(["root", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run `npm root -g`: {e}"))?;
+    get_npm_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return Err(
+/// Version of `get_npm_global_prefix` that accepts an injected
+/// `CommandRunner`. Tests use this with a `MockCommandRunner` to
+/// exercise the success arm (binary present, stdout parsed) without
+/// requiring npm on the host's PATH.
+pub fn get_npm_global_prefix_with(runner: &dyn CommandRunner) -> Result<String, String> {
+    parse_npm_root_output(runner.run("npm", &["root", "-g"]).as_deref().unwrap_or(""))
+        .ok_or_else(|| {
             "Failed to determine npm global prefix. Ensure npm is installed and in PATH."
-                .to_string(),
-        );
-    }
+                .to_string()
+        })
+}
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// Pure parser for `npm root -g` stdout. Returns the trimmed path or
+/// `None` on empty input. Extracted so the helper logic is unit-
+/// testable without shelling out.
+pub fn parse_npm_root_output(stdout: &str) -> Option<String> {
+    let path = stdout.trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Get the yarn global `node_modules` path via `yarn global dir`.
 pub fn get_yarn_global_prefix() -> Option<String> {
-    let output = Command::new("yarn")
-        .args(["global", "dir"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_yarn_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
+/// Version of `get_yarn_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_yarn_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_yarn_dir_output(runner.run("yarn", &["global", "dir"]).as_deref().unwrap_or(""))
+}
 
-    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `yarn global dir` stdout. Returns `<dir>/node_modules`
+/// or `None` on empty input. Extracted so the path-derivation logic is
+/// unit-testable without shelling out.
+pub fn parse_yarn_dir_output(stdout: &str) -> Option<String> {
+    let dir = stdout.trim().to_string();
     if dir.is_empty() {
         return None;
     }
@@ -123,19 +134,19 @@ pub fn get_yarn_global_prefix() -> Option<String> {
 
 /// Get the pnpm global `node_modules` path via `pnpm root -g`.
 pub fn get_pnpm_global_prefix() -> Option<String> {
-    let output = Command::new("pnpm")
-        .args(["root", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_pnpm_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
+/// Version of `get_pnpm_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_pnpm_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_pnpm_root_output(runner.run("pnpm", &["root", "-g"]).as_deref().unwrap_or(""))
+}
 
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `pnpm root -g` stdout. Returns the trimmed path or
+/// `None` on empty input.
+pub fn parse_pnpm_root_output(stdout: &str) -> Option<String> {
+    let path = stdout.trim().to_string();
     if path.is_empty() {
         return None;
     }
@@ -144,19 +155,24 @@ pub fn get_pnpm_global_prefix() -> Option<String> {
 
 /// Get the bun global `node_modules` path via `bun pm bin -g`.
 pub fn get_bun_global_prefix() -> Option<String> {
-    let output = Command::new("bun")
-        .args(["pm", "bin", "-g"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()?;
+    get_bun_global_prefix_with(&SystemCommandRunner)
+}
 
-    if !output.status.success() {
-        return None;
-    }
+/// Version of `get_bun_global_prefix` that accepts an injected
+/// `CommandRunner`. See `get_npm_global_prefix_with`.
+pub fn get_bun_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
+    parse_bun_bin_output(runner.run("bun", &["pm", "bin", "-g"]).as_deref().unwrap_or(""))
+}
 
-    let bin_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+/// Pure parser for `bun pm bin -g` stdout. Extracted so the
+/// derive-the-global-node_modules-path logic is unit-testable
+/// without shelling out.
+///
+/// Given output like `"/Users/foo/.bun/bin\n"` returns
+/// `Some("/Users/foo/.bun/install/global/node_modules")`. Returns
+/// `None` on empty input or a root-only path with no parent.
+pub fn parse_bun_bin_output(stdout: &str) -> Option<String> {
+    let bin_path = stdout.trim().to_string();
     if bin_path.is_empty() {
         return None;
     }
@@ -181,6 +197,13 @@ pub fn get_bun_global_prefix() -> Option<String> {
 ///
 /// Each segment is either a literal directory name or `"*"` which matches any
 /// directory entry. Symlinks are followed via `std::fs::metadata`.
+///
+/// Production callers live inside `#[cfg(target_os = "macos")]` blocks of
+/// `get_global_node_modules_paths` (Homebrew/nvm/volta/fnm fallbacks).
+/// `#[allow(dead_code)]` keeps the function visible to the inline
+/// `#[cfg(test)] mod tests` callers on every target without tripping
+/// `-D dead_code` on non-macOS clippy runs.
+#[allow(dead_code)]
 fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
     if !base.is_dir() {
         return Vec::new();
@@ -359,7 +382,8 @@ impl NpmCrawler {
         }
 
         // macOS-specific fallback paths
-        if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
             let home = std::env::var("HOME").unwrap_or_default();
 
             // Homebrew Apple Silicon
@@ -424,22 +448,10 @@ impl NpmCrawler {
         results: &'a mut Vec<PathBuf>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let mut entries = match tokio::fs::read_dir(dir).await {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+            for entry in crate::utils::fs::list_dir_entries(dir).await {
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
-
                 if !file_type.is_dir() {
                     continue;
                 }
@@ -481,17 +493,7 @@ impl NpmCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(node_modules_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
+        for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
 
@@ -500,9 +502,8 @@ impl NpmCrawler {
                 continue;
             }
 
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
             };
 
             // Allow both directories and symlinks (pnpm uses symlinks)
@@ -542,17 +543,7 @@ impl NpmCrawler {
         Box::pin(async move {
             let mut results = Vec::new();
 
-            let mut entries = match tokio::fs::read_dir(scope_path).await {
-                Ok(rd) => rd,
-                Err(_) => return results,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
+            for entry in crate::utils::fs::list_dir_entries(scope_path).await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
 
@@ -560,9 +551,8 @@ impl NpmCrawler {
                     continue;
                 }
 
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
 
                 if !file_type.is_dir() && !file_type.is_symlink() {
@@ -593,20 +583,9 @@ impl NpmCrawler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
         Box::pin(async move {
             let nested_nm = pkg_path.join("node_modules");
-
-            let mut entries = match tokio::fs::read_dir(&nested_nm).await {
-                Ok(rd) => rd,
-                Err(_) => return Vec::new(),
-            };
-
             let mut results = Vec::new();
 
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
+            for entry in crate::utils::fs::list_dir_entries(&nested_nm).await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
 
@@ -614,9 +593,8 @@ impl NpmCrawler {
                     continue;
                 }
 
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
 
                 if !file_type.is_dir() && !file_type.is_symlink() {

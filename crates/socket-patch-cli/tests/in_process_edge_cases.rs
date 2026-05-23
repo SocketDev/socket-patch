@@ -282,21 +282,23 @@ async fn apply_blob_after_hash_mismatch_reports_failure() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&claimed_after_hash), actual_blob_bytes).unwrap();
 
+    let pre = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
     let code = apply_run(default_apply(tmp.path())).await;
-    // Apply detects the mismatch (post-write hash != claimed afterHash)
-    // and reports a partial failure (exit 1). The file IS overwritten
-    // first then verified — that's how `apply_file_patch` is structured
-    // — so the contents reflect the bad blob bytes. Production users
-    // would see the partial_failure status and inspect.
+    // Apply detects the hash mismatch BEFORE any disk write (the
+    // in-memory hash of the candidate blob doesn't match the
+    // manifest's `afterHash`). The atomic-write rewrite of
+    // `apply_file_patch` means the target file stays byte-identical
+    // on the failure path — no half-written corruption.
     assert_eq!(code, 1, "afterHash mismatch must produce partial_failure");
     let post = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
-    // Post-state is the corrupted bytes (verify-after-write); the
-    // contract we care about is the partial_failure exit, not file
-    // preservation. Document this for the test reader.
     assert_eq!(
-        post, actual_blob_bytes,
-        "post-write verify rejects but bytes are already on disk; this is current behavior"
+        post, pre,
+        "atomic-write contract: hash-mismatch failure must leave the on-disk file byte-identical (no half-written corruption)"
     );
+    // `actual_blob_bytes` is what would have been written by the
+    // broken pre-rebase behavior. Document the contract by negation
+    // — the test reader sees what the OLD behavior was.
+    let _ = actual_blob_bytes;
 }
 
 // ---------------------------------------------------------------------------

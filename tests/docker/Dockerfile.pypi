@@ -1,8 +1,14 @@
-# pypi ecosystem test image: base + Python 3.11 + pip + venv.
+# pypi ecosystem test image: base + Python 3.11 + pip + venv + uv.
 #
 # Debian 12 ships Python 3.11. We use a venv inside each test to keep
 # pip from needing `--break-system-packages` and to match real-world
 # user flow.
+#
+# uv is installed from PyPI (single self-contained wheel) so the same
+# image can drive both the pip-based and uv-based e2e tests. The
+# `--break-system-packages` flag is what Debian-packaged pip3 requires
+# to install into the system site-packages; it's safe inside the
+# disposable test container.
 FROM socket-patch-test-base:latest
 
 RUN apt-get update \
@@ -11,5 +17,7 @@ RUN apt-get update \
       python3-pip \
       python3-venv \
  && rm -rf /var/lib/apt/lists/* \
+ && pip3 install --break-system-packages --no-cache-dir uv \
  && python3 --version \
- && pip3 --version
+ && pip3 --version \
+ && uv --version
