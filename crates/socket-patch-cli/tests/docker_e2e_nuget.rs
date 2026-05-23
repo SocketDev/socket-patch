@@ -238,6 +238,15 @@ fn run_container(script: &str) -> std::process::Output {
         "--rm",
         "--add-host=host.docker.internal:host-gateway",
         "-i",
+        // NuGet crawler is gated by `SOCKET_EXPERIMENTAL_NUGET=1` at
+        // runtime (see ecosystem_dispatch::nuget_runtime_enabled).
+        // Signed .nupkg packages carry a `.nupkg.sha512` tamper-marker
+        // the sidecar can't honestly rewrite without the original
+        // `.nupkg` bytes; the gate makes operators opt in to that
+        // tradeoff. Tests opt in explicitly so docker actually
+        // exercises the nuget scan / apply path.
+        "-e",
+        "SOCKET_EXPERIMENTAL_NUGET=1",
     ])
     .args(cov_docker_args())
     .args(["socket-patch-test-nuget:latest", "bash", "-c", script]);

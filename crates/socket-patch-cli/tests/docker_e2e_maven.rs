@@ -207,6 +207,14 @@ async fn maven_install_full_apply_chain() {
         "--rm",
         "--add-host=host.docker.internal:host-gateway",
         "-i",
+        // Maven crawler is gated by `SOCKET_EXPERIMENTAL_MAVEN=1` at
+        // runtime (see ecosystem_dispatch::maven_runtime_enabled).
+        // The gate exists because Maven apply corrupts jar sidecar
+        // checksums — operators have to opt in. Tests opt in
+        // explicitly so the docker run actually exercises the
+        // maven scan / apply path.
+        "-e",
+        "SOCKET_EXPERIMENTAL_MAVEN=1",
     ])
     .args(cov_docker_args())
     .args([
