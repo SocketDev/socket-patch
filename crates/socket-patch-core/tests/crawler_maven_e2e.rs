@@ -205,6 +205,74 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
     );
 }
 
+/// `get_maven_repo_paths(global=true)` with a real m2 layout under
+/// MAVEN_REPO_LOCAL returns just that repo (lines 205-208).
+#[tokio::test]
+#[serial]
+async fn get_maven_repo_paths_global_mode_with_maven_repo_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("custom-m2");
+    tokio::fs::create_dir_all(&repo).await.unwrap();
+
+    let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
+    std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+
+    let crawler = MavenCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_maven_repo_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev {
+        std::env::set_var("MAVEN_REPO_LOCAL", v);
+    } else {
+        std::env::remove_var("MAVEN_REPO_LOCAL");
+    }
+
+    assert_eq!(paths, vec![repo]);
+}
+
+/// `get_maven_repo_paths(global=true)` with no env vars set and no
+/// HOME/.m2 either — `is_dir` check fails and the crawler returns
+/// empty (line 209).
+#[tokio::test]
+#[serial]
+async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
+    let prev_m2 = std::env::var("M2_HOME").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("M2_HOME");
+    std::env::set_var("HOME", tmp.path()); // No .m2/ inside
+
+    let crawler = MavenCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_maven_repo_paths(&opts).await.unwrap();
+
+    if let Some(v) = prev_local {
+        std::env::set_var("MAVEN_REPO_LOCAL", v);
+    }
+    if let Some(v) = prev_m2 {
+        std::env::set_var("M2_HOME", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(paths.is_empty(), "no m2 anywhere must yield empty; got {paths:?}");
+}
+
 /// `find_by_purls` for a version directory that contains a non-`.pom`
 /// file but no `.pom` — exercise the `has_pom_file` return-false arm
 /// (line 405) via verify_maven_at_path.

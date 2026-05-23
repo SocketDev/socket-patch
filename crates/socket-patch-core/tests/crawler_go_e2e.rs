@@ -270,6 +270,44 @@ async fn crawl_all_skips_cache_metadata_dir() {
     assert!(result.is_empty(), "cache/ subtree must be skipped; got {result:?}");
 }
 
+/// With GOMODCACHE and GOPATH both unset, `get_gomodcache` falls
+/// through to `$HOME/go/pkg/mod` (lines 194-197).
+#[tokio::test]
+#[serial]
+async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::write(tmp.path().join("go.mod"), b"module example.com/test\n\ngo 1.21\n")
+        .await
+        .unwrap();
+    let prev_gomod = std::env::var("GOMODCACHE").ok();
+    let prev_gopath = std::env::var("GOPATH").ok();
+    let prev_home = std::env::var("HOME").ok();
+    std::env::remove_var("GOMODCACHE");
+    std::env::remove_var("GOPATH");
+    std::env::set_var("HOME", tmp.path());
+
+    let crawler = GoCrawler;
+    let paths = crawler.get_module_cache_paths(&options_at(tmp.path())).await.unwrap();
+
+    if let Some(v) = prev_gomod {
+        std::env::set_var("GOMODCACHE", v);
+    }
+    if let Some(v) = prev_gopath {
+        std::env::set_var("GOPATH", v);
+    }
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    let expected = tmp.path().join("go").join("pkg").join("mod");
+    assert!(
+        paths.iter().any(|p| p == &expected),
+        "HOME/go/pkg/mod fallback must work; got {paths:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn get_module_cache_paths_gopath_fallback_when_gomodcache_unset() {
