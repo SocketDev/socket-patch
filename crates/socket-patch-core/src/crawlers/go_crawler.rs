@@ -223,22 +223,8 @@ impl GoCrawler {
         results: &'a mut Vec<CrawledPackage>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let mut entries = match tokio::fs::read_dir(current_path).await {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
+            for entry in crate::utils::fs::list_dir_entries(current_path).await {
+                if !crate::utils::fs::entry_is_dir(&entry).await {
                     continue;
                 }
 

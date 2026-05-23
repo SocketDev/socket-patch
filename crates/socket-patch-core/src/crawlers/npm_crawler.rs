@@ -446,22 +446,10 @@ impl NpmCrawler {
         results: &'a mut Vec<PathBuf>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let mut entries = match tokio::fs::read_dir(dir).await {
-                Ok(rd) => rd,
-                Err(_) => return,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+            for entry in crate::utils::fs::list_dir_entries(dir).await {
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
-
                 if !file_type.is_dir() {
                     continue;
                 }
@@ -503,17 +491,7 @@ impl NpmCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(node_modules_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
+        for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
 
@@ -522,9 +500,8 @@ impl NpmCrawler {
                 continue;
             }
 
-            let file_type = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
+            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                continue;
             };
 
             // Allow both directories and symlinks (pnpm uses symlinks)
@@ -564,17 +541,7 @@ impl NpmCrawler {
         Box::pin(async move {
             let mut results = Vec::new();
 
-            let mut entries = match tokio::fs::read_dir(scope_path).await {
-                Ok(rd) => rd,
-                Err(_) => return results,
-            };
-
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
+            for entry in crate::utils::fs::list_dir_entries(scope_path).await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
 
@@ -582,9 +549,8 @@ impl NpmCrawler {
                     continue;
                 }
 
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
 
                 if !file_type.is_dir() && !file_type.is_symlink() {
@@ -615,20 +581,9 @@ impl NpmCrawler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
         Box::pin(async move {
             let nested_nm = pkg_path.join("node_modules");
-
-            let mut entries = match tokio::fs::read_dir(&nested_nm).await {
-                Ok(rd) => rd,
-                Err(_) => return Vec::new(),
-            };
-
             let mut results = Vec::new();
 
-            let mut entry_list = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                entry_list.push(entry);
-            }
-
-            for entry in entry_list {
+            for entry in crate::utils::fs::list_dir_entries(&nested_nm).await {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy().to_string();
 
@@ -636,9 +591,8 @@ impl NpmCrawler {
                     continue;
                 }
 
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
                 };
 
                 if !file_type.is_dir() && !file_type.is_symlink() {

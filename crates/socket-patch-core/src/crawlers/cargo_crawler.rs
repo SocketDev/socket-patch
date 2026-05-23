@@ -219,22 +219,11 @@ impl CargoCrawler {
         let registry_src = cargo_home.join("registry").join("src");
 
         let mut paths = Vec::new();
-
-        let mut entries = match tokio::fs::read_dir(&registry_src).await {
-            Ok(rd) => rd,
-            Err(_) => return paths,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(&registry_src).await {
+            if crate::utils::fs::entry_is_dir(&entry).await {
                 paths.push(registry_src.join(entry.file_name()));
             }
         }
-
         paths
     }
 
@@ -247,22 +236,8 @@ impl CargoCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(src_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(src_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
 

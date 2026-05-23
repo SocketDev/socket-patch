@@ -164,22 +164,8 @@ impl NuGetCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(pkg_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
 
@@ -231,20 +217,11 @@ impl NuGetCrawler {
         name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<Vec<CrawledPackage>> {
-        let mut version_entries = match tokio::fs::read_dir(name_dir).await {
-            Ok(rd) => rd,
-            Err(_) => return None,
-        };
-
         let mut found_any = false;
         let mut results = Vec::new();
 
-        while let Ok(Some(ver_entry)) = version_entries.next_entry().await {
-            let ft = match ver_entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for ver_entry in crate::utils::fs::list_dir_entries(name_dir).await {
+            if !crate::utils::fs::entry_is_dir(&ver_entry).await {
                 continue;
             }
 
@@ -300,8 +277,7 @@ impl NuGetCrawler {
     ) -> Option<PathBuf> {
         let target = format!("{}.{}", name.to_lowercase(), version.to_lowercase());
 
-        let mut entries = tokio::fs::read_dir(pkg_path).await.ok()?;
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
             if dir_name_str.to_lowercase() == target {
@@ -340,12 +316,7 @@ fn nuget_home() -> PathBuf {
 async fn is_dotnet_project(cwd: &Path) -> bool {
     let extensions = [".csproj", ".fsproj", ".vbproj", ".sln"];
 
-    let mut entries = match tokio::fs::read_dir(cwd).await {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in crate::utils::fs::list_dir_entries(cwd).await {
         if let Some(name) = entry.file_name().to_str() {
             for ext in &extensions {
                 if name.ends_with(ext) {
@@ -357,7 +328,6 @@ async fn is_dotnet_project(cwd: &Path) -> bool {
             }
         }
     }
-
     false
 }
 
@@ -385,8 +355,7 @@ fn parse_legacy_dir_name(dir_name: &str) -> Option<(String, String)> {
 
 /// Find a `.nuspec` file in a directory.
 async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
-    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in crate::utils::fs::list_dir_entries(dir).await {
         if let Some(name) = entry.file_name().to_str() {
             if name.ends_with(".nuspec") {
                 return Some(dir.join(name));
@@ -409,17 +378,8 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
     }
 
     // Also check subdirectories one level deep for multi-project solutions
-    let mut entries = match tokio::fs::read_dir(cwd).await {
-        Ok(rd) => rd,
-        Err(_) => return paths,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
+    for entry in crate::utils::fs::list_dir_entries(cwd).await {
+        if !crate::utils::fs::entry_is_dir(&entry).await {
             continue;
         }
         let sub_assets = cwd.join(entry.file_name()).join("obj").join("project.assets.json");
@@ -429,7 +389,6 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
-
     paths
 }
 

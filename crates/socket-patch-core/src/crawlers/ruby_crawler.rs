@@ -123,24 +123,15 @@ impl RubyCrawler {
         let vendor_ruby = cwd.join("vendor").join("bundle").join("ruby");
         let mut paths = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(&vendor_ruby).await {
-            Ok(rd) => rd,
-            Err(_) => return paths,
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                let gems_dir = vendor_ruby.join(entry.file_name()).join("gems");
-                if is_dir(&gems_dir).await {
-                    paths.push(gems_dir);
-                }
+        for entry in crate::utils::fs::list_dir_entries(&vendor_ruby).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
+                continue;
+            }
+            let gems_dir = vendor_ruby.join(entry.file_name()).join("gems");
+            if is_dir(&gems_dir).await {
+                paths.push(gems_dir);
             }
         }
-
         paths
     }
 
@@ -184,34 +175,26 @@ impl RubyCrawler {
         ];
 
         for base in &fallback_globs {
-            if let Ok(mut entries) = tokio::fs::read_dir(base).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let ft = match entry.file_type().await {
-                        Ok(ft) => ft,
-                        Err(_) => continue,
-                    };
-                    if !ft.is_dir() {
-                        continue;
-                    }
+            for entry in crate::utils::fs::list_dir_entries(base).await {
+                if !crate::utils::fs::entry_is_dir(&entry).await {
+                    continue;
+                }
 
-                    let entry_path = base.join(entry.file_name());
+                let entry_path = base.join(entry.file_name());
 
-                    // ~/.gem/ruby/*/gems/
-                    let gems_dir = entry_path.join("gems");
+                // ~/.gem/ruby/*/gems/
+                let gems_dir = entry_path.join("gems");
+                if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
+                    paths.push(gems_dir);
+                    continue;
+                }
+
+                // ~/.rbenv/versions/*/lib/ruby/gems/*/gems/
+                let lib_ruby_gems = entry_path.join("lib").join("ruby").join("gems");
+                for sub_entry in crate::utils::fs::list_dir_entries(&lib_ruby_gems).await {
+                    let gems_dir = lib_ruby_gems.join(sub_entry.file_name()).join("gems");
                     if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
                         paths.push(gems_dir);
-                        continue;
-                    }
-
-                    // ~/.rbenv/versions/*/lib/ruby/gems/*/gems/
-                    let lib_ruby_gems = entry_path.join("lib").join("ruby").join("gems");
-                    if let Ok(mut sub_entries) = tokio::fs::read_dir(&lib_ruby_gems).await {
-                        while let Ok(Some(sub_entry)) = sub_entries.next_entry().await {
-                            let gems_dir = lib_ruby_gems.join(sub_entry.file_name()).join("gems");
-                            if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
-                                paths.push(gems_dir);
-                            }
-                        }
                     }
                 }
             }
@@ -225,12 +208,10 @@ impl RubyCrawler {
         ];
 
         for base in &system_bases {
-            if let Ok(mut entries) = tokio::fs::read_dir(base).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let gems_dir = base.join(entry.file_name()).join("gems");
-                    if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
-                        paths.push(gems_dir);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(base).await {
+                let gems_dir = base.join(entry.file_name()).join("gems");
+                if is_dir(&gems_dir).await && seen.insert(gems_dir.clone()) {
+                    paths.push(gems_dir);
                 }
             }
         }
@@ -265,22 +246,8 @@ impl RubyCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let mut entries = match tokio::fs::read_dir(gem_path).await {
-            Ok(rd) => rd,
-            Err(_) => return results,
-        };
-
-        let mut entry_list = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            entry_list.push(entry);
-        }
-
-        for entry in entry_list {
-            let ft = match entry.file_type().await {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !ft.is_dir() {
+        for entry in crate::utils::fs::list_dir_entries(gem_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
 
@@ -334,12 +301,10 @@ impl RubyCrawler {
         }
 
         // Check for any .gemspec file
-        if let Ok(mut entries) = tokio::fs::read_dir(path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".gemspec") {
-                        return true;
-                    }
+        for entry in crate::utils::fs::list_dir_entries(path).await {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".gemspec") {
+                    return true;
                 }
             }
         }

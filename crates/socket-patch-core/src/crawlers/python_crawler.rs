@@ -118,38 +118,13 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
 
     if first == "python3.*" {
         // Wildcard: list directory and match python3.X entries
-        if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("python3.") {
-                    let sub = Box::pin(find_python_dirs(
-                        &base_path.join(entry.file_name()),
-                        rest,
-                    ))
-                    .await;
-                    results.extend(sub);
-                }
+        for entry in crate::utils::fs::list_dir_entries(base_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
+                continue;
             }
-        }
-    } else if first == "*" {
-        // Generic wildcard: match any directory entry
-        if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let ft = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("python3.") {
                 let sub = Box::pin(find_python_dirs(
                     &base_path.join(entry.file_name()),
                     rest,
@@ -157,6 +132,19 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
                 .await;
                 results.extend(sub);
             }
+        }
+    } else if first == "*" {
+        // Generic wildcard: match any directory entry
+        for entry in crate::utils::fs::list_dir_entries(base_path).await {
+            if !crate::utils::fs::entry_is_dir(&entry).await {
+                continue;
+            }
+            let sub = Box::pin(find_python_dirs(
+                &base_path.join(entry.file_name()),
+                rest,
+            ))
+            .await;
+            results.extend(sub);
         }
     } else {
         // Literal segment: just check if it exists
@@ -348,41 +336,35 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         // pip --user on Windows: %APPDATA%\Python\PythonXY\site-packages
         if let Ok(appdata) = std::env::var("APPDATA") {
             let appdata_python = PathBuf::from(&appdata).join("Python");
-            if let Ok(mut entries) = tokio::fs::read_dir(&appdata_python).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let p = appdata_python.join(entry.file_name()).join("site-packages");
-                    if tokio::fs::metadata(&p).await.is_ok() {
-                        add_path(p, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(&appdata_python).await {
+                let p = appdata_python.join(entry.file_name()).join("site-packages");
+                if tokio::fs::metadata(&p).await.is_ok() {
+                    add_path(p, &mut seen, &mut results);
                 }
             }
         }
         // Common Windows Python install locations
         for base in &["C:\\Python", "C:\\Program Files\\Python"] {
-            if let Ok(mut entries) = tokio::fs::read_dir(base).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let sp = PathBuf::from(base)
-                        .join(entry.file_name())
-                        .join("Lib")
-                        .join("site-packages");
-                    if tokio::fs::metadata(&sp).await.is_ok() {
-                        add_path(sp, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(Path::new(base)).await {
+                let sp = PathBuf::from(base)
+                    .join(entry.file_name())
+                    .join("Lib")
+                    .join("site-packages");
+                if tokio::fs::metadata(&sp).await.is_ok() {
+                    add_path(sp, &mut seen, &mut results);
                 }
             }
         }
         // Microsoft Store / python.org via LocalAppData
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let programs_python = PathBuf::from(&local).join("Programs").join("Python");
-            if let Ok(mut entries) = tokio::fs::read_dir(&programs_python).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let sp = programs_python
-                        .join(entry.file_name())
-                        .join("Lib")
-                        .join("site-packages");
-                    if tokio::fs::metadata(&sp).await.is_ok() {
-                        add_path(sp, &mut seen, &mut results);
-                    }
+            for entry in crate::utils::fs::list_dir_entries(&programs_python).await {
+                let sp = programs_python
+                    .join(entry.file_name())
+                    .join("Lib")
+                    .join("site-packages");
+                if tokio::fs::metadata(&sp).await.is_ok() {
+                    add_path(sp, &mut seen, &mut results);
                 }
             }
         }
@@ -518,19 +500,7 @@ impl PythonCrawler {
         }
 
         // Scan all .dist-info dirs
-        let entries = match tokio::fs::read_dir(site_packages_path).await {
-            Ok(rd) => {
-                let mut entries = rd;
-                let mut v = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    v.push(entry);
-                }
-                v
-            }
-            Err(_) => return Ok(result),
-        };
-
-        for entry in entries {
+        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if !name_str.ends_with(".dist-info") {
@@ -572,19 +542,7 @@ impl PythonCrawler {
     ) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
-        let entries = match tokio::fs::read_dir(site_packages_path).await {
-            Ok(rd) => {
-                let mut entries = rd;
-                let mut v = Vec::new();
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    v.push(entry);
-                }
-                v
-            }
-            Err(_) => return results,
-        };
-
-        for entry in entries {
+        for entry in crate::utils::fs::list_dir_entries(site_packages_path).await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if !name_str.ends_with(".dist-info") {
