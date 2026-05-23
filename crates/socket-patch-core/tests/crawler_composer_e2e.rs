@@ -275,11 +275,17 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
     let dot_composer = tmp.path().join(".composer");
     let vendor = dot_composer.join("vendor");
     tokio::fs::create_dir_all(&vendor).await.unwrap();
+    // Stub PATH to a binary-free tempdir so `composer global config
+    // home` can't short-circuit the HOME-based fallback on CI runners
+    // where composer is installed.
+    let empty_path = tempfile::tempdir().unwrap();
 
     let prev_composer = std::env::var("COMPOSER_HOME").ok();
     let prev_home = std::env::var("HOME").ok();
+    let prev_path = std::env::var("PATH").ok();
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", tmp.path());
+    std::env::set_var("PATH", empty_path.path());
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -297,6 +303,11 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
         std::env::set_var("HOME", v);
     } else {
         std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
     }
 
     assert!(
@@ -307,6 +318,11 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
 
 /// HOME with `.config/composer/` but no `.composer/` exercises the
 /// second candidate in the platform-default list.
+///
+/// PATH is stubbed to a binary-free tempdir so `composer global
+/// config home` can't short-circuit the fallback chain — on CI
+/// runners that have composer installed, the shell-out would
+/// otherwise return a real home outside our test tempdir.
 #[tokio::test]
 #[serial_test::serial]
 async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
@@ -314,11 +330,14 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
     let xdg = tmp.path().join(".config").join("composer");
     let vendor = xdg.join("vendor");
     tokio::fs::create_dir_all(&vendor).await.unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
 
     let prev_composer = std::env::var("COMPOSER_HOME").ok();
     let prev_home = std::env::var("HOME").ok();
+    let prev_path = std::env::var("PATH").ok();
     std::env::remove_var("COMPOSER_HOME");
     std::env::set_var("HOME", tmp.path());
+    std::env::set_var("PATH", empty_path.path());
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -336,6 +355,11 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
         std::env::set_var("HOME", v);
     } else {
         std::env::remove_var("HOME");
+    }
+    if let Some(v) = prev_path {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
     }
 
     assert!(

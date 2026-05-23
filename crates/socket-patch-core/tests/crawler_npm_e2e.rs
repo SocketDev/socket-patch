@@ -193,6 +193,14 @@ async fn get_node_modules_paths_global_mode_no_prefix() {
 /// Bun's global node_modules lives at `<bun-root>/install/global/node_modules`
 /// — the parser strips the trailing `bin` segment and joins the well-known
 /// suffix.
+///
+/// Skipped on Windows: `PathBuf::join` uses `\` there, which produces
+/// `/home/foo/.bun\install\global\node_modules` from Unix-style input.
+/// The pure-parser semantics are still correct (parent stripping +
+/// suffix join), just expressed in the host's path-separator. Real
+/// bun installs on Windows would feed Windows-style paths into the
+/// same parser.
+#[cfg(unix)]
 #[test]
 fn parse_bun_bin_output_well_formed_unix() {
     let parsed = parse_bun_bin_output("/home/foo/.bun/bin\n");
@@ -290,6 +298,9 @@ fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
     assert!(get_npm_global_prefix_with(&runner).is_err());
 }
 
+// Skipped on Windows: same path-separator reason as
+// `parse_bun_bin_output_well_formed_unix` above.
+#[cfg(unix)]
 #[test]
 fn get_yarn_global_prefix_with_mock_runner_success() {
     let runner =
@@ -313,6 +324,9 @@ fn get_pnpm_global_prefix_with_mock_runner_success() {
     );
 }
 
+// Skipped on Windows: same path-separator reason as
+// `parse_bun_bin_output_well_formed_unix` above.
+#[cfg(unix)]
 #[test]
 fn get_bun_global_prefix_with_mock_runner_success() {
     let runner = common::MockCommandRunner::new().with_response(
@@ -345,6 +359,10 @@ fn parse_npm_root_output_empty_returns_none() {
 // ── parse_yarn_dir_output ──────────────────────────────────────
 
 /// yarn global dir prints `<dir>`; we append `/node_modules`.
+///
+/// Skipped on Windows: same path-separator reason as the other
+/// `_unix`-style tests above.
+#[cfg(unix)]
 #[test]
 fn parse_yarn_dir_output_appends_node_modules() {
     let parsed = parse_yarn_dir_output("/Users/foo/.yarn/global\n");
