@@ -177,6 +177,19 @@ impl Default for ComposerCrawler {
     }
 }
 
+/// Pure parser for `composer global config home` stdout. Returns
+/// the trimmed path as a `PathBuf` or `None` on empty input.
+/// Extracted so the path-derivation logic is unit-testable without
+/// the composer CLI installed.
+pub fn parse_composer_home_output(stdout: &str) -> Option<PathBuf> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 /// Get the Composer home directory.
 ///
 /// Checks `$COMPOSER_HOME`, then runs `composer global config home`,
@@ -196,9 +209,8 @@ async fn get_composer_home() -> Option<PathBuf> {
         .output()
     {
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                let path = PathBuf::from(&stdout);
+            if let Some(path) = parse_composer_home_output(&String::from_utf8_lossy(&output.stdout))
+            {
                 if is_dir(&path).await {
                     return Some(path);
                 }

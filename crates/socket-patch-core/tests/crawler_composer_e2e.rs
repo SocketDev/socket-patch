@@ -7,8 +7,21 @@
 
 use std::path::Path;
 
+use socket_patch_core::crawlers::composer_crawler::parse_composer_home_output;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::ComposerCrawler;
+
+#[test]
+fn parse_composer_home_output_well_formed() {
+    let p = parse_composer_home_output("/Users/foo/.composer\n").unwrap();
+    assert_eq!(p, std::path::PathBuf::from("/Users/foo/.composer"));
+}
+
+#[test]
+fn parse_composer_home_output_empty_returns_none() {
+    assert_eq!(parse_composer_home_output(""), None);
+    assert_eq!(parse_composer_home_output("   \n  "), None);
+}
 
 const ORG_PURL: &str = "pkg:composer/monolog/monolog@3.5.0";
 
