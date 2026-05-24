@@ -74,9 +74,8 @@ jobs:
         # validates the output with vexctl when it's on PATH. vexctl is
         # a Go binary distributed via `go install`. Setting up Go here
         # is the cheapest way to give every test job a usable vexctl.
-        # TODO(pin): replace the floating @v5 tag with the SHA used
-        # elsewhere in this workflow once the maintainer audits it.
-        uses: actions/setup-go@v5
+        # SHA pin resolved from `gh api repos/actions/setup-go/git/refs/tags/v6.4.0`.
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version: '1.22'
           cache: false
