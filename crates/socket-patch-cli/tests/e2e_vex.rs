@@ -564,10 +564,12 @@ fn verify_mode_all_failed_exits_non_zero() {
 /// vexctl before the test step so the validation actually runs there;
 /// local devs without Go see a skip message instead of a failure.
 ///
-/// `vexctl list <file>` loads the document and prints its statements —
-/// it exits non-zero when the JSON fails to parse as an OpenVEX doc,
-/// which makes it the canonical schema gate at v0.3.x (vexctl does
-/// not yet expose a dedicated `validate` subcommand).
+/// `vexctl merge --files=<path>` loads, parses, and re-emits the
+/// document. vexctl does not yet expose a dedicated `validate`
+/// subcommand at v0.3.x, but a successful merge of a single file is
+/// the canonical proof that the input parses cleanly against the
+/// OpenVEX schema (`list` requires a selector argument, `filter`
+/// requires a query expression — merge is the only no-arg parse gate).
 fn maybe_validate_with_vexctl(vex_text: &str) {
     let Some(vexctl) = find_vexctl_on_path() else {
         eprintln!("(skipping vexctl validation — binary not on PATH)");
@@ -577,7 +579,7 @@ fn maybe_validate_with_vexctl(vex_text: &str) {
     std::fs::write(tmp.path(), vex_text).unwrap();
 
     let out = Command::new(&vexctl)
-        .args(["list", tmp.path().to_str().unwrap()])
+        .args(["merge", "--files", tmp.path().to_str().unwrap()])
         .output()
         .expect("spawn vexctl");
     assert!(
@@ -586,6 +588,9 @@ fn maybe_validate_with_vexctl(vex_text: &str) {
         String::from_utf8_lossy(&out.stderr),
         String::from_utf8_lossy(&out.stdout)
     );
+    // Sanity: the merge output must itself be valid OpenVEX JSON.
+    let _: Value = serde_json::from_slice(&out.stdout)
+        .expect("vexctl merge output must be valid JSON");
 }
 
 /// Stdlib-only `PATH` lookup for `vexctl`. Returns `None` if missing.
