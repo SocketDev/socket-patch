@@ -324,6 +324,7 @@ pub enum Command {
     Repair,
     Setup,
     Unlock,
+    Vex,
 }
 
 

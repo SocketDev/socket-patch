@@ -68,6 +68,10 @@ pub enum Commands {
     /// when free, 1 when held. Pass `--release` to also delete the
     /// lock file when it is free.
     Unlock(commands::unlock::UnlockArgs),
+
+    /// Generate an OpenVEX 0.2.0 attestation describing the
+    /// vulnerabilities mitigated by the applied patches.
+    Vex(commands::vex::VexArgs),
 }
 
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).

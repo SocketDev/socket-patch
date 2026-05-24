@@ -16,6 +16,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
 | `setup` | — | Configure package.json postinstall scripts |
 | `repair` | `gc` | Download missing blobs + clean up unused ones |
+| `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive). See [`src/lib.rs::looks_like_uuid`](src/lib.rs).
 
@@ -58,6 +59,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
 | `remove` | positional `identifier`; `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Manifest entry removal |
 | `rollback` | optional positional `identifier`; `--one-off` | `SOCKET_ONE_OFF` | Rollback target |
+| `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
 | `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`) |
 | `setup` | (none beyond globals) | — | — |
 
@@ -323,6 +325,27 @@ Exit `1` when `status` is `partialFailure` (any `events[*].action == "failed"`) 
 | `1` | Error (missing/invalid manifest, fetch failed, apply failed, selection cancelled in non-JSON mode, etc.) |
 
 `list` returns **`0`** for an empty manifest and **`1`** for a missing manifest — these are distinct and load-bearing.
+
+`vex` exit codes are tri-state:
+
+| Code | Meaning |
+|---|---|
+| `0` | A non-empty OpenVEX document was produced |
+| `1` | No applicable patches (empty manifest, or every patch failed verification with `--verify`) |
+| `2` | Hard error before document generation (manifest unreadable, `--json` without `--output`, product auto-detect failed, write error) |
+
+### vex output channels
+
+The VEX document is JSON-LD, which collides with the standard `--json` envelope on stdout. The shape is:
+
+| `--output` | `--json` | VEX → | Envelope → |
+|---|---|---|---|
+| unset | unset | stdout | stderr (one-line summary) |
+| set to `<path>` | unset | `<path>` | stdout (one-line summary) |
+| set to `<path>` | set | `<path>` | stdout (full envelope, with one `verified` event per emitted subcomponent) |
+| unset | set | (error: `json_requires_output`, exit `2`) | stdout (envelope-only) |
+
+When verification is enabled (the default) and a patch is omitted, the failed PURLs are surfaced on stderr in plain mode or as `skipped` events on the envelope in JSON mode. Status becomes `partialFailure` when at least one patch was omitted but at least one was emitted.
 
 ## Semver policy
 

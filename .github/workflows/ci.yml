@@ -69,6 +69,27 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-features
 
+      - name: Install Go (for vexctl)
+        # The `vex` subcommand emits OpenVEX documents; tests/e2e_vex.rs
+        # validates the output with vexctl when it's on PATH. vexctl is
+        # a Go binary distributed via `go install`. Setting up Go here
+        # is the cheapest way to give every test job a usable vexctl.
+        # TODO(pin): replace the floating @v5 tag with the SHA used
+        # elsewhere in this workflow once the maintainer audits it.
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Install vexctl
+        # `go install` puts the binary in $(go env GOPATH)/bin; surface
+        # that path to subsequent steps so `Command::new("vexctl")` in
+        # the test resolves. Pinned to a tagged release rather than
+        # @latest for reproducibility.
+        run: |
+          go install github.com/openvex/vexctl@v0.3.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Run tests
         run: cargo test --workspace --all-features
 

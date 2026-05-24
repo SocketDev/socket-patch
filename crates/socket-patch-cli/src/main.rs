@@ -24,6 +24,7 @@ async fn main() {
         Commands::Setup(args) => commands::setup::run(args).await,
         Commands::Repair(args) => commands::repair::run(args).await,
         Commands::Unlock(args) => commands::unlock::run(args).await,
+        Commands::Vex(args) => commands::vex::run(args).await,
     };
 
     std::process::exit(exit_code);
