@@ -579,7 +579,7 @@ fn maybe_validate_with_vexctl(vex_text: &str) {
     std::fs::write(tmp.path(), vex_text).unwrap();
 
     let out = Command::new(&vexctl)
-        .args(["merge", "--files", tmp.path().to_str().unwrap()])
+        .args(["merge", tmp.path().to_str().unwrap()])
         .output()
         .expect("spawn vexctl");
     assert!(
