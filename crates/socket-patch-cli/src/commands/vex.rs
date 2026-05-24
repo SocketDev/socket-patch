@@ -40,6 +40,13 @@ pub struct VexArgs {
     pub output: Option<PathBuf>,
 
     /// Override the auto-detected top-level product PURL/identifier.
+    /// Auto-detection probes (in order):
+    /// 1. `.git/config` `[remote "origin"]` — converted to
+    ///    `pkg:github/<owner>/<repo>` for github.com, similar for
+    ///    gitlab.com/bitbucket.org, raw URL otherwise.
+    /// 2. `package.json` → `pkg:npm/<name>@<version>`
+    /// 3. `pyproject.toml` → `pkg:pypi/<name>@<version>`
+    /// 4. `Cargo.toml` → `pkg:cargo/<name>@<version>`
     #[arg(long = "product", env = "SOCKET_VEX_PRODUCT")]
     pub product: Option<String>,
 

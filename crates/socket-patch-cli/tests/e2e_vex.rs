@@ -343,6 +343,51 @@ fn json_envelope_with_output_emits_both() {
 }
 
 #[test]
+fn auto_detect_prefers_git_remote_over_package_json() {
+    // Both signals present; the binary must surface the git-remote PURL.
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"from-pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let git_dir = cwd.join(".git");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(
+        git_dir.join("config"),
+        "[remote \"origin\"]\n\turl = git@github.com:SocketDev/socket-patch.git\n",
+    )
+    .unwrap();
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/x@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-zz",
+            &["CVE-ZZ"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let out = Command::new(binary())
+        .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
+        .output()
+        .expect("invoke vex");
+    assert!(out.status.success());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:github/SocketDev/socket-patch"
+    );
+}
+
+#[test]
 fn auto_detect_uses_package_json() {
     // When --product is omitted the binary reads `package.json` for the
     // product PURL. We don't lay down node_modules so we pair this with
@@ -519,8 +564,10 @@ fn verify_mode_all_failed_exits_non_zero() {
 /// vexctl before the test step so the validation actually runs there;
 /// local devs without Go see a skip message instead of a failure.
 ///
-/// `vexctl inspect <file>` exits 0 when the JSON parses as an OpenVEX
-/// document and 1 otherwise — that's the canonical schema gate.
+/// `vexctl list <file>` loads the document and prints its statements —
+/// it exits non-zero when the JSON fails to parse as an OpenVEX doc,
+/// which makes it the canonical schema gate at v0.3.x (vexctl does
+/// not yet expose a dedicated `validate` subcommand).
 fn maybe_validate_with_vexctl(vex_text: &str) {
     let Some(vexctl) = find_vexctl_on_path() else {
         eprintln!("(skipping vexctl validation — binary not on PATH)");
@@ -530,7 +577,7 @@ fn maybe_validate_with_vexctl(vex_text: &str) {
     std::fs::write(tmp.path(), vex_text).unwrap();
 
     let out = Command::new(&vexctl)
-        .args(["inspect", tmp.path().to_str().unwrap()])
+        .args(["list", tmp.path().to_str().unwrap()])
         .output()
         .expect("spawn vexctl");
     assert!(

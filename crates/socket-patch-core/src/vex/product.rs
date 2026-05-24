@@ -1,14 +1,21 @@
 //! Top-level product PURL auto-detection.
 //!
-//! Inspects the working directory for the first of:
-//!   1. `package.json` (npm)        → `pkg:npm/<name>@<version>`
-//!   2. `pyproject.toml` (PyPI)     → `pkg:pypi/<name>@<version>`
-//!   3. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
+//! Detection chain (first match wins):
+//!   1. `.git/config` `[remote "origin"]` URL — the canonical
+//!      identifier when the repo IS the product. GitHub/GitLab/
+//!      Bitbucket URLs are normalized to
+//!      `pkg:<github|gitlab|bitbucket>/<owner>/<name>`; anything else
+//!      is returned as the raw URL.
+//!   2. `package.json` (npm)        → `pkg:npm/<name>@<version>`
+//!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<name>@<version>`
+//!   4. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
 //!
-//! Returns `None` only when none of these files exist or none have a
-//! usable `name + version`. Multiple-manifests case: we pick the highest
-//! priority and surface a warning via [`DetectResult::warnings`] so the
-//! CLI can echo it to stderr.
+//! Returns `None` only when none of these sources yield a usable
+//! identifier. Multiple-package-manifest case: we pick the highest
+//! package-manifest priority and surface a warning via
+//! [`DetectResult::warnings`] so the CLI can echo it to stderr. Git
+//! remote presence does NOT trigger that warning even when alongside
+//! a package manifest — the priority is documented and stable.
 
 use std::path::Path;
 
@@ -24,6 +31,12 @@ pub struct DetectResult {
 
 pub async fn detect_product(cwd: &Path) -> DetectResult {
     let mut result = DetectResult::default();
+
+    // 1. git remote origin (highest priority — canonical when present).
+    if let Some(purl) = detect_git_remote(cwd).await {
+        result.purl = Some(purl);
+        return result;
+    }
 
     let pkg_json = cwd.join("package.json");
     let pyproject = cwd.join("pyproject.toml");
@@ -144,6 +157,138 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name, version))
+}
+
+/// Walk up from `start` looking for a `.git/config` (the working tree
+/// or any of its ancestors). When found, parse the
+/// `[remote "origin"] url = ...` line and convert that URL to a PURL.
+///
+/// Returns `None` when:
+/// * `cwd` is not inside a git working tree,
+/// * `.git/config` has no `[remote "origin"]` section, or
+/// * the URL is empty / parsing failed catastrophically. (Otherwise
+///   even unrecognized hosts fall through to the raw-URL case.)
+///
+/// Worktrees (`.git` as a file pointing at a real git dir elsewhere)
+/// are deliberately NOT followed — they're rare and the package-
+/// manifest fallback handles them correctly. Submodules likewise:
+/// only the outermost `.git/config` wins.
+async fn detect_git_remote(start: &Path) -> Option<String> {
+    let git_config_path = find_git_config(start).await?;
+    let content = tokio::fs::read_to_string(&git_config_path).await.ok()?;
+    let url = scan_remote_origin_url(&content)?;
+    Some(remote_url_to_purl(&url))
+}
+
+/// Walk ancestors looking for `<dir>/.git/config` as a regular file.
+/// Returns the path to it, or `None` if we exhaust the chain.
+async fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
+    let mut cursor = match tokio::fs::canonicalize(start).await {
+        Ok(p) => p,
+        Err(_) => start.to_path_buf(),
+    };
+    loop {
+        let candidate = cursor.join(".git").join("config");
+        if tokio::fs::metadata(&candidate)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+        match cursor.parent() {
+            Some(p) => cursor = p.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Read the `url = ...` line out of the `[remote "origin"]` section of
+/// a git config file. Returns the trimmed URL, or `None`.
+fn scan_remote_origin_url(content: &str) -> Option<String> {
+    let mut in_section = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line == "[remote \"origin\"]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("url") {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix('=')?.trim();
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Convert a git remote URL to a PURL when possible, else return the
+/// URL itself (OpenVEX `@id` accepts any URI).
+///
+/// Handled forms:
+/// * `git@github.com:owner/repo.git`     → `pkg:github/owner/repo`
+/// * `https://github.com/owner/repo.git` → `pkg:github/owner/repo`
+/// * `https://github.com/owner/repo`     → `pkg:github/owner/repo`
+/// * Same shapes for `gitlab.com` (→ `pkg:gitlab`) and `bitbucket.org`
+///   (→ `pkg:bitbucket`).
+/// * Anything else (self-hosted gitea, generic SSH, etc.) → URL as-is.
+fn remote_url_to_purl(url: &str) -> String {
+    if let Some((host, path)) = split_remote_host_path(url) {
+        let cleaned = path.strip_suffix(".git").unwrap_or(path);
+        let cleaned = cleaned.trim_matches('/');
+        let parts: Vec<&str> = cleaned.split('/').collect();
+        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+            let ecosystem = match host {
+                "github.com" => Some("github"),
+                "gitlab.com" => Some("gitlab"),
+                "bitbucket.org" => Some("bitbucket"),
+                _ => None,
+            };
+            if let Some(eco) = ecosystem {
+                return format!("pkg:{eco}/{}/{}", parts[0], parts[1]);
+            }
+        }
+    }
+    url.to_string()
+}
+
+/// Pull `(host, path)` out of a git remote URL. Returns `None` for
+/// shapes we don't recognize — the caller falls back to raw-URL mode.
+fn split_remote_host_path(url: &str) -> Option<(&str, &str)> {
+    // SSH form: `git@<host>:<path>`. The `:` is a path separator, NOT
+    // a port — git's URL parser treats this as scp-style.
+    if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return Some((host, path));
+    }
+    // ssh:// or git+ssh:// form: strip both then drop the user.
+    let stripped = url
+        .strip_prefix("ssh://")
+        .or_else(|| url.strip_prefix("git+ssh://"))
+        .or_else(|| url.strip_prefix("git://"))
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("http://"));
+    if let Some(rest) = stripped {
+        // Drop optional `user@` prefix.
+        let rest = match rest.split_once('@') {
+            Some((_, after)) => after,
+            None => rest,
+        };
+        let (host_with_port, path) = rest.split_once('/')?;
+        // Strip a `:port` if present.
+        let host = host_with_port
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_with_port);
+        return Some((host, path));
+    }
+    None
 }
 
 /// Parse `<key> = "<value>"`. Returns `None` if the key doesn't match,
@@ -288,5 +433,146 @@ mod tests {
     fn scan_toml_missing_version_returns_none() {
         let toml = "[package]\nname = \"only-name\"\n";
         assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    // ─────────────────── git-remote detection ───────────────────
+
+    #[test]
+    fn remote_url_github_ssh_becomes_pkg_github() {
+        assert_eq!(
+            remote_url_to_purl("git@github.com:SocketDev/socket-patch.git"),
+            "pkg:github/SocketDev/socket-patch"
+        );
+    }
+
+    #[test]
+    fn remote_url_github_https_becomes_pkg_github() {
+        assert_eq!(
+            remote_url_to_purl("https://github.com/SocketDev/socket-patch.git"),
+            "pkg:github/SocketDev/socket-patch"
+        );
+    }
+
+    #[test]
+    fn remote_url_github_https_no_dot_git() {
+        assert_eq!(
+            remote_url_to_purl("https://github.com/SocketDev/socket-patch"),
+            "pkg:github/SocketDev/socket-patch"
+        );
+    }
+
+    #[test]
+    fn remote_url_gitlab_and_bitbucket() {
+        assert_eq!(
+            remote_url_to_purl("git@gitlab.com:foo/bar.git"),
+            "pkg:gitlab/foo/bar"
+        );
+        assert_eq!(
+            remote_url_to_purl("https://bitbucket.org/foo/bar"),
+            "pkg:bitbucket/foo/bar"
+        );
+    }
+
+    #[test]
+    fn remote_url_unknown_host_returns_url_as_is() {
+        // Self-hosted gitea / unknown forge — VEX `@id` accepts any URI.
+        let raw = "https://git.example.com/team/repo.git";
+        assert_eq!(remote_url_to_purl(raw), raw);
+    }
+
+    #[test]
+    fn remote_url_ssh_protocol_form() {
+        assert_eq!(
+            remote_url_to_purl("ssh://git@github.com/foo/bar.git"),
+            "pkg:github/foo/bar"
+        );
+    }
+
+    #[test]
+    fn scan_origin_url_picks_url_in_section() {
+        let cfg = "[core]\nbare = false\n[remote \"origin\"]\nurl = git@github.com:foo/bar.git\nfetch = +refs/heads/*:refs/remotes/origin/*\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    #[test]
+    fn scan_origin_url_ignores_other_remotes() {
+        // `[remote "upstream"]` must not be confused for origin.
+        let cfg = "[remote \"upstream\"]\nurl = git@github.com:other/repo.git\n[remote \"origin\"]\nurl = git@github.com:me/repo.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:me/repo.git")
+        );
+    }
+
+    #[test]
+    fn scan_origin_url_returns_none_when_missing() {
+        assert!(scan_remote_origin_url("[core]\nbare = false\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_prefers_git_remote_over_package_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // package.json says "from-pkg"; git remote says "from-git".
+        // Git remote must win.
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"from-pkg","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:owner/from-git.git\n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/owner/from-git"));
+    }
+
+    #[tokio::test]
+    async fn detect_falls_back_to_package_manifest_when_no_git_remote() {
+        // Empty .git/config (no remote) → fall through to package.json.
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"pkg-only","version":"2.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(git_dir.join("config"), "[core]\nbare = false\n")
+            .await
+            .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/pkg-only@2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn detect_finds_git_config_in_parent_directory() {
+        // Common case: socket-patch is invoked from a subdir of the repo.
+        let root = tempfile::tempdir().unwrap();
+        let git_dir = root.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:org/proj.git\n",
+        )
+        .await
+        .unwrap();
+
+        let nested = root.path().join("packages").join("inner");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+
+        let r = detect_product(&nested).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:github/org/proj"));
     }
 }
