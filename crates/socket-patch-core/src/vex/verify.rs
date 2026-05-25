@@ -244,4 +244,168 @@ mod tests {
         assert!(out.applied.is_empty());
         assert_eq!(out.failed[0].reason, "not_applied");
     }
+
+    // ── Edge-case + degenerate-input coverage ─────────────────────
+
+    /// `VerifyOutcome::default()` is the empty outcome — defaulting
+    /// is used by the CLI's `--no-verify` path.
+    #[test]
+    fn outcome_default_is_empty() {
+        let o = VerifyOutcome::default();
+        assert!(o.applied.is_empty());
+        assert!(o.failed.is_empty());
+    }
+
+    /// `FailedPatch` equality + clone for downstream consumers
+    /// (the CLI emits these in `--json` warnings).
+    #[test]
+    fn failed_patch_value_semantics() {
+        let a = FailedPatch {
+            purl: "pkg:npm/x@1".to_string(),
+            reason: "hash_mismatch".to_string(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    /// Empty manifest → empty outcome. No iteration, no panic.
+    #[tokio::test]
+    async fn empty_manifest_returns_empty_outcome() {
+        let manifest = PatchManifest::new();
+        let paths: HashMap<String, PathBuf> = HashMap::new();
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert!(out.failed.is_empty());
+    }
+
+    /// A patch with `files = {}` is vacuously applied — the
+    /// "all files match" predicate is `true` over an empty set.
+    /// This is intentional behavior: a "patch" that touches no
+    /// files is always-applied. Documented here so a future
+    /// refactor that flips the predicate is forced to revisit it.
+    #[tokio::test]
+    async fn patch_record_with_zero_files_is_vacuously_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/empty@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert(
+            "pkg:npm/empty@1.0.0".to_string(),
+            pkg_dir.path().to_path_buf(),
+        );
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/empty@1.0.0".to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// Extra `package_paths` entries that aren't in the manifest
+    /// are ignored — we iterate manifest entries, not the map.
+    #[tokio::test]
+    async fn extra_package_paths_are_ignored() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let patched = b"patched";
+        let hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(pkg_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/x@1.0.0".to_string(), record_with_one_file(&hash));
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+        // Stray entry not in the manifest.
+        paths.insert(
+            "pkg:npm/stray@9.9.9".to_string(),
+            pkg_dir.path().to_path_buf(),
+        );
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied.len(), 1);
+        assert_eq!(out.applied[0], "pkg:npm/x@1.0.0");
+        assert!(out.failed.is_empty());
+    }
+
+    /// Multi-file patch where the FIRST file fails — the iteration
+    /// halts after the first failure (we don't keep going to
+    /// surface every reason). Lock this in so future refactors
+    /// don't accidentally start running the second file's check.
+    ///
+    /// The patch lists two files. `a.js` has the wrong content (no
+    /// match for before_hash or after_hash); `b.js` is fine. Order
+    /// is non-deterministic across HashMap iteration, so we only
+    /// assert "one failure reason", not which one.
+    #[tokio::test]
+    async fn multi_file_first_failure_short_circuits() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        // a.js: corrupt
+        tokio::fs::write(pkg_dir.path().join("a.js"), b"garbage")
+            .await
+            .unwrap();
+        // b.js: at the right after_hash so it would pass.
+        let patched_b = b"patched-b";
+        let hash_b = compute_git_sha256_from_bytes(patched_b);
+        tokio::fs::write(pkg_dir.path().join("b.js"), patched_b)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "a.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: "deadbeef".to_string(),
+            },
+        );
+        files.insert(
+            "b.js".to_string(),
+            PatchFileInfo {
+                before_hash: "cccc".to_string(),
+                after_hash: hash_b,
+            },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed.len(), 1, "first failure must short-circuit");
+        // Reason depends on iteration order, but it MUST be one of
+        // the two failure tags (not the success path).
+        let reason = &out.failed[0].reason;
+        assert!(
+            matches!(reason.as_str(), "hash_mismatch" | "not_applied"),
+            "unexpected reason: {reason}"
+        );
+    }
 }

@@ -106,7 +106,10 @@ async fn read_package_json(path: &Path) -> Option<String> {
 
 async fn read_pyproject(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
-    let (name, version) = scan_toml_section(&content, "project")?;
+    // PEP 621 `[project]` takes precedence (newer projects favor it),
+    // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
+    let (name, version) = scan_toml_section(&content, "project")
+        .or_else(|| scan_toml_section(&content, "tool.poetry"))?;
     Some(format!("pkg:pypi/{name}@{version}"))
 }
 
@@ -574,5 +577,405 @@ mod tests {
 
         let r = detect_product(&nested).await;
         assert_eq!(r.purl.as_deref(), Some("pkg:github/org/proj"));
+    }
+
+    // ── Edge-case + branch coverage ───────────────────────────────
+
+    /// `.git/config` exists but lists only non-origin remotes →
+    /// detection must fall through to package-manifest discovery
+    /// (otherwise the repo would surface no identifier at all).
+    #[tokio::test]
+    async fn git_config_with_only_non_origin_remote_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"fallback-app","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "[remote \"upstream\"]\n\turl = git@github.com:other/proj.git\n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/fallback-app@1.0.0"));
+    }
+
+    /// `url =` with no value after the `=` is a malformed git config.
+    /// Detection must treat it as "no remote" and fall through.
+    #[tokio::test]
+    async fn git_config_with_empty_url_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"fallback-app","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let git_dir = dir.path().join(".git");
+        tokio::fs::create_dir_all(&git_dir).await.unwrap();
+        tokio::fs::write(
+            git_dir.join("config"),
+            "[remote \"origin\"]\n\turl = \n",
+        )
+        .await
+        .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/fallback-app@1.0.0"));
+    }
+
+    /// CRLF line endings — Rust's `str::lines()` already handles
+    /// `\r\n`, but pin this so a future switch to `split('\n')`
+    /// would surface the regression.
+    #[test]
+    fn scan_origin_url_handles_crlf_line_endings() {
+        let cfg =
+            "[remote \"origin\"]\r\n\turl = git@github.com:foo/bar.git\r\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// `git+ssh://` URL form → `split_remote_host_path` branch.
+    #[test]
+    fn remote_url_git_plus_ssh_form() {
+        assert_eq!(
+            remote_url_to_purl("git+ssh://git@github.com/owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// `git://` URL form (legacy unauthenticated) — separate branch
+    /// from `ssh://` and `https://`.
+    #[test]
+    fn remote_url_git_protocol_form() {
+        assert_eq!(
+            remote_url_to_purl("git://github.com/owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// `http://` (plain, not https) — exercises the
+    /// `strip_prefix("http://")` arm in `split_remote_host_path`.
+    #[test]
+    fn remote_url_http_form() {
+        assert_eq!(
+            remote_url_to_purl("http://github.com/owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// `ssh://git@host:22/path` — port suffix on host must be
+    /// stripped so the ecosystem lookup still matches `github.com`.
+    #[test]
+    fn remote_url_ssh_with_port_strips_port() {
+        assert_eq!(
+            remote_url_to_purl("ssh://git@github.com:22/owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// Pre-`split_remote_host_path` SSH form WITH NO user prefix:
+    /// `ssh://github.com/foo/bar.git`. Branch where the `@` split
+    /// doesn't fire and the whole rest is treated as `host/path`.
+    #[test]
+    fn remote_url_ssh_no_user_prefix() {
+        assert_eq!(
+            remote_url_to_purl("ssh://github.com/foo/bar.git"),
+            "pkg:github/foo/bar"
+        );
+    }
+
+    /// Truly unrecognized URL form (no recognized scheme prefix and
+    /// no scp-style `git@host:path`) → returned as-is.
+    #[test]
+    fn remote_url_unknown_shape_returned_verbatim() {
+        let weird = "file:///srv/repos/proj.git";
+        assert_eq!(remote_url_to_purl(weird), weird);
+    }
+
+    /// `pyproject.toml` with `[tool.poetry]` (Poetry layout) is now
+    /// supported as a fallback when `[project]` is absent.
+    #[tokio::test]
+    async fn detect_pyproject_tool_poetry_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[tool.poetry]\nname = \"poetry-app\"\nversion = \"0.9.0\"\n";
+        tokio::fs::write(dir.path().join("pyproject.toml"), content)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/poetry-app@0.9.0"));
+    }
+
+    /// When `[project]` and `[tool.poetry]` are both present, the
+    /// PEP-621 section wins (modern projects prefer it).
+    #[tokio::test]
+    async fn detect_pyproject_project_section_wins_over_tool_poetry() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "[project]\nname = \"pep621-app\"\nversion = \"1.0.0\"\n\n[tool.poetry]\nname = \"poetry-app\"\nversion = \"0.9.0\"\n";
+        tokio::fs::write(dir.path().join("pyproject.toml"), content)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/pep621-app@1.0.0"));
+    }
+
+    /// Multi-manifest combo: pyproject + Cargo.toml present, no
+    /// package.json. pyproject wins per the priority list.
+    #[tokio::test]
+    async fn detect_pyproject_over_cargo_when_no_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"py-app\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"rust-app\"\nversion = \"2.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/py-app@1.0.0"));
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("pyproject.toml"));
+        assert!(r.warnings[0].contains("Cargo.toml"));
+    }
+
+    /// `package.json` with only `version` (no `name`) → None.
+    /// Currently the early `is_empty()` branch in `read_package_json`.
+    #[tokio::test]
+    async fn package_json_missing_name_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `package.json` with empty `name` string → None (is_empty check).
+    #[tokio::test]
+    async fn package_json_empty_name_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"","version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `package.json` with invalid JSON → None (parse-error branch).
+    #[tokio::test]
+    async fn package_json_invalid_json_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("package.json"), "{ not json").await.unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `parse_toml_string_kv`: line without `=` → None.
+    #[test]
+    fn parse_toml_kv_returns_none_when_no_equals() {
+        assert!(parse_toml_string_kv("name without equals", "name").is_none());
+    }
+
+    /// `parse_toml_string_kv`: key mismatch → None even if value is fine.
+    #[test]
+    fn parse_toml_kv_returns_none_when_key_mismatch() {
+        assert!(parse_toml_string_kv(r#"other = "value""#, "name").is_none());
+    }
+
+    /// `parse_toml_string_kv`: missing closing quote → None.
+    #[test]
+    fn parse_toml_kv_returns_none_when_unterminated_string() {
+        assert!(parse_toml_string_kv(r#"name = "no-close"#, "name").is_none());
+    }
+
+    /// `parse_toml_string_kv`: empty quoted value → None (we reject
+    /// `name = ""`).
+    #[test]
+    fn parse_toml_kv_returns_none_when_value_empty() {
+        assert!(parse_toml_string_kv(r#"name = """#, "name").is_none());
+    }
+
+    /// `parse_toml_string_kv`: non-string value (e.g. `key = 42`) →
+    /// None (we only accept quoted strings).
+    #[test]
+    fn parse_toml_kv_returns_none_when_value_not_quoted() {
+        assert!(parse_toml_string_kv(r#"name = 42"#, "name").is_none());
+    }
+
+    /// `split_remote_host_path`: SSH URL with no `:` separator →
+    /// None. Defensive — `git@` prefix without scp-style path.
+    #[test]
+    fn split_host_path_rejects_ssh_without_colon() {
+        assert!(split_remote_host_path("git@github.com").is_none());
+    }
+
+    /// `split_remote_host_path`: stripped scheme but no `/` →
+    /// host-without-path, the inner `split_once('/')` returns None.
+    #[test]
+    fn split_host_path_rejects_scheme_url_without_path() {
+        assert!(split_remote_host_path("https://github.com").is_none());
+    }
+
+    /// `remote_url_to_purl`: GitHub URL with 3 path segments
+    /// (`owner/repo/extra`) falls into the "not exactly 2 parts"
+    /// branch and returns the raw URL.
+    #[test]
+    fn remote_url_three_path_segments_returns_url_as_is() {
+        let raw = "https://github.com/owner/repo/extra";
+        assert_eq!(remote_url_to_purl(raw), raw);
+    }
+
+    /// `remote_url_to_purl`: trailing slash on the path is trimmed
+    /// before splitting, so `https://github.com/owner/repo/` still
+    /// resolves to `pkg:github/owner/repo`.
+    #[test]
+    fn remote_url_trailing_slash_is_normalized() {
+        assert_eq!(
+            remote_url_to_purl("https://github.com/owner/repo/"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// `Cargo.toml` with `name` only (no `version`) → None. Exercises
+    /// the `version?` early-return path inside `scan_toml_section`.
+    #[tokio::test]
+    async fn cargo_toml_missing_version_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"only-name\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// Pyproject without `[project]` AND without `[tool.poetry]` →
+    /// None.
+    #[tokio::test]
+    async fn pyproject_with_no_recognized_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[build-system]\nrequires = [\"setuptools\"]\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `DetectResult::default()` is empty (purl=None, warnings=[]).
+    #[test]
+    fn detect_result_default_is_empty() {
+        let r = DetectResult::default();
+        assert!(r.purl.is_none());
+        assert!(r.warnings.is_empty());
+    }
+
+    /// `find_git_config` returns None for a path that genuinely has
+    /// no `.git/config` on any ancestor. Tempdir on `/var/folders` (macOS)
+    /// or `/tmp` (linux) gives us a tree that escapes the user's home.
+    #[tokio::test]
+    async fn find_git_config_returns_none_when_no_repo_ancestor() {
+        // Walk up from the tempdir — none of its ancestors should
+        // contain `.git/config`. This depends on the test runner's
+        // tempdir living outside any git repo; both macOS
+        // /var/folders and Linux /tmp satisfy that.
+        let dir = tempfile::tempdir().unwrap();
+        let r = find_git_config(dir.path()).await;
+        assert!(r.is_none(), "unexpected .git/config above {dir:?}: {r:?}");
+    }
+
+    /// `find_git_config` handles a non-existent start path via the
+    /// `canonicalize → Err` arm and still walks ancestors of the
+    /// raw input. Returns None when no config is found.
+    #[tokio::test]
+    async fn find_git_config_handles_non_existent_start_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("does/not/exist");
+        // No I/O panic; the fallback `start.to_path_buf()` arm of
+        // the `canonicalize` match runs.
+        let r = find_git_config(&nonexistent).await;
+        assert!(r.is_none());
+    }
+
+    /// `package.json` where `name` is a number, not a string → None.
+    /// Exercises the `.as_str()?` branch on the JSON value.
+    #[tokio::test]
+    async fn package_json_with_non_string_name_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":42,"version":"1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `package.json` where `version` is a number → None.
+    #[tokio::test]
+    async fn package_json_with_non_string_version_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"x","version":42}"#,
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    /// `[remote "origin"]` block has a line that starts with `url`
+    /// but has no `=` (e.g. `url ` then EOL). The `strip_prefix('=')?`
+    /// inside `scan_remote_origin_url` returns None and the scanner
+    /// continues — eventually exhausting the section with no url.
+    #[test]
+    fn scan_origin_url_skips_url_line_without_equals_sign() {
+        let cfg = "[remote \"origin\"]\n\turl no-equals-here\n";
+        // The `url` line has no `=`, so the scanner returns None
+        // from the inner `strip_prefix('=')?` — but per the code
+        // shape (line 224 with `?` on an Option), that propagates
+        // out of `scan_remote_origin_url` as None.
+        assert!(scan_remote_origin_url(cfg).is_none());
+    }
+
+    /// `package.json` missing the `version` key entirely. Exercises
+    /// the `v.get("version")?` early-return path (distinct from the
+    /// `.as_str()?` branch — `get` returns None, not Some(non-string)).
+    #[tokio::test]
+    async fn package_json_missing_version_key_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"x"}"#,
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
     }
 }
