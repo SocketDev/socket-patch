@@ -698,6 +698,34 @@ pub async fn get_api_client_with_overrides(
     (client, false)
 }
 
+/// Build a public-proxy `ApiClient` from the same overrides used by
+/// [`get_api_client_with_overrides`], ignoring any API token.
+///
+/// Used by `scan` and `get` to retry against the public proxy after
+/// the authenticated endpoint returns 401/403 — a stale/revoked token
+/// shouldn't block access to free patches. The auth header is
+/// deliberately dropped (`api_token: None`).
+pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClient {
+    let proxy_url = overrides.proxy_url.clone().unwrap_or_else(|| {
+        read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+            .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
+    });
+    ApiClient::new(ApiClientOptions {
+        api_url: proxy_url,
+        api_token: None,
+        use_public_proxy: true,
+        org_slug: None,
+    })
+}
+
+/// Classify an [`ApiError`] as a candidate for the auth → proxy
+/// fallback. We only re-route on 401/403 (the stale-credentials
+/// signals). Network errors, rate limits, 404s, and 5xx surface as-is
+/// so they remain visible to the operator.
+pub fn is_fallback_candidate(err: &ApiError) -> bool {
+    matches!(err, ApiError::Unauthorized(_) | ApiError::Forbidden(_))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Percent-encode a string for use in URL path segments.

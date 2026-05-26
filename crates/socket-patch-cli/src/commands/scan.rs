@@ -1,5 +1,7 @@
 use clap::Args;
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+};
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
@@ -247,10 +249,16 @@ pub async fn run(args: ScanArgs) -> i32 {
     let apply = args.apply || args.sync;
     let prune = args.prune || args.sync;
 
-    let (api_client, _use_public_proxy) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let overrides = args.common.api_client_overrides();
+    let (mut api_client, mut use_public_proxy) =
+        get_api_client_with_overrides(overrides.clone()).await;
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
+    // Tracks whether scan was downgraded from the authenticated
+    // endpoint to the public proxy mid-run after a 401/403. Surfaces
+    // in the final `patch_scanned` telemetry event so we can measure
+    // how often stale-token fallbacks fire in the wild.
+    let mut fallback_to_proxy = false;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -399,10 +407,34 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
 
         let purls: Vec<String> = chunk.to_vec();
-        match api_client
+        let mut result = api_client
             .search_patches_batch(effective_org_slug, &purls)
-            .await
-        {
+            .await;
+
+        // Fallback: a 401/403 against the authenticated endpoint can
+        // mean a stale/revoked token. Retry against the public proxy
+        // (free patches only) once, then continue the rest of the
+        // loop with the downgraded client. Only triggers on the
+        // first authenticated batch; subsequent iterations are
+        // already on the proxy.
+        if !use_public_proxy {
+            if let Err(ref e) = result {
+                if is_fallback_candidate(e) {
+                    eprintln!(
+                        "Warning: authenticated API returned {e}; \
+                         falling back to public patch API proxy (free patches only)."
+                    );
+                    api_client = build_proxy_fallback_client(&overrides);
+                    use_public_proxy = true;
+                    fallback_to_proxy = true;
+                    result = api_client
+                        .search_patches_batch(effective_org_slug, &purls)
+                        .await;
+                }
+            }
+        }
+
+        match result {
             Ok(response) => {
                 if response.can_access_paid_patches {
                     can_access_paid_patches = true;
@@ -431,7 +463,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             .unwrap_or_else(|| "all batches failed".to_string());
         track_patch_scan_failed(
             &err,
-            false,
+            fallback_to_proxy,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
         )
@@ -478,16 +510,16 @@ pub async fn run(args: ScanArgs) -> i32 {
     let total_patches = free_patches + paid_patches;
 
     // Telemetry: record the scan outcome once we have the canonical
-    // per-tier counts. `fallback_to_proxy` is wired through as false here;
-    // when the auth → proxy fallback lands (separate change) the same
-    // call site will surface a true value.
+    // per-tier counts. `fallback_to_proxy` is `true` iff the batch
+    // loop downgraded from the authenticated endpoint to the public
+    // proxy after a 401/403.
     track_patch_scanned(
         package_count,
         free_patches,
         paid_patches,
         can_access_paid_patches,
         args.common.ecosystems.clone().unwrap_or_default().as_slice(),
-        false,
+        fallback_to_proxy,
         telemetry_token.as_deref(),
         telemetry_org.as_deref(),
     )

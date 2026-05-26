@@ -1,6 +1,8 @@
 use clap::Args;
 use regex::Regex;
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
@@ -728,11 +730,17 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     apply_env_toggles(&args.common);
-    let (api_client, use_public_proxy) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let overrides = args.common.api_client_overrides();
+    let (mut api_client, mut use_public_proxy) =
+        get_api_client_with_overrides(overrides.clone()).await;
     let telemetry_token = api_client.api_token().cloned();
     let telemetry_org = api_client.org_slug().cloned();
     let download_mode = args.common.download_mode.clone();
+    // Set to `true` after the first 401/403 from the authenticated
+    // endpoint triggered a rebuild against the public proxy. Plumbed
+    // through to every subsequent telemetry event so we can track the
+    // incidence of stale-token fallbacks.
+    let mut fallback_to_proxy = false;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -763,16 +771,35 @@ pub async fn run(args: GetArgs) -> i32 {
         if !args.common.json {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
-        match api_client
+        let mut fetch_result = api_client
             .fetch_patch(effective_org_slug, &args.identifier)
-            .await
-        {
+            .await;
+        // 401/403 from the auth endpoint → swap to the public proxy
+        // and retry once. Free patches still surface; paid patches
+        // come back as the existing "paid_required" branch below.
+        if !use_public_proxy {
+            if let Err(ref e) = fetch_result {
+                if is_fallback_candidate(e) {
+                    eprintln!(
+                        "Warning: authenticated API returned {e}; \
+                         falling back to public patch API proxy (free patches only)."
+                    );
+                    api_client = build_proxy_fallback_client(&overrides);
+                    use_public_proxy = true;
+                    fallback_to_proxy = true;
+                    fetch_result = api_client
+                        .fetch_patch(effective_org_slug, &args.identifier)
+                        .await;
+                }
+            }
+        }
+        match fetch_result {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
                     track_patch_fetch_failed(
                         &patch.uuid,
                         "paid_required",
-                        false,
+                        fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
@@ -808,7 +835,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     &patch.tier,
                     &ecosystem_from_purl(&patch.purl),
                     &download_mode,
-                    false,
+                    fallback_to_proxy,
                     telemetry_token.as_deref(),
                     telemetry_org.as_deref(),
                 )
@@ -821,7 +848,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 track_patch_fetch_failed(
                     &args.identifier,
                     "not_found",
-                    false,
+                    fallback_to_proxy,
                     telemetry_token.as_deref(),
                     telemetry_org.as_deref(),
                 )
@@ -843,7 +870,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 track_patch_fetch_failed(
                     &args.identifier,
                     &e,
-                    false,
+                    fallback_to_proxy,
                     telemetry_token.as_deref(),
                     telemetry_org.as_deref(),
                 )
@@ -876,7 +903,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     track_patch_fetch_failed(
                         &args.identifier,
                         &e,
-                        false,
+                        fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
@@ -906,7 +933,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     track_patch_fetch_failed(
                         &args.identifier,
                         &e,
-                        false,
+                        fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
@@ -936,7 +963,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     track_patch_fetch_failed(
                         &args.identifier,
                         &e,
-                        false,
+                        fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
@@ -1031,7 +1058,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     track_patch_fetch_failed(
                         &args.identifier,
                         &e,
-                        false,
+                        fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
