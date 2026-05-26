@@ -499,6 +499,13 @@ pub async fn track_patch_rollback_failed(
 /// Track a successful `scan`. Reports per-tier patch counts and whether
 /// the call was downgraded to the public proxy after an auth-endpoint
 /// 401/403 (`fallback_to_proxy`).
+///
+/// The argument count intentionally mirrors the metadata fields the
+/// dashboard needs — grouping them into a struct would force callers
+/// to build a config object for a single fire-and-forget call, which
+/// is worse ergonomics for a tracker. `track_patch_event` is the
+/// general path when you need that flexibility.
+#[allow(clippy::too_many_arguments)]
 pub async fn track_patch_scanned(
     packages_scanned: usize,
     free_patches: usize,
