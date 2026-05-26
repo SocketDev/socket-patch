@@ -343,6 +343,143 @@ async fn list_emits_patch_listed_telemetry_when_telemetry_enabled() {
     assert_eq!(count, 1, "list must POST exactly one patch_listed event");
 }
 
+// ---------------------------------------------------------------------------
+// Fallback: 401/403 from the auth endpoint downgrades to public proxy.
+// ---------------------------------------------------------------------------
+
+/// Spin up two mock servers: one returns 401 on `/v0/orgs/{slug}/patches/batch`
+/// (the auth endpoint), the other serves the public proxy (per-package GETs
+/// at `/patch/by-package/{purl}`). After the fallback, scan must succeed
+/// against the proxy and emit a `patch_scanned` event tagged
+/// `fallback_to_proxy: true` in its metadata.
+#[tokio::test]
+async fn scan_falls_back_to_proxy_on_401_and_tags_telemetry() {
+    let auth_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid token"))
+        .mount(&auth_mock)
+        .await;
+    // Telemetry POST from the auth-mode try lands here (auth client
+    // still has token+slug at the moment the telemetry endpoint is
+    // chosen — but with `fallback_to_proxy: true` in the body once we
+    // re-enter telemetry after the swap).
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&auth_mock)
+        .await;
+
+    let proxy_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&proxy_mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+
+    // Auth URL → 401 mock. Proxy URL → success mock.
+    let (code, _stdout, stderr) = run_cmd(
+        tmp.path(),
+        &auth_mock.uri(),
+        "scan",
+        &[],
+        &[("SOCKET_PROXY_URL", &proxy_mock.uri())],
+    );
+    assert_eq!(code, 0, "scan must succeed after falling back to proxy");
+    assert!(
+        stderr.contains("falling back to public patch API proxy"),
+        "stderr must carry the fallback warning; got: {stderr}"
+    );
+
+    // The post-fallback telemetry POST must include `fallback_to_proxy: true`.
+    let received = auth_mock
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let telemetry_bodies: Vec<serde_json::Value> = received
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url
+                    .path()
+                    .ends_with(&format!("/v0/orgs/{ORG_SLUG}/telemetry"))
+        })
+        .filter_map(|r| serde_json::from_slice(&r.body).ok())
+        .collect();
+    let scanned = telemetry_bodies
+        .iter()
+        .find(|v| v.get("event_type").and_then(|t| t.as_str()) == Some("patch_scanned"))
+        .expect("a patch_scanned event must reach the recorder");
+    assert_eq!(
+        scanned["metadata"]["fallback_to_proxy"],
+        serde_json::Value::Bool(true),
+        "fallback must be reflected in telemetry metadata; got {scanned}"
+    );
+}
+
+/// 404/5xx must NOT trigger fallback — they surface as scan errors so
+/// upstream backend issues stay visible. Guards against an
+/// over-eager classifier.
+#[tokio::test]
+async fn scan_does_not_fall_back_on_500() {
+    let auth_mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("backend on fire"))
+        .mount(&auth_mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&auth_mock)
+        .await;
+
+    // Proxy mock that would accept the call if fallback fired. We
+    // assert below that it receives ZERO requests, proving no
+    // fallback happened.
+    let proxy_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&proxy_mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2");
+
+    let (_code, _stdout, stderr) = run_cmd(
+        tmp.path(),
+        &auth_mock.uri(),
+        "scan",
+        &[],
+        &[("SOCKET_PROXY_URL", &proxy_mock.uri())],
+    );
+    assert!(
+        !stderr.contains("falling back"),
+        "5xx must NOT trigger fallback; stderr was: {stderr}"
+    );
+    let proxy_hits = proxy_mock
+        .received_requests()
+        .await
+        .expect("recording enabled")
+        .len();
+    assert_eq!(
+        proxy_hits, 0,
+        "proxy must not be queried after a 500 from the auth endpoint"
+    );
+}
+
 #[tokio::test]
 async fn list_skips_telemetry_in_airgap_mode() {
     let mock = setup_mock(
