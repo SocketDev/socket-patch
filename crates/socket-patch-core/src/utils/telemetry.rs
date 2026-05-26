@@ -103,6 +103,9 @@ pub struct TrackPatchEventOptions {
 /// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
 ///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
 /// - `VITEST` is `"true"` (test environment)
+/// - `SOCKET_OFFLINE` is `"1"` or `"true"` (airgap mode — the telemetry
+///   endpoint is a network call, so honoring `--offline`/`SOCKET_OFFLINE`
+///   here keeps every command compliant with the strict-airgap contract)
 ///
 /// Note that the CLI also exposes a `--no-telemetry` flag; when that flag
 /// is set the CLI dispatcher sets `SOCKET_TELEMETRY_DISABLED=1` for the
@@ -111,8 +114,13 @@ pub fn is_telemetry_disabled() -> bool {
     let env_value =
         read_env_with_legacy("SOCKET_TELEMETRY_DISABLED", "SOCKET_PATCH_TELEMETRY_DISABLED")
             .unwrap_or_default();
-    matches!(env_value.as_str(), "1" | "true")
-        || std::env::var("VITEST").unwrap_or_default() == "true"
+    let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
+    let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
+    let offline = matches!(
+        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
+        "1" | "true"
+    );
+    disabled_via_env || vitest || offline
 }
 
 /// Check if debug mode is enabled. Reads `SOCKET_DEBUG` (with legacy
@@ -461,19 +469,22 @@ mod tests {
     use super::*;
 
     /// Combined into a single test to avoid env-var races across parallel tests.
-    /// Exercises both the new `SOCKET_TELEMETRY_DISABLED` name and the
-    /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` shim.
+    /// Exercises the `SOCKET_TELEMETRY_DISABLED` name, the legacy
+    /// `SOCKET_PATCH_TELEMETRY_DISABLED` shim, and the airgap gate via
+    /// `SOCKET_OFFLINE`.
     #[test]
     fn test_is_telemetry_disabled() {
         // Save originals
         let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
         let orig_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
         let orig_vitest = std::env::var("VITEST").ok();
+        let orig_offline = std::env::var("SOCKET_OFFLINE").ok();
 
         // Default: not disabled
         std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
         std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
         std::env::remove_var("VITEST");
+        std::env::remove_var("SOCKET_OFFLINE");
         assert!(!is_telemetry_disabled());
 
         // Disabled via new var "1"
@@ -486,6 +497,26 @@ mod tests {
         assert!(is_telemetry_disabled());
         std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", "true");
         assert!(is_telemetry_disabled());
+        std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+
+        // Disabled via airgap: SOCKET_OFFLINE=1 implies "no network",
+        // which includes the telemetry endpoint.
+        std::env::set_var("SOCKET_OFFLINE", "1");
+        assert!(
+            is_telemetry_disabled(),
+            "SOCKET_OFFLINE=1 must disable telemetry (airgap)"
+        );
+        std::env::set_var("SOCKET_OFFLINE", "true");
+        assert!(
+            is_telemetry_disabled(),
+            "SOCKET_OFFLINE=true must disable telemetry (airgap)"
+        );
+        // Non-truthy values do not disable
+        std::env::set_var("SOCKET_OFFLINE", "0");
+        assert!(!is_telemetry_disabled());
+        std::env::set_var("SOCKET_OFFLINE", "");
+        assert!(!is_telemetry_disabled());
+        std::env::remove_var("SOCKET_OFFLINE");
 
         // Restore originals
         match orig_new {
@@ -499,6 +530,10 @@ mod tests {
         match orig_vitest {
             Some(v) => std::env::set_var("VITEST", v),
             None => std::env::remove_var("VITEST"),
+        }
+        match orig_offline {
+            Some(v) => std::env::set_var("SOCKET_OFFLINE", v),
+            None => std::env::remove_var("SOCKET_OFFLINE"),
         }
     }
 
