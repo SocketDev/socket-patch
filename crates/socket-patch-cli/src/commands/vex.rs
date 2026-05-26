@@ -20,6 +20,7 @@ use clap::Args;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, FailedPatch, VerifyOutcome,
 };
@@ -76,12 +77,13 @@ pub async fn run(args: VexArgs) -> i32 {
     // on the same stdout stream. Bail out with a clear error before
     // doing any work.
     if args.common.json && args.output.is_none() {
-        emit_envelope_error(
+        emit_envelope_error_and_track(
             &args,
             "json_requires_output",
             "--json requires --output (the VEX document is itself JSON; \
              route it to a file so the envelope can use stdout)",
-        );
+        )
+        .await;
         return 2;
     }
 
@@ -90,26 +92,28 @@ pub async fn run(args: VexArgs) -> i32 {
     let manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            emit_envelope_error(
+            emit_envelope_error_and_track(
                 &args,
                 "manifest_not_found",
                 &format!("Manifest not found at {}", manifest_path.display()),
-            );
+            )
+            .await;
             return 2;
         }
         Err(e) => {
-            emit_envelope_error(&args, "manifest_unreadable", &e.to_string());
+            emit_envelope_error_and_track(&args, "manifest_unreadable", &e.to_string()).await;
             return 2;
         }
     };
 
     if manifest.patches.is_empty() {
-        emit_envelope_error(
+        emit_envelope_error_and_track(
             &args,
             "no_patches",
             "Manifest is empty — nothing to attest. Run `socket-patch get` \
              or `socket-patch scan --sync` first.",
-        );
+        )
+        .await;
         return 1;
     }
 
@@ -117,7 +121,7 @@ pub async fn run(args: VexArgs) -> i32 {
     let product_id = match resolve_product_id(&args).await {
         Ok(id) => id,
         Err(reason) => {
-            emit_envelope_error(&args, "product_undetected", &reason);
+            emit_envelope_error_and_track(&args, "product_undetected", &reason).await;
             return 2;
         }
     };
@@ -156,6 +160,12 @@ pub async fn run(args: VexArgs) -> i32 {
     let doc = match build_document(&manifest, &outcome.applied, &opts) {
         Some(doc) => doc,
         None => {
+            track_vex_failed(
+                "no_applicable_patches",
+                args.common.api_token.as_deref(),
+                args.common.org.as_deref(),
+            )
+            .await;
             emit_envelope_error_with_failures(
                 &args,
                 "no_applicable_patches",
@@ -171,7 +181,7 @@ pub async fn run(args: VexArgs) -> i32 {
         match serde_json::to_string(&doc) {
             Ok(s) => s,
             Err(e) => {
-                emit_envelope_error(&args, "serialize_failed", &e.to_string());
+                emit_envelope_error_and_track(&args, "serialize_failed", &e.to_string()).await;
                 return 2;
             }
         }
@@ -179,7 +189,7 @@ pub async fn run(args: VexArgs) -> i32 {
         match serde_json::to_string_pretty(&doc) {
             Ok(s) => s,
             Err(e) => {
-                emit_envelope_error(&args, "serialize_failed", &e.to_string());
+                emit_envelope_error_and_track(&args, "serialize_failed", &e.to_string()).await;
                 return 2;
             }
         }
@@ -189,7 +199,7 @@ pub async fn run(args: VexArgs) -> i32 {
     let wrote_to_file = match &args.output {
         Some(path) => {
             if let Err(e) = tokio::fs::write(path, &serialized).await {
-                emit_envelope_error(&args, "write_failed", &e.to_string());
+                emit_envelope_error_and_track(&args, "write_failed", &e.to_string()).await;
                 return 2;
             }
             true
@@ -215,6 +225,15 @@ pub async fn run(args: VexArgs) -> i32 {
         let stmt_count = doc.statements.len();
         eprintln!("Emitted {stmt_count} VEX statement(s)");
     }
+
+    track_vex_generated(
+        doc.statements.len(),
+        "openvex-0.2.0",
+        if wrote_to_file { "file" } else { "stdout" },
+        args.common.api_token.as_deref(),
+        args.common.org.as_deref(),
+    )
+    .await;
 
     0
 }
@@ -264,6 +283,19 @@ fn emit_envelope_error(args: &VexArgs, code: &str, message: &str) {
     } else {
         eprintln!("Error: {message}");
     }
+}
+
+/// Async error sink that mirrors `emit_envelope_error` and also fires
+/// the `vex_failed` telemetry event. Centralizes both side effects so
+/// each `return` site in `run` only needs one call.
+async fn emit_envelope_error_and_track(args: &VexArgs, code: &str, message: &str) {
+    track_vex_failed(
+        code,
+        args.common.api_token.as_deref(),
+        args.common.org.as_deref(),
+    )
+    .await;
+    emit_envelope_error(args, code, message);
 }
 
 fn emit_envelope_error_with_failures(

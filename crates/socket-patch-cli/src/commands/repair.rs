@@ -9,6 +9,7 @@ use socket_patch_core::patch::apply::PatchSources;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
 };
+use socket_patch_core::utils::telemetry::{track_patch_repair_failed, track_patch_repaired};
 use std::path::Path;
 use std::time::Duration;
 
@@ -82,7 +83,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     let lock_was_broken = acquired.broke_lock;
 
     match repair_inner(&args, &manifest_path).await {
-        Ok(mut env) => {
+        Ok((mut env, counts)) => {
             if lock_was_broken {
                 // Audit trail for `--break-lock`. Event ordering is
                 // documented as best-effort; appending keeps the
@@ -90,12 +91,26 @@ pub async fn run(args: RepairArgs) -> i32 {
                 // stay in sync).
                 env.record(lock_broken_event(socket_dir));
             }
+            track_patch_repaired(
+                counts.downloaded,
+                counts.cleaned,
+                0,
+                args.common.api_token.as_deref(),
+                args.common.org.as_deref(),
+            )
+            .await;
             if args.common.json {
                 println!("{}", env.to_pretty_json());
             }
             0
         }
         Err(e) => {
+            track_patch_repair_failed(
+                &e,
+                args.common.api_token.as_deref(),
+                args.common.org.as_deref(),
+            )
+            .await;
             if args.common.json {
                 let mut env = Envelope::new(Command::Repair);
                 env.dry_run = args.common.dry_run;
@@ -109,7 +124,16 @@ pub async fn run(args: RepairArgs) -> i32 {
     }
 }
 
-async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<Envelope, String> {
+/// Aggregate counts surfaced by `repair_inner` for telemetry use.
+struct RepairCounts {
+    downloaded: usize,
+    cleaned: usize,
+}
+
+async fn repair_inner(
+    args: &RepairArgs,
+    manifest_path: &Path,
+) -> Result<(Envelope, RepairCounts), String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -329,5 +353,11 @@ async fn repair_inner(args: &RepairArgs, manifest_path: &Path) -> Result<Envelop
             "checked": blobs_checked,
         })));
     }
-    Ok(env)
+    Ok((
+        env,
+        RepairCounts {
+            downloaded: downloaded_count,
+            cleaned: blobs_cleaned,
+        },
+    ))
 }

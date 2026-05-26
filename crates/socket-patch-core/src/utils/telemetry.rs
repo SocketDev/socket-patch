@@ -751,18 +751,18 @@ pub async fn track_patch_setup(
     .await;
 }
 
-/// Track a successful `unlock`. `was_held` indicates whether the lock
-/// file existed at invocation; `broken` is true when `--break-lock`
-/// forcibly removed it despite a live holder PID.
+/// Track a successful `unlock`. `was_held` indicates whether another
+/// process was holding the lock at probe time; `released` is true when
+/// `--release` actually removed the lock file (vs. the inspect-only case).
 pub async fn track_patch_unlocked(
     was_held: bool,
-    broken: bool,
+    released: bool,
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
     let mut metadata = HashMap::new();
     metadata.insert("was_held".to_string(), serde_json::Value::Bool(was_held));
-    metadata.insert("broken".to_string(), serde_json::Value::Bool(broken));
+    metadata.insert("released".to_string(), serde_json::Value::Bool(released));
 
     track_patch_event(TrackPatchEventOptions {
         event_type: PatchTelemetryEventType::PatchUnlocked,

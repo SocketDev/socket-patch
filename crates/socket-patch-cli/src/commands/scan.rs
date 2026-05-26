@@ -7,6 +7,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
+use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -248,6 +249,8 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     let (api_client, _use_public_proxy) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let telemetry_token = api_client.api_token().cloned();
+    let telemetry_org = api_client.org_slug().cloned();
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -333,6 +336,18 @@ pub async fn run(args: ScanArgs) -> i32 {
             install_cmds.push_str("/composer");
             println!("No packages found. Run {install_cmds} install first.");
         }
+        // Telemetry: empty-scan still counts as a successful scan.
+        track_patch_scanned(
+            0,
+            0,
+            0,
+            false,
+            args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+            false,
+            telemetry_token.as_deref(),
+            telemetry_org.as_deref(),
+        )
+        .await;
         return 0;
     }
 
@@ -367,6 +382,8 @@ pub async fn run(args: ScanArgs) -> i32 {
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
     let total_batches = all_purls.len().div_ceil(args.batch_size);
+    let mut batch_error_count = 0usize;
+    let mut last_batch_error: Option<String> = None;
 
     if show_progress {
         eprint!("Querying API for patches... (batch 1/{total_batches})");
@@ -397,11 +414,28 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             }
             Err(e) => {
+                batch_error_count += 1;
+                last_batch_error = Some(e.to_string());
                 if !args.common.json {
                     eprintln!("\nError querying batch {}: {e}", batch_idx + 1);
                 }
             }
         }
+    }
+
+    // If every batch errored, surface this as a full scan failure rather
+    // than silently reporting zero patches (which historically looked
+    // identical to "no patches for these packages").
+    if total_batches > 0 && batch_error_count == total_batches {
+        let err = last_batch_error
+            .unwrap_or_else(|| "all batches failed".to_string());
+        track_patch_scan_failed(
+            &err,
+            false,
+            telemetry_token.as_deref(),
+            telemetry_org.as_deref(),
+        )
+        .await;
     }
 
     let total_patches_found: usize = all_packages_with_patches
@@ -442,6 +476,22 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
     }
     let total_patches = free_patches + paid_patches;
+
+    // Telemetry: record the scan outcome once we have the canonical
+    // per-tier counts. `fallback_to_proxy` is wired through as false here;
+    // when the auth → proxy fallback lands (separate change) the same
+    // call site will surface a true value.
+    track_patch_scanned(
+        package_count,
+        free_patches,
+        paid_patches,
+        can_access_paid_patches,
+        args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+        false,
+        telemetry_token.as_deref(),
+        telemetry_org.as_deref(),
+    )
+    .await;
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
