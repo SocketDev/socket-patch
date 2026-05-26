@@ -8,3 +8,4 @@ pub mod rollback;
 pub mod scan;
 pub mod setup;
 pub mod unlock;
+pub mod vex;
