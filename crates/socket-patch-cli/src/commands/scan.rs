@@ -1,5 +1,7 @@
 use clap::Args;
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+};
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
@@ -7,6 +9,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
+use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -246,8 +249,16 @@ pub async fn run(args: ScanArgs) -> i32 {
     let apply = args.apply || args.sync;
     let prune = args.prune || args.sync;
 
-    let (api_client, _use_public_proxy) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let overrides = args.common.api_client_overrides();
+    let (mut api_client, mut use_public_proxy) =
+        get_api_client_with_overrides(overrides.clone()).await;
+    let telemetry_token = api_client.api_token().cloned();
+    let telemetry_org = api_client.org_slug().cloned();
+    // Tracks whether scan was downgraded from the authenticated
+    // endpoint to the public proxy mid-run after a 401/403. Surfaces
+    // in the final `patch_scanned` telemetry event so we can measure
+    // how often stale-token fallbacks fire in the wild.
+    let mut fallback_to_proxy = false;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -333,6 +344,18 @@ pub async fn run(args: ScanArgs) -> i32 {
             install_cmds.push_str("/composer");
             println!("No packages found. Run {install_cmds} install first.");
         }
+        // Telemetry: empty-scan still counts as a successful scan.
+        track_patch_scanned(
+            0,
+            0,
+            0,
+            false,
+            args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+            false,
+            telemetry_token.as_deref(),
+            telemetry_org.as_deref(),
+        )
+        .await;
         return 0;
     }
 
@@ -367,6 +390,8 @@ pub async fn run(args: ScanArgs) -> i32 {
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
     let total_batches = all_purls.len().div_ceil(args.batch_size);
+    let mut batch_error_count = 0usize;
+    let mut last_batch_error: Option<String> = None;
 
     if show_progress {
         eprint!("Querying API for patches... (batch 1/{total_batches})");
@@ -382,10 +407,34 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
 
         let purls: Vec<String> = chunk.to_vec();
-        match api_client
+        let mut result = api_client
             .search_patches_batch(effective_org_slug, &purls)
-            .await
-        {
+            .await;
+
+        // Fallback: a 401/403 against the authenticated endpoint can
+        // mean a stale/revoked token. Retry against the public proxy
+        // (free patches only) once, then continue the rest of the
+        // loop with the downgraded client. Only triggers on the
+        // first authenticated batch; subsequent iterations are
+        // already on the proxy.
+        if !use_public_proxy {
+            if let Err(ref e) = result {
+                if is_fallback_candidate(e) {
+                    eprintln!(
+                        "Warning: authenticated API returned {e}; \
+                         falling back to public patch API proxy (free patches only)."
+                    );
+                    api_client = build_proxy_fallback_client(&overrides);
+                    use_public_proxy = true;
+                    fallback_to_proxy = true;
+                    result = api_client
+                        .search_patches_batch(effective_org_slug, &purls)
+                        .await;
+                }
+            }
+        }
+
+        match result {
             Ok(response) => {
                 if response.can_access_paid_patches {
                     can_access_paid_patches = true;
@@ -397,11 +446,28 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             }
             Err(e) => {
+                batch_error_count += 1;
+                last_batch_error = Some(e.to_string());
                 if !args.common.json {
                     eprintln!("\nError querying batch {}: {e}", batch_idx + 1);
                 }
             }
         }
+    }
+
+    // If every batch errored, surface this as a full scan failure rather
+    // than silently reporting zero patches (which historically looked
+    // identical to "no patches for these packages").
+    if total_batches > 0 && batch_error_count == total_batches {
+        let err = last_batch_error
+            .unwrap_or_else(|| "all batches failed".to_string());
+        track_patch_scan_failed(
+            &err,
+            fallback_to_proxy,
+            telemetry_token.as_deref(),
+            telemetry_org.as_deref(),
+        )
+        .await;
     }
 
     let total_patches_found: usize = all_packages_with_patches
@@ -442,6 +508,22 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
     }
     let total_patches = free_patches + paid_patches;
+
+    // Telemetry: record the scan outcome once we have the canonical
+    // per-tier counts. `fallback_to_proxy` is `true` iff the batch
+    // loop downgraded from the authenticated endpoint to the public
+    // proxy after a 401/403.
+    track_patch_scanned(
+        package_count,
+        free_patches,
+        paid_patches,
+        can_access_paid_patches,
+        args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+        fallback_to_proxy,
+        telemetry_token.as_deref(),
+        telemetry_org.as_deref(),
+    )
+    .await;
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the

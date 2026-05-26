@@ -1,6 +1,8 @@
 use clap::Args;
 use regex::Regex;
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+};
 use socket_patch_core::api::types::{
     PatchResponse, PatchSearchResult, SearchResponse, VulnerabilityResponse,
 };
@@ -11,6 +13,7 @@ use socket_patch_core::manifest::schema::{
 };
 use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::utils::purl::is_purl;
+use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -18,6 +21,17 @@ use std::path::PathBuf;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{confirm, select_one, SelectError};
+
+/// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
+/// the telemetry `ecosystem` field. Returns an empty string when the
+/// PURL is malformed — telemetry events should never block on input
+/// validation.
+fn ecosystem_from_purl(purl: &str) -> String {
+    purl.strip_prefix("pkg:")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_string()
+}
 
 /// Per-patch outcome reported in the JSON output of `download_and_apply_patches`.
 /// `Updated` carries the previous UUID so a bot can diff a manifest update against
@@ -716,8 +730,17 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     apply_env_toggles(&args.common);
-    let (api_client, use_public_proxy) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let overrides = args.common.api_client_overrides();
+    let (mut api_client, mut use_public_proxy) =
+        get_api_client_with_overrides(overrides.clone()).await;
+    let telemetry_token = api_client.api_token().cloned();
+    let telemetry_org = api_client.org_slug().cloned();
+    let download_mode = args.common.download_mode.clone();
+    // Set to `true` after the first 401/403 from the authenticated
+    // endpoint triggered a rebuild against the public proxy. Plumbed
+    // through to every subsequent telemetry event so we can track the
+    // incidence of stale-token fallbacks.
+    let mut fallback_to_proxy = false;
 
     // org slug is already stored in the client
     let effective_org_slug: Option<&str> = None;
@@ -748,12 +771,39 @@ pub async fn run(args: GetArgs) -> i32 {
         if !args.common.json {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
-        match api_client
+        let mut fetch_result = api_client
             .fetch_patch(effective_org_slug, &args.identifier)
-            .await
-        {
+            .await;
+        // 401/403 from the auth endpoint → swap to the public proxy
+        // and retry once. Free patches still surface; paid patches
+        // come back as the existing "paid_required" branch below.
+        if !use_public_proxy {
+            if let Err(ref e) = fetch_result {
+                if is_fallback_candidate(e) {
+                    eprintln!(
+                        "Warning: authenticated API returned {e}; \
+                         falling back to public patch API proxy (free patches only)."
+                    );
+                    api_client = build_proxy_fallback_client(&overrides);
+                    use_public_proxy = true;
+                    fallback_to_proxy = true;
+                    fetch_result = api_client
+                        .fetch_patch(effective_org_slug, &args.identifier)
+                        .await;
+                }
+            }
+        }
+        match fetch_result {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
+                    track_patch_fetch_failed(
+                        &patch.uuid,
+                        "paid_required",
+                        fallback_to_proxy,
+                        telemetry_token.as_deref(),
+                        telemetry_org.as_deref(),
+                    )
+                    .await;
                     if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "paid_required",
@@ -775,11 +825,34 @@ pub async fn run(args: GetArgs) -> i32 {
                     return 0;
                 }
 
+                // Record the fetch BEFORE the save+apply step so the
+                // event captures patch identity even if a downstream
+                // file-system error trips up save_and_apply. The save
+                // step has its own apply-side telemetry (track_patch_applied)
+                // so we don't lose visibility into the rest of the pipeline.
+                track_patch_fetched(
+                    &patch.uuid,
+                    &patch.tier,
+                    &ecosystem_from_purl(&patch.purl),
+                    &download_mode,
+                    fallback_to_proxy,
+                    telemetry_token.as_deref(),
+                    telemetry_org.as_deref(),
+                )
+                .await;
                 // Save to manifest
                 return save_and_apply_patch(&args, &patch.purl, &patch.uuid, effective_org_slug)
                     .await;
             }
             Ok(None) => {
+                track_patch_fetch_failed(
+                    &args.identifier,
+                    "not_found",
+                    fallback_to_proxy,
+                    telemetry_token.as_deref(),
+                    telemetry_org.as_deref(),
+                )
+                .await;
                 if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "not_found",
@@ -794,6 +867,14 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
             Err(e) => {
+                track_patch_fetch_failed(
+                    &args.identifier,
+                    &e,
+                    fallback_to_proxy,
+                    telemetry_token.as_deref(),
+                    telemetry_org.as_deref(),
+                )
+                .await;
                 if args.common.json {
                     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                         "status": "error",
@@ -819,6 +900,14 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    track_patch_fetch_failed(
+                        &args.identifier,
+                        &e,
+                        fallback_to_proxy,
+                        telemetry_token.as_deref(),
+                        telemetry_org.as_deref(),
+                    )
+                    .await;
                     if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
@@ -841,6 +930,14 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    track_patch_fetch_failed(
+                        &args.identifier,
+                        &e,
+                        fallback_to_proxy,
+                        telemetry_token.as_deref(),
+                        telemetry_org.as_deref(),
+                    )
+                    .await;
                     if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
@@ -863,6 +960,14 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    track_patch_fetch_failed(
+                        &args.identifier,
+                        &e,
+                        fallback_to_proxy,
+                        telemetry_token.as_deref(),
+                        telemetry_org.as_deref(),
+                    )
+                    .await;
                     if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",
@@ -950,6 +1055,14 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    track_patch_fetch_failed(
+                        &args.identifier,
+                        &e,
+                        fallback_to_proxy,
+                        telemetry_token.as_deref(),
+                        telemetry_org.as_deref(),
+                    )
+                    .await;
                     if args.common.json {
                         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                             "status": "error",

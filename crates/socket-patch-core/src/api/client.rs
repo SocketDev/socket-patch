@@ -665,6 +665,14 @@ pub async fn get_api_client_with_overrides(
         return (client, true);
     }
 
+    // Shape check the configured token before the network round-trip so
+    // a "you set the hash, not the token" mistake is loud and immediate.
+    if let Some(ref t) = api_token {
+        if let Some(msg) = validate_token_shape(t) {
+            eprintln!("{msg}");
+        }
+    }
+
     let api_url = overrides
         .api_url
         .or_else(|| std::env::var("SOCKET_API_URL").ok())
@@ -684,6 +692,18 @@ pub async fn get_api_client_with_overrides(
             Ok(slug) => Some(slug),
             Err(e) => {
                 eprintln!("Warning: Could not auto-detect organization: {e}");
+                if matches!(e, ApiError::Unauthorized(_)) {
+                    if let Some(ref t) = api_token {
+                        if looks_like_token_hash(t) {
+                            eprintln!(
+                                "  Hint: SOCKET_API_TOKEN starts with `{}-` \
+                                 which is the stored hash format. Set it to \
+                                 the raw `sktsec_..._api` value instead.",
+                                t.split('-').next().unwrap_or("sha512")
+                            );
+                        }
+                    }
+                }
                 None
             }
         }
@@ -696,6 +716,94 @@ pub async fn get_api_client_with_overrides(
         org_slug: final_org_slug,
     });
     (client, false)
+}
+
+/// Build a public-proxy `ApiClient` from the same overrides used by
+/// [`get_api_client_with_overrides`], ignoring any API token.
+///
+/// Used by `scan` and `get` to retry against the public proxy after
+/// the authenticated endpoint returns 401/403 — a stale/revoked token
+/// shouldn't block access to free patches. The auth header is
+/// deliberately dropped (`api_token: None`).
+pub fn build_proxy_fallback_client(overrides: &ApiClientEnvOverrides) -> ApiClient {
+    let proxy_url = overrides.proxy_url.clone().unwrap_or_else(|| {
+        read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+            .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
+    });
+    ApiClient::new(ApiClientOptions {
+        api_url: proxy_url,
+        api_token: None,
+        use_public_proxy: true,
+        org_slug: None,
+    })
+}
+
+/// Return `true` when the configured token value looks like an
+/// SRI-format hash (`sha512-<base64>` etc.) rather than a raw API
+/// token. The server stores tokens *as* this hash; the CLI sometimes
+/// gets configured with the storage representation by mistake (users
+/// copy what they see in the dashboard). Surfacing this as a hint
+/// short-circuits a confusing 401 round-trip.
+pub fn looks_like_token_hash(token: &str) -> bool {
+    matches!(
+        token.split_once('-'),
+        Some(("sha256" | "sha384" | "sha512", _))
+    )
+}
+
+/// Inspect a configured `SOCKET_API_TOKEN` value and return a
+/// human-readable warning when the value doesn't match the canonical
+/// Socket API token shape (`sktsec_<44 chars>_api`). Returns `None`
+/// when the token looks valid, so the caller can ignore the result
+/// without checking length.
+///
+/// The validation is intentionally a non-authoritative shape check —
+/// the server's regex is the source of truth. We only flag values
+/// that are *obviously* wrong (e.g. the storage hash, an empty
+/// prefix/suffix) so a benign typo at the server's regex boundary
+/// doesn't generate noise.
+///
+/// The returned message redacts the middle of the token (first 8 +
+/// last 4 chars) so a real token doesn't leak into stderr if a user
+/// pastes one with a wrong suffix.
+pub fn validate_token_shape(token: &str) -> Option<String> {
+    let has_prefix = token.starts_with("sktsec_");
+    let has_suffix = token.ends_with("_api") || token.ends_with("_agent");
+    let plausible_len = token.len() >= 55;
+    if has_prefix && has_suffix && plausible_len {
+        return None;
+    }
+    let len = token.len();
+    let head: String = token.chars().take(8).collect();
+    let tail_start = len.saturating_sub(4);
+    let tail: String = token.chars().skip(tail_start).collect();
+    let preview = if len <= 12 {
+        token.to_string()
+    } else {
+        format!("{head}...{tail}")
+    };
+    let hash_hint = if looks_like_token_hash(token) {
+        "\n  That value looks like an SRI-format hash (sha###-<base64>) — \
+         the server stores the *hash* of your token, not what you should \
+         set here. Use the raw `sktsec_..._api` value shown when the token \
+         was generated."
+    } else {
+        ""
+    };
+    Some(format!(
+        "Warning: SOCKET_API_TOKEN does not look like a Socket API token \
+         (expected `sktsec_<44 chars>_api`).{hash_hint}\n  \
+         Got: {preview} ({len} chars). Continuing anyway; the server may \
+         reject this with 401."
+    ))
+}
+
+/// Classify an [`ApiError`] as a candidate for the auth → proxy
+/// fallback. We only re-route on 401/403 (the stale-credentials
+/// signals). Network errors, rate limits, 404s, and 5xx surface as-is
+/// so they remain visible to the operator.
+pub fn is_fallback_candidate(err: &ApiError) -> bool {
+    matches!(err, ApiError::Unauthorized(_) | ApiError::Forbidden(_))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -1159,5 +1267,70 @@ mod tests {
         let (client, _) = get_api_client_from_env(None).await;
         let result = client.fetch_package("xxx").await;
         assert!(matches!(result, Err(ApiError::InvalidHash(_))));
+    }
+
+    // ── Token shape validation ─────────────────────────────────────────
+
+    #[test]
+    fn validate_token_shape_accepts_canonical_api_token() {
+        // 7-char prefix + 44 random chars + 4-char `_api` suffix = 55 chars,
+        // matching the server's SOCKET_TOKEN_REGEXP.
+        let raw = format!("sktsec_{}_api", "x".repeat(44));
+        assert_eq!(raw.len(), 55);
+        assert!(validate_token_shape(&raw).is_none());
+    }
+
+    #[test]
+    fn validate_token_shape_accepts_agent_token() {
+        let raw = format!("sktsec_{}_agent", "x".repeat(44));
+        assert!(validate_token_shape(&raw).is_none());
+    }
+
+    #[test]
+    fn validate_token_shape_flags_sha512_hash() {
+        let hash = "sha512-7aegAloeNsCqF1mpNL2J9MJ2dpIxQEwgKvXPml8XY2rrV2Za+\
+                    bfj0yhG7RcqvqqLZ4iAH/drJjHjOqFkTGhddg==";
+        let msg = validate_token_shape(hash).expect("hash must be flagged");
+        assert!(
+            msg.contains("does not look like a Socket API token"),
+            "missing core warning; got: {msg}"
+        );
+        assert!(
+            msg.contains("SRI-format hash"),
+            "missing sha-hash hint; got: {msg}"
+        );
+        assert!(
+            msg.contains("sktsec_"),
+            "warning must point users at the correct prefix; got: {msg}"
+        );
+        // Token preview must not leak the whole value.
+        assert!(
+            !msg.contains("7RcqvqqLZ4iAH"),
+            "middle of the value must be redacted; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_token_shape_flags_too_short() {
+        let msg = validate_token_shape("sktsec_abc_api")
+            .expect("short token must be flagged");
+        assert!(msg.contains("does not look like a Socket API token"));
+        assert!(!msg.contains("SRI-format hash"));
+    }
+
+    #[test]
+    fn validate_token_shape_flags_missing_suffix() {
+        let raw = format!("sktsec_{}", "x".repeat(50));
+        assert!(validate_token_shape(&raw).is_some());
+    }
+
+    #[test]
+    fn looks_like_token_hash_recognizes_sri_prefixes() {
+        assert!(looks_like_token_hash("sha256-abc"));
+        assert!(looks_like_token_hash("sha384-abc"));
+        assert!(looks_like_token_hash("sha512-abc"));
+        assert!(!looks_like_token_hash("sktsec_xxx_api"));
+        assert!(!looks_like_token_hash("hello"));
+        assert!(!looks_like_token_hash(""));
     }
 }

@@ -81,6 +81,99 @@ fn telemetry_disabled_legacy_socket_patch_var_honored() {
 }
 
 #[test]
+#[serial]
+fn telemetry_disabled_when_socket_offline_eq_1() {
+    // Airgap mode: SOCKET_OFFLINE=1 means "never contact the network",
+    // so the telemetry endpoint (which is a network call) must be
+    // suppressed for every command.
+    let prev_disabled = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
+    let prev_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+    let prev_vitest = std::env::var("VITEST").ok();
+    let prev_offline = std::env::var("SOCKET_OFFLINE").ok();
+    std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("VITEST");
+    std::env::set_var("SOCKET_OFFLINE", "1");
+    assert!(
+        is_telemetry_disabled(),
+        "SOCKET_OFFLINE=1 must disable telemetry (airgap)"
+    );
+    std::env::remove_var("SOCKET_OFFLINE");
+    if let Some(v) = prev_disabled {
+        std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_legacy {
+        std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_vitest {
+        std::env::set_var("VITEST", v);
+    }
+    if let Some(v) = prev_offline {
+        std::env::set_var("SOCKET_OFFLINE", v);
+    }
+}
+
+#[test]
+#[serial]
+fn telemetry_disabled_when_socket_offline_eq_true() {
+    let prev_disabled = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
+    let prev_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+    let prev_vitest = std::env::var("VITEST").ok();
+    let prev_offline = std::env::var("SOCKET_OFFLINE").ok();
+    std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("VITEST");
+    std::env::set_var("SOCKET_OFFLINE", "true");
+    assert!(
+        is_telemetry_disabled(),
+        "SOCKET_OFFLINE=true must disable telemetry (airgap)"
+    );
+    std::env::remove_var("SOCKET_OFFLINE");
+    if let Some(v) = prev_disabled {
+        std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_legacy {
+        std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_vitest {
+        std::env::set_var("VITEST", v);
+    }
+    if let Some(v) = prev_offline {
+        std::env::set_var("SOCKET_OFFLINE", v);
+    }
+}
+
+#[test]
+#[serial]
+fn telemetry_not_disabled_when_socket_offline_unset_or_falsy() {
+    // Defensive: confirm "0" and empty don't accidentally engage the gate.
+    let prev_disabled = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
+    let prev_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+    let prev_vitest = std::env::var("VITEST").ok();
+    let prev_offline = std::env::var("SOCKET_OFFLINE").ok();
+    std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("VITEST");
+    std::env::set_var("SOCKET_OFFLINE", "0");
+    assert!(!is_telemetry_disabled(), "SOCKET_OFFLINE=0 must not engage gate");
+    std::env::set_var("SOCKET_OFFLINE", "");
+    assert!(!is_telemetry_disabled(), "SOCKET_OFFLINE='' must not engage gate");
+    std::env::remove_var("SOCKET_OFFLINE");
+    if let Some(v) = prev_disabled {
+        std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_legacy {
+        std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
+    }
+    if let Some(v) = prev_vitest {
+        std::env::set_var("VITEST", v);
+    }
+    if let Some(v) = prev_offline {
+        std::env::set_var("SOCKET_OFFLINE", v);
+    }
+}
+
+#[test]
 fn sanitize_error_message_without_home_returns_unchanged() {
     // No home substring means no replacement happens.
     let msg = "some error message with no home directory in it";

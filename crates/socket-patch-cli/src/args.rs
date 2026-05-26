@@ -86,7 +86,12 @@ pub struct GlobalArgs {
 
     /// Strict airgap: never contact the network. Operations that need remote
     /// data fail loudly when this is set.
-    #[arg(long, env = "SOCKET_OFFLINE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "SOCKET_OFFLINE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     pub offline: bool,
 
     /// Operate on globally-installed packages.
@@ -95,6 +100,7 @@ pub struct GlobalArgs {
         short = 'g',
         env = "SOCKET_GLOBAL",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub global: bool,
 
@@ -108,6 +114,7 @@ pub struct GlobalArgs {
         short = 'j',
         env = "SOCKET_JSON",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub json: bool,
 
@@ -117,6 +124,7 @@ pub struct GlobalArgs {
         short = 'v',
         env = "SOCKET_VERBOSE",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub verbose: bool,
 
@@ -126,6 +134,7 @@ pub struct GlobalArgs {
         short = 's',
         env = "SOCKET_SILENT",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub silent: bool,
 
@@ -134,6 +143,7 @@ pub struct GlobalArgs {
         long = "dry-run",
         env = "SOCKET_DRY_RUN",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub dry_run: bool,
 
@@ -143,6 +153,7 @@ pub struct GlobalArgs {
         short = 'y',
         env = "SOCKET_YES",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub yes: bool,
 
@@ -163,11 +174,21 @@ pub struct GlobalArgs {
     /// `lock_broken` warning event in the JSON envelope so the
     /// action is auditable. Only meaningful for mutating
     /// subcommands; other commands accept it silently.
-    #[arg(long = "break-lock", env = "SOCKET_BREAK_LOCK", default_value_t = false)]
+    #[arg(
+        long = "break-lock",
+        env = "SOCKET_BREAK_LOCK",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     pub break_lock: bool,
 
     /// Emit verbose debug logs to stderr.
-    #[arg(long = "debug", env = "SOCKET_DEBUG", default_value_t = false)]
+    #[arg(
+        long = "debug",
+        env = "SOCKET_DEBUG",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     pub debug: bool,
 
     /// Disable anonymous usage telemetry.
@@ -175,6 +196,7 @@ pub struct GlobalArgs {
         long = "no-telemetry",
         env = "SOCKET_TELEMETRY_DISABLED",
         default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub no_telemetry: bool,
 }

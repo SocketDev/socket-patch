@@ -4,11 +4,20 @@ use socket_patch_core::package_json::find::{
     detect_package_manager, find_package_json_files, WorkspaceType,
 };
 use socket_patch_core::package_json::update::{update_package_json, UpdateStatus};
+use socket_patch_core::utils::telemetry::track_patch_setup;
 use std::io::{self, Write};
 use std::path::Path;
 
 use crate::args::GlobalArgs;
 use crate::output::stdin_is_tty;
+
+/// Stringify the detected manager for telemetry.
+fn manager_name(pm: PackageManager) -> &'static str {
+    match pm {
+        PackageManager::Npm => "npm",
+        PackageManager::Pnpm => "pnpm",
+    }
+}
 
 #[derive(Args)]
 pub struct SetupArgs {
@@ -55,6 +64,17 @@ pub async fn run(args: SetupArgs) -> i32 {
 
     // Detect package manager from lockfiles in the project root.
     let pm = detect_package_manager(&args.common.cwd).await;
+
+    // Setup telemetry: emit once we know a real setup is being attempted
+    // (past the "no files found" early exit) and the package manager is
+    // resolved. Carries the detected manager so we can see which install
+    // hooks are exercised in the wild.
+    track_patch_setup(
+        manager_name(pm),
+        args.common.api_token.as_deref(),
+        args.common.org.as_deref(),
+    )
+    .await;
 
     if !args.common.json {
         println!("Found {} package.json file(s)", package_json_files.len());

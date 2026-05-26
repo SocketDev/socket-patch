@@ -14,6 +14,48 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-05-26
+
+### Added
+
+- **Telemetry coverage for read-side + housekeeping + attestation commands.**
+  `scan`, `get`, `list`, `setup`, `repair`, `unlock`, and the new `vex`
+  command each emit a `patch_<action>` (and matching `*_failed`) event
+  through the existing send path, joining the apply/remove/rollback
+  trio that already shipped. The `scan` event carries per-tier counts
+  (`free_patches`/`paid_patches`/`can_access_paid`), the ecosystems
+  filter, and a `fallback_to_proxy` flag; `get` carries
+  `uuid`/`tier`/`ecosystem`/`download_mode`/`fallback_to_proxy`.
+
+- **`scan` + `get` automatically fall back to the public proxy on
+  401/403** from the authenticated endpoint. A stale or revoked
+  token no longer blocks access to free patches — the CLI logs a
+  warning to stderr, swaps to the proxy, retries once, and tags the
+  resulting telemetry event with `fallback_to_proxy: true`. The
+  classifier is deliberately narrow: 404, 5xx, network, and rate-limit
+  errors do NOT trigger fallback so backend issues stay visible.
+  `apply`/`remove`/`rollback`/`vex` keep their fail-loud semantics.
+
+- **`SOCKET_OFFLINE` (airgap mode) now disables telemetry universally.**
+  `is_telemetry_disabled()` honors the same `SOCKET_OFFLINE=1|true`
+  signal `--offline` uses for network suppression, so apply (and
+  every future command) no longer attempts a 5-second telemetry POST
+  against `https://api.socket.dev` when the operator explicitly
+  requested airgap.
+
+### Tests
+
+- New `tests/telemetry_e2e.rs` end-to-end behavioral coverage:
+  apply/scan/get/list emit telemetry against a wiremock recorder;
+  `SOCKET_OFFLINE=1` produces zero telemetry POSTs across all four;
+  scan falls back on 401 + tags the resulting event; scan does NOT
+  fall back on 500 (conservative classifier).
+- New `scan_invariants` cases for the patch-management lifecycle:
+  withdrawn patches keep their entry when the package is still
+  installed but API is silent; entries for uninstalled packages get
+  pruned; `scan` without `--apply` is read-only against the manifest
+  and blobs even when an update is detected.
+
 ## [3.0.0] — 2026-05-22
 
 ### Breaking

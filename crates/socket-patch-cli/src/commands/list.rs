@@ -1,5 +1,6 @@
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::utils::telemetry::track_patch_listed;
 
 use crate::args::GlobalArgs;
 use crate::json_envelope::{
@@ -40,6 +41,13 @@ pub async fn run(args: ListArgs) -> i32 {
     match read_manifest(&manifest_path).await {
         Ok(Some(manifest)) => {
             let patch_entries: Vec<_> = manifest.patches.iter().collect();
+            let patches_count = patch_entries.len();
+            track_patch_listed(
+                patches_count,
+                args.common.api_token.as_deref(),
+                args.common.org.as_deref(),
+            )
+            .await;
 
             if args.common.json {
                 let mut env = Envelope::new(Command::List);

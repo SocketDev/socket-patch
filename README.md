@@ -454,7 +454,7 @@ When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-procee
 
 | Variable | Description |
 |----------|-------------|
-| `SOCKET_API_TOKEN` | API authentication token |
+| `SOCKET_API_TOKEN` | API authentication token. Use the raw token (`sktsec_<...>_api`) shown when it was generated, **not** the SHA-512 hash (`sha512-...`) that the dashboard may also display for identification. |
 | `SOCKET_ORG_SLUG` | Default organization slug |
 | `SOCKET_API_URL` | API base URL (default: `https://api.socket.dev`) |
 
