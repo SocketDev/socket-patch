@@ -24,12 +24,28 @@ const PACKAGE_VERSION: &str = "1.0.0";
 /// Telemetry event types for the patch lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchTelemetryEventType {
+    // Write-side: apply / remove / rollback
     PatchApplied,
     PatchApplyFailed,
     PatchRemoved,
     PatchRemoveFailed,
     PatchRolledBack,
     PatchRollbackFailed,
+    // Read-side: scan / get (get is internally "fetch")
+    PatchScanned,
+    PatchScanFailed,
+    PatchFetched,
+    PatchFetchFailed,
+    // Inspection / housekeeping
+    PatchListed,
+    PatchRepaired,
+    PatchRepairFailed,
+    PatchSetup,
+    PatchUnlocked,
+    PatchUnlockFailed,
+    // OpenVEX attestation (added in #81)
+    VexGenerated,
+    VexFailed,
 }
 
 impl PatchTelemetryEventType {
@@ -42,6 +58,18 @@ impl PatchTelemetryEventType {
             Self::PatchRemoveFailed => "patch_remove_failed",
             Self::PatchRolledBack => "patch_rolled_back",
             Self::PatchRollbackFailed => "patch_rollback_failed",
+            Self::PatchScanned => "patch_scanned",
+            Self::PatchScanFailed => "patch_scan_failed",
+            Self::PatchFetched => "patch_fetched",
+            Self::PatchFetchFailed => "patch_fetch_failed",
+            Self::PatchListed => "patch_listed",
+            Self::PatchRepaired => "patch_repaired",
+            Self::PatchRepairFailed => "patch_repair_failed",
+            Self::PatchSetup => "patch_setup",
+            Self::PatchUnlocked => "patch_unlocked",
+            Self::PatchUnlockFailed => "patch_unlock_failed",
+            Self::VexGenerated => "vex_generated",
+            Self::VexFailed => "vex_failed",
         }
     }
 }
@@ -464,6 +492,361 @@ pub async fn track_patch_rollback_failed(
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Read-side trackers: scan + get
+// ---------------------------------------------------------------------------
+
+/// Track a successful `scan`. Reports per-tier patch counts and whether
+/// the call was downgraded to the public proxy after an auth-endpoint
+/// 401/403 (`fallback_to_proxy`).
+pub async fn track_patch_scanned(
+    packages_scanned: usize,
+    free_patches: usize,
+    paid_patches: usize,
+    can_access_paid: bool,
+    ecosystems: &[String],
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "packages_scanned".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(packages_scanned)),
+    );
+    metadata.insert(
+        "free_patches".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(free_patches)),
+    );
+    metadata.insert(
+        "paid_patches".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(paid_patches)),
+    );
+    metadata.insert(
+        "can_access_paid".to_string(),
+        serde_json::Value::Bool(can_access_paid),
+    );
+    metadata.insert(
+        "ecosystems".to_string(),
+        serde_json::Value::Array(
+            ecosystems
+                .iter()
+                .map(|e| serde_json::Value::String(e.clone()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        "fallback_to_proxy".to_string(),
+        serde_json::Value::Bool(fallback_to_proxy),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchScanned,
+        command: "scan".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a failed `scan`.
+pub async fn track_patch_scan_failed(
+    error: impl std::fmt::Display,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "fallback_to_proxy".to_string(),
+        serde_json::Value::Bool(fallback_to_proxy),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchScanFailed,
+        command: "scan".to_string(),
+        metadata: Some(metadata),
+        error: Some(("Error".to_string(), error.to_string())),
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a successful `get`. Reports patch identity + delivery mode and
+/// whether the call was downgraded to the public proxy after an
+/// auth-endpoint 401/403.
+pub async fn track_patch_fetched(
+    uuid: &str,
+    tier: &str,
+    ecosystem: &str,
+    download_mode: &str,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "uuid".to_string(),
+        serde_json::Value::String(uuid.to_string()),
+    );
+    metadata.insert(
+        "tier".to_string(),
+        serde_json::Value::String(tier.to_string()),
+    );
+    metadata.insert(
+        "ecosystem".to_string(),
+        serde_json::Value::String(ecosystem.to_string()),
+    );
+    metadata.insert(
+        "download_mode".to_string(),
+        serde_json::Value::String(download_mode.to_string()),
+    );
+    metadata.insert(
+        "fallback_to_proxy".to_string(),
+        serde_json::Value::Bool(fallback_to_proxy),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchFetched,
+        command: "get".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a failed `get`. `uuid` may be empty when the failure occurred
+/// before the patch was resolved (e.g. lookup miss).
+pub async fn track_patch_fetch_failed(
+    uuid: &str,
+    error: impl std::fmt::Display,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "uuid".to_string(),
+        serde_json::Value::String(uuid.to_string()),
+    );
+    metadata.insert(
+        "fallback_to_proxy".to_string(),
+        serde_json::Value::Bool(fallback_to_proxy),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchFetchFailed,
+        command: "get".to_string(),
+        metadata: Some(metadata),
+        error: Some(("Error".to_string(), error.to_string())),
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Inspection / housekeeping trackers: list / repair / setup / unlock
+// ---------------------------------------------------------------------------
+
+/// Track a successful `list`. Reports the number of patches surfaced.
+pub async fn track_patch_listed(
+    patches_count: usize,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "patches_count".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(patches_count)),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchListed,
+        command: "list".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a successful `repair`. Reports blob deltas and bytes freed.
+pub async fn track_patch_repaired(
+    blobs_added: usize,
+    blobs_removed: usize,
+    bytes_freed: u64,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "blobs_added".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(blobs_added)),
+    );
+    metadata.insert(
+        "blobs_removed".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(blobs_removed)),
+    );
+    metadata.insert(
+        "bytes_freed".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(bytes_freed)),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchRepaired,
+        command: "repair".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a failed `repair`.
+pub async fn track_patch_repair_failed(
+    error: impl std::fmt::Display,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchRepairFailed,
+        command: "repair".to_string(),
+        metadata: None,
+        error: Some(("Error".to_string(), error.to_string())),
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a successful `setup`. Reports the detected package manager so
+/// we can tell which install hooks are exercised in the wild.
+pub async fn track_patch_setup(
+    manager: &str,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "manager".to_string(),
+        serde_json::Value::String(manager.to_string()),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchSetup,
+        command: "setup".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a successful `unlock`. `was_held` indicates whether the lock
+/// file existed at invocation; `broken` is true when `--break-lock`
+/// forcibly removed it despite a live holder PID.
+pub async fn track_patch_unlocked(
+    was_held: bool,
+    broken: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert("was_held".to_string(), serde_json::Value::Bool(was_held));
+    metadata.insert("broken".to_string(), serde_json::Value::Bool(broken));
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchUnlocked,
+        command: "unlock".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a failed `unlock`.
+pub async fn track_patch_unlock_failed(
+    error: impl std::fmt::Display,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::PatchUnlockFailed,
+        command: "unlock".to_string(),
+        metadata: None,
+        error: Some(("Error".to_string(), error.to_string())),
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// OpenVEX trackers
+// ---------------------------------------------------------------------------
+
+/// Track a successful `vex` generation. `format` is e.g. `"openvex-0.2.0"`;
+/// `output_kind` describes where the document went (`"stdout"`, `"file"`).
+pub async fn track_vex_generated(
+    advisories_count: usize,
+    format: &str,
+    output_kind: &str,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "advisories_count".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(advisories_count)),
+    );
+    metadata.insert(
+        "format".to_string(),
+        serde_json::Value::String(format.to_string()),
+    );
+    metadata.insert(
+        "output_kind".to_string(),
+        serde_json::Value::String(output_kind.to_string()),
+    );
+
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::VexGenerated,
+        command: "vex".to_string(),
+        metadata: Some(metadata),
+        error: None,
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
+/// Track a failed `vex` generation.
+pub async fn track_vex_failed(
+    error: impl std::fmt::Display,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    track_patch_event(TrackPatchEventOptions {
+        event_type: PatchTelemetryEventType::VexFailed,
+        command: "vex".to_string(),
+        metadata: None,
+        error: Some(("Error".to_string(), error.to_string())),
+        api_token: api_token.map(|s| s.to_string()),
+        org_slug: org_slug.map(|s| s.to_string()),
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +937,7 @@ mod tests {
 
     #[test]
     fn test_event_type_as_str() {
+        // Write-side
         assert_eq!(PatchTelemetryEventType::PatchApplied.as_str(), "patch_applied");
         assert_eq!(
             PatchTelemetryEventType::PatchApplyFailed.as_str(),
@@ -572,6 +956,39 @@ mod tests {
             PatchTelemetryEventType::PatchRollbackFailed.as_str(),
             "patch_rollback_failed"
         );
+        // Read-side
+        assert_eq!(PatchTelemetryEventType::PatchScanned.as_str(), "patch_scanned");
+        assert_eq!(
+            PatchTelemetryEventType::PatchScanFailed.as_str(),
+            "patch_scan_failed"
+        );
+        assert_eq!(PatchTelemetryEventType::PatchFetched.as_str(), "patch_fetched");
+        assert_eq!(
+            PatchTelemetryEventType::PatchFetchFailed.as_str(),
+            "patch_fetch_failed"
+        );
+        // Inspection / housekeeping
+        assert_eq!(PatchTelemetryEventType::PatchListed.as_str(), "patch_listed");
+        assert_eq!(
+            PatchTelemetryEventType::PatchRepaired.as_str(),
+            "patch_repaired"
+        );
+        assert_eq!(
+            PatchTelemetryEventType::PatchRepairFailed.as_str(),
+            "patch_repair_failed"
+        );
+        assert_eq!(PatchTelemetryEventType::PatchSetup.as_str(), "patch_setup");
+        assert_eq!(
+            PatchTelemetryEventType::PatchUnlocked.as_str(),
+            "patch_unlocked"
+        );
+        assert_eq!(
+            PatchTelemetryEventType::PatchUnlockFailed.as_str(),
+            "patch_unlock_failed"
+        );
+        // OpenVEX
+        assert_eq!(PatchTelemetryEventType::VexGenerated.as_str(), "vex_generated");
+        assert_eq!(PatchTelemetryEventType::VexFailed.as_str(), "vex_failed");
     }
 
     #[test]
