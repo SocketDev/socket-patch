@@ -705,3 +705,219 @@ async fn scan_handles_api_500_error_gracefully() {
         "scan must not crash on 500; got exit code {code}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle: withdrawn patches and patch updates
+// ---------------------------------------------------------------------------
+
+/// Defensive scoping test for `--prune`: a manifest entry whose package
+/// is still installed but for which the API now returns *no* patches
+/// (e.g. the upstream withdrew the only patch but the package itself is
+/// still present in the project) MUST NOT be silently pruned. The
+/// current prune semantics target manifest entries whose PURL is no
+/// longer in the crawl results — not entries the API has fallen silent
+/// on. If we ever change that, we want to do it deliberately.
+#[tokio::test]
+async fn scan_prune_keeps_entry_when_package_installed_but_api_silent() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    // The package is still installed locally — only its patch is gone.
+    write_npm_package(tmp.path(), "still-installed", "1.0.0");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let original_manifest = r#"{
+  "patches": {
+    "pkg:npm/still-installed@1.0.0": {
+      "uuid": "22222222-2222-4222-8222-222222222222",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {},
+      "vulnerabilities": {},
+      "description": "still here, just no patch this scan",
+      "license": "MIT",
+      "tier": "free"
+    }
+  }
+}"#;
+    std::fs::write(socket.join("manifest.json"), original_manifest).unwrap();
+
+    let (code, _stdout, _stderr) = run_scan(tmp.path(), &mock.uri(), &["--prune", "--yes"]);
+    assert_eq!(code, 0);
+
+    let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        manifest["patches"].as_object().unwrap().len(),
+        1,
+        "entry for still-installed package must survive prune when API is silent"
+    );
+    assert!(
+        manifest["patches"]["pkg:npm/still-installed@1.0.0"]
+            .as_object()
+            .is_some(),
+        "the original PURL/UUID record must remain intact"
+    );
+}
+
+/// Withdrawn-patch lifecycle: a patch present in the manifest for a
+/// package that has since been *uninstalled* (no longer in crawl
+/// results) must be pruned by `--prune`. This complements
+/// `scan_prune_removes_stale_manifest_entries` by additionally placing
+/// a stub blob file on disk for the to-be-withdrawn patch and asserting
+/// the manifest no longer references it (so `repair` can subsequently
+/// GC the blob).
+#[tokio::test]
+async fn scan_prune_removes_withdrawn_patch_entry() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    // Only a different package is now present — the previously patched
+    // package was uninstalled, simulating withdrawal.
+    write_npm_package(tmp.path(), "unrelated", "1.0.0");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        r#"{
+  "patches": {
+    "pkg:npm/withdrawn-pkg@1.0.0": {
+      "uuid": "33333333-3333-4333-8333-333333333333",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {},
+      "vulnerabilities": {},
+      "description": "withdrawn from upstream",
+      "license": "MIT",
+      "tier": "free"
+    }
+  }
+}"#,
+    )
+    .unwrap();
+    // Drop a stub blob on disk so we can confirm subsequent `repair`
+    // would GC it. Real blob name uses content hash; for prune's
+    // purposes the file's mere presence is enough.
+    std::fs::write(
+        socket.join("blobs").join("stub-blob"),
+        b"placeholder bytes for withdrawn patch",
+    )
+    .unwrap();
+
+    let (code, _stdout, _stderr) = run_scan(tmp.path(), &mock.uri(), &["--prune", "--yes"]);
+    assert_eq!(code, 0);
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["patches"].as_object().unwrap().len(),
+        0,
+        "withdrawn entry must be removed"
+    );
+}
+
+/// Update detection: when the API returns a different UUID for the
+/// same PURL that's in the manifest, `scan` surfaces that in the
+/// `updates` array even without `--apply`. Sibling to
+/// `scan_emits_updates_entry_when_newer_uuid_available` but exercised
+/// with a stub blob on disk so we pin the read-only behavior: scan
+/// alone never mutates files.
+#[tokio::test]
+async fn scan_detects_update_without_touching_existing_blobs() {
+    const OLD_UUID: &str = "44444444-4444-4444-8444-444444444444";
+    const NEW_UUID: &str = "55555555-5555-4555-8555-555555555555";
+
+    let purl = "pkg:npm/lodash@4.17.20";
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": NEW_UUID,
+                    "purl": purl,
+                    "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "Updated lodash patch",
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "lodash", "4.17.20");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{
+  "patches": {{
+    "pkg:npm/lodash@4.17.20": {{
+      "uuid": "{OLD_UUID}",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{}},
+      "vulnerabilities": {{}},
+      "description": "Original lodash patch",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+    // Marker blob: scan without --apply must leave it untouched.
+    let marker = socket.join("blobs").join("untouched-by-scan");
+    std::fs::write(&marker, b"original contents").unwrap();
+
+    let (code, stdout, _stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0);
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let updates = v["updates"].as_array().expect("updates array present");
+    assert_eq!(updates.len(), 1, "exactly one update detected");
+    assert_eq!(updates[0]["purl"], "pkg:npm/lodash@4.17.20");
+    assert_eq!(updates[0]["oldUuid"], OLD_UUID);
+    assert_eq!(updates[0]["newUuid"], NEW_UUID);
+
+    // Critical: scan is read-only. The manifest still records the OLD
+    // UUID and the marker blob is byte-for-byte unchanged.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["patches"]["pkg:npm/lodash@4.17.20"]["uuid"], OLD_UUID,
+        "scan without --apply must not rewrite the manifest"
+    );
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"original contents",
+        "scan without --apply must not touch existing blobs"
+    );
+}
