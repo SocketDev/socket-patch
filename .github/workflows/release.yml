@@ -51,25 +51,8 @@ jobs:
             exit 1
           fi
 
-  tag:
-    needs: version
-    if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Create and push tag
-        run: |
-          TAG="v${{ needs.version.outputs.version }}"
-          git tag "$TAG"
-          git push origin "$TAG"
-
   build:
-    needs: [version, tag]
-    if: ${{ always() && needs.version.result == 'success' && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
+    needs: version
     strategy:
       matrix:
         include:
@@ -139,10 +122,14 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # toolchain version is read from rust-toolchain.toml (exact-pinned).
-          targets: ${{ matrix.target }}
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. The dtolnay action
+        # cannot auto-detect the channel when pinned by SHA (it normally
+        # parses it from the ref name), so we go through rustup directly.
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.build-tool == 'cross'
@@ -183,8 +170,24 @@ jobs:
           name: socket-patch-${{ matrix.target }}
           path: socket-patch-${{ matrix.target }}.zip
 
-  github-release:
+  tag:
     needs: [version, build]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create and push tag
+        run: |
+          TAG="v${{ needs.version.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+  github-release:
+    needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
@@ -215,7 +218,7 @@ jobs:
             artifacts/*
 
   cargo-publish:
-    needs: [version, build]
+    needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
@@ -228,8 +231,10 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml (exact-pinned).
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing.
+        run: rustup show
 
       - name: Authenticate with crates.io
         id: crates-io-auth
@@ -252,7 +257,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
   npm-publish:
-    needs: [version, build]
+    needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
@@ -342,7 +347,7 @@ jobs:
           }
 
   pypi-publish:
-    needs: [version, build]
+    needs: [version, build, tag]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     permissions:
