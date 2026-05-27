@@ -230,20 +230,23 @@ impl ApiClient {
         self.get_json(&path).await
     }
 
-    /// Search patches by CVE ID.
-    pub async fn search_patches_by_cve(
+    /// Shared implementation for `search_patches_by_{cve,ghsa,package}`.
+    /// `route` is the `by-<x>` URL segment — the rest of the path layout
+    /// is identical across the three endpoints.
+    async fn search_patches_by_route(
         &self,
         org_slug: Option<&str>,
-        cve_id: &str,
+        route: &str,
+        identifier: &str,
     ) -> Result<SearchResponse, ApiError> {
-        let encoded = urlencoding_encode(cve_id);
+        let encoded = urlencoding_encode(identifier);
         let path = if self.use_public_proxy {
-            format!("/patch/by-cve/{}", encoded)
+            format!("/patch/{route}/{encoded}")
         } else {
             let slug = org_slug
                 .or(self.org_slug.as_deref())
                 .unwrap_or("default");
-            format!("/v0/orgs/{}/patches/by-cve/{}", slug, encoded)
+            format!("/v0/orgs/{slug}/patches/{route}/{encoded}")
         };
         let result = self.get_json::<SearchResponse>(&path).await?;
         Ok(result.unwrap_or_else(|| SearchResponse {
@@ -252,26 +255,22 @@ impl ApiClient {
         }))
     }
 
+    /// Search patches by CVE ID.
+    pub async fn search_patches_by_cve(
+        &self,
+        org_slug: Option<&str>,
+        cve_id: &str,
+    ) -> Result<SearchResponse, ApiError> {
+        self.search_patches_by_route(org_slug, "by-cve", cve_id).await
+    }
+
     /// Search patches by GHSA ID.
     pub async fn search_patches_by_ghsa(
         &self,
         org_slug: Option<&str>,
         ghsa_id: &str,
     ) -> Result<SearchResponse, ApiError> {
-        let encoded = urlencoding_encode(ghsa_id);
-        let path = if self.use_public_proxy {
-            format!("/patch/by-ghsa/{}", encoded)
-        } else {
-            let slug = org_slug
-                .or(self.org_slug.as_deref())
-                .unwrap_or("default");
-            format!("/v0/orgs/{}/patches/by-ghsa/{}", slug, encoded)
-        };
-        let result = self.get_json::<SearchResponse>(&path).await?;
-        Ok(result.unwrap_or_else(|| SearchResponse {
-            patches: Vec::new(),
-            can_access_paid_patches: false,
-        }))
+        self.search_patches_by_route(org_slug, "by-ghsa", ghsa_id).await
     }
 
     /// Search patches by package PURL.
@@ -283,20 +282,7 @@ impl ApiClient {
         org_slug: Option<&str>,
         purl: &str,
     ) -> Result<SearchResponse, ApiError> {
-        let encoded = urlencoding_encode(purl);
-        let path = if self.use_public_proxy {
-            format!("/patch/by-package/{}", encoded)
-        } else {
-            let slug = org_slug
-                .or(self.org_slug.as_deref())
-                .unwrap_or("default");
-            format!("/v0/orgs/{}/patches/by-package/{}", slug, encoded)
-        };
-        let result = self.get_json::<SearchResponse>(&path).await?;
-        Ok(result.unwrap_or_else(|| SearchResponse {
-            patches: Vec::new(),
-            can_access_paid_patches: false,
-        }))
+        self.search_patches_by_route(org_slug, "by-package", purl).await
     }
 
     /// Search patches for multiple packages (batch).

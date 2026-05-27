@@ -13,6 +13,55 @@ pub struct CleanupResult {
     pub removed_blobs: Vec<String>,
 }
 
+/// Shared core for `cleanup_unused_blobs` / `cleanup_unused_archives`.
+///
+/// Walks `dir`, treats it as authoritative socket-patch state (so any
+/// regular non-hidden file is considered for removal), and asks
+/// `is_used(filename) -> bool` whether each file should be kept.
+async fn cleanup_dir<F: Fn(&str) -> bool>(
+    dir: &Path,
+    dry_run: bool,
+    is_used: F,
+) -> Result<CleanupResult, std::io::Error> {
+    if tokio::fs::metadata(dir).await.is_err() {
+        return Ok(CleanupResult::default());
+    }
+
+    let mut read_dir = tokio::fs::read_dir(dir).await?;
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        entries.push(entry);
+    }
+
+    let mut result = CleanupResult {
+        blobs_checked: entries.len(),
+        ..CleanupResult::default()
+    };
+
+    for entry in &entries {
+        let file_name_str = entry.file_name().to_string_lossy().to_string();
+        if file_name_str.starts_with('.') {
+            continue;
+        }
+        let path = dir.join(&file_name_str);
+        let metadata = tokio::fs::metadata(&path).await?;
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_used(&file_name_str) {
+            continue;
+        }
+        result.blobs_removed += 1;
+        result.bytes_freed += metadata.len();
+        result.removed_blobs.push(file_name_str);
+        if !dry_run {
+            tokio::fs::remove_file(&path).await?;
+        }
+    }
+
+    Ok(result)
+}
+
 /// Cleans up unused blob files from the blobs directory.
 ///
 /// Analyzes the manifest to determine which afterHash blobs are needed for applying patches,
@@ -28,64 +77,7 @@ pub async fn cleanup_unused_blobs(
 ) -> Result<CleanupResult, std::io::Error> {
     // Only keep afterHash blobs - beforeHash blobs are downloaded on-demand during rollback
     let used_blobs = get_after_hash_blobs(manifest);
-
-    // Check if blobs directory exists
-    if tokio::fs::metadata(blobs_dir).await.is_err() {
-        // Blobs directory doesn't exist, nothing to clean up
-        return Ok(CleanupResult {
-            blobs_checked: 0,
-            blobs_removed: 0,
-            bytes_freed: 0,
-            removed_blobs: vec![],
-        });
-    }
-
-    // Read all files in the blobs directory
-    let mut read_dir = tokio::fs::read_dir(blobs_dir).await?;
-    let mut blob_entries = Vec::new();
-
-    while let Some(entry) = read_dir.next_entry().await? {
-        blob_entries.push(entry);
-    }
-
-    let mut result = CleanupResult {
-        blobs_checked: blob_entries.len(),
-        blobs_removed: 0,
-        bytes_freed: 0,
-        removed_blobs: vec![],
-    };
-
-    // Check each blob file
-    for entry in &blob_entries {
-        let file_name = entry.file_name();
-        let file_name_str = file_name.to_string_lossy().to_string();
-
-        // Skip hidden files and directories
-        if file_name_str.starts_with('.') {
-            continue;
-        }
-
-        let blob_path = blobs_dir.join(&file_name_str);
-
-        // Check if it's a file (not a directory)
-        let metadata = tokio::fs::metadata(&blob_path).await?;
-        if !metadata.is_file() {
-            continue;
-        }
-
-        // If this blob is not in use, remove it
-        if !used_blobs.contains(&file_name_str) {
-            result.blobs_removed += 1;
-            result.bytes_freed += metadata.len();
-            result.removed_blobs.push(file_name_str);
-
-            if !dry_run {
-                tokio::fs::remove_file(&blob_path).await?;
-            }
-        }
-    }
-
-    Ok(result)
+    cleanup_dir(blobs_dir, dry_run, |name| used_blobs.contains(name)).await
 }
 
 /// Cleans up unused per-patch archive files from `archives_dir`.
@@ -102,62 +94,15 @@ pub async fn cleanup_unused_archives(
     archives_dir: &Path,
     dry_run: bool,
 ) -> Result<CleanupResult, std::io::Error> {
-    let used_uuids: HashSet<String> = manifest
-        .patches
-        .values()
-        .map(|r| r.uuid.clone())
-        .collect();
-
-    if tokio::fs::metadata(archives_dir).await.is_err() {
-        return Ok(CleanupResult {
-            blobs_checked: 0,
-            blobs_removed: 0,
-            bytes_freed: 0,
-            removed_blobs: vec![],
-        });
-    }
-
-    let mut read_dir = tokio::fs::read_dir(archives_dir).await?;
-    let mut entries = Vec::new();
-    while let Some(entry) = read_dir.next_entry().await? {
-        entries.push(entry);
-    }
-
-    let mut result = CleanupResult {
-        blobs_checked: entries.len(),
-        blobs_removed: 0,
-        bytes_freed: 0,
-        removed_blobs: vec![],
-    };
-
-    for entry in &entries {
-        let file_name = entry.file_name();
-        let file_name_str = file_name.to_string_lossy().to_string();
-        if file_name_str.starts_with('.') {
-            continue;
-        }
-        let archive_path = archives_dir.join(&file_name_str);
-        let metadata = tokio::fs::metadata(&archive_path).await?;
-        if !metadata.is_file() {
-            continue;
-        }
-        // Strip the .tar.gz suffix to recover the UUID; if it doesn't end
-        // in .tar.gz, treat the entry as orphaned and remove it.
-        let uuid_part = file_name_str
-            .strip_suffix(".tar.gz")
-            .unwrap_or(&file_name_str);
-        if used_uuids.contains(uuid_part) {
-            continue;
-        }
-        result.blobs_removed += 1;
-        result.bytes_freed += metadata.len();
-        result.removed_blobs.push(file_name_str);
-        if !dry_run {
-            tokio::fs::remove_file(&archive_path).await?;
-        }
-    }
-
-    Ok(result)
+    let used_uuids: HashSet<String> =
+        manifest.patches.values().map(|r| r.uuid.clone()).collect();
+    cleanup_dir(archives_dir, dry_run, |name| {
+        // Strip the .tar.gz suffix to recover the UUID; if it doesn't
+        // end in .tar.gz, treat the entry as orphaned (not "used").
+        let uuid_part = name.strip_suffix(".tar.gz").unwrap_or(name);
+        used_uuids.contains(uuid_part)
+    })
+    .await
 }
 
 /// Formats the cleanup result for human-readable output.

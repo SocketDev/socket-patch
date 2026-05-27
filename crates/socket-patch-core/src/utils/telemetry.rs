@@ -359,6 +359,44 @@ pub async fn track_patch_event(options: TrackPatchEventOptions) {
 // convenient (callers typically have `Option<String>` and call `.as_deref()`).
 // ---------------------------------------------------------------------------
 
+/// Convert a `serde_json::json!({...})` object into the `HashMap` that
+/// [`TrackPatchEventOptions::metadata`] expects, swallowing the conversion
+/// to avoid `.unwrap()` noise at every call site.
+fn metadata_from_json(value: serde_json::Value) -> Option<HashMap<String, serde_json::Value>> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                None
+            } else {
+                Some(map.into_iter().collect())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Shared fire-and-forget helper for the per-event tracker wrappers below.
+/// Centralizes the `String::from` plumbing for the four optional fields
+/// that every tracker shares.
+async fn fire(
+    event_type: PatchTelemetryEventType,
+    command: &'static str,
+    metadata: serde_json::Value,
+    error: Option<impl std::fmt::Display>,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    track_patch_event(TrackPatchEventOptions {
+        event_type,
+        command: command.to_string(),
+        metadata: metadata_from_json(metadata),
+        error: error.map(|e| ("Error".to_string(), e.to_string())),
+        api_token: api_token.map(String::from),
+        org_slug: org_slug.map(String::from),
+    })
+    .await;
+}
+
 /// Track a successful patch application.
 pub async fn track_patch_applied(
     patches_count: usize,
@@ -366,21 +404,14 @@ pub async fn track_patch_applied(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "patches_count".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(patches_count)),
-    );
-    metadata.insert("dry_run".to_string(), serde_json::Value::Bool(dry_run));
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchApplied,
-        command: "apply".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchApplied,
+        "apply",
+        serde_json::json!({ "patches_count": patches_count, "dry_run": dry_run }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -394,17 +425,14 @@ pub async fn track_patch_apply_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert("dry_run".to_string(), serde_json::Value::Bool(dry_run));
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchApplyFailed,
-        command: "apply".to_string(),
-        metadata: Some(metadata),
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchApplyFailed,
+        "apply",
+        serde_json::json!({ "dry_run": dry_run }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -414,39 +442,31 @@ pub async fn track_patch_removed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "removed_count".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(removed_count)),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRemoved,
-        command: "remove".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRemoved,
+        "remove",
+        serde_json::json!({ "removed_count": removed_count }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
-/// Track a failed patch removal.
-///
-/// Accepts any `Display` type for the error.
+/// Track a failed patch removal. Accepts any `Display` type for the error.
 pub async fn track_patch_remove_failed(
     error: impl std::fmt::Display,
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRemoveFailed,
-        command: "remove".to_string(),
-        metadata: None,
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRemoveFailed,
+        "remove",
+        serde_json::Value::Null,
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -456,39 +476,31 @@ pub async fn track_patch_rolled_back(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "rolled_back_count".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(rolled_back_count)),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRolledBack,
-        command: "rollback".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRolledBack,
+        "rollback",
+        serde_json::json!({ "rolled_back_count": rolled_back_count }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
-/// Track a failed patch rollback.
-///
-/// Accepts any `Display` type for the error.
+/// Track a failed patch rollback. Accepts any `Display` type for the error.
 pub async fn track_patch_rollback_failed(
     error: impl std::fmt::Display,
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRollbackFailed,
-        command: "rollback".to_string(),
-        metadata: None,
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRollbackFailed,
+        "rollback",
+        serde_json::Value::Null,
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -516,45 +528,21 @@ pub async fn track_patch_scanned(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "packages_scanned".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(packages_scanned)),
-    );
-    metadata.insert(
-        "free_patches".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(free_patches)),
-    );
-    metadata.insert(
-        "paid_patches".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(paid_patches)),
-    );
-    metadata.insert(
-        "can_access_paid".to_string(),
-        serde_json::Value::Bool(can_access_paid),
-    );
-    metadata.insert(
-        "ecosystems".to_string(),
-        serde_json::Value::Array(
-            ecosystems
-                .iter()
-                .map(|e| serde_json::Value::String(e.clone()))
-                .collect(),
-        ),
-    );
-    metadata.insert(
-        "fallback_to_proxy".to_string(),
-        serde_json::Value::Bool(fallback_to_proxy),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchScanned,
-        command: "scan".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchScanned,
+        "scan",
+        serde_json::json!({
+            "packages_scanned": packages_scanned,
+            "free_patches": free_patches,
+            "paid_patches": paid_patches,
+            "can_access_paid": can_access_paid,
+            "ecosystems": ecosystems,
+            "fallback_to_proxy": fallback_to_proxy,
+        }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -565,20 +553,14 @@ pub async fn track_patch_scan_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "fallback_to_proxy".to_string(),
-        serde_json::Value::Bool(fallback_to_proxy),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchScanFailed,
-        command: "scan".to_string(),
-        metadata: Some(metadata),
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchScanFailed,
+        "scan",
+        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -594,36 +576,20 @@ pub async fn track_patch_fetched(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "uuid".to_string(),
-        serde_json::Value::String(uuid.to_string()),
-    );
-    metadata.insert(
-        "tier".to_string(),
-        serde_json::Value::String(tier.to_string()),
-    );
-    metadata.insert(
-        "ecosystem".to_string(),
-        serde_json::Value::String(ecosystem.to_string()),
-    );
-    metadata.insert(
-        "download_mode".to_string(),
-        serde_json::Value::String(download_mode.to_string()),
-    );
-    metadata.insert(
-        "fallback_to_proxy".to_string(),
-        serde_json::Value::Bool(fallback_to_proxy),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchFetched,
-        command: "get".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchFetched,
+        "get",
+        serde_json::json!({
+            "uuid": uuid,
+            "tier": tier,
+            "ecosystem": ecosystem,
+            "download_mode": download_mode,
+            "fallback_to_proxy": fallback_to_proxy,
+        }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -636,24 +602,14 @@ pub async fn track_patch_fetch_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "uuid".to_string(),
-        serde_json::Value::String(uuid.to_string()),
-    );
-    metadata.insert(
-        "fallback_to_proxy".to_string(),
-        serde_json::Value::Bool(fallback_to_proxy),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchFetchFailed,
-        command: "get".to_string(),
-        metadata: Some(metadata),
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchFetchFailed,
+        "get",
+        serde_json::json!({ "uuid": uuid, "fallback_to_proxy": fallback_to_proxy }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -667,20 +623,14 @@ pub async fn track_patch_listed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "patches_count".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(patches_count)),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchListed,
-        command: "list".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchListed,
+        "list",
+        serde_json::json!({ "patches_count": patches_count }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -692,28 +642,18 @@ pub async fn track_patch_repaired(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "blobs_added".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(blobs_added)),
-    );
-    metadata.insert(
-        "blobs_removed".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(blobs_removed)),
-    );
-    metadata.insert(
-        "bytes_freed".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(bytes_freed)),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRepaired,
-        command: "repair".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRepaired,
+        "repair",
+        serde_json::json!({
+            "blobs_added": blobs_added,
+            "blobs_removed": blobs_removed,
+            "bytes_freed": bytes_freed,
+        }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -723,14 +663,14 @@ pub async fn track_patch_repair_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchRepairFailed,
-        command: "repair".to_string(),
-        metadata: None,
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchRepairFailed,
+        "repair",
+        serde_json::Value::Null,
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -741,20 +681,14 @@ pub async fn track_patch_setup(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "manager".to_string(),
-        serde_json::Value::String(manager.to_string()),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchSetup,
-        command: "setup".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchSetup,
+        "setup",
+        serde_json::json!({ "manager": manager }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -767,18 +701,14 @@ pub async fn track_patch_unlocked(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert("was_held".to_string(), serde_json::Value::Bool(was_held));
-    metadata.insert("released".to_string(), serde_json::Value::Bool(released));
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchUnlocked,
-        command: "unlock".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchUnlocked,
+        "unlock",
+        serde_json::json!({ "was_held": was_held, "released": released }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -788,14 +718,14 @@ pub async fn track_patch_unlock_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::PatchUnlockFailed,
-        command: "unlock".to_string(),
-        metadata: None,
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::PatchUnlockFailed,
+        "unlock",
+        serde_json::Value::Null,
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -812,28 +742,18 @@ pub async fn track_vex_generated(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        "advisories_count".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(advisories_count)),
-    );
-    metadata.insert(
-        "format".to_string(),
-        serde_json::Value::String(format.to_string()),
-    );
-    metadata.insert(
-        "output_kind".to_string(),
-        serde_json::Value::String(output_kind.to_string()),
-    );
-
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::VexGenerated,
-        command: "vex".to_string(),
-        metadata: Some(metadata),
-        error: None,
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::VexGenerated,
+        "vex",
+        serde_json::json!({
+            "advisories_count": advisories_count,
+            "format": format,
+            "output_kind": output_kind,
+        }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
@@ -843,14 +763,14 @@ pub async fn track_vex_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    track_patch_event(TrackPatchEventOptions {
-        event_type: PatchTelemetryEventType::VexFailed,
-        command: "vex".to_string(),
-        metadata: None,
-        error: Some(("Error".to_string(), error.to_string())),
-        api_token: api_token.map(|s| s.to_string()),
-        org_slug: org_slug.map(|s| s.to_string()),
-    })
+    fire(
+        PatchTelemetryEventType::VexFailed,
+        "vex",
+        serde_json::Value::Null,
+        Some(error),
+        api_token,
+        org_slug,
+    )
     .await;
 }
 
