@@ -1,0 +1,2 @@
+[target.aarch64-linux-android]
+image = "ghcr.io/cross-rs/aarch64-linux-android@sha256:2c8b8d97bfd7b0079679973085c69ce30741093f675565eb47eb15c2d59f6336"
