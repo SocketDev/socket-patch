@@ -54,7 +54,7 @@ pub struct BlobFetchResult {
 }
 
 /// Aggregate result of a blob-fetch operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FetchMissingBlobsResult {
     pub total: usize,
     pub downloaded: usize,
@@ -114,38 +114,42 @@ pub async fn fetch_missing_blobs(
     let missing = get_missing_blobs(manifest, blobs_path).await;
 
     if missing.is_empty() {
-        return FetchMissingBlobsResult {
-            total: 0,
-            downloaded: 0,
-            failed: 0,
-            skipped: 0,
-            results: Vec::new(),
-        };
+        return FetchMissingBlobsResult::default();
     }
 
     // Ensure blobs directory exists
     if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        // If we cannot create the directory, every blob will fail.
-        let results: Vec<BlobFetchResult> = missing
-            .iter()
-            .map(|h| BlobFetchResult {
-                hash: h.clone(),
-                success: false,
-                error: Some(format!("Cannot create blobs directory: {}", e)),
-            })
-            .collect();
-        let failed = results.len();
-        return FetchMissingBlobsResult {
-            total: failed,
-            downloaded: 0,
-            failed,
-            skipped: 0,
-            results,
-        };
+        return all_failed_result(missing.iter(), |h| {
+            (h.clone(), format!("Cannot create blobs directory: {}", e))
+        });
     }
 
     let hashes: Vec<String> = missing.into_iter().collect();
     download_hashes(&hashes, blobs_path, client, on_progress).await
+}
+
+/// Build a [`FetchMissingBlobsResult`] whose entries are all failures
+/// for the same reason. Used by the early-return branches that hit a
+/// blocker (e.g. cannot create blobs dir) before any download attempt.
+fn all_failed_result<'a, I, F>(items: I, mut into_pair: F) -> FetchMissingBlobsResult
+where
+    I: IntoIterator<Item = &'a String>,
+    F: FnMut(&'a String) -> (String, String),
+{
+    let results: Vec<BlobFetchResult> = items
+        .into_iter()
+        .map(|item| {
+            let (hash, error) = into_pair(item);
+            BlobFetchResult { hash, success: false, error: Some(error) }
+        })
+        .collect();
+    let failed = results.len();
+    FetchMissingBlobsResult {
+        total: failed,
+        failed,
+        results,
+        ..FetchMissingBlobsResult::default()
+    }
 }
 
 /// Download specific blobs identified by their hashes.
@@ -161,33 +165,14 @@ pub async fn fetch_blobs_by_hash(
     on_progress: Option<&OnProgress>,
 ) -> FetchMissingBlobsResult {
     if hashes.is_empty() {
-        return FetchMissingBlobsResult {
-            total: 0,
-            downloaded: 0,
-            failed: 0,
-            skipped: 0,
-            results: Vec::new(),
-        };
+        return FetchMissingBlobsResult::default();
     }
 
     // Ensure blobs directory exists
     if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        let results: Vec<BlobFetchResult> = hashes
-            .iter()
-            .map(|h| BlobFetchResult {
-                hash: h.clone(),
-                success: false,
-                error: Some(format!("Cannot create blobs directory: {}", e)),
-            })
-            .collect();
-        let failed = results.len();
-        return FetchMissingBlobsResult {
-            total: failed,
-            downloaded: 0,
-            failed,
-            skipped: 0,
-            results,
-        };
+        return all_failed_result(hashes.iter(), |h| {
+            (h.clone(), format!("Cannot create blobs directory: {}", e))
+        });
     }
 
     // Filter out hashes that already exist on disk
@@ -281,7 +266,7 @@ pub async fn fetch_missing_sources(
                 fetch_missing_archives_inner(manifest, dir, ArchiveKind::Diff, client, on_progress)
                     .await
             }
-            None => empty_result(),
+            None => FetchMissingBlobsResult::default(),
         },
         DownloadMode::Package => match sources.packages_path {
             Some(dir) => fetch_missing_archives_inner(
@@ -292,7 +277,7 @@ pub async fn fetch_missing_sources(
                 on_progress,
             )
             .await,
-            None => empty_result(),
+            None => FetchMissingBlobsResult::default(),
         },
     }
 }
@@ -301,16 +286,6 @@ pub async fn fetch_missing_sources(
 enum ArchiveKind {
     Diff,
     Package,
-}
-
-fn empty_result() -> FetchMissingBlobsResult {
-    FetchMissingBlobsResult {
-        total: 0,
-        downloaded: 0,
-        failed: 0,
-        skipped: 0,
-        results: Vec::new(),
-    }
 }
 
 async fn fetch_missing_archives_inner(
@@ -322,26 +297,13 @@ async fn fetch_missing_archives_inner(
 ) -> FetchMissingBlobsResult {
     let missing = get_missing_archives(manifest, archives_dir).await;
     if missing.is_empty() {
-        return empty_result();
+        return FetchMissingBlobsResult::default();
     }
 
     if let Err(e) = tokio::fs::create_dir_all(archives_dir).await {
-        let results: Vec<BlobFetchResult> = missing
-            .iter()
-            .map(|u| BlobFetchResult {
-                hash: u.clone(),
-                success: false,
-                error: Some(format!("Cannot create archives directory: {}", e)),
-            })
-            .collect();
-        let failed = results.len();
-        return FetchMissingBlobsResult {
-            total: failed,
-            downloaded: 0,
-            failed,
-            skipped: 0,
-            results,
-        };
+        return all_failed_result(missing.iter(), |u| {
+            (u.clone(), format!("Cannot create archives directory: {}", e))
+        });
     }
 
     let uuids: Vec<String> = missing.into_iter().collect();

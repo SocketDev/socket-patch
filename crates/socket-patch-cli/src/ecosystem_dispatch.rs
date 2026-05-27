@@ -29,13 +29,9 @@ use socket_patch_core::crawlers::DenoCrawler;
 /// recovery — the user has to re-download the jar.
 #[cfg(feature = "maven")]
 fn maven_runtime_enabled() -> bool {
-    std::env::var("SOCKET_EXPERIMENTAL_MAVEN")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env_truthy("SOCKET_EXPERIMENTAL_MAVEN")
 }
 
-/// One-line stderr warning for the "Maven patches present, but
-/// experimental gate is off" path.
 #[cfg(feature = "maven")]
 fn warn_maven_disabled(skipped: usize) {
     eprintln!(
@@ -46,24 +42,18 @@ fn warn_maven_disabled(skipped: usize) {
     eprintln!("  Set SOCKET_EXPERIMENTAL_MAVEN=1 to enable at your own risk.");
 }
 
-/// Runtime opt-in gate for experimental NuGet support.
-///
-/// Same shape as the Maven gate. Even with the sidecar fixup
-/// deleting `.nupkg.metadata`, signed packages still carry a
-/// `.nupkg.sha512` marker that NuGet treats as tamper-evidence
-/// at restore time. The fixup cannot honestly rewrite this
-/// without the original `.nupkg` (which we don't have post-
-/// extraction). Refuse to dispatch unless the operator has
-/// explicitly opted in to the experimental tier.
+/// Runtime opt-in gate for experimental NuGet support. Same shape as
+/// the Maven gate. Even with the sidecar fixup deleting
+/// `.nupkg.metadata`, signed packages still carry a `.nupkg.sha512`
+/// marker that NuGet treats as tamper-evidence at restore time. The
+/// fixup cannot honestly rewrite this without the original `.nupkg`
+/// (which we don't have post-extraction). Refuse to dispatch unless
+/// the operator has explicitly opted in to the experimental tier.
 #[cfg(feature = "nuget")]
 fn nuget_runtime_enabled() -> bool {
-    std::env::var("SOCKET_EXPERIMENTAL_NUGET")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env_truthy("SOCKET_EXPERIMENTAL_NUGET")
 }
 
-/// One-line stderr warning for the "NuGet patches present, but
-/// experimental gate is off" path.
 #[cfg(feature = "nuget")]
 fn warn_nuget_disabled(skipped: usize) {
     eprintln!(
@@ -75,13 +65,19 @@ fn warn_nuget_disabled(skipped: usize) {
     eprintln!("  Set SOCKET_EXPERIMENTAL_NUGET=1 to enable at your own risk.");
 }
 
+#[cfg(any(feature = "maven", feature = "nuget"))]
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Partition PURLs by ecosystem, filtering by the `--ecosystems` flag if set.
 pub fn partition_purls(
     purls: &[String],
     allowed_ecosystems: Option<&[String]>,
 ) -> HashMap<Ecosystem, Vec<String>> {
     let mut map: HashMap<Ecosystem, Vec<String>> = HashMap::new();
-
     for purl in purls {
         if let Some(eco) = Ecosystem::from_purl(purl) {
             if let Some(allowed) = allowed_ecosystems {
@@ -92,8 +88,283 @@ pub fn partition_purls(
             map.entry(eco).or_default().push(purl.clone());
         }
     }
-
     map
+}
+
+/// Standard scan-one-ecosystem pattern: discover source paths, run
+/// `find_by_purls` on each, and merge results into `$out` keyed by PURL
+/// (first wins). Used by every ecosystem except pypi (which dedups
+/// PURLs and, on rollback, remaps base PURLs back to qualified ones).
+///
+/// `$using_label` is the noun in "Using <X> at: <path>" for global
+/// scans; pass `""` to suppress that line.
+macro_rules! scan_ecosystem {
+    (
+        out = $out:ident,
+        partitioned = $partitioned:expr,
+        eco = $eco:expr,
+        options = $options:expr,
+        silent = $silent:expr,
+        crawler = $crawler:expr,
+        get_paths = $get_paths:ident,
+        using_label = $using_label:expr,
+        err_label = $err_label:expr,
+        purls_override = $purls_override:expr,
+        on_match = $on_match:expr $(,)?
+    ) => {{
+        if let Some(purls) = $partitioned.get(&$eco) {
+            if !purls.is_empty() {
+                let crawler = $crawler;
+                let purls_to_use: Vec<String> = $purls_override(purls);
+                match crawler.$get_paths($options).await {
+                    Ok(paths) => {
+                        let using: &str = $using_label;
+                        if !using.is_empty()
+                            && ($options.global || $options.global_prefix.is_some())
+                            && !$silent
+                        {
+                            if let Some(first) = paths.first() {
+                                println!("Using {} at: {}", using, first.display());
+                            }
+                        }
+                        for path in &paths {
+                            match crawler.find_by_purls(path, &purls_to_use).await {
+                                Ok(packages) => {
+                                    $on_match(&mut $out, purls, packages);
+                                }
+                                Err(e) => {
+                                    if !$silent {
+                                        eprintln!(
+                                            "Warning: Failed to scan {}: {}",
+                                            path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if !$silent {
+                            eprintln!("Failed to find {}: {}", $err_label, e);
+                        }
+                    }
+                }
+            }
+        }
+    }};
+}
+
+/// Default merge: insert the crawler-returned PURL → first wins.
+fn merge_first_wins(
+    out: &mut HashMap<String, PathBuf>,
+    _purls: &[String],
+    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+) {
+    for (purl, pkg) in packages {
+        out.entry(purl).or_insert(pkg.path);
+    }
+}
+
+/// Pypi rollback merge: the crawler is queried with base PURLs (no
+/// `?qualifiers`); fan the resulting paths back out to every qualified
+/// caller-supplied PURL that strips to the same base.
+fn merge_pypi_qualified(
+    out: &mut HashMap<String, PathBuf>,
+    purls: &[String],
+    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+) {
+    for (base_purl, pkg) in packages {
+        for qualified in purls {
+            if strip_purl_qualifiers(qualified) == base_purl
+                && !out.contains_key(qualified)
+            {
+                out.insert(qualified.clone(), pkg.path.clone());
+            }
+        }
+    }
+}
+
+fn dedup_pypi_purls(purls: &[String]) -> Vec<String> {
+    purls
+        .iter()
+        .map(|p| strip_purl_qualifiers(p).to_string())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn passthrough_purls(purls: &[String]) -> Vec<String> {
+    purls.to_vec()
+}
+
+/// Drive every enabled ecosystem's find-by-purls path, accumulating
+/// into one `purl -> path` map.
+///
+/// `pypi_merge` lets the rollback variant fan a single crawler result
+/// out to every caller-supplied qualified PURL; everything else just
+/// inserts the crawler-returned PURL with first-wins semantics.
+async fn dispatch_find(
+    partitioned: &HashMap<Ecosystem, Vec<String>>,
+    options: &CrawlerOptions,
+    silent: bool,
+    pypi_merge: fn(
+        &mut HashMap<String, PathBuf>,
+        &[String],
+        HashMap<String, CrawledPackage>,
+    ),
+) -> HashMap<String, PathBuf> {
+    let mut out: HashMap<String, PathBuf> = HashMap::new();
+
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Npm,
+        options = options,
+        silent = silent,
+        crawler = NpmCrawler,
+        get_paths = get_node_modules_paths,
+        using_label = "global npm packages",
+        err_label = "npm packages",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Pypi,
+        options = options,
+        silent = silent,
+        crawler = PythonCrawler,
+        get_paths = get_site_packages_paths,
+        using_label = "",
+        err_label = "Python packages",
+        purls_override = dedup_pypi_purls,
+        on_match = pypi_merge,
+    );
+
+    #[cfg(feature = "cargo")]
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Cargo,
+        options = options,
+        silent = silent,
+        crawler = CargoCrawler,
+        get_paths = get_crate_source_paths,
+        using_label = "cargo crate sources",
+        err_label = "Cargo crates",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Gem,
+        options = options,
+        silent = silent,
+        crawler = RubyCrawler,
+        get_paths = get_gem_paths,
+        using_label = "ruby gem paths",
+        err_label = "Ruby gems",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    #[cfg(feature = "golang")]
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Golang,
+        options = options,
+        silent = silent,
+        crawler = GoCrawler,
+        get_paths = get_module_cache_paths,
+        using_label = "Go module cache",
+        err_label = "Go modules",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    #[cfg(feature = "maven")]
+    if let Some(maven_purls) = partitioned.get(&Ecosystem::Maven) {
+        if !maven_purls.is_empty() && !maven_runtime_enabled() {
+            if !silent {
+                warn_maven_disabled(maven_purls.len());
+            }
+        } else {
+            scan_ecosystem!(
+                out = out,
+                partitioned = partitioned,
+                eco = Ecosystem::Maven,
+                options = options,
+                silent = silent,
+                crawler = MavenCrawler,
+                get_paths = get_maven_repo_paths,
+                using_label = "Maven repository",
+                err_label = "Maven packages",
+                purls_override = passthrough_purls,
+                on_match = merge_first_wins,
+            );
+        }
+    }
+
+    #[cfg(feature = "composer")]
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Composer,
+        options = options,
+        silent = silent,
+        crawler = ComposerCrawler,
+        get_paths = get_vendor_paths,
+        using_label = "PHP vendor packages",
+        err_label = "PHP packages",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    #[cfg(feature = "nuget")]
+    if let Some(nuget_purls) = partitioned.get(&Ecosystem::Nuget) {
+        if !nuget_purls.is_empty() && !nuget_runtime_enabled() {
+            if !silent {
+                warn_nuget_disabled(nuget_purls.len());
+            }
+        } else {
+            scan_ecosystem!(
+                out = out,
+                partitioned = partitioned,
+                eco = Ecosystem::Nuget,
+                options = options,
+                silent = silent,
+                crawler = NuGetCrawler,
+                get_paths = get_nuget_package_paths,
+                using_label = "NuGet packages",
+                err_label = "NuGet packages",
+                purls_override = passthrough_purls,
+                on_match = merge_first_wins,
+            );
+        }
+    }
+
+    #[cfg(feature = "deno")]
+    scan_ecosystem!(
+        out = out,
+        partitioned = partitioned,
+        eco = Ecosystem::Deno,
+        options = options,
+        silent = silent,
+        crawler = DenoCrawler,
+        get_paths = get_jsr_cache_paths,
+        using_label = "Deno JSR cache",
+        err_label = "Deno JSR packages",
+        purls_override = passthrough_purls,
+        on_match = merge_first_wins,
+    );
+
+    out
 }
 
 /// For each ecosystem in the partitioned map, create the crawler, discover
@@ -104,419 +375,7 @@ pub async fn find_packages_for_purls(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    let mut all_packages: HashMap<String, PathBuf> = HashMap::new();
-
-    // npm
-    if let Some(npm_purls) = partitioned.get(&Ecosystem::Npm) {
-        if !npm_purls.is_empty() {
-            let npm_crawler = NpmCrawler;
-            match npm_crawler.get_node_modules_paths(options).await {
-                Ok(nm_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = nm_paths.first() {
-                            println!("Using global npm packages at: {}", first.display());
-                        }
-                    }
-                    for nm_path in &nm_paths {
-                        match npm_crawler.find_by_purls(nm_path, npm_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", nm_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find npm packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // pypi — deduplicate by base PURL (stripping qualifiers)
-    if let Some(pypi_purls) = partitioned.get(&Ecosystem::Pypi) {
-        if !pypi_purls.is_empty() {
-            let python_crawler = PythonCrawler;
-            let base_pypi_purls: Vec<String> = pypi_purls
-                .iter()
-                .map(|p| strip_purl_qualifiers(p).to_string())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            match python_crawler.get_site_packages_paths(options).await {
-                Ok(sp_paths) => {
-                    for sp_path in &sp_paths {
-                        match python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", sp_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Python packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // cargo
-    #[cfg(feature = "cargo")]
-    if let Some(cargo_purls) = partitioned.get(&Ecosystem::Cargo) {
-        if !cargo_purls.is_empty() {
-            let cargo_crawler = CargoCrawler;
-            match cargo_crawler.get_crate_source_paths(options).await {
-                Ok(src_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = src_paths.first() {
-                            println!("Using cargo crate sources at: {}", first.display());
-                        }
-                    }
-                    for src_path in &src_paths {
-                        match cargo_crawler.find_by_purls(src_path, cargo_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", src_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Cargo crates: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // gem
-    if let Some(gem_purls) = partitioned.get(&Ecosystem::Gem) {
-        if !gem_purls.is_empty() {
-            let ruby_crawler = RubyCrawler;
-            match ruby_crawler.get_gem_paths(options).await {
-                Ok(gem_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = gem_paths.first() {
-                            println!("Using ruby gem paths at: {}", first.display());
-                        }
-                    }
-                    for gem_path in &gem_paths {
-                        match ruby_crawler.find_by_purls(gem_path, gem_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", gem_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Ruby gems: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // golang
-    #[cfg(feature = "golang")]
-    if let Some(golang_purls) = partitioned.get(&Ecosystem::Golang) {
-        if !golang_purls.is_empty() {
-            let go_crawler = GoCrawler;
-            match go_crawler.get_module_cache_paths(options).await {
-                Ok(cache_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = cache_paths.first() {
-                            println!("Using Go module cache at: {}", first.display());
-                        }
-                    }
-                    for cache_path in &cache_paths {
-                        match go_crawler.find_by_purls(cache_path, golang_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Go modules: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // maven — experimental, double-gated. See `maven_runtime_enabled`.
-    #[cfg(feature = "maven")]
-    if let Some(maven_purls) = partitioned.get(&Ecosystem::Maven) {
-        if !maven_purls.is_empty() && !maven_runtime_enabled() {
-            if !silent {
-                warn_maven_disabled(maven_purls.len());
-            }
-        } else if !maven_purls.is_empty() {
-            let maven_crawler = MavenCrawler;
-            match maven_crawler.get_maven_repo_paths(options).await {
-                Ok(repo_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = repo_paths.first() {
-                            println!("Using Maven repository at: {}", first.display());
-                        }
-                    }
-                    for repo_path in &repo_paths {
-                        match maven_crawler.find_by_purls(repo_path, maven_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", repo_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Maven packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // composer
-    #[cfg(feature = "composer")]
-    if let Some(composer_purls) = partitioned.get(&Ecosystem::Composer) {
-        if !composer_purls.is_empty() {
-            let composer_crawler = ComposerCrawler;
-            match composer_crawler.get_vendor_paths(options).await {
-                Ok(vendor_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = vendor_paths.first() {
-                            println!("Using PHP vendor packages at: {}", first.display());
-                        }
-                    }
-                    for vendor_path in &vendor_paths {
-                        match composer_crawler.find_by_purls(vendor_path, composer_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", vendor_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find PHP packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // nuget — experimental, double-gated. See `nuget_runtime_enabled`.
-    #[cfg(feature = "nuget")]
-    if let Some(nuget_purls) = partitioned.get(&Ecosystem::Nuget) {
-        if !nuget_purls.is_empty() && !nuget_runtime_enabled() {
-            if !silent {
-                warn_nuget_disabled(nuget_purls.len());
-            }
-        } else if !nuget_purls.is_empty() {
-            let nuget_crawler = NuGetCrawler;
-            match nuget_crawler.get_nuget_package_paths(options).await {
-                Ok(pkg_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = pkg_paths.first() {
-                            println!("Using NuGet packages at: {}", first.display());
-                        }
-                    }
-                    for pkg_path in &pkg_paths {
-                        match nuget_crawler.find_by_purls(pkg_path, nuget_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", pkg_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find NuGet packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // deno — JSR registry packages cached under DENO_DIR/npm/jsr.io/.
-    #[cfg(feature = "deno")]
-    if let Some(deno_purls) = partitioned.get(&Ecosystem::Deno) {
-        if !deno_purls.is_empty() {
-            let deno_crawler = DenoCrawler;
-            match deno_crawler.get_jsr_cache_paths(options).await {
-                Ok(cache_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = cache_paths.first() {
-                            println!("Using Deno JSR cache at: {}", first.display());
-                        }
-                    }
-                    for cache_path in &cache_paths {
-                        match deno_crawler.find_by_purls(cache_path, deno_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Deno JSR packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    all_packages
-}
-
-/// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.
-pub async fn crawl_all_ecosystems(
-    options: &CrawlerOptions,
-) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>) {
-    let mut all_packages = Vec::new();
-    let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
-
-    let npm_crawler = NpmCrawler;
-    let npm_packages = npm_crawler.crawl_all(options).await;
-    counts.insert(Ecosystem::Npm, npm_packages.len());
-    all_packages.extend(npm_packages);
-
-    let python_crawler = PythonCrawler;
-    let python_packages = python_crawler.crawl_all(options).await;
-    counts.insert(Ecosystem::Pypi, python_packages.len());
-    all_packages.extend(python_packages);
-
-    #[cfg(feature = "cargo")]
-    {
-        let cargo_crawler = CargoCrawler;
-        let cargo_packages = cargo_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Cargo, cargo_packages.len());
-        all_packages.extend(cargo_packages);
-    }
-
-    {
-        let ruby_crawler = RubyCrawler;
-        let gem_packages = ruby_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Gem, gem_packages.len());
-        all_packages.extend(gem_packages);
-    }
-
-    #[cfg(feature = "golang")]
-    {
-        let go_crawler = GoCrawler;
-        let go_packages = go_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Golang, go_packages.len());
-        all_packages.extend(go_packages);
-    }
-
-    #[cfg(feature = "maven")]
-    if maven_runtime_enabled() {
-        // Same runtime gate as `find_packages_for_purls` — `scan`
-        // walks the Maven repo only when the operator has explicitly
-        // opted into experimental support.
-        let maven_crawler = MavenCrawler;
-        let maven_packages = maven_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Maven, maven_packages.len());
-        all_packages.extend(maven_packages);
-    }
-
-    #[cfg(feature = "composer")]
-    {
-        let composer_crawler = ComposerCrawler;
-        let composer_packages = composer_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Composer, composer_packages.len());
-        all_packages.extend(composer_packages);
-    }
-
-    #[cfg(feature = "nuget")]
-    if nuget_runtime_enabled() {
-        // Same runtime gate as `find_packages_for_purls`.
-        let nuget_crawler = NuGetCrawler;
-        let nuget_packages = nuget_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Nuget, nuget_packages.len());
-        all_packages.extend(nuget_packages);
-    }
-
-    #[cfg(feature = "deno")]
-    {
-        let deno_crawler = DenoCrawler;
-        let deno_packages = deno_crawler.crawl_all(options).await;
-        counts.insert(Ecosystem::Deno, deno_packages.len());
-        all_packages.extend(deno_packages);
-    }
-
-    (all_packages, counts)
+    dispatch_find(partitioned, options, silent, merge_first_wins).await
 }
 
 /// Variant of `find_packages_for_purls` for rollback, which needs to remap
@@ -527,304 +386,48 @@ pub async fn find_packages_for_rollback(
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    let mut all_packages: HashMap<String, PathBuf> = HashMap::new();
+    dispatch_find(partitioned, options, silent, merge_pypi_qualified).await
+}
 
-    // npm
-    if let Some(npm_purls) = partitioned.get(&Ecosystem::Npm) {
-        if !npm_purls.is_empty() {
-            let npm_crawler = NpmCrawler;
-            match npm_crawler.get_node_modules_paths(options).await {
-                Ok(nm_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = nm_paths.first() {
-                            println!("Using global npm packages at: {}", first.display());
-                        }
-                    }
-                    for nm_path in &nm_paths {
-                        match npm_crawler.find_by_purls(nm_path, npm_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", nm_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find npm packages: {e}");
-                    }
-                }
-            }
-        }
+/// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.
+pub async fn crawl_all_ecosystems(
+    options: &CrawlerOptions,
+) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>) {
+    let mut all_packages = Vec::new();
+    let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
+
+    macro_rules! crawl {
+        ($eco:expr, $crawler:expr) => {{
+            let pkgs = $crawler.crawl_all(options).await;
+            counts.insert($eco, pkgs.len());
+            all_packages.extend(pkgs);
+        }};
     }
 
-    // pypi — remap qualified PURLs to found base PURLs
-    if let Some(pypi_purls) = partitioned.get(&Ecosystem::Pypi) {
-        if !pypi_purls.is_empty() {
-            let python_crawler = PythonCrawler;
-            let base_pypi_purls: Vec<String> = pypi_purls
-                .iter()
-                .map(|p| strip_purl_qualifiers(p).to_string())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            if let Ok(sp_paths) = python_crawler.get_site_packages_paths(options).await {
-                for sp_path in &sp_paths {
-                    match python_crawler.find_by_purls(sp_path, &base_pypi_purls).await {
-                        Ok(packages) => {
-                            for (base_purl, pkg) in packages {
-                                for qualified_purl in pypi_purls {
-                                    if strip_purl_qualifiers(qualified_purl) == base_purl
-                                        && !all_packages.contains_key(qualified_purl)
-                                    {
-                                        all_packages
-                                            .insert(qualified_purl.clone(), pkg.path.clone());
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if !silent {
-                                eprintln!("Warning: Failed to scan {}: {}", sp_path.display(), e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // cargo
+    crawl!(Ecosystem::Npm, NpmCrawler);
+    crawl!(Ecosystem::Pypi, PythonCrawler);
     #[cfg(feature = "cargo")]
-    if let Some(cargo_purls) = partitioned.get(&Ecosystem::Cargo) {
-        if !cargo_purls.is_empty() {
-            let cargo_crawler = CargoCrawler;
-            match cargo_crawler.get_crate_source_paths(options).await {
-                Ok(src_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = src_paths.first() {
-                            println!("Using cargo crate sources at: {}", first.display());
-                        }
-                    }
-                    for src_path in &src_paths {
-                        match cargo_crawler.find_by_purls(src_path, cargo_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", src_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Cargo crates: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // gem
-    if let Some(gem_purls) = partitioned.get(&Ecosystem::Gem) {
-        if !gem_purls.is_empty() {
-            let ruby_crawler = RubyCrawler;
-            match ruby_crawler.get_gem_paths(options).await {
-                Ok(gem_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = gem_paths.first() {
-                            println!("Using ruby gem paths at: {}", first.display());
-                        }
-                    }
-                    for gem_path in &gem_paths {
-                        match ruby_crawler.find_by_purls(gem_path, gem_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", gem_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Ruby gems: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // golang
+    crawl!(Ecosystem::Cargo, CargoCrawler);
+    crawl!(Ecosystem::Gem, RubyCrawler);
     #[cfg(feature = "golang")]
-    if let Some(golang_purls) = partitioned.get(&Ecosystem::Golang) {
-        if !golang_purls.is_empty() {
-            let go_crawler = GoCrawler;
-            match go_crawler.get_module_cache_paths(options).await {
-                Ok(cache_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = cache_paths.first() {
-                            println!("Using Go module cache at: {}", first.display());
-                        }
-                    }
-                    for cache_path in &cache_paths {
-                        match go_crawler.find_by_purls(cache_path, golang_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", cache_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Go modules: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // maven — experimental, double-gated. See `maven_runtime_enabled`.
+    crawl!(Ecosystem::Golang, GoCrawler);
     #[cfg(feature = "maven")]
-    if let Some(maven_purls) = partitioned.get(&Ecosystem::Maven) {
-        if !maven_purls.is_empty() && !maven_runtime_enabled() {
-            if !silent {
-                warn_maven_disabled(maven_purls.len());
-            }
-        } else if !maven_purls.is_empty() {
-            let maven_crawler = MavenCrawler;
-            match maven_crawler.get_maven_repo_paths(options).await {
-                Ok(repo_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = repo_paths.first() {
-                            println!("Using Maven repository at: {}", first.display());
-                        }
-                    }
-                    for repo_path in &repo_paths {
-                        match maven_crawler.find_by_purls(repo_path, maven_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", repo_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find Maven packages: {e}");
-                    }
-                }
-            }
-        }
+    if maven_runtime_enabled() {
+        // Same runtime gate as `find_packages_for_purls` — `scan`
+        // walks the Maven repo only when the operator has explicitly
+        // opted into experimental support.
+        crawl!(Ecosystem::Maven, MavenCrawler);
     }
-
-    // composer
     #[cfg(feature = "composer")]
-    if let Some(composer_purls) = partitioned.get(&Ecosystem::Composer) {
-        if !composer_purls.is_empty() {
-            let composer_crawler = ComposerCrawler;
-            match composer_crawler.get_vendor_paths(options).await {
-                Ok(vendor_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = vendor_paths.first() {
-                            println!("Using PHP vendor packages at: {}", first.display());
-                        }
-                    }
-                    for vendor_path in &vendor_paths {
-                        match composer_crawler.find_by_purls(vendor_path, composer_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", vendor_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find PHP packages: {e}");
-                    }
-                }
-            }
-        }
-    }
-
-    // nuget — experimental, double-gated. See `nuget_runtime_enabled`.
+    crawl!(Ecosystem::Composer, ComposerCrawler);
     #[cfg(feature = "nuget")]
-    if let Some(nuget_purls) = partitioned.get(&Ecosystem::Nuget) {
-        if !nuget_purls.is_empty() && !nuget_runtime_enabled() {
-            if !silent {
-                warn_nuget_disabled(nuget_purls.len());
-            }
-        } else if !nuget_purls.is_empty() {
-            let nuget_crawler = NuGetCrawler;
-            match nuget_crawler.get_nuget_package_paths(options).await {
-                Ok(pkg_paths) => {
-                    if (options.global || options.global_prefix.is_some()) && !silent {
-                        if let Some(first) = pkg_paths.first() {
-                            println!("Using NuGet packages at: {}", first.display());
-                        }
-                    }
-                    for pkg_path in &pkg_paths {
-                        match nuget_crawler.find_by_purls(pkg_path, nuget_purls).await {
-                            Ok(packages) => {
-                                for (purl, pkg) in packages {
-                                    all_packages.entry(purl).or_insert(pkg.path);
-                                }
-                            }
-                            Err(e) => {
-                                if !silent {
-                                    eprintln!("Warning: Failed to scan {}: {}", pkg_path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !silent {
-                        eprintln!("Failed to find NuGet packages: {e}");
-                    }
-                }
-            }
-        }
+    if nuget_runtime_enabled() {
+        crawl!(Ecosystem::Nuget, NuGetCrawler);
     }
+    #[cfg(feature = "deno")]
+    crawl!(Ecosystem::Deno, DenoCrawler);
 
-    all_packages
+    (all_packages, counts)
 }
 
 #[cfg(test)]

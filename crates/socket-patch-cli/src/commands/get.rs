@@ -16,7 +16,7 @@ use socket_patch_core::utils::purl::is_purl;
 use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
@@ -159,6 +159,143 @@ fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
     }
 }
 
+/// Print a `serde_json::Value` as pretty JSON to stdout.
+fn print_json(v: &serde_json::Value) {
+    println!("{}", serde_json::to_string_pretty(v).unwrap());
+}
+
+/// Build a no-results JSON envelope with the given status code. Used in
+/// the `no_packages`, `no_match`, and `not_found` branches of `get`,
+/// which all share the same `{status, counts, patches: []}` shape.
+fn empty_result_json(status: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "found": 0,
+        "downloaded": 0,
+        "applied": 0,
+        "patches": [],
+    })
+}
+
+/// Fire a `patch_fetch_failed` telemetry event and surface the error to
+/// the caller (JSON envelope or stderr). Returns `1` so callers can
+/// just `return report_fetch_failure(...).await;`.
+async fn report_fetch_failure(
+    identifier: &str,
+    error: impl std::fmt::Display,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+    json: bool,
+) -> i32 {
+    let msg = error.to_string();
+    track_patch_fetch_failed(identifier, &msg, fallback_to_proxy, api_token, org_slug).await;
+    report_error(json, msg);
+    1
+}
+
+/// Report an error to the caller: a `{status, error}` envelope on
+/// stdout when `json` is true, otherwise a plain `Error: ...` on stderr.
+fn report_error(json: bool, message: impl std::fmt::Display) {
+    let message = message.to_string();
+    if json {
+        print_json(&serde_json::json!({"status": "error", "error": message}));
+    } else {
+        eprintln!("Error: {message}");
+    }
+}
+
+/// Decode a base64 string and write it to `blobs_dir/hash`. Returns a
+/// formatted error string referencing `file_path` and `label` on failure.
+async fn write_blob_entry(
+    blobs_dir: &Path,
+    b64: &str,
+    hash: &str,
+    file_path: &str,
+    label: &str,
+) -> Result<(), String> {
+    let decoded = base64_decode(b64)
+        .map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
+    tokio::fs::write(blobs_dir.join(hash), &decoded)
+        .await
+        .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))
+}
+
+/// Write every after/before blob for `patch` into `blobs_dir`, reporting
+/// per-file failures on stderr unless `quiet` is set. Returns `Err(())`
+/// on the first failure; callers handle the bookkeeping that follows.
+async fn write_all_patch_blobs(
+    blobs_dir: &Path,
+    patch: &PatchResponse,
+    quiet: bool,
+) -> Result<(), ()> {
+    for (file_path, file_info) in &patch.files {
+        if let (Some(blob), Some(hash)) =
+            (&file_info.blob_content, &file_info.after_hash)
+        {
+            if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, "blob").await {
+                if !quiet {
+                    eprintln!("  [error] {e}");
+                }
+                return Err(());
+            }
+        }
+        if let (Some(blob), Some(hash)) =
+            (&file_info.before_blob_content, &file_info.before_hash)
+        {
+            if let Err(e) =
+                write_blob_entry(blobs_dir, blob, hash, file_path, "before-blob").await
+            {
+                if !quiet {
+                    eprintln!("  [error] {e}");
+                }
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convert the API-shaped vulnerability map on `PatchResponse` into the
+/// serialization-shaped map stored in the manifest.
+fn vulnerabilities_for_manifest(
+    vulns: &HashMap<String, VulnerabilityResponse>,
+) -> HashMap<String, VulnerabilityInfo> {
+    vulns
+        .iter()
+        .map(|(id, v)| {
+            (
+                id.clone(),
+                VulnerabilityInfo {
+                    cves: v.cves.clone(),
+                    summary: v.summary.clone(),
+                    severity: v.severity.clone(),
+                    description: v.description.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Build the `PatchRecord` that will be inserted into the manifest for
+/// `patch`. `files` is the (purl-keyed) before/after-hash map the
+/// caller built — semantics for what counts as a "patchable file" differ
+/// between the get and download flows, so the caller owns that decision.
+fn build_patch_record(
+    patch: &PatchResponse,
+    files: HashMap<String, PatchFileInfo>,
+) -> PatchRecord {
+    PatchRecord {
+        uuid: patch.uuid.clone(),
+        exported_at: patch.published_at.clone(),
+        files,
+        vulnerabilities: vulnerabilities_for_manifest(&patch.vulnerabilities),
+        description: patch.description.clone(),
+        license: patch.license.clone(),
+        tier: patch.tier.clone(),
+    }
+}
+
 #[derive(Args)]
 pub struct GetArgs {
     /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name).
@@ -192,7 +329,7 @@ pub struct GetArgs {
     pub one_off: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum IdentifierType {
     Uuid,
     Cve,
@@ -394,26 +531,12 @@ pub async fn download_and_apply_patches(
 
     if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
         let err = format!("Failed to create .socket directory: {}", e);
-        if params.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": &err,
-            })).unwrap());
-        } else {
-            eprintln!("Error: {}", &err);
-        }
+        report_error(params.json, &err);
         return (1, serde_json::json!({"status": "error", "error": err}));
     }
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
         let err = format!("Failed to create blobs directory: {}", e);
-        if params.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": &err,
-            })).unwrap());
-        } else {
-            eprintln!("Error: {}", &err);
-        }
+        report_error(params.json, &err);
         return (1, serde_json::json!({"status": "error", "error": err}));
     }
 
@@ -469,11 +592,12 @@ pub async fn download_and_apply_patches(
                     continue;
                 }
 
-                // Save blob contents
-                let mut patch_failed = false;
+                // Build the manifest `files` map. Download flow requires
+                // BOTH before+after hash (skips new files); see
+                // `save_and_apply_patch` for the new-file-tolerant variant.
                 let mut files = HashMap::new();
                 for (file_path, file_info) in &patch.files {
-                    if let (Some(ref before), Some(ref after)) =
+                    if let (Some(before), Some(after)) =
                         (&file_info.before_hash, &file_info.after_hash)
                     {
                         files.insert(
@@ -484,57 +608,10 @@ pub async fn download_and_apply_patches(
                             },
                         );
                     }
-
-                    if let (Some(ref blob_content), Some(ref after_hash)) =
-                        (&file_info.blob_content, &file_info.after_hash)
-                    {
-                        match base64_decode(blob_content) {
-                            Ok(decoded) => {
-                                let blob_path = blobs_dir.join(after_hash);
-                                if let Err(e) = tokio::fs::write(&blob_path, &decoded).await {
-                                    if !params.json && !params.silent {
-                                        eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
-                                    }
-                                    patch_failed = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if !params.json && !params.silent {
-                                    eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
-                                }
-                                patch_failed = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    // Also store beforeHash blob if present (needed for rollback)
-                    if let (Some(ref before_blob), Some(ref before_hash)) =
-                        (&file_info.before_blob_content, &file_info.before_hash)
-                    {
-                        match base64_decode(before_blob) {
-                            Ok(decoded) => {
-                                if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
-                                    if !params.json && !params.silent {
-                                        eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
-                                    }
-                                    patch_failed = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                if !params.json && !params.silent {
-                                    eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
-                                }
-                                patch_failed = true;
-                                break;
-                            }
-                        }
-                    }
                 }
 
-                if patch_failed {
+                let quiet = params.json || params.silent;
+                if write_all_patch_blobs(&blobs_dir, &patch, quiet).await.is_err() {
                     patches_failed += 1;
                     downloaded_patches.push(serde_json::json!({
                         "purl": patch.purl,
@@ -545,34 +622,9 @@ pub async fn download_and_apply_patches(
                     continue;
                 }
 
-                let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
-                    .vulnerabilities
-                    .iter()
-                    .map(|(id, v)| {
-                        (
-                            id.clone(),
-                            VulnerabilityInfo {
-                                cves: v.cves.clone(),
-                                summary: v.summary.clone(),
-                                severity: v.severity.clone(),
-                                description: v.description.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-
-                manifest.patches.insert(
-                    patch.purl.clone(),
-                    PatchRecord {
-                        uuid: patch.uuid.clone(),
-                        exported_at: patch.published_at.clone(),
-                        files,
-                        vulnerabilities,
-                        description: patch.description.clone(),
-                        license: patch.license.clone(),
-                        tier: patch.tier.clone(),
-                    },
-                );
+                manifest
+                    .patches
+                    .insert(patch.purl.clone(), build_patch_record(&patch, files));
 
                 let mut action_record = match &action {
                     PatchAction::Updated { old_uuid } => {
@@ -634,14 +686,12 @@ pub async fn download_and_apply_patches(
 
     // Write manifest
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        let err_json = serde_json::json!({
-            "status": "error",
-            "error": format!("Error writing manifest: {e}"),
-        });
+        let msg = format!("Error writing manifest: {e}");
+        let err_json = serde_json::json!({ "status": "error", "error": &msg });
         if params.json {
-            println!("{}", serde_json::to_string_pretty(&err_json).unwrap());
+            print_json(&err_json);
         } else {
-            eprintln!("Error writing manifest: {e}");
+            eprintln!("{msg}");
         }
         return (1, err_json);
     }
@@ -707,22 +757,18 @@ pub async fn run(args: GetArgs) -> i32 {
         .filter(|&&f| f)
         .count();
     if type_flags > 1 {
-        if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "Only one of --id, --cve, --ghsa, or --package can be specified",
-            })).unwrap());
-        } else {
-            eprintln!("Error: Only one of --id, --cve, --ghsa, or --package can be specified");
-        }
+        report_error(
+            args.common.json,
+            "Only one of --id, --cve, --ghsa, or --package can be specified",
+        );
         return 1;
     }
     if args.one_off && args.save_only {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            print_json(&serde_json::json!({
                 "status": "error",
                 "error": "--one-off and --save-only cannot be used together",
-            })).unwrap());
+            }));
         } else {
             eprintln!("Error: --one-off and --save-only cannot be used together");
         }
@@ -805,7 +851,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     )
                     .await;
                     if args.common.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        print_json(&serde_json::json!({
                             "status": "paid_required",
                             "found": 1,
                             "downloaded": 0,
@@ -815,7 +861,7 @@ pub async fn run(args: GetArgs) -> i32 {
                                 "uuid": patch.uuid,
                                 "tier": "paid",
                             }],
-                        })).unwrap());
+                        }));
                     } else {
                         println!("\nThis patch requires a paid subscription to download.");
                         println!("\n  Patch: {}", patch.purl);
@@ -854,129 +900,70 @@ pub async fn run(args: GetArgs) -> i32 {
                 )
                 .await;
                 if args.common.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "not_found",
-                        "found": 0,
-                        "downloaded": 0,
-                        "applied": 0,
-                        "patches": [],
-                    })).unwrap());
+                    print_json(&empty_result_json("not_found"));
                 } else {
                     println!("No patch found with UUID: {}", args.identifier);
                 }
                 return 0;
             }
             Err(e) => {
-                track_patch_fetch_failed(
+                return report_fetch_failure(
                     &args.identifier,
-                    &e,
+                    e,
                     fallback_to_proxy,
                     telemetry_token.as_deref(),
                     telemetry_org.as_deref(),
+                    args.common.json,
                 )
                 .await;
-                if args.common.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "error",
-                        "error": e.to_string(),
-                    })).unwrap());
-                } else {
-                    eprintln!("Error: {e}");
-                }
-                return 1;
             }
         }
     }
 
-    // For CVE/GHSA/PURL/package, search first
+    // For CVE/GHSA/PURL/package, search first.
+    // CVE / GHSA / PURL share the same path: log the search, dispatch to
+    // the matching endpoint, and surface errors via `report_fetch_failure`.
     let search_response: SearchResponse = match id_type {
-        IdentifierType::Cve => {
+        IdentifierType::Cve | IdentifierType::Ghsa | IdentifierType::Purl => {
             if !args.common.json {
-                println!("Searching patches for CVE: {}", args.identifier);
+                let label = match id_type {
+                    IdentifierType::Cve => "CVE",
+                    IdentifierType::Ghsa => "GHSA",
+                    IdentifierType::Purl => "PURL",
+                    _ => unreachable!(),
+                };
+                println!("Searching patches for {label}: {}", args.identifier);
             }
-            match api_client
-                .search_patches_by_cve(effective_org_slug, &args.identifier)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    track_patch_fetch_failed(
-                        &args.identifier,
-                        &e,
-                        fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
-                    )
-                    .await;
-                    if args.common.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string(),
-                        })).unwrap());
-                    } else {
-                        eprintln!("Error: {e}");
-                    }
-                    return 1;
+            let result = match id_type {
+                IdentifierType::Cve => {
+                    api_client
+                        .search_patches_by_cve(effective_org_slug, &args.identifier)
+                        .await
                 }
-            }
-        }
-        IdentifierType::Ghsa => {
-            if !args.common.json {
-                println!("Searching patches for GHSA: {}", args.identifier);
-            }
-            match api_client
-                .search_patches_by_ghsa(effective_org_slug, &args.identifier)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    track_patch_fetch_failed(
-                        &args.identifier,
-                        &e,
-                        fallback_to_proxy,
-                        telemetry_token.as_deref(),
-                        telemetry_org.as_deref(),
-                    )
-                    .await;
-                    if args.common.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string(),
-                        })).unwrap());
-                    } else {
-                        eprintln!("Error: {e}");
-                    }
-                    return 1;
+                IdentifierType::Ghsa => {
+                    api_client
+                        .search_patches_by_ghsa(effective_org_slug, &args.identifier)
+                        .await
                 }
-            }
-        }
-        IdentifierType::Purl => {
-            if !args.common.json {
-                println!("Searching patches for PURL: {}", args.identifier);
-            }
-            match api_client
-                .search_patches_by_package(effective_org_slug, &args.identifier)
-                .await
-            {
+                IdentifierType::Purl => {
+                    api_client
+                        .search_patches_by_package(effective_org_slug, &args.identifier)
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            match result {
                 Ok(r) => r,
                 Err(e) => {
-                    track_patch_fetch_failed(
+                    return report_fetch_failure(
                         &args.identifier,
-                        &e,
+                        e,
                         fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
+                        args.common.json,
                     )
                     .await;
-                    if args.common.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string(),
-                        })).unwrap());
-                    } else {
-                        eprintln!("Error: {e}");
-                    }
-                    return 1;
                 }
             }
         }
@@ -994,13 +981,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
             if all_packages.is_empty() {
                 if args.common.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "no_packages",
-                        "found": 0,
-                        "downloaded": 0,
-                        "applied": 0,
-                        "patches": [],
-                    })).unwrap());
+                    print_json(&empty_result_json("no_packages"));
                 } else if args.common.global {
                     println!("No global packages found.");
                 } else {
@@ -1027,13 +1008,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
             if matches.is_empty() {
                 if args.common.json {
-                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "no_match",
-                        "found": 0,
-                        "downloaded": 0,
-                        "applied": 0,
-                        "patches": [],
-                    })).unwrap());
+                    print_json(&empty_result_json("no_match"));
                 } else {
                     println!("No packages matching \"{}\" found.", args.identifier);
                 }
@@ -1055,23 +1030,15 @@ pub async fn run(args: GetArgs) -> i32 {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    track_patch_fetch_failed(
+                    return report_fetch_failure(
                         &args.identifier,
-                        &e,
+                        e,
                         fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
+                        args.common.json,
                     )
                     .await;
-                    if args.common.json {
-                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string(),
-                        })).unwrap());
-                    } else {
-                        eprintln!("Error: {e}");
-                    }
-                    return 1;
                 }
             }
         }
@@ -1080,13 +1047,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if search_response.patches.is_empty() {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "not_found",
-                "found": 0,
-                "downloaded": 0,
-                "applied": 0,
-                "patches": [],
-            })).unwrap());
+            print_json(&empty_result_json("not_found"));
         } else {
             println!(
                 "No patches found for {}: {}",
@@ -1110,7 +1071,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     if accessible.is_empty() {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            print_json(&serde_json::json!({
                 "status": "paid_required",
                 "found": search_response.patches.len(),
                 "downloaded": 0,
@@ -1120,7 +1081,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     "uuid": p.uuid,
                     "tier": p.tier,
                 })).collect::<Vec<_>>(),
-            })).unwrap());
+            }));
         } else {
             println!("\nAll available patches require a paid subscription.");
             println!("\n  Upgrade at: https://socket.dev/pricing\n");
@@ -1238,27 +1199,14 @@ async fn save_and_apply_patch(
         Ok(Some(p)) => p,
         Ok(None) => {
             if args.common.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "not_found",
-                    "found": 0,
-                    "downloaded": 0,
-                    "applied": 0,
-                    "patches": [],
-                })).unwrap());
+                print_json(&empty_result_json("not_found"));
             } else {
                 println!("No patch found with UUID: {uuid}");
             }
             return 0;
         }
         Err(e) => {
-            if args.common.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e.to_string(),
-                })).unwrap());
-            } else {
-                eprintln!("Error: {e}");
-            }
+            report_error(args.common.json, e);
             return 1;
         }
     };
@@ -1268,14 +1216,7 @@ async fn save_and_apply_patch(
     let manifest_path = socket_dir.join("manifest.json");
 
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": format!("Failed to create blobs directory: {}", e),
-            })).unwrap());
-        } else {
-            eprintln!("Error: Failed to create blobs directory: {}", e);
-        }
+        report_error(args.common.json, format!("Failed to create blobs directory: {e}"));
         return 1;
     }
 
@@ -1284,72 +1225,29 @@ async fn save_and_apply_patch(
         _ => PatchManifest::new(),
     };
 
-    // Build and save patch record
-    let mut blob_failed = false;
+    // Build the manifest `files` map. UUID flow is more permissive than
+    // the download flow: a file with after_hash but no before_hash is a
+    // new file; we record an empty `before_hash` and let apply treat it
+    // as a new-file insert.
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
-        if let Some(ref after) = file_info.after_hash {
+        if let Some(after) = &file_info.after_hash {
             files.insert(
                 file_path.clone(),
                 PatchFileInfo {
-                    before_hash: file_info
-                        .before_hash
-                        .clone()
-                        .unwrap_or_default(),
+                    before_hash: file_info.before_hash.clone().unwrap_or_default(),
                     after_hash: after.clone(),
                 },
             );
         }
-        if let (Some(ref blob_content), Some(ref after_hash)) =
-            (&file_info.blob_content, &file_info.after_hash)
-        {
-            match base64_decode(blob_content) {
-                Ok(decoded) => {
-                    if let Err(e) = tokio::fs::write(blobs_dir.join(after_hash), &decoded).await {
-                        if !args.common.json {
-                            eprintln!("  [error] Failed to write blob for {}: {}", file_path, e);
-                        }
-                        blob_failed = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if !args.common.json {
-                        eprintln!("  [error] Failed to decode blob for {}: {}", file_path, e);
-                    }
-                    blob_failed = true;
-                    break;
-                }
-            }
-        }
-        // Also store beforeHash blob if present (needed for rollback)
-        if let (Some(ref before_blob), Some(ref before_hash)) =
-            (&file_info.before_blob_content, &file_info.before_hash)
-        {
-            match base64_decode(before_blob) {
-                Ok(decoded) => {
-                    if let Err(e) = tokio::fs::write(blobs_dir.join(before_hash), &decoded).await {
-                        if !args.common.json {
-                            eprintln!("  [error] Failed to write before-blob for {}: {}", file_path, e);
-                        }
-                        blob_failed = true;
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if !args.common.json {
-                        eprintln!("  [error] Failed to decode before-blob for {}: {}", file_path, e);
-                    }
-                    blob_failed = true;
-                    break;
-                }
-            }
-        }
     }
 
-    if blob_failed {
+    if write_all_patch_blobs(&blobs_dir, &patch, args.common.json)
+        .await
+        .is_err()
+    {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            print_json(&serde_json::json!({
                 "status": "error",
                 "found": 1,
                 "downloaded": 0,
@@ -1361,56 +1259,24 @@ async fn save_and_apply_patch(
                     "action": "failed",
                     "error": "Blob decode or write failed",
                 }],
-            })).unwrap());
+            }));
         } else {
             eprintln!("Error: Blob decode or write failed for patch {}", patch.purl);
         }
         return 1;
     }
 
-    let vulnerabilities: HashMap<String, VulnerabilityInfo> = patch
-        .vulnerabilities
-        .iter()
-        .map(|(id, v)| {
-            (
-                id.clone(),
-                VulnerabilityInfo {
-                    cves: v.cves.clone(),
-                    summary: v.summary.clone(),
-                    severity: v.severity.clone(),
-                    description: v.description.clone(),
-                },
-            )
-        })
-        .collect();
-
     let added = manifest
         .patches
         .get(&patch.purl)
         .is_none_or(|p| p.uuid != patch.uuid);
 
-    manifest.patches.insert(
-        patch.purl.clone(),
-        PatchRecord {
-            uuid: patch.uuid.clone(),
-            exported_at: patch.published_at.clone(),
-            files,
-            vulnerabilities,
-            description: patch.description.clone(),
-            license: patch.license.clone(),
-            tier: patch.tier.clone(),
-        },
-    );
+    manifest
+        .patches
+        .insert(patch.purl.clone(), build_patch_record(&patch, files));
 
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": format!("Error writing manifest: {e}"),
-            })).unwrap());
-        } else {
-            eprintln!("Error writing manifest: {e}");
-        }
+        report_error(args.common.json, format!("Error writing manifest: {e}"));
         return 1;
     }
 
