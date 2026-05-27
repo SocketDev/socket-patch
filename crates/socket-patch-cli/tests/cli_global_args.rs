@@ -175,6 +175,7 @@ fn reserved_short_forms_are_not_assigned() {
 ///
 /// Combined into one test to avoid env-var races between parallel tests.
 #[test]
+#[serial_test::serial]
 fn env_vars_populate_global_args() {
     // Save then clear any env vars we set, then verify clap picks them up.
     let pairs = [
@@ -240,6 +241,108 @@ fn env_vars_populate_global_args() {
     }
 
     // Restore originals.
+    for (k, orig) in saved {
+        match orig {
+            Some(v) => std::env::set_var(&k, v),
+            None => std::env::remove_var(&k),
+        }
+    }
+}
+
+/// Regression: bool env vars accept "1"/"yes" (the conventional truthy
+/// strings), not just clap's strict "true"/"false". Before
+/// BoolishValueParser was wired onto every bool with env, setting
+/// SOCKET_OFFLINE=1 (or SOCKET_DEBUG=1) crashed clap with
+/// `error: invalid value '1' for '--offline'`, taking down every
+/// downstream CLI run that follows the conventional shell idiom.
+///
+/// `#[serial]` because env-var state is process-global; without it
+/// these tests race each other (and the existing
+/// `env_vars_populate_global_args`) when cargo runs them in
+/// parallel.
+#[test]
+#[serial_test::serial]
+fn bool_env_vars_accept_one_and_yes() {
+    // (env var name, value to set)
+    let cases: &[(&str, &str)] = &[
+        ("SOCKET_OFFLINE", "1"),
+        ("SOCKET_GLOBAL", "yes"),
+        ("SOCKET_JSON", "on"),
+        ("SOCKET_VERBOSE", "1"),
+        ("SOCKET_SILENT", "y"),
+        ("SOCKET_DRY_RUN", "1"),
+        ("SOCKET_YES", "yes"),
+        ("SOCKET_BREAK_LOCK", "1"),
+        ("SOCKET_DEBUG", "1"),
+        ("SOCKET_TELEMETRY_DISABLED", "1"),
+    ];
+
+    let saved: Vec<(String, Option<String>)> = cases
+        .iter()
+        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+        .collect();
+    for (k, v) in cases {
+        std::env::set_var(k, v);
+    }
+
+    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    if let socket_patch_cli::Commands::List(args) = cli.command {
+        assert!(args.common.offline, "SOCKET_OFFLINE=1 must parse as true");
+        assert!(args.common.global, "SOCKET_GLOBAL=yes must parse as true");
+        assert!(args.common.json, "SOCKET_JSON=on must parse as true");
+        assert!(args.common.verbose, "SOCKET_VERBOSE=1 must parse as true");
+        assert!(args.common.silent, "SOCKET_SILENT=y must parse as true");
+        assert!(args.common.dry_run, "SOCKET_DRY_RUN=1 must parse as true");
+        assert!(args.common.yes, "SOCKET_YES=yes must parse as true");
+        assert!(args.common.break_lock, "SOCKET_BREAK_LOCK=1 must parse as true");
+        assert!(args.common.debug, "SOCKET_DEBUG=1 must parse as true");
+        assert!(
+            args.common.no_telemetry,
+            "SOCKET_TELEMETRY_DISABLED=1 must parse as true"
+        );
+    } else {
+        panic!("expected List");
+    }
+
+    for (k, orig) in saved {
+        match orig {
+            Some(v) => std::env::set_var(&k, v),
+            None => std::env::remove_var(&k),
+        }
+    }
+}
+
+/// Defensive: "0", "false", "no", "off", and empty string must NOT
+/// engage a bool. Otherwise an operator unsetting via SOCKET_OFFLINE=0
+/// would still get airgap mode (and various subtler shell idioms).
+#[test]
+#[serial_test::serial]
+fn bool_env_vars_reject_zero_and_falsey() {
+    let cases: &[(&str, &str)] = &[
+        ("SOCKET_OFFLINE", "0"),
+        ("SOCKET_DEBUG", "false"),
+        ("SOCKET_TELEMETRY_DISABLED", "no"),
+        ("SOCKET_JSON", "off"),
+    ];
+
+    let saved: Vec<(String, Option<String>)> = cases
+        .iter()
+        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+        .collect();
+    for (k, v) in cases {
+        std::env::set_var(k, v);
+    }
+
+    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    if let socket_patch_cli::Commands::List(args) = cli.command {
+        assert!(!args.common.offline);
+        assert!(!args.common.debug);
+        assert!(!args.common.no_telemetry);
+        assert!(!args.common.json);
+    } else {
+        panic!("expected List");
+    }
+
     for (k, orig) in saved {
         match orig {
             Some(v) => std::env::set_var(&k, v),
