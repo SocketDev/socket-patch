@@ -279,12 +279,13 @@ jobs:
           merge-multiple: true
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '22.22.1'
           registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
 
-      - name: Update npm for trusted publishing
+      - name: Update npm for staged publishing
         run: npm install -g npm@11.15.0
 
       - name: Stage binaries into platform packages
@@ -317,34 +318,79 @@ jobs:
           stage_win socket-patch-i686-pc-windows-msvc        npm/socket-patch-win32-ia32
           stage_win socket-patch-aarch64-pc-windows-msvc     npm/socket-patch-win32-arm64
 
-      - name: Publish platform packages
+      - name: Stage-publish platform packages
+        id: stage-platform
         run: |
+          : > "${RUNNER_TEMP}/staged-packages.txt"
           for pkg_dir in npm/socket-patch-*/; do
-            echo "Publishing ${pkg_dir}..."
-            npm publish "./${pkg_dir}" --provenance --access public || {
-              if npm view "@socketsecurity/$(basename "$pkg_dir")@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
+            pkg_name="@socketsecurity/$(basename "$pkg_dir")"
+            echo "Staging ${pkg_name}..."
+            if npm stage publish "./${pkg_dir}" --access public; then
+              echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+            else
+              if npm view "${pkg_name}@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
                 echo "Already published, skipping."
               else
                 exit 1
               fi
-            }
+            fi
           done
-
-      - name: Wait for npm registry propagation
-        run: sleep 30
 
       - name: Copy README for npm package
         run: cp README.md npm/socket-patch/README.md
 
-      - name: Publish main package
+      - name: Stage-publish main package
         run: |
-          npm publish ./npm/socket-patch --provenance --access public || {
-            if npm view "@socketsecurity/socket-patch@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
+          pkg_name="@socketsecurity/socket-patch"
+          if npm stage publish ./npm/socket-patch --access public; then
+            echo "$pkg_name" >> "${RUNNER_TEMP}/staged-packages.txt"
+          else
+            if npm view "${pkg_name}@${{ needs.version.outputs.version }}" version >/dev/null 2>&1; then
               echo "Already published, skipping."
             else
               exit 1
             fi
-          }
+          fi
+
+      - name: Summarize staged versions awaiting approval
+        if: always()
+        run: |
+          STAGED_FILE="${RUNNER_TEMP}/staged-packages.txt"
+          if [ ! -s "$STAGED_FILE" ]; then
+            echo "No packages staged this run (all versions already published or publish step failed before staging)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          VERSION="${{ needs.version.outputs.version }}"
+          {
+            echo "## npm staged versions awaiting approval"
+            echo ""
+            echo "Version \`${VERSION}\` is staged on npm. A maintainer must approve each package with 2FA before it becomes installable."
+            echo ""
+            echo "**Approve platform packages first**, then the main \`@socketsecurity/socket-patch\` package, so install-time \`optionalDependencies\` resolution sees the platform binaries already live."
+            echo ""
+            echo "**Approve from the web** (signs in + 2FA prompts inline):"
+            echo ""
+            echo "- Org dashboard: <https://www.npmjs.com/settings/socketsecurity/staged-packages>"
+            echo ""
+            echo "Per-package review pages:"
+            echo ""
+            while IFS= read -r pkg_name; do
+              [ -z "$pkg_name" ] && continue
+              # npmjs.com renders staged versions inline on the package page;
+              # the access page exposes the "Staged" tab and the approve button.
+              echo "- \`${pkg_name}@${VERSION}\` — <https://www.npmjs.com/package/${pkg_name}/access>"
+            done < "$STAGED_FILE"
+            echo ""
+            echo "**Approve from the CLI** (requires \`npm@11.15.0+\` locally, signed in to the \`socketsecurity\` org with 2FA):"
+            echo ""
+            echo '```sh'
+            echo "npm stage list"
+            echo "# then, for each stage id printed above (platform packages first, main package last):"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Mirror to step log so it's also visible in the raw run output.
+          echo "::notice title=npm staged versions awaiting approval::Review and approve at https://www.npmjs.com/settings/socketsecurity/staged-packages"
 
   pypi-publish:
     needs: [version, build, tag]
