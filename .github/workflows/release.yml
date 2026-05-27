@@ -139,10 +139,13 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        with:
-          # toolchain version is read from rust-toolchain.toml (exact-pinned).
-          targets: ${{ matrix.target }}
+        # rustup is pre-installed on GitHub-hosted runners. `rustup show`
+        # reads rust-toolchain.toml in the repo root, then installs the
+        # pinned channel + listed components if missing. Target add is
+        # explicit because rust-toolchain.toml only pins the channel.
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.build-tool == 'cross'
@@ -228,8 +231,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # stable
-        # toolchain version is read from rust-toolchain.toml (exact-pinned).
+        # `rustup show` reads rust-toolchain.toml and installs the pinned
+        # channel + listed components.
+        run: rustup show
 
       - name: Authenticate with crates.io
         id: crates-io-auth
