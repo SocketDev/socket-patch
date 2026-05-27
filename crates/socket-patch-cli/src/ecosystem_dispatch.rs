@@ -155,6 +155,12 @@ macro_rules! scan_ecosystem {
     }};
 }
 
+/// Signature shared by `merge_first_wins` and `merge_pypi_qualified`.
+/// `dispatch_find` swaps between them so the rollback path can fan one
+/// crawler result back out to every caller-supplied qualified PURL.
+type MergeFn =
+    fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, CrawledPackage>);
+
 /// Default merge: insert the crawler-returned PURL → first wins.
 fn merge_first_wins(
     out: &mut HashMap<String, PathBuf>,
@@ -208,11 +214,7 @@ async fn dispatch_find(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
-    pypi_merge: fn(
-        &mut HashMap<String, PathBuf>,
-        &[String],
-        HashMap<String, CrawledPackage>,
-    ),
+    pypi_merge: MergeFn,
 ) -> HashMap<String, PathBuf> {
     let mut out: HashMap<String, PathBuf> = HashMap::new();
 
