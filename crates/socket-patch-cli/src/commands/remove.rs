@@ -3,6 +3,7 @@ use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
+use socket_patch_core::utils::purl::purl_matches_identifier;
 use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remove_failed};
 use std::path::Path;
 use std::time::Duration;
@@ -92,13 +93,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
 
-    // Find matching patches to show what will be removed
+    // Find matching patches to show what will be removed. A base PURL
+    // (no `?`) matches every release variant of that package@version; a
+    // qualified PURL or a UUID targets a single patch.
     let matching: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
         if args.identifier.starts_with("pkg:") {
             manifest
                 .patches
                 .iter()
-                .filter(|(purl, _)| *purl == &args.identifier)
+                .filter(|(purl, _)| purl_matches_identifier(purl, &args.identifier))
                 .collect()
         } else {
             manifest
@@ -125,9 +128,23 @@ pub async fn run(args: RemoveArgs) -> i32 {
         return 1;
     }
 
-    // Show what will be removed and confirm
+    // Show what will be removed and confirm. When a base PURL expanded
+    // to multiple manifest entries (PyPI release variants), make the
+    // blast radius explicit so the user understands why a single
+    // `remove pkg:pypi/foo@1.0` is removing several variants.
     if !args.common.json {
-        eprintln!("The following patch(es) will be removed:");
+        if args.identifier.starts_with("pkg:")
+            && !args.identifier.contains('?')
+            && matching.len() > 1
+        {
+            eprintln!(
+                "{} matches {} release variant(s) — all will be removed:",
+                args.identifier,
+                matching.len()
+            );
+        } else {
+            eprintln!("The following patch(es) will be removed:");
+        }
         for (purl, patch) in &matching {
             let file_count = patch.files.len();
             eprintln!("  - {} (UUID: {}, {} file(s))", purl, &patch.uuid[..8], file_count);
@@ -303,22 +320,26 @@ async fn remove_patch_from_manifest(
 
     let mut removed = Vec::new();
 
-    if identifier.starts_with("pkg:") {
-        if manifest.patches.remove(identifier).is_some() {
-            removed.push(identifier.to_string());
-        }
+    let purls_to_remove: Vec<String> = if identifier.starts_with("pkg:") {
+        // Base PURL removes every release variant; qualified PURL removes one.
+        manifest
+            .patches
+            .keys()
+            .filter(|purl| purl_matches_identifier(purl, identifier))
+            .cloned()
+            .collect()
     } else {
-        let purls_to_remove: Vec<String> = manifest
+        manifest
             .patches
             .iter()
             .filter(|(_, patch)| patch.uuid == identifier)
             .map(|(purl, _)| purl.clone())
-            .collect();
+            .collect()
+    };
 
-        for purl in purls_to_remove {
-            manifest.patches.remove(&purl);
-            removed.push(purl);
-        }
+    for purl in purls_to_remove {
+        manifest.patches.remove(&purl);
+        removed.push(purl);
     }
 
     if !removed.is_empty() {
@@ -328,4 +349,101 @@ async fn remove_patch_from_manifest(
     }
 
     Ok((removed, manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use std::collections::HashMap;
+
+    fn make_record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "test".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    /// Write a manifest with three PyPI release variants of one
+    /// package@version plus an unrelated npm package, returning the
+    /// temp dir (kept alive) and the manifest path.
+    async fn write_multi_variant(dir: &Path) {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=wheel-cp311".to_string(),
+            make_record("uuid-cp311"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=sdist".to_string(),
+            make_record("uuid-sdist"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=wheel-cp312".to_string(),
+            make_record("uuid-cp312"),
+        );
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        let manifest = PatchManifest { patches };
+        write_manifest(&dir.join("manifest.json"), &manifest)
+            .await
+            .expect("write manifest");
+    }
+
+    #[tokio::test]
+    async fn remove_base_purl_removes_all_variants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_multi_variant(tmp.path()).await;
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+                .await
+                .expect("remove ok");
+
+        // All three release variants removed; the npm package untouched.
+        assert_eq!(removed.len(), 3);
+        assert!(removed.iter().all(|p| p.contains("six@1.16.0")));
+        assert_eq!(manifest.patches.len(), 1);
+        assert!(manifest.patches.contains_key("pkg:npm/foo@1.0"));
+    }
+
+    #[tokio::test]
+    async fn remove_qualified_purl_removes_single_variant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_multi_variant(tmp.path()).await;
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let (removed, manifest) = remove_patch_from_manifest(
+            "pkg:pypi/six@1.16.0?artifact_id=sdist",
+            &manifest_path,
+        )
+        .await
+        .expect("remove ok");
+
+        // Only the sdist variant removed; the two wheels + npm remain.
+        assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
+        assert_eq!(manifest.patches.len(), 3);
+        assert!(!manifest
+            .patches
+            .contains_key("pkg:pypi/six@1.16.0?artifact_id=sdist"));
+    }
+
+    #[tokio::test]
+    async fn remove_by_uuid_removes_single_variant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_multi_variant(tmp.path()).await;
+        let manifest_path = tmp.path().join("manifest.json");
+
+        let (removed, manifest) =
+            remove_patch_from_manifest("uuid-cp312", &manifest_path)
+                .await
+                .expect("remove ok");
+
+        assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=wheel-cp312"]);
+        assert_eq!(manifest.patches.len(), 3);
+    }
 }

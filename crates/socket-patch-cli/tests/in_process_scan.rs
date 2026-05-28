@@ -36,6 +36,7 @@ fn default_args(cwd: &Path) -> ScanArgs {
         apply: false,
         prune: false,
         sync: false,
+        all_releases: false,
     }
 }
 

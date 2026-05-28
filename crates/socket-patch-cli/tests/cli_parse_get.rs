@@ -43,6 +43,16 @@ fn defaults_with_only_required_identifier() {
     assert!(!a.one_off);
     assert!(!a.common.json);
     assert_eq!(a.common.download_mode, "diff");
+    assert!(
+        !a.all_releases,
+        "--all-releases default is false (narrow — installed-dist variant only)"
+    );
+}
+
+#[test]
+fn all_releases_flag_sets_all_releases() {
+    let a = parse_get(&["some-id", "--all-releases"]);
+    assert!(a.all_releases);
 }
 
 #[test]

@@ -40,6 +40,7 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
         package: false,
         save_only: true,
         one_off: false,
+        all_releases: false,
     }
 }
 

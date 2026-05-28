@@ -225,6 +225,28 @@ pub fn is_purl(s: &str) -> bool {
     s.starts_with("pkg:")
 }
 
+/// Does a manifest PURL key match a user-supplied PURL identifier?
+///
+/// PyPI patches are keyed in the manifest by their fully-qualified PURL
+/// (`pkg:pypi/foo@1.0?artifact_id=...`), one entry per release variant.
+/// A user removing or rolling back a package usually types the *base*
+/// PURL without a qualifier and expects it to cover every variant. So:
+///
+/// * a **base** identifier (no `?`) matches any key whose base equals it
+///   — i.e. all release variants of that `package@version`, and
+/// * a **qualified** identifier (`?artifact_id=...`) matches only the
+///   exact key, so a single variant can still be targeted precisely.
+///
+/// Non-PyPI keys never carry a `?`, so for them this reduces to plain
+/// equality.
+pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
+    if identifier.contains('?') {
+        manifest_key == identifier
+    } else {
+        strip_purl_qualifiers(manifest_key) == identifier
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +276,47 @@ mod tests {
         assert_eq!(parse_pypi_purl("pkg:npm/lodash@4.17.21"), None);
         assert_eq!(parse_pypi_purl("pkg:pypi/@2.28.0"), None);
         assert_eq!(parse_pypi_purl("pkg:pypi/requests@"), None);
+    }
+
+    #[test]
+    fn test_purl_matches_identifier() {
+        // Base identifier matches every qualified variant + the bare base.
+        assert!(purl_matches_identifier(
+            "pkg:pypi/requests@2.28.0?artifact_id=abc",
+            "pkg:pypi/requests@2.28.0"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:pypi/requests@2.28.0",
+            "pkg:pypi/requests@2.28.0"
+        ));
+        // Base identifier does NOT match a different version.
+        assert!(!purl_matches_identifier(
+            "pkg:pypi/requests@2.29.0?artifact_id=abc",
+            "pkg:pypi/requests@2.28.0"
+        ));
+        // Qualified identifier matches only the exact key.
+        assert!(purl_matches_identifier(
+            "pkg:pypi/requests@2.28.0?artifact_id=abc",
+            "pkg:pypi/requests@2.28.0?artifact_id=abc"
+        ));
+        assert!(!purl_matches_identifier(
+            "pkg:pypi/requests@2.28.0?artifact_id=xyz",
+            "pkg:pypi/requests@2.28.0?artifact_id=abc"
+        ));
+        // A qualified identifier must not match the bare base key.
+        assert!(!purl_matches_identifier(
+            "pkg:pypi/requests@2.28.0",
+            "pkg:pypi/requests@2.28.0?artifact_id=abc"
+        ));
+        // Non-PyPI keys: plain equality.
+        assert!(purl_matches_identifier(
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/lodash@4.17.21"
+        ));
+        assert!(!purl_matches_identifier(
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/lodash@4.17.20"
+        ));
     }
 
     #[test]
