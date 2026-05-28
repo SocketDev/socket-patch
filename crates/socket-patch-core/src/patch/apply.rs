@@ -211,6 +211,52 @@ pub async fn verify_file_patch(
     }
 }
 
+/// Select the single variant whose installed bytes match the on-disk
+/// distribution — i.e. the "minimally required" release for this
+/// environment.
+///
+/// A package@version may resolve to several patch variants (PyPI
+/// `?artifact_id=...` releases, one per wheel/sdist). Only one
+/// distribution is ever installed in a given environment, so only one
+/// variant can apply. This mirrors the first-file hash check the apply
+/// pipeline uses: a variant matches when its first patched file is not
+/// in a [`VerifyStatus::HashMismatch`] state against the on-disk
+/// package. A variant with no files (nothing to verify) is treated as a
+/// match.
+///
+/// `variants` maps a variant key (typically a qualified PURL) to that
+/// variant's patched files. Returns the index of the first variant whose
+/// first patched file is in a [`VerifyStatus::Ready`] or
+/// [`VerifyStatus::AlreadyPatched`] state — i.e. its `beforeHash` (or
+/// `afterHash`, if already applied) matches the installed bytes — or
+/// `None` when no variant matches the installed distribution.
+///
+/// A [`VerifyStatus::NotFound`] (a missing pre-existing file) or
+/// [`VerifyStatus::HashMismatch`] does **not** count as a match: those
+/// signal the variant describes a *different* distribution than the one
+/// on disk. A variant with no files (nothing to verify) is treated as a
+/// match. Both the narrow download filter (scan/get) and the rollback
+/// dedupe share this helper so release selection stays consistent.
+pub async fn select_installed_variant(
+    pkg_path: &Path,
+    variants: &[(&str, &HashMap<String, PatchFileInfo>)],
+) -> Option<usize> {
+    for (idx, (_key, files)) in variants.iter().enumerate() {
+        // No files to verify — nothing to disqualify the variant.
+        let Some((file_name, file_info)) = files.iter().next() else {
+            return Some(idx);
+        };
+        let verify = verify_file_patch(pkg_path, file_name, file_info).await;
+        if matches!(
+            verify.status,
+            VerifyStatus::Ready | VerifyStatus::AlreadyPatched
+        ) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// Apply a patch to a single file.
 ///
 /// **Permission policy** (per the user-visible contract — patched

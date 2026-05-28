@@ -9,6 +9,7 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
 use std::path::Path;
@@ -158,14 +159,24 @@ async fn preview_apply_gc(
 /// correspond to packages that were once patched but are no longer
 /// installed (or no longer reachable to the crawler). Pure / no I/O so
 /// it's unit-testable.
+///
+/// Comparison is on the **base** PURL (qualifiers stripped) on both
+/// sides: the pypi crawler reports base PURLs, but a manifest may hold
+/// several qualified release variants (`?artifact_id=...`) of one
+/// installed package. Matching on the base keeps every variant of an
+/// installed package while still pruning all variants of one that is
+/// gone — otherwise `scan --all-releases --sync` would prune the very
+/// variants it just downloaded.
 pub(crate) fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
 ) -> Vec<String> {
+    let scanned_bases: HashSet<&str> =
+        scanned_purls.iter().map(|p| strip_purl_qualifiers(p)).collect();
     manifest
         .patches
         .keys()
-        .filter(|p| !scanned_purls.contains(*p))
+        .filter(|p| !scanned_bases.contains(strip_purl_qualifiers(p)))
         .cloned()
         .collect()
 }
@@ -237,6 +248,21 @@ pub struct ScanArgs {
     /// fully-reconciled state in one invocation.
     #[arg(long, default_value_t = false)]
     pub sync: bool,
+
+    /// Download patches for every release/distribution (artifact_id) of
+    /// a matched package, not just the one matching the locally-
+    /// installed distribution. Only affects PyPI today — the only
+    /// ecosystem with per-release artifact_id variants. Off by default:
+    /// narrow scans store only the patch for the installed dist, keeping
+    /// `.socket/` small; `--all-releases` makes the manifest portable
+    /// across environments (e.g. cross-platform CI caches).
+    #[arg(
+        long = "all-releases",
+        env = "SOCKET_ALL_RELEASES",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub all_releases: bool,
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -651,6 +677,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                     silent: true,
                     download_mode: args.common.download_mode.clone(),
                     api_overrides: args.common.api_client_overrides(),
+                    all_releases: args.all_releases,
                 };
                 let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
                 apply_code = code;
@@ -990,6 +1017,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         silent: false,
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
+        all_releases: args.all_releases,
     };
 
     let (code, _) = download_and_apply_patches(&selected, &params).await;
@@ -1228,5 +1256,34 @@ mod tests {
             out,
             vec!["pkg:npm/bar@2.0".to_string(), "pkg:npm/foo@1.0".to_string()],
         );
+    }
+
+    #[test]
+    fn detect_prunable_keeps_pypi_variants_of_installed_base() {
+        // Manifest holds three qualified release variants; the crawler
+        // reports only the base PURL. None should be pruned — they all
+        // belong to the installed package.
+        let m = manifest_with(&[
+            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a"),
+            ("pkg:pypi/six@1.16.0?artifact_id=wheel-b", "uuid-b"),
+            ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
+        ]);
+        let out = detect_prunable(&m, &scanned(&["pkg:pypi/six@1.16.0"]));
+        assert!(
+            out.is_empty(),
+            "variants of an installed base must not be pruned; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn detect_prunable_removes_all_variants_of_uninstalled_base() {
+        // The package is no longer installed (empty crawl): every
+        // release variant is prunable.
+        let m = manifest_with(&[
+            ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a"),
+            ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
+        ]);
+        let out = detect_prunable(&m, &scanned(&[]));
+        assert_eq!(out.len(), 2, "all variants of a gone package should prune");
     }
 }

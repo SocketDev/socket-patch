@@ -58,6 +58,7 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
         apply: false,
         prune: false,
         sync: false,
+        all_releases: false,
     }
 }
 

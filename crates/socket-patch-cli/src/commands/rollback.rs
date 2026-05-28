@@ -5,10 +5,12 @@ use socket_patch_core::api::blob_fetcher::{
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
+use socket_patch_core::patch::apply::select_installed_variant;
 use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
+use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -51,11 +53,15 @@ fn find_patches_to_rollback(
         Some(id) => {
             let mut patches = Vec::new();
             if id.starts_with("pkg:") {
-                if let Some(patch) = manifest.patches.get(id) {
-                    patches.push(PatchToRollback {
-                        purl: id.to_string(),
-                        patch: patch.clone(),
-                    });
+                // A base PURL (no `?`) matches every release variant of
+                // that package@version; a qualified PURL targets one.
+                for (purl, patch) in &manifest.patches {
+                    if purl_matches_identifier(purl, id) {
+                        patches.push(PatchToRollback {
+                            purl: purl.clone(),
+                            patch: patch.clone(),
+                        });
+                    }
                 }
             } else {
                 for (purl, patch) in &manifest.patches {
@@ -445,36 +451,81 @@ async fn rollback_patches_inner(
         return Ok((true, Vec::new()));
     }
 
+    // Group discovered packages by base PURL. A PyPI package@version may
+    // have several release variants (`?artifact_id=...`) in the manifest;
+    // `merge_pypi_qualified` resolves them all to the single on-disk
+    // distribution. Rolling back every variant against that one file
+    // would HashMismatch on the non-installed variants and report
+    // spurious failures, so — mirroring apply — we collapse each group to
+    // the single variant whose hashes match the installed bytes.
+    let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
+    for (purl, pkg_path) in &all_packages {
+        groups
+            .entry(strip_purl_qualifiers(purl).to_string())
+            .or_default()
+            .push((purl, pkg_path));
+    }
+
     // Rollback patches
     let mut results: Vec<RollbackResult> = Vec::new();
     let mut has_errors = false;
 
-    for (purl, pkg_path) in &all_packages {
-        let patch = match filtered_manifest.patches.get(purl) {
-            Some(p) => p,
-            None => continue,
+    for (_base, entries) in groups {
+        // Resolve which variant(s) to roll back for this base PURL.
+        let to_rollback: Vec<(&String, &PathBuf)> = if entries.len() == 1 {
+            entries
+        } else {
+            // All variants in a group resolve to the same installed path.
+            let pkg_path = entries[0].1;
+            let candidates: Vec<(&str, &HashMap<String, PatchFileInfo>)> = entries
+                .iter()
+                .filter_map(|(purl, _)| {
+                    filtered_manifest
+                        .patches
+                        .get(*purl)
+                        .map(|p| (purl.as_str(), &p.files))
+                })
+                .collect();
+            match select_installed_variant(pkg_path, &candidates).await {
+                Some(idx) => {
+                    let winner = candidates[idx].0.to_string();
+                    entries.into_iter().filter(|(p, _)| **p == winner).collect()
+                }
+                // No variant matches the installed distribution (e.g. a
+                // locally-modified file). Fall back to attempting every
+                // variant so the per-file verification surfaces the
+                // mismatch rather than silently skipping the package.
+                None => entries,
+            }
         };
 
-        let result = rollback_package_patch(
-            purl,
-            pkg_path,
-            &patch.files,
-            &blobs_path,
-            args.common.dry_run,
-        )
-        .await;
+        for (purl, pkg_path) in to_rollback {
+            let patch = match filtered_manifest.patches.get(purl) {
+                Some(p) => p,
+                None => continue,
+            };
 
-        if !result.success {
-            has_errors = true;
-            if !args.common.silent && !args.common.json {
-                eprintln!(
-                    "Failed to rollback {}: {}",
-                    purl,
-                    result.error.as_deref().unwrap_or("unknown error")
-                );
+            let result = rollback_package_patch(
+                purl,
+                pkg_path,
+                &patch.files,
+                &blobs_path,
+                args.common.dry_run,
+            )
+            .await;
+
+            if !result.success {
+                has_errors = true;
+                if !args.common.silent && !args.common.json {
+                    eprintln!(
+                        "Failed to rollback {}: {}",
+                        purl,
+                        result.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
             }
+            results.push(result);
         }
-        results.push(result);
     }
 
     Ok((!has_errors, results))
@@ -576,5 +627,57 @@ mod tests {
         let result =
             find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
         assert!(result.is_empty());
+    }
+
+    /// A manifest holding several PyPI release variants of one
+    /// package@version (broad mode).
+    fn make_multi_variant_manifest() -> PatchManifest {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=wheel-cp311".to_string(),
+            make_record("uuid-wheel-cp311"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=wheel-cp312".to_string(),
+            make_record("uuid-wheel-cp312"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=sdist".to_string(),
+            make_record("uuid-sdist"),
+        );
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        PatchManifest { patches }
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_base_purl_matches_all_variants() {
+        let manifest = make_multi_variant_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        // Base PURL (no qualifier) expands to every release variant.
+        assert_eq!(result.len(), 3);
+        for p in &result {
+            assert!(p.purl.starts_with("pkg:pypi/six@1.16.0?artifact_id="));
+        }
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_qualified_purl_matches_one_variant() {
+        let manifest = make_multi_variant_manifest();
+        let result = find_patches_to_rollback(
+            &manifest,
+            Some("pkg:pypi/six@1.16.0?artifact_id=sdist"),
+        );
+        // A fully-qualified PURL targets exactly one variant.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].purl, "pkg:pypi/six@1.16.0?artifact_id=sdist");
+    }
+
+    #[test]
+    fn test_find_patches_to_rollback_base_purl_does_not_leak_other_packages() {
+        let manifest = make_multi_variant_manifest();
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        assert!(result.iter().all(|p| p.purl.contains("six@1.16.0")));
     }
 }

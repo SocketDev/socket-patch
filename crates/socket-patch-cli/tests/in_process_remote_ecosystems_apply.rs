@@ -60,6 +60,7 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
         apply: false,
         prune: false,
         sync: true,
+        all_releases: false,
     }
 }
 

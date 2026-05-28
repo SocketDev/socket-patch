@@ -203,6 +203,7 @@ async fn gem_install_scan_sync_patches_real_file() {
         apply: false,
         prune: false,
         sync: true,
+        all_releases: false,
     };
     let code = scan_run(args).await;
     assert!(code == 0 || code == 1, "scan --sync exit: {code}");
@@ -262,6 +263,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         apply: false,
         prune: false,
         sync: false,
+        all_releases: false,
     };
     assert_eq!(scan_run(args).await, 0);
 }

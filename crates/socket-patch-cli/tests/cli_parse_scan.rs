@@ -59,6 +59,16 @@ fn defaults_match_contract() {
     assert!(!args.prune, "--prune default is false (GC is opt-in in v3.0)");
     assert!(!args.sync, "--sync default is false");
     assert!(!args.common.dry_run, "--dry-run default is false");
+    assert!(
+        !args.all_releases,
+        "--all-releases default is false (narrow — installed-dist variant only)"
+    );
+}
+
+#[test]
+fn all_releases_flag_long_form() {
+    let args = parse_scan(&["--all-releases"]);
+    assert!(args.all_releases);
 }
 
 #[test]
