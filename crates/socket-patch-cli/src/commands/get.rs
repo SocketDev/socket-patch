@@ -11,7 +11,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-use socket_patch_core::patch::apply::select_installed_variant;
+use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
 use socket_patch_core::utils::purl::{is_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
@@ -329,11 +329,12 @@ pub struct GetArgs {
     #[arg(long = "one-off", env = "SOCKET_ONE_OFF", default_value_t = false)]
     pub one_off: bool,
 
-    /// Download patches for every release/distribution (artifact_id) of
-    /// a matched package, not just the one matching the locally-
-    /// installed distribution. Only affects PyPI today — the only
-    /// ecosystem with per-release artifact_id variants. Off by default:
-    /// only the patch for the installed dist is fetched.
+    /// Download patches for every release/distribution variant of a
+    /// matched package, not just the one(s) matching the locally-
+    /// installed distribution. Affects ecosystems with per-release
+    /// variants — PyPI (wheel/sdist via `artifact_id`), RubyGems
+    /// (`platform`), and Maven (`classifier`). Off by default: only the
+    /// patch(es) for the installed dist are fetched.
     #[arg(
         long = "all-releases",
         env = "SOCKET_ALL_RELEASES",
@@ -530,20 +531,18 @@ pub struct DownloadParams {
     pub all_releases: bool,
 }
 
-/// Download and apply a set of selected patches.
+/// Narrow a selection of patches down to the release variant(s) present
+/// in each locally-installed distribution.
 ///
-/// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
-/// Narrow a selection of patches down to the release variant matching
-/// each locally-installed distribution.
-///
-/// A PyPI `package@version` can resolve to several patch variants — one
-/// per `?artifact_id=...` release (wheel/sdist). Only one distribution
-/// is ever installed in a given environment, so only one variant can
-/// apply. With `--all-releases` off (the default) we keep just the
-/// variant whose first patched file's hash matches the on-disk package,
-/// dropping the rest so they are never downloaded or written to the
-/// manifest. Non-PyPI ecosystems never carry `artifact_id` qualifiers,
-/// so they pass through untouched.
+/// A release-variant ecosystem `package@version` can resolve to several
+/// patch variants — one per qualified PURL: PyPI `?artifact_id=`
+/// (wheel/sdist), RubyGems `?platform=`, Maven `?classifier=&ext=`. With
+/// `--all-releases` off (the default) we keep only the variant(s) whose
+/// first patched file's hash matches what's on disk, dropping the rest so
+/// they are never downloaded or written to the manifest. PyPI/RubyGems
+/// install one distribution per environment (≤1 kept); Maven classifier
+/// jars coexist, so several may be kept. Ecosystems that ship one
+/// artifact per version never carry qualifiers and pass through untouched.
 ///
 /// Fallbacks (keep all variants of the base, i.e. behave as broad):
 ///   * the base package is not installed on disk (nothing to match
@@ -560,14 +559,15 @@ async fn filter_to_installed_releases(
     api_client: &socket_patch_core::api::client::ApiClient,
     org: Option<&str>,
 ) -> (Vec<PatchSearchResult>, Vec<String>) {
-    // Group the PyPI selections by their base PURL (qualifiers stripped).
-    // Anything that isn't PyPI, or whose base has a single variant, is
-    // kept verbatim and needs no installed-dist resolution.
-    let mut pypi_groups: HashMap<String, Vec<PatchSearchResult>> = HashMap::new();
+    // Group release-variant ecosystem selections (PyPI / RubyGems / Maven)
+    // by their base PURL (qualifiers stripped). Anything that can't have
+    // release variants, or whose base has a single variant, is kept
+    // verbatim and needs no installed-dist resolution.
+    let mut variant_groups: HashMap<String, Vec<PatchSearchResult>> = HashMap::new();
     let mut kept: Vec<PatchSearchResult> = Vec::new();
     for sr in selected {
-        if Ecosystem::from_purl(&sr.purl) == Some(Ecosystem::Pypi) {
-            pypi_groups
+        if Ecosystem::from_purl(&sr.purl).is_some_and(|e| e.supports_release_variants()) {
+            variant_groups
                 .entry(strip_purl_qualifiers(&sr.purl).to_string())
                 .or_default()
                 .push(sr.clone());
@@ -578,10 +578,10 @@ async fn filter_to_installed_releases(
 
     let mut warnings: Vec<String> = Vec::new();
 
-    // Singleton PyPI bases have nothing to disambiguate — keep as-is.
+    // Singleton bases have nothing to disambiguate — keep as-is.
     // Collect the multi-variant bases that actually need resolution.
     let mut multi: Vec<(String, Vec<PatchSearchResult>)> = Vec::new();
-    for (base, variants) in pypi_groups {
+    for (base, variants) in variant_groups {
         if variants.len() <= 1 {
             kept.extend(variants);
         } else {
@@ -593,10 +593,11 @@ async fn filter_to_installed_releases(
         return (kept, warnings);
     }
 
-    // Discover the on-disk path for each multi-variant base. The pypi
-    // crawler is queried with base PURLs and the result is fanned back
-    // out to every qualified variant (all variants of one installed
-    // package resolve to the same path).
+    // Discover the on-disk path for each multi-variant base. The crawler
+    // is queried with base PURLs and the result is fanned back out to
+    // every qualified variant. For PyPI/RubyGems all variants of one
+    // installed package resolve to the same dir; for Maven the variants
+    // share a version dir but target distinct jar files within it.
     let all_qualified: Vec<String> = multi
         .iter()
         .flat_map(|(_, variants)| variants.iter().map(|s| s.purl.clone()))
@@ -612,8 +613,8 @@ async fn filter_to_installed_releases(
     let paths = find_packages_for_rollback(&partitioned, &crawler_options, true).await;
 
     for (base, variants) in multi {
-        // Any variant's resolved path works — they all map to the single
-        // installed distribution.
+        // Any variant's resolved path works — they all map to the same
+        // installed package directory.
         let pkg_path = variants.iter().find_map(|s| paths.get(&s.purl)).cloned();
         let Some(pkg_path) = pkg_path else {
             // Not installed: cannot determine the relevant release. Keep
@@ -645,21 +646,23 @@ async fn filter_to_installed_releases(
             .map(|(purl, files)| (purl.as_str(), files))
             .collect();
 
-        match select_installed_variant(&pkg_path, &refs).await {
-            Some(idx) => {
-                let winner = candidates[idx].0.clone();
-                kept.extend(variants.into_iter().filter(|s| s.purl == winner));
-            }
-            None => {
-                // Installed, but no variant matches the on-disk bytes.
-                // Fall back to broad rather than silently dropping a
-                // package the user asked about.
-                warnings.push(format!(
-                    "No release variant of {base} matches the installed distribution; keeping all {} variant(s).",
-                    variants.len()
-                ));
-                kept.extend(variants);
-            }
+        // Keep every variant present on disk. PyPI/RubyGems install one
+        // distribution per env (≤1 match); Maven classifier jars coexist
+        // so several may match.
+        let matched = select_installed_variants(&pkg_path, &refs).await;
+        if matched.is_empty() {
+            // Installed, but no variant matches the on-disk bytes. Fall
+            // back to broad rather than silently dropping a package the
+            // user asked about.
+            warnings.push(format!(
+                "No release variant of {base} matches the installed distribution; keeping all {} variant(s).",
+                variants.len()
+            ));
+            kept.extend(variants);
+        } else {
+            let winners: std::collections::HashSet<String> =
+                matched.iter().map(|&i| candidates[i].0.clone()).collect();
+            kept.extend(variants.into_iter().filter(|s| winners.contains(&s.purl)));
         }
     }
 
@@ -686,6 +689,9 @@ fn files_for_selection(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> 
     files
 }
 
+/// Download and apply a set of selected patches.
+///
+/// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,

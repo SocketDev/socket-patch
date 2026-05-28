@@ -249,11 +249,12 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// Download patches for every release/distribution (artifact_id) of
-    /// a matched package, not just the one matching the locally-
-    /// installed distribution. Only affects PyPI today — the only
-    /// ecosystem with per-release artifact_id variants. Off by default:
-    /// narrow scans store only the patch for the installed dist, keeping
+    /// Download patches for every release/distribution variant of a
+    /// matched package, not just the one(s) matching the locally-
+    /// installed distribution. Affects ecosystems with per-release
+    /// variants — PyPI (wheel/sdist via `artifact_id`), RubyGems
+    /// (`platform`), and Maven (`classifier`). Off by default: narrow
+    /// scans store only the patch(es) for the installed dist, keeping
     /// `.socket/` small; `--all-releases` makes the manifest portable
     /// across environments (e.g. cross-platform CI caches).
     #[arg(

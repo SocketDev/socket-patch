@@ -6,7 +6,7 @@ use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::select_installed_variant;
+use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
 use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
@@ -451,13 +451,14 @@ async fn rollback_patches_inner(
         return Ok((true, Vec::new()));
     }
 
-    // Group discovered packages by base PURL. A PyPI package@version may
-    // have several release variants (`?artifact_id=...`) in the manifest;
-    // `merge_pypi_qualified` resolves them all to the single on-disk
-    // distribution. Rolling back every variant against that one file
-    // would HashMismatch on the non-installed variants and report
-    // spurious failures, so — mirroring apply — we collapse each group to
-    // the single variant whose hashes match the installed bytes.
+    // Group discovered packages by base PURL. A release-variant
+    // `package@version` (PyPI/RubyGems/Maven) may have several variants
+    // in the manifest that `merge_qualified` resolves to the same
+    // installed package dir. Rolling back a variant that is *not* present
+    // on disk would HashMismatch and report a spurious failure, so —
+    // mirroring apply — we collapse each group to the variant(s) whose
+    // hashes actually match the installed bytes. PyPI/RubyGems yield one
+    // such variant; Maven's coexisting classifier jars may yield several.
     let mut groups: HashMap<String, Vec<(&String, &PathBuf)>> = HashMap::new();
     for (purl, pkg_path) in &all_packages {
         groups
@@ -486,16 +487,20 @@ async fn rollback_patches_inner(
                         .map(|p| (purl.as_str(), &p.files))
                 })
                 .collect();
-            match select_installed_variant(pkg_path, &candidates).await {
-                Some(idx) => {
-                    let winner = candidates[idx].0.to_string();
-                    entries.into_iter().filter(|(p, _)| **p == winner).collect()
-                }
+            let matched = select_installed_variants(pkg_path, &candidates).await;
+            if matched.is_empty() {
                 // No variant matches the installed distribution (e.g. a
                 // locally-modified file). Fall back to attempting every
                 // variant so the per-file verification surfaces the
                 // mismatch rather than silently skipping the package.
-                None => entries,
+                entries
+            } else {
+                let winners: HashSet<String> =
+                    matched.iter().map(|&i| candidates[i].0.to_string()).collect();
+                entries
+                    .into_iter()
+                    .filter(|(p, _)| winners.contains(*p))
+                    .collect()
             }
         };
 

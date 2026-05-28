@@ -225,36 +225,45 @@ pub async fn verify_file_patch(
 /// match.
 ///
 /// `variants` maps a variant key (typically a qualified PURL) to that
-/// variant's patched files. Returns the index of the first variant whose
-/// first patched file is in a [`VerifyStatus::Ready`] or
+/// variant's patched files. Returns the indices of **every** variant
+/// whose first patched file is in a [`VerifyStatus::Ready`] or
 /// [`VerifyStatus::AlreadyPatched`] state — i.e. its `beforeHash` (or
-/// `afterHash`, if already applied) matches the installed bytes — or
-/// `None` when no variant matches the installed distribution.
+/// `afterHash`, if already applied) matches the installed bytes.
 ///
 /// A [`VerifyStatus::NotFound`] (a missing pre-existing file) or
 /// [`VerifyStatus::HashMismatch`] does **not** count as a match: those
-/// signal the variant describes a *different* distribution than the one
-/// on disk. A variant with no files (nothing to verify) is treated as a
-/// match. Both the narrow download filter (scan/get) and the rollback
-/// dedupe share this helper so release selection stays consistent.
-pub async fn select_installed_variant(
+/// signal the variant describes a distribution that is *not* present on
+/// disk. A variant with no files (nothing to verify) is treated as a
+/// match.
+///
+/// Returning all matches (not just the first) is what lets ecosystems
+/// whose variants *coexist* on disk work — e.g. Maven, where several
+/// classifier jars (`foo-1.0.jar`, `foo-1.0-linux-x86_64.jar`) live in
+/// one version directory and each maps to its own file. For PyPI and
+/// RubyGems exactly one distribution is installed per environment, so
+/// this naturally yields ≤1 index and their behavior is unchanged. The
+/// narrow download filter (scan/get) and the rollback dedupe share this
+/// helper so release selection stays consistent with apply.
+pub async fn select_installed_variants(
     pkg_path: &Path,
     variants: &[(&str, &HashMap<String, PatchFileInfo>)],
-) -> Option<usize> {
+) -> Vec<usize> {
+    let mut matched = Vec::new();
     for (idx, (_key, files)) in variants.iter().enumerate() {
         // No files to verify — nothing to disqualify the variant.
         let Some((file_name, file_info)) = files.iter().next() else {
-            return Some(idx);
+            matched.push(idx);
+            continue;
         };
         let verify = verify_file_patch(pkg_path, file_name, file_info).await;
         if matches!(
             verify.status,
             VerifyStatus::Ready | VerifyStatus::AlreadyPatched
         ) {
-            return Some(idx);
+            matched.push(idx);
         }
     }
-    None
+    matched
 }
 
 /// Apply a patch to a single file.

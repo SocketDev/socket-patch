@@ -107,6 +107,30 @@ impl Ecosystem {
         }
     }
 
+    /// Whether this ecosystem can have multiple release/distribution
+    /// variants per `package@version`, each a distinct downloadable
+    /// artifact distinguished by a PURL qualifier:
+    ///
+    /// * PyPI — `?artifact_id=` (wheel / sdist),
+    /// * RubyGems — `?platform=` (e.g. `x86_64-linux`, `arm64-darwin`),
+    /// * Maven — `?classifier=&ext=` (e.g. native `-linux-x86_64` jars).
+    ///
+    /// Single-artifact ecosystems (npm, cargo, go, composer, nuget, deno)
+    /// return false: they ship exactly one tarball/zip per version, and
+    /// any platform split lives under separate package *names* rather
+    /// than as variants of one coordinate. Callers use this to decide
+    /// whether to dedupe qualified PURLs to a base and fan results back
+    /// out to every variant (release-variant ecosystems) or to match
+    /// PURLs 1:1 (everything else).
+    pub fn supports_release_variants(&self) -> bool {
+        match self {
+            Ecosystem::Pypi | Ecosystem::Gem => true,
+            #[cfg(feature = "maven")]
+            Ecosystem::Maven => true,
+            _ => false,
+        }
+    }
+
     /// Human-readable name for user-facing messages.
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -256,6 +280,21 @@ mod tests {
     fn test_cargo_properties() {
         assert_eq!(Ecosystem::Cargo.cli_name(), "cargo");
         assert_eq!(Ecosystem::Cargo.display_name(), "cargo");
+    }
+
+    #[test]
+    fn test_supports_release_variants() {
+        // Multi-artifact ecosystems.
+        assert!(Ecosystem::Pypi.supports_release_variants());
+        assert!(Ecosystem::Gem.supports_release_variants());
+        #[cfg(feature = "maven")]
+        assert!(Ecosystem::Maven.supports_release_variants());
+        // Single-artifact ecosystems.
+        assert!(!Ecosystem::Npm.supports_release_variants());
+        #[cfg(feature = "cargo")]
+        assert!(!Ecosystem::Cargo.supports_release_variants());
+        #[cfg(feature = "nuget")]
+        assert!(!Ecosystem::Nuget.supports_release_variants());
     }
 
     #[test]

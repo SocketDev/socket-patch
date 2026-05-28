@@ -242,6 +242,122 @@ async fn maven_handcrafted_install_apply_patches_file() {
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
+/// Maven is the one release-variant ecosystem where multiple variants
+/// COEXIST on disk: a version dir can hold several classifier jars at
+/// once (e.g. native `-linux-x86_64` / `-osx-x86_64`). This pins that
+/// the (default, narrow) apply path keeps and patches *every* present
+/// classifier variant — exercising the plural `select_installed_variants`
+/// selector — rather than just the first.
+#[cfg(feature = "maven")]
+#[tokio::test]
+#[serial]
+async fn maven_multi_classifier_patches_every_present_jar() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("m2-repo");
+    let version_dir = repo.join("org/example/native-lib/1.0.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::write(
+        version_dir.join("native-lib-1.0.0.pom"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>native-lib</artifactId><version>1.0.0</version></project>",
+    )
+    .unwrap();
+
+    // Two classifier jars coexist in the same version directory.
+    let jar_a = "native-lib-1.0.0-linux-x86_64.jar";
+    let jar_b = "native-lib-1.0.0-osx-x86_64.jar";
+    let orig_a = b"JAR-A original bytes\n";
+    let orig_b = b"JAR-B original bytes\n";
+    std::fs::write(version_dir.join(jar_a), orig_a).unwrap();
+    std::fs::write(version_dir.join(jar_b), orig_b).unwrap();
+    let mut patched_a = orig_a.to_vec();
+    patched_a.extend_from_slice(b"\n# MARKER-A\n");
+    let mut patched_b = orig_b.to_vec();
+    patched_b.extend_from_slice(b"\n# MARKER-B\n");
+
+    std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
+
+    let base = "pkg:maven/org.example/native-lib@1.0.0";
+    let purl_a = format!("{base}?classifier=linux-x86_64&ext=jar");
+    let purl_b = format!("{base}?classifier=osx-x86_64&ext=jar");
+    let uuid_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let uuid_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    let server = MockServer::start().await;
+    // Batch + by-package advertise both classifier variants for the base.
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": base,
+                "patches": [
+                    { "uuid": uuid_a, "purl": purl_a, "tier": "free", "cveIds": [],
+                      "ghsaIds": [], "severity": "medium", "title": "linux jar" },
+                    { "uuid": uuid_b, "purl": purl_b, "tier": "free", "cveIds": [],
+                      "ghsaIds": [], "severity": "medium", "title": "osx jar" },
+                ]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                { "uuid": uuid_a, "purl": purl_a, "publishedAt": "2024-01-01T00:00:00Z",
+                  "description": "linux", "license": "MIT", "tier": "free", "vulnerabilities": {} },
+                { "uuid": uuid_b, "purl": purl_b, "publishedAt": "2024-01-01T00:00:00Z",
+                  "description": "osx", "license": "MIT", "tier": "free", "vulnerabilities": {} },
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    for (uuid, purl, jar, before, after) in [
+        (uuid_a, &purl_a, jar_a, orig_a.to_vec(), patched_a.clone()),
+        (uuid_b, &purl_b, jar_b, orig_b.to_vec(), patched_b.clone()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid,
+                "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": {
+                    jar: {
+                        "beforeHash": git_sha256(&before),
+                        "afterHash": git_sha256(&after),
+                        "blobContent": base64::engine::general_purpose::STANDARD.encode(&after),
+                    }
+                },
+                "vulnerabilities": {},
+                "description": "fixture", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let args = default_scan_args(tmp.path(), "maven", server.uri());
+    let code = scan_run(args).await;
+    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+
+    // BOTH coexisting classifier jars must be patched.
+    let after_a = std::fs::read(version_dir.join(jar_a)).expect("read jar a");
+    let after_b = std::fs::read(version_dir.join(jar_b)).expect("read jar b");
+    assert!(
+        after_a.windows(b"# MARKER-A\n".len()).any(|w| w == b"# MARKER-A\n"),
+        "linux-x86_64 classifier jar was not patched"
+    );
+    assert!(
+        after_b.windows(b"# MARKER-B\n".len()).any(|w| w == b"# MARKER-B\n"),
+        "osx-x86_64 classifier jar was not patched (plural selector must keep both)"
+    );
+
+    std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+}
+
 // ---------------------------------------------------------------------------
 // composer
 // ---------------------------------------------------------------------------
