@@ -95,8 +95,10 @@ impl RubyCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) {
-                let gem_dir = gem_path.join(format!("{name}-{version}"));
-                if self.verify_gem_at_path(&gem_dir).await {
+                // The purl is the base PURL (qualifiers stripped upstream).
+                // Resolve it to the installed gem dir, which may carry a
+                // `-<platform>` suffix for platform gems.
+                if let Some(gem_dir) = self.locate_gem_dir(gem_path, name, version).await {
                     result.insert(
                         purl.clone(),
                         CrawledPackage {
@@ -309,25 +311,61 @@ impl RubyCrawler {
         false
     }
 
-    /// Parse a gem directory name into (name, version).
+    /// Parse a gem directory name into its base `(name, version)`.
     ///
-    /// Gem directories follow the pattern `<name>-<version>`, where the
-    /// version is the last `-`-separated component that starts with a digit.
+    /// Gem directories follow `<name>-<version>` (ruby-platform gems) or
+    /// `<name>-<version>-<platform>` (platform gems, e.g.
+    /// `nokogiri-1.16.5-x86_64-linux`). The name/version boundary is the
+    /// **first** `-` followed by a digit. A RubyGems version is dash-free
+    /// (prerelease dashes render as `.pre.`), so the version is the run up
+    /// to the next `-`; anything after that is the platform suffix, which
+    /// we drop — the installed platform is resolved later by hashing the
+    /// gem's files (the same model as PyPI's `artifact_id`). The qualified
+    /// `?platform=` PURL is only ever carried in the manifest/API.
     fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
-        // Find the last '-' followed by a digit
-        let mut split_idx = None;
-        for (i, _) in dir_name.match_indices('-') {
-            if dir_name[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
-                split_idx = Some(i);
-            }
-        }
-        let idx = split_idx?;
+        let idx = dir_name
+            .match_indices('-')
+            .find(|(i, _)| dir_name[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+            .map(|(i, _)| i)?;
         let name = &dir_name[..idx];
-        let version = &dir_name[idx + 1..];
+        let rest = &dir_name[idx + 1..];
+        // Version is the leading dash-free token; drop any `-<platform>`.
+        let version = rest.split('-').next().unwrap_or(rest);
         if name.is_empty() || version.is_empty() {
             return None;
         }
         Some((name.to_string(), version.to_string()))
+    }
+
+    /// Locate an installed gem directory for a base `name`/`version`.
+    ///
+    /// Plain (ruby-platform) gems live in `<name>-<version>/`; platform
+    /// gems append a `-<platform>` suffix
+    /// (`<name>-<version>-x86_64-linux/`). Only one platform is installed
+    /// per environment, so we return the exact dir when present, otherwise
+    /// the first verifying `<name>-<version>-*` directory.
+    async fn locate_gem_dir(
+        &self,
+        gem_path: &Path,
+        name: &str,
+        version: &str,
+    ) -> Option<PathBuf> {
+        let exact = gem_path.join(format!("{name}-{version}"));
+        if self.verify_gem_at_path(&exact).await {
+            return Some(exact);
+        }
+        let prefix = format!("{name}-{version}-");
+        for entry in crate::utils::fs::list_dir_entries(gem_path).await {
+            let file_name = entry.file_name();
+            let dir_name = file_name.to_string_lossy();
+            if dir_name.starts_with(&prefix) {
+                let dir = gem_path.join(&*dir_name);
+                if self.verify_gem_at_path(&dir).await {
+                    return Some(dir);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -381,6 +419,37 @@ mod tests {
         );
         assert!(RubyCrawler::parse_dir_name_version("no-version-here").is_none());
         assert!(RubyCrawler::parse_dir_name_version("noversion").is_none());
+    }
+
+    #[test]
+    fn test_parse_gem_dir_name_platform_gems() {
+        // Platform gems append `-<platform>` to the base name-version; the
+        // platform must be stripped so the base PURL matches the manifest.
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("nokogiri-1.16.5-x86_64-linux"),
+            Some(("nokogiri".to_string(), "1.16.5".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("nokogiri-1.16.5-arm64-darwin"),
+            Some(("nokogiri".to_string(), "1.16.5".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("sassc-2.4.0-java"),
+            Some(("sassc".to_string(), "2.4.0".to_string()))
+        );
+        // Platform with a trailing OS version number must not leak into
+        // the gem version (regression: a "last dash-digit" parser would
+        // split on `-21`).
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("nokogiri-1.16.5-universal-darwin-21"),
+            Some(("nokogiri".to_string(), "1.16.5".to_string()))
+        );
+        // A name with an embedded version-like number resolves at the
+        // first dash-digit boundary.
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("libv8-node-18.16.0.0-x86_64-linux"),
+            Some(("libv8-node".to_string(), "18.16.0.0".to_string()))
+        );
     }
 
     #[tokio::test]

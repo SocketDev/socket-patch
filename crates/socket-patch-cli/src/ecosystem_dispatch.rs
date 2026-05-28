@@ -155,7 +155,7 @@ macro_rules! scan_ecosystem {
     }};
 }
 
-/// Signature shared by `merge_first_wins` and `merge_pypi_qualified`.
+/// Signature shared by `merge_first_wins` and `merge_qualified`.
 /// `dispatch_find` swaps between them so the rollback path can fan one
 /// crawler result back out to every caller-supplied qualified PURL.
 type MergeFn =
@@ -172,10 +172,13 @@ fn merge_first_wins(
     }
 }
 
-/// Pypi rollback merge: the crawler is queried with base PURLs (no
+/// Release-variant merge: the crawler is queried with base PURLs (no
 /// `?qualifiers`); fan the resulting paths back out to every qualified
-/// caller-supplied PURL that strips to the same base.
-fn merge_pypi_qualified(
+/// caller-supplied PURL that strips to the same base. Used for the
+/// release-variant ecosystems (PyPI / RubyGems / Maven) so a single
+/// installed package directory is mapped to every manifest variant for
+/// later hash-based selection.
+fn merge_qualified(
     out: &mut HashMap<String, PathBuf>,
     purls: &[String],
     packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
@@ -191,7 +194,10 @@ fn merge_pypi_qualified(
     }
 }
 
-fn dedup_pypi_purls(purls: &[String]) -> Vec<String> {
+/// Strip qualifiers and dedupe — the crawler only needs the base PURL of
+/// a release-variant ecosystem; the variant is resolved later by hashing
+/// the installed files.
+fn dedup_qualified_purls(purls: &[String]) -> Vec<String> {
     purls
         .iter()
         .map(|p| strip_purl_qualifiers(p).to_string())
@@ -207,14 +213,16 @@ fn passthrough_purls(purls: &[String]) -> Vec<String> {
 /// Drive every enabled ecosystem's find-by-purls path, accumulating
 /// into one `purl -> path` map.
 ///
-/// `pypi_merge` lets the rollback variant fan a single crawler result
+/// `variant_merge` lets the rollback variant fan a single crawler result
 /// out to every caller-supplied qualified PURL; everything else just
-/// inserts the crawler-returned PURL with first-wins semantics.
+/// inserts the crawler-returned PURL with first-wins semantics. It is
+/// applied to the release-variant ecosystems (PyPI / RubyGems / Maven),
+/// which are also queried with deduped base PURLs.
 async fn dispatch_find(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
-    pypi_merge: MergeFn,
+    variant_merge: MergeFn,
 ) -> HashMap<String, PathBuf> {
     let mut out: HashMap<String, PathBuf> = HashMap::new();
 
@@ -242,8 +250,8 @@ async fn dispatch_find(
         get_paths = get_site_packages_paths,
         using_label = "",
         err_label = "Python packages",
-        purls_override = dedup_pypi_purls,
-        on_match = pypi_merge,
+        purls_override = dedup_qualified_purls,
+        on_match = variant_merge,
     );
 
     #[cfg(feature = "cargo")]
@@ -271,8 +279,11 @@ async fn dispatch_find(
         get_paths = get_gem_paths,
         using_label = "ruby gem paths",
         err_label = "Ruby gems",
-        purls_override = passthrough_purls,
-        on_match = merge_first_wins,
+        // RubyGems has per-platform release variants (`?platform=`); the
+        // crawler emits the base PURL and the platform is resolved by
+        // hashing the installed files, same as PyPI.
+        purls_override = dedup_qualified_purls,
+        on_match = variant_merge,
     );
 
     #[cfg(feature = "golang")]
@@ -307,8 +318,12 @@ async fn dispatch_find(
                 get_paths = get_maven_repo_paths,
                 using_label = "Maven repository",
                 err_label = "Maven packages",
-                purls_override = passthrough_purls,
-                on_match = merge_first_wins,
+                // Maven has per-classifier release variants
+                // (`?classifier=&ext=`) that coexist as distinct jars in
+                // one version dir; the crawler emits the base PURL and
+                // each variant is resolved by hashing its jar file.
+                purls_override = dedup_qualified_purls,
+                on_match = variant_merge,
             );
         }
     }
@@ -380,15 +395,16 @@ pub async fn find_packages_for_purls(
     dispatch_find(partitioned, options, silent, merge_first_wins).await
 }
 
-/// Variant of `find_packages_for_purls` for rollback, which needs to remap
-/// pypi qualified PURLs (with `?artifact_id=...`) to the base PURL found
-/// by the crawler.
+/// Variant of `find_packages_for_purls` for rollback and narrow-release
+/// resolution, which needs to remap qualified PURLs (PyPI
+/// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=&ext=`) to
+/// the base PURL found by the crawler.
 pub async fn find_packages_for_rollback(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
     silent: bool,
 ) -> HashMap<String, PathBuf> {
-    dispatch_find(partitioned, options, silent, merge_pypi_qualified).await
+    dispatch_find(partitioned, options, silent, merge_qualified).await
 }
 
 /// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.

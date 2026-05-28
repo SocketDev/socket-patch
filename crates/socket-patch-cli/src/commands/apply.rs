@@ -602,15 +602,20 @@ async fn apply_patches_inner(
     let mut results: Vec<ApplyResult> = Vec::new();
     let mut has_errors = false;
 
-    // Group pypi PURLs by base (for variant matching with qualifiers)
-    let mut pypi_qualified_groups: HashMap<String, Vec<String>> = HashMap::new();
-    if let Some(pypi_purls) = partitioned.get(&Ecosystem::Pypi) {
-        for purl in pypi_purls {
-            let base = strip_purl_qualifiers(purl).to_string();
-            pypi_qualified_groups
-                .entry(base)
-                .or_default()
-                .push(purl.clone());
+    // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
+    // RubyGems (`?platform=`), and Maven (`?classifier=&ext=`) carry
+    // qualifiers distinguishing releases of one `package@version`; the
+    // crawler emits the base PURL, so we match the manifest's qualified
+    // variants against it here.
+    let mut variant_qualified_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (eco, purls) in &partitioned {
+        if eco.supports_release_variants() {
+            for purl in purls {
+                variant_qualified_groups
+                    .entry(strip_purl_qualifiers(purl).to_string())
+                    .or_default()
+                    .push(purl.clone());
+            }
         }
     }
 
@@ -618,13 +623,13 @@ async fn apply_patches_inner(
     let mut matched_manifest_purls: HashSet<String> = HashSet::new();
 
     for (purl, pkg_path) in &all_packages {
-        if Ecosystem::from_purl(purl) == Some(Ecosystem::Pypi) {
+        if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
             let base_purl = strip_purl_qualifiers(purl).to_string();
             if applied_base_purls.contains(&base_purl) {
                 continue;
             }
 
-            let variants = pypi_qualified_groups
+            let variants = variant_qualified_groups
                 .get(&base_purl)
                 .cloned()
                 .unwrap_or_else(|| vec![base_purl.clone()]);
@@ -636,7 +641,9 @@ async fn apply_patches_inner(
                     None => continue,
                 };
 
-                // Check first file hash match (skip when --force)
+                // Check first file hash match (skip when --force). A
+                // mismatch means this variant's distribution isn't the
+                // one on disk, so skip it.
                 if !args.force {
                     if let Some((file_name, file_info)) = patch.files.iter().next() {
                         let verify = verify_file_patch(pkg_path, file_name, file_info).await;
@@ -664,16 +671,21 @@ async fn apply_patches_inner(
 
                 if result.success {
                     applied = true;
-                    applied_base_purls.insert(base_purl.clone());
                     results.push(result);
                     matched_manifest_purls.insert(variant_purl.clone());
-                    break;
+                    // No `break`: apply *every* matching variant. PyPI/gem
+                    // have exactly one installed distribution (the rest
+                    // hash-mismatch and were skipped above), so this
+                    // applies a single variant for them; Maven's coexisting
+                    // classifier jars each get patched.
                 } else {
                     results.push(result);
                 }
             }
 
-            if !applied {
+            if applied {
+                applied_base_purls.insert(base_purl.clone());
+            } else {
                 has_errors = true;
                 if !args.common.silent && !args.common.json {
                     eprintln!("Failed to patch {base_purl}: no matching variant found");
