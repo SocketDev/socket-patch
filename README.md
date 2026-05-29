@@ -78,9 +78,38 @@ socket-patch 550e8400-e29b-41d4-a716-446655440000
 # equivalent to: socket-patch get 550e8400-e29b-41d4-a716-446655440000
 ```
 
+## Global Options
+
+These flags are accepted by **every** subcommand — they are flattened into each command's argument set, so `socket-patch <command> --json --cwd ./app` works uniformly. A command silently ignores any global flag it doesn't use (e.g. `list --global` parses fine and the flag is a no-op).
+
+Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI arg > env var > default**, so a flag on the command line always wins over the environment.
+
+| Flag | Env var | Description |
+|------|---------|-------------|
+| `--cwd <dir>` | `SOCKET_CWD` | Working directory (default: `.`). The manifest path is resolved relative to this. |
+| `-m, --manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
+| `--api-url <url>` | `SOCKET_API_URL` | Socket API URL for the authenticated endpoint (default: `https://api.socket.dev`). |
+| `--api-token <token>` | `SOCKET_API_TOKEN` | Socket API token. When omitted, the public patch proxy is used. |
+| `-o, --org <slug>` | `SOCKET_ORG_SLUG` | Organization slug. Auto-resolved when omitted and a token is set. |
+| `--proxy-url <url>` | `SOCKET_PROXY_URL` | Public proxy URL used when no API token is set. |
+| `-e, --ecosystems <list>` | `SOCKET_ECOSYSTEMS` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`). |
+| `--download-mode <mode>` | `SOCKET_DOWNLOAD_MODE` | Artifact to fetch when local files are missing: `diff` (default, smallest delta), `package` (full per-package tarball), or `file` (legacy per-file blobs). |
+| `--offline` | `SOCKET_OFFLINE` | Strict airgap: never contact the network. Operations that need remote data fail loudly. |
+| `-g, --global` | `SOCKET_GLOBAL` | Operate on globally-installed packages. |
+| `--global-prefix <path>` | `SOCKET_GLOBAL_PREFIX` | Override the path used to discover globally-installed packages. |
+| `-j, --json` | `SOCKET_JSON` | Emit machine-readable JSON output. Every JSON response includes a `"status"` field (`"success"`, `"error"`, `"no_manifest"`, etc.) for reliable programmatic consumption. |
+| `-v, --verbose` | `SOCKET_VERBOSE` | Show extra detail in human-readable output. |
+| `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
+| `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
+| `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
+| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
+| `--break-lock` | `SOCKET_BREAK_LOCK` | Force-remove a stale `.socket/apply.lock` before acquiring it. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
+| `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
+| `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
+
 ## Commands
 
-All commands support `--json` for structured JSON output and `--cwd <dir>` to set the working directory (default: `.`). Every JSON response includes a `"status"` field (`"success"`, `"error"`, `"no_manifest"`, etc.) for reliable programmatic consumption.
+The tables below list only the **command-specific** flags. Every command also accepts the [Global Options](#global-options) above.
 
 ### `get`
 
@@ -93,23 +122,18 @@ Alias: `download`
 socket-patch get <identifier> [options]
 ```
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `--org <slug>` | Organization slug (required when using `SOCKET_API_TOKEN`) |
 | `--id` | Force identifier to be treated as a UUID |
 | `--cve` | Force identifier to be treated as a CVE ID |
 | `--ghsa` | Force identifier to be treated as a GHSA ID |
 | `-p, --package` | Force identifier to be treated as a package name |
-| `-y, --yes` | Skip confirmation prompt for multiple patches |
 | `--save-only` | Download patch without applying it (alias: `--no-apply`) |
-| `--one-off` | Apply patch immediately without saving to `.socket` folder |
-| `-g, --global` | Apply to globally installed packages |
-| `--global-prefix <path>` | Custom path to global `node_modules` |
-| `--json` | Output results as JSON |
-| `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
-| `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
+| `--one-off` | Apply patch immediately without saving to the `.socket` folder |
+| `--all-releases` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one |
+
+> Authenticated lookups require an org: pass `--org <slug>` (or set `SOCKET_ORG_SLUG`) when using `SOCKET_API_TOKEN`.
 
 **Examples:**
 ```bash
@@ -144,24 +168,16 @@ Scan installed packages for available security patches. Since v3.0 `scan --sync`
 socket-patch scan [options]
 ```
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
 | `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. |
 | `--prune` | Garbage-collect after the scan: remove manifest entries for uninstalled packages and orphan blob/diff/package-archive files. Off by default. |
 | `--sync` | Sugar for `--apply --prune`. The canonical bot-mode flag. |
-| `-d, --dry-run` | Preview what `--apply`/`--prune`/`--sync` would do without mutating disk. |
-| `--org <slug>` | Organization slug |
-| `--json` | Output results as JSON |
-| `-y, --yes` | Skip confirmation prompts |
-| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
-| `-g, --global` | Scan globally installed packages |
-| `--global-prefix <path>` | Custom path to global `node_modules` |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
-| `--download-mode <mode>` | `diff` (default), `package`, or `file` |
-| `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
-| `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
+| `--all-releases` | Store patches for every release/distribution variant, not just the installed one — makes the manifest portable across environments (e.g. cross-platform CI caches) |
+
+> Use `--dry-run` to preview what `--apply`/`--prune`/`--sync` would do without mutating disk.
 
 **Examples:**
 ```bash
@@ -199,20 +215,10 @@ Apply security patches from the local manifest.
 socket-patch apply [options]
 ```
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `-d, --dry-run` | Verify patches without modifying files |
-| `-s, --silent` | Only output errors |
 | `-f, --force` | Skip pre-application hash verification (apply even if package version differs) |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--offline` | Do not download missing blobs; fail if any are missing |
-| `-g, --global` | Apply to globally installed packages |
-| `--global-prefix <path>` | Custom path to global `node_modules` |
-| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`) |
-| `--json` | Output results as JSON |
-| `-v, --verbose` | Show detailed per-file verification information |
-| `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
 ```bash
@@ -241,23 +247,10 @@ Rollback patches to restore original files. If no identifier is given, all patch
 socket-patch rollback [identifier] [options]
 ```
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `-d, --dry-run` | Verify rollback without modifying files |
-| `-s, --silent` | Only output errors |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--offline` | Do not download missing blobs; fail if any are missing |
-| `-g, --global` | Rollback globally installed packages |
-| `--global-prefix <path>` | Custom path to global `node_modules` |
-| `--one-off` | Rollback by fetching original files from API (no manifest required) |
-| `--ecosystems <list>` | Restrict to specific ecosystems (comma-separated) |
-| `--json` | Output results as JSON |
-| `-v, --verbose` | Show detailed per-file verification information |
-| `--org <slug>` | Organization slug |
-| `--api-token <token>` | Socket API token (overrides `SOCKET_API_TOKEN`) |
-| `--api-url <url>` | Socket API URL (overrides `SOCKET_API_URL`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
+| `--one-off` | Rollback by fetching original (`beforeHash`) files from the API — no manifest required |
 
 **Examples:**
 ```bash
@@ -286,12 +279,7 @@ List all patches in the local manifest.
 socket-patch list [options]
 ```
 
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `--json` | Output as JSON |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
+No command-specific options — see [Global Options](#global-options) (`--json`, `--manifest-path`, `--cwd` are the relevant ones).
 
 **Examples:**
 ```bash
@@ -330,15 +318,10 @@ socket-patch remove <identifier> [options]
 **Arguments:**
 - `identifier` - Package PURL (e.g., `pkg:npm/package@version`) or patch UUID
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
 | `--skip-rollback` | Only update manifest, do not restore original files |
-| `-g, --global` | Remove from globally installed packages |
-| `--global-prefix <path>` | Custom path to global `node_modules` |
-| `--json` | Output results as JSON |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
 
 **Examples:**
 ```bash
@@ -368,16 +351,10 @@ Alias: `gc`
 socket-patch repair [options]
 ```
 
-**Options:**
+**Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `-d, --dry-run` | Show what would be done without doing it |
-| `--offline` | Skip network operations (cleanup only) |
-| `--download-only` | Only download missing blobs, do not clean up |
-| `--json` | Output results as JSON |
-| `-m, --manifest-path <path>` | Path to manifest (default: `.socket/manifest.json`) |
-| `--cwd <dir>` | Working directory (default: `.`) |
-| `--download-mode <mode>` | `file` (default), `diff`, or `package` |
+| `--download-only` | Only download missing artifacts, do not clean up (incompatible with `--offline`) |
 
 **Examples:**
 ```bash
@@ -403,13 +380,7 @@ Configure `package.json` postinstall scripts to automatically apply patches afte
 socket-patch setup [options]
 ```
 
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `-d, --dry-run` | Preview changes without modifying files |
-| `-y, --yes` | Skip confirmation prompt |
-| `--json` | Output results as JSON |
-| `--cwd <dir>` | Working directory (default: `.`) |
+No command-specific options — see [Global Options](#global-options) (`--dry-run`, `--yes`, `--json`, `--cwd` are the relevant ones).
 
 **Examples:**
 ```bash
@@ -425,6 +396,78 @@ socket-patch setup --dry-run
 # JSON output for scripting
 socket-patch setup --json -y
 ```
+
+### `vex`
+
+Generate an [OpenVEX](https://github.com/openvex) 0.2.0 attestation describing the vulnerabilities that the applied patches have mitigated. See [OpenVEX attestations](#openvex-attestations) below for the full workflow.
+
+**Usage:**
+```bash
+socket-patch vex [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `-O, --output <path>` | Write the VEX document to this path instead of stdout. Required when combined with `--json`. (env: `SOCKET_VEX_OUTPUT`) |
+| `--product <id>` | Override the auto-detected top-level product PURL/identifier. (env: `SOCKET_VEX_PRODUCT`) |
+| `--no-verify` | Skip the on-disk file-hash check and trust the manifest — useful on a build machine that doesn't have the patched files laid out. (env: `SOCKET_VEX_NO_VERIFY`) |
+| `--doc-id <id>` | Override the document `@id`. Default is a random `urn:uuid:<v4>` regenerated each run; pin this for a reproducible identifier. (env: `SOCKET_VEX_DOC_ID`) |
+| `--compact` | Emit compact JSON instead of pretty-printed. (env: `SOCKET_VEX_COMPACT`) |
+
+**Examples:**
+```bash
+# Print a VEX document to stdout (human-readable status goes to stderr)
+socket-patch vex
+
+# Write the document to a file
+socket-patch vex --output socket.vex.json
+
+# CI shape: VEX doc to file, machine-readable envelope to stdout
+socket-patch vex --json --output socket.vex.json
+
+# Generate on a build box without verifying on-disk files
+socket-patch vex --no-verify --output socket.vex.json
+```
+
+## OpenVEX attestations
+
+`socket-patch vex` turns your local manifest into a signed-off statement of *which known vulnerabilities no longer affect your build* because a Socket patch has been applied. This lets vulnerability scanners stop flagging CVEs that you've already remediated in place — without bumping the package version.
+
+**How it works**
+
+1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each patched file's hash on disk so the attestation only covers patches that are actually applied.
+2. Auto-detects the top-level **product** identifier (override with `--product`), probing in order:
+   - `.git/config` `[remote "origin"]` → `pkg:github/<owner>/<repo>` (similar for GitLab/Bitbucket; raw URL otherwise)
+   - `package.json` → `pkg:npm/<name>@<version>`
+   - `pyproject.toml` → `pkg:pypi/<name>@<version>`
+   - `Cargo.toml` → `pkg:cargo/<name>@<version>`
+3. Emits an OpenVEX 0.2.0 document whose statements mark each mitigated vulnerability as `not_affected` (justification: the patch is present), suitable for piping into `vexctl`, Grype, Trivy, and similar tools.
+
+**Output channels**
+
+| Invocation | VEX document | stdout |
+|------------|--------------|--------|
+| _default_ (no `--output`, no `--json`) | stdout | human-readable status on stderr |
+| `--output <path>` | the file | one-line summary |
+| `--json --output <path>` | the file | machine-readable envelope (the CI shape) |
+
+`--json` requires `--output`, since the VEX document is itself JSON and would otherwise collide with the envelope on stdout.
+
+**Using it with a scanner**
+
+```bash
+# Generate the attestation as part of CI, then hand it to a scanner
+socket-patch vex --output socket.vex.json
+
+# Suppress already-patched findings in Grype
+grype <image-or-dir> --vex socket.vex.json
+
+# Or with Trivy
+trivy image --vex socket.vex.json <image>
+```
+
+Run `socket-patch get` or `socket-patch scan --sync` first — `vex` errors with `no_patches` against an empty manifest.
 
 ## Scripting & CI/CD
 
@@ -451,6 +494,8 @@ socket-patch apply --json | jq '.status'
 When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-proceed instead of blocking. Progress indicators and ANSI colors are automatically suppressed when output is piped.
 
 ## Environment Variables
+
+Every [Global Option](#global-options) has a matching `SOCKET_*` environment variable (listed in that table), and `vex`-specific flags map to `SOCKET_VEX_*`. The most commonly used variables are:
 
 | Variable | Description |
 |----------|-------------|
