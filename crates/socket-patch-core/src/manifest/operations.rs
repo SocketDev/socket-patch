@@ -53,29 +53,30 @@ pub fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, Str
 /// Read and parse a manifest from the filesystem.
 /// Returns Ok(None) if the file does not exist.
 /// Returns Err for I/O errors, JSON parse errors, or validation errors.
-pub async fn read_manifest(path: impl AsRef<Path>) -> Result<Option<PatchManifest>, std::io::Error> {
+pub async fn read_manifest(
+    path: impl AsRef<Path>,
+) -> Result<Option<PatchManifest>, std::io::Error> {
     let path = path.as_ref();
 
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),   // FIX: propagate actual I/O error
+        Err(e) => return Err(e), // FIX: propagate actual I/O error
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
-        Err(e) => return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to parse manifest JSON: {}", e),
-        )),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to parse manifest JSON: {}", e),
+            ))
+        }
     };
 
     match validate_manifest(&parsed) {
         Ok(manifest) => Ok(Some(manifest)),
-        Err(e) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            e,
-        )),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
     }
 }
 
@@ -98,18 +99,12 @@ mod tests {
     const TEST_UUID_1: &str = "11111111-1111-4111-8111-111111111111";
     const TEST_UUID_2: &str = "22222222-2222-4222-8222-222222222222";
 
-    const BEFORE_HASH_1: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111";
-    const AFTER_HASH_1: &str =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111";
-    const BEFORE_HASH_2: &str =
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2222";
-    const AFTER_HASH_2: &str =
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2222";
-    const BEFORE_HASH_3: &str =
-        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee3333";
-    const AFTER_HASH_3: &str =
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3333";
+    const BEFORE_HASH_1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111";
+    const AFTER_HASH_1: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111";
+    const BEFORE_HASH_2: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2222";
+    const AFTER_HASH_2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2222";
+    const BEFORE_HASH_3: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee3333";
+    const AFTER_HASH_3: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3333";
 
     fn create_test_manifest() -> PatchManifest {
         let mut patches = HashMap::new();
@@ -210,7 +205,6 @@ mod tests {
         assert_eq!(blobs.len(), 0);
     }
 
-
     #[test]
     fn test_validate_manifest_valid() {
         let json = serde_json::json!({
@@ -262,6 +256,106 @@ mod tests {
         let result = read_manifest("/nonexistent/path/manifest.json").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    // Regression: a missing file maps to Ok(None), but malformed JSON must
+    // surface as an InvalidData error -- NOT be silently swallowed as Ok(None).
+    // The original implementation returned Ok(None) for every failure mode,
+    // which hid corrupt manifests from callers.
+    #[tokio::test]
+    async fn test_read_manifest_malformed_json_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        tokio::fs::write(&path, "{ not valid json").await.unwrap();
+
+        let result = read_manifest(&path).await;
+        assert!(
+            result.is_err(),
+            "malformed JSON must be an error, not Ok(None)"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // Regression: well-formed JSON that doesn't satisfy the schema (missing
+    // required fields) must also surface as an InvalidData error.
+    #[tokio::test]
+    async fn test_read_manifest_invalid_schema_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        // Valid JSON, but `patches` has the wrong shape.
+        tokio::fs::write(&path, r#"{"patches": "not-an-object"}"#)
+            .await
+            .unwrap();
+
+        let result = read_manifest(&path).await;
+        assert!(
+            result.is_err(),
+            "schema-invalid manifest must be an error, not Ok(None)"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // Regression: the two blob extractors must not be swapped. Each must return
+    // exactly its own side of the hash pair with zero cross-contamination.
+    #[test]
+    fn test_blob_extractors_do_not_cross_contaminate() {
+        let manifest = create_test_manifest();
+        let after = get_after_hash_blobs(&manifest);
+        let before = get_before_hash_blobs(&manifest);
+
+        // The two sets are disjoint for this fixture.
+        assert!(after.is_disjoint(&before));
+        // Every after-blob is an afterHash from the fixture, never a beforeHash.
+        for b in [BEFORE_HASH_1, BEFORE_HASH_2, BEFORE_HASH_3] {
+            assert!(!after.contains(b));
+        }
+        for a in [AFTER_HASH_1, AFTER_HASH_2, AFTER_HASH_3] {
+            assert!(!before.contains(a));
+        }
+    }
+
+    // Regression: a non-NotFound I/O error must propagate as Err -- it must NOT
+    // be collapsed into Ok(None). Only a genuinely-missing file is Ok(None).
+    // Reading a directory as if it were a file produces such an I/O error, which
+    // directly exercises the `Err(e) => return Err(e)` arm. (The malformed-JSON
+    // and invalid-schema tests cover the parse/validate arms but not this one.)
+    #[tokio::test]
+    async fn test_read_manifest_io_error_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        // Path exists but is a directory, so read_to_string fails with an I/O
+        // error whose kind is NOT NotFound.
+        let result = read_manifest(dir.path()).await;
+        assert!(
+            result.is_err(),
+            "a non-NotFound I/O error must surface as Err, not Ok(None)"
+        );
+        assert_ne!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "an existing-but-unreadable path is not a 'missing file'"
+        );
+    }
+
+    // Regression: write_manifest -> read_manifest must preserve the full record,
+    // not merely the patch count. Guards against a serializer that drops nested
+    // fields (file hashes, vulnerabilities) while still round-tripping the keys.
+    #[tokio::test]
+    async fn test_write_manifest_preserves_full_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        let manifest = create_test_manifest();
+        write_manifest(&path, &manifest).await.unwrap();
+
+        let read_back = read_manifest(&path).await.unwrap().unwrap();
+        // Deep equality: every patch, file, hash, and vulnerability survives.
+        assert_eq!(read_back, manifest);
+
+        // Spot-check a nested hash to make the intent explicit.
+        let record = read_back.patches.get("pkg:npm/pkg-a@1.0.0").unwrap();
+        let file_info = record.files.get("package/index.js").unwrap();
+        assert_eq!(file_info.before_hash, BEFORE_HASH_1);
+        assert_eq!(file_info.after_hash, AFTER_HASH_1);
     }
 
     #[tokio::test]

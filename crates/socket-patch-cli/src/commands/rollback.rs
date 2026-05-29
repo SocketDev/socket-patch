@@ -113,6 +113,38 @@ fn verify_rollback_status_str(status: &VerifyRollbackStatus) -> &'static str {
     }
 }
 
+/// True when every file the engine verified for this package is already
+/// at its original (`beforeHash`) state — i.e. the rollback is a complete
+/// no-op on disk.
+///
+/// This is the rollback-side mirror of apply's `all_files_already_patched`.
+/// The `!is_empty()` guard is essential: `Iterator::all` over an empty
+/// slice is vacuously `true`. Without it a result with no verified files
+/// — a zero-file patch record, or a result whose `files_verified` came
+/// back empty — would be mislabeled "already original" and miscounted as
+/// a no-op even though nothing matched `beforeHash`.
+fn all_files_already_original(result: &RollbackResult) -> bool {
+    !result.files_verified.is_empty()
+        && result
+            .files_verified
+            .iter()
+            .all(|f| f.status == VerifyRollbackStatus::AlreadyOriginal)
+}
+
+/// Number of packages that have files which actually need restoring,
+/// used by the dry-run summary. Successful-but-already-original packages
+/// are no-ops reported on their own line, so they are excluded here —
+/// mirroring apply's dry-run split — to avoid double-counting them
+/// against "can be rolled back".
+fn can_rollback_count(results: &[RollbackResult]) -> usize {
+    let successful = results.iter().filter(|r| r.success).count();
+    let already_original = results
+        .iter()
+        .filter(|r| r.success && all_files_already_original(r))
+        .count();
+    successful.saturating_sub(already_original)
+}
+
 fn result_to_json(result: &RollbackResult) -> serde_json::Value {
     serde_json::json!({
         "purl": result.package_key,
@@ -209,12 +241,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .count();
             let already_original_count = results
                 .iter()
-                .filter(|r| {
-                    r.success
-                        && r.files_verified.iter().all(|f| {
-                            f.status == VerifyRollbackStatus::AlreadyOriginal
-                        })
-                })
+                .filter(|r| r.success && all_files_already_original(r))
                 .count();
             let failed_count = results.iter().filter(|r| !r.success).count();
 
@@ -250,18 +277,16 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .collect();
                 let already_original: Vec<_> = results
                     .iter()
-                    .filter(|r| {
-                        r.success
-                            && r.files_verified.iter().all(|f| {
-                                f.status == VerifyRollbackStatus::AlreadyOriginal
-                            })
-                    })
+                    .filter(|r| r.success && all_files_already_original(r))
                     .collect();
                 let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
 
                 if args.common.dry_run {
                     println!("\nRollback verification complete:");
-                    let can_rollback = results.iter().filter(|r| r.success).count();
+                    // Exclude already-original packages — they are
+                    // reported separately just below, so counting them
+                    // here too would double-report each no-op.
+                    let can_rollback = can_rollback_count(&results);
                     println!("  {can_rollback} package(s) can be rolled back");
                     if !already_original.is_empty() {
                         println!(
@@ -684,5 +709,122 @@ mod tests {
         let result =
             find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
         assert!(result.iter().all(|p| p.purl.contains("six@1.16.0")));
+    }
+
+    // --- Summary-counting regressions -----------------------------------
+    //
+    // These pin the rollback summary to the same contract apply uses:
+    // an "already original" result must have at least one verified file,
+    // and the dry-run "can be rolled back" count must not double-report
+    // packages that are already in their original state.
+
+    use socket_patch_core::patch::rollback::VerifyRollbackResult;
+
+    fn verified(status: VerifyRollbackStatus) -> VerifyRollbackResult {
+        VerifyRollbackResult {
+            file: "package/index.js".to_string(),
+            status,
+            message: None,
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        }
+    }
+
+    /// Build a `RollbackResult` from verification statuses and the list of
+    /// files reported rolled back. `success` defaults to whether every
+    /// verified file is Ready/AlreadyOriginal, matching the engine.
+    fn make_result(
+        verified_statuses: &[VerifyRollbackStatus],
+        rolled_back: &[&str],
+    ) -> RollbackResult {
+        let files_verified: Vec<_> =
+            verified_statuses.iter().cloned().map(verified).collect();
+        let success = files_verified.iter().all(|f| {
+            f.status == VerifyRollbackStatus::Ready
+                || f.status == VerifyRollbackStatus::AlreadyOriginal
+        });
+        RollbackResult {
+            package_key: "pkg:npm/foo@1.0.0".to_string(),
+            package_path: "/tmp/foo".to_string(),
+            success,
+            files_verified,
+            files_rolled_back: rolled_back.iter().map(|s| s.to_string()).collect(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn all_files_already_original_true_when_every_file_matches() {
+        let r = make_result(
+            &[
+                VerifyRollbackStatus::AlreadyOriginal,
+                VerifyRollbackStatus::AlreadyOriginal,
+            ],
+            &[],
+        );
+        assert!(all_files_already_original(&r));
+    }
+
+    #[test]
+    fn all_files_already_original_false_when_any_file_differs() {
+        let r = make_result(
+            &[
+                VerifyRollbackStatus::AlreadyOriginal,
+                VerifyRollbackStatus::Ready,
+            ],
+            &[],
+        );
+        assert!(!all_files_already_original(&r));
+    }
+
+    /// Regression: `Iterator::all` over an empty slice is vacuously true.
+    /// A successful result with no verified files (a zero-file patch
+    /// record) must NOT be reported as "already original" — the
+    /// `!is_empty()` guard enforces this, matching apply.
+    #[test]
+    fn all_files_already_original_false_when_no_verified_files() {
+        let r = make_result(&[], &[]);
+        assert!(r.files_verified.is_empty());
+        assert!(r.success);
+        assert!(!all_files_already_original(&r));
+    }
+
+    /// Regression: the dry-run "can be rolled back" count must exclude
+    /// already-original packages, which are reported on their own line.
+    /// Otherwise each no-op is double-counted (once as can-rollback, once
+    /// as already-original).
+    #[test]
+    fn can_rollback_count_excludes_already_original() {
+        let results = vec![
+            // Genuinely needs restoring.
+            make_result(&[VerifyRollbackStatus::Ready], &[]),
+            // No-op: already at beforeHash.
+            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            // Mixed → still needs restoring.
+            make_result(
+                &[
+                    VerifyRollbackStatus::Ready,
+                    VerifyRollbackStatus::AlreadyOriginal,
+                ],
+                &[],
+            ),
+            // Failed (e.g. HashMismatch) → not counted as rollbackable.
+            make_result(&[VerifyRollbackStatus::HashMismatch], &[]),
+        ];
+        // 2 successful non-no-op packages; the already-original one is
+        // excluded and the failed one was never successful.
+        assert_eq!(can_rollback_count(&results), 2);
+    }
+
+    /// A summary made entirely of no-ops reports zero rollbackable
+    /// packages (and `saturating_sub` keeps it from underflowing).
+    #[test]
+    fn can_rollback_count_all_already_original_is_zero() {
+        let results = vec![
+            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+        ];
+        assert_eq!(can_rollback_count(&results), 0);
     }
 }

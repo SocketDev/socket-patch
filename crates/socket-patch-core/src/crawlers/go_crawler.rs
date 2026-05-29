@@ -52,10 +52,32 @@ pub fn parse_go_mod_module(content: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("module") {
+            // `module` must be a whole token: the directive is followed by
+            // whitespace. Without this guard, lines like `modulepath = x`
+            // would be misparsed as a module declaration.
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            // Strip a trailing line comment (`module foo // note`). Module
+            // paths never contain `//`, so the first occurrence is the comment.
+            let rest = match rest.find("//") {
+                Some(idx) => &rest[..idx],
+                None => rest,
+            };
             let rest = rest.trim();
             // Handle quoted module paths
-            if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
-                return Some(rest[1..rest.len() - 1].to_string());
+            if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+                let inner = &rest[1..rest.len() - 1];
+                // A quoted-but-empty path (`module ""`) is malformed: Go
+                // module paths are never empty. Treat it as absent rather
+                // than returning `Some("")`, which would later build a
+                // bogus PURL like `pkg:golang/@<version>`. A go.mod has at
+                // most one `module` directive, so skipping here falls
+                // through to `None`.
+                if inner.is_empty() {
+                    continue;
+                }
+                return Some(inner.to_string());
             }
             // Unquoted module path
             if !rest.is_empty() {
@@ -146,11 +168,15 @@ impl GoCrawler {
 
         for purl in purls {
             if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
-                // Encode the module path for the filesystem
+                // Encode the module path AND the version for the filesystem.
+                // Go case-escapes both halves of the directory name, so a
+                // version like `v1.0.0-RC1` must be looked up as
+                // `v1.0.0-!r!c1` or the directory is never found.
                 let encoded = encode_module_path(module_path);
+                let encoded_version = encode_module_path(version);
 
-                // Go module cache layout: <encoded-module-path>@<version>/
-                let module_dir = cache_path.join(format!("{encoded}@{version}"));
+                // Go module cache layout: <encoded-module-path>@<encoded-version>/
+                let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
 
                 if is_dir(&module_dir).await {
                     // Split module_path into namespace and name
@@ -186,9 +212,13 @@ impl GoCrawler {
             }
         }
         if let Ok(gopath) = std::env::var("GOPATH") {
-            let p = PathBuf::from(gopath);
-            if !p.as_os_str().is_empty() {
-                return Some(p.join("pkg").join("mod"));
+            // GOPATH may list several directories separated by the OS path
+            // separator (`:` on Unix, `;` on Windows). Go uses the FIRST
+            // entry for the module cache, so split rather than treating the
+            // whole value as a single path.
+            if let Some(first) = std::env::split_paths(&gopath).find(|p| !p.as_os_str().is_empty())
+            {
+                return Some(first.join("pkg").join("mod"));
             }
         }
         let home = std::env::var("HOME")
@@ -231,12 +261,22 @@ impl GoCrawler {
                 let dir_name = entry.file_name();
                 let dir_name_str = dir_name.to_string_lossy();
 
-                // Skip hidden directories and the cache metadata directory
-                if dir_name_str.starts_with('.') || dir_name_str == "cache" {
+                // Skip hidden directories anywhere, and the module cache's
+                // `cache/` metadata directory — but ONLY at the cache root.
+                // The download cache lives at `<root>/cache`; a `cache` path
+                // component deeper in the tree is a legitimate module name
+                // (e.g. `github.com/go-redis/cache/v9@v9.0.0`) and must not be
+                // pruned, or the versioned dir beneath it is never discovered.
+                if dir_name_str.starts_with('.')
+                    || (dir_name_str == "cache" && current_path == base_path)
+                {
                     continue;
                 }
 
-                let full_path = current_path.join(&*dir_name_str);
+                // Build the child path from the raw `OsStr` rather than the
+                // lossy UTF-8 rendering, so non-UTF-8 directory names still
+                // resolve to the correct on-disk path.
+                let full_path = current_path.join(entry.file_name());
 
                 // Check if this directory has `@` in its name (versioned module)
                 if dir_name_str.contains('@') {
@@ -276,10 +316,14 @@ impl GoCrawler {
             return None;
         }
 
-        // Decode case-encoded path
+        // Decode case-encoding. Go escapes uppercase letters in BOTH the
+        // module path and the version, so a pre-release tag such as
+        // `v1.0.0-RC1` lands on disk as `v1.0.0-!r!c1`. Decoding only the
+        // path would leave an escaped version in the PURL.
         let module_path = decode_module_path(encoded_module_path);
+        let version = decode_module_path(version);
 
-        let purl = crate::utils::purl::build_golang_purl(&module_path, version);
+        let purl = crate::utils::purl::build_golang_purl(&module_path, &version);
 
         if seen.contains(&purl) {
             return None;
@@ -407,6 +451,16 @@ mod tests {
     fn test_parse_go_mod_module_missing() {
         let content = "go 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n";
         assert_eq!(parse_go_mod_module(content), None);
+    }
+
+    #[test]
+    fn test_parse_go_mod_module_empty_quoted_path() {
+        // A quoted-but-empty module path is malformed and must not yield
+        // `Some("")` (which would later build a bogus `pkg:golang/@...`
+        // PURL). Mirrors the bare-`module` empty-path regression test.
+        assert_eq!(parse_go_mod_module("module \"\"\n\ngo 1.21\n"), None);
+        // Whitespace-padded variant is equally malformed.
+        assert_eq!(parse_go_mod_module("  module \"\"  \n"), None);
     }
 
     #[test]
@@ -606,10 +660,7 @@ mod tests {
             "pkg:golang/github.com/Azure/azure-sdk-for-go@v1.0.0"
         );
         assert_eq!(packages[0].name, "azure-sdk-for-go");
-        assert_eq!(
-            packages[0].namespace,
-            Some("github.com/Azure".to_string())
-        );
+        assert_eq!(packages[0].namespace, Some("github.com/Azure".to_string()));
     }
 
     /// `rel_str = "@v1.0.0"` — the dir literally lives at the cache
@@ -624,6 +675,111 @@ mod tests {
         let mut seen = HashSet::new();
         let crawler = GoCrawler;
         let result = crawler.parse_versioned_dir(base, dir, "@v1.0.0", &mut seen);
-        assert!(result.is_none(), "empty encoded module path must yield None");
+        assert!(
+            result.is_none(),
+            "empty encoded module path must yield None"
+        );
+    }
+
+    // -- Regression tests -------------------------------------------------
+
+    #[test]
+    fn test_parse_go_mod_module_trailing_comment() {
+        // A trailing line comment must not leak into the module path.
+        let content = "module github.com/gin-gonic/gin // indirect note\n\ngo 1.21\n";
+        assert_eq!(
+            parse_go_mod_module(content),
+            Some("github.com/gin-gonic/gin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_go_mod_module_word_boundary() {
+        // `module` must be a whole token; `modulepath` is not the directive.
+        let content = "modulepath github.com/should/not/match\ngo 1.21\n";
+        assert_eq!(parse_go_mod_module(content), None);
+    }
+
+    #[tokio::test]
+    async fn test_crawl_finds_module_with_cache_path_component() {
+        // The `cache` skip must only apply at the cache root, not to a
+        // legitimate `cache` segment inside a module path. Without the
+        // fix, `github.com/go-redis/cache/v9@v9.0.0` is pruned entirely.
+        let dir = tempfile::tempdir().unwrap();
+
+        let cache_module = dir
+            .path()
+            .join("github.com")
+            .join("go-redis")
+            .join("cache")
+            .join("v9@v9.0.0");
+        tokio::fs::create_dir_all(&cache_module).await.unwrap();
+
+        // And the real top-level `cache/` metadata dir must still be skipped.
+        let metadata = dir.path().join("cache").join("download").join("sumdb");
+        tokio::fs::create_dir_all(&metadata).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(packages.len(), 1, "only the real module should be found");
+        assert!(purls.contains("pkg:golang/github.com/go-redis/cache/v9@v9.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_crawl_decodes_uppercase_version() {
+        // Go case-escapes uppercase letters in the version too. A pre-release
+        // tag `v1.0.0-RC1` is stored on disk as `v1.0.0-!r!c1` and must be
+        // decoded back when forming the PURL.
+        let dir = tempfile::tempdir().unwrap();
+
+        let module_dir = dir
+            .path()
+            .join("github.com")
+            .join("foo")
+            .join("bar@v1.0.0-!r!c1");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].version, "v1.0.0-RC1");
+        assert_eq!(packages[0].purl, "pkg:golang/github.com/foo/bar@v1.0.0-RC1");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_uppercase_version() {
+        // Lookup must escape the version to match the on-disk directory.
+        let dir = tempfile::tempdir().unwrap();
+
+        let module_dir = dir
+            .path()
+            .join("github.com")
+            .join("foo")
+            .join("bar@v1.0.0-!r!c1");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let purls = vec!["pkg:golang/github.com/foo/bar@v1.0.0-RC1".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let pkg = &result["pkg:golang/github.com/foo/bar@v1.0.0-RC1"];
+        assert_eq!(pkg.name, "bar");
+        assert_eq!(pkg.version, "v1.0.0-RC1");
     }
 }

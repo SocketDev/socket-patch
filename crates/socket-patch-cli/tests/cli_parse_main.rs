@@ -116,6 +116,22 @@ fn repair_subcommand_parses() {
     assert!(matches!(cli.command, Commands::Repair(_)));
 }
 
+#[test]
+fn unlock_subcommand_parses() {
+    // `unlock` is one of the two newest subcommands and the second-to-last
+    // arm in main.rs's dispatch match — keep its name + dispatch wiring
+    // covered alongside the older commands.
+    let cli = parse(&["socket-patch", "unlock"]).expect("unlock must parse with no positional");
+    assert!(matches!(cli.command, Commands::Unlock(_)));
+}
+
+#[test]
+fn vex_subcommand_parses() {
+    // `vex` is the last arm in main.rs's dispatch match; lock its name in.
+    let cli = parse(&["socket-patch", "vex"]).expect("vex must parse with no positional");
+    assert!(matches!(cli.command, Commands::Vex(_)));
+}
+
 // ---------- visible aliases ----------
 
 #[test]

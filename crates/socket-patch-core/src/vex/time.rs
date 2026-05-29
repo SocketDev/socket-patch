@@ -220,6 +220,71 @@ mod tests {
         );
     }
 
+    /// Century years 2200 and 2300 are divisible by 100 but NOT by
+    /// 400, so neither has a Feb 29 — Feb 28 must roll straight to
+    /// Mar 1. Complements `century_year_2100_is_not_a_leap_year` and
+    /// guards the `doe / 36_524` / `doe / 146_096` era corrections at
+    /// timestamps where the `era` quotient is ≥ 1 (post-2099).
+    #[test]
+    fn far_future_century_years_are_not_leap() {
+        assert_eq!(
+            format_unix_secs_rfc3339(7_263_215_999),
+            "2200-02-28T23:59:59Z"
+        );
+        assert_eq!(
+            format_unix_secs_rfc3339(7_263_216_000),
+            "2200-03-01T00:00:00Z"
+        );
+        assert_eq!(
+            format_unix_secs_rfc3339(10_418_889_599),
+            "2300-02-28T23:59:59Z"
+        );
+        assert_eq!(
+            format_unix_secs_rfc3339(10_418_889_600),
+            "2300-03-01T00:00:00Z"
+        );
+    }
+
+    /// 2400 is divisible by 400 → leap year, so Feb 29 2400 exists.
+    /// This is the four-century reset point one full era past 2000,
+    /// exercising the `era * 400` year reconstruction with `era` ≥ 1.
+    #[test]
+    fn year_2400_is_a_leap_year() {
+        assert_eq!(
+            format_unix_secs_rfc3339(13_574_606_400),
+            "2400-02-29T12:00:00Z"
+        );
+    }
+
+    /// A far-future leap day (2248-02-29) with a non-trivial time of
+    /// day. Pins the full Y/M/D/h/m/s reconstruction at a timestamp
+    /// well into the `era == 1` range.
+    #[test]
+    fn far_future_leap_day_with_time_of_day() {
+        assert_eq!(
+            format_unix_secs_rfc3339(8_777_917_815),
+            "2248-02-29T06:30:15Z"
+        );
+    }
+
+    /// Time-of-day rollovers: second→minute, minute→hour, and the
+    /// noon midpoint. The date-boundary tests above never cross a
+    /// `:59 → :00` minute/hour carry within a fixed day, so these pin
+    /// the `secs_of_day` div/mod arithmetic directly.
+    #[test]
+    fn time_of_day_rollovers() {
+        let cases: &[(u64, &str)] = &[
+            (1_704_067_259, "2024-01-01T00:00:59Z"), // last second of minute 0
+            (1_704_067_260, "2024-01-01T00:01:00Z"), // minute carry
+            (1_704_070_799, "2024-01-01T00:59:59Z"), // last second of hour 0
+            (1_704_070_800, "2024-01-01T01:00:00Z"), // hour carry
+            (1_704_110_400, "2024-01-01T12:00:00Z"), // noon
+        ];
+        for &(secs, expected) in cases {
+            assert_eq!(format_unix_secs_rfc3339(secs), expected, "secs={secs}");
+        }
+    }
+
     /// `u64::MAX` does not panic. Output isn't asserted byte-for-byte
     /// because the algorithm uses an `i64` cast that overflows in
     /// well-defined wrapping in debug-release but the function MUST
@@ -230,9 +295,7 @@ mod tests {
         // Wrap in `std::panic::catch_unwind` for safety even though
         // the function uses pure arithmetic — a regression that
         // introduced an unsafe cast would still be caught.
-        let result = std::panic::catch_unwind(|| {
-            format_unix_secs_rfc3339(u64::MAX)
-        });
+        let result = std::panic::catch_unwind(|| format_unix_secs_rfc3339(u64::MAX));
         assert!(result.is_ok(), "u64::MAX must not panic");
         // The output shape should still end in `Z`.
         let s = result.unwrap();

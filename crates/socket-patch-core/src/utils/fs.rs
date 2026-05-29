@@ -26,16 +26,17 @@
 
 use std::path::Path;
 
-use tokio::fs::DirEntry;
 use std::fs::FileType;
+use tokio::fs::DirEntry;
 
 /// List the immediate children of `path`.
 ///
 /// Returns an empty vector if the directory cannot be read (does not
-/// exist, permission denied, etc.) or if any individual `next_entry`
-/// call fails. The crawlers treat both cases the same way: surface
-/// no packages from the unreadable subtree, but don't abort the
-/// whole crawl.
+/// exist, permission denied, etc.). If a later `next_entry` call
+/// fails mid-iteration, the entries gathered so far are returned and
+/// iteration stops. The crawlers treat all of these the same way:
+/// surface whatever the readable portion of the subtree yields, but
+/// don't abort the whole crawl.
 pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(rd) => rd,
@@ -51,11 +52,18 @@ pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 
 /// Resolve whether `entry` is a directory, following symlinks.
 ///
-/// Returns `false` if `file_type()` errors — the caller then skips
-/// the entry rather than aborting the walk.
+/// Returns `false` if the stat fails (broken symlink, permission
+/// error, etc.) — the caller then skips the entry rather than
+/// aborting the walk.
+///
+/// `DirEntry::metadata()` does **not** traverse symlinks (it behaves
+/// like `symlink_metadata`), so a symlink pointing at a directory
+/// would wrongly report `false`. To honor the documented
+/// symlink-following contract — which crawlers like deno/python/ruby
+/// rely on for symlinked package directories — we stat the resolved
+/// `entry.path()` via `tokio::fs::metadata`, which does follow links.
 pub async fn entry_is_dir(entry: &DirEntry) -> bool {
-    entry
-        .metadata()
+    tokio::fs::metadata(entry.path())
         .await
         .map(|m| m.is_dir())
         .unwrap_or(false)
@@ -96,7 +104,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::create_dir(tmp.path().join("a")).await.unwrap();
         tokio::fs::create_dir(tmp.path().join("b")).await.unwrap();
-        tokio::fs::write(tmp.path().join("c.txt"), b"").await.unwrap();
+        tokio::fs::write(tmp.path().join("c.txt"), b"")
+            .await
+            .unwrap();
         let mut names: Vec<String> = list_dir_entries(tmp.path())
             .await
             .into_iter()
@@ -121,5 +131,87 @@ mod tests {
                 other => panic!("unexpected entry: {other}"),
             }
         }
+    }
+
+    /// Regression: `entry_is_dir` must follow symlinks. A symlink that
+    /// points at a directory has to report `true`, otherwise crawlers
+    /// silently skip symlinked package directories (pnpm stores,
+    /// virtualenvs, vendored gems, etc.). `DirEntry::metadata()` does
+    /// NOT traverse symlinks, so this guards against regressing back to
+    /// it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entry_is_dir_follows_symlink_to_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real_dir");
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, tmp.path().join("link_to_dir"))
+            .await
+            .unwrap();
+
+        let entries = list_dir_entries(tmp.path()).await;
+        let link = entries
+            .into_iter()
+            .find(|e| e.file_name().to_string_lossy() == "link_to_dir")
+            .expect("symlink entry present");
+        assert!(
+            entry_is_dir(&link).await,
+            "symlink pointing at a directory must resolve to is_dir = true"
+        );
+    }
+
+    /// A symlink pointing at a regular file must report `false`, and a
+    /// broken/dangling symlink must report `false` rather than panic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entry_is_dir_symlink_to_file_and_broken_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_target = tmp.path().join("real_file");
+        tokio::fs::write(&file_target, b"x").await.unwrap();
+        tokio::fs::symlink(&file_target, tmp.path().join("link_to_file"))
+            .await
+            .unwrap();
+        tokio::fs::symlink(
+            tmp.path().join("missing_target"),
+            tmp.path().join("dangling"),
+        )
+        .await
+        .unwrap();
+
+        for entry in list_dir_entries(tmp.path()).await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = entry_is_dir(&entry).await;
+            match name.as_str() {
+                "real_file" | "link_to_file" | "dangling" => {
+                    assert!(!is_dir, "{name} should not be a dir");
+                }
+                other => panic!("unexpected entry: {other}"),
+            }
+        }
+    }
+
+    /// `entry_file_type` is the symlink-aware counterpart: it reports
+    /// the link itself (`is_symlink`), never the resolved target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entry_file_type_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real_dir");
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::symlink(&target, tmp.path().join("link_to_dir"))
+            .await
+            .unwrap();
+
+        let entries = list_dir_entries(tmp.path()).await;
+        let link = entries
+            .into_iter()
+            .find(|e| e.file_name().to_string_lossy() == "link_to_dir")
+            .expect("symlink entry present");
+        let ft = entry_file_type(&link).await.expect("file_type available");
+        assert!(
+            ft.is_symlink(),
+            "entry_file_type must surface the link kind"
+        );
+        assert!(!ft.is_dir(), "entry_file_type must not resolve the target");
     }
 }

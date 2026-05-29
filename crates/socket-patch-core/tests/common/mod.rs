@@ -76,7 +76,10 @@ impl MockCommandRunner {
     /// `Some(stdout)` simulates the binary returning success; a
     /// `None` simulates spawn failure or non-zero exit.
     pub fn with_response(mut self, bin: &str, args: &[&str], stdout: Option<&str>) -> Self {
-        let key = (bin.to_string(), args.iter().map(|s| s.to_string()).collect());
+        let key = (
+            bin.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        );
         self.responses.insert(key, stdout.map(|s| s.to_string()));
         self
     }
@@ -84,7 +87,10 @@ impl MockCommandRunner {
 
 impl socket_patch_core::utils::process::CommandRunner for MockCommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        let key = (bin.to_string(), args.iter().map(|s| s.to_string()).collect());
+        let key = (
+            bin.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        );
         self.responses.get(&key).cloned().unwrap_or(None)
     }
 }

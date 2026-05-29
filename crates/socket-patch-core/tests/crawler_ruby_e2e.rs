@@ -40,7 +40,9 @@ fn options_at(root: &Path) -> CrawlerOptions {
 /// accepts it.
 async fn stage_gem(gem_path: &Path, name: &str, version: &str) -> std::path::PathBuf {
     let pkg_dir = gem_path.join(format!("{name}-{version}"));
-    tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+    tokio::fs::create_dir_all(pkg_dir.join("lib"))
+        .await
+        .unwrap();
     pkg_dir
 }
 
@@ -66,7 +68,9 @@ async fn find_by_purls_accepts_gem_with_gemspec_only() {
     // Stage with .gemspec but NO lib/ directory (alternate marker).
     let pkg_dir = tmp.path().join("rails-7.1.0");
     tokio::fs::create_dir(&pkg_dir).await.unwrap();
-    tokio::fs::write(pkg_dir.join("rails.gemspec"), b"# gemspec").await.unwrap();
+    tokio::fs::write(pkg_dir.join("rails.gemspec"), b"# gemspec")
+        .await
+        .unwrap();
 
     let crawler = RubyCrawler;
     let result = crawler
@@ -107,10 +111,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = RubyCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-gem/rails@7.1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-gem/rails@7.1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -161,7 +162,10 @@ async fn get_gem_paths_vendor_bundle_takes_precedence_over_global() {
     tokio::fs::create_dir_all(&gems).await.unwrap();
 
     let crawler = RubyCrawler;
-    let paths = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(
         paths.iter().any(|p| p == &gems),
         "vendor/bundle gems dir must be discovered; got {paths:?}"
@@ -173,7 +177,10 @@ async fn get_gem_paths_no_gemfile_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No Gemfile, no Gemfile.lock, no vendor/bundle.
     let crawler = RubyCrawler;
-    let paths = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty(), "non-Ruby dir must return empty paths");
 }
 
@@ -185,10 +192,15 @@ async fn get_gem_paths_with_gemfile_no_vendor_returns_paths() {
     // This either returns paths (if `gem` is on PATH and produces output)
     // or empty (if `gem` is missing). Both are valid — the contract is
     // "doesn't crash".
-    tokio::fs::write(tmp.path().join("Gemfile"), b"source 'https://rubygems.org'").await.unwrap();
+    tokio::fs::write(tmp.path().join("Gemfile"), b"source 'https://rubygems.org'")
+        .await
+        .unwrap();
 
     let crawler = RubyCrawler;
-    let _ = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+    let _ = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     // No assertion on contents — just contract that no panic occurs.
 }
 
@@ -196,9 +208,14 @@ async fn get_gem_paths_with_gemfile_no_vendor_returns_paths() {
 #[serial]
 async fn get_gem_paths_with_gemfile_lock_only_works_too() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("Gemfile.lock"), b"GEM\n").await.unwrap();
+    tokio::fs::write(tmp.path().join("Gemfile.lock"), b"GEM\n")
+        .await
+        .unwrap();
     let crawler = RubyCrawler;
-    let _ = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+    let _ = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 }
 
 // ── global gem discovery ───────────────────────────────────────
@@ -282,14 +299,22 @@ fn ruby_crawler_default_and_new_construct_cleanly() {
 #[serial]
 async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("Gemfile"), b"source 'https://rubygems.org'\n").await.unwrap();
+    tokio::fs::write(
+        tmp.path().join("Gemfile"),
+        b"source 'https://rubygems.org'\n",
+    )
+    .await
+    .unwrap();
 
     let empty_path = tempfile::tempdir().unwrap();
     let prev = std::env::var("PATH").ok();
     std::env::set_var("PATH", empty_path.path());
 
     let crawler = RubyCrawler;
-    let paths = crawler.get_gem_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_gem_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev {
         std::env::set_var("PATH", v);
@@ -297,7 +322,10 @@ async fn get_gem_paths_local_gemfile_no_gem_binary_returns_empty() {
         std::env::remove_var("PATH");
     }
 
-    assert!(paths.is_empty(), "no gem binary + no vendor must yield empty");
+    assert!(
+        paths.is_empty(),
+        "no gem binary + no vendor must yield empty"
+    );
 }
 
 /// Global mode with `gem` not on PATH and HOME pointing at a tempdir

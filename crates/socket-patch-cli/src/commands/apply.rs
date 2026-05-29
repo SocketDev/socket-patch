@@ -70,6 +70,55 @@ pub struct ApplyArgs {
     pub force: bool,
 }
 
+/// True when every file the engine verified for this package is already
+/// at its `afterHash` — i.e. the patch is a complete no-op on disk.
+///
+/// Single source of truth for the `already_patched` classification, shared
+/// by [`result_to_event`] (which feeds the JSON envelope) and the
+/// human-readable summaries so both label packages identically.
+///
+/// The `!is_empty()` guard is essential: `Iterator::all` over an empty
+/// slice is vacuously `true`. Without the guard a result with no verified
+/// files — a zero-file patch, or a freshly-applied package whose
+/// `files_verified` came back empty — would be mislabeled "already
+/// patched" and counted as a no-op even though nothing matched `afterHash`.
+fn all_files_already_patched(result: &ApplyResult) -> bool {
+    !result.files_verified.is_empty()
+        && result
+            .files_verified
+            .iter()
+            .all(|f| f.status == VerifyStatus::AlreadyPatched)
+}
+
+/// Decide whether a release variant describes the distribution that is
+/// actually installed on disk, based on the verification status of its
+/// first patched file.
+///
+/// This is the apply-side mirror of
+/// [`select_installed_variants`](socket_patch_core::patch::apply::select_installed_variants),
+/// which `rollback` and `get` use: a variant matches only when its first
+/// file is [`Ready`](VerifyStatus::Ready) (its `beforeHash` matches the
+/// on-disk bytes) or [`AlreadyPatched`](VerifyStatus::AlreadyPatched)
+/// (its `afterHash` already matches). A variant with no files (`None`)
+/// has nothing to disqualify it and is treated as a match.
+///
+/// Crucially, both [`HashMismatch`](VerifyStatus::HashMismatch) **and**
+/// [`NotFound`](VerifyStatus::NotFound) mean "this variant's
+/// distribution is not the one on disk" and must be skipped. A
+/// `NotFound` arises when a non-installed variant patches a file that
+/// only exists in *its* distribution (e.g. an sdist patching `setup.py`
+/// while a wheel is installed). Skipping it avoids attempting — and
+/// spuriously reporting a `Failed` event for — a variant that was never
+/// installed.
+fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
+    match first_file_status {
+        None => true,
+        Some(status) => {
+            *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched
+        }
+    }
+}
+
 /// Translate the core engine's per-package [`ApplyResult`] into a single
 /// patch-level [`PatchEvent`] for the unified envelope.
 ///
@@ -94,13 +143,7 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         );
     }
 
-    let all_already_patched = !result.files_verified.is_empty()
-        && result
-            .files_verified
-            .iter()
-            .all(|f| f.status == VerifyStatus::AlreadyPatched);
-
-    if all_already_patched {
+    if all_files_already_patched(result) {
         return PatchEvent::new(PatchAction::Skipped, purl)
             .with_reason("already_patched", "All files already match afterHash");
     }
@@ -274,16 +317,17 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 let patched: Vec<_> = results.iter().filter(|r| r.success).collect();
                 let already_patched: Vec<_> = results
                     .iter()
-                    .filter(|r| {
-                        r.files_verified
-                            .iter()
-                            .all(|f| f.status == VerifyStatus::AlreadyPatched)
-                    })
+                    .filter(|r| all_files_already_patched(r))
                     .collect();
 
                 if args.common.dry_run {
+                    // An already-patched package is `Skipped` in the JSON
+                    // envelope, not `Verified`. Mirror that split here so
+                    // "can be patched" excludes the no-ops instead of
+                    // double-counting them against "already patched".
+                    let can_be_patched = patched.len().saturating_sub(already_patched.len());
                     println!("\nPatch verification complete:");
-                    println!("  {} package(s) can be patched", patched.len());
+                    println!("  {} package(s) can be patched", can_be_patched);
                     if !already_patched.is_empty() {
                         println!("  {} package(s) already patched", already_patched.len());
                     }
@@ -308,9 +352,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                                 format!(" (via {})", tags.join("+"))
                             };
                             println!("  {}{}", result.package_key, suffix);
-                        } else if result.files_verified.iter().all(|f| {
-                            f.status == VerifyStatus::AlreadyPatched
-                        }) {
+                        } else if all_files_already_patched(result) {
                             println!("  {} (already patched)", result.package_key);
                         }
                     }
@@ -641,15 +683,20 @@ async fn apply_patches_inner(
                     None => continue,
                 };
 
-                // Check first file hash match (skip when --force). A
-                // mismatch means this variant's distribution isn't the
-                // one on disk, so skip it.
+                // Check the first file's status (skip when --force). A
+                // mismatch *or* a missing file means this variant's
+                // distribution isn't the one on disk, so skip it —
+                // attempting it would only produce a spurious failure.
+                // Mirrors `select_installed_variants`, used by rollback/get.
                 if !args.force {
-                    if let Some((file_name, file_info)) = patch.files.iter().next() {
-                        let verify = verify_file_patch(pkg_path, file_name, file_info).await;
-                        if verify.status == VerifyStatus::HashMismatch {
-                            continue;
+                    let first_status = match patch.files.iter().next() {
+                        Some((file_name, file_info)) => {
+                            Some(verify_file_patch(pkg_path, file_name, file_info).await.status)
                         }
+                        None => None,
+                    };
+                    if !variant_matches_installed(first_status.as_ref()) {
+                        continue;
                     }
                 }
 
@@ -753,9 +800,7 @@ async fn apply_patches_inner(
     // Post-apply summary
     if !args.common.silent && !args.common.json {
         let applied_count = results.iter().filter(|r| r.success && !r.files_patched.is_empty()).count();
-        let already_count = results.iter().filter(|r| {
-            r.files_verified.iter().all(|f| f.status == VerifyStatus::AlreadyPatched)
-        }).count();
+        let already_count = results.iter().filter(|r| all_files_already_patched(r)).count();
         println!(
             "\nSummary: {}/{} targeted patches applied, {} already patched, {} not found on disk",
             applied_count,
@@ -895,5 +940,116 @@ mod tests {
         assert_eq!(by_path["package/a.js"]["appliedVia"], "diff");
         assert_eq!(by_path["package/b.js"]["appliedVia"], "package");
         assert_eq!(by_path["package/c.js"]["appliedVia"], "blob");
+    }
+
+    /// Build a successful `ApplyResult` whose verified files carry the
+    /// given statuses, with no patched files. Used to exercise the
+    /// `already_patched` classification directly.
+    fn sample_verified(statuses: &[VerifyStatus]) -> ApplyResult {
+        let files_verified = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, status)| VerifyResult {
+                file: format!("package/f{i}.js"),
+                status: status.clone(),
+                message: None,
+                current_hash: None,
+                expected_hash: None,
+                target_hash: None,
+            })
+            .collect();
+        ApplyResult {
+            package_key: "pkg:npm/foo@1.0.0".to_string(),
+            package_path: "/tmp/foo".to_string(),
+            success: true,
+            files_verified,
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn all_files_already_patched_true_when_every_file_matches() {
+        let result = sample_verified(&[
+            VerifyStatus::AlreadyPatched,
+            VerifyStatus::AlreadyPatched,
+        ]);
+        assert!(all_files_already_patched(&result));
+    }
+
+    #[test]
+    fn all_files_already_patched_false_when_any_file_differs() {
+        let result = sample_verified(&[
+            VerifyStatus::AlreadyPatched,
+            VerifyStatus::Ready,
+        ]);
+        assert!(!all_files_already_patched(&result));
+    }
+
+    /// Regression: `Iterator::all` over an empty slice is vacuously true.
+    /// A result with no verified files must NOT be reported as
+    /// "already patched" — the `!is_empty()` guard enforces this so the
+    /// human summaries and the JSON envelope agree.
+    #[test]
+    fn all_files_already_patched_false_when_no_verified_files() {
+        let mut result = sample_verified(&[]);
+        assert!(result.files_verified.is_empty());
+        assert!(!all_files_already_patched(&result));
+
+        // A freshly-applied package (files patched, none left verified)
+        // is likewise not a no-op.
+        result.files_patched = vec!["package/a.js".to_string()];
+        assert!(!all_files_already_patched(&result));
+    }
+
+    /// Regression: a non-installed release variant whose first patched
+    /// file is `NotFound` (e.g. an sdist patching `setup.py` while only a
+    /// wheel is on disk) must be treated as NOT installed and skipped —
+    /// exactly like a `HashMismatch`. Before the fix the loop only skipped
+    /// `HashMismatch`, so a `NotFound` variant slipped through to
+    /// `apply_package_patch` and produced a spurious `Failed` event in the
+    /// JSON envelope. This pins the apply-side decision to the same
+    /// Ready/AlreadyPatched contract as `select_installed_variants`.
+    #[test]
+    fn variant_matches_only_when_first_file_ready_or_already_patched() {
+        // Installed distribution: first file applies cleanly, or is
+        // already at afterHash → this variant is the one on disk.
+        assert!(variant_matches_installed(Some(&VerifyStatus::Ready)));
+        assert!(variant_matches_installed(Some(&VerifyStatus::AlreadyPatched)));
+
+        // Not the installed distribution → must be skipped. The NotFound
+        // case is the specific regression this guards.
+        assert!(!variant_matches_installed(Some(&VerifyStatus::HashMismatch)));
+        assert!(!variant_matches_installed(Some(&VerifyStatus::NotFound)));
+
+        // A variant with no files has nothing to disqualify it — match,
+        // mirroring `select_installed_variants`.
+        assert!(variant_matches_installed(None));
+    }
+
+    /// Regression: a freshly-applied result with an empty `files_verified`
+    /// must map to `Applied`, never `Skipped`/`already_patched`. This is
+    /// the same classification the human-readable summary relies on via
+    /// `all_files_already_patched`.
+    #[test]
+    fn applied_with_empty_verified_is_not_skipped() {
+        let mut applied_via = HashMap::new();
+        applied_via.insert("package/a.js".to_string(), CoreAppliedVia::Blob);
+        let result = ApplyResult {
+            package_key: "pkg:npm/foo@1.0.0".to_string(),
+            package_path: "/tmp/foo".to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: vec!["package/a.js".to_string()],
+            applied_via,
+            error: None,
+            sidecar: None,
+        };
+        let event = result_to_event(&result, false);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "applied");
     }
 }

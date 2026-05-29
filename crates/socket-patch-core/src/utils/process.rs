@@ -91,4 +91,69 @@ mod tests {
         let out = runner.run("false", &[]);
         assert_eq!(out, None);
     }
+
+    /// Exit 0 but stdout is empty → None. This is the fourth arm of
+    /// the contract and was previously untested. A successful command
+    /// that prints nothing carries no information for the crawlers.
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_returns_none_on_empty_stdout_despite_success() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("true", &[]);
+        assert_eq!(out, None);
+    }
+
+    /// Exit 0 with whitespace-only stdout → None: the empty check
+    /// happens *after* trimming, so a command that prints only spaces
+    /// and newlines is treated as "no output".
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_treats_whitespace_only_stdout_as_empty() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("sh", &["-c", "printf '  \\t\\n  '"]);
+        assert_eq!(out, None);
+    }
+
+    /// Surrounding whitespace is trimmed from a non-empty result, so
+    /// callers that join the value into a path don't get stray
+    /// newlines (e.g. `npm root -g` emits a trailing `\n`).
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_trims_surrounding_whitespace() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("sh", &["-c", "printf '  /some/path  \\n'"]);
+        assert_eq!(out.as_deref(), Some("/some/path"));
+    }
+
+    /// stderr never leaks into the result. When stdout is empty but
+    /// the process wrote to stderr and still exited 0, the result is
+    /// None — stderr is captured and dropped, not returned.
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_ignores_stderr_when_stdout_empty() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("sh", &["-c", "printf 'diagnostic' >&2"]);
+        assert_eq!(out, None);
+    }
+
+    /// When a command writes to both streams, only stdout comes back —
+    /// the stderr line must not be appended or interleaved.
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_returns_only_stdout_when_both_streams_used() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("sh", &["-c", "printf 'good\\n'; printf 'bad\\n' >&2"]);
+        assert_eq!(out.as_deref(), Some("good"));
+    }
+
+    /// Every element of `args` is forwarded to the child in order.
+    /// Here `$0` is `sh` and `$1` is `forwarded`; printing `$1` proves
+    /// positional args survive the hop into `Command::args`.
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_forwards_all_args_in_order() {
+        let runner = SystemCommandRunner;
+        let out = runner.run("sh", &["-c", "printf '%s' \"$1\"", "sh", "forwarded"]);
+        assert_eq!(out.as_deref(), Some("forwarded"));
+    }
 }

@@ -82,6 +82,37 @@ fn sample_doc() -> Document {
     .expect("build sample doc")
 }
 
+/// A document whose single statement is the result of MERGING two
+/// patches that share one vuln id and one overlapping CVE. Unlike
+/// `sample_doc` (every statement carries a single subcomponent and a
+/// set of all-distinct aliases), this fixture forces the builder's
+/// transpose to collapse:
+///   * two PURLs into one product with TWO subcomponents, and
+///   * the duplicated `CVE-DUP` into a single alias.
+/// The uniqueness/dedup conformance invariants below are vacuous
+/// against `sample_doc`; they only have teeth against a merged
+/// statement.
+fn merged_doc() -> Document {
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/aaa@1.0.0".to_string(),
+        record("uuid-a", &[("GHSA-shared", &["CVE-DUP", "CVE-A-ONLY"])]),
+    );
+    manifest.patches.insert(
+        "pkg:npm/bbb@2.0.0".to_string(),
+        record("uuid-b", &[("GHSA-shared", &["CVE-DUP", "CVE-B-ONLY"])]),
+    );
+    build_document(
+        &manifest,
+        &[
+            "pkg:npm/aaa@1.0.0".to_string(),
+            "pkg:npm/bbb@2.0.0".to_string(),
+        ],
+        &options(),
+    )
+    .expect("build merged doc")
+}
+
 // ── 1. `@context` literal value ─────────────────────────────────
 
 #[test]
@@ -213,7 +244,7 @@ fn affected_statement_in_json_omits_justification() {
             name: "CVE-X".to_string(),
             aliases: Vec::new(),
         },
-        timestamp: "2024-01-01T00:00:00Z".to_string(),
+        timestamp: Some("2024-01-01T00:00:00Z".to_string()),
         last_updated: None,
         products: vec![Product {
             id: "pkg:npm/x@1.0.0".to_string(),
@@ -313,7 +344,8 @@ fn all_statement_timestamps_match_document_timestamp() {
     let doc = sample_doc();
     for st in &doc.statements {
         assert_eq!(
-            st.timestamp, doc.timestamp,
+            st.timestamp.as_deref(),
+            Some(doc.timestamp.as_str()),
             "statement timestamp must match document timestamp"
         );
     }
@@ -369,7 +401,7 @@ fn fully_populated_doc_round_trips_through_serde() {
                 name: "GHSA-xxx".to_string(),
                 aliases: vec!["CVE-2024-1".to_string(), "CVE-2024-2".to_string()],
             },
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            timestamp: Some("2024-01-01T00:00:00Z".to_string()),
             last_updated: Some("2024-06-01T00:00:00Z".to_string()),
             products: vec![Product {
                 id: "pkg:npm/app@1.0.0".to_string(),
@@ -431,7 +463,16 @@ fn builder_output_is_valid_utf8_json() {
     let pretty = serde_json::to_string_pretty(&doc).unwrap();
     let v_compact: serde_json::Value = serde_json::from_str(&compact).unwrap();
     let v_pretty: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+    // NOTE: compact-vs-pretty equality alone is a tautology — it holds
+    // for ANY serializable value. The real interop invariant is that
+    // the emitted JSON deserializes back into an *equal* `Document`
+    // (this is what `vexctl merge` / Grype / Trivy rely on), so assert
+    // that too.
     assert_eq!(v_compact, v_pretty);
+    let reparsed_compact: Document = serde_json::from_str(&compact).unwrap();
+    let reparsed_pretty: Document = serde_json::from_str(&pretty).unwrap();
+    assert_eq!(reparsed_compact, doc, "compact output must round-trip");
+    assert_eq!(reparsed_pretty, doc, "pretty output must round-trip");
 }
 
 // ── 12. Each emitted statement has at least one product ─────────
@@ -450,7 +491,12 @@ fn every_emitted_statement_has_at_least_one_product() {
 
 #[test]
 fn vulnerability_aliases_are_unique_within_statement() {
-    let doc = sample_doc();
+    // Built from a MERGED statement so the dedup path is actually
+    // exercised: two patches both list `CVE-DUP`, and the builder must
+    // collapse it. (Against `sample_doc`, where every alias is already
+    // distinct, this loop can never observe a duplicate — see the doc
+    // comment on `merged_doc`.)
+    let doc = merged_doc();
     for st in &doc.statements {
         let mut seen = std::collections::HashSet::new();
         for alias in &st.vulnerability.aliases {
@@ -460,15 +506,35 @@ fn vulnerability_aliases_are_unique_within_statement() {
             );
         }
     }
+    // Non-vacuous guard: the merged statement carries multiple aliases
+    // with the overlapping CVE present exactly once. If alias dedup
+    // regressed, the loop above would fire on `CVE-DUP`.
+    assert_eq!(doc.statements.len(), 1, "fixture must merge to one statement");
+    assert_eq!(
+        doc.statements[0].vulnerability.aliases,
+        vec![
+            "CVE-A-ONLY".to_string(),
+            "CVE-B-ONLY".to_string(),
+            "CVE-DUP".to_string(),
+        ],
+    );
 }
 
 // ── 14. Subcomponent @ids are unique within a product ───────────
 
 #[test]
 fn subcomponent_ids_are_unique_within_product() {
-    let doc = sample_doc();
+    // Built from a MERGED statement so a product with MORE THAN ONE
+    // subcomponent actually exists. Against `sample_doc` every product
+    // has exactly one subcomponent, so the uniqueness loop body runs at
+    // most once and can never catch a duplicate.
+    let doc = merged_doc();
+    let mut saw_multi_subcomponent_product = false;
     for st in &doc.statements {
         for p in &st.products {
+            if p.subcomponents.len() > 1 {
+                saw_multi_subcomponent_product = true;
+            }
             let mut seen = std::collections::HashSet::new();
             for sub in &p.subcomponents {
                 assert!(
@@ -479,4 +545,78 @@ fn subcomponent_ids_are_unique_within_product() {
             }
         }
     }
+    assert!(
+        saw_multi_subcomponent_product,
+        "fixture must exercise a product with >1 subcomponent, else this test is vacuous"
+    );
+}
+
+// ── 15. Merged-statement transpose, at the JSON layer ───────────
+
+#[test]
+fn merged_statement_emits_all_subcomponents_with_at_id_in_serialized_json() {
+    // The `PURL -> {vulnId}` → `vulnId -> {PURL}` transpose is the
+    // crux of the builder; pin its serialized shape (not just the
+    // in-memory structs `merged_doc` already exercises). The two
+    // merged PURLs must surface as sorted subcomponents, each under the
+    // JSON-LD `@id` key (never raw `id`).
+    let doc = merged_doc();
+    let v = serde_json::to_value(&doc).unwrap();
+    let statements = v["statements"].as_array().unwrap();
+    assert_eq!(statements.len(), 1, "two patches sharing a vuln → one statement");
+
+    let subs = statements[0]["products"][0]["subcomponents"]
+        .as_array()
+        .unwrap();
+    let ids: Vec<&str> = subs
+        .iter()
+        .map(|s| {
+            let obj = s.as_object().unwrap();
+            assert!(obj.contains_key("@id"), "subcomponent must use @id");
+            assert!(!obj.contains_key("id"), "raw `id` must not leak");
+            s["@id"].as_str().unwrap()
+        })
+        .collect();
+    // Sorted for deterministic downstream diffs.
+    assert_eq!(ids, vec!["pkg:npm/aaa@1.0.0", "pkg:npm/bbb@2.0.0"]);
+}
+
+// ── 16. Statement-level `@id` rename (gap in test #2) ───────────
+
+#[test]
+fn statement_level_id_renders_under_at_sign() {
+    // The builder never sets `Statement.id`, so the cross-cutting
+    // `@`-prefix test above (which walks builder output) never covers
+    // the statement-level rename. Pin it directly: a present statement
+    // id MUST serialize as `@id`, never raw `id`.
+    let mut s = Statement {
+        id: Some("urn:uuid:stmt-7".to_string()),
+        vulnerability: Vulnerability {
+            name: "GHSA-z".to_string(),
+            aliases: Vec::new(),
+        },
+        timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+        last_updated: None,
+        products: vec![Product {
+            id: "pkg:npm/x@1.0.0".to_string(),
+            identifiers: None,
+            hashes: None,
+            subcomponents: Vec::new(),
+        }],
+        status: Status::NotAffected,
+        supplier: None,
+        justification: Some(Justification::InlineMitigationsAlreadyExist),
+        impact_statement: Some("Patched via Socket".to_string()),
+        action_statement: None,
+    };
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["@id"], "urn:uuid:stmt-7");
+    assert!(!v.as_object().unwrap().contains_key("id"));
+
+    // And when absent, neither `@id` nor `id` appears.
+    s.id = None;
+    let v = serde_json::to_value(&s).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(!obj.contains_key("@id"), "absent statement id must omit @id");
+    assert!(!obj.contains_key("id"));
 }

@@ -111,15 +111,23 @@ pub fn update_package_json_object(
     let status = is_setup_configured(package_json);
 
     if !status.needs_update {
-        return (
-            false,
-            status.postinstall_script,
-            status.dependencies_script,
-        );
+        return (false, status.postinstall_script, status.dependencies_script);
     }
 
-    // Ensure scripts object exists
-    if package_json.get("scripts").is_none() {
+    // We can only attach scripts to an object root. Anything else (array,
+    // string, number, bool, null) cannot hold a "scripts" key, so indexing it
+    // below would panic. Bail out as a no-op instead.
+    if !package_json.is_object() {
+        return (false, status.postinstall_script, status.dependencies_script);
+    }
+
+    // Ensure `scripts` exists *and* is an object. A present-but-non-object
+    // `scripts` (e.g. a string or array) would otherwise panic when indexed.
+    if !package_json
+        .get("scripts")
+        .map(serde_json::Value::is_object)
+        .unwrap_or(false)
+    {
         package_json["scripts"] = serde_json::json!({});
     }
 
@@ -156,6 +164,20 @@ pub fn update_package_json_content(
     let mut package_json: serde_json::Value =
         serde_json::from_str(content).map_err(|e| format!("Invalid package.json: {e}"))?;
 
+    // A package.json must be a JSON object; otherwise there is nowhere to add
+    // lifecycle scripts.
+    if !package_json.is_object() {
+        return Err("Invalid package.json: root is not a JSON object".to_string());
+    }
+
+    // Refuse to clobber a malformed (present but non-object) `scripts` value.
+    // `null` is treated as absent and replaced with a fresh object downstream.
+    if let Some(scripts) = package_json.get("scripts") {
+        if !scripts.is_null() && !scripts.is_object() {
+            return Err("Invalid package.json: \"scripts\" is not a JSON object".to_string());
+        }
+    }
+
     let status = is_setup_configured(&package_json);
 
     if !status.needs_update {
@@ -172,8 +194,7 @@ pub fn update_package_json_content(
     let old_postinstall = status.postinstall_script.clone();
     let old_dependencies = status.dependencies_script.clone();
 
-    let (_, new_postinstall, new_dependencies) =
-        update_package_json_object(&mut package_json, pm);
+    let (_, new_postinstall, new_dependencies) = update_package_json_object(&mut package_json, pm);
     let new_content = serde_json::to_string_pretty(&package_json).unwrap() + "\n";
 
     Ok((
@@ -280,7 +301,8 @@ mod tests {
 
     #[test]
     fn test_configured_str_legacy_npx_pattern() {
-        let content = r#"{"scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent"}}"#;
+        let content =
+            r#"{"scripts":{"postinstall":"npx @socketsecurity/socket-patch apply --silent"}}"#;
         let status = is_setup_configured_str(content);
         assert!(status.postinstall_configured);
     }
@@ -438,6 +460,90 @@ mod tests {
         let result = update_package_json_content("not json", PackageManager::Npm);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid package.json"));
+    }
+
+    #[test]
+    fn test_update_object_scripts_is_string_does_not_panic() {
+        // Regression: a present-but-non-object `scripts` previously panicked
+        // when indexed (`cannot access key "postinstall" in JSON string`).
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": "build"
+        });
+        let (modified, _, _) = update_package_json_object(&mut pkg, PackageManager::Npm);
+        // Root is an object but `scripts` is malformed; the object-level helper
+        // replaces it rather than panicking.
+        assert!(modified);
+        assert!(pkg["scripts"]["postinstall"].is_string());
+        assert!(pkg["scripts"]["dependencies"].is_string());
+    }
+
+    #[test]
+    fn test_update_object_scripts_is_array_does_not_panic() {
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": ["build"]
+        });
+        let (modified, _, _) = update_package_json_object(&mut pkg, PackageManager::Npm);
+        assert!(modified);
+        assert!(pkg["scripts"].is_object());
+    }
+
+    #[test]
+    fn test_update_object_scripts_is_null() {
+        // `null` scripts is treated as absent and replaced with an object.
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": null
+        });
+        let (modified, _, _) = update_package_json_object(&mut pkg, PackageManager::Npm);
+        assert!(modified);
+        assert!(pkg["scripts"]["postinstall"].is_string());
+    }
+
+    #[test]
+    fn test_update_object_non_object_root_is_noop() {
+        // Regression: a non-object root previously panicked on `["scripts"] = ...`.
+        let mut arr: serde_json::Value = serde_json::json!([1, 2, 3]);
+        let (modified, _, _) = update_package_json_object(&mut arr, PackageManager::Npm);
+        assert!(!modified);
+        assert_eq!(arr, serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_update_content_non_object_root_errors() {
+        // Regression: valid JSON that is not an object must error, not panic.
+        for content in ["[1,2,3]", "42", "\"hello\"", "true", "null"] {
+            let result = update_package_json_content(content, PackageManager::Npm);
+            assert!(result.is_err(), "expected error for content {content:?}");
+            assert!(result.unwrap_err().contains("root is not a JSON object"));
+        }
+    }
+
+    #[test]
+    fn test_update_content_non_object_scripts_errors() {
+        // Regression: a present-but-non-object `scripts` must error rather than
+        // silently clobbering the user's value or panicking.
+        let content = r#"{"name":"test","scripts":"build"}"#;
+        let result = update_package_json_content(content, PackageManager::Npm);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("\"scripts\" is not a JSON object"));
+    }
+
+    #[test]
+    fn test_update_content_null_scripts_creates_object() {
+        // `null` scripts is benign: treated as absent and populated.
+        let content = r#"{"name":"test","scripts":null}"#;
+        let (modified, new_content, _, new_pi, _, new_dep) =
+            update_package_json_content(content, PackageManager::Npm).unwrap();
+        assert!(modified);
+        assert!(new_pi.contains("npx @socketsecurity/socket-patch apply"));
+        assert!(new_dep.contains("npx @socketsecurity/socket-patch apply"));
+        let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
+        assert!(parsed["scripts"]["postinstall"].is_string());
+        assert!(parsed["scripts"]["dependencies"].is_string());
     }
 
     #[test]

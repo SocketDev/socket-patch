@@ -10,8 +10,8 @@
 //!   "status":   "success" | "partialFailure" | "error" | "noManifest" | ...,
 //!   "dryRun":   false,
 //!   "events":   [ { "action": "...", "purl": "...", ... }, ... ],
-//!   "summary":  { "applied": 0, "downloaded": 0, ... },
-//!   "error":    null
+//!   "summary":  { "applied": 0, "downloaded": 0, ... }
+//!   // "error":  { "code": ..., "message": ... }  — present only on failure
 //! }
 //! ```
 //!
@@ -95,8 +95,18 @@ impl Envelope {
     /// Append an event and bump the matching summary counter. Centralizes
     /// the "events list must agree with summary counts" invariant so per-
     /// command code can't drift.
+    ///
+    /// Recording a `Failed` event also marks the run as a partial failure
+    /// (unless it's already a hard `Error`), enforcing the `status`
+    /// invariant documented on [`Envelope::status`] here rather than
+    /// relying on every command to remember a follow-up
+    /// `mark_partial_failure` call. A run can never end up reporting
+    /// `Success` while carrying a `Failed` event.
     pub fn record(&mut self, event: PatchEvent) {
         self.summary.bump(event.action);
+        if matches!(event.action, PatchAction::Failed) {
+            self.mark_partial_failure();
+        }
         self.events.push(event);
     }
 
@@ -142,6 +152,11 @@ pub struct PatchEvent {
     /// many patches at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
+    /// The UUID this patch replaced. Set only on `Updated` events so a
+    /// consumer can diff a manifest update — the new UUID lives in
+    /// `uuid`, the one it overwrote here. Omitted for every other action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_uuid: Option<String>,
     /// Files touched by an `Applied` / `Verified` / `Removed` event.
     /// Empty for actions that don't operate on files (e.g. `Downloaded`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -175,6 +190,7 @@ impl PatchEvent {
             action,
             purl: Some(purl.into()),
             uuid: None,
+            old_uuid: None,
             files: Vec::new(),
             reason: None,
             error_code: None,
@@ -190,6 +206,7 @@ impl PatchEvent {
             action,
             purl: None,
             uuid: None,
+            old_uuid: None,
             files: Vec::new(),
             reason: None,
             error_code: None,
@@ -200,6 +217,14 @@ impl PatchEvent {
 
     pub fn with_uuid(mut self, uuid: impl Into<String>) -> Self {
         self.uuid = Some(uuid.into());
+        self
+    }
+
+    /// Attach the UUID this event's patch replaced. Use on `Updated`
+    /// events so consumers can diff against the prior manifest entry;
+    /// serializes as `oldUuid`.
+    pub fn with_old_uuid(mut self, old_uuid: impl Into<String>) -> Self {
+        self.old_uuid = Some(old_uuid.into());
         self
     }
 
@@ -255,9 +280,10 @@ pub struct PatchEventFile {
 
 /// What kind of thing happened to a patch.
 ///
-/// Serializes to lowercase camelCase strings — e.g. `Applied` → `"applied"`,
-/// `PaidRequired` → `"paidRequired"`. The full vocabulary is part of the
-/// CLI contract; new variants are MINOR-safe but renames are MAJOR.
+/// Serializes to camelCase strings — e.g. `Applied` → `"applied"`,
+/// `Downloaded` → `"downloaded"` (a hypothetical multi-word variant would
+/// lower-camel, e.g. `FooBar` → `"fooBar"`). The full vocabulary is part of
+/// the CLI contract; new variants are MINOR-safe but renames are MAJOR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PatchAction {
@@ -454,6 +480,60 @@ mod tests {
         assert_eq!(env.summary.downloaded, 1);
         assert_eq!(env.summary.skipped, 1);
         assert_eq!(env.events.len(), 3);
+    }
+
+    #[test]
+    fn recording_failed_event_marks_partial_failure() {
+        // The `status` invariant — "PartialFailure when any event has
+        // action = Failed" — must be enforced by `record` itself, not
+        // left to each command to remember. Otherwise a Success envelope
+        // can carry a `failed` event (and a non-zero `summary.failed`).
+        let mut env = Envelope::new(Command::Apply);
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/foo@1.0.0"));
+        assert_eq!(env.status, Status::Success);
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:npm/bar@2.0.0")
+                .with_error("apply_failed", "boom"),
+        );
+        assert_eq!(env.status, Status::PartialFailure);
+        assert_eq!(env.summary.failed, 1);
+    }
+
+    #[test]
+    fn recording_failed_event_does_not_demote_hard_error() {
+        // A prior hard error outranks the per-event partial failure that
+        // `record` raises — recording a Failed event must not downgrade
+        // Error to PartialFailure regardless of ordering.
+        let mut env = Envelope::new(Command::Apply);
+        env.mark_error(EnvelopeError::new("manifest_unreadable", "bad json"));
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:npm/bar@2.0.0")
+                .with_error("apply_failed", "boom"),
+        );
+        assert_eq!(env.status, Status::Error);
+    }
+
+    #[test]
+    fn updated_event_carries_old_uuid() {
+        // The CLI contract promises `oldUuid` on `updated` events. The
+        // new UUID lives in `uuid`; the replaced one in `oldUuid`.
+        let event = PatchEvent::new(PatchAction::Updated, "pkg:npm/foo@1.0.0")
+            .with_uuid("uuid-new")
+            .with_old_uuid("uuid-old");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(v["action"], "updated");
+        assert_eq!(v["uuid"], "uuid-new");
+        assert_eq!(v["oldUuid"], "uuid-old");
+    }
+
+    #[test]
+    fn old_uuid_omitted_when_unset() {
+        // Non-Updated events must not leak an `oldUuid` key.
+        let event = PatchEvent::new(PatchAction::Applied, "pkg:npm/foo@1.0.0");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("oldUuid"));
     }
 
     #[test]

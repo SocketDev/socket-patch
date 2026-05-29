@@ -55,10 +55,14 @@ async fn stage_composer_project(root: &Path, vendor_name: &str, pkg_name: &str, 
   ]
 }}"#
     );
-    tokio::fs::write(installed_dir.join("installed.json"), installed_json).await.unwrap();
+    tokio::fs::write(installed_dir.join("installed.json"), installed_json)
+        .await
+        .unwrap();
 
     // composer.json marker on the project root.
-    tokio::fs::write(root.join("composer.json"), b"{}").await.unwrap();
+    tokio::fs::write(root.join("composer.json"), b"{}")
+        .await
+        .unwrap();
 }
 
 // ── find_by_purls ──────────────────────────────────────────────
@@ -75,7 +79,10 @@ async fn find_by_purls_finds_package_in_vendor() {
         .unwrap();
     assert_eq!(result.len(), 1);
     let pkg = result.get(ORG_PURL).unwrap();
-    assert_eq!(pkg.path, tmp.path().join("vendor").join("monolog").join("monolog"));
+    assert_eq!(
+        pkg.path,
+        tmp.path().join("vendor").join("monolog").join("monolog")
+    );
 }
 
 #[tokio::test]
@@ -150,8 +157,12 @@ async fn crawl_all_with_corrupt_installed_json_returns_empty() {
     let vendor = tmp.path().join("vendor");
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
-    tokio::fs::write(composer.join("installed.json"), b"{ this is not json").await.unwrap();
-    tokio::fs::write(tmp.path().join("composer.json"), b"{}").await.unwrap();
+    tokio::fs::write(composer.join("installed.json"), b"{ this is not json")
+        .await
+        .unwrap();
+    tokio::fs::write(tmp.path().join("composer.json"), b"{}")
+        .await
+        .unwrap();
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -184,7 +195,10 @@ async fn get_vendor_paths_with_global_prefix_passthrough() {
 async fn get_vendor_paths_local_no_vendor_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = ComposerCrawler;
-    let paths = crawler.get_vendor_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty());
 }
 
@@ -194,11 +208,19 @@ async fn get_vendor_paths_local_no_installed_json_returns_empty() {
     let vendor = tmp.path().join("vendor");
     tokio::fs::create_dir(&vendor).await.unwrap();
     // vendor exists but no installed.json inside.
-    tokio::fs::write(tmp.path().join("composer.json"), b"{}").await.unwrap();
+    tokio::fs::write(tmp.path().join("composer.json"), b"{}")
+        .await
+        .unwrap();
 
     let crawler = ComposerCrawler;
-    let paths = crawler.get_vendor_paths(&options_at(tmp.path())).await.unwrap();
-    assert!(paths.is_empty(), "vendor without installed.json must not match");
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert!(
+        paths.is_empty(),
+        "vendor without installed.json must not match"
+    );
 }
 
 #[tokio::test]
@@ -207,12 +229,20 @@ async fn get_vendor_paths_local_no_composer_marker_returns_empty() {
     let vendor = tmp.path().join("vendor");
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
-    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}").await.unwrap();
+    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}")
+        .await
+        .unwrap();
     // No composer.json or composer.lock on the project root.
 
     let crawler = ComposerCrawler;
-    let paths = crawler.get_vendor_paths(&options_at(tmp.path())).await.unwrap();
-    assert!(paths.is_empty(), "no composer.json must mean not-a-PHP-project");
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert!(
+        paths.is_empty(),
+        "no composer.json must mean not-a-PHP-project"
+    );
 }
 
 #[tokio::test]
@@ -221,11 +251,18 @@ async fn get_vendor_paths_local_full_setup_returns_vendor() {
     let vendor = tmp.path().join("vendor");
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
-    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}").await.unwrap();
-    tokio::fs::write(tmp.path().join("composer.json"), b"{}").await.unwrap();
+    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}")
+        .await
+        .unwrap();
+    tokio::fs::write(tmp.path().join("composer.json"), b"{}")
+        .await
+        .unwrap();
 
     let crawler = ComposerCrawler;
-    let paths = crawler.get_vendor_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert_eq!(paths, vec![vendor]);
 }
 
@@ -411,7 +448,10 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
         std::env::remove_var("PATH");
     }
 
-    assert!(paths.is_empty(), "no composer source anywhere must yield empty; got {paths:?}");
+    assert!(
+        paths.is_empty(),
+        "no composer source anywhere must yield empty; got {paths:?}"
+    );
 }
 
 #[path = "common/mod.rs"]
@@ -432,7 +472,9 @@ async fn find_by_purls_handles_unreadable_installed_json() {
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
     let installed = composer.join("installed.json");
-    tokio::fs::write(&installed, r#"{"packages":[]}"#).await.unwrap();
+    tokio::fs::write(&installed, r#"{"packages":[]}"#)
+        .await
+        .unwrap();
     common::chmod_unreadable(&installed);
 
     let crawler = ComposerCrawler;
@@ -442,7 +484,10 @@ async fn find_by_purls_handles_unreadable_installed_json() {
         .unwrap();
     common::chmod_readable(&installed);
 
-    assert!(result.is_empty(), "unreadable installed.json must yield empty");
+    assert!(
+        result.is_empty(),
+        "unreadable installed.json must yield empty"
+    );
 }
 
 /// `crawl_all` should dedup packages discovered across multiple
@@ -457,8 +502,12 @@ async fn crawl_all_dedups_across_vendor_paths() {
     let pkg_dir = custom_vendor.join("monolog").join("monolog");
     tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
     let installed = r#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"},{"name":"monolog/monolog","version":"3.5.0"}]}"#;
-    tokio::fs::write(composer_dir.join("installed.json"), installed).await.unwrap();
-    tokio::fs::write(tmp.path().join("composer.json"), b"{}").await.unwrap();
+    tokio::fs::write(composer_dir.join("installed.json"), installed)
+        .await
+        .unwrap();
+    tokio::fs::write(tmp.path().join("composer.json"), b"{}")
+        .await
+        .unwrap();
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
@@ -468,7 +517,11 @@ async fn crawl_all_dedups_across_vendor_paths() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert_eq!(result.len(), 1, "duplicates inside installed.json must dedup");
+    assert_eq!(
+        result.len(),
+        1,
+        "duplicates inside installed.json must dedup"
+    );
 }
 
 #[tokio::test]
@@ -477,10 +530,17 @@ async fn get_vendor_paths_local_with_lock_marker_also_works() {
     let vendor = tmp.path().join("vendor");
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
-    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}").await.unwrap();
-    tokio::fs::write(tmp.path().join("composer.lock"), b"{}").await.unwrap();
+    tokio::fs::write(composer.join("installed.json"), b"{\"packages\":[]}")
+        .await
+        .unwrap();
+    tokio::fs::write(tmp.path().join("composer.lock"), b"{}")
+        .await
+        .unwrap();
 
     let crawler = ComposerCrawler;
-    let paths = crawler.get_vendor_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_vendor_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert_eq!(paths, vec![vendor]);
 }

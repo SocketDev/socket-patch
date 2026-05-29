@@ -118,15 +118,27 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
 /// `"blob"` synonym for `File`, and rejects unknown strings.
 #[test]
 fn download_mode_parse_covers_all_branches() {
-    assert!(matches!(DownloadMode::parse("diff"), Ok(DownloadMode::Diff)));
+    assert!(matches!(
+        DownloadMode::parse("diff"),
+        Ok(DownloadMode::Diff)
+    ));
     assert!(matches!(
         DownloadMode::parse("package"),
         Ok(DownloadMode::Package)
     ));
-    assert!(matches!(DownloadMode::parse("file"), Ok(DownloadMode::File)));
-    assert!(matches!(DownloadMode::parse("blob"), Ok(DownloadMode::File)));
+    assert!(matches!(
+        DownloadMode::parse("file"),
+        Ok(DownloadMode::File)
+    ));
+    assert!(matches!(
+        DownloadMode::parse("blob"),
+        Ok(DownloadMode::File)
+    ));
     // Case-insensitive.
-    assert!(matches!(DownloadMode::parse("DIFF"), Ok(DownloadMode::Diff)));
+    assert!(matches!(
+        DownloadMode::parse("DIFF"),
+        Ok(DownloadMode::Diff)
+    ));
     assert!(matches!(
         DownloadMode::parse("Package"),
         Ok(DownloadMode::Package)
@@ -139,7 +151,11 @@ fn download_mode_parse_covers_all_branches() {
 /// `DownloadMode::as_tag` round-trips with `parse` for all variants.
 #[test]
 fn download_mode_as_tag_round_trips_with_parse() {
-    for mode in [DownloadMode::Diff, DownloadMode::Package, DownloadMode::File] {
+    for mode in [
+        DownloadMode::Diff,
+        DownloadMode::Package,
+        DownloadMode::File,
+    ] {
         let tag = mode.as_tag();
         assert_eq!(DownloadMode::parse(tag).unwrap(), mode);
     }

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
-use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
 pub struct RepairArgs {
@@ -91,18 +91,37 @@ pub async fn run(args: RepairArgs) -> i32 {
                 // stay in sync).
                 env.record(lock_broken_event(socket_dir));
             }
-            track_patch_repaired(
-                counts.downloaded,
-                counts.cleaned,
-                0,
-                args.common.api_token.as_deref(),
-                args.common.org.as_deref(),
-            )
-            .await;
+            // A repair where some artifacts failed to download is marked a
+            // partial failure inside `repair_inner` (a `Failed` event plus
+            // `mark_partial_failure`). Mirror `apply`: surface that as a
+            // non-zero exit and the failure telemetry, so a CI guarding on
+            // the exit code doesn't treat a half-finished repair as success.
+            let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
+            if had_failure {
+                track_patch_repair_failed(
+                    "One or more artifacts failed to download",
+                    args.common.api_token.as_deref(),
+                    args.common.org.as_deref(),
+                )
+                .await;
+            } else {
+                track_patch_repaired(
+                    counts.downloaded,
+                    counts.cleaned,
+                    counts.bytes_freed,
+                    args.common.api_token.as_deref(),
+                    args.common.org.as_deref(),
+                )
+                .await;
+            }
             if args.common.json {
                 println!("{}", env.to_pretty_json());
             }
-            0
+            if had_failure {
+                1
+            } else {
+                0
+            }
         }
         Err(e) => {
             track_patch_repair_failed(
@@ -125,12 +144,13 @@ pub async fn run(args: RepairArgs) -> i32 {
 }
 
 /// Aggregate counts surfaced by `repair_inner` for telemetry use.
-struct RepairCounts {
+pub(crate) struct RepairCounts {
     downloaded: usize,
     cleaned: usize,
+    bytes_freed: u64,
 }
 
-async fn repair_inner(
+pub(crate) async fn repair_inner(
     args: &RepairArgs,
     manifest_path: &Path,
 ) -> Result<(Envelope, RepairCounts), String> {
@@ -150,6 +170,7 @@ async fn repair_inner(
     let mut download_failed_count = 0usize;
     let mut blobs_cleaned = 0usize;
     let mut blobs_checked = 0usize;
+    let mut bytes_freed = 0u64;
 
     // Step 1: Check for and download missing artifacts in the requested
     // mode. Counts below refer to whatever kind of artifact was requested
@@ -245,6 +266,7 @@ async fn repair_inner(
             Ok(cleanup_result) => {
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
+                bytes_freed += cleanup_result.bytes_freed;
                 if !args.common.json {
                     if cleanup_result.blobs_checked == 0 {
                         println!("No blobs directory found, nothing to clean up.");
@@ -270,6 +292,7 @@ async fn repair_inner(
             Ok(cleanup_result) => {
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
+                bytes_freed += cleanup_result.bytes_freed;
                 if !args.common.json && cleanup_result.blobs_removed > 0 {
                     println!(
                         "{}",
@@ -290,6 +313,7 @@ async fn repair_inner(
             Ok(cleanup_result) => {
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
+                bytes_freed += cleanup_result.bytes_freed;
                 if !args.common.json && cleanup_result.blobs_removed > 0 {
                     println!(
                         "{}",
@@ -320,7 +344,11 @@ async fn repair_inner(
     } else {
         PatchAction::Downloaded
     };
-    if downloaded_count > 0 || (args.common.dry_run && missing_count > 0) {
+    // Only the online path downloads (or, in dry-run, *would* download).
+    // In offline mode nothing is fetched even when artifacts are missing,
+    // so don't record a download/would-download event there — that would
+    // contradict the human-readable path, which only prints a warning.
+    if downloaded_count > 0 || (!args.common.offline && args.common.dry_run && missing_count > 0) {
         let count = if args.common.dry_run {
             missing_count
         } else {
@@ -358,6 +386,186 @@ async fn repair_inner(
         RepairCounts {
             downloaded: downloaded_count,
             cleaned: blobs_cleaned,
+            bytes_freed,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `repair_inner` — the offline cleanup / event-recording
+    //! core. These run without a network (all use `--offline`), exercising
+    //! the orphan-cleanup and envelope-building paths directly so the
+    //! contract is pinned independently of the binary harness.
+    use super::*;
+    use crate::args::GlobalArgs;
+    use std::path::PathBuf;
+
+    const MANIFEST_JSON: &str = r#"{
+      "patches": {
+        "pkg:npm/__repair_unit__@1.0.0": {
+          "uuid": "11111111-1111-4111-8111-111111111111",
+          "exportedAt": "2024-01-01T00:00:00Z",
+          "files": {
+            "package/index.js": {
+              "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+              "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
+            }
+          },
+          "vulnerabilities": {},
+          "description": "unit test patch",
+          "license": "MIT",
+          "tier": "free"
+        }
+      }
+    }"#;
+
+    const REFERENCED_HASH: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Write a `.socket/manifest.json` under `root` and return the socket dir.
+    fn make_socket(root: &Path) -> PathBuf {
+        let socket = root.join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        std::fs::write(socket.join("manifest.json"), MANIFEST_JSON).unwrap();
+        socket
+    }
+
+    fn write_blob(socket: &Path, hash: &str, content: &[u8]) {
+        let blobs = socket.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(hash), content).unwrap();
+    }
+
+    fn offline_args(cwd: &Path) -> RepairArgs {
+        RepairArgs {
+            common: GlobalArgs {
+                cwd: cwd.to_path_buf(),
+                manifest_path: ".socket/manifest.json".to_string(),
+                offline: true,
+                json: true,
+                download_mode: "file".to_string(),
+                ..GlobalArgs::default()
+            },
+            download_only: false,
+        }
+    }
+
+    /// True when `env` carries the download / would-download artifact event
+    /// (identified by its `details.mode` field, unique to that event).
+    fn has_download_event(env: &Envelope) -> bool {
+        env.events.iter().any(|e| {
+            e.details
+                .as_ref()
+                .and_then(|d| d.get("mode"))
+                .is_some()
+        })
+    }
+
+    /// Regression for the offline + dry-run leak: with `--offline` set, the
+    /// download phase is skipped entirely, so even in dry-run mode a missing
+    /// artifact must NOT produce a "would-download" (verified) event. Before
+    /// the fix the event was recorded unconditionally on `dry_run &&
+    /// missing > 0`, contradicting the human-readable path (which only warns).
+    #[tokio::test]
+    async fn offline_dry_run_does_not_record_download_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        // No blob on disk → the manifest's afterHash is "missing".
+        let mut args = offline_args(tmp.path());
+        args.common.dry_run = true;
+
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert!(
+            !has_download_event(&env),
+            "offline dry-run must not emit a download/would-download event; events={:?}",
+            env.events
+        );
+        assert_eq!(counts.downloaded, 0);
+        assert_eq!(env.status, Status::Success);
+    }
+
+    /// The online dry-run path *should* still preview the download — this
+    /// pins that the offline gate didn't over-correct. We can't hit the
+    /// network here, but `repair_inner`'s dry-run branch records the event
+    /// from the missing-artifact list without contacting the server.
+    #[tokio::test]
+    async fn online_dry_run_records_would_download_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        let mut args = offline_args(tmp.path());
+        args.common.offline = false;
+        args.common.dry_run = true;
+
+        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert!(
+            has_download_event(&env),
+            "online dry-run must preview the download; events={:?}",
+            env.events
+        );
+    }
+
+    /// Regression for the dropped `bytes_freed`: cleanup of an orphan blob
+    /// must report the reclaimed byte count up through `RepairCounts` so the
+    /// telemetry `bytes_freed` field is non-zero (it was hardcoded to 0).
+    #[tokio::test]
+    async fn cleanup_reports_bytes_freed_and_removed_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        write_blob(&socket, REFERENCED_HASH, b"kept");
+        let orphan_hash = "deadbeef".repeat(8); // 64 hex chars
+        let orphan_bytes = b"orphaned content bytes";
+        write_blob(&socket, &orphan_hash, orphan_bytes);
+
+        let args = offline_args(tmp.path());
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert_eq!(counts.cleaned, 1, "one orphan should be cleaned");
+        assert_eq!(
+            counts.bytes_freed,
+            orphan_bytes.len() as u64,
+            "bytes_freed must reflect the reclaimed orphan size"
+        );
+        // The referenced blob survives; the orphan is gone.
+        assert!(socket.join("blobs").join(REFERENCED_HASH).exists());
+        assert!(!socket.join("blobs").join(&orphan_hash).exists());
+        // A Removed event is recorded for the swept orphan.
+        assert_eq!(env.summary.removed, 1);
+    }
+
+    /// `--download-only` skips the cleanup pass, so an orphan blob survives
+    /// and `bytes_freed` stays zero. (Run without `--offline`, which is
+    /// mutually exclusive; the manifest's blob is present so the online
+    /// download phase has nothing to fetch and never touches the network.)
+    #[tokio::test]
+    async fn download_only_skips_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        write_blob(&socket, REFERENCED_HASH, b"kept");
+        let orphan_hash = "feedface".repeat(8);
+        write_blob(&socket, &orphan_hash, b"orphan");
+
+        let mut args = offline_args(tmp.path());
+        args.common.offline = false;
+        args.download_only = true;
+
+        let (_env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert_eq!(counts.cleaned, 0, "download-only must skip cleanup");
+        assert_eq!(counts.bytes_freed, 0);
+        assert!(
+            socket.join("blobs").join(&orphan_hash).exists(),
+            "orphan must survive when cleanup is skipped"
+        );
+    }
 }

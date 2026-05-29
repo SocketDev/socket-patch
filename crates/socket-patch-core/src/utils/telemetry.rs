@@ -14,8 +14,11 @@ use crate::utils::env_compat::read_env_with_legacy;
 /// Shared across all telemetry events in a single run.
 static SESSION_ID: Lazy<String> = Lazy::new(|| Uuid::new_v4().to_string());
 
-/// Package version — updated during build.
-const PACKAGE_VERSION: &str = "1.0.0";
+/// Package version — sourced from the crate's `Cargo.toml` at build time so
+/// it always tracks the real release (matching `USER_AGENT` in `constants.rs`
+/// and the `vex` tooling string). A hardcoded literal here silently drifts
+/// from the published version.
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -139,9 +142,11 @@ pub struct TrackPatchEventOptions {
 /// is set the CLI dispatcher sets `SOCKET_TELEMETRY_DISABLED=1` for the
 /// duration of the process so this check stays the single source of truth.
 pub fn is_telemetry_disabled() -> bool {
-    let env_value =
-        read_env_with_legacy("SOCKET_TELEMETRY_DISABLED", "SOCKET_PATCH_TELEMETRY_DISABLED")
-            .unwrap_or_default();
+    let env_value = read_env_with_legacy(
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_PATCH_TELEMETRY_DISABLED",
+    )
+    .unwrap_or_default();
     let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
     let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
     let offline = matches!(
@@ -205,12 +210,13 @@ fn home_dir_string() -> Option<String> {
 
 /// Build a telemetry event from the given options.
 fn build_telemetry_event(options: &TrackPatchEventOptions) -> PatchTelemetryEvent {
-    let error = options.error.as_ref().map(|(error_type, message)| {
-        PatchTelemetryError {
+    let error = options
+        .error
+        .as_ref()
+        .map(|(error_type, message)| PatchTelemetryError {
             error_type: error_type.clone(),
             message: Some(sanitize_error_message(message)),
-        }
-    });
+        });
 
     PatchTelemetryEvent {
         event_sender_created_at: chrono_now_iso(),
@@ -239,9 +245,7 @@ fn chrono_now_iso() -> String {
 
     let (year, month, day) = days_to_ymd(days);
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -280,9 +284,8 @@ async fn send_telemetry_event(
             (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
         }
         _ => {
-            let proxy_url =
-                read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                    .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
             (format!("{proxy_url}/patch/telemetry"), false)
         }
     };
@@ -676,11 +679,7 @@ pub async fn track_patch_repair_failed(
 
 /// Track a successful `setup`. Reports the detected package manager so
 /// we can tell which install hooks are exercised in the wild.
-pub async fn track_patch_setup(
-    manager: &str,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
+pub async fn track_patch_setup(manager: &str, api_token: Option<&str>, org_slug: Option<&str>) {
     fire(
         PatchTelemetryEventType::PatchSetup,
         "setup",
@@ -865,12 +864,18 @@ mod tests {
     #[test]
     fn test_event_type_as_str() {
         // Write-side
-        assert_eq!(PatchTelemetryEventType::PatchApplied.as_str(), "patch_applied");
+        assert_eq!(
+            PatchTelemetryEventType::PatchApplied.as_str(),
+            "patch_applied"
+        );
         assert_eq!(
             PatchTelemetryEventType::PatchApplyFailed.as_str(),
             "patch_apply_failed"
         );
-        assert_eq!(PatchTelemetryEventType::PatchRemoved.as_str(), "patch_removed");
+        assert_eq!(
+            PatchTelemetryEventType::PatchRemoved.as_str(),
+            "patch_removed"
+        );
         assert_eq!(
             PatchTelemetryEventType::PatchRemoveFailed.as_str(),
             "patch_remove_failed"
@@ -884,18 +889,27 @@ mod tests {
             "patch_rollback_failed"
         );
         // Read-side
-        assert_eq!(PatchTelemetryEventType::PatchScanned.as_str(), "patch_scanned");
+        assert_eq!(
+            PatchTelemetryEventType::PatchScanned.as_str(),
+            "patch_scanned"
+        );
         assert_eq!(
             PatchTelemetryEventType::PatchScanFailed.as_str(),
             "patch_scan_failed"
         );
-        assert_eq!(PatchTelemetryEventType::PatchFetched.as_str(), "patch_fetched");
+        assert_eq!(
+            PatchTelemetryEventType::PatchFetched.as_str(),
+            "patch_fetched"
+        );
         assert_eq!(
             PatchTelemetryEventType::PatchFetchFailed.as_str(),
             "patch_fetch_failed"
         );
         // Inspection / housekeeping
-        assert_eq!(PatchTelemetryEventType::PatchListed.as_str(), "patch_listed");
+        assert_eq!(
+            PatchTelemetryEventType::PatchListed.as_str(),
+            "patch_listed"
+        );
         assert_eq!(
             PatchTelemetryEventType::PatchRepaired.as_str(),
             "patch_repaired"
@@ -914,7 +928,10 @@ mod tests {
             "patch_unlock_failed"
         );
         // OpenVEX
-        assert_eq!(PatchTelemetryEventType::VexGenerated.as_str(), "vex_generated");
+        assert_eq!(
+            PatchTelemetryEventType::VexGenerated.as_str(),
+            "vex_generated"
+        );
         assert_eq!(PatchTelemetryEventType::VexFailed.as_str(), "vex_failed");
     }
 
@@ -925,6 +942,26 @@ mod tests {
         assert_eq!(ctx.version, PACKAGE_VERSION);
         assert!(!ctx.platform.is_empty());
         assert!(!ctx.arch.is_empty());
+    }
+
+    /// Regression: the reported version must track the real crate version,
+    /// not a hardcoded literal that drifts from the published release.
+    /// Anchoring on `CARGO_PKG_VERSION` (rather than the `PACKAGE_VERSION`
+    /// const) is deliberate — comparing the context against the same const it
+    /// is built from is self-referential and can never catch a stale value.
+    #[test]
+    fn test_telemetry_version_tracks_crate_version() {
+        assert_eq!(PACKAGE_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            build_telemetry_context("apply").version,
+            env!("CARGO_PKG_VERSION")
+        );
+        // The previously-hardcoded literal must never reappear unless the crate
+        // is genuinely at that version.
+        assert!(
+            PACKAGE_VERSION != "1.0.0" || env!("CARGO_PKG_VERSION") == "1.0.0",
+            "telemetry version is still hardcoded to the stale 1.0.0 literal"
+        );
     }
 
     #[test]

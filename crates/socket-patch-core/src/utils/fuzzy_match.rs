@@ -130,14 +130,16 @@ pub fn fuzzy_match_packages(
         if type_cmp != std::cmp::Ordering::Equal {
             return type_cmp;
         }
-        get_full_name(&a.package).cmp(&get_full_name(&b.package))
+        // Tie-break alphabetically by full name. Matching is case-insensitive,
+        // so the ordering must be too — otherwise byte order sorts uppercase
+        // ('Z' = 0x5A) before lowercase ('a' = 0x61), which is not alphabetical
+        // and can flip which package lands at `matches[0]`.
+        get_full_name(&a.package)
+            .to_lowercase()
+            .cmp(&get_full_name(&b.package).to_lowercase())
     });
 
-    matches
-        .into_iter()
-        .take(limit)
-        .map(|m| m.package)
-        .collect()
+    matches.into_iter().take(limit).map(|m| m.package).collect()
 }
 
 #[cfg(test)]
@@ -145,11 +147,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn make_pkg(
-        name: &str,
-        version: &str,
-        namespace: Option<&str>,
-    ) -> CrawledPackage {
+    fn make_pkg(name: &str, version: &str, namespace: Option<&str>) -> CrawledPackage {
         let ns = namespace.map(|s| s.to_string());
         let purl = match &ns {
             Some(n) => format!("pkg:npm/{n}/{name}@{version}"),
@@ -242,4 +240,59 @@ mod tests {
         assert_eq!(results.len(), 10);
     }
 
+    /// Regression: within a single match tier the alphabetical tie-break must
+    /// be case-insensitive, matching the case-insensitive matching above. With
+    /// a raw byte-order comparison, 'Z' (0x5A) sorts before 'a' (0x61), so
+    /// "Zebra" would wrongly precede "apple" and become `matches[0]`.
+    #[test]
+    fn test_tiebreak_is_case_insensitive() {
+        let packages = vec![
+            make_pkg("Zebra", "1.0.0", None),
+            make_pkg("apple", "1.0.0", None),
+        ];
+        // "e" is a substring of both names but a prefix of neither, so both
+        // land in the same ContainsFull tier and the tie-break decides order.
+        let results = fuzzy_match_packages("e", &packages, 20);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].name, "apple",
+            "alphabetical tie-break must ignore case"
+        );
+        assert_eq!(results[1].name, "Zebra");
+    }
+
+    /// A better match tier must outrank alphabetical order, and the `limit`
+    /// truncation must keep the best matches (it is applied after sorting).
+    #[test]
+    fn test_best_tier_survives_limit() {
+        let packages = vec![
+            make_pkg("ax", "1.0.0", None),
+            make_pkg("bx", "1.0.0", None),
+            make_pkg("x", "1.0.0", None), // ExactFull, but alphabetically last
+        ];
+        let results = fuzzy_match_packages("x", &packages, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].name, "x",
+            "exact match must beat alphabetically-earlier contains matches"
+        );
+    }
+
+    /// A namespaced package whose bare name (but not its namespace-qualified
+    /// full name) prefixes the query is a PrefixName match, which ranks below
+    /// a non-namespaced PrefixFull match for the same query.
+    #[test]
+    fn test_namespaced_prefix_name_ranks_below_full() {
+        let packages = vec![
+            make_pkg("lodash", "4.17.21", Some("@scope")),
+            make_pkg("lodash-es", "4.17.21", None),
+        ];
+        let results = fuzzy_match_packages("lod", &packages, 20);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].name, "lodash-es",
+            "PrefixFull (no namespace) outranks PrefixName (namespaced)"
+        );
+        assert!(results[0].namespace.is_none());
+    }
 }

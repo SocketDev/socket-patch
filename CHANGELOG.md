@@ -14,6 +14,130 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-05-29
+
+A repo-wide correctness, security, and filesystem-safety hardening pass: every
+source file in both crates was reviewed line by line, the bugs found were fixed,
+and regression tests were added throughout (the lib + integration suites grow by
+~10k lines of mostly tests). The audit harness used to drive the review lives in
+`scripts/study-crates.ts`.
+
+### Security
+
+- **Path-traversal in archive extraction.** `read_archive_to_map`
+  (`patch/package.rs`) validated the raw tar entry path but returned the
+  `package/`-stripped path, so an entry like `package//etc/passwd` passed every
+  check and then resolved to an absolute `/etc/passwd` that `Path::join`
+  writes outside the package tree. Validation now runs on the normalized path
+  actually written to disk.
+- **Unbounded preallocation from an untrusted delta header.** `apply_diff`
+  (`patch/diff.rs`) reserved a `Vec` sized from the bsdiff target-size header,
+  which qbsdiff never validates — a tiny hostile delta could claim up to
+  `i64::MAX` and abort the process. The hint is now clamped to 64 MiB.
+- **Evidence-free VEX attestation.** `verify_patch_record` (`vex/verify.rs`)
+  returned `applied` for a patch touching zero files, producing a
+  `not_affected` statement with no on-disk evidence; zero-file records are now
+  omitted (`no_files`).
+
+### Fixed — filesystem safety, atomicity & rollback
+
+- **`apply` could not write into read-only directories** (Go module cache marks
+  dirs `0o555`); added a `DirWriteGuard` that temporarily grants write on the
+  parent dir around the CoW-break + atomic rename and restores its exact mode.
+- **`apply` stripped setuid/setgid bits** on every patched file because `chown`
+  ran after `chmod`; reordered to chown-before-chmod, plus a parent-dir `fsync`
+  so the rename survives a crash.
+- **Non-atomic symlink break** (`patch/cow.rs`) removed the file before staging
+  its replacement, destroying it with no rollback on a failed write; now
+  rename-over the link, matching the hardlink path. Stage files are cleaned up
+  on every error arm.
+- **`rollback` used an unsafe in-place write**; it now delegates to the hardened
+  `apply_file_patch` (atomic, CoW-safe, validate-before-write, permission
+  restore). Also: a GC'd before-blob no longer shadows the already-original
+  short-circuit, and new-file deletion works inside read-only directories.
+- **Hash integrity:** `compute_file_git_sha256` (`patch/file_hash.rs`) opened
+  and stat'd the path separately (TOCTOU) and never checked the target was a
+  regular file (a directory hashed as the empty blob); now opens once, fstats
+  the descriptor, and rejects non-regular files. `compute_git_sha256_from_reader`
+  now errors when the streamed byte count disagrees with the declared size.
+- **Sidecar writes in read-only caches:** the cargo `.cargo-checksum.json`
+  rewrite and the NuGet `.nupkg.metadata` delete used bare, non-atomic I/O that
+  failed `EACCES` in the locked-down registry trees they exist to serve; both
+  now go through the hardened write/`DirWriteGuard` paths.
+- **Blob cleanup** (`utils/cleanup_blobs.rs`) aborted the whole sweep on one
+  dangling symlink and inflated the "checked" count with subdirs/dotfiles; now
+  uses `symlink_metadata`, skips stat errors, and counts only real blobs.
+- **Lock acquisition** (`patch/apply_lock.rs`) mapped every `flock` error to
+  `Held` (masking `ENOLCK`/`EACCES`/unsupported-FS and busy-waiting through the
+  whole timeout) and overshot sub-100 ms waits; genuine faults now surface
+  immediately and the sleep is clamped to the remaining budget.
+
+### Fixed — crawlers (on-disk layout & metadata)
+
+- **Composer:** normalize the `v`-prefixed `installed.json` version against bare
+  PURLs, tolerate a single malformed entry instead of dropping the file, and
+  skip packages absent on disk.
+- **Go:** only skip `cache/` at the module-cache root (not at any depth),
+  decode/encode case-escaped versions (`v1.0.0-RC1` ↔ `…-!r!c1`), treat `GOPATH`
+  as a path list, and reject malformed/empty `module` directives.
+- **npm:** follow symlinked directories during the global-fallback walk
+  (`DirEntry::metadata()` doesn't follow links) and guard nested recursion so it
+  doesn't descend through symlinked packages.
+- **NuGet:** lowercase the version directory (not just the id) when resolving the
+  global packages folder, so prerelease-cased versions resolve.
+- **Python:** the macOS framework `Versions/` layout uses bare `3.11` dirs, and a
+  package with missing/malformed `METADATA` now falls back to its
+  `<name>-<version>.dist-info` directory name instead of vanishing.
+- **Deno:** correct the macOS cache path (`~/Library/Caches/deno`), honor
+  `XDG_CACHE_HOME` on Linux, and treat an empty `DENO_DIR` as unset.
+- **Maven:** strip XML comments before tag matching and handle self-closing /
+  inline skip-sections so a commented or oddly-formatted POM can't leak a
+  plugin's coordinates as the project's.
+- **Cargo:** tolerate `[package]` headers with comments/whitespace and split
+  `<name>-<version>` dirs at the dotted version (handles numeric pre-releases).
+- **Shared:** `utils/fs::entry_is_dir` now follows symlinks, fixing symlinked
+  package-dir discovery across every dir-walking crawler at once.
+
+### Fixed — API client, commands & misc
+
+- **API client:** honor a `--proxy-url` override on binary downloads (was
+  re-derived from env), and make org selection, patch titles, and the
+  individual-query batch capability flag deterministic / order-independent;
+  hash comparison is now case-insensitive.
+- **Version reporting:** `USER_AGENT` and telemetry `context.version` were
+  hardcoded to `1.0`/`1.0.0`; both now derive from `CARGO_PKG_VERSION`.
+- **`apply`** no longer emits a spurious `Failed` envelope event for a
+  release-variant whose first file is `NotFound`.
+- **UTF-8 safety:** `get`/`scan`/`remove` truncated display strings with raw
+  byte slices that panic on multi-byte API text; all use char-safe truncation.
+- **Exit codes:** `setup` now exits non-zero (not `already_configured`) when a
+  `package.json` fails to parse, and `repair` exits non-zero and fires failure
+  telemetry on a partial download failure (also gates the offline dry-run
+  "would download" event and threads through `bytes_freed`).
+- **`rollback`** no longer miscounts zero-file records as already-original or
+  double-counts no-ops in dry-run; **`unlock`** reports `released` from a
+  pre-`acquire` snapshot so a probe-created lock file isn't reported as removed.
+- **`vex`** resolves qualified PyPI/Gem/Maven PURLs via the rollback-aware
+  resolver so those patches are no longer dropped as `package_not_found`.
+- **`package.json` handling:** no longer panics on a non-object root or
+  non-object `scripts`, de-dups overlapping workspace patterns, handles bare
+  `*`/`**`/deep globs, strips inline YAML comments, and preserves top-level key
+  order (enabled `serde_json`'s `preserve_order`).
+- Smaller fixes: deterministic `list` output ordering, case-insensitive
+  `fuzzy_match` tie-break, `json_envelope` status-invariant enforcement +
+  `oldUuid` field, `lock_cli` sub-second timeout message, blob-fetcher
+  all-skipped formatting, VEX `Statement.timestamp` made optional per OpenVEX
+  0.2.0, and VEX git-remote `url` parsing.
+
+### Tests & tooling
+
+- Hundreds of regression tests added across the patch engine, crawlers, API
+  client, manifest, `package.json`, VEX, and CLI command layers; the stale
+  `repair`/`python_crawler` e2e expectations were updated to the corrected
+  contracts. Full suite green (`--features cargo`).
+- Added the `scripts/study-crates.ts` per-file audit harness (with an example
+  prompt config) used to drive this review.
+
 ## [3.1.0] — 2026-05-26
 
 ### Added

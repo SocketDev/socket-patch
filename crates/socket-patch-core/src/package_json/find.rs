@@ -46,9 +46,7 @@ pub struct PackageJsonFindResult {
 }
 
 /// Find all package.json files, respecting workspace configurations.
-pub async fn find_package_json_files(
-    start_path: &Path,
-) -> PackageJsonFindResult {
+pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult {
     let mut results = Vec::new();
     let root_package_json = start_path.join("package.json");
 
@@ -77,11 +75,17 @@ pub async fn find_package_json_files(
             }
         }
         _ => {
-            let ws_packages =
-                find_workspace_packages(start_path, &workspace_config).await;
+            let ws_packages = find_workspace_packages(start_path, &workspace_config).await;
             results.extend(ws_packages);
         }
     }
+
+    // Workspace patterns can overlap (e.g. "packages/*" and "packages/a", or a
+    // glob plus an exact path), which would otherwise yield the same
+    // package.json more than once. De-duplicate by path, preserving discovery
+    // order so the root entry stays first.
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|loc| seen.insert(loc.path.clone()));
 
     PackageJsonFindResult {
         files: results,
@@ -96,19 +100,13 @@ pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         patterns: Vec::new(),
     };
 
-    let content = match fs::read_to_string(package_json_path).await {
-        Ok(c) => c,
-        Err(_) => return default,
-    };
-
-    let pkg: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return default,
-    };
-
     // Check for pnpm workspaces first — pnpm projects may also have
-    // "workspaces" in package.json for compatibility, but
-    // pnpm-workspace.yaml is the definitive signal.
+    // "workspaces" in package.json for compatibility, but pnpm-workspace.yaml
+    // is the definitive signal. It lives next to package.json and does not
+    // depend on package.json being present or even valid JSON, so it must be
+    // checked *before* parsing package.json — otherwise a malformed (e.g.
+    // JSONC, or simply broken) root manifest would wrongly demote a real pnpm
+    // workspace to "no workspace".
     let dir = package_json_path.parent().unwrap_or(Path::new("."));
     let pnpm_workspace = dir.join("pnpm-workspace.yaml");
     if let Ok(yaml_content) = fs::read_to_string(&pnpm_workspace).await {
@@ -118,6 +116,16 @@ pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
             patterns,
         };
     }
+
+    let content = match fs::read_to_string(package_json_path).await {
+        Ok(c) => c,
+        Err(_) => return default,
+    };
+
+    let pkg: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return default,
+    };
 
     // Check for npm/yarn workspaces
     if let Some(workspaces) = pkg.get("workspaces") {
@@ -161,23 +169,47 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
         }
 
         if in_packages {
-            if !trimmed.is_empty()
-                && !trimmed.starts_with('-')
-                && !trimmed.starts_with('#')
-            {
+            if !trimmed.is_empty() && !trimmed.starts_with('-') && !trimmed.starts_with('#') {
                 break;
             }
 
             if let Some(rest) = trimmed.strip_prefix('-') {
-                let item = rest.trim().trim_matches('\'').trim_matches('"');
+                let item = parse_yaml_list_value(rest);
                 if !item.is_empty() {
-                    patterns.push(item.to_string());
+                    patterns.push(item);
                 }
             }
         }
     }
 
     patterns
+}
+
+/// Extract the scalar value of a YAML list item, handling surrounding quotes
+/// and trailing inline comments (`# ...`).
+fn parse_yaml_list_value(raw: &str) -> String {
+    let s = raw.trim();
+
+    // Quoted scalar: take the content between the first matching pair of
+    // quotes. Anything after the closing quote (e.g. an inline comment) is
+    // ignored, and a `#` inside the quotes stays part of the value.
+    for q in ['\'', '"'] {
+        if let Some(rest) = s.strip_prefix(q) {
+            if let Some(end) = rest.find(q) {
+                return rest[..end].to_string();
+            }
+        }
+    }
+
+    // Unquoted scalar: a `#` preceded by whitespace begins an inline comment.
+    let bytes = s.as_bytes();
+    let comment_start =
+        (1..bytes.len()).find(|&i| bytes[i] == b'#' && bytes[i - 1].is_ascii_whitespace());
+    let value = match comment_start {
+        Some(idx) => &s[..idx],
+        None => s,
+    };
+    value.trim().to_string()
 }
 
 /// Find workspace packages based on workspace patterns.
@@ -203,27 +235,43 @@ async fn find_workspace_packages(
 }
 
 /// Find packages matching a workspace pattern.
-async fn find_packages_matching_pattern(
-    root_path: &Path,
-    pattern: &str,
-) -> Vec<PathBuf> {
+async fn find_packages_matching_pattern(root_path: &Path, pattern: &str) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    let parts: Vec<&str> = pattern.split('/').collect();
 
-    if parts.len() == 2 && parts[1] == "*" {
-        let search_path = root_path.join(parts[0]);
-        search_one_level(&search_path, &mut results).await;
-    } else if parts.len() == 2 && parts[1] == "**" {
-        let search_path = root_path.join(parts[0]);
-        search_recursive(&search_path, &mut results).await;
-    } else {
-        let pkg_json = root_path.join(pattern).join("package.json");
-        if fs::metadata(&pkg_json).await.is_ok() {
-            results.push(pkg_json);
+    // A trailing `*`/`**` segment is a glob; everything before the final `/`
+    // is a (possibly empty, possibly multi-segment) directory prefix. Split on
+    // the *last* `/` so bare globs (`*`, `**`) and deeper prefixes (`a/b/*`)
+    // are handled, not just the two-segment `prefix/*` form.
+    let (prefix, last) = pattern.rsplit_once('/').unwrap_or(("", pattern));
+
+    match last {
+        "*" | "**" => {
+            let search_path = if prefix.is_empty() {
+                root_path.to_path_buf()
+            } else {
+                root_path.join(prefix)
+            };
+            if last == "*" {
+                search_one_level(&search_path, &mut results).await;
+            } else {
+                search_recursive(&search_path, &mut results).await;
+            }
+        }
+        _ => {
+            let pkg_json = root_path.join(pattern).join("package.json");
+            if fs::metadata(&pkg_json).await.is_ok() {
+                results.push(pkg_json);
+            }
         }
     }
 
     results
+}
+
+/// Directories that are never workspace members and must be skipped while
+/// walking the tree (hidden dirs plus dependency/output directories).
+fn is_ignored_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == "dist" || name == "build"
 }
 
 /// Search one level deep for package.json files.
@@ -239,6 +287,11 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
             Err(_) => continue,
         };
         if !ft.is_dir() {
+            continue;
+        }
+        // A `dir/*` pattern must not pick up node_modules/hidden/output dirs as
+        // workspace members, matching the recursive searchers below.
+        if is_ignored_dir(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let pkg_json = entry.path().join("package.json");
@@ -268,11 +321,7 @@ async fn search_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
         let name_str = name.to_string_lossy();
 
         // Skip hidden directories, node_modules, dist, build
-        if name_str.starts_with('.')
-            || name_str == "node_modules"
-            || name_str == "dist"
-            || name_str == "build"
-        {
+        if is_ignored_dir(&name_str) {
             continue;
         }
 
@@ -287,9 +336,7 @@ async fn search_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
 }
 
 /// Find nested package.json files without workspace configuration.
-async fn find_nested_package_json_files(
-    start_path: &Path,
-) -> Vec<PackageJsonLocation> {
+async fn find_nested_package_json_files(start_path: &Path) -> Vec<PackageJsonLocation> {
     let mut results = Vec::new();
     let root_pkg = start_path.join("package.json");
     search_nested(start_path, &root_pkg, 0, &mut results).await;
@@ -323,11 +370,7 @@ async fn search_nested(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if name_str.starts_with('.')
-            || name_str == "node_modules"
-            || name_str == "dist"
-            || name_str == "build"
-        {
+        if is_ignored_dir(&name_str) {
             continue;
         }
 
@@ -457,9 +500,7 @@ mod tests {
         let pkg = dir.path().join("package.json");
         fs::write(&pkg, r#"{"name": "root"}"#).await.unwrap();
         let pnpm = dir.path().join("pnpm-workspace.yaml");
-        fs::write(&pnpm, "packages:\n  - packages/*")
-            .await
-            .unwrap();
+        fs::write(&pnpm, "packages:\n  - packages/*").await.unwrap();
         let config = detect_workspaces(&pkg).await;
         assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
         assert_eq!(config.patterns, vec!["packages/*"]);
@@ -471,12 +512,9 @@ mod tests {
         // exist, pnpm should take priority
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
-        fs::write(
-            &pkg,
-            r#"{"name": "root", "workspaces": ["packages/*"]}"#,
-        )
-        .await
-        .unwrap();
+        fs::write(&pkg, r#"{"name": "root", "workspaces": ["packages/*"]}"#)
+            .await
+            .unwrap();
         let pnpm = dir.path().join("pnpm-workspace.yaml");
         fs::write(&pnpm, "packages:\n  - workspaces/*")
             .await
@@ -485,6 +523,24 @@ mod tests {
         assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
         // Should use pnpm-workspace.yaml patterns, not package.json workspaces
         assert_eq!(config.patterns, vec!["workspaces/*"]);
+    }
+
+    #[tokio::test]
+    async fn test_detect_workspaces_pnpm_with_malformed_package_json() {
+        // Regression: pnpm-workspace.yaml is the definitive signal and must be
+        // honored even when the root package.json is not valid JSON. Previously
+        // the JSON parse error short-circuited before the pnpm check.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        // JSONC-style comment — valid for some tooling, invalid for serde_json.
+        fs::write(&pkg, "{\n  // a comment\n  \"name\": \"root\"\n}")
+            .await
+            .unwrap();
+        let pnpm = dir.path().join("pnpm-workspace.yaml");
+        fs::write(&pnpm, "packages:\n  - packages/*").await.unwrap();
+        let config = detect_workspaces(&pkg).await;
+        assert!(matches!(config.ws_type, WorkspaceType::Pnpm));
+        assert_eq!(config.patterns, vec!["packages/*"]);
     }
 
     #[tokio::test]
@@ -652,6 +708,143 @@ mod tests {
             .unwrap();
         let result = find_package_json_files(dir.path()).await;
         assert_eq!(result.files.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pnpm_inline_comment_stripped() {
+        // A `# ...` inline comment after a pattern must not become part of it.
+        let yaml = "packages:\n  - packages/*  # workspace packages\n  - apps/*\t# trailing tab";
+        assert_eq!(
+            parse_pnpm_workspace_patterns(yaml),
+            vec!["packages/*", "apps/*"]
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_quoted_value_keeps_hash() {
+        // A `#` inside quotes is part of the value, not a comment.
+        let yaml = "packages:\n  - 'packages/#weird'  # but this is a comment";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/#weird"]);
+    }
+
+    #[tokio::test]
+    async fn test_find_overlapping_patterns_no_duplicates() {
+        // "packages/*" and the exact "packages/a" both match the same member;
+        // the result must contain it only once.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*", "packages/a"]}"#,
+        )
+        .await
+        .unwrap();
+        let a = dir.path().join("packages").join("a");
+        fs::create_dir_all(&a).await.unwrap();
+        fs::write(a.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        // root + exactly one workspace member (no duplicate for packages/a)
+        assert_eq!(result.files.len(), 2);
+        assert!(result.files[0].is_root);
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert_eq!(workspace_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_star_pattern_skips_node_modules() {
+        // A `packages/*` glob must not treat node_modules (or hidden/output
+        // dirs) as a workspace member, even if they contain a package.json.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let real = dir.path().join("packages").join("real");
+        fs::create_dir_all(&real).await.unwrap();
+        fs::write(real.join("package.json"), r#"{"name":"real"}"#)
+            .await
+            .unwrap();
+        for ignored in ["node_modules", ".cache", "dist", "build"] {
+            let d = dir.path().join("packages").join(ignored);
+            fs::create_dir_all(&d).await.unwrap();
+            fs::write(d.join("package.json"), r#"{"name":"x"}"#)
+                .await
+                .unwrap();
+        }
+        let result = find_package_json_files(dir.path()).await;
+        // root + only the "real" member
+        assert_eq!(result.files.len(), 2);
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert_eq!(workspace_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_bare_star() {
+        // A bare `*` glob means "every immediate subdirectory" and must be
+        // expanded, not treated as a literal directory named `*`.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"workspaces": ["*"]}"#)
+            .await
+            .unwrap();
+        for member in ["a", "b"] {
+            let m = dir.path().join(member);
+            fs::create_dir_all(&m).await.unwrap();
+            fs::write(m.join("package.json"), r#"{"name":"m"}"#)
+                .await
+                .unwrap();
+        }
+        // node_modules must still be ignored even for a root-level `*`.
+        let nm = dir.path().join("node_modules").join("dep");
+        fs::create_dir_all(&nm).await.unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"dep"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        // root + members a and b (node_modules excluded)
+        assert_eq!(workspace_count, 2);
+        assert!(result.files[0].is_root);
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_bare_double_glob() {
+        // A bare `**` glob recurses from the root.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"workspaces": ["**"]}"#)
+            .await
+            .unwrap();
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(&nested).await.unwrap();
+        fs::write(nested.join("package.json"), r#"{"name":"b"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert!(workspace_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_deep_prefix_glob() {
+        // A glob with a multi-segment prefix (`group/sub/*`) must expand the
+        // directory under that prefix, not be treated as a literal path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["group/sub/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let member = dir.path().join("group").join("sub").join("pkg");
+        fs::create_dir_all(&member).await.unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"pkg"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert_eq!(workspace_count, 1);
     }
 
     // ── detect_package_manager ──────────────────────────────────────

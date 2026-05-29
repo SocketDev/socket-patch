@@ -46,7 +46,9 @@ async fn stage_global_cache_pkg(root: &Path, name: &str, version: &str) -> std::
 /// `packages.config` projects.
 async fn stage_legacy_pkg(root: &Path, name: &str, version: &str) -> std::path::PathBuf {
     let pkg_dir = root.join(format!("{name}.{version}"));
-    tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+    tokio::fs::create_dir_all(pkg_dir.join("lib"))
+        .await
+        .unwrap();
     tokio::fs::write(
         pkg_dir.join(format!("{name}.nuspec")),
         format!(
@@ -109,10 +111,18 @@ async fn find_by_purls_case_insensitive_legacy_layout() {
         .find_by_purls(tmp.path(), &[ORG_PURL_A.to_string()])
         .await
         .unwrap();
-    assert_eq!(result.len(), 1, "package must be found via either fast or case-insensitive path");
+    assert_eq!(
+        result.len(),
+        1,
+        "package must be found via either fast or case-insensitive path"
+    );
     let found = result.get(ORG_PURL_A).unwrap();
     // Either casing is acceptable; the contract is "matched something".
-    assert!(found.path.exists(), "returned path must exist; got {:?}", found.path);
+    assert!(
+        found.path.exists(),
+        "returned path must exist; got {:?}",
+        found.path
+    );
 }
 
 #[tokio::test]
@@ -133,10 +143,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     stage_global_cache_pkg(tmp.path(), "Newtonsoft.Json", "13.0.3").await;
     let crawler = NuGetCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-nuget/Foo@1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-nuget/Foo@1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty(), "non-nuget PURLs must be skipped");
@@ -161,10 +168,7 @@ async fn crawl_all_discovers_global_cache_layout() {
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 2);
     // The crawler lowercases the discovered name from the directory.
-    let purls: Vec<String> = result
-        .iter()
-        .map(|p| p.purl.to_ascii_lowercase())
-        .collect();
+    let purls: Vec<String> = result.iter().map(|p| p.purl.to_ascii_lowercase()).collect();
     assert!(purls.iter().any(|p| p.contains("newtonsoft.json")));
     assert!(purls.iter().any(|p| p.contains("serilog")));
 }
@@ -183,7 +187,10 @@ async fn crawl_all_discovers_legacy_layout() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.len() >= 2, "legacy layout must be discovered; got {result:?}");
+    assert!(
+        result.len() >= 2,
+        "legacy layout must be discovered; got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -194,7 +201,9 @@ async fn crawl_all_skips_hidden_directories() {
     // Hidden dir that mimics a package layout — must be skipped.
     let hidden = tmp.path().join(".cache").join("13.0.3");
     tokio::fs::create_dir_all(&hidden).await.unwrap();
-    tokio::fs::write(hidden.join(".cache.nuspec"), b"<package/>").await.unwrap();
+    tokio::fs::write(hidden.join(".cache.nuspec"), b"<package/>")
+        .await
+        .unwrap();
 
     let crawler = NuGetCrawler;
     let opts = CrawlerOptions {
@@ -207,7 +216,10 @@ async fn crawl_all_skips_hidden_directories() {
     // Only the real package should show up.
     assert_eq!(result.len(), 1);
     assert!(
-        result[0].purl.to_ascii_lowercase().contains("newtonsoft.json"),
+        result[0]
+            .purl
+            .to_ascii_lowercase()
+            .contains("newtonsoft.json"),
         "expected newtonsoft.json; got {:?}",
         result[0].purl
     );
@@ -238,8 +250,14 @@ async fn get_nuget_package_paths_local_discovers_packages_dir() {
     tokio::fs::create_dir_all(&pkg).await.unwrap();
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
-    assert!(paths.iter().any(|p| p == &pkg), "packages/ must be discovered; got {paths:?}");
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert!(
+        paths.iter().any(|p| p == &pkg),
+        "packages/ must be discovered; got {paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +277,10 @@ async fn get_nuget_package_paths_local_with_csproj_falls_back_to_global() {
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -278,7 +299,10 @@ async fn get_nuget_package_paths_local_no_project_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No `packages/`, no `.csproj`, no `.sln`, no `obj/`.
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty(), "non-.NET dir must return empty paths");
 }
 
@@ -286,15 +310,21 @@ async fn get_nuget_package_paths_local_no_project_returns_empty() {
 #[serial]
 async fn get_nuget_package_paths_with_sln_falls_back_to_global() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("MySolution.sln"), b"Microsoft Visual Studio Solution File")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        tmp.path().join("MySolution.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .await
+    .unwrap();
     let nuget_root = tempfile::tempdir().unwrap();
     let prev = std::env::var("NUGET_PACKAGES").ok();
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -316,21 +346,28 @@ async fn find_by_purls_rejects_dir_without_nuspec_or_lib() {
     let pkg_dir = tmp.path().join("newtonsoft.json").join("13.0.3");
     tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
     // No .nuspec, no lib/ — just an unrelated file.
-    tokio::fs::write(pkg_dir.join("README.md"), b"hello").await.unwrap();
+    tokio::fs::write(pkg_dir.join("README.md"), b"hello")
+        .await
+        .unwrap();
 
     let crawler = NuGetCrawler;
     let result = crawler
         .find_by_purls(tmp.path(), &[ORG_PURL_A.to_string()])
         .await
         .unwrap();
-    assert!(result.is_empty(), "dir without nuspec or lib/ must not match");
+    assert!(
+        result.is_empty(),
+        "dir without nuspec or lib/ must not match"
+    );
 }
 
 #[tokio::test]
 async fn find_by_purls_with_lib_dir_marker_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_dir = tmp.path().join("newtonsoft.json").join("13.0.3");
-    tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+    tokio::fs::create_dir_all(pkg_dir.join("lib"))
+        .await
+        .unwrap();
     // No .nuspec but lib/ is present — verify accepts it.
 
     let crawler = NuGetCrawler;
@@ -408,7 +445,9 @@ async fn crawl_all_skips_files_at_top_level() {
     // Stage a real package so the scan actually runs.
     let _pkg = stage_global_cache_pkg(tmp.path(), "newtonsoft.json", "13.0.3").await;
     // Plain file at the top level — must be skipped.
-    tokio::fs::write(tmp.path().join("readme.txt"), b"not a package").await.unwrap();
+    tokio::fs::write(tmp.path().join("readme.txt"), b"not a package")
+        .await
+        .unwrap();
 
     let crawler = NuGetCrawler;
     let opts = CrawlerOptions {
@@ -419,7 +458,9 @@ async fn crawl_all_skips_files_at_top_level() {
     };
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.iter().any(|n| n.eq_ignore_ascii_case("newtonsoft.json")));
+    assert!(names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("newtonsoft.json")));
     assert_eq!(result.len(), 1, "plain file must be skipped");
 }
 
@@ -518,7 +559,10 @@ async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
         std::env::remove_var("HOME");
     }
 
-    assert!(paths.is_empty(), "missing global cache dir must yield empty; got {paths:?}");
+    assert!(
+        paths.is_empty(),
+        "missing global cache dir must yield empty; got {paths:?}"
+    );
 }
 
 /// `is_dotnet_project` accepts a NuGet.Config marker without any
@@ -528,13 +572,18 @@ async fn get_nuget_package_paths_global_mode_missing_home_returns_empty() {
 #[serial]
 async fn get_nuget_package_paths_with_nuget_config_falls_back_to_global() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("NuGet.Config"), b"<configuration/>").await.unwrap();
+    tokio::fs::write(tmp.path().join("NuGet.Config"), b"<configuration/>")
+        .await
+        .unwrap();
     let nuget_root = tempfile::tempdir().unwrap();
     let prev = std::env::var("NUGET_PACKAGES").ok();
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -569,7 +618,9 @@ async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
         serde_json::Value::Object(serde_json::Map::new()),
     );
     let assets = serde_json::json!({ "packageFolders": folders }).to_string();
-    tokio::fs::write(obj.join("project.assets.json"), assets).await.unwrap();
+    tokio::fs::write(obj.join("project.assets.json"), assets)
+        .await
+        .unwrap();
     // Also need a project marker to satisfy is_dotnet_project (so the
     // global-cache fallback path runs as well) — but assets discovery
     // is independent, so this test exercises the obj-path branch even
@@ -579,7 +630,10 @@ async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -609,14 +663,19 @@ async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
         serde_json::Value::Object(serde_json::Map::new()),
     );
     let assets = serde_json::json!({ "packageFolders": folders }).to_string();
-    tokio::fs::write(sub_obj.join("project.assets.json"), assets).await.unwrap();
+    tokio::fs::write(sub_obj.join("project.assets.json"), assets)
+        .await
+        .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let nuget_root = tempfile::tempdir().unwrap();
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -637,7 +696,9 @@ async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_path
     let tmp = tempfile::tempdir().unwrap();
     let obj = tmp.path().join("obj");
     tokio::fs::create_dir_all(&obj).await.unwrap();
-    tokio::fs::write(obj.join("project.assets.json"), br#"{"packageFolders":{}}"#).await.unwrap();
+    tokio::fs::write(obj.join("project.assets.json"), br#"{"packageFolders":{}}"#)
+        .await
+        .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();
@@ -645,7 +706,10 @@ async fn get_nuget_package_paths_assets_json_empty_packagefolders_yields_no_path
     std::env::set_var("HOME", tmp.path());
 
     let crawler = NuGetCrawler;
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -668,7 +732,9 @@ async fn get_nuget_package_paths_assets_json_malformed_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let obj = tmp.path().join("obj");
     tokio::fs::create_dir_all(&obj).await.unwrap();
-    tokio::fs::write(obj.join("project.assets.json"), b"this is not json").await.unwrap();
+    tokio::fs::write(obj.join("project.assets.json"), b"this is not json")
+        .await
+        .unwrap();
 
     let prev = std::env::var("NUGET_PACKAGES").ok();
     let prev_home = std::env::var("HOME").ok();
@@ -677,7 +743,10 @@ async fn get_nuget_package_paths_assets_json_malformed_skipped() {
 
     let crawler = NuGetCrawler;
     // Must succeed with no panic, returning empty.
-    let paths = crawler.get_nuget_package_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("NUGET_PACKAGES");
     if let Some(v) = prev {
@@ -689,5 +758,8 @@ async fn get_nuget_package_paths_assets_json_malformed_skipped() {
         std::env::remove_var("HOME");
     }
 
-    assert!(paths.is_empty(), "malformed assets.json must be skipped; got {paths:?}");
+    assert!(
+        paths.is_empty(),
+        "malformed assets.json must be skipped; got {paths:?}"
+    );
 }

@@ -72,9 +72,7 @@ pub enum NpmPkgManager {
 pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     // 1. yarn-berry PnP — highest priority because it determines
     //    whether the npm crawler can find anything at all.
-    if project_root.join(".pnp.cjs").is_file()
-        || project_root.join(".pnp.loader.mjs").is_file()
-    {
+    if project_root.join(".pnp.cjs").is_file() || project_root.join(".pnp.loader.mjs").is_file() {
         return NpmPkgManager::YarnBerryPnP;
     }
 
@@ -83,17 +81,14 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     //    below, we require `node_modules/` to actually exist —
     //    a bare lockfile without an install is a fresh checkout.
     let node_modules = project_root.join("node_modules");
-    if (project_root.join("bun.lock").is_file()
-        || project_root.join("bun.lockb").is_file())
+    if (project_root.join("bun.lock").is_file() || project_root.join("bun.lockb").is_file())
         && node_modules.is_dir()
     {
         return NpmPkgManager::Bun;
     }
 
     // 3. pnpm — markers live inside node_modules/.
-    if node_modules.join(".modules.yaml").is_file()
-        || node_modules.join(".pnpm").is_dir()
-    {
+    if node_modules.join(".modules.yaml").is_file() || node_modules.join(".pnpm").is_dir() {
         return NpmPkgManager::Pnpm;
     }
 
@@ -234,5 +229,71 @@ mod tests {
             detect_npm_pkg_manager(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
+    }
+
+    /// The ESM PnP loader variant (`.pnp.loader.mjs`) is sufficient on
+    /// its own — newer yarn-berry installs ship it instead of (or
+    /// alongside) `.pnp.cjs`. The end-to-end refusal test pins this at
+    /// the CLI layer; pin it here at the detector layer too so a unit
+    /// regression is caught without standing up the whole apply path.
+    #[test]
+    fn yarn_berry_pnp_via_loader_mjs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.loader.mjs"), "").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// PnP wins even when a real `node_modules/` is also present (a
+    /// yarn-berry checkout can carry both an installed tree and the
+    /// loader). The refusal is the safety-critical branch — it must not
+    /// be masked by the npm fallthrough.
+    #[test]
+    fn yarn_berry_pnp_priority_over_node_modules() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// pnpm is checked before yarn-classic: a project with both a
+    /// `yarn.lock` and pnpm's `.pnpm/` store (e.g. a repo migrating
+    /// package managers without a clean reinstall) classifies as pnpm,
+    /// matching the documented precedence table.
+    #[test]
+    fn pnpm_priority_over_yarn_classic() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+        std::fs::write(d.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+    }
+
+    /// bun is checked before yarn-classic too: a `bun.lock` plus a
+    /// stray `yarn.lock` (multi-PM repo) classifies as bun.
+    #[test]
+    fn bun_priority_over_yarn_classic() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        std::fs::write(d.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+    }
+
+    /// Robustness: a malformed layout where `node_modules` is a regular
+    /// *file* rather than a directory must not be misclassified. Every
+    /// non-PnP branch gates on `node_modules.is_dir()` (directly or via
+    /// a child `join`), so a bun lockfile next to a `node_modules` file
+    /// falls through to Unknown rather than claiming bun.
+    #[test]
+    fn node_modules_as_file_is_not_misclassified() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("node_modules"), "not a dir").unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
     }
 }

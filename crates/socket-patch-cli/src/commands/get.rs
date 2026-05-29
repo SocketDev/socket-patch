@@ -165,6 +165,30 @@ fn print_json(v: &serde_json::Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
 }
 
+/// Truncate `s` to at most `limit` displayed characters, appending an
+/// ellipsis when it was longer (so the result is never wider than
+/// `limit`). Operates on `char` boundaries, NOT bytes: a byte-index slice
+/// like `&s[..n]` panics when `n` lands in the middle of a multi-byte
+/// UTF-8 sequence, and patch descriptions come straight from the API and
+/// routinely contain non-ASCII text.
+pub(crate) fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(limit.saturating_sub(3)).collect();
+        format!("{head}...")
+    }
+}
+
+/// Short, display-only prefix of a UUID for `[update]` log lines. Returns
+/// the first 8 bytes when they fall on a char boundary, otherwise the
+/// whole string. A naive `&uuid[..8]` panics on a malformed/short UUID in
+/// the manifest (out-of-bounds or mid-codepoint); this never does. Pure
+/// so the no-panic guarantee is unit-testable.
+fn short_uuid(uuid: &str) -> &str {
+    uuid.get(..8).unwrap_or(uuid)
+}
+
 /// Build a no-results JSON envelope with the given status code. Used in
 /// the `no_packages`, `no_match`, and `not_found` branches of `get`,
 /// which all share the same `{status, counts, patches: []}` shape.
@@ -441,11 +465,7 @@ pub fn select_patches(
                     } else {
                         format!(" (fixes: {})", vuln_summary.join(", "))
                     };
-                    let desc = if p.description.len() > 60 {
-                        format!("{}...", &p.description[..57])
-                    } else {
-                        p.description.clone()
-                    };
+                    let desc = truncate_with_ellipsis(&p.description, 60);
                     format!("{} [{}]{} - {}", p.uuid, p.tier, vulns, desc)
                 })
                 .collect();
@@ -763,7 +783,10 @@ pub async fn download_and_apply_patches(
                     eprintln!(
                         "  [update] {} (replacing {})",
                         search_result.purl,
-                        &existing.uuid[..8]
+                        // Defensive: a malformed/short UUID in the manifest
+                        // must not panic the download loop. `&uuid[..8]`
+                        // would; fall back to the whole string.
+                        short_uuid(&existing.uuid)
                     );
                 }
             }
@@ -1362,11 +1385,7 @@ fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) 
         println!("  {}. {}{}{}", i + 1, patch.purl, tier_label, access_label);
         println!("     UUID: {}", patch.uuid);
         if !patch.description.is_empty() {
-            let desc = if patch.description.len() > 80 {
-                format!("{}...", &patch.description[..77])
-            } else {
-                patch.description.clone()
-            };
+            let desc = truncate_with_ellipsis(&patch.description, 80);
             println!("     Description: {desc}");
         }
 
@@ -1969,5 +1988,83 @@ mod tests {
         // The empty vulnerabilities array is still present so the
         // shape stays consistent.
         assert_eq!(meta["vulnerabilities"].as_array().unwrap().len(), 0);
+    }
+
+    // --- truncate_with_ellipsis ------------------------------------------
+    // Patch descriptions come from the API and may contain multi-byte
+    // UTF-8. The old `&desc[..n]` byte slicing panicked when `n` fell mid
+    // codepoint; these lock in char-safe behavior.
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_with_ellipsis("hello", 60), "hello");
+    }
+
+    #[test]
+    fn truncate_at_limit_unchanged() {
+        let s = "a".repeat(60);
+        assert_eq!(truncate_with_ellipsis(&s, 60), s);
+    }
+
+    #[test]
+    fn truncate_long_ascii_adds_ellipsis_and_respects_limit() {
+        let s = "a".repeat(100);
+        let out = truncate_with_ellipsis(&s, 60);
+        // 57 content chars + "..." == 60, never wider than the limit.
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.ends_with("..."));
+        assert_eq!(out, format!("{}...", "a".repeat(57)));
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic_and_is_char_safe() {
+        // 90 bytes (30 * 3-byte chars) but only 30 chars: the byte length
+        // exceeds 80 while the char count does not. A `&s[..77]` byte slice
+        // would land mid-codepoint and panic; this must return the string
+        // untouched because it fits within the char limit.
+        let s = "日".repeat(30);
+        let out = truncate_with_ellipsis(&s, 80);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn truncate_multibyte_long_truncates_on_char_boundary() {
+        // 100 multi-byte chars (300 bytes) — must truncate to 77 chars plus
+        // the ellipsis without ever slicing through a codepoint.
+        let s = "é".repeat(100);
+        let out = truncate_with_ellipsis(&s, 80);
+        assert_eq!(out.chars().count(), 80);
+        assert!(out.ends_with("..."));
+        assert_eq!(out, format!("{}...", "é".repeat(77)));
+    }
+
+    // --- short_uuid ------------------------------------------------------
+    // The `[update]` log line prints the first 8 chars of the manifest's
+    // existing UUID. A naive `&uuid[..8]` panics on a short or non-ASCII
+    // value; `short_uuid` must never panic.
+
+    #[test]
+    fn short_uuid_truncates_normal_uuid() {
+        assert_eq!(short_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c"), "80630680");
+    }
+
+    #[test]
+    fn short_uuid_returns_whole_string_when_shorter_than_eight() {
+        // `&"abc"[..8]` would panic; the helper falls back to the whole value.
+        assert_eq!(short_uuid("abc"), "abc");
+        assert_eq!(short_uuid(""), "");
+    }
+
+    #[test]
+    fn short_uuid_does_not_panic_on_multibyte_boundary() {
+        // Byte 8 lands mid-codepoint (each "é" is 2 bytes, so byte 8 is a
+        // char boundary here — but byte 7 would not be). Use a value whose
+        // 8th byte splits a char to exercise the None fallback.
+        let s = "ab€cd"; // '€' is 3 bytes: bytes are a b € c d -> len 7
+        // get(..8) is out of range -> None -> whole string, no panic.
+        assert_eq!(short_uuid(s), s);
+        // A value where byte 8 splits the trailing multibyte char.
+        let s2 = "abcdef€"; // 6 ascii + 3-byte '€' = 9 bytes; byte 8 mid-char
+        assert_eq!(short_uuid(s2), s2);
     }
 }

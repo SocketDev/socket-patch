@@ -231,11 +231,13 @@ async fn cow_symlink_to_missing_target_propagates_read_error() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
-/// Symlink branch remove-fails arm (cow.rs:70): when the symlink
-/// itself carries the `uchg` (user-immutable) flag, `read(path)`
-/// follows the link and succeeds, but `remove_file(path)` cannot
-/// unlink the immutable symlink. The error propagates before the
-/// stage-rename step.
+/// Symlink branch rename-fails arm: when the symlink itself carries
+/// the `uchg` (user-immutable) flag, `read(path)` follows the link
+/// and succeeds and the stage file is created fine, but the atomic
+/// `rename(stage, path)` over the immutable symlink is refused with
+/// EPERM. The error propagates, the stage is cleaned up, and — the
+/// key invariant — the original symlink is left intact (CoW never
+/// destructively unlinks before the replacement is committed).
 ///
 /// macOS-only: BSD `chflags -h` is the only userspace tool that
 /// can set flags on a symlink without dereferencing. Linux's
@@ -278,8 +280,24 @@ async fn cow_symlink_unremovable_propagates_remove_error() {
     // Clear so tempdir cleanup can recurse.
     let _ = Command::new("chflags").arg("-h").arg("nouchg").arg(&link).status();
 
-    let err = result.expect_err("remove of immutable symlink must propagate EPERM");
+    let err = result.expect_err("rename over immutable symlink must propagate EPERM");
     assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // Regression (atomicity): the failed break must NOT have destroyed
+    // the original. The path still exists and is still the symlink.
+    let meta = std::fs::symlink_metadata(&link)
+        .expect("failed CoW must leave the original symlink in place");
+    assert!(
+        meta.file_type().is_symlink(),
+        "original symlink must survive a failed break, got {meta:?}"
+    );
+    // And no stage litter left behind.
+    let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
+        .collect();
+    assert!(leftover.is_empty(), "stage litter left behind: {leftover:?}");
 }
 
 /// Hardlink branch read-fails arm (cow.rs:84): a hardlinked file
@@ -380,20 +398,22 @@ async fn cow_stage_write_failure_propagates() {
     assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
 }
 
-/// Symlink-branch write_via_stage_rename failure arm (cow.rs:71):
-/// after `read(symlink)` and `remove_file(symlink)` both succeed,
-/// the subsequent `write_via_stage_rename` fails to create its
-/// `.socket-cow-*` stage file because the parent directory has a
-/// macOS ACL that denies `add_file` while still allowing
-/// `delete_child` — a state POSIX mode bits can't express
-/// (write perm on a dir is monolithic for create+delete).
+/// Symlink-branch `write_via_stage_rename` stage-create failure arm:
+/// after `read(symlink)` succeeds, `write_via_stage_rename` fails to
+/// create its `.socket-cow-*` stage file because the parent directory
+/// has a macOS ACL that denies `add_file` while still allowing
+/// `delete_child` — a state POSIX mode bits can't express (write perm
+/// on a dir is monolithic for create+delete).
 ///
-/// This is the only filesystem state that lets remove succeed but
-/// the next write fail in the same parent dir, which is required
-/// to reach the `?` Err arm on cow.rs:71. macOS-only because BSD
-/// extended ACLs (`chmod +a`) are the only userspace mechanism
-/// for this kind of fine-grained denial. Linux's POSIX.1e ACLs
-/// can't split create-vs-delete on directories.
+/// This same ACL is what made the old, destructive flow dangerous:
+/// the previous code did `remove_file(symlink)` (a `delete_child`,
+/// which the ACL *allows*) BEFORE the stage write, so the link was
+/// gone the instant the denied stage create failed — destroying the
+/// package file with no rollback. The current flow stages first and
+/// never pre-unlinks, so this asserts the original symlink survives.
+/// macOS-only because BSD extended ACLs (`chmod +a`) are the only
+/// userspace mechanism for this kind of fine-grained denial; Linux's
+/// POSIX.1e ACLs can't split create-vs-delete on directories.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn cow_symlink_stage_write_failure_propagates() {
@@ -439,10 +459,26 @@ async fn cow_symlink_stage_write_failure_propagates() {
     let _ = Command::new("chmod").arg("-a#").arg("0").arg(&dir).status();
 
     let err = result.expect_err(
-        "with deny-add_file ACL, write_via_stage_rename's stage create must fail \
-         AFTER read + remove succeeded, hitting cow.rs:71's `?` Err arm",
+        "with deny-add_file ACL, write_via_stage_rename's stage create must fail, \
+         surfacing the stage-write `?` Err arm",
     );
     assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // Regression (atomicity / rollback): the old code unlinked the
+    // symlink before this denied stage write, leaving the package file
+    // gone. The current code stages first, so the original symlink must
+    // still be present after the failure.
+    let meta = std::fs::symlink_metadata(&link)
+        .expect("failed CoW must leave the original symlink in place");
+    assert!(
+        meta.file_type().is_symlink(),
+        "original symlink must survive a failed stage write, got {meta:?}"
+    );
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        b"shared bytes",
+        "symlink must still resolve to its original target content"
+    );
 }
 
 /// `break_hardlink_if_needed` failure-cleanup arm (cow.rs:116-120):

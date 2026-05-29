@@ -65,8 +65,6 @@ pub fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
     }
 }
 
-/// Read the new env var; if it isn't set, also probe the legacy name and
-/// surface a deprecation warning when the legacy name is set. Returns the
 /// Renamed env vars whose legacy `SOCKET_PATCH_*` names are still honored.
 ///
 /// First entry of each tuple is the new name (what clap and current code
@@ -74,7 +72,10 @@ pub fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
 pub const LEGACY_ENV_RENAMES: &[(&str, &str)] = &[
     ("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"),
     ("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG"),
-    ("SOCKET_TELEMETRY_DISABLED", "SOCKET_PATCH_TELEMETRY_DISABLED"),
+    (
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_PATCH_TELEMETRY_DISABLED",
+    ),
 ];
 
 /// Promote legacy `SOCKET_PATCH_*` env vars to their new `SOCKET_*` names
@@ -109,16 +110,91 @@ pub fn promote_legacy_env_vars() {
 mod tests {
     use super::*;
 
-    /// The warning bookkeeping is process-global, so any test that flips a
-    /// real env var would race with parallel tests. Exercise the dedup
-    /// path directly instead.
+    /// The warning bookkeeping is process-global, so tests must use env-var
+    /// names that no other test touches. `std::env` serializes access behind
+    /// an internal lock, so distinct names never race for memory safety; the
+    /// only hazard is two tests fighting over the *same* name, which unique
+    /// names avoid.
     #[test]
     fn warn_legacy_once_fires_only_once_per_name() {
         let name = "SOCKET_TEST_LEGACY_ONCE_PATCH";
         let new = "SOCKET_TEST_LEGACY_ONCE";
         warn_legacy_once(name, new);
         warn_legacy_once(name, new);
-        let warned = WARNED.lock().unwrap();
+        // The dedup is driven by `HashSet::insert` returning `false` once the
+        // name has been recorded. Prove that directly: after `warn_legacy_once`
+        // ran, re-inserting the same name must report "already present", which
+        // is exactly what suppresses any second eprintln.
+        let mut warned = WARNED.lock().unwrap();
         assert!(warned.contains(name));
+        assert!(
+            !warned.insert(name),
+            "name should already be recorded, so a second warning is suppressed"
+        );
+    }
+
+    #[test]
+    fn read_env_prefers_new_var_over_legacy() {
+        const NEW: &str = "SOCKET_TEST_READ_PREFERS_NEW";
+        const LEGACY: &str = "SOCKET_TEST_READ_PREFERS_NEW_PATCH";
+        std::env::set_var(NEW, "new-value");
+        std::env::set_var(LEGACY, "legacy-value");
+        assert_eq!(
+            read_env_with_legacy(NEW, LEGACY),
+            Some("new-value".to_string())
+        );
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    #[test]
+    fn read_env_falls_back_to_legacy_when_new_unset() {
+        const NEW: &str = "SOCKET_TEST_READ_FALLBACK_NEW";
+        const LEGACY: &str = "SOCKET_TEST_READ_FALLBACK_NEW_PATCH";
+        std::env::remove_var(NEW);
+        std::env::set_var(LEGACY, "legacy-value");
+        assert_eq!(
+            read_env_with_legacy(NEW, LEGACY),
+            Some("legacy-value".to_string())
+        );
+        std::env::remove_var(LEGACY);
+    }
+
+    /// Regression: an empty new var must be treated as "unset" and fall back to
+    /// the legacy name, matching the prior call sites' `!is_empty()` filtering.
+    #[test]
+    fn read_env_empty_new_falls_back_to_legacy() {
+        const NEW: &str = "SOCKET_TEST_READ_EMPTY_NEW";
+        const LEGACY: &str = "SOCKET_TEST_READ_EMPTY_NEW_PATCH";
+        std::env::set_var(NEW, "");
+        std::env::set_var(LEGACY, "legacy-value");
+        assert_eq!(
+            read_env_with_legacy(NEW, LEGACY),
+            Some("legacy-value".to_string())
+        );
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    #[test]
+    fn read_env_none_when_neither_set() {
+        const NEW: &str = "SOCKET_TEST_READ_NONE_NEW";
+        const LEGACY: &str = "SOCKET_TEST_READ_NONE_NEW_PATCH";
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+        assert_eq!(read_env_with_legacy(NEW, LEGACY), None);
+    }
+
+    /// Regression: both names set but empty → `None` (empty == unset on both
+    /// sides), per the documented contract.
+    #[test]
+    fn read_env_none_when_both_empty() {
+        const NEW: &str = "SOCKET_TEST_READ_BOTH_EMPTY_NEW";
+        const LEGACY: &str = "SOCKET_TEST_READ_BOTH_EMPTY_NEW_PATCH";
+        std::env::set_var(NEW, "");
+        std::env::set_var(LEGACY, "");
+        assert_eq!(read_env_with_legacy(NEW, LEGACY), None);
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
     }
 }

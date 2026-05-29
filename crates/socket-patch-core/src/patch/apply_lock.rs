@@ -91,14 +91,46 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(LockGuard { _file: file }),
-            Err(_) => {
-                if Instant::now() >= deadline {
+            // Only a genuine "someone else holds it" signal counts as
+            // contention and feeds the retry/`Held` path. Any other
+            // failure (ENOLCK, EBADF, a filesystem that doesn't support
+            // advisory locks, EACCES on a pre-existing read-only lock
+            // file, …) is a real I/O fault: surface it immediately as
+            // `Io` rather than busy-sleeping for the whole budget and
+            // then mislabelling it as `Held`. See `is_lock_contended`.
+            Err(ref e) if is_lock_contended(e) => {
+                let now = Instant::now();
+                if now >= deadline {
                     return Err(LockError::Held);
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                // Never sleep past the deadline: a sub-100 ms budget
+                // must not be rounded up to a full 100 ms wait. The
+                // remaining slice is always > 0 here (now < deadline).
+                let remaining = deadline - now;
+                std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
+            Err(source) => {
+                return Err(LockError::Io {
+                    path: path.clone(),
+                    source,
+                });
             }
         }
     }
+}
+
+/// Distinguish "the lock is held by someone else" from a real I/O
+/// failure of `try_lock_exclusive`.
+///
+/// `fs2` reports contention via a fixed OS-error sentinel
+/// (`EWOULDBLOCK` on Unix, `ERROR_LOCK_VIOLATION` on Windows), exposed
+/// as [`fs2::lock_contended_error`]. We compare raw OS codes — an exact
+/// match, and portable, because both that sentinel and any genuine
+/// `flock(2)`/`LockFileEx` failure are constructed from an OS error
+/// code. A non-OS error (`raw_os_error() == None`) can never be
+/// contention, so it correctly falls through to `Io`.
+fn is_lock_contended(err: &std::io::Error) -> bool {
+    err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 #[cfg(test)]
@@ -167,6 +199,86 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(200),
             "expected at least 200ms wait, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Regression: `fs2`'s own contended-lock sentinel must be
+    /// classified as contention (the `Held` path). If `fs2` ever
+    /// changed the sentinel out from under us, this catches it before
+    /// the misclassification reaches users.
+    #[test]
+    fn contended_sentinel_is_classified_as_contention() {
+        assert!(is_lock_contended(&fs2::lock_contended_error()));
+    }
+
+    /// Regression: genuine I/O failures of `try_lock_exclusive` must
+    /// NOT masquerade as contention. Previously every error funnelled
+    /// into the retry/`Held` path, so a real fault (e.g. ENOLCK on a
+    /// full kernel lock table, or a filesystem without advisory locks)
+    /// was reported as "another process is operating here" — and, with
+    /// a positive timeout, only after busy-sleeping the entire budget.
+    #[test]
+    fn genuine_io_errors_are_not_contention() {
+        use std::io::{Error, ErrorKind};
+
+        // Kind-only errors carry no OS code, so they can never equal
+        // the contended sentinel.
+        assert!(!is_lock_contended(&Error::from(ErrorKind::NotFound)));
+        assert!(!is_lock_contended(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+
+        // A concrete-but-different OS error (EINTR == 4 on Unix) must
+        // not look like contention either. Skip the exact code match on
+        // the off chance a platform reuses 4 for the contended sentinel.
+        let eintr = Error::from_raw_os_error(4);
+        if eintr.raw_os_error() != fs2::lock_contended_error().raw_os_error() {
+            assert!(!is_lock_contended(&eintr));
+        }
+    }
+
+    /// A non-blocking (`ZERO`) acquire on a contended lock returns
+    /// `Held` essentially immediately — it must not pay the 100 ms
+    /// backoff sleep before giving up.
+    #[test]
+    fn zero_timeout_does_not_sleep_before_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
+        let start = Instant::now();
+        let err = acquire(dir.path(), Duration::ZERO).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, LockError::Held));
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "non-blocking acquire should not sleep, took {:?}",
+            elapsed
+        );
+    }
+
+    /// The retry loop must not overshoot the deadline by a full sleep
+    /// quantum. A 150 ms budget should resolve well under the old
+    /// fixed-100 ms-sleep worst case (~200 ms) — the final sleep is
+    /// clamped to the remaining slice.
+    #[test]
+    fn wait_respects_deadline_without_full_quantum_overshoot() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
+        let start = Instant::now();
+        let err = acquire(dir.path(), Duration::from_millis(150)).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, LockError::Held));
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "should wait at least the budget, got {:?}",
+            elapsed
+        );
+        // Loose upper bound: clamped sleeps mean we don't blow well past
+        // the budget. Generous slack keeps slow CI hosts non-flaky while
+        // still failing the old uncapped behaviour's pathological cases.
+        assert!(
+            elapsed < Duration::from_millis(450),
+            "clamped sleep should keep us near the budget, got {:?}",
             elapsed
         );
     }

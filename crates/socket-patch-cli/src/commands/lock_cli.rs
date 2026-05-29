@@ -103,14 +103,7 @@ pub fn acquire_or_emit(
     match acquire(socket_dir, timeout) {
         Ok(guard) => Ok(LockAcquired { guard, broke_lock }),
         Err(LockError::Held) => {
-            let msg = if timeout > Duration::ZERO {
-                format!(
-                    "another socket-patch process is operating in this directory (waited {}s)",
-                    timeout.as_secs()
-                )
-            } else {
-                "another socket-patch process is operating in this directory".to_string()
-            };
+            let msg = held_message(timeout);
             emit(
                 command,
                 json,
@@ -151,6 +144,43 @@ pub fn record_lock_broken(env: &mut Envelope, socket_dir: &Path) {
     env.record(lock_broken_event(socket_dir));
 }
 
+/// Human-readable description of a `lock_held` contention for the given
+/// wait budget. A zero budget means the historical non-blocking
+/// try-once, so we omit the "(waited …)" clause entirely.
+fn held_message(timeout: Duration) -> String {
+    if timeout > Duration::ZERO {
+        format!(
+            "another socket-patch process is operating in this directory (waited {})",
+            fmt_duration(timeout)
+        )
+    } else {
+        "another socket-patch process is operating in this directory".to_string()
+    }
+}
+
+/// Format a wait budget for humans. Whole seconds read naturally
+/// (`5s`); sub-second budgets — reachable through the library API even
+/// though the CLI only ever passes whole seconds — render as
+/// milliseconds rather than truncating to a misleading `0s`.
+fn fmt_duration(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+/// Build the top-level error envelope emitted in `--json` mode when
+/// lock acquisition fails. Split out from [`emit`] so the serialized
+/// shape (status / error.code / command / dryRun) is unit-testable
+/// without capturing stdout.
+fn error_envelope(command: Command, dry_run: bool, code: &str, message: &str) -> Envelope {
+    let mut env = Envelope::new(command);
+    env.dry_run = dry_run;
+    env.mark_error(EnvelopeError::new(code, message));
+    env
+}
+
 fn emit(
     command: Command,
     json: bool,
@@ -161,10 +191,7 @@ fn emit(
     hint_dir: Option<&Path>,
 ) {
     if json {
-        let mut env = Envelope::new(command);
-        env.dry_run = dry_run;
-        env.mark_error(EnvelopeError::new(code, message));
-        println!("{}", env.to_pretty_json());
+        println!("{}", error_envelope(command, dry_run, code, message).to_pretty_json());
     } else if !silent {
         eprintln!("Error: {message}.");
         if hint_dir.is_some() {
@@ -323,6 +350,67 @@ mod tests {
             !acquired.broke_lock,
             "broke_lock should be false when there was nothing to remove"
         );
+    }
+
+    /// Whole-second budgets read naturally in the contention message.
+    #[test]
+    fn held_message_reports_whole_seconds() {
+        assert_eq!(
+            held_message(Duration::from_secs(5)),
+            "another socket-patch process is operating in this directory (waited 5s)"
+        );
+    }
+
+    /// Regression: `timeout.as_secs()` truncated a 250ms budget to
+    /// `(waited 0s)`, which read as "we didn't wait at all". Sub-second
+    /// budgets now surface as milliseconds. The 250ms budget mirrors
+    /// `acquire_or_emit_honors_lock_timeout`, so the message stays
+    /// honest for the exact value that test exercises.
+    #[test]
+    fn held_message_does_not_truncate_sub_second_to_zero() {
+        let msg = held_message(Duration::from_millis(250));
+        assert!(msg.contains("250ms"), "expected ms rendering, got: {msg}");
+        assert!(
+            !msg.contains("0s"),
+            "sub-second budget must not collapse to 0s: {msg}"
+        );
+    }
+
+    /// A zero budget is the non-blocking try-once shape — no "(waited …)"
+    /// clause, since we never actually waited.
+    #[test]
+    fn held_message_zero_timeout_omits_waited_clause() {
+        let msg = held_message(Duration::ZERO);
+        assert!(!msg.contains("waited"), "zero budget should not claim a wait: {msg}");
+    }
+
+    /// The `--json` failure envelope (previously emitted only via
+    /// `println!`, so untested) has the stable error shape downstream
+    /// consumers pattern-match on: top-level `status: "error"` and
+    /// `error.code` carrying the lock reason tag.
+    #[test]
+    fn error_envelope_has_stable_lock_held_shape() {
+        let env = error_envelope(Command::Apply, false, "lock_held", "held by another run");
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["command"], "apply");
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["dryRun"], false);
+        assert_eq!(v["error"]["code"], "lock_held");
+        assert_eq!(v["error"]["message"], "held by another run");
+        // A pre-event failure carries no events.
+        assert_eq!(v["events"].as_array().unwrap().len(), 0);
+    }
+
+    /// `dry_run` and `command` are plumbed through to the envelope so a
+    /// contention during a dry-run apply/rollback is still reported as
+    /// a dry run. Covers the other two reason tags too.
+    #[test]
+    fn error_envelope_propagates_dry_run_and_command() {
+        let env = error_envelope(Command::Rollback, true, "lock_io", "open failed");
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["command"], "rollback");
+        assert_eq!(v["dryRun"], true);
+        assert_eq!(v["error"]["code"], "lock_io");
     }
 
     #[test]

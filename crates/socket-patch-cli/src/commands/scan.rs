@@ -18,7 +18,9 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
 
-use super::get::{download_and_apply_patches, select_patches, DownloadParams};
+use super::get::{
+    download_and_apply_patches, select_patches, truncate_with_ellipsis, DownloadParams,
+};
 
 const DEFAULT_BATCH_SIZE: usize = 100;
 
@@ -212,6 +214,29 @@ pub(crate) fn detect_updates(
         }
     }
     updates
+}
+
+/// Collect the deduplicated CVE and GHSA identifiers across every patch of
+/// a package, for the scan table's VULNERABILITIES column. CVEs are listed
+/// before GHSAs and each group is sorted, so the rendered output is stable —
+/// the per-patch ID lists and set-based dedup are otherwise nondeterministic
+/// in order. Pure / no I/O so it's unit-testable.
+pub(crate) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
+    let mut cves: HashSet<String> = HashSet::new();
+    let mut ghsas: HashSet<String> = HashSet::new();
+    for patch in &pkg.patches {
+        for cve in &patch.cve_ids {
+            cves.insert(cve.clone());
+        }
+        for ghsa in &patch.ghsa_ids {
+            ghsas.insert(ghsa.clone());
+        }
+    }
+    let mut cves: Vec<String> = cves.into_iter().collect();
+    cves.sort();
+    let mut ghsas: Vec<String> = ghsas.into_iter().collect();
+    ghsas.sort();
+    cves.into_iter().chain(ghsas).collect()
 }
 
 #[derive(Args)]
@@ -748,12 +773,10 @@ pub async fn run(args: ScanArgs) -> i32 {
     println!("{}", "=".repeat(100));
 
     for pkg in &all_packages_with_patches {
-        let max_purl_len = 40;
-        let display_purl = if pkg.purl.len() > max_purl_len {
-            format!("{}...", &pkg.purl[..max_purl_len - 3])
-        } else {
-            pkg.purl.clone()
-        };
+        // Char-safe truncation: a byte slice (`&pkg.purl[..37]`) panics
+        // when the cut lands mid-codepoint. PURLs can carry non-ASCII
+        // names/qualifiers, so route through the shared helper.
+        let display_purl = truncate_with_ellipsis(&pkg.purl, 40);
 
         let pkg_free = pkg.patches.iter().filter(|p| p.tier == "free").count();
         let pkg_paid = pkg.patches.iter().filter(|p| p.tier == "paid").count();
@@ -776,18 +799,9 @@ pub async fn run(args: ScanArgs) -> i32 {
             .min_by_key(|s| severity_order(s))
             .unwrap_or("unknown");
 
-        // Collect vuln IDs
-        let mut all_cves = HashSet::new();
-        let mut all_ghsas = HashSet::new();
-        for patch in &pkg.patches {
-            for cve in &patch.cve_ids {
-                all_cves.insert(cve.clone());
-            }
-            for ghsa in &patch.ghsa_ids {
-                all_ghsas.insert(ghsa.clone());
-            }
-        }
-        let vuln_ids: Vec<_> = all_cves.into_iter().chain(all_ghsas).collect();
+        // Collect vuln IDs (deterministic: deduped, CVEs then GHSAs,
+        // each group sorted — see collect_vuln_ids).
+        let vuln_ids = collect_vuln_ids(pkg);
         let vuln_str = if vuln_ids.len() > 2 {
             format!(
                 "{} (+{})",
@@ -960,11 +974,9 @@ pub async fn run(args: ScanArgs) -> i32 {
         let sev_display = highest_severity.unwrap_or("unknown");
         let sev_colored = format_severity(sev_display, use_color);
 
-        let desc = if patch.description.len() > 72 {
-            format!("{}...", &patch.description[..69])
-        } else {
-            patch.description.clone()
-        };
+        // Char-safe: descriptions come straight from the API and routinely
+        // contain non-ASCII text; a `&desc[..69]` byte slice would panic.
+        let desc = truncate_with_ellipsis(&patch.description, 72);
 
         println!(
             "  {} [{}] {}",
@@ -978,11 +990,9 @@ pub async fn run(args: ScanArgs) -> i32 {
         // Show per-vulnerability summaries
         for vuln in patch.vulnerabilities.values() {
             if !vuln.summary.is_empty() {
-                let summary = if vuln.summary.len() > 76 {
-                    format!("{}...", &vuln.summary[..73])
-                } else {
-                    vuln.summary.clone()
-                };
+                // Char-safe: vulnerability summaries are API-sourced free
+                // text; a `&summary[..73]` byte slice would panic mid-codepoint.
+                let summary = truncate_with_ellipsis(&vuln.summary, 76);
                 let cve_label = if vuln.cves.is_empty() {
                     String::new()
                 } else {
@@ -1286,5 +1296,119 @@ mod tests {
         ]);
         let out = detect_prunable(&m, &scanned(&[]));
         assert_eq!(out.len(), 2, "all variants of a gone package should prune");
+    }
+
+    // ---- collect_vuln_ids --------------------------------------------------
+
+    /// Build a single-patch package whose patch carries the given CVE and
+    /// GHSA identifier lists.
+    fn batch_with_vulns(purl: &str, cves: &[&str], ghsas: &[&str]) -> BatchPackagePatches {
+        BatchPackagePatches {
+            purl: purl.to_string(),
+            patches: vec![BatchPatchInfo {
+                uuid: "uuid".to_string(),
+                purl: purl.to_string(),
+                tier: "free".to_string(),
+                cve_ids: cves.iter().map(|s| (*s).to_string()).collect(),
+                ghsa_ids: ghsas.iter().map(|s| (*s).to_string()).collect(),
+                severity: None,
+                title: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn collect_vuln_ids_empty_when_no_vulns() {
+        let pkg = batch_with_vulns("pkg:npm/foo@1.0", &[], &[]);
+        assert!(collect_vuln_ids(&pkg).is_empty());
+    }
+
+    #[test]
+    fn collect_vuln_ids_lists_cves_before_ghsas_each_sorted() {
+        // Deliberately unsorted input; output must be CVEs (sorted) then
+        // GHSAs (sorted) so the rendered table column is deterministic.
+        let pkg = batch_with_vulns(
+            "pkg:npm/foo@1.0",
+            &["CVE-2024-2", "CVE-2024-1"],
+            &["GHSA-zzzz-zzzz-zzzz", "GHSA-aaaa-aaaa-aaaa"],
+        );
+        assert_eq!(
+            collect_vuln_ids(&pkg),
+            vec![
+                "CVE-2024-1".to_string(),
+                "CVE-2024-2".to_string(),
+                "GHSA-aaaa-aaaa-aaaa".to_string(),
+                "GHSA-zzzz-zzzz-zzzz".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn collect_vuln_ids_dedups_across_patches() {
+        // The same CVE appears on two patches of one package; it must be
+        // reported once.
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                BatchPatchInfo {
+                    uuid: "u1".to_string(),
+                    purl: "pkg:npm/foo@1.0".to_string(),
+                    tier: "free".to_string(),
+                    cve_ids: vec!["CVE-2024-1".to_string()],
+                    ghsa_ids: vec![],
+                    severity: None,
+                    title: String::new(),
+                },
+                BatchPatchInfo {
+                    uuid: "u2".to_string(),
+                    purl: "pkg:npm/foo@1.0".to_string(),
+                    tier: "free".to_string(),
+                    cve_ids: vec!["CVE-2024-1".to_string()],
+                    ghsa_ids: vec!["GHSA-aaaa-aaaa-aaaa".to_string()],
+                    severity: None,
+                    title: String::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            collect_vuln_ids(&pkg),
+            vec![
+                "CVE-2024-1".to_string(),
+                "GHSA-aaaa-aaaa-aaaa".to_string(),
+            ],
+        );
+    }
+
+    // ---- truncate_with_ellipsis (scan's display columns) -------------------
+    // scan.rs renders PURLs, descriptions, and vulnerability summaries — all
+    // API-sourced and potentially non-ASCII — into fixed-width columns. These
+    // pin scan's use of the char-safe helper; a raw `&s[..n]` byte slice
+    // would panic when the cut lands mid-codepoint.
+
+    #[test]
+    fn truncate_multibyte_purl_does_not_panic() {
+        // 30 three-byte chars (90 bytes, 30 chars). The old purl path sliced
+        // `&purl[..37]` once `len() > 40`; byte 37 splits a codepoint here.
+        let purl = format!("pkg:npm/{}", "日".repeat(30));
+        let out = truncate_with_ellipsis(&purl, 40);
+        assert!(out.chars().count() <= 40);
+    }
+
+    #[test]
+    fn truncate_multibyte_description_truncates_on_char_boundary() {
+        // 100 two-byte chars; description column truncates at 72.
+        let desc = "é".repeat(100);
+        let out = truncate_with_ellipsis(&desc, 72);
+        assert_eq!(out.chars().count(), 72);
+        assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_multibyte_summary_truncates_on_char_boundary() {
+        // Summary column truncates at 76.
+        let summary = "—".repeat(100); // em dash, 3 bytes each
+        let out = truncate_with_ellipsis(&summary, 76);
+        assert_eq!(out.chars().count(), 76);
+        assert!(out.ends_with("..."));
     }
 }

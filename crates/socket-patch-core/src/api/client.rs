@@ -88,10 +88,7 @@ impl ApiClient {
             header::USER_AGENT,
             HeaderValue::from_static(USER_AGENT_VALUE),
         );
-        default_headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("application/json"),
-        );
+        default_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
 
         if let Some(ref token) = options.api_token {
             if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {}", token)) {
@@ -180,9 +177,9 @@ impl ApiClient {
                 Ok(Some(body))
             }
             StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::UNAUTHORIZED => {
-                Err(ApiError::Unauthorized("Unauthorized: Invalid API token".into()))
-            }
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized(
+                "Unauthorized: Invalid API token".into(),
+            )),
             StatusCode::FORBIDDEN => {
                 let msg = if use_public_proxy {
                     "Forbidden: This patch is only available to paid subscribers. \
@@ -193,11 +190,9 @@ impl ApiClient {
                 };
                 Err(ApiError::Forbidden(msg.into()))
             }
-            StatusCode::TOO_MANY_REQUESTS => {
-                Err(ApiError::RateLimited(
-                    "Rate limit exceeded. Please try again later.".into(),
-                ))
-            }
+            StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited(
+                "Rate limit exceeded. Please try again later.".into(),
+            )),
             _ => {
                 let text = resp.text().await.unwrap_or_default();
                 Err(ApiError::Other(format!(
@@ -222,9 +217,7 @@ impl ApiClient {
         let path = if self.use_public_proxy {
             format!("/patch/view/{}", uuid)
         } else {
-            let slug = org_slug
-                .or(self.org_slug.as_deref())
-                .unwrap_or("default");
+            let slug = org_slug.or(self.org_slug.as_deref()).unwrap_or("default");
             format!("/v0/orgs/{}/patches/view/{}", slug, uuid)
         };
         self.get_json(&path).await
@@ -243,9 +236,7 @@ impl ApiClient {
         let path = if self.use_public_proxy {
             format!("/patch/{route}/{encoded}")
         } else {
-            let slug = org_slug
-                .or(self.org_slug.as_deref())
-                .unwrap_or("default");
+            let slug = org_slug.or(self.org_slug.as_deref()).unwrap_or("default");
             format!("/v0/orgs/{slug}/patches/{route}/{encoded}")
         };
         let result = self.get_json::<SearchResponse>(&path).await?;
@@ -261,7 +252,8 @@ impl ApiClient {
         org_slug: Option<&str>,
         cve_id: &str,
     ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-cve", cve_id).await
+        self.search_patches_by_route(org_slug, "by-cve", cve_id)
+            .await
     }
 
     /// Search patches by GHSA ID.
@@ -270,7 +262,8 @@ impl ApiClient {
         org_slug: Option<&str>,
         ghsa_id: &str,
     ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-ghsa", ghsa_id).await
+        self.search_patches_by_route(org_slug, "by-ghsa", ghsa_id)
+            .await
     }
 
     /// Search patches by package PURL.
@@ -282,7 +275,8 @@ impl ApiClient {
         org_slug: Option<&str>,
         purl: &str,
     ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-package", purl).await
+        self.search_patches_by_route(org_slug, "by-package", purl)
+            .await
     }
 
     /// Search patches for multiple packages (batch).
@@ -299,9 +293,7 @@ impl ApiClient {
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         if !self.use_public_proxy {
-            let slug = org_slug
-                .or(self.org_slug.as_deref())
-                .unwrap_or("default");
+            let slug = org_slug.or(self.org_slug.as_deref()).unwrap_or("default");
             let path = format!("/v0/orgs/{}/patches/batch", slug);
             let body = BatchSearchBody {
                 components: purls
@@ -309,7 +301,9 @@ impl ApiClient {
                     .map(|p| BatchComponent { purl: p.clone() })
                     .collect(),
             };
-            let result = self.post_json::<BatchSearchResponse, _>(&path, &body).await?;
+            let result = self
+                .post_json::<BatchSearchResponse, _>(&path, &body)
+                .await?;
             return Ok(result.unwrap_or_else(|| BatchSearchResponse {
                 packages: Vec::new(),
                 can_access_paid_patches: false,
@@ -317,7 +311,8 @@ impl ApiClient {
         }
 
         // Public proxy: fall back to individual per-package GET requests
-        self.search_patches_batch_via_individual_queries(purls).await
+        self.search_patches_batch_via_individual_queries(purls)
+            .await
     }
 
     /// Internal: fall back to individual GET requests per PURL when the
@@ -330,9 +325,6 @@ impl ApiClient {
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         const CONCURRENCY_LIMIT: usize = 10;
-
-        let mut packages: Vec<BatchPackagePatches> = Vec::new();
-        let mut can_access_paid_patches = false;
 
         // Collect all (purl, response) pairs
         let mut all_results: Vec<(String, Option<SearchResponse>)> = Vec::new();
@@ -366,33 +358,8 @@ impl ApiClient {
             }
         }
 
-        // Convert individual SearchResponse results to BatchSearchResponse format
-        for (purl, response) in all_results {
-            let response = match response {
-                Some(r) if !r.patches.is_empty() => r,
-                _ => continue,
-            };
-
-            if response.can_access_paid_patches {
-                can_access_paid_patches = true;
-            }
-
-            let batch_patches: Vec<BatchPatchInfo> = response
-                .patches
-                .into_iter()
-                .map(convert_search_result_to_batch_info)
-                .collect();
-
-            packages.push(BatchPackagePatches {
-                purl,
-                patches: batch_patches,
-            });
-        }
-
-        Ok(BatchSearchResponse {
-            packages,
-            can_access_paid_patches,
-        })
+        // Convert the individual SearchResponse results into the batch shape.
+        Ok(assemble_batch_from_individual(all_results))
     }
 
     /// Fetch organizations accessible to the current API token.
@@ -416,23 +383,7 @@ impl ApiClient {
     /// If there are none, returns an error.
     pub async fn resolve_org_slug(&self) -> Result<String, ApiError> {
         let orgs = self.fetch_organizations().await?;
-        match orgs.len() {
-            0 => Err(ApiError::Other(
-                "No organizations found for this API token.".into(),
-            )),
-            1 => Ok(orgs.into_iter().next().unwrap().slug),
-            _ => {
-                let slugs: Vec<_> = orgs.iter().map(|o| o.slug.as_str()).collect();
-                let first = orgs[0].slug.clone();
-                eprintln!(
-                    "Multiple organizations found: {}. Using \"{}\". \
-                     Pass --org to select a different one.",
-                    slugs.join(", "),
-                    first
-                );
-                Ok(first)
-            }
-        }
+        select_org_slug(orgs)
     }
 
     /// Fetch a blob by its SHA-256 hash.
@@ -479,6 +430,44 @@ impl ApiClient {
         self.fetch_binary("package", "package", uuid).await
     }
 
+    /// Build the URL (and an `is_authenticated` flag) for a binary fetch of
+    /// `kind` (`blob` / `diff` / `package`) identified by `identifier`.
+    ///
+    /// Uses the authenticated `/v0/orgs/<slug>/patches/...` endpoint when a
+    /// token and org slug are configured (and we're not pinned to the public
+    /// proxy). Otherwise it targets the public proxy.
+    ///
+    /// In public-proxy mode the base is the client's own configured `api_url`
+    /// — the same value the JSON endpoints (`get_json`/`post_json`) use — so an
+    /// explicit `--proxy-url` / `SOCKET_PROXY_URL` override is honored for
+    /// binary downloads too. Only when falling back from an *authenticated*
+    /// client that lacks an org slug (so `api_url` is the auth host, not a
+    /// proxy) do we re-derive the proxy base from the environment.
+    fn binary_url(&self, kind: &str, identifier: &str) -> (String, bool) {
+        if self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy {
+            let slug = self.org_slug.as_deref().unwrap();
+            let u = format!(
+                "{}/v0/orgs/{}/patches/{}/{}",
+                self.api_url, slug, kind, identifier
+            );
+            (u, true)
+        } else {
+            let base = if self.use_public_proxy {
+                self.api_url.clone()
+            } else {
+                read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                    .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
+            };
+            let u = format!(
+                "{}/patch/{}/{}",
+                base.trim_end_matches('/'),
+                kind,
+                identifier
+            );
+            (u, false)
+        }
+    }
+
     /// Shared implementation for `fetch_blob` / `fetch_diff` / `fetch_package`.
     ///
     /// `kind` is the URL segment (`blob` / `diff` / `package`). `label` is the
@@ -490,26 +479,7 @@ impl ApiClient {
         label: &str,
         identifier: &str,
     ) -> Result<Option<Vec<u8>>, ApiError> {
-        let (url, use_auth) =
-            if self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy {
-                let slug = self.org_slug.as_deref().unwrap();
-                let u = format!(
-                    "{}/v0/orgs/{}/patches/{}/{}",
-                    self.api_url, slug, kind, identifier
-                );
-                (u, true)
-            } else {
-                let proxy_url =
-                    read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                        .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
-                let u = format!(
-                    "{}/patch/{}/{}",
-                    proxy_url.trim_end_matches('/'),
-                    kind,
-                    identifier
-                );
-                (u, false)
-            };
+        let (url, use_auth) = self.binary_url(kind, identifier);
 
         debug_log(&format!("GET {} {}", label, url));
 
@@ -623,9 +593,7 @@ pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool
 /// corresponding env var. Used by CLI commands that expose `--api-url`,
 /// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
 /// CLI crate.
-pub async fn get_api_client_with_overrides(
-    overrides: ApiClientEnvOverrides,
-) -> (ApiClient, bool) {
+pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
     let api_token = overrides
         .api_token
         .or_else(|| std::env::var("SOCKET_API_TOKEN").ok())
@@ -639,9 +607,7 @@ pub async fn get_api_client_with_overrides(
             read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
                 .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string())
         });
-        eprintln!(
-            "No SOCKET_API_TOKEN set. Using public patch API proxy (free patches only)."
-        );
+        eprintln!("No SOCKET_API_TOKEN set. Using public patch API proxy (free patches only).");
         let client = ApiClient::new(ApiClientOptions {
             api_url: proxy_url,
             api_token: None,
@@ -792,6 +758,36 @@ pub fn is_fallback_candidate(err: &ApiError) -> bool {
     matches!(err, ApiError::Unauthorized(_) | ApiError::Forbidden(_))
 }
 
+/// Choose an org slug from the list returned by `/v0/organizations`.
+///
+/// Returns an error when the list is empty, the sole slug when there is
+/// exactly one, and the first slug (with a warning) when there are several.
+///
+/// `fetch_organizations` collects from a `HashMap`, so the upstream order is
+/// not stable across runs. We sort by slug first so the chosen org *and* the
+/// warning text are deterministic — otherwise a token with multiple orgs
+/// could silently operate against a different org on each invocation.
+fn select_org_slug(mut orgs: Vec<crate::api::types::OrganizationInfo>) -> Result<String, ApiError> {
+    orgs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    match orgs.len() {
+        0 => Err(ApiError::Other(
+            "No organizations found for this API token.".into(),
+        )),
+        1 => Ok(orgs.into_iter().next().unwrap().slug),
+        _ => {
+            let slugs: Vec<_> = orgs.iter().map(|o| o.slug.as_str()).collect();
+            let first = orgs[0].slug.clone();
+            eprintln!(
+                "Multiple organizations found: {}. Using \"{}\". \
+                 Pass --org to select a different one.",
+                slugs.join(", "),
+                first
+            );
+            Ok(first)
+        }
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Percent-encode a string for use in URL path segments.
@@ -850,7 +846,14 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
 
     let mut seen_cves: HashSet<String> = HashSet::new();
 
-    for (ghsa_id, vuln) in &patch.vulnerabilities {
+    // `vulnerabilities` is a HashMap, so iterate in a stable (GHSA-id) order.
+    // Otherwise the chosen `title` (first non-empty summary) — and the
+    // first-seen tie-break for equal severities — would vary across runs.
+    let mut entries: Vec<(&String, &VulnerabilityResponse)> =
+        patch.vulnerabilities.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (ghsa_id, vuln) in entries {
         ghsa_ids.push(ghsa_id.clone());
 
         for cve in &vuln.cves {
@@ -888,6 +891,52 @@ fn convert_search_result_to_batch_info(patch: PatchSearchResult) -> BatchPatchIn
         ghsa_ids,
         severity: highest_severity,
         title,
+    }
+}
+
+/// Assemble a [`BatchSearchResponse`] from the per-PURL [`SearchResponse`]s
+/// gathered by the public-proxy fallback (one GET per package).
+///
+/// A `None` entry is a query that errored and is skipped. The
+/// `can_access_paid_patches` capability is OR-aggregated across **every**
+/// successful response — independent of whether that response carried any
+/// patches — because it is a global capability signal, not a per-package
+/// one. The empty-patches check only governs whether a package is added to
+/// the `packages` list (an empty package would be noise), so it must run
+/// *after* the flag is observed; folding it into the same skip would drop a
+/// `canAccessPaidPatches: true` that arrived alongside an empty patch list.
+fn assemble_batch_from_individual(
+    results: Vec<(String, Option<SearchResponse>)>,
+) -> BatchSearchResponse {
+    let mut packages: Vec<BatchPackagePatches> = Vec::new();
+    let mut can_access_paid_patches = false;
+
+    for (purl, response) in results {
+        let Some(response) = response else { continue };
+
+        if response.can_access_paid_patches {
+            can_access_paid_patches = true;
+        }
+
+        if response.patches.is_empty() {
+            continue;
+        }
+
+        let batch_patches: Vec<BatchPatchInfo> = response
+            .patches
+            .into_iter()
+            .map(convert_search_result_to_batch_info)
+            .collect();
+
+        packages.push(BatchPackagePatches {
+            purl,
+            patches: batch_patches,
+        });
+    }
+
+    BatchSearchResponse {
+        packages,
+        can_access_paid_patches,
     }
 }
 
@@ -952,7 +1001,10 @@ mod tests {
         assert!(get_severity_order(Some("high")) < get_severity_order(Some("medium")));
         assert!(get_severity_order(Some("medium")) < get_severity_order(Some("low")));
         assert!(get_severity_order(Some("low")) < get_severity_order(None));
-        assert_eq!(get_severity_order(Some("unknown")), get_severity_order(None));
+        assert_eq!(
+            get_severity_order(Some("unknown")),
+            get_severity_order(None)
+        );
     }
 
     #[test]
@@ -1061,7 +1113,11 @@ mod tests {
         let patch = make_patch(vulns, "desc");
         let info = convert_search_result_to_batch_info(patch);
         // Same CVE in both vulns should only appear once
-        let cve_count = info.cve_ids.iter().filter(|c| *c == "CVE-2024-0001").count();
+        let cve_count = info
+            .cve_ids
+            .iter()
+            .filter(|c| *c == "CVE-2024-0001")
+            .count();
         assert_eq!(cve_count, 1);
     }
 
@@ -1069,10 +1125,7 @@ mod tests {
     fn test_convert_title_truncated_at_100() {
         let long_summary = "x".repeat(150);
         let mut vulns = HashMap::new();
-        vulns.insert(
-            "GHSA-1111".into(),
-            make_vuln(&long_summary, "high", vec![]),
-        );
+        vulns.insert("GHSA-1111".into(), make_vuln(&long_summary, "high", vec![]));
         let patch = make_patch(vulns, "desc");
         let info = convert_search_result_to_batch_info(patch);
         // Should be 97 chars + "..." = 100 chars
@@ -1104,10 +1157,7 @@ mod tests {
     #[test]
     fn test_convert_title_falls_back_to_description() {
         let mut vulns = HashMap::new();
-        vulns.insert(
-            "GHSA-1111".into(),
-            make_vuln("", "high", vec![]),
-        );
+        vulns.insert("GHSA-1111".into(), make_vuln("", "high", vec![]));
         let patch = make_patch(vulns, "Fallback desc");
         let info = convert_search_result_to_batch_info(patch);
         assert_eq!(info.title, "Fallback desc");
@@ -1116,10 +1166,7 @@ mod tests {
     #[test]
     fn test_convert_empty_summary_and_description() {
         let mut vulns = HashMap::new();
-        vulns.insert(
-            "GHSA-1111".into(),
-            make_vuln("", "high", vec![]),
-        );
+        vulns.insert("GHSA-1111".into(), make_vuln("", "high", vec![]));
         let patch = make_patch(vulns, "");
         let info = convert_search_result_to_batch_info(patch);
         assert!(info.title.is_empty());
@@ -1298,8 +1345,7 @@ mod tests {
 
     #[test]
     fn validate_token_shape_flags_too_short() {
-        let msg = validate_token_shape("sktsec_abc_api")
-            .expect("short token must be flagged");
+        let msg = validate_token_shape("sktsec_abc_api").expect("short token must be flagged");
         assert!(msg.contains("does not look like a Socket API token"));
         assert!(!msg.contains("SRI-format hash"));
     }
@@ -1318,5 +1364,236 @@ mod tests {
         assert!(!looks_like_token_hash("sktsec_xxx_api"));
         assert!(!looks_like_token_hash("hello"));
         assert!(!looks_like_token_hash(""));
+    }
+
+    // ── binary_url: proxy override must reach blob/diff/package fetches ──
+    //
+    // Regression: `fetch_binary` used to re-derive the proxy base from
+    // `SOCKET_PROXY_URL`/default instead of the client's configured
+    // `api_url`, so a `--proxy-url` override (which sets `api_url` but no env
+    // var) was honored for searches yet silently ignored for downloads.
+
+    fn proxy_client(api_url: &str) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: api_url.into(),
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        })
+    }
+
+    #[test]
+    fn binary_url_proxy_uses_configured_api_url() {
+        let client = proxy_client("https://custom.proxy.example");
+        let (url, use_auth) = client.binary_url("blob", "deadbeef");
+        assert!(!use_auth);
+        assert_eq!(url, "https://custom.proxy.example/patch/blob/deadbeef");
+    }
+
+    #[test]
+    fn binary_url_proxy_covers_diff_and_package() {
+        let client = proxy_client("https://custom.proxy.example");
+        assert_eq!(
+            client.binary_url("diff", "uuid-1").0,
+            "https://custom.proxy.example/patch/diff/uuid-1"
+        );
+        assert_eq!(
+            client.binary_url("package", "uuid-1").0,
+            "https://custom.proxy.example/patch/package/uuid-1"
+        );
+    }
+
+    #[test]
+    fn binary_url_proxy_trims_trailing_slash() {
+        // `new()` trims the trailing slash on api_url; binary_url also trims
+        // defensively so the path never ends up with a doubled separator.
+        let client = proxy_client("https://custom.proxy.example/");
+        assert_eq!(
+            client.binary_url("blob", "x").0,
+            "https://custom.proxy.example/patch/blob/x"
+        );
+    }
+
+    #[test]
+    fn binary_url_authenticated_uses_org_path() {
+        let client = ApiClient::new(ApiClientOptions {
+            api_url: "https://api.socket.dev".into(),
+            api_token: Some("sktsec_x_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("my-org".into()),
+        });
+        let (url, use_auth) = client.binary_url("diff", "uuid-123");
+        assert!(use_auth);
+        assert_eq!(
+            url,
+            "https://api.socket.dev/v0/orgs/my-org/patches/diff/uuid-123"
+        );
+    }
+
+    // ── select_org_slug: deterministic org selection ────────────────────
+
+    fn org(slug: &str) -> crate::api::types::OrganizationInfo {
+        crate::api::types::OrganizationInfo {
+            id: format!("id-{slug}"),
+            name: Some(slug.to_string()),
+            image: None,
+            plan: "free".into(),
+            slug: slug.into(),
+        }
+    }
+
+    #[test]
+    fn select_org_slug_errors_when_empty() {
+        assert!(matches!(select_org_slug(vec![]), Err(ApiError::Other(_))));
+    }
+
+    #[test]
+    fn select_org_slug_returns_sole_org() {
+        assert_eq!(select_org_slug(vec![org("acme")]).unwrap(), "acme");
+    }
+
+    #[test]
+    fn select_org_slug_is_deterministic_for_multiple() {
+        // Regardless of the (HashMap-derived) input order, the
+        // lexicographically-first slug is chosen so repeated runs agree.
+        let a = select_org_slug(vec![org("zeta"), org("alpha"), org("mid")]).unwrap();
+        let b = select_org_slug(vec![org("mid"), org("zeta"), org("alpha")]).unwrap();
+        assert_eq!(a, "alpha");
+        assert_eq!(b, "alpha");
+    }
+
+    // ── assemble_batch_from_individual: proxy-fallback aggregation ──────
+
+    fn search_response(
+        purl: &str,
+        can_access_paid_patches: bool,
+        patch_uuids: &[&str],
+    ) -> SearchResponse {
+        SearchResponse {
+            patches: patch_uuids
+                .iter()
+                .map(|uuid| PatchSearchResult {
+                    uuid: (*uuid).into(),
+                    purl: purl.into(),
+                    published_at: "2024-01-01".into(),
+                    description: "desc".into(),
+                    license: "MIT".into(),
+                    tier: "free".into(),
+                    vulnerabilities: HashMap::new(),
+                })
+                .collect(),
+            can_access_paid_patches,
+        }
+    }
+
+    #[test]
+    fn assemble_batch_collects_patches_per_purl() {
+        let results = vec![
+            (
+                "pkg:npm/a@1".to_string(),
+                Some(search_response("pkg:npm/a@1", false, &["uuid-a"])),
+            ),
+            (
+                "pkg:npm/b@1".to_string(),
+                Some(search_response(
+                    "pkg:npm/b@1",
+                    false,
+                    &["uuid-b1", "uuid-b2"],
+                )),
+            ),
+        ];
+        let batch = assemble_batch_from_individual(results);
+        assert_eq!(batch.packages.len(), 2);
+        assert!(!batch.can_access_paid_patches);
+        let a = batch
+            .packages
+            .iter()
+            .find(|p| p.purl == "pkg:npm/a@1")
+            .unwrap();
+        assert_eq!(a.patches.len(), 1);
+        let b = batch
+            .packages
+            .iter()
+            .find(|p| p.purl == "pkg:npm/b@1")
+            .unwrap();
+        assert_eq!(b.patches.len(), 2);
+    }
+
+    #[test]
+    fn assemble_batch_skips_errored_and_empty_responses() {
+        // None = query errored; an empty patch list contributes no package.
+        let results = vec![
+            ("pkg:npm/err@1".to_string(), None),
+            (
+                "pkg:npm/empty@1".to_string(),
+                Some(search_response("pkg:npm/empty@1", false, &[])),
+            ),
+            (
+                "pkg:npm/ok@1".to_string(),
+                Some(search_response("pkg:npm/ok@1", false, &["uuid-ok"])),
+            ),
+        ];
+        let batch = assemble_batch_from_individual(results);
+        // Only the package with at least one patch is listed.
+        assert_eq!(batch.packages.len(), 1);
+        assert_eq!(batch.packages[0].purl, "pkg:npm/ok@1");
+    }
+
+    #[test]
+    fn assemble_batch_aggregates_paid_flag_across_all_responses() {
+        // OR-aggregation: any response with the flag set flips the aggregate.
+        let results = vec![
+            (
+                "pkg:npm/a@1".to_string(),
+                Some(search_response("pkg:npm/a@1", false, &["uuid-a"])),
+            ),
+            (
+                "pkg:npm/b@1".to_string(),
+                Some(search_response("pkg:npm/b@1", true, &["uuid-b"])),
+            ),
+        ];
+        let batch = assemble_batch_from_individual(results);
+        assert!(batch.can_access_paid_patches);
+    }
+
+    #[test]
+    fn assemble_batch_keeps_paid_flag_from_empty_patch_response() {
+        // Regression: the capability flag must survive even when the response
+        // that carries it has *no* patches. The empty-patch response must not
+        // be listed as a package, but its `canAccessPaidPatches: true` must
+        // still flip the aggregate flag — a fused skip would have dropped it.
+        let results = vec![
+            (
+                "pkg:npm/free@1".to_string(),
+                Some(search_response("pkg:npm/free@1", false, &["uuid-free"])),
+            ),
+            (
+                "pkg:npm/paid-only@1".to_string(),
+                Some(search_response("pkg:npm/paid-only@1", true, &[])),
+            ),
+        ];
+        let batch = assemble_batch_from_individual(results);
+        assert!(
+            batch.can_access_paid_patches,
+            "paid-access flag from an empty-patch response was dropped"
+        );
+        // The empty-patch package must not appear in the listing.
+        assert_eq!(batch.packages.len(), 1);
+        assert_eq!(batch.packages[0].purl, "pkg:npm/free@1");
+    }
+
+    // ── convert: title selection is deterministic ───────────────────────
+
+    #[test]
+    fn test_convert_title_deterministic_across_iteration_order() {
+        // Two vulns, each with a non-empty summary. The title must always be
+        // drawn from the lexicographically-first GHSA id so the value is
+        // stable across runs (HashMap iteration order is not).
+        let mut vulns = HashMap::new();
+        vulns.insert("GHSA-zzzz".into(), make_vuln("Z summary", "high", vec![]));
+        vulns.insert("GHSA-aaaa".into(), make_vuln("A summary", "high", vec![]));
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        assert_eq!(info.title, "A summary");
     }
 }

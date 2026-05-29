@@ -22,6 +22,58 @@ fn extract_xml_value(line: &str, element: &str) -> Option<String> {
     }
 }
 
+/// Strip the commented-out portions of a single line, threading the
+/// `in_comment` state across lines so multi-line `<!-- ... -->` blocks are
+/// handled. XML comments do not nest, so we always close on the first `-->`.
+///
+/// This runs before any tag matching: POM files routinely carry license
+/// headers and commented-out `<dependency>`/`<build>` snippets, and naive
+/// substring matching would otherwise miscount skip-section depth (e.g. a
+/// comment containing `</build>` could "close" a block that is still open
+/// and leak a plugin's coordinates as the project's).
+fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        if *in_comment {
+            match rest.find("-->") {
+                Some(end) => {
+                    rest = &rest[end + 3..];
+                    *in_comment = false;
+                }
+                None => return out, // remainder of the line is inside a comment
+            }
+        } else {
+            match rest.find("<!--") {
+                Some(start) => {
+                    out.push_str(&rest[..start]);
+                    rest = &rest[start + 4..];
+                    *in_comment = true;
+                }
+                None => {
+                    out.push_str(rest);
+                    return out;
+                }
+            }
+        }
+    }
+}
+
+/// Does the opening tag for `element` on this line self-close
+/// (e.g. `<dependencies/>` or `<dependencies foo="x"/>`)? Such a tag opens
+/// and closes in one shot and must not change the skip-section depth.
+fn opening_tag_self_closes(line: &str, element: &str) -> bool {
+    let open = format!("<{element}");
+    let Some(pos) = line.find(&open) else {
+        return false;
+    };
+    let after = &line[pos + open.len()..];
+    match after.find('>') {
+        Some(gt) => after[..gt].trim_end().ends_with('/'),
+        None => false,
+    }
+}
+
 /// Parse `groupId`, `artifactId`, and `version` from a POM XML file.
 ///
 /// Uses a simple line-based parser — no XML crate dependency.
@@ -36,6 +88,7 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
     let mut parent_group_id: Option<String> = None;
 
     let mut in_parent = false;
+    let mut in_comment = false;
     let mut skip_depth: u32 = 0;
 
     let skip_sections = [
@@ -52,16 +105,21 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
     ];
 
     for line in content.lines() {
-        let trimmed = line.trim();
+        let cleaned = strip_comment_spans(line, &mut in_comment);
+        let trimmed = cleaned.trim();
 
-        // Check for skip section open/close
+        // Check for skip section open/close. A tag that opens and closes on
+        // the same line (`<modules></modules>`) or self-closes
+        // (`<dependencies/>`) leaves the depth unchanged; only a lone open
+        // increments and a lone close decrements.
         for section in &skip_sections {
             let open_tag = format!("<{section}");
             let close_tag = format!("</{section}>");
-            if trimmed.contains(&open_tag) && !trimmed.contains(&close_tag) {
+            let has_open = trimmed.contains(&open_tag);
+            let has_close = trimmed.contains(&close_tag);
+            if has_open && !has_close && !opening_tag_self_closes(trimmed, section) {
                 skip_depth += 1;
-            }
-            if trimmed.contains(&close_tag) {
+            } else if has_close && !has_open {
                 skip_depth = skip_depth.saturating_sub(1);
             }
         }
@@ -70,8 +128,12 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             continue;
         }
 
-        // Track parent section
-        if trimmed.contains("<parent") && !trimmed.contains("</parent") {
+        // Track parent section (a self-closing `<parent/>` carries no
+        // coordinates, so it never opens a parent block).
+        if trimmed.contains("<parent")
+            && !trimmed.contains("</parent")
+            && !opening_tag_self_closes(trimmed, "parent")
+        {
             in_parent = true;
             continue;
         }
@@ -145,7 +207,10 @@ fn group_id_to_path(group_id: &str) -> String {
 ///
 /// The Maven repository layout is: `<groupId-as-path>/<artifactId>/<version>/`
 /// e.g. `org/apache/commons/commons-lang3/3.12.0/`
-fn parse_path_coordinates(version_dir: &Path, repo_root: &Path) -> Option<(String, String, String)> {
+fn parse_path_coordinates(
+    version_dir: &Path,
+    repo_root: &Path,
+) -> Option<(String, String, String)> {
     let rel = version_dir.strip_prefix(repo_root).ok()?;
     let components: Vec<&str> = rel
         .components()
@@ -320,11 +385,7 @@ impl MavenCrawler {
     ///
     /// Uses `walkdir` to recursively find `.pom` files, then extracts
     /// coordinates from the POM content or falls back to directory path parsing.
-    fn scan_maven_repo(
-        &self,
-        repo_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
+    fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
         let mut results = Vec::new();
 
         for entry in walkdir::WalkDir::new(repo_path)
@@ -352,8 +413,7 @@ impl MavenCrawler {
                 .or_else(|| parse_path_coordinates(version_dir, repo_path));
 
             if let Some((group_id, artifact_id, version)) = coords {
-                let purl =
-                    crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
+                let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
                 if seen.insert(purl.clone()) {
                     results.push(CrawledPackage {
                         name: artifact_id,
@@ -537,6 +597,150 @@ mod tests {
         assert_eq!(v, "1.0.0");
     }
 
+    #[test]
+    fn test_parse_pom_comment_does_not_leak_skip_section_close() {
+        // A comment containing `</build>` must NOT be treated as the real
+        // close of the `<build>` block. Otherwise the parser would "exit"
+        // the build section early and pick up a plugin's groupId/version as
+        // the project's coordinates.
+        let content = r#"<project>
+  <artifactId>my-app</artifactId>
+  <build>
+    <!-- end of </build> goes here -->
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+      </plugin>
+    </plugins>
+  </build>
+  <groupId>com.example</groupId>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_commented_out_dependencies_block() {
+        // A commented-out `<dependencies>` block (no real close tag) must not
+        // start skipping the rest of the file.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <!-- TODO re-enable <dependencies> later -->
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_multiline_comment() {
+        // A comment spanning multiple lines that mentions skip-section tags
+        // must be ignored entirely.
+        let content = r#"<project>
+  <!--
+    This module used to declare <dependencies> and a custom <build>.
+    Removed for now; see ticket ABC-123.
+  -->
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_self_closing_skip_section() {
+        // A self-closing `<dependencies/>` opens and closes at once and must
+        // not swallow the coordinates that follow it.
+        let content = r#"<project>
+  <dependencies/>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_inline_skip_section_does_not_unbalance_depth() {
+        // An inline `<modules></modules>` nested inside `<profiles>` must not
+        // spuriously decrement the depth and leak the profile's dependency
+        // coordinates.
+        let content = r#"<project>
+  <artifactId>my-app</artifactId>
+  <profiles>
+    <profile>
+      <modules></modules>
+      <dependencies>
+        <dependency>
+          <groupId>org.leak</groupId>
+          <artifactId>leak</artifactId>
+          <version>9.9.9</version>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+  <groupId>com.example</groupId>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_scan_maven_repo_comment_pom_falls_back_to_path() {
+        // End-to-end: a POM whose own coordinates can't be trusted (here a
+        // leaky comment) must still resolve to the correct PURL — either by
+        // parsing correctly or by falling back to the on-disk path.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir
+            .path()
+            .join("com")
+            .join("example")
+            .join("my-app")
+            .join("1.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("my-app-1.0.0.pom"),
+            r#"<project>
+  <artifactId>my-app</artifactId>
+  <build>
+    <!-- close </build> -->
+    <plugins><plugin>
+      <groupId>org.leak</groupId>
+      <artifactId>leak</artifactId>
+      <version>6.6.6</version>
+    </plugin></plugins>
+  </build>
+  <groupId>com.example</groupId>
+  <version>1.0.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let crawler = MavenCrawler::new();
+        let mut seen = HashSet::new();
+        let pkgs = crawler.scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].purl, "pkg:maven/com.example/my-app@1.0.0");
+    }
+
     // ---- extract_xml_value tests ----
 
     #[test]
@@ -567,7 +771,8 @@ mod tests {
     #[test]
     fn test_parse_path_coordinates() {
         let repo = Path::new("/home/user/.m2/repository");
-        let version_dir = Path::new("/home/user/.m2/repository/org/apache/commons/commons-lang3/3.12.0");
+        let version_dir =
+            Path::new("/home/user/.m2/repository/org/apache/commons/commons-lang3/3.12.0");
         let (g, a, v) = parse_path_coordinates(version_dir, repo).unwrap();
         assert_eq!(g, "org.apache.commons");
         assert_eq!(a, "commons-lang3");
@@ -589,7 +794,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create Maven repo layout: org/apache/commons/commons-lang3/3.12.0/
-        let pkg_dir = dir.path()
+        let pkg_dir = dir
+            .path()
             .join("org")
             .join("apache")
             .join("commons")
@@ -631,7 +837,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create two Maven packages
-        let pkg1_dir = dir.path()
+        let pkg1_dir = dir
+            .path()
             .join("org")
             .join("apache")
             .join("commons")
@@ -649,7 +856,8 @@ mod tests {
         .await
         .unwrap();
 
-        let pkg2_dir = dir.path()
+        let pkg2_dir = dir
+            .path()
             .join("com")
             .join("google")
             .join("guava")
@@ -688,7 +896,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create one package
-        let pkg_dir = dir.path()
+        let pkg_dir = dir
+            .path()
             .join("com")
             .join("example")
             .join("my-lib")
@@ -723,7 +932,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create package with POM that has property references (can't parse)
-        let pkg_dir = dir.path()
+        let pkg_dir = dir
+            .path()
             .join("com")
             .join("example")
             .join("my-lib")

@@ -46,45 +46,54 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     let pyproject_exists = tokio::fs::metadata(&pyproject).await.is_ok();
     let cargo_exists = tokio::fs::metadata(&cargo).await.is_ok();
 
-    // Collect a warning if more than one manifest is present.
-    let present_count = [pkg_json_exists, pyproject_exists, cargo_exists]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    if present_count > 1 {
-        let mut found = Vec::new();
-        if pkg_json_exists {
-            found.push("package.json");
-        }
-        if pyproject_exists {
-            found.push("pyproject.toml");
-        }
-        if cargo_exists {
-            found.push("Cargo.toml");
-        }
-        result.warnings.push(format!(
-            "Multiple project manifests detected ({}); using {} for the top-level product",
-            found.join(", "),
-            found[0]
-        ));
+    // Names of every manifest present, in priority order — used for the
+    // "detected (...)" portion of the multi-manifest warning.
+    let mut present = Vec::new();
+    if pkg_json_exists {
+        present.push("package.json");
+    }
+    if pyproject_exists {
+        present.push("pyproject.toml");
+    }
+    if cargo_exists {
+        present.push("Cargo.toml");
     }
 
+    // Read manifests in priority order, taking the first that yields a
+    // usable PURL. `selected` records the manifest ACTUALLY used — not
+    // merely the highest-priority one present, because that one may fail
+    // to parse (invalid JSON, missing version, workspace inheritance) and
+    // fall through to a lower-priority manifest. The warning must name
+    // what we used, otherwise it misreports the source.
+    let mut selected: Option<&str> = None;
     if pkg_json_exists {
         if let Some(purl) = read_package_json(&pkg_json).await {
             result.purl = Some(purl);
-            return result;
+            selected = Some("package.json");
         }
     }
-    if pyproject_exists {
+    if result.purl.is_none() && pyproject_exists {
         if let Some(purl) = read_pyproject(&pyproject).await {
             result.purl = Some(purl);
-            return result;
+            selected = Some("pyproject.toml");
         }
     }
-    if cargo_exists {
+    if result.purl.is_none() && cargo_exists {
         if let Some(purl) = read_cargo_toml(&cargo).await {
             result.purl = Some(purl);
-            return result;
+            selected = Some("Cargo.toml");
+        }
+    }
+
+    // Warn only when more than one manifest is present AND we actually
+    // settled on one — naming the manifest we used.
+    if present.len() > 1 {
+        if let Some(used) = selected {
+            result.warnings.push(format!(
+                "Multiple project manifests detected ({}); using {} for the top-level product",
+                present.join(", "),
+                used
+            ));
         }
     }
 
@@ -219,14 +228,23 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
         if !in_section {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("url") {
-            let rest = rest.trim_start();
-            let rest = rest.strip_prefix('=')?.trim();
-            if rest.is_empty() {
-                return None;
-            }
-            return Some(rest.to_string());
+        // Parse `key = value`. Only the EXACT `url` key counts: a
+        // `url`-prefixed-but-different key (git permits arbitrary
+        // config keys, e.g. a custom `urlsuffix`) or a malformed
+        // `url ...` line without an `=` must be SKIPPED, not abort
+        // the scan — otherwise a later, valid `url = ...` line in the
+        // same section would never be read.
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "url" {
+            continue;
         }
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value.to_string());
     }
     None
 }
@@ -243,11 +261,19 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
 /// * Anything else (self-hosted gitea, generic SSH, etc.) → URL as-is.
 fn remote_url_to_purl(url: &str) -> String {
     if let Some((host, path)) = split_remote_host_path(url) {
-        let cleaned = path.strip_suffix(".git").unwrap_or(path);
+        // Trim slashes BEFORE stripping `.git`: a URL like
+        // `https://github.com/owner/repo.git/` carries a trailing
+        // slash, so stripping `.git` first would no-op and leave
+        // `repo.git` baked into the PURL. Trim again afterward in case
+        // the `.git` strip exposes a slash.
+        let cleaned = path.trim_matches('/');
+        let cleaned = cleaned.strip_suffix(".git").unwrap_or(cleaned);
         let cleaned = cleaned.trim_matches('/');
         let parts: Vec<&str> = cleaned.split('/').collect();
         if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            let ecosystem = match host {
+            // Hostnames are case-insensitive per DNS; match on a
+            // lowercased copy so `git@GitHub.com:...` still normalizes.
+            let ecosystem = match host.to_ascii_lowercase().as_str() {
                 "github.com" => Some("github"),
                 "gitlab.com" => Some("gitlab"),
                 "bitbucket.org" => Some("bitbucket"),
@@ -515,6 +541,44 @@ mod tests {
         assert!(scan_remote_origin_url("[core]\nbare = false\n").is_none());
     }
 
+    /// Regression: a key that merely *starts with* `url` (e.g. a
+    /// custom `urlsuffix` git permits) must NOT be treated as the
+    /// `url` key, and — critically — must not abort the scan before
+    /// the real `url = ...` line that follows it is read.
+    #[test]
+    fn scan_origin_url_ignores_url_prefixed_key_and_keeps_scanning() {
+        let cfg = "[remote \"origin\"]\n\turlsuffix = nonsense\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// Regression: a malformed `url ...` line WITHOUT an `=` must be
+    /// skipped, allowing a later well-formed `url = ...` line in the
+    /// same section to still be picked up. (Previously the `?` on the
+    /// `=` strip aborted the whole function, returning None.)
+    #[test]
+    fn scan_origin_url_skips_malformed_url_line_then_finds_valid_one() {
+        let cfg = "[remote \"origin\"]\n\turl no-equals-here\n\turl = git@github.com:foo/bar.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:foo/bar.git")
+        );
+    }
+
+    /// A `url` value embedding an `=` (rare, but the scp/https forms
+    /// permit query-ish suffixes) keeps everything after the FIRST
+    /// `=`, matching the prior behavior.
+    #[test]
+    fn scan_origin_url_preserves_equals_inside_value() {
+        let cfg = "[remote \"origin\"]\n\turl = https://host/p?token=abc\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("https://host/p?token=abc")
+        );
+    }
+
     #[tokio::test]
     async fn detect_prefers_git_remote_over_package_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -619,12 +683,9 @@ mod tests {
         .unwrap();
         let git_dir = dir.path().join(".git");
         tokio::fs::create_dir_all(&git_dir).await.unwrap();
-        tokio::fs::write(
-            git_dir.join("config"),
-            "[remote \"origin\"]\n\turl = \n",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(git_dir.join("config"), "[remote \"origin\"]\n\turl = \n")
+            .await
+            .unwrap();
 
         let r = detect_product(dir.path()).await;
         assert_eq!(r.purl.as_deref(), Some("pkg:npm/fallback-app@1.0.0"));
@@ -635,8 +696,7 @@ mod tests {
     /// would surface the regression.
     #[test]
     fn scan_origin_url_handles_crlf_line_endings() {
-        let cfg =
-            "[remote \"origin\"]\r\n\turl = git@github.com:foo/bar.git\r\n";
+        let cfg = "[remote \"origin\"]\r\n\turl = git@github.com:foo/bar.git\r\n";
         assert_eq!(
             scan_remote_origin_url(cfg).as_deref(),
             Some("git@github.com:foo/bar.git")
@@ -756,12 +816,9 @@ mod tests {
     #[tokio::test]
     async fn package_json_missing_name_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(
-            dir.path().join("package.json"),
-            r#"{"version":"1.0.0"}"#,
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(dir.path().join("package.json"), r#"{"version":"1.0.0"}"#)
+            .await
+            .unwrap();
         let r = detect_product(dir.path()).await;
         assert!(r.purl.is_none());
     }
@@ -784,7 +841,9 @@ mod tests {
     #[tokio::test]
     async fn package_json_invalid_json_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("package.json"), "{ not json").await.unwrap();
+        tokio::fs::write(dir.path().join("package.json"), "{ not json")
+            .await
+            .unwrap();
         let r = detect_product(dir.path()).await;
         assert!(r.purl.is_none());
     }
@@ -969,13 +1028,117 @@ mod tests {
     #[tokio::test]
     async fn package_json_missing_version_key_returns_none() {
         let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#)
+            .await
+            .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    // ── Regression: `.git` strip ordering ─────────────────────────
+
+    /// Regression: a remote URL carrying BOTH a `.git` suffix AND a
+    /// trailing slash (`https://github.com/owner/repo.git/`) must still
+    /// normalize to `pkg:github/owner/repo`. Previously `.git` was
+    /// stripped before the slash was trimmed, so the strip no-opped and
+    /// the PURL kept `repo.git`.
+    #[test]
+    fn remote_url_dotgit_with_trailing_slash_is_normalized() {
+        assert_eq!(
+            remote_url_to_purl("https://github.com/owner/repo.git/"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// scp-style SSH form with the same `.git/` combination.
+    #[test]
+    fn remote_url_ssh_dotgit_with_trailing_slash_is_normalized() {
+        assert_eq!(
+            remote_url_to_purl("git@github.com:owner/repo.git/"),
+            "pkg:github/owner/repo"
+        );
+    }
+
+    /// Regression: hostnames are case-insensitive (DNS), so a remote
+    /// with a mixed-case host (`GitHub.com`) must still map to the
+    /// `github` ecosystem rather than fall through to the raw URL.
+    #[test]
+    fn remote_url_mixed_case_host_is_normalized() {
+        assert_eq!(
+            remote_url_to_purl("git@GitHub.com:owner/repo.git"),
+            "pkg:github/owner/repo"
+        );
+        assert_eq!(
+            remote_url_to_purl("https://GitLab.com/foo/bar"),
+            "pkg:gitlab/foo/bar"
+        );
+    }
+
+    /// The owner/repo path segments stay case-preserved even though the
+    /// host is lowercased for the ecosystem match — repo names are
+    /// case-sensitive.
+    #[test]
+    fn remote_url_path_case_is_preserved() {
+        assert_eq!(
+            remote_url_to_purl("git@GITHUB.COM:SocketDev/Socket-Patch.git"),
+            "pkg:github/SocketDev/Socket-Patch"
+        );
+    }
+
+    // ── Regression: multi-manifest warning names the USED manifest ──
+
+    /// Regression: when the highest-priority manifest is present but
+    /// fails to parse (invalid JSON), detection falls through to the
+    /// next manifest — and the warning must name the manifest ACTUALLY
+    /// used, not the one that failed. Previously the warning hard-coded
+    /// `found[0]` ("package.json") even though Cargo.toml was used.
+    #[tokio::test]
+    async fn multi_manifest_warning_names_actually_used_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // package.json present but unparseable → falls through to Cargo.
+        tokio::fs::write(dir.path().join("package.json"), "{ not json")
+            .await
+            .unwrap();
         tokio::fs::write(
-            dir.path().join("package.json"),
-            r#"{"name":"x"}"#,
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"alt\"\nversion = \"9.9.9\"\n",
         )
         .await
         .unwrap();
+
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/alt@9.9.9"));
+        assert_eq!(r.warnings.len(), 1);
+        // The "detected (...)" list still mentions both manifests.
+        assert!(r.warnings[0].contains("package.json"));
+        assert!(r.warnings[0].contains("Cargo.toml"));
+        // But the "using X" clause must name Cargo.toml, the one used.
+        assert!(
+            r.warnings[0].contains("using Cargo.toml"),
+            "warning should name the manifest actually used: {}",
+            r.warnings[0]
+        );
+    }
+
+    /// When multiple manifests are present but NONE parse, there is no
+    /// product to surface and therefore no "using X" warning to emit
+    /// (it would name a manifest that wasn't actually used).
+    #[tokio::test]
+    async fn multi_manifest_all_unparseable_emits_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("package.json"), "{ not json")
+            .await
+            .unwrap();
+        // Cargo.toml present but version is workspace-inherited (unsupported).
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"alt\"\nversion.workspace = true\n",
+        )
+        .await
+        .unwrap();
+
         let r = detect_product(dir.path()).await;
         assert!(r.purl.is_none());
+        assert!(r.warnings.is_empty());
     }
 }

@@ -91,11 +91,12 @@ pub fn get_npm_global_prefix() -> Result<String, String> {
 /// exercise the success arm (binary present, stdout parsed) without
 /// requiring npm on the host's PATH.
 pub fn get_npm_global_prefix_with(runner: &dyn CommandRunner) -> Result<String, String> {
-    parse_npm_root_output(runner.run("npm", &["root", "-g"]).as_deref().unwrap_or(""))
-        .ok_or_else(|| {
+    parse_npm_root_output(runner.run("npm", &["root", "-g"]).as_deref().unwrap_or("")).ok_or_else(
+        || {
             "Failed to determine npm global prefix. Ensure npm is installed and in PATH."
                 .to_string()
-        })
+        },
+    )
 }
 
 /// Pure parser for `npm root -g` stdout. Returns the trimmed path or
@@ -118,7 +119,12 @@ pub fn get_yarn_global_prefix() -> Option<String> {
 /// Version of `get_yarn_global_prefix` that accepts an injected
 /// `CommandRunner`. See `get_npm_global_prefix_with`.
 pub fn get_yarn_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
-    parse_yarn_dir_output(runner.run("yarn", &["global", "dir"]).as_deref().unwrap_or(""))
+    parse_yarn_dir_output(
+        runner
+            .run("yarn", &["global", "dir"])
+            .as_deref()
+            .unwrap_or(""),
+    )
 }
 
 /// Pure parser for `yarn global dir` stdout. Returns `<dir>/node_modules`
@@ -129,7 +135,12 @@ pub fn parse_yarn_dir_output(stdout: &str) -> Option<String> {
     if dir.is_empty() {
         return None;
     }
-    Some(PathBuf::from(dir).join("node_modules").to_string_lossy().to_string())
+    Some(
+        PathBuf::from(dir)
+            .join("node_modules")
+            .to_string_lossy()
+            .to_string(),
+    )
 }
 
 /// Get the pnpm global `node_modules` path via `pnpm root -g`.
@@ -161,7 +172,12 @@ pub fn get_bun_global_prefix() -> Option<String> {
 /// Version of `get_bun_global_prefix` that accepts an injected
 /// `CommandRunner`. See `get_npm_global_prefix_with`.
 pub fn get_bun_global_prefix_with(runner: &dyn CommandRunner) -> Option<String> {
-    parse_bun_bin_output(runner.run("bun", &["pm", "bin", "-g"]).as_deref().unwrap_or(""))
+    parse_bun_bin_output(
+        runner
+            .run("bun", &["pm", "bin", "-g"])
+            .as_deref()
+            .unwrap_or(""),
+    )
 }
 
 /// Pure parser for `bun pm bin -g` stdout. Extracted so the
@@ -219,13 +235,17 @@ fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
         let mut results = Vec::new();
         if let Ok(entries) = std::fs::read_dir(base) {
             for entry in entries.flatten() {
-                // Follow symlinks: use metadata() not symlink_metadata()
-                let is_dir = entry
-                    .metadata()
+                // Follow symlinks: `DirEntry::metadata()` does NOT traverse
+                // symlinks (it stats the link itself), so a symlinked version
+                // dir — fnm's per-version layout, nvm `default`/`current`
+                // aliases — would be missed. Stat the joined path with the
+                // free `std::fs::metadata`, which resolves the link target.
+                let child = base.join(entry.file_name());
+                let is_dir = std::fs::metadata(&child)
                     .map(|m| m.is_dir())
                     .unwrap_or(false);
                 if is_dir {
-                    results.extend(find_node_dirs_sync(&base.join(entry.file_name()), rest));
+                    results.extend(find_node_dirs_sync(&child, rest));
                 }
             }
         }
@@ -257,7 +277,10 @@ impl NpmCrawler {
     /// In global mode returns well-known global paths; in local mode walks
     /// the project tree looking for `node_modules` directories (including
     /// workspace packages).
-    pub async fn get_node_modules_paths(&self, options: &CrawlerOptions) -> Result<Vec<PathBuf>, std::io::Error> {
+    pub async fn get_node_modules_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
@@ -273,7 +296,10 @@ impl NpmCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let nm_paths = self.get_node_modules_paths(options).await.unwrap_or_default();
+        let nm_paths = self
+            .get_node_modules_paths(options)
+            .await
+            .unwrap_or_default();
 
         for nm_path in &nm_paths {
             let found = self.scan_node_modules(nm_path, &mut seen).await;
@@ -300,7 +326,8 @@ impl NpmCrawler {
             namespace: Option<String>,
             name: String,
             version: String,
-            #[allow(dead_code)] purl: String,
+            #[allow(dead_code)]
+            purl: String,
             dir_key: String,
         }
 
@@ -329,11 +356,7 @@ impl NpmCrawler {
 
             if let Some((_, version)) = read_package_json(&pkg_json_path).await {
                 if version == target.version {
-                    let purl = build_npm_purl(
-                        target.namespace.as_deref(),
-                        &target.name,
-                        &version,
-                    );
+                    let purl = build_npm_purl(target.namespace.as_deref(), &target.name, &version);
                     if purl_set.contains(purl.as_str()) {
                         result.insert(
                             purl.clone(),
@@ -515,8 +538,7 @@ impl NpmCrawler {
 
             if name_str.starts_with('@') {
                 // Scoped packages
-                let scoped =
-                    Self::scan_scoped_packages(&entry_path, seen).await;
+                let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
                 results.extend(scoped);
             } else {
                 // Regular package
@@ -525,8 +547,7 @@ impl NpmCrawler {
                 }
                 // Nested node_modules only for real directories (not symlinks)
                 if file_type.is_dir() {
-                    let nested =
-                        Self::scan_nested_node_modules(&entry_path, seen).await;
+                    let nested = Self::scan_nested_node_modules(&entry_path, seen).await;
                     results.extend(nested);
                 }
             }
@@ -566,8 +587,7 @@ impl NpmCrawler {
 
                 // Nested node_modules only for real directories
                 if file_type.is_dir() {
-                    let nested =
-                        Self::scan_nested_node_modules(&pkg_path, seen).await;
+                    let nested = Self::scan_nested_node_modules(&pkg_path, seen).await;
                     results.extend(nested);
                 }
             }
@@ -604,17 +624,21 @@ impl NpmCrawler {
                 let entry_path = nested_nm.join(&name_str);
 
                 if name_str.starts_with('@') {
-                    let scoped =
-                        Self::scan_scoped_packages(&entry_path, seen).await;
+                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
                     results.extend(scoped);
                 } else {
                     if let Some(pkg) = Self::check_package(&entry_path, seen).await {
                         results.push(pkg);
                     }
-                    // Recursively check deeper nested node_modules
-                    let deeper =
-                        Self::scan_nested_node_modules(&entry_path, seen).await;
-                    results.extend(deeper);
+                    // Recurse into deeper nested node_modules only for real
+                    // directories (not symlinks) — matching the invariant in
+                    // `scan_node_modules`/`scan_scoped_packages`. Following a
+                    // symlink here would walk into pnpm's content-addressed
+                    // store (or an `npm link` target outside the project).
+                    if file_type.is_dir() {
+                        let deeper = Self::scan_nested_node_modules(&entry_path, seen).await;
+                        results.extend(deeper);
+                    }
                 }
             }
 
@@ -624,10 +648,7 @@ impl NpmCrawler {
 
     /// Check a package directory and return `CrawledPackage` if valid.
     /// Deduplicates by PURL via the `seen` set.
-    async fn check_package(
-        pkg_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Option<CrawledPackage> {
+    async fn check_package(pkg_path: &Path, seen: &mut HashSet<String>) -> Option<CrawledPackage> {
         let pkg_json_path = pkg_path.join("package.json");
         let (full_name, version) = read_package_json(&pkg_json_path).await?;
         let (namespace, name) = parse_package_name(&full_name);
@@ -745,8 +766,7 @@ mod tests {
 
     #[test]
     fn test_parse_purl_components_unscoped() {
-        let (ns, name, ver) =
-            NpmCrawler::parse_purl_components("pkg:npm/lodash@4.17.21").unwrap();
+        let (ns, name, ver) = NpmCrawler::parse_purl_components("pkg:npm/lodash@4.17.21").unwrap();
         assert!(ns.is_none());
         assert_eq!(name, "lodash");
         assert_eq!(ver, "4.17.21");
@@ -762,12 +782,9 @@ mod tests {
     async fn test_read_package_json_valid() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_json = dir.path().join("package.json");
-        tokio::fs::write(
-            &pkg_json,
-            r#"{"name": "test-pkg", "version": "1.0.0"}"#,
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(&pkg_json, r#"{"name": "test-pkg", "version": "1.0.0"}"#)
+            .await
+            .unwrap();
 
         let result = read_package_json(&pkg_json).await;
         assert!(result.is_some());
@@ -868,6 +885,37 @@ mod tests {
         // Non-existent base path should return empty
         let results = find_node_dirs_sync(Path::new("/nonexistent/path/xyz"), &["*", "lib"]);
         assert!(results.is_empty());
+    }
+
+    /// Regression: a wildcard segment that matches a *symlinked*
+    /// directory must be followed. `DirEntry::metadata()` stats the link
+    /// itself (reports `is_dir == false`), so the resolver previously
+    /// skipped symlinked version dirs — exactly the layout fnm produces
+    /// and the `current`/`default` aliases nvm creates. The fix stats the
+    /// joined path with `std::fs::metadata`, which resolves the target.
+    #[cfg(unix)]
+    #[test]
+    fn test_find_node_dirs_sync_follows_symlinked_segment() {
+        use std::os::unix::fs::symlink;
+
+        // Real version layout lives in its own tree, away from `base`,
+        // so the only way to reach it is through the symlink.
+        let real = tempfile::tempdir().unwrap();
+        let real_nm = real.path().join("lib").join("node_modules");
+        std::fs::create_dir_all(&real_nm).unwrap();
+
+        // `base` holds only a symlink standing in for a version dir.
+        let base = tempfile::tempdir().unwrap();
+        let alias = base.path().join("current");
+        symlink(real.path(), &alias).unwrap();
+
+        let results = find_node_dirs_sync(base.path(), &["*", "lib", "node_modules"]);
+        assert_eq!(
+            results.len(),
+            1,
+            "a symlinked version dir must be followed, not skipped"
+        );
+        assert_eq!(results[0], alias.join("lib").join("node_modules"));
     }
 
     #[test]

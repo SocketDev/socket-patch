@@ -236,3 +236,101 @@ fn setup_yes_json_files_entry_has_expected_keys() {
     assert!(entry["path"].is_string());
     assert!(entry["status"].is_string());
 }
+
+// ---------------------------------------------------------------------------
+// Error handling — a malformed package.json must NOT be reported as success.
+//
+// Regression: when nothing was updatable but a file errored (e.g. invalid
+// JSON), `setup` used to emit `status: "already_configured"` with exit 0,
+// masking the failure. A parse error must surface as a non-zero exit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_malformed_package_json_reports_error_and_exits_nonzero() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), "not valid json!!!");
+
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 1, "a malformed package.json must exit non-zero; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        v["status"], "error",
+        "must not be reported as already_configured"
+    );
+    assert_eq!(v["updated"], 0);
+    assert_eq!(v["alreadyConfigured"], 0);
+    assert_eq!(v["errors"], 1);
+    let files = v["files"].as_array().expect("files array");
+    assert_eq!(files[0]["status"], "error");
+    assert!(files[0]["error"].is_string());
+}
+
+#[test]
+fn setup_malformed_does_not_claim_already_configured_in_human_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), "not valid json!!!");
+
+    // Human (non-JSON) mode: the misleading "All package.json files are
+    // already configured" line must not appear when a file errored.
+    let out = Command::new(binary())
+        .args(["setup", "--yes"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "human mode must exit 1; stdout=\n{stdout}");
+    assert!(
+        !stdout.contains("already configured with socket-patch"),
+        "must not falsely claim everything is already configured; stdout=\n{stdout}"
+    );
+}
+
+#[test]
+fn setup_dry_run_with_error_exits_nonzero() {
+    // A valid root (would-update) alongside a malformed workspace member:
+    // dry-run must still surface the parse error via a non-zero exit rather
+    // than masking it behind the `dry_run` status.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }
+"#,
+    );
+    write(&tmp.path().join("packages/a/package.json"), "{bad json");
+
+    let (code, stdout) = run_setup(tmp.path(), &["--dry-run"]);
+    assert_eq!(code, 1, "dry-run with an error must exit non-zero; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "dry_run");
+    assert_eq!(v["errors"], 1);
+    assert_eq!(v["wouldUpdate"], 1);
+
+    // dry-run must not have written anything.
+    let root = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    assert!(!root.contains("socket-patch"), "dry-run must not modify files");
+}
+
+#[test]
+fn setup_partial_failure_exits_nonzero_when_applying() {
+    // One updatable file + one malformed file, applied for real (--yes):
+    // the run must report partial_failure and exit 1.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }
+"#,
+    );
+    write(&tmp.path().join("packages/a/package.json"), "{bad json");
+
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 1, "partial failure must exit non-zero; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "partial_failure");
+    assert_eq!(v["updated"], 1);
+    assert_eq!(v["errors"], 1);
+
+    // The valid root file should have been written.
+    let root = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    assert!(root.contains("socket-patch"), "valid file should still be updated");
+}

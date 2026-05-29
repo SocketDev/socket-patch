@@ -57,7 +57,15 @@ pub struct Statement {
     #[serde(rename = "@id", skip_serializing_if = "Option::is_none", default)]
     pub id: Option<String>,
     pub vulnerability: Vulnerability,
-    pub timestamp: String,
+    /// RFC 3339 timestamp the statement's assertion was known true.
+    /// Optional per spec — it cascades down from the document when a
+    /// statement omits it (see OpenVEX inheritance rules), so a
+    /// spec-valid document may legitimately leave it out. We always
+    /// emit one (the builder clones the document timestamp), but the
+    /// type must still accept its absence on parse, mirroring the
+    /// sibling `last_updated` field below.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub timestamp: Option<String>,
     /// RFC 3339 timestamp of the most recent revision of this statement.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_updated: Option<String>,
@@ -171,8 +179,7 @@ mod tests {
     #[test]
     fn every_status_variant_deserializes_from_spec_literal() {
         for (variant, literal) in STATUS_LITERALS {
-            let parsed: Status =
-                serde_json::from_str(&format!("\"{literal}\"")).unwrap();
+            let parsed: Status = serde_json::from_str(&format!("\"{literal}\"")).unwrap();
             assert_eq!(parsed, *variant, "literal {literal:?}");
         }
     }
@@ -216,16 +223,14 @@ mod tests {
     #[test]
     fn every_justification_variant_deserializes_from_spec_literal() {
         for (variant, literal) in JUSTIFICATION_LITERALS {
-            let parsed: Justification =
-                serde_json::from_str(&format!("\"{literal}\"")).unwrap();
+            let parsed: Justification = serde_json::from_str(&format!("\"{literal}\"")).unwrap();
             assert_eq!(parsed, *variant, "literal {literal:?}");
         }
     }
 
     #[test]
     fn justification_rejects_unknown_literal() {
-        let r: Result<Justification, _> =
-            serde_json::from_str("\"hand_waving\"");
+        let r: Result<Justification, _> = serde_json::from_str("\"hand_waving\"");
         assert!(r.is_err());
     }
 
@@ -314,7 +319,7 @@ mod tests {
                 name: "GHSA-xxxx".to_string(),
                 aliases: Vec::new(),
             },
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            timestamp: Some("2024-01-01T00:00:00Z".to_string()),
             last_updated: None,
             products: vec![Product {
                 id: "pkg:npm/app@1.0.0".to_string(),
@@ -551,7 +556,7 @@ mod tests {
                     name: "GHSA-xxx".to_string(),
                     aliases: vec!["CVE-2024-0001".to_string()],
                 },
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                timestamp: Some("2024-01-01T00:00:00Z".to_string()),
                 last_updated: Some("2024-06-01T00:00:00Z".to_string()),
                 products: vec![Product {
                     id: "pkg:npm/app@1.0.0".to_string(),
@@ -603,5 +608,132 @@ mod tests {
         assert!(st.last_updated.is_none());
         assert!(st.supplier.is_none());
         assert!(st.action_statement.is_none());
+    }
+
+    // ── Statement timestamp is optional/inheritable per spec ───────
+
+    /// Regression: the statement-level `timestamp` is OPTIONAL in
+    /// OpenVEX 0.2.0 — it cascades from the document when omitted. A
+    /// spec-valid statement that leaves it out (the canonical spec
+    /// example does exactly this for a `fixed` statement) MUST parse,
+    /// not error with "missing field `timestamp`". Previously the
+    /// field was a required `String`, so this document was rejected.
+    #[test]
+    fn statement_without_timestamp_parses_and_leaves_it_none() {
+        let doc_json = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": 1,
+            "statements": [
+              {
+                "vulnerability": {"name": "CVE-2014-123456"},
+                "products": [{"@id": "pkg:apk/wolfi/bash@1.0.0"}],
+                "status": "fixed"
+              }
+            ]
+        }"#;
+        let doc: Document =
+            serde_json::from_str(doc_json).expect("statement may omit timestamp (inherited)");
+        assert_eq!(doc.statements.len(), 1);
+        assert!(
+            doc.statements[0].timestamp.is_none(),
+            "omitted statement timestamp must deserialize to None, not error"
+        );
+    }
+
+    /// A statement timestamp that IS present round-trips through the
+    /// `Option<String>` field, and an absent one is omitted from the
+    /// serialized JSON (no `null`, no empty string).
+    #[test]
+    fn statement_timestamp_some_emits_none_omits() {
+        let mut s = minimal_statement(); // carries Some(timestamp)
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["timestamp"], "2024-01-01T00:00:00Z");
+
+        s.timestamp = None;
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.as_object().unwrap().get("timestamp").is_none(),
+            "None timestamp must be omitted, never serialized as null/empty"
+        );
+    }
+
+    // ── Forward-compat: unmodeled spec fields are tolerated ────────
+
+    /// OpenVEX 0.2.0 carries fields we intentionally don't model
+    /// (statement-level `version`, `status_notes`,
+    /// `action_statement_timestamp`, vulnerability `@id`/`description`).
+    /// Real documents and future spec revisions will include them.
+    /// Because no struct uses `#[serde(deny_unknown_fields)]`, parsing
+    /// MUST ignore them rather than erroring — pin that so a future
+    /// `deny_unknown_fields` (which would break interop) regresses here.
+    #[test]
+    fn parsing_tolerates_unmodeled_spec_fields() {
+        let doc_json = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": 1,
+            "extra_doc_field": "ignored",
+            "statements": [
+              {
+                "@id": "urn:uuid:stmt-1",
+                "version": 2,
+                "vulnerability": {
+                  "@id": "https://nvd.example/CVE-2024-1",
+                  "name": "GHSA-x",
+                  "description": "an unmodeled field",
+                  "aliases": ["CVE-2024-1"]
+                },
+                "timestamp": "2024-01-01T00:00:00Z",
+                "status_notes": "determined by hand",
+                "products": [{
+                  "@id": "pkg:npm/app@1.0.0",
+                  "subcomponents": [{"@id": "pkg:npm/lodash@4.17.21"}]
+                }],
+                "status": "not_affected",
+                "justification": "inline_mitigations_already_exist",
+                "action_statement_timestamp": "2024-01-02T00:00:00Z"
+              }
+            ]
+        }"#;
+        let doc: Document =
+            serde_json::from_str(doc_json).expect("unmodeled spec fields must be ignored");
+        assert_eq!(doc.statements.len(), 1);
+        let st = &doc.statements[0];
+        assert_eq!(st.vulnerability.name, "GHSA-x");
+        assert_eq!(st.vulnerability.aliases, vec!["CVE-2024-1".to_string()]);
+        assert_eq!(st.status, Status::NotAffected);
+        assert_eq!(st.products[0].subcomponents[0].id, "pkg:npm/lodash@4.17.21");
+    }
+
+    // ── Wire format: multi-word keys stay snake_case ───────────────
+
+    /// The statement-level multi-word keys MUST be emitted in the
+    /// OpenVEX snake_case spelling. `Statement` has no `rename_all`, so
+    /// this relies on the field idents already being snake_case.
+    /// Round-trip tests can't catch a switch to
+    /// `rename_all = "camelCase"` (ser/de would stay symmetric), so pin
+    /// the exact emitted keys — and assert the camelCase forms are absent.
+    #[test]
+    fn statement_multiword_keys_emit_in_snake_case() {
+        let mut s = minimal_statement();
+        s.last_updated = Some("2024-02-01T00:00:00Z".to_string());
+        s.impact_statement = Some("x".to_string());
+        s.action_statement = Some("y".to_string());
+        let v = serde_json::to_value(&s).unwrap();
+        let obj = v.as_object().unwrap();
+        for snake in ["last_updated", "impact_statement", "action_statement"] {
+            assert!(obj.contains_key(snake), "missing snake_case key {snake:?}");
+        }
+        for camel in ["lastUpdated", "impactStatement", "actionStatement"] {
+            assert!(
+                !obj.contains_key(camel),
+                "camelCase key {camel:?} must never be emitted"
+            );
+        }
     }
 }

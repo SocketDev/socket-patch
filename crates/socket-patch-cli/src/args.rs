@@ -284,3 +284,120 @@ impl Default for GlobalArgs {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `api_client_overrides` must forward every populated value verbatim.
+    #[test]
+    fn api_client_overrides_forwards_set_values() {
+        let args = GlobalArgs {
+            api_url: "https://api.example.com".to_string(),
+            api_token: Some("tok123".to_string()),
+            org: Some("acme".to_string()),
+            proxy_url: "https://proxy.example.com".to_string(),
+            ..GlobalArgs::default()
+        };
+        let o = args.api_client_overrides();
+        assert_eq!(o.api_url.as_deref(), Some("https://api.example.com"));
+        assert_eq!(o.api_token.as_deref(), Some("tok123"));
+        assert_eq!(o.org_slug.as_deref(), Some("acme"));
+        assert_eq!(o.proxy_url.as_deref(), Some("https://proxy.example.com"));
+    }
+
+    /// `GlobalArgs::default()` leaves `api_url`/`proxy_url` empty and the
+    /// optional fields `None`, so every override must come back `None` —
+    /// this is what lets integration tests set `SOCKET_*` env vars *after*
+    /// constructing args and still have env-var resolution win downstream.
+    #[test]
+    fn api_client_overrides_default_is_all_none() {
+        let o = GlobalArgs::default().api_client_overrides();
+        assert!(o.api_url.is_none(), "empty api_url must not be forwarded");
+        assert!(o.proxy_url.is_none(), "empty proxy_url must not be forwarded");
+        assert!(o.api_token.is_none());
+        assert!(o.org_slug.is_none());
+    }
+
+    /// Empty strings for url/token/org are filtered out, not forwarded as
+    /// `Some("")` — otherwise an empty CLI value would mask env-var fallback.
+    #[test]
+    fn api_client_overrides_filters_empty_strings() {
+        let args = GlobalArgs {
+            api_url: String::new(),
+            api_token: Some(String::new()),
+            org: Some(String::new()),
+            proxy_url: String::new(),
+            ..GlobalArgs::default()
+        };
+        let o = args.api_client_overrides();
+        assert!(o.api_url.is_none());
+        assert!(o.api_token.is_none());
+        assert!(o.org_slug.is_none());
+        assert!(o.proxy_url.is_none());
+    }
+
+    /// A relative `manifest_path` is resolved against `cwd`.
+    #[test]
+    fn resolved_manifest_path_joins_relative_against_cwd() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: ".socket/manifest.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            args.resolved_manifest_path(),
+            PathBuf::from("/work/project/.socket/manifest.json"),
+        );
+    }
+
+    /// An absolute `manifest_path` ignores `cwd` and passes through unchanged.
+    #[test]
+    fn resolved_manifest_path_passes_absolute_through() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "/etc/socket/manifest.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            args.resolved_manifest_path(),
+            PathBuf::from("/etc/socket/manifest.json"),
+        );
+    }
+
+    /// `apply_env_toggles` mirrors `--debug` / `--no-telemetry` into the env
+    /// vars core code reads directly, and is a no-op when the flags are off.
+    /// `#[serial]` because it mutates process-global env state.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_toggles_mirrors_flags_into_env() {
+        let saved_debug = std::env::var("SOCKET_DEBUG").ok();
+        let saved_telemetry = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
+        std::env::remove_var("SOCKET_DEBUG");
+        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+
+        // Flags off: no-op, env stays unset.
+        apply_env_toggles(&GlobalArgs::default());
+        assert!(std::env::var("SOCKET_DEBUG").is_err());
+        assert!(std::env::var("SOCKET_TELEMETRY_DISABLED").is_err());
+
+        // Flags on: mirrored into the env.
+        let args = GlobalArgs {
+            debug: true,
+            no_telemetry: true,
+            ..GlobalArgs::default()
+        };
+        apply_env_toggles(&args);
+        assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(), Ok("1"));
+
+        match saved_debug {
+            Some(v) => std::env::set_var("SOCKET_DEBUG", v),
+            None => std::env::remove_var("SOCKET_DEBUG"),
+        }
+        match saved_telemetry {
+            Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
+            None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
+        }
+    }
+}

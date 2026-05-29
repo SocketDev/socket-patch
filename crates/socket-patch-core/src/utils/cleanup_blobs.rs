@@ -33,10 +33,7 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         entries.push(entry);
     }
 
-    let mut result = CleanupResult {
-        blobs_checked: entries.len(),
-        ..CleanupResult::default()
-    };
+    let mut result = CleanupResult::default();
 
     for entry in &entries {
         let file_name_str = entry.file_name().to_string_lossy().to_string();
@@ -44,10 +41,20 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
             continue;
         }
         let path = dir.join(&file_name_str);
-        let metadata = tokio::fs::metadata(&path).await?;
+        // Use symlink_metadata (lstat) rather than metadata (stat) so we never
+        // follow symlinks: a symlink is not a real socket-patch blob, and a
+        // dangling symlink would otherwise return an error. Tolerate any stat
+        // error (e.g. the entry was removed concurrently) by skipping that
+        // entry instead of aborting cleanup of every other orphan.
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         if !metadata.is_file() {
             continue;
         }
+        // Only regular, non-hidden files are actually considered/checked.
+        result.blobs_checked += 1;
         if is_used(&file_name_str) {
             continue;
         }
@@ -94,8 +101,7 @@ pub async fn cleanup_unused_archives(
     archives_dir: &Path,
     dry_run: bool,
 ) -> Result<CleanupResult, std::io::Error> {
-    let used_uuids: HashSet<String> =
-        manifest.patches.values().map(|r| r.uuid.clone()).collect();
+    let used_uuids: HashSet<String> = manifest.patches.values().map(|r| r.uuid.clone()).collect();
     cleanup_dir(archives_dir, dry_run, |name| {
         // Strip the .tar.gz suffix to recover the UUID; if it doesn't
         // end in .tar.gz, treat the entry as orphaned (not "used").
@@ -112,10 +118,7 @@ pub fn format_cleanup_result(result: &CleanupResult, dry_run: bool) -> String {
     }
 
     if result.blobs_removed == 0 {
-        return format!(
-            "Checked {} blob(s), all are in use.",
-            result.blobs_checked
-        );
+        return format!("Checked {} blob(s), all are in use.", result.blobs_checked);
     }
 
     let action = if dry_run { "Would remove" } else { "Removed" };
@@ -164,16 +167,11 @@ mod tests {
     use std::collections::HashMap;
 
     const TEST_UUID: &str = "11111111-1111-4111-8111-111111111111";
-    const BEFORE_HASH_1: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111";
-    const AFTER_HASH_1: &str =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111";
-    const BEFORE_HASH_2: &str =
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2222";
-    const AFTER_HASH_2: &str =
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2222";
-    const ORPHAN_HASH: &str =
-        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo";
+    const BEFORE_HASH_1: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111";
+    const AFTER_HASH_1: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111";
+    const BEFORE_HASH_2: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2222";
+    const AFTER_HASH_2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2222";
+    const ORPHAN_HASH: &str = "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo";
 
     fn create_test_manifest() -> PatchManifest {
         let mut files = HashMap::new();
@@ -446,12 +444,16 @@ mod tests {
         assert!(result
             .removed_blobs
             .contains(&format!("{SECOND_UUID}.tar.gz")));
-        assert!(tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
-            .await
-            .is_ok());
-        assert!(tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
-            .await
-            .is_err());
+        assert!(
+            tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -470,9 +472,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.blobs_removed, 1);
-        assert!(tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
-            .await
-            .is_ok());
+        assert!(
+            tokio::fs::metadata(archives.join(format!("{SECOND_UUID}.tar.gz")))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -511,6 +515,133 @@ mod tests {
             .unwrap();
         assert_eq!(result.blobs_checked, 0);
         assert_eq!(result.blobs_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_does_not_count_subdirs_or_hidden_files() {
+        // Regression: blobs_checked must only count regular, non-hidden files
+        // that are actually considered -- not subdirectories or dotfiles. This
+        // count is surfaced to users (human-readable + JSON in `repair`), so an
+        // inflated number is a real reporting bug.
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let manifest = create_test_manifest();
+
+        // One real (used) blob, plus noise that must be ignored entirely.
+        tokio::fs::write(blobs_dir.join(AFTER_HASH_1), "after content 1")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(blobs_dir.join("subdir"))
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.join(".hidden"), "hidden")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_blobs(&manifest, &blobs_dir, false)
+            .await
+            .unwrap();
+
+        // Only the single regular, non-hidden file is checked; nothing removed.
+        assert_eq!(result.blobs_checked, 1);
+        assert_eq!(result.blobs_removed, 0);
+
+        // The subdirectory and hidden file are left untouched.
+        assert!(tokio::fs::metadata(blobs_dir.join("subdir")).await.is_ok());
+        assert!(tokio::fs::metadata(blobs_dir.join(".hidden")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_existing_dir_checks_nothing() {
+        // An existing-but-empty directory must report zero checked (no entries
+        // to consider), distinct from a populated one.
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let result = cleanup_unused_blobs(&create_test_manifest(), &blobs_dir, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_checked, 0);
+        assert_eq!(result.blobs_removed, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cleanup_dangling_symlink_does_not_abort() {
+        // Regression: a single dangling symlink must not abort cleanup of every
+        // other orphan. Previously `tokio::fs::metadata(..)?` followed the link,
+        // hit a NotFound error, and propagated it out of the whole operation.
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let manifest = create_test_manifest();
+
+        // A real orphan that should still be removed despite the bad symlink.
+        tokio::fs::write(blobs_dir.join(ORPHAN_HASH), "orphan content")
+            .await
+            .unwrap();
+        // A dangling symlink (target does not exist).
+        symlink(
+            blobs_dir.join("missing-target"),
+            blobs_dir.join("dangling-link"),
+        )
+        .unwrap();
+
+        let result = cleanup_unused_blobs(&manifest, &blobs_dir, false)
+            .await
+            .unwrap();
+
+        // The orphan is removed; the symlink is counted as neither checked nor
+        // removed (it is not a regular file) and is left in place.
+        assert_eq!(result.blobs_removed, 1);
+        assert!(result.removed_blobs.contains(&ORPHAN_HASH.to_string()));
+        assert!(tokio::fs::metadata(blobs_dir.join(ORPHAN_HASH))
+            .await
+            .is_err());
+        assert!(tokio::fs::symlink_metadata(blobs_dir.join("dangling-link"))
+            .await
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cleanup_does_not_follow_symlink_to_used_target() {
+        // A symlink is never treated as a blob, so its target's size is never
+        // attributed to bytes_freed and the link is never removed.
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let manifest = create_test_manifest();
+
+        // A real file outside the managed set, plus a symlink pointing at it.
+        let outside = dir.path().join("outside.bin");
+        tokio::fs::write(&outside, vec![0u8; 4096]).await.unwrap();
+        symlink(&outside, blobs_dir.join("link-to-outside")).unwrap();
+
+        let result = cleanup_unused_blobs(&manifest, &blobs_dir, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_checked, 0);
+        assert_eq!(result.blobs_removed, 0);
+        assert_eq!(result.bytes_freed, 0);
+        // The symlink and its target both survive.
+        assert!(
+            tokio::fs::symlink_metadata(blobs_dir.join("link-to-outside"))
+                .await
+                .is_ok()
+        );
+        assert!(tokio::fs::metadata(&outside).await.is_ok());
     }
 
     #[test]

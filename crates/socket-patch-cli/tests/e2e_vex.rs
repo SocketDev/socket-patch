@@ -557,6 +557,90 @@ fn verify_mode_all_failed_exits_non_zero() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Release-variant verify-mode regression — PyPI manifests key patches by
+// *qualified* PURLs (`?artifact_id=`), but the crawler only knows the base
+// PURL. `vex` must resolve package paths with the qualified-aware
+// (rollback) dispatcher, exactly like `get`/`rollback` do; otherwise every
+// PyPI/Gem/Maven patch is silently dropped from the VEX doc as
+// `package_not_found`. We drive the PyPI crawler at a synthetic
+// `site-packages` via `--global-prefix` to keep the test offline.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn verify_mode_resolves_qualified_pypi_purl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // Synthetic site-packages with a dist-info the crawler can read.
+    let site_packages = cwd.join("site-packages");
+    let dist_info = site_packages.join("examplepkg-1.2.3.dist-info");
+    std::fs::create_dir_all(&dist_info).unwrap();
+    std::fs::write(
+        dist_info.join("METADATA"),
+        "Metadata-Version: 2.1\nName: examplepkg\nVersion: 1.2.3\n\n",
+    )
+    .unwrap();
+
+    // Lay the patched file at the package root (file_name strips the
+    // leading `package/` segment, so this lands at site-packages/mod.py).
+    let patched = b"patched python module";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    std::fs::write(site_packages.join("mod.py"), patched).unwrap();
+
+    // Manifest keyed by a *qualified* PyPI PURL, as `get --sync` writes
+    // for release-variant ecosystems.
+    let qualified_purl = "pkg:pypi/examplepkg@1.2.3?artifact_id=sdist";
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        qualified_purl.to_string(),
+        make_record(
+            "33333333-3333-4333-8333-333333333333",
+            "package/mod.py",
+            "a".repeat(64).as_str(),
+            after_hash.as_str(),
+            "GHSA-pypi-variant",
+            &["CVE-2024-PYPI"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let out = Command::new(binary())
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--global-prefix",
+            site_packages.to_str().unwrap(),
+            "--ecosystems",
+            "pypi",
+            "--product",
+            "pkg:pypi/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "qualified PyPI patch must verify and emit a statement. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the qualified PyPI patch must not be dropped as package_not_found"
+    );
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-pypi-variant");
+    // The subcomponent retains the fully-qualified manifest PURL.
+    let subs = stmts[0]["products"][0]["subcomponents"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["@id"], qualified_purl);
+
+    maybe_validate_with_vexctl(&String::from_utf8_lossy(&out.stdout));
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // vexctl integration (run only when the binary is on PATH)
 // ──────────────────────────────────────────────────────────────────────
 

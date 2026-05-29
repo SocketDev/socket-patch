@@ -50,11 +50,21 @@ pub async fn run(args: UnlockArgs) -> i32 {
     // holding a lock that doesn't exist). Useful for fresh repos
     // where the operator wants to confirm no stale state remains.
     if !socket_dir.exists() {
-        // No lock to inspect → was_held=false, released matches whether
-        // the user asked for --release (no file existed to remove).
-        track_patch_unlocked(false, args.release, api_token.as_deref(), org_slug.as_deref()).await;
+        // No lock to inspect → was_held=false. Nothing existed to
+        // remove, so `released` is false regardless of whether the
+        // user passed --release. Telemetry and the emitted envelope
+        // must agree on this.
+        track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
         return emit_free(args.common.json, &lock_file, false, args.release);
     }
+
+    // Snapshot whether a lock file already exists *before* acquiring.
+    // `acquire` opens the file with `create(true)`, so after the call
+    // the file always exists — even when the operator's tree was
+    // clean. To honestly report whether `--release` removed a
+    // pre-existing leftover (vs. a file the probe itself just
+    // created), we have to capture this now.
+    let lock_existed = lock_file.exists();
 
     match acquire(&socket_dir, Duration::ZERO) {
         Ok(guard) => {
@@ -65,16 +75,29 @@ pub async fn run(args: UnlockArgs) -> i32 {
 
             if args.release {
                 match std::fs::remove_file(&lock_file) {
+                    // `remove_file` here almost always returns `Ok`
+                    // (the probe's `acquire` ensured the file exists),
+                    // so we can't infer from it whether a real leftover
+                    // was present — `lock_existed` is the source of
+                    // truth for that. We still delete the file (the
+                    // operator asked for a clean slate), but only claim
+                    // we "released" something when a lock file was there
+                    // before we probed.
                     Ok(()) => {
-                        track_patch_unlocked(false, true, api_token.as_deref(), org_slug.as_deref())
-                            .await;
-                        emit_free(args.common.json, &lock_file, true, true)
+                        track_patch_unlocked(
+                            false,
+                            lock_existed,
+                            api_token.as_deref(),
+                            org_slug.as_deref(),
+                        )
+                        .await;
+                        emit_free(args.common.json, &lock_file, lock_existed, true)
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         // The file was never created (e.g. socket
                         // dir existed but no run has acquired the
                         // lock yet). Treat as success.
-                        track_patch_unlocked(false, true, api_token.as_deref(), org_slug.as_deref())
+                        track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref())
                             .await;
                         emit_free(args.common.json, &lock_file, false, true)
                     }
@@ -249,6 +272,26 @@ mod tests {
         assert!(
             !socket_dir.join("apply.lock").exists(),
             "--release should have deleted the file"
+        );
+    }
+
+    /// `--release` against a clean `.socket/` (no pre-existing lock
+    /// file) succeeds, and does not leave behind the file that the
+    /// probe's `acquire` created on demand. Guards the regression
+    /// where the probe-created file masqueraded as a released
+    /// leftover.
+    #[tokio::test]
+    async fn run_release_cleans_up_probe_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        assert!(!socket_dir.join("apply.lock").exists());
+
+        let code = run(args_in(dir.path(), true)).await;
+        assert_eq!(code, 0);
+        assert!(
+            !socket_dir.join("apply.lock").exists(),
+            "--release must not leave a probe-created lock file behind"
         );
     }
 
