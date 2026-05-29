@@ -109,6 +109,13 @@ mod tests {
 
         let result = compute_file_git_sha256(dir.path()).await;
         let err = result.expect_err("hashing a directory must error");
+
+        // On Unix a directory opens successfully and the `is_file` guard
+        // rejects it with `InvalidInput`. On Windows `File::open` on a
+        // directory fails at the open call itself (a different OS error kind),
+        // so we only pin the specific kind off-Windows. Either way the
+        // contract that matters holds: it errors and never hashes.
+        #[cfg(not(windows))]
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
         // It must specifically NOT have returned the empty-blob hash.
