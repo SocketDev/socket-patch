@@ -54,6 +54,8 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | Subcommand | Local arg | Env var | Purpose |
 |---|---|---|---|
 | `apply` | `--force` / `-f` | `SOCKET_FORCE` | Bypass beforeHash check |
+| `apply`, `scan` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
+| `apply`, `scan` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
 | `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune) |
 | `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size (default `100`) |
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
@@ -72,6 +74,18 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 `--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts.
 
 The hidden alias `--no-apply` on `get --save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
+
+### Embedded VEX (`apply --vex` / `scan --vex`)
+
+`--vex <path>` folds OpenVEX 0.2.0 generation into `apply` and `scan`: on a successful run the command writes the document to `<path>` using the same engine as the standalone `vex` command. The `--vex-*` flags mirror `vex`'s `--product` / `--no-verify` / `--doc-id` / `--compact` knobs (namespaced to avoid colliding with the host command), and reuse the standalone env vars (`SOCKET_VEX_PRODUCT`, etc.). They are inert unless `--vex` is set.
+
+Contract details:
+
+* **Always written to the file** — never stdout — so the document never races the command's own `--json` output.
+* **Fail-the-command**: if `--vex` was requested but generation fails (product PURL undetectable, empty/missing manifest, all patches unverified, unwritable path), the command exits non-zero **even when the apply/scan itself succeeded**. In `--json` mode the failure surfaces in the envelope's `error` (`apply`) / top-level `error` (`scan`), with a stable code (`product_undetected`, `no_applicable_patches`, `write_failed`, …).
+* **Built from the post-run manifest**, verified against on-disk state (unless `--vex-no-verify`). Generated for real applies, `--dry-run`, and read-only `scan` alike.
+* **JSON success surface**: `apply` adds a top-level `vex` object to its envelope; `scan` adds a top-level `vex` key to its result. Both carry `{ path, statements, format: "openvex-0.2.0" }`.
+* `apply`'s no-manifest early exit (the "No .socket folder found" success no-op) does **not** trigger VEX generation — there is nothing to attest.
 
 `repair` keeps its `gc` visible alias.
 
@@ -105,6 +119,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
+| `SOCKET_VEX` | `apply --vex` / `scan --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on `apply`/`scan` they bind to `--vex-product` etc. |
 
 ### Deprecated env vars
 

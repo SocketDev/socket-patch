@@ -204,6 +204,7 @@ async fn gem_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         all_releases: false,
+        vex: Default::default(),
     };
     let code = scan_run(args).await;
     assert!(code == 0 || code == 1, "scan --sync exit: {code}");
@@ -264,6 +265,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 }

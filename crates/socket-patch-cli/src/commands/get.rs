@@ -949,6 +949,9 @@ pub async fn download_and_apply_patches(
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
+            // get drives apply internally; embedded VEX is opt-in on the
+            // top-level command, never on this internal invocation.
+            vex: Default::default(),
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
@@ -1530,6 +1533,9 @@ async fn save_and_apply_patch(
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
+            // get drives apply internally; embedded VEX is opt-in on the
+            // top-level command, never on this internal invocation.
+            vex: Default::default(),
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;

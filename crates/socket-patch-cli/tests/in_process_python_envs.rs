@@ -59,6 +59,7 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     }
 }
 

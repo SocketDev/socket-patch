@@ -219,6 +219,7 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         all_releases: false,
+        vex: Default::default(),
     };
     // CARGO_HOME must be set in this process's env so the cargo crawler
     // probes the isolated location (not the developer's real ~/.cargo).
@@ -291,6 +292,7 @@ async fn cargo_crawler_finds_real_fetched_crate() {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
     std::env::remove_var("CARGO_HOME");

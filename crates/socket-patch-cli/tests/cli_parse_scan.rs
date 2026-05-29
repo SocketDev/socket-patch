@@ -63,6 +63,39 @@ fn defaults_match_contract() {
         !args.all_releases,
         "--all-releases default is false (narrow — installed-dist variant only)"
     );
+    // Embedded VEX is opt-in: off / unset by default.
+    assert_eq!(args.vex.vex, None);
+    assert_eq!(args.vex.vex_product, None);
+    assert!(!args.vex.vex_no_verify);
+    assert_eq!(args.vex.vex_doc_id, None);
+    assert!(!args.vex.vex_compact);
+}
+
+#[test]
+fn vex_path_sets_output() {
+    assert_eq!(
+        parse_scan(&["--vex", "out.vex.json"]).vex.vex,
+        Some(std::path::PathBuf::from("out.vex.json"))
+    );
+}
+
+#[test]
+fn vex_passthrough_flags() {
+    let args = parse_scan(&[
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        "pkg:npm/app@1.0.0",
+        "--vex-no-verify",
+        "--vex-doc-id",
+        "urn:uuid:fixed",
+        "--vex-compact",
+    ]);
+    assert_eq!(args.vex.vex, Some(std::path::PathBuf::from("out.vex.json")));
+    assert_eq!(args.vex.vex_product.as_deref(), Some("pkg:npm/app@1.0.0"));
+    assert!(args.vex.vex_no_verify);
+    assert_eq!(args.vex.vex_doc_id.as_deref(), Some("urn:uuid:fixed"));
+    assert!(args.vex.vex_compact);
 }
 
 #[test]

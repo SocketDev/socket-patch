@@ -37,6 +37,7 @@ fn default_args(cwd: &Path) -> ScanArgs {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     }
 }
 

@@ -14,7 +14,7 @@
 //!   to stdout. This is the CI integration shape.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::crawlers::CrawlerOptions;
@@ -22,7 +22,7 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
-    build_document, detect_product, BuildOptions, FailedPatch, VerifyOutcome,
+    build_document, detect_product, BuildOptions, Document, FailedPatch, VerifyOutcome,
 };
 
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -68,6 +68,88 @@ pub struct VexArgs {
     /// Emit compact JSON instead of pretty-printed.
     #[arg(long = "compact", env = "SOCKET_VEX_COMPACT", default_value_t = false)]
     pub compact: bool,
+}
+
+/// VEX-generation knobs embedded into `apply` and `scan` via `--vex`.
+///
+/// `--vex <path>` is the trigger: when set, the host command generates an
+/// OpenVEX document at that path after a successful run. The remaining
+/// `--vex-*` flags mirror the standalone `vex` command's knobs but are
+/// namespaced so they don't collide with the host command's own
+/// vocabulary (e.g. apply's `--force`). They are inert unless `--vex` is
+/// set.
+#[derive(Args, Default, Clone)]
+pub struct VexEmbedArgs {
+    /// Generate an OpenVEX 0.2.0 document at this path after a successful
+    /// run. The document is always written to the file (never stdout), so
+    /// it never races the command's own `--json` output.
+    #[arg(long = "vex", env = "SOCKET_VEX")]
+    pub vex: Option<PathBuf>,
+
+    /// Override the auto-detected top-level product PURL for the VEX
+    /// document. See `socket-patch vex --product`.
+    #[arg(long = "vex-product", env = "SOCKET_VEX_PRODUCT")]
+    pub vex_product: Option<String>,
+
+    /// Skip the on-disk file-hash check when building the VEX document and
+    /// trust the manifest. See `socket-patch vex --no-verify`.
+    #[arg(long = "vex-no-verify", env = "SOCKET_VEX_NO_VERIFY", default_value_t = false)]
+    pub vex_no_verify: bool,
+
+    /// Pin the VEX document `@id`. See `socket-patch vex --doc-id`.
+    #[arg(long = "vex-doc-id", env = "SOCKET_VEX_DOC_ID")]
+    pub vex_doc_id: Option<String>,
+
+    /// Emit compact (non-pretty) JSON for the VEX document.
+    #[arg(long = "vex-compact", env = "SOCKET_VEX_COMPACT", default_value_t = false)]
+    pub vex_compact: bool,
+}
+
+impl VexEmbedArgs {
+    /// Build the core [`VexBuildParams`] from the embedded flags. The
+    /// output is always the `--vex` path (embedded VEX never writes to
+    /// stdout). Caller must have checked `self.vex.is_some()`.
+    pub(crate) fn to_build_params(&self) -> VexBuildParams {
+        VexBuildParams {
+            output: self.vex.clone(),
+            product: self.vex_product.clone(),
+            no_verify: self.vex_no_verify,
+            doc_id: self.vex_doc_id.clone(),
+            compact: self.vex_compact,
+        }
+    }
+}
+
+/// Plain (non-clap) inputs to [`generate_vex`] so the standalone `vex`
+/// command and the embedded `apply`/`scan` paths feed one code path.
+pub(crate) struct VexBuildParams {
+    /// Where to write the document. `None` => stdout (standalone `vex`
+    /// only); embedded callers always pass `Some(path)`.
+    pub output: Option<PathBuf>,
+    pub product: Option<String>,
+    pub no_verify: bool,
+    pub doc_id: Option<String>,
+    pub compact: bool,
+}
+
+/// Successful result of [`generate_vex`].
+pub(crate) struct VexWriteSummary {
+    pub statements: usize,
+    pub failed: Vec<FailedPatch>,
+    pub wrote_to_file: bool,
+    /// The built document — returned so the standalone `vex` command can
+    /// emit its per-subcomponent envelope without rebuilding.
+    pub doc: Document,
+}
+
+/// Failure from [`generate_vex`], carrying a stable code + message the
+/// caller surfaces in its own output channel.
+pub(crate) struct VexGenError {
+    pub code: &'static str,
+    pub message: String,
+    /// Patches omitted by verification, populated only for the
+    /// `no_applicable_patches` case (so callers can list them).
+    pub failed: Vec<FailedPatch>,
 }
 
 pub async fn run(args: VexArgs) -> i32 {
@@ -117,27 +199,76 @@ pub async fn run(args: VexArgs) -> i32 {
         return 1;
     }
 
-    // Resolve product.
-    let product_id = match resolve_product_id(&args).await {
-        Ok(id) => id,
-        Err(reason) => {
-            emit_envelope_error_and_track(&args, "product_undetected", &reason).await;
-            return 2;
+    let params = VexBuildParams {
+        output: args.output.clone(),
+        product: args.product.clone(),
+        no_verify: args.no_verify,
+        doc_id: args.doc_id.clone(),
+        compact: args.compact,
+    };
+
+    match generate_vex(&args.common, &params, &manifest).await {
+        Ok(summary) => {
+            if args.common.json {
+                emit_envelope_success(&summary.doc, &summary.failed);
+            } else if summary.wrote_to_file {
+                if !args.common.silent {
+                    let path = args.output.as_ref().unwrap().display();
+                    println!(
+                        "Wrote OpenVEX document with {} statement(s) to {path}",
+                        summary.statements
+                    );
+                }
+            } else if !args.common.silent {
+                eprintln!("Emitted {} VEX statement(s)", summary.statements);
+            }
+            0
         }
+        // `no_applicable_patches` is a soft "nothing to attest" (exit 1)
+        // and lists the omitted patches; every other error is a hard
+        // failure (exit 2). `generate_vex` already fired telemetry, so
+        // these emit-only sinks must not re-track.
+        Err(e) if e.code == "no_applicable_patches" => {
+            emit_envelope_error_with_failures(&args, e.code, &e.message, &e.failed);
+            1
+        }
+        Err(e) => {
+            emit_envelope_error(&args, e.code, &e.message);
+            2
+        }
+    }
+}
+
+/// Core VEX pipeline shared by the standalone `vex` command and the
+/// embedded `apply`/`scan` `--vex` paths: resolve the product, verify the
+/// manifest against disk (unless `no_verify`), build the OpenVEX document,
+/// serialize, write (or print to stdout when `output` is `None`), and fire
+/// telemetry. Returns a [`VexWriteSummary`] on success or a structured
+/// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
+/// telemetry is fired here so every caller reports consistently.
+pub(crate) async fn generate_vex(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest: &PatchManifest,
+) -> Result<VexWriteSummary, VexGenError> {
+    // Resolve product.
+    let product_id = match resolve_product_id(common, params.product.as_deref()).await {
+        Ok(id) => id,
+        Err(reason) => return Err(fail(common, "product_undetected", reason).await),
     };
 
     // Partition manifest into applied / failed.
-    let outcome = if args.no_verify {
+    let outcome = if params.no_verify {
         VerifyOutcome {
             applied: manifest.patches.keys().cloned().collect(),
             failed: Vec::new(),
         }
     } else {
-        let package_paths = resolve_package_paths(&args, &manifest).await;
-        socket_patch_core::vex::applied_patches(&manifest, &package_paths).await
+        let package_paths = resolve_package_paths(common, manifest).await;
+        socket_patch_core::vex::applied_patches(manifest, &package_paths).await
     };
 
-    if !outcome.failed.is_empty() && !args.common.silent && !args.common.json {
+    if !outcome.failed.is_empty() && !common.silent && !common.json {
         for f in &outcome.failed {
             eprintln!(
                 "Warning: omitting patch for {} from VEX ({})",
@@ -149,7 +280,7 @@ pub async fn run(args: VexArgs) -> i32 {
     // Build the document.
     let opts = BuildOptions {
         product_id,
-        doc_id: args
+        doc_id: params
             .doc_id
             .clone()
             .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4())),
@@ -157,50 +288,41 @@ pub async fn run(args: VexArgs) -> i32 {
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document(&manifest, &outcome.applied, &opts) {
+    let doc = match build_document(manifest, &outcome.applied, &opts) {
         Some(doc) => doc,
         None => {
             track_vex_failed(
                 "no_applicable_patches",
-                args.common.api_token.as_deref(),
-                args.common.org.as_deref(),
+                common.api_token.as_deref(),
+                common.org.as_deref(),
             )
             .await;
-            emit_envelope_error_with_failures(
-                &args,
-                "no_applicable_patches",
-                "No applied patches with vulnerability metadata to attest.",
-                &outcome.failed,
-            );
-            return 1;
+            return Err(VexGenError {
+                code: "no_applicable_patches",
+                message: "No applied patches with vulnerability metadata to attest.".to_string(),
+                failed: outcome.failed,
+            });
         }
     };
 
     // Serialize.
-    let serialized = if args.compact {
+    let serialized = if params.compact {
         match serde_json::to_string(&doc) {
             Ok(s) => s,
-            Err(e) => {
-                emit_envelope_error_and_track(&args, "serialize_failed", &e.to_string()).await;
-                return 2;
-            }
+            Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
         }
     } else {
         match serde_json::to_string_pretty(&doc) {
             Ok(s) => s,
-            Err(e) => {
-                emit_envelope_error_and_track(&args, "serialize_failed", &e.to_string()).await;
-                return 2;
-            }
+            Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
         }
     };
 
     // Write.
-    let wrote_to_file = match &args.output {
+    let wrote_to_file = match &params.output {
         Some(path) => {
             if let Err(e) = tokio::fs::write(path, &serialized).await {
-                emit_envelope_error_and_track(&args, "write_failed", &e.to_string()).await;
-                return 2;
+                return Err(fail(common, "write_failed", e.to_string()).await);
             }
             true
         }
@@ -210,42 +332,75 @@ pub async fn run(args: VexArgs) -> i32 {
         }
     };
 
-    // Status reporting.
-    if args.common.json {
-        emit_envelope_success(&args, &doc, &outcome.failed);
-    } else if wrote_to_file {
-        let path = args.output.as_ref().unwrap().display();
-        let stmt_count = doc.statements.len();
-        if !args.common.silent {
-            println!(
-                "Wrote OpenVEX document with {stmt_count} statement(s) to {path}"
-            );
-        }
-    } else if !args.common.silent && !args.common.json {
-        let stmt_count = doc.statements.len();
-        eprintln!("Emitted {stmt_count} VEX statement(s)");
-    }
-
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
         if wrote_to_file { "file" } else { "stdout" },
-        args.common.api_token.as_deref(),
-        args.common.org.as_deref(),
+        common.api_token.as_deref(),
+        common.org.as_deref(),
     )
     .await;
 
-    0
+    Ok(VexWriteSummary {
+        statements: doc.statements.len(),
+        failed: outcome.failed,
+        wrote_to_file,
+        doc,
+    })
 }
 
-/// Pick the product PURL from `--product` or by filesystem auto-detect.
-async fn resolve_product_id(args: &VexArgs) -> Result<String, String> {
-    if let Some(p) = &args.product {
-        return Ok(p.clone());
+/// Read the manifest at `manifest_path`, then [`generate_vex`]. Manifest
+/// read failures are wrapped as [`VexGenError`] so embedded callers
+/// (`apply`/`scan`) get a single error channel. Used by the embedded
+/// `--vex` paths, which always write to a file.
+pub(crate) async fn generate_vex_from_manifest_path(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest_path: &Path,
+) -> Result<VexWriteSummary, VexGenError> {
+    let manifest = match read_manifest(manifest_path).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Err(fail(
+                common,
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            )
+            .await)
+        }
+        Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
+    };
+    if manifest.patches.is_empty() {
+        return Err(fail(
+            common,
+            "no_patches",
+            "Manifest is empty — nothing to attest.".to_string(),
+        )
+        .await);
     }
-    let detect = detect_product(&args.common.cwd).await;
+    generate_vex(common, params, &manifest).await
+}
+
+/// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
+/// Centralizes the "track then return error" pattern in [`generate_vex`].
+async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
+    track_vex_failed(code, common.api_token.as_deref(), common.org.as_deref()).await;
+    VexGenError {
+        code,
+        message,
+        failed: Vec::new(),
+    }
+}
+
+/// Pick the product PURL from an explicit override or by filesystem
+/// auto-detect.
+async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Result<String, String> {
+    if let Some(p) = product {
+        return Ok(p.to_string());
+    }
+    let detect = detect_product(&common.cwd).await;
     for w in &detect.warnings {
-        if !args.common.silent && !args.common.json {
+        if !common.silent && !common.json {
             eprintln!("Warning: {w}");
         }
     }
@@ -253,7 +408,7 @@ async fn resolve_product_id(args: &VexArgs) -> Result<String, String> {
         format!(
             "Could not auto-detect a top-level product PURL in {}. \
              Provide one with --product <purl> (e.g. pkg:npm/my-app@1.0.0).",
-            args.common.cwd.display()
+            common.cwd.display()
         )
     })
 }
@@ -261,15 +416,15 @@ async fn resolve_product_id(args: &VexArgs) -> Result<String, String> {
 /// Walk the ecosystem dispatch to build the PURL -> on-disk-path map
 /// used by `vex::verify::applied_patches`.
 async fn resolve_package_paths(
-    args: &VexArgs,
+    common: &GlobalArgs,
     manifest: &PatchManifest,
 ) -> HashMap<String, PathBuf> {
     let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned = partition_purls(&purls, args.common.ecosystems.as_deref());
+    let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
     let crawler_options = CrawlerOptions {
-        cwd: args.common.cwd.clone(),
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
         batch_size: 0, // unused for find_packages_for_rollback
     };
     // Use the rollback (qualified-aware) resolver, NOT
@@ -283,7 +438,7 @@ async fn resolve_package_paths(
     // as `package_not_found`. The rollback variant fans each base path
     // back out to every qualified manifest PURL — the same mapping the
     // manifest was written with (`get` uses the same resolver).
-    find_packages_for_rollback(&partitioned, &crawler_options, args.common.silent).await
+    find_packages_for_rollback(&partitioned, &crawler_options, common.silent).await
 }
 
 fn emit_envelope_error(args: &VexArgs, code: &str, message: &str) {
@@ -333,11 +488,7 @@ fn emit_envelope_error_with_failures(
     }
 }
 
-fn emit_envelope_success(
-    _args: &VexArgs,
-    doc: &socket_patch_core::vex::Document,
-    failures: &[FailedPatch],
-) {
+fn emit_envelope_success(doc: &Document, failures: &[FailedPatch]) {
     let mut env = Envelope::new(Command::Vex);
     for st in &doc.statements {
         for prod in &st.products {

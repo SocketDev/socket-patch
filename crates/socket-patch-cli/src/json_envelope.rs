@@ -74,6 +74,27 @@ pub struct Envelope {
     /// with no sidecar contract (e.g. npm).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<SidecarRecord>,
+    /// Present only when `--vex <path>` was passed to `apply`/`scan` and
+    /// an OpenVEX document was successfully generated as a side-effect of
+    /// the run. Describes where it landed and how many statements it
+    /// carries. A *failed* embedded VEX generation surfaces via `error`
+    /// (and flips the exit code), not here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vex: Option<VexSummary>,
+}
+
+/// Summary of an OpenVEX document emitted as a side-effect of an
+/// `apply`/`scan` run via `--vex`. The full document is written to
+/// `path`; this is just the pointer + headline count for JSON consumers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VexSummary {
+    /// Filesystem path the OpenVEX document was written to.
+    pub path: String,
+    /// Number of OpenVEX statements in the document.
+    pub statements: usize,
+    /// Document format tag, e.g. `"openvex-0.2.0"`.
+    pub format: String,
 }
 
 impl Envelope {
@@ -89,6 +110,7 @@ impl Envelope {
             summary: Summary::default(),
             error: None,
             sidecars: Vec::new(),
+            vex: None,
         }
     }
 
