@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use serial_test::serial;
+use socket_patch_core::crawlers::maven_crawler::parse_pom_group_artifact_version;
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::MavenCrawler;
-use socket_patch_core::crawlers::maven_crawler::parse_pom_group_artifact_version;
 
 fn options_at(root: &Path) -> CrawlerOptions {
     CrawlerOptions {
@@ -23,7 +23,12 @@ fn options_at(root: &Path) -> CrawlerOptions {
 
 /// Stage a maven m2-layout package: <repo>/<group/path>/<artifact>/<version>/
 /// with a minimal pom.xml.
-async fn stage_maven_pkg(repo: &Path, group: &str, artifact: &str, version: &str) -> std::path::PathBuf {
+async fn stage_maven_pkg(
+    repo: &Path,
+    group: &str,
+    artifact: &str,
+    version: &str,
+) -> std::path::PathBuf {
     let group_path = group.replace('.', "/");
     let pkg_dir = repo.join(group_path).join(artifact).join(version);
     tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
@@ -36,7 +41,9 @@ async fn stage_maven_pkg(repo: &Path, group: &str, artifact: &str, version: &str
   <version>{version}</version>
 </project>"#
     );
-    tokio::fs::write(pkg_dir.join(format!("{artifact}-{version}.pom")), pom).await.unwrap();
+    tokio::fs::write(pkg_dir.join(format!("{artifact}-{version}.pom")), pom)
+        .await
+        .unwrap();
     pkg_dir
 }
 
@@ -203,7 +210,9 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
     let tmp = tempfile::tempdir().unwrap();
     let m2 = tmp.path().join(".m2").join("repository");
     tokio::fs::create_dir_all(&m2).await.unwrap();
-    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>").await.unwrap();
+    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
+        .await
+        .unwrap();
 
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
@@ -213,7 +222,10 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
     std::env::set_var("HOME", tmp.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev_local {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
@@ -298,7 +310,10 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
         std::env::remove_var("HOME");
     }
 
-    assert!(paths.is_empty(), "no m2 anywhere must yield empty; got {paths:?}");
+    assert!(
+        paths.is_empty(),
+        "no m2 anywhere must yield empty; got {paths:?}"
+    );
 }
 
 /// `find_by_purls` for a version directory that contains a non-`.pom`
@@ -308,10 +323,16 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
 async fn find_by_purls_version_dir_without_pom_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let group_path = "org/apache/commons";
-    let pkg_dir = tmp.path().join(group_path).join("commons-lang3").join("3.12.0");
+    let pkg_dir = tmp
+        .path()
+        .join(group_path)
+        .join("commons-lang3")
+        .join("3.12.0");
     tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
     // Put a non-.pom file in there — has_pom_file must reject.
-    tokio::fs::write(pkg_dir.join("commons-lang3-3.12.0.jar"), b"fake jar").await.unwrap();
+    tokio::fs::write(pkg_dir.join("commons-lang3-3.12.0.jar"), b"fake jar")
+        .await
+        .unwrap();
 
     let crawler = MavenCrawler;
     let result = crawler
@@ -377,10 +398,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = MavenCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-maven/foo@1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-maven/foo@1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -402,7 +420,10 @@ async fn crawl_all_discovers_packages_in_repo() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.len() >= 2, "must discover both packages; got {result:?}");
+    assert!(
+        result.len() >= 2,
+        "must discover both packages; got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -441,7 +462,10 @@ async fn get_maven_repo_paths_no_marker_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No pom.xml, no build.gradle — not a Java project.
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty(), "non-Java dir must return empty paths");
 }
 
@@ -449,13 +473,18 @@ async fn get_maven_repo_paths_no_marker_returns_empty() {
 #[serial]
 async fn get_maven_repo_paths_with_pom_xml_returns_repo() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>").await.unwrap();
+    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
+        .await
+        .unwrap();
     let repo = tempfile::tempdir().unwrap();
     let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
     std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
     if let Some(v) = prev {
@@ -469,13 +498,18 @@ async fn get_maven_repo_paths_with_pom_xml_returns_repo() {
 #[serial]
 async fn get_maven_repo_paths_with_build_gradle_returns_repo() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("build.gradle"), b"plugins {}").await.unwrap();
+    tokio::fs::write(tmp.path().join("build.gradle"), b"plugins {}")
+        .await
+        .unwrap();
     let repo = tempfile::tempdir().unwrap();
     let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
     std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
     if let Some(v) = prev {
@@ -489,13 +523,18 @@ async fn get_maven_repo_paths_with_build_gradle_returns_repo() {
 #[serial]
 async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("build.gradle.kts"), b"plugins {}").await.unwrap();
+    tokio::fs::write(tmp.path().join("build.gradle.kts"), b"plugins {}")
+        .await
+        .unwrap();
     let repo = tempfile::tempdir().unwrap();
     let prev = std::env::var("MAVEN_REPO_LOCAL").ok();
     std::env::set_var("MAVEN_REPO_LOCAL", repo.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
     if let Some(v) = prev {
@@ -509,7 +548,9 @@ async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
 #[serial]
 async fn get_maven_repo_paths_m2_home_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>").await.unwrap();
+    tokio::fs::write(tmp.path().join("pom.xml"), b"<project/>")
+        .await
+        .unwrap();
     let m2_home = tempfile::tempdir().unwrap();
     let repo_dir = m2_home.path().join("repository");
     tokio::fs::create_dir(&repo_dir).await.unwrap();
@@ -519,7 +560,10 @@ async fn get_maven_repo_paths_m2_home_fallback() {
     std::env::set_var("M2_HOME", m2_home.path());
 
     let crawler = MavenCrawler;
-    let paths = crawler.get_maven_repo_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_maven_repo_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("M2_HOME");
     if let Some(v) = prev_maven_repo {

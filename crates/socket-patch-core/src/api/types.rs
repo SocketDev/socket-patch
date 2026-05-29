@@ -244,4 +244,175 @@ mod tests {
         assert_eq!(back.published_at, "2024-06-15");
         assert!(json.contains("publishedAt"));
     }
+
+    // ── Regression: deserialize from realistic, server-shaped payloads ──
+    //
+    // The structs above are pure serde DTOs, so the only thing that can
+    // break is the JSON field-name contract with the Socket API. The tests
+    // below pin that contract by deserializing payloads in the *exact*
+    // camelCase shape the live endpoints emit (mirroring the integration
+    // fixtures under crates/socket-patch-cli/tests). A dropped or mistyped
+    // `rename_all` / field rename would fail these.
+
+    #[test]
+    fn test_patch_response_full_view_payload_deserialize() {
+        // Mirrors GET /v0/orgs/<slug>/patches/view/<uuid>: populated files
+        // (every PatchFileResponse field present) and a populated
+        // vulnerabilities map keyed by GHSA id.
+        let json = r#"{
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "purl": "pkg:npm/x@1.0.0",
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": "aaaa000000000000000000000000000000000000000000000000000000000000",
+                    "afterHash": "bbbb000000000000000000000000000000000000000000000000000000000000",
+                    "socketBlob": "blob-ref",
+                    "blobContent": "YWZ0ZXIK",
+                    "beforeBlobContent": "YmVmb3JlCg=="
+                }
+            },
+            "vulnerabilities": {
+                "GHSA-jrhj-2j3q-xf3v": {
+                    "cves": ["CVE-2024-1234"],
+                    "summary": "Path traversal",
+                    "severity": "high",
+                    "description": "A path traversal vulnerability"
+                }
+            },
+            "description": "Fix path traversal",
+            "license": "MIT",
+            "tier": "free"
+        }"#;
+        let pr: PatchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.published_at, "2024-01-01T00:00:00Z");
+
+        let file = pr.files.get("package/index.js").expect("file present");
+        assert_eq!(
+            file.before_hash.as_deref(),
+            Some("aaaa000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            file.after_hash.as_deref(),
+            Some("bbbb000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(file.socket_blob.as_deref(), Some("blob-ref"));
+        assert_eq!(file.blob_content.as_deref(), Some("YWZ0ZXIK"));
+        assert_eq!(file.before_blob_content.as_deref(), Some("YmVmb3JlCg=="));
+
+        let vuln = pr
+            .vulnerabilities
+            .get("GHSA-jrhj-2j3q-xf3v")
+            .expect("vuln present");
+        assert_eq!(vuln.cves, vec!["CVE-2024-1234"]);
+        assert_eq!(vuln.severity, "high");
+        assert_eq!(vuln.summary, "Path traversal");
+    }
+
+    #[test]
+    fn test_patch_file_response_absent_optional_keys_are_none() {
+        // serde treats absent Option fields as None. The existing optional-
+        // fields test only round-trips explicit `null`s; this pins the
+        // (distinct) absent-key path the server actually uses when a blob
+        // isn't inlined.
+        let pfr: PatchFileResponse = serde_json::from_str("{}").unwrap();
+        assert!(pfr.before_hash.is_none());
+        assert!(pfr.after_hash.is_none());
+        assert!(pfr.socket_blob.is_none());
+        assert!(pfr.blob_content.is_none());
+        assert!(pfr.before_blob_content.is_none());
+    }
+
+    #[test]
+    fn test_batch_search_response_api_payload_deserialize() {
+        // Mirrors POST /v0/orgs/<slug>/patches/batch. One patch carries a
+        // severity, the other omits it (Option<String> -> None).
+        let json = r#"{
+            "packages": [{
+                "purl": "pkg:npm/x@1.0.0",
+                "patches": [
+                    {
+                        "uuid": "u1",
+                        "purl": "pkg:npm/x@1.0.0",
+                        "tier": "free",
+                        "cveIds": ["CVE-2024-0001"],
+                        "ghsaIds": ["GHSA-1111-2222-3333"],
+                        "severity": "high",
+                        "title": "Patch one"
+                    },
+                    {
+                        "uuid": "u2",
+                        "purl": "pkg:npm/x@1.0.0",
+                        "tier": "paid",
+                        "cveIds": [],
+                        "ghsaIds": [],
+                        "title": "Patch two"
+                    }
+                ]
+            }],
+            "canAccessPaidPatches": true
+        }"#;
+        let bsr: BatchSearchResponse = serde_json::from_str(json).unwrap();
+        assert!(bsr.can_access_paid_patches);
+        assert_eq!(bsr.packages.len(), 1);
+        let patches = &bsr.packages[0].patches;
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0].cve_ids, vec!["CVE-2024-0001"]);
+        assert_eq!(patches[0].ghsa_ids, vec!["GHSA-1111-2222-3333"]);
+        assert_eq!(patches[0].severity.as_deref(), Some("high"));
+        assert!(patches[1].severity.is_none());
+        assert!(patches[1].cve_ids.is_empty());
+    }
+
+    #[test]
+    fn test_organizations_response_deserialize() {
+        // Mirrors GET /v0/organizations: an object keyed by org id. `name`
+        // and `image` are optional (one org omits both).
+        let json = r#"{
+            "organizations": {
+                "org-abc": {
+                    "id": "org-abc",
+                    "name": "Acme",
+                    "image": "https://example.com/a.png",
+                    "plan": "team",
+                    "slug": "acme"
+                },
+                "org-def": {
+                    "id": "org-def",
+                    "plan": "free",
+                    "slug": "beta"
+                }
+            }
+        }"#;
+        let resp: OrganizationsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.organizations.len(), 2);
+        let acme = resp.organizations.get("org-abc").unwrap();
+        assert_eq!(acme.slug, "acme");
+        assert_eq!(acme.name.as_deref(), Some("Acme"));
+        let beta = resp.organizations.get("org-def").unwrap();
+        assert_eq!(beta.slug, "beta");
+        assert!(beta.name.is_none());
+        assert!(beta.image.is_none());
+    }
+
+    #[test]
+    fn test_search_response_api_payload_deserialize() {
+        // Mirrors GET /v0/orgs/<slug>/patches/by-package/<purl>.
+        let json = r#"{
+            "patches": [{
+                "uuid": "u1",
+                "purl": "pkg:npm/x@1.0.0",
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "A patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false
+        }"#;
+        let sr: SearchResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(sr.patches.len(), 1);
+        assert!(!sr.can_access_paid_patches);
+        assert_eq!(sr.patches[0].published_at, "2024-01-01T00:00:00Z");
+    }
 }

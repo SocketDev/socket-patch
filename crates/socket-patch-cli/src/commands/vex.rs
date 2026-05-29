@@ -26,7 +26,7 @@ use socket_patch_core::vex::{
 };
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent,
 };
@@ -270,9 +270,20 @@ async fn resolve_package_paths(
         cwd: args.common.cwd.clone(),
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
-        batch_size: 0, // unused for find_packages_for_purls
+        batch_size: 0, // unused for find_packages_for_rollback
     };
-    find_packages_for_purls(&partitioned, &crawler_options, args.common.silent).await
+    // Use the rollback (qualified-aware) resolver, NOT
+    // `find_packages_for_purls`. Release-variant ecosystems
+    // (PyPI / RubyGems / Maven) key the manifest by *qualified* PURLs
+    // (`?artifact_id=`, `?platform=`, `?classifier=&ext=`), but the
+    // crawler only knows the *base* PURL. `find_packages_for_purls`
+    // would key the result map by the base PURL, so the qualified
+    // lookups in `vex::applied_patches` would all miss and every
+    // PyPI/Gem/Maven patch would be silently dropped from the VEX doc
+    // as `package_not_found`. The rollback variant fans each base path
+    // back out to every qualified manifest PURL — the same mapping the
+    // manifest was written with (`get` uses the same resolver).
+    find_packages_for_rollback(&partitioned, &crawler_options, args.common.silent).await
 }
 
 fn emit_envelope_error(args: &VexArgs, code: &str, message: &str) {

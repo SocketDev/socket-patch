@@ -452,6 +452,210 @@ pub async fn crawl_all_ecosystems(
 mod tests {
     use super::*;
 
+    /// Build a `CrawledPackage` keyed by `purl` whose `path` encodes the
+    /// supplied directory, for exercising the merge helpers in isolation.
+    fn pkg(purl: &str, path: &str) -> CrawledPackage {
+        CrawledPackage {
+            name: "n".to_string(),
+            version: "v".to_string(),
+            namespace: None,
+            purl: purl.to_string(),
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn packages(entries: &[(&str, &str)]) -> HashMap<String, CrawledPackage> {
+        entries
+            .iter()
+            .map(|(purl, path)| (purl.to_string(), pkg(purl, path)))
+            .collect()
+    }
+
+    // ---- merge_first_wins -------------------------------------------------
+
+    #[test]
+    fn merge_first_wins_inserts_crawler_keyed_purls() {
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        merge_first_wins(
+            &mut out,
+            &[],
+            packages(&[("pkg:npm/foo@1.0", "/a"), ("pkg:npm/bar@2.0", "/b")]),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/a")));
+        assert_eq!(out.get("pkg:npm/bar@2.0"), Some(&PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn merge_first_wins_keeps_first_path_across_calls() {
+        // Simulates the macro calling on_match once per discovered path:
+        // the first path that yields a given PURL wins.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/first")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/second")]));
+        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/first")));
+    }
+
+    #[test]
+    fn merge_first_wins_ignores_purls_arg() {
+        // The `purls` slice must not influence first-wins merging — only
+        // the crawler-returned keys matter.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let unrelated = vec!["pkg:npm/unrelated@9.9".to_string()];
+        merge_first_wins(&mut out, &unrelated, packages(&[("pkg:npm/foo@1.0", "/a")]));
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("pkg:npm/foo@1.0"));
+    }
+
+    // ---- merge_qualified --------------------------------------------------
+
+    #[test]
+    fn merge_qualified_fans_base_out_to_every_variant() {
+        // Crawler is queried with the base PURL and returns it keyed to a
+        // single install dir; every caller-supplied qualified variant that
+        // strips to that base must map to the same path.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let qualified = vec![
+            "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
+            "pkg:pypi/requests@2.28.0?artifact_id=sdist".to_string(),
+        ];
+        merge_qualified(
+            &mut out,
+            &qualified,
+            packages(&[("pkg:pypi/requests@2.28.0", "/site-packages")]),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.get("pkg:pypi/requests@2.28.0?artifact_id=wheel"),
+            Some(&PathBuf::from("/site-packages"))
+        );
+        assert_eq!(
+            out.get("pkg:pypi/requests@2.28.0?artifact_id=sdist"),
+            Some(&PathBuf::from("/site-packages"))
+        );
+    }
+
+    #[test]
+    fn merge_qualified_matches_bare_base_identifier() {
+        // A caller may supply the bare base PURL (no `?`); it strips to
+        // itself and must still map to the crawler result.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let purls = vec!["pkg:pypi/requests@2.28.0".to_string()];
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[("pkg:pypi/requests@2.28.0", "/sp")]),
+        );
+        assert_eq!(out.get("pkg:pypi/requests@2.28.0"), Some(&PathBuf::from("/sp")));
+    }
+
+    #[test]
+    fn merge_qualified_does_not_cross_versions() {
+        // A variant of a *different* version must not be mapped to the
+        // crawler result for 2.28.0.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let purls = vec!["pkg:pypi/requests@2.29.0?artifact_id=wheel".to_string()];
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[("pkg:pypi/requests@2.28.0", "/sp")]),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn merge_qualified_keeps_first_path_per_qualified_key() {
+        // First discovered path wins for a given qualified key, mirroring
+        // the per-path iteration in the scan macro.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let purls = vec!["pkg:gem/nokogiri@1.16.5?platform=arm64-darwin".to_string()];
+        merge_qualified(&mut out, &purls, packages(&[("pkg:gem/nokogiri@1.16.5", "/first")]));
+        merge_qualified(&mut out, &purls, packages(&[("pkg:gem/nokogiri@1.16.5", "/second")]));
+        assert_eq!(
+            out.get("pkg:gem/nokogiri@1.16.5?platform=arm64-darwin"),
+            Some(&PathBuf::from("/first"))
+        );
+    }
+
+    // ---- purls_override helpers ------------------------------------------
+
+    #[test]
+    fn dedup_qualified_purls_strips_and_dedupes() {
+        let purls = vec![
+            "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
+            "pkg:pypi/requests@2.28.0?artifact_id=sdist".to_string(),
+            "pkg:pypi/requests@2.28.0".to_string(),
+        ];
+        let mut out = dedup_qualified_purls(&purls);
+        out.sort();
+        assert_eq!(out, vec!["pkg:pypi/requests@2.28.0".to_string()]);
+    }
+
+    #[test]
+    fn dedup_qualified_purls_keeps_distinct_bases() {
+        let purls = vec![
+            "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
+            "pkg:pypi/flask@3.0.0?artifact_id=wheel".to_string(),
+        ];
+        let mut out = dedup_qualified_purls(&purls);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "pkg:pypi/flask@3.0.0".to_string(),
+                "pkg:pypi/requests@2.28.0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn passthrough_purls_is_identity() {
+        let purls = vec![
+            "pkg:npm/foo@1.0".to_string(),
+            "pkg:npm/bar@2.0".to_string(),
+        ];
+        assert_eq!(passthrough_purls(&purls), purls);
+    }
+
+    /// The dedup/merge release-variant treatment must stay aligned with
+    /// `Ecosystem::supports_release_variants()`. If a new ecosystem flips
+    /// that predicate, this test flags that `dispatch_find` needs the
+    /// matching `dedup_qualified_purls` + `variant_merge` wiring.
+    #[test]
+    fn release_variant_predicate_matches_dispatch_expectations() {
+        assert!(Ecosystem::Pypi.supports_release_variants());
+        assert!(Ecosystem::Gem.supports_release_variants());
+        #[cfg(feature = "maven")]
+        assert!(Ecosystem::Maven.supports_release_variants());
+        assert!(!Ecosystem::Npm.supports_release_variants());
+        #[cfg(feature = "cargo")]
+        assert!(!Ecosystem::Cargo.supports_release_variants());
+        #[cfg(feature = "golang")]
+        assert!(!Ecosystem::Golang.supports_release_variants());
+        #[cfg(feature = "composer")]
+        assert!(!Ecosystem::Composer.supports_release_variants());
+        #[cfg(feature = "nuget")]
+        assert!(!Ecosystem::Nuget.supports_release_variants());
+        #[cfg(feature = "deno")]
+        assert!(!Ecosystem::Deno.supports_release_variants());
+    }
+
+    #[cfg(any(feature = "maven", feature = "nuget"))]
+    #[test]
+    fn env_truthy_accepts_one_and_true_case_insensitive() {
+        let key = "SOCKET_TEST_ENV_TRUTHY";
+        std::env::set_var(key, "1");
+        assert!(env_truthy(key));
+        std::env::set_var(key, "TrUe");
+        assert!(env_truthy(key));
+        std::env::set_var(key, "0");
+        assert!(!env_truthy(key));
+        std::env::set_var(key, "yes");
+        assert!(!env_truthy(key));
+        std::env::remove_var(key);
+        assert!(!env_truthy(key));
+    }
+
     #[test]
     fn partition_purls_no_filter_single_npm() {
         let purls = vec!["pkg:npm/foo@1.0".to_string()];
@@ -471,7 +675,15 @@ mod tests {
             "pkg:cargo/baz@3.0".to_string(),
         ];
         let map = partition_purls(&purls, None);
-        assert_eq!(map.len(), 3);
+        // `pkg:cargo/...` is only recognized when the `cargo` feature is
+        // compiled in; otherwise `Ecosystem::from_purl` drops it. Keep the
+        // expected length in step with the active feature set so this test
+        // is correct in both configurations.
+        #[cfg(feature = "cargo")]
+        let expected_len = 3;
+        #[cfg(not(feature = "cargo"))]
+        let expected_len = 2;
+        assert_eq!(map.len(), expected_len);
         assert_eq!(
             map.get(&Ecosystem::Npm),
             Some(&vec!["pkg:npm/foo@1.0".to_string()])

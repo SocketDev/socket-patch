@@ -95,6 +95,52 @@ fn unlock_release_deletes_lock_file_when_free() {
     );
 }
 
+/// `unlock --release` against a `.socket/` directory that has no
+/// lock file reports `released: false` — there was nothing to
+/// release. Regression test: `acquire` creates the lock file on
+/// demand, so a naive `remove_file().is_ok()` check would wrongly
+/// claim it released a pre-existing leftover. The probe must not
+/// leave a lock file behind either (clean slate).
+#[test]
+fn unlock_release_reports_not_released_when_no_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    assert!(!lock_file.exists(), "pre-stage: no lock file expected");
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--release"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "status"), Some("free"));
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(false),
+        "nothing pre-existed, so released must be false: {stdout}"
+    );
+    assert!(
+        !lock_file.exists(),
+        "--release should not leave a probe-created lock file behind"
+    );
+}
+
+/// `unlock --release` against a completely fresh project (no
+/// `.socket/` at all) reports `released: false` and exits 0.
+/// Mirrors the missing-dir branch's contract.
+#[test]
+fn unlock_release_reports_not_released_when_no_socket_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--release"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "status"), Some("free"));
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(false),
+        "no .socket/ existed, so released must be false: {stdout}"
+    );
+}
+
 /// `unlock --release` refuses when the lock is HELD — the file
 /// must NOT be removed (otherwise we'd undermine the OS-level
 /// exclusion). The user has to use `--break-lock` on the mutating

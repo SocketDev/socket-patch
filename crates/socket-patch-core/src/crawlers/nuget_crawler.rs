@@ -74,7 +74,10 @@ impl NuGetCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let pkg_paths = self.get_nuget_package_paths(options).await.unwrap_or_default();
+        let pkg_paths = self
+            .get_nuget_package_paths(options)
+            .await
+            .unwrap_or_default();
 
         for pkg_path in &pkg_paths {
             let found = self.scan_package_dir(pkg_path, &mut seen).await;
@@ -94,8 +97,14 @@ impl NuGetCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) {
-                // Try global cache layout: <lowercase-name>/<version>/
-                let global_dir = pkg_path.join(name.to_lowercase()).join(version);
+                // Try global cache layout: <lowercase-name>/<lowercase-version>/.
+                // NuGet lowercases BOTH the id and the version when it lays
+                // out the global packages folder, so a prerelease tag like
+                // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
+                // the name (but not the version) would miss those packages.
+                let global_dir = pkg_path
+                    .join(name.to_lowercase())
+                    .join(version.to_lowercase());
                 if self.verify_nuget_package(&global_dir).await {
                     result.insert(
                         purl.clone(),
@@ -334,7 +343,12 @@ async fn is_dotnet_project(cwd: &Path) -> bool {
 /// Parse a legacy packages directory name into (name, version).
 ///
 /// Legacy NuGet directories follow the pattern `<Name>.<Version>`, where
-/// the version starts at the last `.` followed by a digit-starting segment.
+/// the version starts at the *first* `.` followed by a digit-starting
+/// segment. NuGet versions always begin with a numeric major component,
+/// and id segments don't start with a digit, so the first numeric-leading
+/// segment marks the name/version boundary. Splitting on the *last* such
+/// dot would wrongly carve `Newtonsoft.Json.13.0.3` into
+/// `("Newtonsoft.Json.13.0", "3")`.
 fn parse_legacy_dir_name(dir_name: &str) -> Option<(String, String)> {
     // Find the first '.' followed by a digit
     let mut split_idx = None;
@@ -382,7 +396,10 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
         if !crate::utils::fs::entry_is_dir(&entry).await {
             continue;
         }
-        let sub_assets = cwd.join(entry.file_name()).join("obj").join("project.assets.json");
+        let sub_assets = cwd
+            .join(entry.file_name())
+            .join("obj")
+            .join("project.assets.json");
         if let Some(pkg_folders) = parse_project_assets_package_folders(&sub_assets).await {
             for folder in pkg_folders {
                 paths.push(folder);
@@ -479,7 +496,9 @@ mod tests {
 
         // Create legacy layout: <Name>.<Version>/
         let pkg_dir = dir.path().join("Newtonsoft.Json.13.0.3");
-        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         let purls = vec!["pkg:nuget/Newtonsoft.Json@13.0.3".to_string()];
@@ -595,7 +614,9 @@ mod tests {
     async fn test_verify_nuget_package_with_lib() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_dir = dir.path().join("testpkg");
-        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         assert!(crawler.verify_nuget_package(&pkg_dir).await);
@@ -617,7 +638,9 @@ mod tests {
 
         // Create a single package
         let pkg_dir = dir.path().join("newtonsoft.json").join("13.0.3");
-        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         let options = CrawlerOptions {
@@ -681,5 +704,76 @@ mod tests {
     #[test]
     fn test_parse_legacy_dir_name_empty_name_guard() {
         assert_eq!(parse_legacy_dir_name(".1.0.0"), None);
+    }
+
+    /// Regression: the name/version split must happen at the *first*
+    /// numeric-leading segment, not the last. A version with three or
+    /// more numeric components (the common case) would otherwise be
+    /// truncated to its final segment.
+    #[test]
+    fn test_parse_legacy_dir_name_splits_at_first_numeric_segment() {
+        assert_eq!(
+            parse_legacy_dir_name("Newtonsoft.Json.13.0.3"),
+            Some(("Newtonsoft.Json".to_string(), "13.0.3".to_string()))
+        );
+        // A four-component version still keeps every numeric segment.
+        assert_eq!(
+            parse_legacy_dir_name("Microsoft.Web.Infrastructure.1.0.0.0"),
+            Some((
+                "Microsoft.Web.Infrastructure".to_string(),
+                "1.0.0.0".to_string()
+            ))
+        );
+    }
+
+    /// Regression: NuGet's global packages folder lowercases the version
+    /// directory as well as the package-id directory. A prerelease tag
+    /// carrying uppercase characters in the PURL (e.g. `2.0.0-RC1`) must
+    /// still resolve to the on-disk `2.0.0-rc1` folder.
+    #[tokio::test]
+    async fn test_find_by_purls_global_cache_lowercases_version() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // On disk both the id and the version are lowercased.
+        let pkg_dir = dir.path().join("contoso.widgets").join("2.0.0-rc1");
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        // The PURL preserves the original (mixed) case for id and version.
+        let purls = vec!["pkg:nuget/Contoso.Widgets@2.0.0-RC1".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let pkg = result
+            .get("pkg:nuget/Contoso.Widgets@2.0.0-RC1")
+            .expect("prerelease package should resolve via lowercased version dir");
+        assert_eq!(pkg.path, pkg_dir);
+        // The reported name/version keep the PURL's original casing.
+        assert_eq!(pkg.name, "Contoso.Widgets");
+        assert_eq!(pkg.version, "2.0.0-RC1");
+    }
+
+    /// Companion to the above: the legacy `<Name>.<Version>/` layout
+    /// preserves the original version casing on disk, and the
+    /// case-insensitive fallback still resolves it when the PURL casing
+    /// differs from the folder casing.
+    #[tokio::test]
+    async fn test_find_by_purls_legacy_case_insensitive_prerelease() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Legacy folder happens to be stored fully lowercased.
+        let pkg_dir = dir.path().join("contoso.widgets.2.0.0-rc1");
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let purls = vec!["pkg:nuget/Contoso.Widgets@2.0.0-RC1".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("pkg:nuget/Contoso.Widgets@2.0.0-RC1"));
     }
 }

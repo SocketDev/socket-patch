@@ -78,7 +78,7 @@ mod reexport_tests {
                 name: "GHSA-x".to_string(),
                 aliases: Vec::new(),
             },
-            timestamp: String::new(),
+            timestamp: None,
             last_updated: None,
             products: Vec::new(),
             status: Status::NotAffected,

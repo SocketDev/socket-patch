@@ -5,7 +5,6 @@
 //! exercise because those tests always pre-stage a layout.
 
 use socket_patch_core::crawlers::types::CrawlerOptions;
-use socket_patch_core::crawlers::{NpmCrawler, PythonCrawler, RubyCrawler};
 #[cfg(feature = "cargo")]
 use socket_patch_core::crawlers::CargoCrawler;
 #[cfg(feature = "golang")]
@@ -14,6 +13,7 @@ use socket_patch_core::crawlers::GoCrawler;
 use socket_patch_core::crawlers::MavenCrawler;
 #[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
+use socket_patch_core::crawlers::{NpmCrawler, PythonCrawler, RubyCrawler};
 use std::path::PathBuf;
 
 /// `CrawlerOptions::default()` should populate cwd from
@@ -47,10 +47,7 @@ fn options_at(root: &std::path::Path) -> CrawlerOptions {
 async fn npm_crawler_find_by_purls_with_empty_purls_returns_empty_map() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = NpmCrawler;
-    let result = crawler
-        .find_by_purls(tmp.path(), &[])
-        .await
-        .unwrap();
+    let result = crawler.find_by_purls(tmp.path(), &[]).await.unwrap();
     assert!(result.is_empty(), "empty PURL list → empty result");
 }
 
@@ -60,10 +57,7 @@ async fn npm_crawler_find_by_purls_with_nonexistent_node_modules_returns_empty()
     let nonexistent = tmp.path().join("missing_node_modules");
     let crawler = NpmCrawler;
     let result = crawler
-        .find_by_purls(
-            &nonexistent,
-            &["pkg:npm/lodash@4.17.21".to_string()],
-        )
+        .find_by_purls(&nonexistent, &["pkg:npm/lodash@4.17.21".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty(), "nonexistent node_modules → empty");

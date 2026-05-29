@@ -23,10 +23,14 @@ use socket_patch_core::crawlers::PythonCrawler;
 
 #[test]
 fn parse_python_site_packages_output_well_formed() {
-    let stdout = "/usr/local/lib/python3.11/site-packages\n/usr/local/lib/python3.11/dist-packages\n";
+    let stdout =
+        "/usr/local/lib/python3.11/site-packages\n/usr/local/lib/python3.11/dist-packages\n";
     let paths = parse_python_site_packages_output(stdout);
     assert_eq!(paths.len(), 2);
-    assert_eq!(paths[0], std::path::PathBuf::from("/usr/local/lib/python3.11/site-packages"));
+    assert_eq!(
+        paths[0],
+        std::path::PathBuf::from("/usr/local/lib/python3.11/site-packages")
+    );
 }
 
 #[test]
@@ -50,8 +54,11 @@ fn parse_python_site_packages_output_trims_and_skips_blanks() {
 /// without needing python3 on the host's PATH.
 #[test]
 fn find_python_command_with_mock_runner_prefers_python3() {
-    let runner = common::MockCommandRunner::new()
-        .with_response("python3", &["--version"], Some("Python 3.11.5\n"));
+    let runner = common::MockCommandRunner::new().with_response(
+        "python3",
+        &["--version"],
+        Some("Python 3.11.5\n"),
+    );
     assert_eq!(find_python_command_with(&runner), Some("python3"));
 }
 
@@ -59,8 +66,11 @@ fn find_python_command_with_mock_runner_prefers_python3() {
 /// fall through to the second candidate.
 #[test]
 fn find_python_command_with_mock_runner_falls_through_to_python() {
-    let runner = common::MockCommandRunner::new()
-        .with_response("python", &["--version"], Some("Python 2.7.18\n"));
+    let runner = common::MockCommandRunner::new().with_response(
+        "python",
+        &["--version"],
+        Some("Python 2.7.18\n"),
+    );
     assert_eq!(find_python_command_with(&runner), Some("python"));
 }
 
@@ -100,8 +110,11 @@ async fn find_python_dirs_python3_wildcard_matches_versions() {
         .await
         .unwrap();
 
-    let result =
-        find_python_dirs(tmp.path(), &["python3.*", "lib", "python3.*", "site-packages"]).await;
+    let result = find_python_dirs(
+        tmp.path(),
+        &["python3.*", "lib", "python3.*", "site-packages"],
+    )
+    .await;
     assert!(
         result.iter().any(|r| r == &p1),
         "must find python3.11 layout; got {result:?}"
@@ -114,15 +127,26 @@ async fn find_python_dirs_python3_wildcard_matches_versions() {
 #[tokio::test]
 async fn find_python_dirs_star_wildcard_matches_all() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::create_dir_all(tmp.path().join("pkg_a").join("lib").join("python3.11").join("site-packages"))
-        .await
-        .unwrap();
-    tokio::fs::create_dir_all(tmp.path().join("pkg_b").join("lib").join("python3.11").join("site-packages"))
-        .await
-        .unwrap();
+    tokio::fs::create_dir_all(
+        tmp.path()
+            .join("pkg_a")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages"),
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(
+        tmp.path()
+            .join("pkg_b")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages"),
+    )
+    .await
+    .unwrap();
 
-    let result =
-        find_python_dirs(tmp.path(), &["*", "lib", "python3.*", "site-packages"]).await;
+    let result = find_python_dirs(tmp.path(), &["*", "lib", "python3.*", "site-packages"]).await;
     assert_eq!(result.len(), 2, "* must match both pkg_a and pkg_b");
 }
 
@@ -132,14 +156,21 @@ async fn find_python_dirs_star_wildcard_matches_all() {
 async fn find_python_dirs_star_wildcard_skips_files() {
     let tmp = tempfile::tempdir().unwrap();
     // A regular file at the wildcard position must NOT cause issues.
-    tokio::fs::write(tmp.path().join("not_a_dir.txt"), b"x").await.unwrap();
-    // And one real match.
-    tokio::fs::create_dir_all(tmp.path().join("real").join("lib").join("python3.11").join("site-packages"))
+    tokio::fs::write(tmp.path().join("not_a_dir.txt"), b"x")
         .await
         .unwrap();
+    // And one real match.
+    tokio::fs::create_dir_all(
+        tmp.path()
+            .join("real")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages"),
+    )
+    .await
+    .unwrap();
 
-    let result =
-        find_python_dirs(tmp.path(), &["*", "lib", "python3.*", "site-packages"]).await;
+    let result = find_python_dirs(tmp.path(), &["*", "lib", "python3.*", "site-packages"]).await;
     assert_eq!(result.len(), 1, "regular file must be skipped");
 }
 
@@ -470,7 +501,9 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
 async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    tokio::fs::write(project.path().join("uv.lock"), b"version = 1\n").await.unwrap();
+    tokio::fs::write(project.path().join("uv.lock"), b"version = 1\n")
+        .await
+        .unwrap();
 
     let prev_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", home.path());
@@ -534,27 +567,26 @@ async fn read_python_metadata_well_formed() {
     .unwrap();
 
     let result = read_python_metadata(&dist_info).await;
-    assert_eq!(
-        result,
-        Some(("requests".to_string(), "2.28.0".to_string()))
-    );
+    assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }
 
-/// Missing METADATA file → None.
+/// Missing METADATA file → fall back to the `<name>-<version>.dist-info`
+/// directory name so a partially-written install stays discoverable.
 #[tokio::test]
-async fn read_python_metadata_missing_file_returns_none() {
+async fn read_python_metadata_missing_file_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
     tokio::fs::create_dir(&dist_info).await.unwrap();
     // No METADATA file.
 
     let result = read_python_metadata(&dist_info).await;
-    assert_eq!(result, None);
+    assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }
 
-/// METADATA missing Name field → None.
+/// METADATA missing Name field → headers are unusable, so fall back to the
+/// directory name rather than dropping the package.
 #[tokio::test]
-async fn read_python_metadata_missing_name_returns_none() {
+async fn read_python_metadata_missing_name_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
     tokio::fs::create_dir(&dist_info).await.unwrap();
@@ -566,7 +598,7 @@ async fn read_python_metadata_missing_name_returns_none() {
     .unwrap();
 
     let result = read_python_metadata(&dist_info).await;
-    assert_eq!(result, None);
+    assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }
 
 #[path = "common/mod.rs"]
@@ -638,7 +670,9 @@ async fn stage_dist_info(site_packages: &Path, raw_name: &str, version: &str) {
     let dist = site_packages.join(format!("{raw_name}-{version}.dist-info"));
     tokio::fs::create_dir_all(&dist).await.unwrap();
     let metadata = format!("Metadata-Version: 2.1\nName: {raw_name}\nVersion: {version}\n");
-    tokio::fs::write(dist.join("METADATA"), metadata).await.unwrap();
+    tokio::fs::write(dist.join("METADATA"), metadata)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -728,7 +762,9 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
     stage_dist_info(tmp.path(), "Requests", "2.28.0").await;
     stage_dist_info(tmp.path(), "urllib3", "2.0.0").await;
     // A non-dist-info dir should be skipped.
-    tokio::fs::create_dir_all(tmp.path().join("ignore-me")).await.unwrap();
+    tokio::fs::create_dir_all(tmp.path().join("ignore-me"))
+        .await
+        .unwrap();
 
     let crawler = PythonCrawler;
     let opts = CrawlerOptions {
@@ -745,11 +781,13 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
 }
 
 #[tokio::test]
-async fn crawl_all_with_corrupt_metadata_skips() {
+async fn crawl_all_with_unparseable_dist_info_skips() {
     let tmp = tempfile::tempdir().unwrap();
-    let dist = tmp.path().join("broken-1.0.0.dist-info");
+    // No version segment in the directory name, so neither the (empty)
+    // METADATA nor the dir-name fallback can yield a name/version — the
+    // package is genuinely unidentifiable and must be skipped.
+    let dist = tmp.path().join("corrupt.dist-info");
     tokio::fs::create_dir_all(&dist).await.unwrap();
-    // Empty METADATA — read_python_metadata returns None.
     tokio::fs::write(dist.join("METADATA"), b"").await.unwrap();
 
     let crawler = PythonCrawler;
@@ -760,7 +798,10 @@ async fn crawl_all_with_corrupt_metadata_skips() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.is_empty(), "broken METADATA must be skipped");
+    assert!(
+        result.is_empty(),
+        "a dist-info with no usable metadata or version-bearing name must be skipped"
+    );
 }
 
 /// `get_site_packages_paths` with `global_prefix` set returns just that
@@ -784,36 +825,35 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
 
 // ── METADATA early-break arm ───────────────────────────────────
 
-/// METADATA with extra header lines AFTER the blank line should NOT be
-/// parsed — the parser must stop at the first blank line after
-/// collecting name+version. Covers `python_crawler.rs:80-81` (the
-/// blank-line break path that fires before both fields are set).
+/// METADATA header lines AFTER the blank line must NOT be parsed — the
+/// header parser stops at the first blank line. Here only `Name` is set
+/// before the blank line, so the `Version` below it is never read from the
+/// headers; the function then falls back to the directory name. We give the
+/// directory a *different* version (`9.9.9`) than the post-blank-line header
+/// (`2.28.0`) so the result proves the blank-line break fired: a `2.28.0`
+/// result would mean the break leaked the trailing header.
 #[tokio::test]
-async fn read_python_metadata_stops_at_blank_line_after_headers() {
+async fn read_python_metadata_stops_at_blank_line_then_falls_back() {
     let tmp = tempfile::tempdir().unwrap();
-    let dist = tmp.path().join("requests-2.28.0.dist-info");
+    let dist = tmp.path().join("requests-9.9.9.dist-info");
     tokio::fs::create_dir(&dist).await.unwrap();
-    // Only `Name` is set when we hit the blank line — version is still
-    // None, so the early both-set break (L71-72) does NOT fire. Instead
-    // we must take the blank-line break at L80-81. After break, the
-    // final-match arm returns None because version was never set.
-    tokio::fs::write(
-        dist.join("METADATA"),
-        "Name: requests\n\nVersion: 2.28.0\n",
-    )
-    .await
-    .unwrap();
+    tokio::fs::write(dist.join("METADATA"), "Name: requests\n\nVersion: 2.28.0\n")
+        .await
+        .unwrap();
 
     let result = read_python_metadata(&dist).await;
     assert_eq!(
-        result, None,
-        "blank-line break must fire before Version is read; got {result:?}"
+        result,
+        Some(("requests".to_string(), "9.9.9".to_string())),
+        "blank-line break must fire before Version is read, so the version \
+         comes from the dir name; got {result:?}"
     );
 }
 
-/// METADATA missing Version field → None.
+/// METADATA missing Version field → headers unusable, fall back to the
+/// directory name.
 #[tokio::test]
-async fn read_python_metadata_missing_version_returns_none() {
+async fn read_python_metadata_missing_version_falls_back_to_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let dist_info = tmp.path().join("requests-2.28.0.dist-info");
     tokio::fs::create_dir(&dist_info).await.unwrap();
@@ -825,5 +865,5 @@ async fn read_python_metadata_missing_version_returns_none() {
     .unwrap();
 
     let result = read_python_metadata(&dist_info).await;
-    assert_eq!(result, None);
+    assert_eq!(result, Some(("requests".to_string(), "2.28.0".to_string())));
 }

@@ -93,6 +93,18 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
         let path = entry.path()?;
         let path_str = path.to_string_lossy().to_string();
 
+        // Strip the `package/` prefix BEFORE validating, so the path we
+        // check is the exact one that gets joined onto `pkg_path`
+        // downstream. Validating the raw, pre-strip path is unsafe: an
+        // entry like `package//etc/passwd` looks harmless before stripping
+        // (no leading separator, and the `//` collapses so there's no `..`
+        // component), but `strip_prefix("package/")` turns it into the
+        // absolute path `/etc/passwd`. `Path::join` resolves an absolute
+        // right-hand side by discarding the base, so that would escape the
+        // package directory entirely. Always validate post-normalization.
+        let normalized = normalize_entry_path(&path_str).to_string();
+        let normalized_path = Path::new(&normalized);
+
         // Reject absolute paths or any `..` components.
         //
         // `Path::is_absolute()` is platform-aware: on Windows it requires
@@ -100,13 +112,13 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
         // is NOT considered absolute and would slip through. Explicitly
         // check the leading byte for `/` and `\` so the guard rejects
         // POSIX-style absolute paths on every platform.
-        let leading_separator = path_str
+        let leading_separator = normalized
             .as_bytes()
             .first()
             .is_some_and(|b| *b == b'/' || *b == b'\\');
-        if path.is_absolute()
+        if normalized_path.is_absolute()
             || leading_separator
-            || path
+            || normalized_path
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
@@ -125,7 +137,6 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             });
         }
 
-        let normalized = normalize_entry_path(&path_str).to_string();
         // `size` is bounded above by MAX_ENTRY_BYTES (16 MiB), so the
         // cast to `usize` is safe on all targets we support.
         let mut bytes = Vec::with_capacity(size as usize);
@@ -187,9 +198,7 @@ mod tests {
         header.set_size(0);
         header.set_mode(0o644);
         header.set_cksum();
-        builder
-            .append_link(&mut header, link_name, target)
-            .unwrap();
+        builder.append_link(&mut header, link_name, target).unwrap();
         builder.into_inner().unwrap().finish().unwrap();
     }
 
@@ -295,6 +304,56 @@ mod tests {
 
         let err = read_archive_to_map(&archive).unwrap_err();
         assert!(matches!(err, ArchiveError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn test_read_archive_rejects_double_slash_package_escape() {
+        // Regression: validation must run on the POST-strip path. The raw
+        // entry `package//etc/passwd` passes every pre-strip check (not
+        // absolute, no leading separator, the `//` collapses so no `..`),
+        // but `strip_prefix("package/")` yields the absolute path
+        // `/etc/passwd`. `pkg_path.join("/etc/passwd")` discards the base
+        // and writes to `/etc/passwd` — an out-of-tree arbitrary write.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"package//etc/passwd", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::UnsafePath(_)),
+            "double-slash package escape must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_archive_rejects_package_prefixed_backslash_escape() {
+        // Sibling of the double-slash case: stripping `package/` from
+        // `package/\evil` leaves `\evil`, a Windows root-relative path the
+        // leading-separator guard must catch post-normalization.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"package/\\evil", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::UnsafePath(_)),
+            "package-prefixed backslash escape must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_archive_rejects_package_prefixed_parent_traversal() {
+        // A `..` that survives the `package/` strip must still be rejected
+        // now that validation happens after normalization.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"package/../../etc/passwd", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::UnsafePath(_)),
+            "package-prefixed parent traversal must be rejected, got {err:?}"
+        );
     }
 
     #[test]

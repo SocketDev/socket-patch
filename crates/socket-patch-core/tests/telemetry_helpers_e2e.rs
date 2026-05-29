@@ -48,7 +48,10 @@ fn telemetry_disabled_when_vitest_env_is_true() {
     let prev_vitest = std::env::var("VITEST").ok();
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
     std::env::set_var("VITEST", "true");
-    assert!(is_telemetry_disabled(), "VITEST=true must disable telemetry");
+    assert!(
+        is_telemetry_disabled(),
+        "VITEST=true must disable telemetry"
+    );
     std::env::remove_var("VITEST");
     if let Some(v) = prev {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
@@ -155,9 +158,15 @@ fn telemetry_not_disabled_when_socket_offline_unset_or_falsy() {
     std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
     std::env::remove_var("VITEST");
     std::env::set_var("SOCKET_OFFLINE", "0");
-    assert!(!is_telemetry_disabled(), "SOCKET_OFFLINE=0 must not engage gate");
+    assert!(
+        !is_telemetry_disabled(),
+        "SOCKET_OFFLINE=0 must not engage gate"
+    );
     std::env::set_var("SOCKET_OFFLINE", "");
-    assert!(!is_telemetry_disabled(), "SOCKET_OFFLINE='' must not engage gate");
+    assert!(
+        !is_telemetry_disabled(),
+        "SOCKET_OFFLINE='' must not engage gate"
+    );
     std::env::remove_var("SOCKET_OFFLINE");
     if let Some(v) = prev_disabled {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);

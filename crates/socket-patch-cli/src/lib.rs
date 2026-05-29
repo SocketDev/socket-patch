@@ -191,6 +191,27 @@ mod tests {
         assert!(!looks_like_uuid("----"));
     }
 
+    #[test]
+    fn looks_like_uuid_accepts_nil_uuid() {
+        // The all-zeros nil UUID is correctly shaped and all-hex.
+        assert!(looks_like_uuid("00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn looks_like_uuid_rejects_surrounding_whitespace() {
+        // The predicate must not trim: a leading/trailing space makes the
+        // first/last group the wrong length (and the space is non-hex).
+        assert!(!looks_like_uuid(" 80630680-4da6-45f9-bba8-b888e0ffd58c"));
+        assert!(!looks_like_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c "));
+    }
+
+    #[test]
+    fn looks_like_uuid_rejects_internal_space() {
+        // A space inside a group keeps the byte length right in one spot but
+        // fails the hex check — guards against byte-length-only acceptance.
+        assert!(!looks_like_uuid("8063068 -4da6-45f9-bba8-b888e0ffd58c"));
+    }
+
     // ---------- parse_with_uuid_fallback ----------
 
     const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
@@ -246,6 +267,51 @@ mod tests {
         let cli = parse_with_uuid_fallback(argv(&["socket-patch", "get", UUID])).unwrap();
         match cli.command {
             Commands::Get(args) => assert_eq!(args.identifier, UUID),
+            _ => panic!("expected Commands::Get"),
+        }
+    }
+
+    #[test]
+    fn fallback_forwards_multiple_flags_in_order() {
+        // Every arg after the program name (UUID included) must be forwarded
+        // after the synthesized `get`, preserving order, so multiple flags
+        // all reach the rewritten command.
+        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--id", "--json"]))
+            .unwrap();
+        match cli.command {
+            Commands::Get(args) => {
+                assert_eq!(args.identifier, UUID);
+                assert!(args.id, "--id should be forwarded to get");
+                assert!(args.common.json, "--json should be forwarded to get");
+            }
+            _ => panic!("expected Commands::Get"),
+        }
+    }
+
+    #[test]
+    fn fallback_handles_no_args_without_panicking() {
+        // Only the program name is present (argv.len() == 1). The
+        // `argv.len() >= 2` guard must short-circuit before indexing argv[1],
+        // so this returns the original clap error rather than panicking.
+        let err = match parse_with_uuid_fallback(argv(&["socket-patch"])) {
+            Ok(_) => panic!("expected parse to fail without a subcommand"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+            "bare invocation should surface clap's missing-subcommand help, not panic"
+        );
+    }
+
+    #[test]
+    fn fallback_rewrites_uppercase_uuid_end_to_end() {
+        // The shape check accepts uppercase; confirm the full fallback path
+        // (not just `looks_like_uuid`) rewrites an uppercase bare UUID to get.
+        const UPPER: &str = "80630680-4DA6-45F9-BBA8-B888E0FFD58C";
+        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UPPER])).unwrap();
+        match cli.command {
+            Commands::Get(args) => assert_eq!(args.identifier, UPPER),
             _ => panic!("expected Commands::Get"),
         }
     }

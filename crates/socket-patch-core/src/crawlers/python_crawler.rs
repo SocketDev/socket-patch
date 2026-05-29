@@ -61,8 +61,36 @@ pub fn canonicalize_pypi_name(name: &str) -> String {
 // Helpers: read Python metadata from dist-info
 // ---------------------------------------------------------------------------
 
-/// Read `Name` and `Version` from a `.dist-info/METADATA` file.
+/// Read `Name` and `Version` for a `.dist-info` directory.
+///
+/// Primary source is the `.dist-info/METADATA` header block. When that
+/// file is missing or malformed (no usable `Name`/`Version`), fall back
+/// to the `<name>-<version>.dist-info` directory name so a corrupt or
+/// partially-written install does not make the package invisible to the
+/// crawler — a real risk for a tool whose job is to find and patch
+/// packages. The fallback only fires for an actual directory, guarding
+/// against a stray `*.dist-info` file masquerading as an install.
 pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, String)> {
+    if let Some(found) = parse_metadata_headers(dist_info_path).await {
+        return Some(found);
+    }
+
+    let is_dir = tokio::fs::metadata(dist_info_path)
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !is_dir {
+        return None;
+    }
+    let dir_name = dist_info_path.file_name()?.to_string_lossy();
+    parse_dist_info_dir_name(&dir_name)
+}
+
+/// Parse the `Name`/`Version` headers from `<dist-info>/METADATA`.
+///
+/// Returns `None` if the file is absent, unreadable, or does not yield a
+/// non-empty `Name` and `Version` before the header/body separator.
+async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String)> {
     let metadata_path = dist_info_path.join("METADATA");
     let content = tokio::fs::read_to_string(&metadata_path).await.ok()?;
 
@@ -88,6 +116,24 @@ pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, Stri
         (Some(n), Some(v)) if !n.is_empty() && !v.is_empty() => Some((n, v)),
         _ => None,
     }
+}
+
+/// Derive `(name, version)` from a `<name>-<version>.dist-info` directory
+/// name. A PEP 440 version never contains `-` (pre-release and local
+/// segments normalize to `aN`/`+local`), so the final `-` is the
+/// name/version boundary even when the distribution name itself contains
+/// a `-` (older pip kept the raw name; newer pip escapes it to `_`).
+/// Either way the caller canonicalizes the name. Returns `None` when the
+/// directory name carries no version segment.
+fn parse_dist_info_dir_name(dir_name: &str) -> Option<(String, String)> {
+    let base = dir_name.strip_suffix(".dist-info")?;
+    let idx = base.rfind('-')?;
+    let name = &base[..idx];
+    let version = &base[idx + 1..];
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -127,11 +173,8 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with("python3.") {
-                let sub = Box::pin(find_python_dirs(
-                    &base_path.join(entry.file_name()),
-                    rest,
-                ))
-                .await;
+                let sub =
+                    Box::pin(find_python_dirs(&base_path.join(entry.file_name()), rest)).await;
                 results.extend(sub);
             }
         }
@@ -141,17 +184,12 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
             if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
-            let sub = Box::pin(find_python_dirs(
-                &base_path.join(entry.file_name()),
-                rest,
-            ))
-            .await;
+            let sub = Box::pin(find_python_dirs(&base_path.join(entry.file_name()), rest)).await;
             results.extend(sub);
         }
     } else {
         // Literal segment: just check if it exists
-        let sub =
-            Box::pin(find_python_dirs(&base_path.join(first), rest)).await;
+        let sub = Box::pin(find_python_dirs(&base_path.join(first), rest)).await;
         results.extend(sub);
     }
 
@@ -304,22 +342,15 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         )
         .await;
 
-        // Python.org framework
+        // Python.org framework: /Library/Frameworks/Python.framework/Versions/
+        // holds bare version dirs (`3.11`, `3.12`, `Current`) — NOT `python3.X`
+        // — so the version segment must be matched with `*`, not `python3.*`.
         let fw_matches = find_python_dirs(
-            Path::new("/Library/Frameworks/Python.framework/Versions"),
-            &["python3.*", "lib", "python3.*", "site-packages"],
-        )
-        .await;
-        for m in fw_matches {
-            add_path(m, &mut seen, &mut results);
-        }
-
-        let fw_matches2 = find_python_dirs(
             Path::new("/Library/Frameworks/Python.framework"),
             &["Versions", "*", "lib", "python3.*", "site-packages"],
         )
         .await;
-        for m in fw_matches2 {
+        for m in fw_matches {
             add_path(m, &mut seen, &mut results);
         }
     }
@@ -371,11 +402,8 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home_dir).join(".pyenv"));
         let pyenv_versions = pyenv_root.join("versions");
-        let pyenv_matches = find_python_dirs(
-            &pyenv_versions,
-            &["*", "lib", "python3.*", "site-packages"],
-        )
-        .await;
+        let pyenv_matches =
+            find_python_dirs(&pyenv_versions, &["*", "lib", "python3.*", "site-packages"]).await;
         for m in pyenv_matches {
             add_path(m, &mut seen, &mut results);
         }
@@ -406,8 +434,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         // %LOCALAPPDATA%\uv\tools
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let uv_base = PathBuf::from(local).join("uv").join("tools");
-            let uv_matches =
-                find_python_dirs(&uv_base, &["*", "Lib", "site-packages"]).await;
+            let uv_matches = find_python_dirs(&uv_base, &["*", "Lib", "site-packages"]).await;
             for m in uv_matches {
                 add_path(m, &mut seen, &mut results);
             }
@@ -452,8 +479,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let uv_python = PathBuf::from(local).join("uv").join("python");
-            let uv_matches =
-                find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
+            let uv_matches = find_python_dirs(&uv_python, &["*", "Lib", "site-packages"]).await;
             for m in uv_matches {
                 add_path(m, &mut seen, &mut results);
             }
@@ -522,7 +548,10 @@ impl PythonCrawler {
     /// Without the marker fallback, a fresh clone with
     /// `pyproject.toml` + `uv.lock` but no `.venv` would silently
     /// return zero packages.
-    pub async fn get_site_packages_paths(&self, options: &CrawlerOptions) -> Result<Vec<PathBuf>, std::io::Error> {
+    pub async fn get_site_packages_paths(
+        &self,
+        options: &CrawlerOptions,
+    ) -> Result<Vec<PathBuf>, std::io::Error> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
@@ -544,7 +573,10 @@ impl PythonCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let sp_paths = self.get_site_packages_paths(options).await.unwrap_or_default();
+        let sp_paths = self
+            .get_site_packages_paths(options)
+            .await
+            .unwrap_or_default();
 
         for sp_path in &sp_paths {
             let found = self.scan_site_packages(sp_path, &mut seen).await;
@@ -765,14 +797,146 @@ mod tests {
         assert!(read_python_metadata(&dist_info).await.is_none());
     }
 
+    #[test]
+    fn test_parse_dist_info_dir_name() {
+        // Modern pip escapes `-` in the name to `_`.
+        assert_eq!(
+            parse_dist_info_dir_name("flask_sqlalchemy-3.0.5.dist-info"),
+            Some(("flask_sqlalchemy".to_string(), "3.0.5".to_string()))
+        );
+        // Older pip kept the raw name with `-`; the final `-` is still the
+        // version boundary because a normalized version never contains `-`.
+        assert_eq!(
+            parse_dist_info_dir_name("Flask-SQLAlchemy-3.0.5.dist-info"),
+            Some(("Flask-SQLAlchemy".to_string(), "3.0.5".to_string()))
+        );
+        assert_eq!(
+            parse_dist_info_dir_name("requests-2.28.0.dist-info"),
+            Some(("requests".to_string(), "2.28.0".to_string()))
+        );
+        // No version segment, wrong suffix, and empty-name guards.
+        assert!(parse_dist_info_dir_name("noversion.dist-info").is_none());
+        assert!(parse_dist_info_dir_name("requests-2.28.0.egg-info").is_none());
+        assert!(parse_dist_info_dir_name("-1.0.dist-info").is_none());
+    }
+
+    /// A `.dist-info` directory whose `METADATA` is missing must still be
+    /// discoverable via the directory name — otherwise a corrupt/partial
+    /// install silently hides a package the crawler is meant to patch.
+    #[tokio::test]
+    async fn test_read_python_metadata_falls_back_to_dir_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let dist_info = dir.path().join("requests-2.28.0.dist-info");
+        tokio::fs::create_dir_all(&dist_info).await.unwrap();
+        // No METADATA file written at all.
+        let (name, version) = read_python_metadata(&dist_info).await.unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(version, "2.28.0");
+    }
+
+    /// Malformed METADATA (present but missing the `Version` header) also
+    /// falls back to the directory name rather than dropping the package.
+    #[tokio::test]
+    async fn test_read_python_metadata_falls_back_on_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dist_info = dir.path().join("urllib3-2.0.7.dist-info");
+        tokio::fs::create_dir_all(&dist_info).await.unwrap();
+        tokio::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: urllib3\n\nDescription body, no Version header\n",
+        )
+        .await
+        .unwrap();
+        let (name, version) = read_python_metadata(&dist_info).await.unwrap();
+        assert_eq!(name, "urllib3");
+        assert_eq!(version, "2.0.7");
+    }
+
+    /// A stray *file* named `*.dist-info` must NOT be surfaced as a package
+    /// via the directory-name fallback.
+    #[tokio::test]
+    async fn test_read_python_metadata_ignores_stray_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join("ghost-1.0.dist-info");
+        tokio::fs::write(&stray, b"not a dir").await.unwrap();
+        assert!(read_python_metadata(&stray).await.is_none());
+    }
+
+    /// `crawl_all` recovers a package whose METADATA is missing by parsing
+    /// the `.dist-info` directory name.
+    #[tokio::test]
+    async fn test_crawl_all_recovers_metadata_less_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join(".venv");
+        #[cfg(windows)]
+        let sp = venv.join("Lib").join("site-packages");
+        #[cfg(not(windows))]
+        let sp = venv.join("lib").join("python3.11").join("site-packages");
+        tokio::fs::create_dir_all(&sp).await.unwrap();
+        // dist-info dir exists but has no METADATA (partial install).
+        tokio::fs::create_dir_all(sp.join("flask_sqlalchemy-3.0.5.dist-info"))
+            .await
+            .unwrap();
+
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "flask-sqlalchemy");
+        assert_eq!(packages[0].version, "3.0.5");
+        assert_eq!(packages[0].purl, "pkg:pypi/flask-sqlalchemy@3.0.5");
+    }
+
+    /// Regression for the macOS Python.framework layout: the `Versions/`
+    /// directory holds bare version dirs (`3.11`), so the version segment
+    /// must be matched with `*`. A `python3.*` pattern matches nothing —
+    /// which is exactly the bug that was fixed.
+    #[tokio::test]
+    async fn test_find_python_dirs_framework_versions_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir
+            .path()
+            .join("Versions")
+            .join("3.11")
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&sp).await.unwrap();
+
+        // Correct pattern (`*` for the version dir) finds it.
+        let ok = find_python_dirs(
+            &dir.path().join("Versions"),
+            &["*", "lib", "python3.*", "site-packages"],
+        )
+        .await;
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0], sp);
+
+        // The buggy pattern (`python3.*` for the version dir) matches nothing.
+        let buggy = find_python_dirs(
+            &dir.path().join("Versions"),
+            &["python3.*", "lib", "python3.*", "site-packages"],
+        )
+        .await;
+        assert!(buggy.is_empty());
+    }
+
     #[tokio::test]
     async fn test_find_python_dirs_literal() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("lib").join("python3.11").join("site-packages");
+        let target = dir
+            .path()
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
         tokio::fs::create_dir_all(&target).await.unwrap();
 
-        let results =
-            find_python_dirs(dir.path(), &["lib", "python3.*", "site-packages"]).await;
+        let results = find_python_dirs(dir.path(), &["lib", "python3.*", "site-packages"]).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], target);
     }
@@ -780,8 +944,16 @@ mod tests {
     #[tokio::test]
     async fn test_find_python_dirs_wildcard() {
         let dir = tempfile::tempdir().unwrap();
-        let sp1 = dir.path().join("lib").join("python3.10").join("site-packages");
-        let sp2 = dir.path().join("lib").join("python3.11").join("site-packages");
+        let sp1 = dir
+            .path()
+            .join("lib")
+            .join("python3.10")
+            .join("site-packages");
+        let sp2 = dir
+            .path()
+            .join("lib")
+            .join("python3.11")
+            .join("site-packages");
         tokio::fs::create_dir_all(&sp1).await.unwrap();
         tokio::fs::create_dir_all(&sp2).await.unwrap();
 
@@ -789,8 +961,7 @@ mod tests {
         let non_match = dir.path().join("lib").join("ruby3.0").join("site-packages");
         tokio::fs::create_dir_all(&non_match).await.unwrap();
 
-        let results =
-            find_python_dirs(dir.path(), &["lib", "python3.*", "site-packages"]).await;
+        let results = find_python_dirs(dir.path(), &["lib", "python3.*", "site-packages"]).await;
         assert_eq!(results.len(), 2);
     }
 

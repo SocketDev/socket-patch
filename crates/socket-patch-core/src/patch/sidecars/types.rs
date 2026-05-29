@@ -44,8 +44,10 @@ pub struct SidecarRecord {
     pub advisory: Option<SidecarAdvisory>,
 }
 
-/// One file the fixup rewrote, deleted, or created. Paths are
-/// relative to the package directory the patch landed in.
+/// One file the fixup rewrote or deleted. Paths are relative to the
+/// package directory the patch landed in. (There is deliberately no
+/// "created" action — see [`SidecarFileAction`], which reserves no
+/// variants ahead of an ecosystem that actually produces them.)
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SidecarFile {
@@ -218,6 +220,63 @@ mod tests {
             serde_json::to_value(SidecarSeverity::Error).unwrap(),
             serde_json::Value::String("error".to_string())
         );
+    }
+
+    /// Contract: `files` is ALWAYS present in the serialized record,
+    /// even for advisory-only ecosystems (PyPI / gem / Go) whose record
+    /// carries an empty file list. Consumers iterate `.sidecars[].files[]`
+    /// unconditionally; dropping the key — e.g. via a stray
+    /// `skip_serializing_if = "Vec::is_empty"` copied from
+    /// `Envelope.sidecars` one layer up — would silently force every
+    /// consumer to null-guard. Locks the "Empty (but always present)"
+    /// guarantee documented on `SidecarRecord::files`.
+    #[test]
+    fn files_always_present_even_when_empty() {
+        let r = SidecarRecord {
+            purl: "pkg:pypi/requests@2.28.0".to_string(),
+            ecosystem: "pypi".to_string(),
+            files: Vec::new(),
+            advisory: Some(SidecarAdvisory {
+                code: SidecarAdvisoryCode::PypiRecordStale,
+                severity: SidecarSeverity::Warning,
+                message: "advisory only".to_string(),
+            }),
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            obj.contains_key("files"),
+            "`files` must always serialize, even when empty"
+        );
+        assert_eq!(
+            obj["files"],
+            serde_json::Value::Array(Vec::new()),
+            "empty file list must serialize as `[]`, not be omitted"
+        );
+    }
+
+    /// Contract: the fixup-failed path — the only scenario that emits
+    /// `SidecarSeverity::Error` (see `apply.rs`) — pairs the `Error`
+    /// severity with the `SidecarFixupFailed` code, an empty `files`
+    /// list, and an advisory. Pins the exact JSON a consumer branches
+    /// on to distinguish "the patch landed but the sidecar fixup blew
+    /// up" from an informational advisory.
+    #[test]
+    fn fixup_failed_serializes_error_severity_and_code() {
+        let r = SidecarRecord {
+            purl: "pkg:cargo/x@1.0.0".to_string(),
+            ecosystem: "cargo".to_string(),
+            files: Vec::new(),
+            advisory: Some(SidecarAdvisory {
+                code: SidecarAdvisoryCode::SidecarFixupFailed,
+                severity: SidecarSeverity::Error,
+                message: "sidecar fixup failed (patch still applied): boom".to_string(),
+            }),
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["advisory"]["code"], "sidecar_fixup_failed");
+        assert_eq!(v["advisory"]["severity"], "error");
+        assert_eq!(v["files"], serde_json::Value::Array(Vec::new()));
     }
 
     /// Multi-file record + advisory together — the NuGet

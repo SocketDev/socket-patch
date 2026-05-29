@@ -219,7 +219,6 @@ pub fn build_cargo_purl(name: &str, version: &str) -> String {
     format!("pkg:cargo/{name}@{version}")
 }
 
-
 /// Check if a string looks like a PURL.
 pub fn is_purl(s: &str) -> bool {
     s.starts_with("pkg:")
@@ -378,10 +377,7 @@ mod tests {
 
     #[test]
     fn test_build_gem_purl() {
-        assert_eq!(
-            build_gem_purl("rails", "7.1.0"),
-            "pkg:gem/rails@7.1.0"
-        );
+        assert_eq!(build_gem_purl("rails", "7.1.0"), "pkg:gem/rails@7.1.0");
     }
 
     #[test]
@@ -405,8 +401,14 @@ mod tests {
         );
         assert_eq!(parse_maven_purl("pkg:npm/lodash@4.17.21"), None);
         assert_eq!(parse_maven_purl("pkg:maven/@3.12.0"), None);
-        assert_eq!(parse_maven_purl("pkg:maven/org.apache.commons/@3.12.0"), None);
-        assert_eq!(parse_maven_purl("pkg:maven/org.apache.commons/commons-lang3@"), None);
+        assert_eq!(
+            parse_maven_purl("pkg:maven/org.apache.commons/@3.12.0"),
+            None
+        );
+        assert_eq!(
+            parse_maven_purl("pkg:maven/org.apache.commons/commons-lang3@"),
+            None
+        );
     }
 
     #[cfg(feature = "maven")]
@@ -572,4 +574,103 @@ mod tests {
         assert_eq!(version, "8.0.0");
     }
 
+    // --- Regression: qualifier handling -------------------------------------
+    //
+    // Qualifiers are stripped *before* the version is split off with
+    // `rfind('@')`. This matters because a qualifier *value* can itself
+    // contain an `@` (e.g. a `git@github.com` source URL). If stripping
+    // ran after the `@` search, that trailing `@` would be mistaken for
+    // the version separator and corrupt both name and version.
+
+    #[test]
+    fn test_strip_qualifiers_with_embedded_at() {
+        assert_eq!(
+            strip_purl_qualifiers("pkg:pypi/requests@2.28.0?vcs_url=git@github.com:psf/requests"),
+            "pkg:pypi/requests@2.28.0"
+        );
+    }
+
+    #[test]
+    fn test_parse_pypi_qualifier_with_embedded_at() {
+        // The `@github.com` inside the qualifier value must not be read
+        // as the version separator.
+        assert_eq!(
+            parse_pypi_purl("pkg:pypi/requests@2.28.0?vcs_url=git@github.com"),
+            Some(("requests", "2.28.0"))
+        );
+    }
+
+    #[test]
+    fn test_parse_gem_with_trailing_qualifier() {
+        assert_eq!(
+            parse_gem_purl("pkg:gem/nokogiri@1.16.5?platform=java"),
+            Some(("nokogiri", "1.16.5"))
+        );
+    }
+
+    #[cfg(feature = "maven")]
+    #[test]
+    fn test_parse_maven_qualifier_with_embedded_at() {
+        // groupId/artifactId split must survive an `@` buried in a
+        // qualifier value.
+        assert_eq!(
+            parse_maven_purl(
+                "pkg:maven/org.apache.commons/commons-lang3@3.12.0?repository_url=user@host"
+            ),
+            Some(("org.apache.commons", "commons-lang3", "3.12.0"))
+        );
+    }
+
+    #[cfg(feature = "composer")]
+    #[test]
+    fn test_parse_composer_qualifier_with_embedded_at() {
+        assert_eq!(
+            parse_composer_purl("pkg:composer/monolog/monolog@3.5.0?source=git@github.com"),
+            Some((("monolog", "monolog"), "3.5.0"))
+        );
+    }
+
+    #[cfg(feature = "golang")]
+    #[test]
+    fn test_parse_golang_keeps_full_module_path() {
+        // The module path retains its internal slashes — only the
+        // version is split off. A trailing qualifier is ignored.
+        assert_eq!(
+            parse_golang_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1?type=module"),
+            Some(("github.com/gin-gonic/gin", "v1.9.1"))
+        );
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_parse_jsr_with_trailing_qualifier() {
+        // Scope `@` + version `@` + qualifier `@` all coexist; only the
+        // version `@` should be honored.
+        assert_eq!(
+            parse_jsr_purl("pkg:jsr/@std/path@0.220.0?download_url=x@y"),
+            Some((("@std", "path"), "0.220.0"))
+        );
+    }
+
+    // --- Regression: purl_matches_identifier for non-PyPI keys --------------
+
+    #[test]
+    fn test_purl_matches_identifier_qualified_id_needs_exact_key() {
+        // A qualified identifier must not match an unqualified manifest
+        // key, even when their bases are equal.
+        assert!(!purl_matches_identifier(
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/lodash@4.17.21?foo=bar"
+        ));
+    }
+
+    #[test]
+    fn test_purl_matches_identifier_base_id_matches_qualified_nonpypi_key() {
+        // A base identifier matches a qualified manifest key in any
+        // ecosystem (gems can carry a `?platform=` qualifier).
+        assert!(purl_matches_identifier(
+            "pkg:gem/nokogiri@1.16.5?platform=java",
+            "pkg:gem/nokogiri@1.16.5"
+        ));
+    }
 }

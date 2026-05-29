@@ -258,10 +258,11 @@ fn repair_download_only_skips_cleanup() {
     // We can't use `run_repair` here because it injects `--offline`,
     // and `--offline` is mutually exclusive with `--download-only`
     // (offline = strict airgap, download-only = network-only). Invoke
-    // the binary directly. The manifest already references every
-    // patched blob, so even without `--offline` there's nothing
-    // missing for the download phase to actually fetch — the test
-    // stays hermetic.
+    // the binary directly. We pin `--download-mode file` so the
+    // already-present `afterHash` blob fully satisfies the download
+    // phase — there's nothing missing to fetch, so the test stays
+    // hermetic (no network). The default `diff` mode would instead look
+    // for `<uuid>.tar.gz`, which is absent, and try to hit the network.
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
@@ -269,7 +270,7 @@ fn repair_download_only_skips_cleanup() {
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
     let out = Command::new(binary())
-        .args(["repair", "--json", "--download-only"])
+        .args(["repair", "--json", "--download-only", "--download-mode", "file"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .output()

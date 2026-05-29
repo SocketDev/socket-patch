@@ -253,4 +253,34 @@ mod tests {
     fn confirm_skip_prompt_and_is_json_both_set_returns_default_yes() {
         assert!(confirm("?", true, true, true));
     }
+
+    // ---- select_one ----
+    //
+    // Only the `is_json` branch is exercised here: it returns before reading
+    // stdin, so it is deterministic regardless of whether the test runs under
+    // a TTY. The non-TTY auto-select (`Ok(0)`) and the interactive
+    // `dialoguer` branches both depend on / consume the real stdin and would
+    // hang or vary by environment, so they are intentionally left to the e2e
+    // suite (see get.rs `select_patches` coverage).
+
+    #[test]
+    fn select_one_json_mode_requires_explicit_selection() {
+        let opts = vec!["first".to_string(), "second".to_string()];
+        match select_one("pick one", &opts, true) {
+            Err(SelectError::JsonModeNeedsExplicit) => {}
+            Err(SelectError::Cancelled) => panic!("json mode must not report Cancelled"),
+            Ok(idx) => panic!("json mode must not auto-select (got index {idx})"),
+        }
+    }
+
+    #[test]
+    fn select_one_json_mode_ignores_options_contents() {
+        // Even with a single option, JSON mode must defer to an explicit
+        // `--id` rather than silently picking it.
+        let opts = vec!["only".to_string()];
+        assert!(matches!(
+            select_one("pick", &opts, true),
+            Err(SelectError::JsonModeNeedsExplicit)
+        ));
+    }
 }

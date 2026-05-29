@@ -30,7 +30,9 @@ async fn stage_npm_pkg(node_modules: &Path, name: &str, version: &str) {
     let pkg_dir = node_modules.join(name);
     tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
     let pkg_json = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
-    tokio::fs::write(pkg_dir.join("package.json"), pkg_json).await.unwrap();
+    tokio::fs::write(pkg_dir.join("package.json"), pkg_json)
+        .await
+        .unwrap();
 }
 
 // ── parse_package_name ─────────────────────────────────────────
@@ -77,13 +79,12 @@ fn build_npm_purl_scoped() {
 async fn read_package_json_well_formed() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
-    tokio::fs::write(&pkg, r#"{"name":"lodash","version":"4.17.21"}"#).await.unwrap();
+    tokio::fs::write(&pkg, r#"{"name":"lodash","version":"4.17.21"}"#)
+        .await
+        .unwrap();
 
     let result = read_package_json(&pkg).await;
-    assert_eq!(
-        result,
-        Some(("lodash".to_string(), "4.17.21".to_string()))
-    );
+    assert_eq!(result, Some(("lodash".to_string(), "4.17.21".to_string())));
 }
 
 #[tokio::test]
@@ -107,7 +108,9 @@ async fn read_package_json_malformed_returns_none() {
 async fn read_package_json_missing_name_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
-    tokio::fs::write(&pkg, r#"{"version":"1.0.0"}"#).await.unwrap();
+    tokio::fs::write(&pkg, r#"{"version":"1.0.0"}"#)
+        .await
+        .unwrap();
 
     let result = read_package_json(&pkg).await;
     assert_eq!(result, None);
@@ -117,7 +120,9 @@ async fn read_package_json_missing_name_returns_none() {
 async fn read_package_json_missing_version_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
-    tokio::fs::write(&pkg, r#"{"name":"lodash"}"#).await.unwrap();
+    tokio::fs::write(&pkg, r#"{"name":"lodash"}"#)
+        .await
+        .unwrap();
 
     let result = read_package_json(&pkg).await;
     assert_eq!(result, None);
@@ -129,7 +134,9 @@ async fn read_package_json_missing_version_returns_none() {
 async fn read_package_json_empty_name_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
-    tokio::fs::write(&pkg, r#"{"name":"","version":"1.0.0"}"#).await.unwrap();
+    tokio::fs::write(&pkg, r#"{"name":"","version":"1.0.0"}"#)
+        .await
+        .unwrap();
     assert_eq!(read_package_json(&pkg).await, None);
 }
 
@@ -137,7 +144,9 @@ async fn read_package_json_empty_name_returns_none() {
 async fn read_package_json_empty_version_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("package.json");
-    tokio::fs::write(&pkg, r#"{"name":"lodash","version":""}"#).await.unwrap();
+    tokio::fs::write(&pkg, r#"{"name":"lodash","version":""}"#)
+        .await
+        .unwrap();
     assert_eq!(read_package_json(&pkg).await, None);
 }
 
@@ -246,7 +255,10 @@ fn with_empty_path<F: FnOnce()>(f: F) {
 fn get_npm_global_prefix_returns_err_when_npm_not_on_path() {
     with_empty_path(|| {
         let result = get_npm_global_prefix();
-        assert!(result.is_err(), "npm-not-on-PATH must return Err; got {result:?}");
+        assert!(
+            result.is_err(),
+            "npm-not-on-PATH must return Err; got {result:?}"
+        );
     });
 }
 
@@ -293,8 +305,7 @@ fn get_npm_global_prefix_with_mock_runner_returns_path() {
 
 #[test]
 fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
-    let runner =
-        common::MockCommandRunner::new().with_response("npm", &["root", "-g"], Some(""));
+    let runner = common::MockCommandRunner::new().with_response("npm", &["root", "-g"], Some(""));
     assert!(get_npm_global_prefix_with(&runner).is_err());
 }
 
@@ -303,8 +314,11 @@ fn get_npm_global_prefix_with_mock_runner_empty_stdout_returns_err() {
 #[cfg(unix)]
 #[test]
 fn get_yarn_global_prefix_with_mock_runner_success() {
-    let runner =
-        common::MockCommandRunner::new().with_response("yarn", &["global", "dir"], Some("/Users/foo/.yarn/global\n"));
+    let runner = common::MockCommandRunner::new().with_response(
+        "yarn",
+        &["global", "dir"],
+        Some("/Users/foo/.yarn/global\n"),
+    );
     assert_eq!(
         get_yarn_global_prefix_with(&runner).as_deref(),
         Some("/Users/foo/.yarn/global/node_modules")
@@ -449,10 +463,7 @@ async fn find_by_purls_strips_qualifiers() {
 
     let crawler = NpmCrawler;
     let result = crawler
-        .find_by_purls(
-            &nm,
-            &["pkg:npm/lodash@4.17.21?extension=tgz".to_string()],
-        )
+        .find_by_purls(&nm, &["pkg:npm/lodash@4.17.21?extension=tgz".to_string()])
         .await
         .unwrap();
     // Note: result key uses the original purl, but lookup back uses
@@ -462,7 +473,10 @@ async fn find_by_purls_strips_qualifiers() {
     // `pkg:npm/lodash@4.17.21` which doesn't match the qualified
     // input — so the result is empty. The important coverage is that
     // parse_purl_components successfully strips the qualifier.
-    assert!(result.is_empty(), "qualifier strip + synth mismatch must yield empty");
+    assert!(
+        result.is_empty(),
+        "qualifier strip + synth mismatch must yield empty"
+    );
 }
 
 /// PURL with no `@` (no version separator) must be rejected via the
@@ -526,10 +540,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = NpmCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-npm/foo@1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-npm/foo@1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -556,7 +567,9 @@ async fn crawl_all_discovers_unscoped_and_scoped() {
 async fn crawl_all_skips_dirs_without_package_json() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
-    tokio::fs::create_dir_all(nm.join("not_a_pkg")).await.unwrap();
+    tokio::fs::create_dir_all(nm.join("not_a_pkg"))
+        .await
+        .unwrap();
     // No package.json — must be skipped.
 
     let crawler = NpmCrawler;
@@ -589,18 +602,39 @@ async fn crawl_all_recurses_into_workspace_packages() {
 async fn crawl_all_skips_hidden_and_skip_dirs() {
     let tmp = tempfile::tempdir().unwrap();
     // Hidden dirs and SKIP_DIRS entries (dist/build/coverage/tmp/...) are skipped.
-    stage_npm_pkg(&tmp.path().join(".hidden").join("node_modules"), "should-not-find", "1.0").await;
-    stage_npm_pkg(&tmp.path().join("dist").join("node_modules"), "also-not", "1.0").await;
+    stage_npm_pkg(
+        &tmp.path().join(".hidden").join("node_modules"),
+        "should-not-find",
+        "1.0",
+    )
+    .await;
+    stage_npm_pkg(
+        &tmp.path().join("dist").join("node_modules"),
+        "also-not",
+        "1.0",
+    )
+    .await;
     // But a real workspace dir should be picked up.
-    stage_npm_pkg(&tmp.path().join("real-ws").join("node_modules"), "found-me", "1.0").await;
+    stage_npm_pkg(
+        &tmp.path().join("real-ws").join("node_modules"),
+        "found-me",
+        "1.0",
+    )
+    .await;
 
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
     assert!(names.contains(&"found-me"));
-    assert!(!names.contains(&"should-not-find"), "hidden dir must be skipped");
-    assert!(!names.contains(&"also-not"), "SKIP_DIRS dir must be skipped");
+    assert!(
+        !names.contains(&"should-not-find"),
+        "hidden dir must be skipped"
+    );
+    assert!(
+        !names.contains(&"also-not"),
+        "SKIP_DIRS dir must be skipped"
+    );
 }
 
 #[path = "common/mod.rs"]
@@ -624,7 +658,10 @@ async fn crawl_all_handles_unreadable_node_modules() {
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&nm);
 
-    assert!(result.is_empty(), "unreadable node_modules must yield empty");
+    assert!(
+        result.is_empty(),
+        "unreadable node_modules must yield empty"
+    );
 }
 
 /// `find_workspace_node_modules` short-circuits cleanly when it
@@ -640,7 +677,12 @@ async fn crawl_all_handles_unreadable_workspace_dir() {
     }
     let tmp = tempfile::tempdir().unwrap();
     // Readable workspace.
-    stage_npm_pkg(&tmp.path().join("readable").join("node_modules"), "ok", "1.0.0").await;
+    stage_npm_pkg(
+        &tmp.path().join("readable").join("node_modules"),
+        "ok",
+        "1.0.0",
+    )
+    .await;
     // Unreadable workspace.
     let blocked = tmp.path().join("blocked");
     tokio::fs::create_dir(&blocked).await.unwrap();
@@ -654,7 +696,10 @@ async fn crawl_all_handles_unreadable_workspace_dir() {
 
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
     assert!(names.contains(&"ok"));
-    assert!(!names.contains(&"hidden"), "unreadable workspace must be skipped");
+    assert!(
+        !names.contains(&"hidden"),
+        "unreadable workspace must be skipped"
+    );
 }
 
 /// Drives scoped-package scanning + nested node_modules recursion +
@@ -683,13 +728,19 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
     .await;
 
     // Hidden subdir inside @scope — must be skipped (L581-583).
-    tokio::fs::create_dir_all(nm.join("@scope").join(".hidden")).await.unwrap();
+    tokio::fs::create_dir_all(nm.join("@scope").join(".hidden"))
+        .await
+        .unwrap();
     // A plain file inside @scope — must be skipped via the !is_dir &&
     // !is_symlink arm (L590-591).
-    tokio::fs::write(nm.join("@scope").join("README.md"), b"x").await.unwrap();
+    tokio::fs::write(nm.join("@scope").join("README.md"), b"x")
+        .await
+        .unwrap();
     // A plain file at top of node_modules too — exercises the same arm
     // in scan_node_modules.
-    tokio::fs::write(nm.join("top-level-file.txt"), b"y").await.unwrap();
+    tokio::fs::write(nm.join("top-level-file.txt"), b"y")
+        .await
+        .unwrap();
 
     // Nested node_modules with a scoped subentry — drives the L650-653 arm
     // (nested → scan_scoped_packages).
@@ -717,10 +768,60 @@ async fn crawl_all_skips_dirs_with_corrupt_package_json() {
     let nm = tmp.path().join("node_modules");
     let bad = nm.join("broken");
     tokio::fs::create_dir_all(&bad).await.unwrap();
-    tokio::fs::write(bad.join("package.json"), b"{ corrupt").await.unwrap();
+    tokio::fs::write(bad.join("package.json"), b"{ corrupt")
+        .await
+        .unwrap();
 
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
+}
+
+/// Regression: a symlinked package inside a nested `node_modules` (the
+/// shape pnpm and `npm link` produce — top-level entries are symlinks
+/// into a content-addressed store) must itself be recorded, but the
+/// crawler must NOT recurse *through* the symlink into the store. Doing
+/// so would surface store-internal packages that aren't part of the
+/// project's dependency tree and could escape the project root
+/// entirely. `scan_nested_node_modules` guards its deeper recursion with
+/// `if file_type.is_dir()`, matching its sibling scanners; this pins
+/// that behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
+    use std::os::unix::fs::symlink;
+
+    // The "store" lives OUTSIDE the crawled cwd, so the only route to it
+    // is through the symlink — not via workspace discovery.
+    let store = tempfile::tempdir().unwrap();
+    let linked_pkg = store.path().join("linked-pkg");
+    stage_npm_pkg(store.path(), "linked-pkg", "2.0.0").await;
+    // The store package has its own nested node_modules with a package
+    // that must only be reachable by following the symlink.
+    stage_npm_pkg(&linked_pkg.join("node_modules"), "buried", "3.0.0").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    // A real host package with a real nested node_modules...
+    stage_npm_pkg(&nm, "host", "1.0.0").await;
+    let host_nm = nm.join("host").join("node_modules");
+    tokio::fs::create_dir_all(&host_nm).await.unwrap();
+    // ...containing a SYMLINK to the out-of-tree store package.
+    symlink(&linked_pkg, host_nm.join("linked-pkg")).unwrap();
+
+    let crawler = NpmCrawler;
+    let opts = options_at(tmp.path());
+    let result = crawler.crawl_all(&opts).await;
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+
+    assert!(names.contains(&"host"), "real host package must be found");
+    assert!(
+        names.contains(&"linked-pkg"),
+        "the symlinked package itself must still be recorded"
+    );
+    assert!(
+        !names.contains(&"buried"),
+        "crawler must not recurse through the symlink into the store"
+    );
 }

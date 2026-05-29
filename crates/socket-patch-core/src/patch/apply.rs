@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 use crate::manifest::schema::PatchFileInfo;
@@ -324,13 +326,22 @@ pub async fn apply_file_patch(
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    // The atomic stage+rename below — and the copy-on-write break, which
+    // also stages a sibling file — need write permission on the *parent
+    // directory*, not just on the file. Go's module cache marks both its
+    // files (0o444) and its directories (0o555) read-only, so without
+    // this the stage-file creation fails with EACCES (where the old
+    // in-place write, like `rollback.rs`, only had to relax the file's
+    // own mode). Temporarily grant owner-write on the directory; the
+    // guard restores its exact mode below.
+    let dir_guard = DirWriteGuard::acquire(filepath.parent()).await;
+
     // Copy-on-write defense against pnpm / bazel / nix shared inodes.
     // If `filepath` is a symlink into a content store, or a hardlink
     // shared with other projects, give this project a private inode
     // before we mutate. No-op on regular private files (single
     // syscall). See `patch::cow`.
-    break_hardlink_if_needed(&filepath).await?;
-
+    //
     // Atomic write: stage in the parent directory, fsync, rename onto
     // the target. POSIX `rename(2)` is atomic — observers see either
     // the old bytes or the new bytes, never a truncated half-write.
@@ -341,7 +352,16 @@ pub async fn apply_file_patch(
     // user-writable inode over the target instead of trying to open
     // a read-only file for write. `restore_file_permissions` then
     // re-applies the pre-patch mode + uid/gid to the new inode.
-    write_atomic(&filepath, patched_content).await?;
+    //
+    // Both steps run inside a closure so the directory mode is ALWAYS
+    // restored — even if a step errors — before the failure propagates.
+    let write_result = async {
+        break_hardlink_if_needed(&filepath).await?;
+        write_atomic(&filepath, patched_content).await
+    }
+    .await;
+    dir_guard.restore().await;
+    write_result?;
 
     // Restore (or set) the final permissions on the post-rename inode.
     // On Unix this includes chown back to the pre-patch uid/gid (or
@@ -350,6 +370,65 @@ pub async fn apply_file_patch(
     restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
 
     Ok(())
+}
+
+/// Guard that temporarily grants owner-write on a directory so the
+/// stage+rename write path can create and move files inside it, then
+/// restores the directory's original mode.
+///
+/// Go's module cache (and some Nix/Bazel layouts) mark package
+/// directories read-only (`0o555`). Creating the `.socket-stage-*` file
+/// and renaming it over the target both require write permission on the
+/// directory, so we relax it for the duration of the write and put it
+/// back exactly as we found it. [`DirWriteGuard::restore`] is a no-op
+/// when nothing was changed (already-writable dir, missing dir, a
+/// `set_permissions` failure, or non-Unix — where a directory's
+/// read-only attribute does not gate file creation).
+pub(crate) struct DirWriteGuard {
+    #[cfg(unix)]
+    relock: Option<(PathBuf, u32)>,
+}
+
+impl DirWriteGuard {
+    pub(crate) async fn acquire(dir: Option<&Path>) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(dir) = dir {
+                if let Ok(meta) = tokio::fs::metadata(dir).await {
+                    let mode = meta.permissions().mode();
+                    // Owner-write bit missing → relax it, remembering the
+                    // original mode so `restore` can re-lock the dir.
+                    if mode & 0o200 == 0 {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(mode | 0o200);
+                        if tokio::fs::set_permissions(dir, perms).await.is_ok() {
+                            return Self {
+                                relock: Some((dir.to_path_buf(), mode)),
+                            };
+                        }
+                    }
+                }
+            }
+            Self { relock: None }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Self {}
+        }
+    }
+
+    pub(crate) async fn restore(self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some((dir, mode)) = self.relock {
+                let _ =
+                    tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).await;
+            }
+        }
+    }
 }
 
 /// Write `content` to `target` atomically via stage + rename.
@@ -369,11 +448,7 @@ async fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "anon".to_string());
-    let stage = parent.join(format!(
-        ".socket-stage-{}-{}",
-        stem,
-        uuid::Uuid::new_v4()
-    ));
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
 
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -396,6 +471,20 @@ async fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
     }
+
+    // Durability: `sync_all` above flushed the file's *data*, but the
+    // rename only updated the parent directory entry. fsync the
+    // directory so the rename itself survives a crash — otherwise a
+    // post-crash filesystem could surface the old name (or neither).
+    // Unix only; best-effort, since a directory we can't open for fsync
+    // must not fail an otherwise-successful write.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
     Ok(())
 }
 
@@ -418,12 +507,16 @@ async fn restore_file_permissions(
 
         match pre_patch {
             Some(meta) => {
-                // Existing file: re-apply the original mode + ownership.
-                let restored = std::fs::Permissions::from_mode(meta.mode());
-                tokio::fs::set_permissions(filepath, restored).await?;
+                // Existing file: re-apply the original ownership FIRST,
+                // then the mode. Order matters — `chown(2)` clears the
+                // setuid/setgid bits for an unprivileged caller (even when
+                // the uid/gid are unchanged), so the chmod must run last
+                // to restore the mode bit-for-bit, setuid/setgid included.
                 let uid = meta.uid();
                 let gid = meta.gid();
                 chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid)).await?;
+                let restored = std::fs::Permissions::from_mode(meta.mode());
+                tokio::fs::set_permissions(filepath, restored).await?;
             }
             None => {
                 // New file. Inherit owner/group from the parent dir.
@@ -431,8 +524,7 @@ async fn restore_file_permissions(
                     if let Ok(parent_meta) = tokio::fs::metadata(parent).await {
                         let uid = parent_meta.uid();
                         let gid = parent_meta.gid();
-                        chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid))
-                            .await?;
+                        chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid)).await?;
                     }
                 }
                 // Default new-file mode: read-only for all.
@@ -570,7 +662,9 @@ pub async fn apply_package_patch(
 
     if all_done_or_skipped {
         // Some or all files were not found but skipped via --force
-        let not_found_count = result.files_verified.iter()
+        let not_found_count = result
+            .files_verified
+            .iter()
             .filter(|v| v.status == VerifyStatus::NotFound)
             .count();
         result.success = true;
@@ -603,9 +697,7 @@ pub async fn apply_package_patch(
     for (file_name, file_info) in files {
         let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
         if let Some(vr) = verify_result {
-            if vr.status == VerifyStatus::AlreadyPatched
-                || vr.status == VerifyStatus::NotFound
-            {
+            if vr.status == VerifyStatus::AlreadyPatched || vr.status == VerifyStatus::NotFound {
                 continue;
             }
         }
@@ -831,7 +923,10 @@ mod tests {
 
     #[test]
     fn test_normalize_file_path_with_prefix() {
-        assert_eq!(normalize_file_path("package/lib/server.js"), "lib/server.js");
+        assert_eq!(
+            normalize_file_path("package/lib/server.js"),
+            "lib/server.js"
+        );
     }
 
     #[test]
@@ -847,7 +942,10 @@ mod tests {
     #[test]
     fn test_normalize_file_path_package_not_prefix() {
         // "package" without trailing "/" should NOT be stripped
-        assert_eq!(normalize_file_path("packagefoo/bar.js"), "packagefoo/bar.js");
+        assert_eq!(
+            normalize_file_path("packagefoo/bar.js"),
+            "packagefoo/bar.js"
+        );
     }
 
     #[tokio::test]
@@ -925,7 +1023,9 @@ mod tests {
         let before_hash = compute_git_sha256_from_bytes(content);
 
         // File is at lib/server.js but patch refers to package/lib/server.js
-        tokio::fs::create_dir_all(dir.path().join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(dir.path().join("lib"))
+            .await
+            .unwrap();
         tokio::fs::write(dir.path().join("lib/server.js"), content)
             .await
             .unwrap();
@@ -1059,7 +1159,11 @@ mod tests {
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, patched);
         // Mode preserved bit-for-bit.
-        let mode_after = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+        let mode_after = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o7777;
         assert_eq!(
             mode_after, 0o444,
@@ -1089,7 +1193,11 @@ mod tests {
             .await
             .unwrap();
 
-        let mode_after = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+        let mode_after = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o7777;
         assert_eq!(mode_after, 0o755);
     }
@@ -1117,7 +1225,11 @@ mod tests {
 
         let path = dir.path().join(nested);
         // Default new-file mode is 0o444.
-        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode()
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o7777;
         assert_eq!(mode, 0o444, "new files default to read-only");
 
@@ -1154,6 +1266,230 @@ mod tests {
         assert_eq!(pre.gid(), post.gid());
     }
 
+    /// Read-only package directory (Go's module cache marks both files
+    /// 0o444 AND directories 0o555). The stage+rename write path needs
+    /// owner-write on the directory; `apply_file_patch` must grant it for
+    /// the write and then restore the directory to its exact prior mode.
+    /// Regression: before the `DirWriteGuard` fix the stage-file creation
+    /// failed with EACCES and the patch could not be applied at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_in_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.js");
+        let original = b"original";
+        let patched = b"patched content";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(&path, original).await.unwrap();
+        // Read-only file inside a read-only directory.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "index.js", patched, &patched_hash)
+            .await
+            .expect("apply must succeed even inside a read-only directory");
+
+        // Content updated.
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), patched);
+        // File mode restored.
+        assert_eq!(
+            tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+        // Directory mode restored to exactly what it was (0o555).
+        assert_eq!(
+            tokio::fs::metadata(dir.path())
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o555,
+            "directory mode must be restored after the write"
+        );
+        // No stage litter survived in the directory.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".socket-stage-"), "stage leaked: {name}");
+        }
+
+        // Re-grant write so the TempDir can clean itself up.
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
+    /// A brand-new file created by a patch inside a read-only directory:
+    /// the directory must be temporarily writable for the create, then
+    /// restored, and the new file gets the default 0o444 mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_new_file_in_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let patched = b"brand new\n";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "new.js", patched, &patched_hash)
+            .await
+            .expect("new-file apply must succeed inside a read-only directory");
+
+        let path = dir.path().join("new.js");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), patched);
+        assert_eq!(
+            tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o444
+        );
+        // Directory mode restored.
+        assert_eq!(
+            tokio::fs::metadata(dir.path())
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o555
+        );
+
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
+    /// setuid/setgid bits survive the patch round-trip. `chown(2)` strips
+    /// these bits even when the uid/gid are unchanged, so the restore
+    /// must chown BEFORE it chmods. Regression: the prior chmod-then-chown
+    /// order silently dropped the setuid bit on every patched file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_preserves_setuid_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suid-bin");
+        let patched = b"new payload";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(&path, b"old payload").await.unwrap();
+        // setuid + rwxr-xr-x.
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755))
+            .await
+            .unwrap();
+        // Guard: skip if the filesystem refused the setuid bit (some
+        // mount options strip it) so the test stays meaningful where it
+        // can run and never gives a false failure where it can't.
+        let pre = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        if pre != 0o4755 {
+            return;
+        }
+
+        apply_file_patch(dir.path(), "suid-bin", patched, &patched_hash)
+            .await
+            .unwrap();
+
+        let mode_after = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode_after, 0o4755,
+            "setuid bit must survive the patch (chown must run before chmod)"
+        );
+    }
+
+    /// End-to-end blob apply against a fully read-only package directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_package_patch_in_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(pkg_dir.path().join("index.js"), original)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+        // Lock both the file and the directory down (Go cache layout).
+        tokio::fs::set_permissions(
+            pkg_dir.path().join("index.js"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(pkg_dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: after_hash.clone(),
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:golang/example.com/x@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(result.files_patched.len(), 1);
+        let written = tokio::fs::read(pkg_dir.path().join("index.js"))
+            .await
+            .unwrap();
+        assert_eq!(written, patched);
+
+        tokio::fs::set_permissions(pkg_dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_apply_package_patch_success() {
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -1183,9 +1519,16 @@ mod tests {
             },
         );
 
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
 
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 1);
@@ -1213,15 +1556,24 @@ mod tests {
             },
         );
 
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, true, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            true,
+            false,
+        )
+        .await;
 
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0); // dry run: nothing actually patched
 
         // File should still have original content
-        let content = tokio::fs::read(pkg_dir.path().join("index.js")).await.unwrap();
+        let content = tokio::fs::read(pkg_dir.path().join("index.js"))
+            .await
+            .unwrap();
         assert_eq!(content, original);
     }
 
@@ -1246,9 +1598,16 @@ mod tests {
             },
         );
 
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
 
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
@@ -1272,9 +1631,16 @@ mod tests {
             },
         );
 
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
 
         assert!(!result.success);
         assert!(result.error.is_some());
@@ -1308,9 +1674,16 @@ mod tests {
         );
 
         // Without force: should fail
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(!result.success);
 
         // Reset the file
@@ -1319,13 +1692,22 @@ mod tests {
             .unwrap();
 
         // With force: should succeed
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, true)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            true,
+        )
+        .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 1);
 
-        let written = tokio::fs::read(pkg_dir.path().join("index.js")).await.unwrap();
+        let written = tokio::fs::read(pkg_dir.path().join("index.js"))
+            .await
+            .unwrap();
         assert_eq!(written, patched);
     }
 
@@ -1344,15 +1726,29 @@ mod tests {
         );
 
         // Without force: should fail (NotFound for non-new file)
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, false)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(!result.success);
 
         // With force: should succeed by skipping the missing file
-        let result =
-            apply_package_patch("pkg:npm/test@1.0.0", pkg_dir.path(), &files, &PatchSources::blobs_only(blobs_dir.path()), None, false, true)
-                .await;
+        let result = apply_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            true,
+        )
+        .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
     }
@@ -1399,7 +1795,7 @@ mod tests {
     /// disk, all of (package, diff, blob) available with valid patched
     /// content. Caller can then delete sources to test fallback.
     async fn make_fixture() -> (
-        tempfile::TempDir, // root holding pkg/, blobs/, packages/, diffs/
+        tempfile::TempDir,  // root holding pkg/, blobs/, packages/, diffs/
         std::path::PathBuf, // pkg dir
         std::path::PathBuf, // blobs dir
         std::path::PathBuf, // packages dir
@@ -1449,7 +1845,16 @@ mod tests {
             },
         );
 
-        (root, pkg_dir, blobs_dir, packages_dir, diffs_dir, files, original, patched)
+        (
+            root,
+            pkg_dir,
+            blobs_dir,
+            packages_dir,
+            diffs_dir,
+            files,
+            original,
+            patched,
+        )
     }
 
     #[tokio::test]

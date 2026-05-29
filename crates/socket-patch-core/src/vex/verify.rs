@@ -73,10 +73,21 @@ pub async fn applied_patches(
 
 /// Returns `Ok(())` if every file in `record.files` is `AlreadyPatched`.
 /// Otherwise returns a short routing tag describing the first failure.
+///
+/// A record with **no files** is *not* treated as applied. Verification
+/// is the strict counterpart to `--no-verify`: it must produce positive
+/// on-disk evidence before a patch is attested as `not_affected`. A
+/// zero-file record offers nothing to hash, so — per the module's
+/// "omit when unconfirmed" contract — it is reported as `no_files` and
+/// dropped from the VEX document rather than vacuously attested.
 async fn verify_patch_record(
     pkg_path: &Path,
     record: &crate::manifest::schema::PatchRecord,
 ) -> Result<(), String> {
+    if record.files.is_empty() {
+        return Err("no_files".to_string());
+    }
+
     for (file_name, file_info) in &record.files {
         let result = verify_file_patch(pkg_path, file_name, file_info).await;
         match result.status {
@@ -141,9 +152,10 @@ mod tests {
     #[tokio::test]
     async fn missing_path_falls_into_failed() {
         let mut manifest = PatchManifest::new();
-        manifest
-            .patches
-            .insert("pkg:npm/x@1.0.0".to_string(), record_with_one_file("deadbeef"));
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record_with_one_file("deadbeef"),
+        );
 
         let paths: HashMap<String, PathBuf> = HashMap::new();
         let out = applied_patches(&manifest, &paths).await;
@@ -162,7 +174,9 @@ mod tests {
         let mut manifest = PatchManifest::new();
         manifest.patches.insert(
             "pkg:npm/x@1.0.0".to_string(),
-            record_with_one_file("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
         );
 
         let mut paths = HashMap::new();
@@ -179,7 +193,9 @@ mod tests {
         let mut manifest = PatchManifest::new();
         manifest.patches.insert(
             "pkg:npm/x@1.0.0".to_string(),
-            record_with_one_file("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
         );
 
         let mut paths = HashMap::new();
@@ -278,13 +294,16 @@ mod tests {
         assert!(out.failed.is_empty());
     }
 
-    /// A patch with `files = {}` is vacuously applied — the
-    /// "all files match" predicate is `true` over an empty set.
-    /// This is intentional behavior: a "patch" that touches no
-    /// files is always-applied. Documented here so a future
-    /// refactor that flips the predicate is forced to revisit it.
+    /// A patch with `files = {}` must NOT be treated as applied.
+    /// Verification requires positive on-disk evidence before a patch
+    /// is attested as `not_affected`; a zero-file record offers nothing
+    /// to hash, so it is omitted with reason `no_files`. Attesting it as
+    /// "fixed" would be an evidence-free claim, contradicting the
+    /// module's "omit when unconfirmed" contract. (The `--no-verify`
+    /// path, which trusts the manifest wholesale, is unaffected — it
+    /// never calls this function.)
     #[tokio::test]
-    async fn patch_record_with_zero_files_is_vacuously_applied() {
+    async fn patch_record_with_zero_files_is_not_applied() {
         let pkg_dir = tempfile::tempdir().unwrap();
         let mut manifest = PatchManifest::new();
         manifest.patches.insert(
@@ -307,8 +326,13 @@ mod tests {
         );
 
         let out = applied_patches(&manifest, &paths).await;
-        assert_eq!(out.applied, vec!["pkg:npm/empty@1.0.0".to_string()]);
-        assert!(out.failed.is_empty());
+        assert!(
+            out.applied.is_empty(),
+            "a zero-file patch must not be attested as applied"
+        );
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].purl, "pkg:npm/empty@1.0.0");
+        assert_eq!(out.failed[0].reason, "no_files");
     }
 
     /// Extra `package_paths` entries that aren't in the manifest
@@ -406,6 +430,267 @@ mod tests {
         assert!(
             matches!(reason.as_str(), "hash_mismatch" | "not_applied"),
             "unexpected reason: {reason}"
+        );
+    }
+
+    /// A new-file patch (empty `beforeHash`) whose file exists on disk
+    /// at the `afterHash` content counts as applied. `verify_file_patch`
+    /// returns `AlreadyPatched` before its is-new-file `Ready` branch, so
+    /// the created-and-applied case is not misreported as `not_applied`.
+    #[tokio::test]
+    async fn new_file_present_at_after_hash_is_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let created = b"freshly-created-file";
+        let hash = compute_git_sha256_from_bytes(created);
+        tokio::fs::write(pkg_dir.path().join("new.js"), created)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(), // new file
+                after_hash: hash,
+            },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// A new-file patch whose file is absent on disk is `not_applied`
+    /// (the creation hasn't happened yet) — NOT `file_not_found`. The
+    /// empty `beforeHash` routes through the `Ready` branch.
+    #[tokio::test]
+    async fn new_file_absent_is_not_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let mut files = HashMap::new();
+        files.insert(
+            "new.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(), // new file, not yet created
+                after_hash:
+                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                        .to_string(),
+            },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed[0].reason, "not_applied");
+    }
+
+    /// A no-op patch where `beforeHash == afterHash` and the file is at
+    /// that content is applied — `verify_file_patch` checks `afterHash`
+    /// first, so it never mistakes the file for the un-patched `Ready`
+    /// state.
+    #[tokio::test]
+    async fn noop_patch_before_equals_after_is_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let content = b"unchanged-content";
+        let hash = compute_git_sha256_from_bytes(content);
+        tokio::fs::write(pkg_dir.path().join("index.js"), content)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: hash.clone(),
+                after_hash: hash,
+            },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// A multi-file patch where EVERY file is at its `afterHash` is
+    /// applied — the loop must run to completion (no early `Ok`) and
+    /// bucket the PURL into `applied`.
+    #[tokio::test]
+    async fn multi_file_all_patched_is_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let a = b"patched-a";
+        let b = b"patched-b";
+        let hash_a = compute_git_sha256_from_bytes(a);
+        let hash_b = compute_git_sha256_from_bytes(b);
+        tokio::fs::write(pkg_dir.path().join("a.js"), a).await.unwrap();
+        tokio::fs::write(pkg_dir.path().join("b.js"), b).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "a.js".to_string(),
+            PatchFileInfo { before_hash: "aaaa".to_string(), after_hash: hash_a },
+        );
+        files.insert(
+            "b.js".to_string(),
+            PatchFileInfo { before_hash: "bbbb".to_string(), after_hash: hash_b },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/x@1.0.0".to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// A manifest with both an applied PURL and a failing PURL splits
+    /// cleanly across the two buckets. Order is HashMap-nondeterministic,
+    /// so we assert membership, not index.
+    #[tokio::test]
+    async fn mixed_manifest_splits_into_both_buckets() {
+        let ok_dir = tempfile::tempdir().unwrap();
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(ok_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+
+        // Failing package: file present but at the wrong content.
+        let bad_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(bad_dir.path().join("index.js"), b"wrong")
+            .await
+            .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/ok@1.0.0".to_string(), record_with_one_file(&hash));
+        manifest.patches.insert(
+            "pkg:npm/bad@1.0.0".to_string(),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/ok@1.0.0".to_string(), ok_dir.path().to_path_buf());
+        paths.insert("pkg:npm/bad@1.0.0".to_string(), bad_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert_eq!(out.applied, vec!["pkg:npm/ok@1.0.0".to_string()]);
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].purl, "pkg:npm/bad@1.0.0");
+        assert_eq!(out.failed[0].reason, "hash_mismatch");
+    }
+
+    /// At most ONE `FailedPatch` is recorded per PURL even when several
+    /// files would fail — `verify_patch_record` returns on the first
+    /// failure. Two distinct failing files, single failure recorded.
+    #[tokio::test]
+    async fn at_most_one_failure_recorded_per_purl() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        // a.js: hash mismatch (neither before nor after).
+        tokio::fs::write(pkg_dir.path().join("a.js"), b"garbage")
+            .await
+            .unwrap();
+        // b.js: absent → would be file_not_found.
+
+        let mut files = HashMap::new();
+        files.insert(
+            "a.js".to_string(),
+            PatchFileInfo { before_hash: "aaaa".to_string(), after_hash: "deadbeef".to_string() },
+        );
+        files.insert(
+            "b.js".to_string(),
+            PatchFileInfo { before_hash: "bbbb".to_string(), after_hash: "deadbeef".to_string() },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed.len(), 1, "one FailedPatch per PURL, not per file");
+        assert!(
+            matches!(out.failed[0].reason.as_str(), "hash_mismatch" | "file_not_found"),
+            "unexpected reason: {}",
+            out.failed[0].reason
         );
     }
 }

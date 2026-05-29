@@ -32,7 +32,11 @@ fn exact_full_name_match_wins() {
         pkg("node-fetch", "3.0.0", None),
     ];
     let results = fuzzy_match_packages("@types/node", &packages, 20);
-    assert_eq!(results.len(), 1, "exact full-name match excludes substrings");
+    assert_eq!(
+        results.len(),
+        1,
+        "exact full-name match excludes substrings"
+    );
     assert_eq!(results[0].name, "node");
     assert_eq!(results[0].namespace.as_deref(), Some("@types"));
 }
@@ -52,7 +56,10 @@ fn exact_name_match_wins_over_prefix() {
 
 #[test]
 fn prefix_match_orders_before_contains() {
-    let packages = vec![pkg("lodash", "4.17.21", None), pkg("lodash-es", "4.17.21", None)];
+    let packages = vec![
+        pkg("lodash", "4.17.21", None),
+        pkg("lodash-es", "4.17.21", None),
+    ];
     let results = fuzzy_match_packages("lodash", &packages, 20);
     assert_eq!(results.len(), 2);
     assert_eq!(
@@ -88,6 +95,18 @@ fn case_insensitive_match() {
     let packages = vec![pkg("React", "18.0.0", None)];
     let results = fuzzy_match_packages("react", &packages, 20);
     assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn same_tier_ties_break_case_insensitively() {
+    // Both names contain "e" (prefix of neither), so they share a match tier
+    // and the alphabetical tie-break — which must ignore case — decides which
+    // package becomes `matches[0]` and drives the patch lookup in `get`.
+    let packages = vec![pkg("Zebra", "1.0.0", None), pkg("apple", "1.0.0", None)];
+    let results = fuzzy_match_packages("e", &packages, 20);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].name, "apple");
+    assert_eq!(results[1].name, "Zebra");
 }
 
 #[test]

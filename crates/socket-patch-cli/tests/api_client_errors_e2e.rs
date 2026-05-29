@@ -356,7 +356,11 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 0, "repair must exit 0 even with download failures; stdout={stdout}");
+    assert_eq!(
+        code, 1,
+        "repair must exit non-zero when an artifact download fails so CI guarding on \
+         the exit code doesn't treat a half-finished repair as success; stdout={stdout}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must be JSON");
     // The repair envelope's summary tracks failures.

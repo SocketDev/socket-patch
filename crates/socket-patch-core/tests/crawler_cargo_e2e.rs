@@ -22,21 +22,25 @@ fn options_at(root: &Path) -> CrawlerOptions {
 async fn stage_registry_crate(src: &Path, name: &str, version: &str) -> std::path::PathBuf {
     let pkg = src.join(format!("{name}-{version}"));
     tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
-    let cargo_toml = format!(
-        "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-    );
-    tokio::fs::write(pkg.join("Cargo.toml"), cargo_toml).await.unwrap();
-    tokio::fs::write(pkg.join("src").join("lib.rs"), b"// stub").await.unwrap();
+    let cargo_toml =
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+    tokio::fs::write(pkg.join("Cargo.toml"), cargo_toml)
+        .await
+        .unwrap();
+    tokio::fs::write(pkg.join("src").join("lib.rs"), b"// stub")
+        .await
+        .unwrap();
     pkg
 }
 
 async fn stage_vendor_crate(src: &Path, name: &str, version: &str) -> std::path::PathBuf {
     let pkg = src.join(name);
     tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
-    let cargo_toml = format!(
-        "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-    );
-    tokio::fs::write(pkg.join("Cargo.toml"), cargo_toml).await.unwrap();
+    let cargo_toml =
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+    tokio::fs::write(pkg.join("Cargo.toml"), cargo_toml)
+        .await
+        .unwrap();
     pkg
 }
 
@@ -44,8 +48,7 @@ async fn stage_vendor_crate(src: &Path, name: &str, version: &str) -> std::path:
 
 #[test]
 fn parse_cargo_toml_well_formed() {
-    let toml =
-        "[package]\nname = \"serde\"\nversion = \"1.0.200\"\nedition = \"2021\"\n";
+    let toml = "[package]\nname = \"serde\"\nversion = \"1.0.200\"\nedition = \"2021\"\n";
     assert_eq!(
         parse_cargo_toml_name_version(toml),
         Some(("serde".to_string(), "1.0.200".to_string()))
@@ -87,7 +90,8 @@ fn parse_cargo_toml_stops_at_next_section() {
 /// (e.g. inside an earlier [profile.release] table).
 #[test]
 fn parse_cargo_toml_ignores_lines_before_package_section() {
-    let toml = "[profile.release]\nname = \"wrong\"\n\n[package]\nname = \"foo\"\nversion = \"1.0.0\"\n";
+    let toml =
+        "[profile.release]\nname = \"wrong\"\n\n[package]\nname = \"foo\"\nversion = \"1.0.0\"\n";
     assert_eq!(
         parse_cargo_toml_name_version(toml),
         Some(("foo".to_string(), "1.0.0".to_string()))
@@ -182,10 +186,7 @@ async fn find_by_purls_vendor_version_mismatch_returns_empty() {
 
     let crawler = CargoCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:cargo/serde@99.99.99".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:cargo/serde@99.99.99".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty(), "version mismatch in vendor must skip");
@@ -207,10 +208,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = CargoCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-cargo/serde@1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-cargo/serde@1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -272,7 +270,10 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
     tokio::fs::create_dir(&vendor).await.unwrap();
 
     let crawler = CargoCrawler;
-    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert_eq!(paths, vec![vendor]);
 }
 
@@ -281,7 +282,10 @@ async fn get_crate_source_paths_no_cargo_project_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No Cargo.toml, no Cargo.lock, no vendor.
     let crawler = CargoCrawler;
-    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty(), "non-Cargo dir must return empty paths");
 }
 
@@ -353,10 +357,7 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
 
     let crawler = CargoCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:cargo/workspace-crate@0.1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:cargo/workspace-crate@0.1.0".to_string()])
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "verify must fall back to dir name");
@@ -425,7 +426,10 @@ async fn crawl_all_skips_hidden_dirs() {
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
     assert!(names.contains(&"real-crate"));
-    assert!(!names.contains(&"hidden-crate"), "hidden dir must be skipped");
+    assert!(
+        !names.contains(&"hidden-crate"),
+        "hidden dir must be skipped"
+    );
 }
 
 /// `read_crate_cargo_toml` early-returns when the purl has already
@@ -453,7 +457,11 @@ async fn crawl_all_dedups_same_purl() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert_eq!(result.len(), 1, "duplicate purls must dedup; got {result:?}");
+    assert_eq!(
+        result.len(),
+        1,
+        "duplicate purls must dedup; got {result:?}"
+    );
 }
 
 /// `get_crate_source_paths` in local mode without a vendor dir but
@@ -464,14 +472,19 @@ async fn crawl_all_dedups_same_purl() {
 #[serial_test::serial]
 async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n").await.unwrap();
+    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n")
+        .await
+        .unwrap();
     // CARGO_HOME points at an empty tempdir → no registry/src to scan.
     let cargo_home = tempfile::tempdir().unwrap();
     let prev = std::env::var("CARGO_HOME").ok();
     std::env::set_var("CARGO_HOME", cargo_home.path());
 
     let crawler = CargoCrawler;
-    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev {
         std::env::set_var("CARGO_HOME", v);
@@ -491,7 +504,9 @@ async fn get_crate_source_paths_local_cargo_toml_falls_back_to_registry() {
 async fn crawl_all_skips_top_level_files() {
     let tmp = tempfile::tempdir().unwrap();
     stage_registry_crate(tmp.path(), "real-crate", "1.0.0").await;
-    tokio::fs::write(tmp.path().join("README"), b"not a crate").await.unwrap();
+    tokio::fs::write(tmp.path().join("README"), b"not a crate")
+        .await
+        .unwrap();
 
     let crawler = CargoCrawler;
     let opts = CrawlerOptions {
@@ -515,7 +530,9 @@ async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
     let tmp = tempfile::tempdir().unwrap();
     let bad = tmp.path().join("no-version-suffix");
     tokio::fs::create_dir(&bad).await.unwrap();
-    tokio::fs::write(bad.join("Cargo.toml"), b"this is not valid toml").await.unwrap();
+    tokio::fs::write(bad.join("Cargo.toml"), b"this is not valid toml")
+        .await
+        .unwrap();
 
     let crawler = CargoCrawler;
     let opts = CrawlerOptions {
@@ -525,7 +542,10 @@ async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.is_empty(), "unparseable + no-version dir name must be skipped");
+    assert!(
+        result.is_empty(),
+        "unparseable + no-version dir name must be skipped"
+    );
 }
 
 #[path = "common/mod.rs"]
@@ -570,7 +590,9 @@ async fn find_by_purls_verify_fails_when_both_parsers_fail() {
     let tmp = tempfile::tempdir().unwrap();
     let bad = tmp.path().join("not-cargo-like-at-all");
     tokio::fs::create_dir(&bad).await.unwrap();
-    tokio::fs::write(bad.join("Cargo.toml"), b"this is not toml").await.unwrap();
+    tokio::fs::write(bad.join("Cargo.toml"), b"this is not toml")
+        .await
+        .unwrap();
 
     let crawler = CargoCrawler;
     // The strict registry dir for `pkg:cargo/foo@1.0.0` is
@@ -589,16 +611,25 @@ async fn find_by_purls_verify_fails_when_both_parsers_fail() {
 #[serial_test::serial]
 async fn get_crate_source_paths_local_cargo_toml_with_registry_src() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n").await.unwrap();
+    tokio::fs::write(tmp.path().join("Cargo.toml"), b"[package]\n")
+        .await
+        .unwrap();
     let cargo_home = tempfile::tempdir().unwrap();
-    let index_dir = cargo_home.path().join("registry").join("src").join("index.crates.io-stub");
+    let index_dir = cargo_home
+        .path()
+        .join("registry")
+        .join("src")
+        .join("index.crates.io-stub");
     tokio::fs::create_dir_all(&index_dir).await.unwrap();
 
     let prev = std::env::var("CARGO_HOME").ok();
     std::env::set_var("CARGO_HOME", cargo_home.path());
 
     let crawler = CargoCrawler;
-    let paths = crawler.get_crate_source_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev {
         std::env::set_var("CARGO_HOME", v);

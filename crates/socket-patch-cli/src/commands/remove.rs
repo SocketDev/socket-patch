@@ -147,7 +147,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
         for (purl, patch) in &matching {
             let file_count = patch.files.len();
-            eprintln!("  - {} (UUID: {}, {} file(s))", purl, &patch.uuid[..8], file_count);
+            // Short-UUID for display only. Slice on a char boundary and
+            // tolerate UUIDs shorter than 8 chars — a malformed manifest
+            // must not panic the whole command in the display path.
+            let short_uuid = patch.uuid.get(..8).unwrap_or(patch.uuid.as_str());
+            eprintln!("  - {} (UUID: {}, {} file(s))", purl, short_uuid, file_count);
         }
         eprintln!();
     }
@@ -175,7 +179,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             Some(&args.identifier),
             false,
             args.common.json, // silent when JSON
-            false,
+            args.common.offline,
             args.common.global,
             args.common.global_prefix.clone(),
             None,
@@ -286,8 +290,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 for purl in &removed {
                     env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
                 }
-                // One artifact-level Removed event covering swept blobs.
-                if blobs_removed > 0 {
+                // One artifact-level Removed event carrying the
+                // blob-sweep and rollback counts. Emitted whenever either
+                // is non-zero so the `rolledBack` count is still reported
+                // even when no blobs happened to be swept (e.g. the removed
+                // patch's afterHash blobs are still referenced elsewhere).
+                if blobs_removed > 0 || rollback_count > 0 {
                     env.record(
                         PatchEvent::artifact(PatchAction::Removed).with_details(serde_json::json!({
                             "blobsRemoved": blobs_removed,
@@ -445,5 +453,88 @@ mod tests {
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=wheel-cp312"]);
         assert_eq!(manifest.patches.len(), 3);
+    }
+
+    /// A plain (qualifier-free) npm PURL removes exactly its own entry and
+    /// must not accidentally match same-prefix neighbours like
+    /// `foobar@1.0`. Guards the `strip_purl_qualifiers == identifier`
+    /// exact-equality path for non-PyPI keys.
+    #[tokio::test]
+    async fn remove_npm_purl_is_exact_and_does_not_prefix_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
+        patches.insert("pkg:npm/foobar@1.0".to_string(), make_record("uuid-foobar"));
+        let manifest = PatchManifest { patches };
+        let manifest_path = tmp.path().join("manifest.json");
+        write_manifest(&manifest_path, &manifest)
+            .await
+            .expect("write manifest");
+
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path)
+                .await
+                .expect("remove ok");
+
+        assert_eq!(removed, vec!["pkg:npm/foo@1.0"]);
+        assert_eq!(manifest.patches.len(), 1);
+        assert!(manifest.patches.contains_key("pkg:npm/foobar@1.0"));
+    }
+
+    /// An identifier that matches nothing removes nothing and — crucially
+    /// — must NOT rewrite the manifest file. We assert byte-identity of
+    /// the on-disk manifest before/after so a future change that always
+    /// re-serializes (churning mtime / formatting) is caught.
+    #[tokio::test]
+    async fn remove_no_match_leaves_manifest_file_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_multi_variant(tmp.path()).await;
+        let manifest_path = tmp.path().join("manifest.json");
+        let before_bytes = tokio::fs::read(&manifest_path).await.expect("read before");
+
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:npm/not-here@9.9.9", &manifest_path)
+                .await
+                .expect("remove ok");
+
+        assert!(removed.is_empty(), "nothing should match");
+        assert_eq!(manifest.patches.len(), 4, "manifest left intact");
+        let after_bytes = tokio::fs::read(&manifest_path).await.expect("read after");
+        assert_eq!(
+            before_bytes, after_bytes,
+            "a no-op remove must not rewrite the manifest file"
+        );
+    }
+
+    /// A base PURL must not bleed across versions: removing `six@1.16.0`
+    /// leaves `six@1.17.0` (and its variants) in place.
+    #[tokio::test]
+    async fn remove_base_purl_does_not_touch_other_versions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:pypi/six@1.16.0?artifact_id=sdist".to_string(),
+            make_record("uuid-16-sdist"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.17.0?artifact_id=sdist".to_string(),
+            make_record("uuid-17-sdist"),
+        );
+        let manifest = PatchManifest { patches };
+        let manifest_path = tmp.path().join("manifest.json");
+        write_manifest(&manifest_path, &manifest)
+            .await
+            .expect("write manifest");
+
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+                .await
+                .expect("remove ok");
+
+        assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
+        assert_eq!(manifest.patches.len(), 1);
+        assert!(manifest
+            .patches
+            .contains_key("pkg:pypi/six@1.17.0?artifact_id=sdist"));
     }
 }

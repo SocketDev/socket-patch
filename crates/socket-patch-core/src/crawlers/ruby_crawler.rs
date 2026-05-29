@@ -344,12 +344,7 @@ impl RubyCrawler {
     /// (`<name>-<version>-x86_64-linux/`). Only one platform is installed
     /// per environment, so we return the exact dir when present, otherwise
     /// the first verifying `<name>-<version>-*` directory.
-    async fn locate_gem_dir(
-        &self,
-        gem_path: &Path,
-        name: &str,
-        version: &str,
-    ) -> Option<PathBuf> {
+    async fn locate_gem_dir(&self, gem_path: &Path, name: &str, version: &str) -> Option<PathBuf> {
         let exact = gem_path.join(format!("{name}-{version}"));
         if self.verify_gem_at_path(&exact).await {
             return Some(exact);
@@ -456,7 +451,9 @@ mod tests {
     async fn test_find_by_purls_gem() {
         let dir = tempfile::tempdir().unwrap();
         let rails_dir = dir.path().join("rails-7.1.0");
-        tokio::fs::create_dir_all(rails_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(rails_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = RubyCrawler::new();
         let purls = vec![
@@ -476,10 +473,14 @@ mod tests {
 
         // Create fake gem directories with lib/
         let rails_dir = dir.path().join("rails-7.1.0");
-        tokio::fs::create_dir_all(rails_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(rails_dir.join("lib"))
+            .await
+            .unwrap();
 
         let nokogiri_dir = dir.path().join("nokogiri-1.16.5");
-        tokio::fs::create_dir_all(nokogiri_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(nokogiri_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = RubyCrawler::new();
         let options = CrawlerOptions {
@@ -520,7 +521,9 @@ mod tests {
 
         // Create a single gem directory
         let rails_dir = dir.path().join("rails-7.1.0");
-        tokio::fs::create_dir_all(rails_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(rails_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = RubyCrawler::new();
         let options = CrawlerOptions {
@@ -558,12 +561,96 @@ mod tests {
         assert!(!crawler.verify_gem_at_path(&gem_dir).await);
     }
 
-    /// `"-1.0.0"` — match_indices finds `i=0` (followed by `1`),
-    /// split_idx ends up Some(0), name slice is empty. The defensive
-    /// empty-name guard at the bottom of parse_dir_name_version
-    /// rejects rather than producing a `Gem("", "1.0.0")` ghost.
+    /// `"-1.0.0"` — match_indices finds `i=0` (followed by `1`), the
+    /// name slice is empty. The defensive empty-name guard at the
+    /// bottom of parse_dir_name_version rejects rather than producing
+    /// a `Gem("", "1.0.0")` ghost.
     #[test]
     fn test_parse_dir_name_version_empty_name_guard() {
         assert_eq!(RubyCrawler::parse_dir_name_version("-1.0.0"), None);
+    }
+
+    // ── platform-suffix resolution end-to-end ─────────────────────
+
+    /// `find_by_purls` must resolve a base PURL to a platform gem dir
+    /// that carries a `-<platform>` suffix on disk. Exercises the
+    /// `locate_gem_dir` prefix-scan fallback, which the original
+    /// suite only covered for the exact (plain-platform) case.
+    #[tokio::test]
+    async fn find_by_purls_resolves_platform_suffixed_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let plat_dir = dir.path().join("nokogiri-1.16.5-x86_64-linux");
+        tokio::fs::create_dir_all(plat_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/nokogiri@1.16.5".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let pkg = result.get("pkg:gem/nokogiri@1.16.5").unwrap();
+        assert_eq!(pkg.version, "1.16.5");
+        assert_eq!(pkg.path, plat_dir);
+    }
+
+    /// A base PURL must NOT resolve to a platform dir whose version is
+    /// merely a prefix of the requested one (`1.0` vs `1.0.0`).
+    #[tokio::test]
+    async fn find_by_purls_rejects_version_prefix_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let plat_dir = dir.path().join("foo-1.0.0-x86_64-linux");
+        tokio::fs::create_dir_all(plat_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        // Request version "1.0" — must not match the installed "1.0.0".
+        let purls = vec!["pkg:gem/foo@1.0".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "1.0 must not match foo-1.0.0-*; got {result:?}"
+        );
+    }
+
+    /// `crawl_all` must strip the platform suffix when building the
+    /// PURL while keeping `path` pointed at the real (platform) dir.
+    #[tokio::test]
+    async fn crawl_all_strips_platform_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let plat_dir = dir.path().join("nokogiri-1.16.5-arm64-darwin");
+        tokio::fs::create_dir_all(plat_dir.join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].purl, "pkg:gem/nokogiri@1.16.5");
+        assert_eq!(packages[0].version, "1.16.5");
+        assert_eq!(packages[0].path, plat_dir);
+    }
+
+    /// A plain `<name>-<version>` dir must win over any platform
+    /// sibling when both are present (exact match short-circuits).
+    #[tokio::test]
+    async fn locate_gem_dir_prefers_exact_over_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("rails-7.1.0");
+        let plat = dir.path().join("rails-7.1.0-x86_64-linux");
+        tokio::fs::create_dir_all(exact.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(plat.join("lib")).await.unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/rails@7.1.0".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+        assert_eq!(result.get("pkg:gem/rails@7.1.0").unwrap().path, exact);
     }
 }

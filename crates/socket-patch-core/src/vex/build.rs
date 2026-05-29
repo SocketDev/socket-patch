@@ -117,7 +117,7 @@ pub fn build_document(
                 name: vuln_id,
                 aliases,
             },
-            timestamp: timestamp.clone(),
+            timestamp: Some(timestamp.clone()),
             last_updated: None,
             products: vec![Product {
                 id: opts.product_id.clone(),
@@ -580,7 +580,7 @@ mod tests {
         let strip = |mut d: Document| -> Document {
             d.timestamp = String::new();
             for s in d.statements.iter_mut() {
-                s.timestamp = String::new();
+                s.timestamp = None;
             }
             d
         };
@@ -604,7 +604,7 @@ mod tests {
             build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts())
                 .unwrap();
         for st in &doc.statements {
-            assert_eq!(st.timestamp, doc.timestamp);
+            assert_eq!(st.timestamp.as_deref(), Some(doc.timestamp.as_str()));
         }
     }
 

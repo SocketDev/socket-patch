@@ -57,8 +57,7 @@ async fn verify_new_file_rollback_already_original_when_missing() {
         before_hash: String::new(),
         after_hash: git_sha256(b"never written"),
     };
-    let result =
-        verify_file_rollback(pkg, "package/never_existed.txt", &file_info, &blobs).await;
+    let result = verify_file_rollback(pkg, "package/never_existed.txt", &file_info, &blobs).await;
     assert_eq!(result.status, VerifyRollbackStatus::AlreadyOriginal);
 }
 
@@ -76,14 +75,17 @@ async fn verify_new_file_rollback_hash_mismatch_when_user_modified() {
     // Manifest claims this is the post-patch content...
     let after = git_sha256(b"patched content the file should have had");
     // ...but the on-disk content has been mutated since.
-    std::fs::write(pkg.join("user_modified.txt"), b"user wrote something different").unwrap();
+    std::fs::write(
+        pkg.join("user_modified.txt"),
+        b"user wrote something different",
+    )
+    .unwrap();
 
     let file_info = PatchFileInfo {
         before_hash: String::new(),
         after_hash: after,
     };
-    let result =
-        verify_file_rollback(pkg, "package/user_modified.txt", &file_info, &blobs).await;
+    let result = verify_file_rollback(pkg, "package/user_modified.txt", &file_info, &blobs).await;
     assert_eq!(result.status, VerifyRollbackStatus::HashMismatch);
     assert!(result.message.as_ref().unwrap().contains("modified"));
 }
@@ -102,13 +104,7 @@ async fn verify_existing_file_rollback_not_found_when_missing() {
         before_hash: git_sha256(b"original"),
         after_hash: git_sha256(b"patched"),
     };
-    let result = verify_file_rollback(
-        pkg,
-        "package/does_not_exist.txt",
-        &file_info,
-        &blobs,
-    )
-    .await;
+    let result = verify_file_rollback(pkg, "package/does_not_exist.txt", &file_info, &blobs).await;
     assert_eq!(result.status, VerifyRollbackStatus::NotFound);
     assert!(result.message.as_ref().unwrap().contains("not found"));
 }

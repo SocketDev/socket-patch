@@ -25,13 +25,20 @@ pub fn parse_cargo_toml_name_version(content: &str) -> Option<(String, String)> 
             continue;
         }
 
-        // Track table headers
+        // Track table headers. Use `parse_table_header` rather than an
+        // exact `== "[package]"` comparison so a header carrying a
+        // trailing inline comment (`[package] # ...`) or whitespace
+        // inside the brackets (`[ package ]`) is still recognized —
+        // both are valid TOML and a too-strict match would silently
+        // drop the package's name/version.
         if trimmed.starts_with('[') {
-            if trimmed == "[package]" {
-                in_package = true;
-            } else {
-                // We left the [package] section
-                if in_package {
+            if let Some(table) = parse_table_header(trimmed) {
+                if table == "package" {
+                    in_package = true;
+                } else if in_package {
+                    // We left the [package] section (a sibling table or
+                    // a `[package.*]` subtable — bare keys can no longer
+                    // follow per TOML, so stop scanning).
                     break;
                 }
             }
@@ -60,6 +67,18 @@ pub fn parse_cargo_toml_name_version(content: &str) -> Option<(String, String)> 
         (Some(n), Some(v)) if !n.is_empty() && !v.is_empty() => Some((n, v)),
         _ => None,
     }
+}
+
+/// Extract the table name from a TOML header line.
+///
+/// `[package]` -> `Some("package")`, `[package] # comment` ->
+/// `Some("package")`, `[ package ]` -> `Some("package")`. Returns
+/// `None` for a line that is not a `[...]` header. Anything after the
+/// closing `]` (typically an inline comment) is ignored.
+fn parse_table_header(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    Some(rest[..end].trim())
 }
 
 /// Extract a quoted string value from a `key = "value"` line.
@@ -140,7 +159,10 @@ impl CargoCrawler {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let src_paths = self.get_crate_source_paths(options).await.unwrap_or_default();
+        let src_paths = self
+            .get_crate_source_paths(options)
+            .await
+            .unwrap_or_default();
 
         for src_path in &src_paths {
             let found = self.scan_crate_source(src_path, &mut seen).await;
@@ -185,10 +207,7 @@ impl CargoCrawler {
 
                 // Try vendor layout: <name>/
                 let vendor_dir = src_path.join(name);
-                if self
-                    .verify_crate_at_path(&vendor_dir, name, version)
-                    .await
-                {
+                if self.verify_crate_at_path(&vendor_dir, name, version).await {
                     result.insert(
                         purl.clone(),
                         CrawledPackage {
@@ -250,8 +269,9 @@ impl CargoCrawler {
             }
 
             let crate_path = src_path.join(&*dir_name_str);
-            if let Some(pkg) =
-                self.read_crate_cargo_toml(&crate_path, &dir_name_str, seen).await
+            if let Some(pkg) = self
+                .read_crate_cargo_toml(&crate_path, &dir_name_str, seen)
+                .await
             {
                 results.push(pkg);
             }
@@ -313,8 +333,7 @@ impl CargoCrawler {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Some((parsed_name, parsed_version)) =
-                    Self::parse_dir_name_version(&dir_name)
+                if let Some((parsed_name, parsed_version)) = Self::parse_dir_name_version(&dir_name)
                 {
                     parsed_name == name && parsed_version == version
                 } else {
@@ -326,18 +345,41 @@ impl CargoCrawler {
 
     /// Parse a registry directory name into (name, version).
     ///
-    /// Registry directories follow the pattern `<crate-name>-<version>`,
-    /// where the version is the last `-`-separated component that starts with
-    /// a digit (handles crate names with hyphens like `serde-json`).
+    /// Registry directories follow the pattern `<crate-name>-<version>`.
+    /// Both halves are ambiguous from the bare string: crate names can
+    /// contain hyphens (`serde-json`) and even hyphen-then-digit runs
+    /// (`sha-1`), while versions can carry hyphenated pre-release / build
+    /// metadata (`1.0.0-rc.1`, `0.11.0+wasi-snapshot-preview1`, and the
+    /// legal-but-rare numeric pre-release `1.0.0-2`).
+    ///
+    /// Heuristic: the version begins at a `-` immediately followed by a
+    /// digit. Prefer the *first* such boundary whose leading component
+    /// (up to the next `-`) is dotted — the common `major.minor.patch`
+    /// shape — so `crate-1.0.0-2` keeps `1.0.0-2` as the version rather
+    /// than splitting off the trailing `2`. When no candidate version is
+    /// dotted (e.g. a single-integer version like `crate-5`), fall back
+    /// to the *last* hyphen-before-digit, which keeps hyphenated names
+    /// like `sha-1-5` parsing as (`sha-1`, `5`).
+    ///
+    /// This is only a fallback for when `Cargo.toml` itself cannot be
+    /// parsed; for registry crates the manifest is authoritative.
     fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
-        // Find the last '-' followed by a digit
-        let mut split_idx = None;
+        let mut first_dotted: Option<usize> = None;
+        let mut last_any: Option<usize> = None;
         for (i, _) in dir_name.match_indices('-') {
-            if dir_name[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
-                split_idx = Some(i);
+            let rest = &dir_name[i + 1..];
+            if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            last_any = Some(i);
+            if first_dotted.is_none() {
+                let component_end = rest.find('-').unwrap_or(rest.len());
+                if rest[..component_end].contains('.') {
+                    first_dotted = Some(i);
+                }
             }
         }
-        let idx = split_idx?;
+        let idx = first_dotted.or(last_any)?;
         let name = &dir_name[..idx];
         let version = &dir_name[idx + 1..];
         if name.is_empty() || version.is_empty() {
@@ -635,5 +677,172 @@ version = "fake"
     #[test]
     fn test_parse_dir_name_version_empty_name_guard() {
         assert_eq!(CargoCrawler::parse_dir_name_version("-1.0.0"), None);
+    }
+
+    // --- regression: table-header parsing tolerance --------------------
+
+    #[test]
+    fn test_parse_table_header_variants() {
+        assert_eq!(parse_table_header("[package]"), Some("package"));
+        assert_eq!(
+            parse_table_header("[package] # main crate"),
+            Some("package")
+        );
+        assert_eq!(parse_table_header("[ package ]"), Some("package"));
+        assert_eq!(
+            parse_table_header("[package.metadata]"),
+            Some("package.metadata")
+        );
+        // Not a header line.
+        assert_eq!(parse_table_header("name = \"x\""), None);
+        // Array value lines don't start with '[' once trimmed by the caller,
+        // but a bare unterminated bracket is rejected.
+        assert_eq!(parse_table_header("[oops"), None);
+    }
+
+    /// A `[package]` header with a trailing inline comment is valid TOML.
+    /// The parser must still recognize it and read name/version — a
+    /// too-strict `== "[package]"` would drop the crate, and in the
+    /// vendor layout (dir name carries no version) that crate would
+    /// become undiscoverable.
+    #[test]
+    fn test_parse_cargo_toml_header_with_inline_comment() {
+        let content = r#"
+[package] # the main package
+name = "serde"
+version = "1.0.200"
+"#;
+        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        assert_eq!(name, "serde");
+        assert_eq!(version, "1.0.200");
+    }
+
+    #[test]
+    fn test_parse_cargo_toml_header_with_inner_spaces() {
+        let content = "[ package ]\nname = \"tokio\"\nversion = \"1.38.0\"\n";
+        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        assert_eq!(name, "tokio");
+        assert_eq!(version, "1.38.0");
+    }
+
+    /// A `[package.metadata]` subtable still terminates bare-key scanning.
+    #[test]
+    fn test_parse_cargo_toml_stops_at_package_subtable() {
+        let content = r#"
+[package]
+name = "foo"
+
+[package.metadata.docs.rs]
+version = "fake"
+"#;
+        // `version` lives under the metadata subtable, not [package].
+        assert!(parse_cargo_toml_name_version(content).is_none());
+    }
+
+    // --- regression: dir-name version splitting ------------------------
+
+    /// A numeric pre-release segment (legal SemVer) must stay part of the
+    /// version. Previously the "last hyphen-before-digit" heuristic split
+    /// `mycrate-1.0.0-2` into (`mycrate-1.0.0`, `2`).
+    #[test]
+    fn test_parse_dir_name_version_numeric_prerelease() {
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("mycrate-1.0.0-2"),
+            Some(("mycrate".to_string(), "1.0.0-2".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_dir_name_version_alpha_prerelease() {
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("crate-1.0.0-rc.1"),
+            Some(("crate".to_string(), "1.0.0-rc.1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_dir_name_version_build_metadata() {
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("wasi-0.11.0+wasi-snapshot-preview1"),
+            Some((
+                "wasi".to_string(),
+                "0.11.0+wasi-snapshot-preview1".to_string()
+            ))
+        );
+    }
+
+    /// Crate name that itself ends in a hyphen-digit run (`sha-1`) must not
+    /// be split inside the name when the version is dotted.
+    #[test]
+    fn test_parse_dir_name_version_hyphen_digit_name() {
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("sha-1-1.0.0"),
+            Some(("sha-1".to_string(), "1.0.0".to_string()))
+        );
+    }
+
+    /// Dot-less single-integer version falls back to the last
+    /// hyphen-before-digit, keeping hyphenated names intact.
+    #[test]
+    fn test_parse_dir_name_version_dotless_fallback() {
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("crate-5"),
+            Some(("crate".to_string(), "5".to_string()))
+        );
+        assert_eq!(
+            CargoCrawler::parse_dir_name_version("sha-1-5"),
+            Some(("sha-1".to_string(), "5".to_string()))
+        );
+    }
+
+    // --- regression: header-comment tolerance end-to-end ---------------
+
+    /// A vendored crate whose Cargo.toml header carries an inline comment
+    /// must still be found by `find_by_purls`. The vendor layout has no
+    /// version in the directory name, so the version can only come from
+    /// parsing the manifest — exercising the header-tolerance fix.
+    #[tokio::test]
+    async fn test_find_by_purls_vendor_header_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let serde_dir = dir.path().join("serde");
+        tokio::fs::create_dir_all(&serde_dir).await.unwrap();
+        tokio::fs::write(
+            serde_dir.join("Cargo.toml"),
+            "[package] # serde\nname = \"serde\"\nversion = \"1.0.200\"\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let purls = vec!["pkg:cargo/serde@1.0.200".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("pkg:cargo/serde@1.0.200"));
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_registry_header_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let serde_dir = dir.path().join("serde-1.0.200");
+        tokio::fs::create_dir_all(&serde_dir).await.unwrap();
+        tokio::fs::write(
+            serde_dir.join("Cargo.toml"),
+            "[package]   # main\nname = \"serde\"\nversion = \"1.0.200\"\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
     }
 }

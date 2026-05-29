@@ -99,7 +99,10 @@ mod tests {
         let manifest: PatchManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.patches.len(), 1);
 
-        let patch = manifest.patches.get("pkg:npm/simplehttpserver@0.0.6").unwrap();
+        let patch = manifest
+            .patches
+            .get("pkg:npm/simplehttpserver@0.0.6")
+            .unwrap();
         assert_eq!(patch.uuid, "12345678-1234-1234-1234-123456789abc");
         assert_eq!(patch.files.len(), 1);
         assert_eq!(patch.vulnerabilities.len(), 1);
@@ -148,5 +151,174 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("exportedAt"));
         assert!(!json.contains("exported_at"));
+    }
+
+    // ── Regression: pin the on-the-wire JSON contract with the TS schema ──
+    //
+    // schema.rs is a pure serde DTO whose only job is to match the
+    // camelCase shape that the legacy TS tool (manifest-schema.ts) reads and
+    // writes. The tests below lock that contract so a dropped or mistyped
+    // `rename_all`, a renamed field, or a removed field fails loudly rather
+    // than silently producing a manifest the TS tooling can't read.
+
+    // The camelCase rename must be ENFORCED on input, not merely emitted on
+    // output. A manifest carrying snake_case keys (as a naive serializer
+    // without `rename_all` would produce) must be rejected, otherwise the two
+    // implementations could silently drift apart.
+    #[test]
+    fn test_patch_file_info_rejects_snake_case_keys() {
+        let snake = r#"{"before_hash": "a", "after_hash": "b"}"#;
+        assert!(
+            serde_json::from_str::<PatchFileInfo>(snake).is_err(),
+            "snake_case keys must not deserialize -- the wire contract is camelCase"
+        );
+
+        let camel = r#"{"beforeHash": "a", "afterHash": "b"}"#;
+        let parsed: PatchFileInfo = serde_json::from_str(camel).unwrap();
+        assert_eq!(parsed.before_hash, "a");
+        assert_eq!(parsed.after_hash, "b");
+    }
+
+    // Likewise for `exportedAt` on a record: snake_case must be rejected.
+    #[test]
+    fn test_patch_record_rejects_snake_case_exported_at() {
+        let json = r#"{
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "exported_at": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "d",
+            "license": "MIT",
+            "tier": "free"
+        }"#;
+        assert!(
+            serde_json::from_str::<PatchRecord>(json).is_err(),
+            "exported_at must be rejected; the contract field is exportedAt"
+        );
+    }
+
+    // VulnerabilityInfo intentionally has NO `rename_all` (all fields are
+    // single lowercase words). Pin its exact keys so nobody "helpfully" adds a
+    // rename that would break the contract, and exercise an empty `cves` array
+    // (the medium-severity shape from the TS test suite).
+    #[test]
+    fn test_vulnerability_info_exact_keys_and_empty_cves() {
+        let json = r#"{
+            "cves": [],
+            "summary": "Some vuln",
+            "severity": "medium",
+            "description": "A medium severity vulnerability"
+        }"#;
+        let vuln: VulnerabilityInfo = serde_json::from_str(json).unwrap();
+        assert!(vuln.cves.is_empty());
+        assert_eq!(vuln.severity, "medium");
+
+        let serialized = serde_json::to_string(&vuln).unwrap();
+        for key in ["\"cves\"", "\"summary\"", "\"severity\"", "\"description\""] {
+            assert!(serialized.contains(key), "missing key {key}");
+        }
+    }
+
+    // Every PatchRecord field is required (mirroring the TS zod schema, which
+    // rejects records missing any field). Dropping any one must fail.
+    #[test]
+    fn test_patch_record_requires_all_fields() {
+        // A complete record, used as the baseline.
+        let complete = serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "d",
+            "license": "MIT",
+            "tier": "free"
+        });
+        assert!(serde_json::from_value::<PatchRecord>(complete.clone()).is_ok());
+
+        for field in [
+            "uuid",
+            "exportedAt",
+            "files",
+            "vulnerabilities",
+            "description",
+            "license",
+            "tier",
+        ] {
+            let mut partial = complete.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<PatchRecord>(partial).is_err(),
+                "a record missing `{field}` must be rejected"
+            );
+        }
+    }
+
+    // A multi-patch manifest mirroring the TS test suite (a free/MIT patch and
+    // a paid/Apache-2.0 patch) must survive a full deserialize -> serialize ->
+    // deserialize round-trip with deep equality, guarding against a serializer
+    // that drops nested records, files, or vulnerabilities.
+    #[test]
+    fn test_multi_patch_manifest_deep_roundtrip() {
+        let json = r#"{
+  "patches": {
+    "pkg:npm/pkg-a@1.0.0": {
+      "uuid": "550e8400-e29b-41d4-a716-446655440001",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {
+        "package/lib/index.js": { "beforeHash": "aaa", "afterHash": "bbb" }
+      },
+      "vulnerabilities": {},
+      "description": "Patch A",
+      "license": "MIT",
+      "tier": "free"
+    },
+    "pkg:npm/pkg-b@2.0.0": {
+      "uuid": "550e8400-e29b-41d4-a716-446655440002",
+      "exportedAt": "2024-02-01T00:00:00Z",
+      "files": {
+        "package/src/main.js": { "beforeHash": "ccc", "afterHash": "ddd" }
+      },
+      "vulnerabilities": {
+        "GHSA-xxxx-yyyy-zzzz": {
+          "cves": [],
+          "summary": "Some vuln",
+          "severity": "medium",
+          "description": "A medium severity vulnerability"
+        }
+      },
+      "description": "Patch B",
+      "license": "Apache-2.0",
+      "tier": "paid"
+    }
+  }
+}"#;
+
+        let manifest: PatchManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.patches.len(), 2);
+
+        let serialized = serde_json::to_string_pretty(&manifest).unwrap();
+        let reparsed: PatchManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(manifest, reparsed);
+
+        let b = reparsed.patches.get("pkg:npm/pkg-b@2.0.0").unwrap();
+        assert_eq!(b.license, "Apache-2.0");
+        assert_eq!(b.tier, "paid");
+        assert_eq!(b.vulnerabilities.len(), 1);
+        assert!(b
+            .vulnerabilities
+            .get("GHSA-xxxx-yyyy-zzzz")
+            .unwrap()
+            .cves
+            .is_empty());
+    }
+
+    // A manifest missing the top-level `patches` key must be rejected (the TS
+    // schema requires it; `{}` is not a valid manifest).
+    #[test]
+    fn test_manifest_requires_patches_field() {
+        assert!(
+            serde_json::from_str::<PatchManifest>("{}").is_err(),
+            "a manifest without a `patches` field must be rejected"
+        );
     }
 }

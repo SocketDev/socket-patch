@@ -155,12 +155,18 @@ pub async fn run(args: SetupArgs) -> i32 {
     }
 
     if to_update.is_empty() {
+        // Nothing to update — but that can mean two very different things:
+        // every file is already configured (a clean exit 0), or some files
+        // failed to process (e.g. malformed JSON). Errors must surface with
+        // an honest status and a non-zero exit; otherwise a parse failure is
+        // silently reported as "already configured" and CI reads it as success.
+        let errs = errors.len();
         if args.common.json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "already_configured",
+                "status": if errs > 0 { "error" } else { "already_configured" },
                 "updated": 0,
                 "alreadyConfigured": already_configured.len(),
-                "errors": errors.len(),
+                "errors": errs,
                 "files": preview_results.iter().map(|r| {
                     serde_json::json!({
                         "path": r.path,
@@ -173,10 +179,15 @@ pub async fn run(args: SetupArgs) -> i32 {
                     })
                 }).collect::<Vec<_>>(),
             })).unwrap());
+        } else if errs > 0 {
+            // Individual errors were already listed in the preview above.
+            println!(
+                "No files were updated; {errs} file(s) could not be processed (see errors above)."
+            );
         } else {
             println!("All package.json files are already configured with socket-patch!");
         }
-        return 0;
+        return if errs > 0 { 1 } else { 0 };
     }
 
     // If not dry-run, ask for confirmation
@@ -283,7 +294,9 @@ pub async fn run(args: SetupArgs) -> i32 {
                 println!("  {errs} error(s)");
             }
         }
-        0
+        // Mirror the non-dry-run path: an unprocessable package.json is a
+        // failure regardless of dry-run, so it must yield a non-zero exit.
+        if errs > 0 { 1 } else { 0 }
     }
 }
 

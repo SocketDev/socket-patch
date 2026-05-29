@@ -31,7 +31,8 @@ use std::path::Path;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::patch::apply::normalize_file_path;
+use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+use crate::patch::apply::{apply_file_patch, normalize_file_path};
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
@@ -66,11 +67,10 @@ pub(crate) async fn fixup(
         }
     };
 
-    let mut json: Value =
-        serde_json::from_str(&raw).map_err(|e| SidecarError::Malformed {
-            path: checksum_path.display().to_string(),
-            detail: e.to_string(),
-        })?;
+    let mut json: Value = serde_json::from_str(&raw).map_err(|e| SidecarError::Malformed {
+        path: checksum_path.display().to_string(),
+        detail: e.to_string(),
+    })?;
 
     let files = json
         .get_mut("files")
@@ -96,12 +96,39 @@ pub(crate) async fn fixup(
         .expect("serializing a Value just deserialized from valid JSON must succeed");
     out.push(b'\n');
 
-    tokio::fs::write(&checksum_path, out).await.map_err(|source| {
-        SidecarError::Io {
+    // Commit through the hardened shared write path — NOT a bare
+    // `tokio::fs::write`. The checksum file lives inside a Cargo
+    // registry/vendor `<crate>-<version>/` tree, which Cargo marks
+    // read-only (files `0o444` inside `0o555` dirs) for tamper
+    // detection. A plain in-place truncating write has three defects
+    // there, all of which the rest of the patch engine was hardened
+    // against (see `apply::apply_file_patch` and `rollback`):
+    //
+    //   1. **Read-only-hostile.** Opening the existing `0o444` file
+    //      `O_TRUNC` fails `EACCES`, so the fixup errored out exactly
+    //      in the real-registry case it exists to handle — leaving the
+    //      checksum stale-patched and every future `cargo build` of the
+    //      crate refusing the (correctly) patched sources.
+    //   2. **Non-atomic.** A crash / `ENOSPC` mid-write leaves a
+    //      truncated, unparseable `.cargo-checksum.json` — strictly
+    //      worse than a stale hash, because cargo can no longer even
+    //      parse it to report a mismatch; the crate is wedged.
+    //   3. **Copy-on-write-unsafe.** A vendored tree hardlinked into a
+    //      shared store would have its sibling mutated in place.
+    //
+    // `apply_file_patch` stages a sibling, fsyncs, and `rename(2)`s
+    // atomically; breaks CoW inodes; relaxes then restores BOTH the
+    // file's and the directory's read-only modes; and verifies the
+    // bytes that landed. The `expected_hash` is just the digest of the
+    // bytes we hand it (a self-check) — the file already exists, so
+    // its original mode is snapshotted and restored bit-for-bit.
+    let expected_hash = compute_git_sha256_from_bytes(&out);
+    apply_file_patch(pkg_path, CHECKSUM_FILE, &out, &expected_hash)
+        .await
+        .map_err(|source| SidecarError::Io {
             path: checksum_path.display().to_string(),
             source,
-        }
-    })?;
+        })?;
 
     Ok(Some(SidecarPayload {
         files: vec![SidecarFile {
@@ -127,10 +154,12 @@ async fn update_entries(
     for file_name in patched {
         let normalized = normalize_file_path(file_name).to_string();
         let on_disk = pkg_path.join(&normalized);
-        let hash = sha256_file(&on_disk).await.map_err(|source| SidecarError::Io {
-            path: on_disk.display().to_string(),
-            source,
-        })?;
+        let hash = sha256_file(&on_disk)
+            .await
+            .map_err(|source| SidecarError::Io {
+                path: on_disk.display().to_string(),
+                source,
+            })?;
         files.insert(normalized, Value::String(hash));
     }
     Ok(())
@@ -174,7 +203,9 @@ mod tests {
             .await
             .unwrap();
         // Write a file we do NOT patch — its hash stays stale.
-        tokio::fs::write(pkg.join("Cargo.toml"), b"unchanged").await.unwrap();
+        tokio::fs::write(pkg.join("Cargo.toml"), b"unchanged")
+            .await
+            .unwrap();
 
         // Pre-existing checksum file with bogus hashes for both.
         let starting = serde_json::json!({
@@ -200,7 +231,9 @@ mod tests {
 
         // Read back and assert.
         let post: serde_json::Value = serde_json::from_str(
-            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE)).await.unwrap(),
+            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE))
+                .await
+                .unwrap(),
         )
         .unwrap();
         let files = post["files"].as_object().unwrap();
@@ -224,7 +257,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let pkg = d.path();
         tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
-        tokio::fs::write(pkg.join("src/new.rs"), b"brand new").await.unwrap();
+        tokio::fs::write(pkg.join("src/new.rs"), b"brand new")
+            .await
+            .unwrap();
 
         let starting = serde_json::json!({
             "files": {
@@ -242,7 +277,9 @@ mod tests {
         let _ = fixup(pkg, &["src/new.rs".to_string()]).await.unwrap();
 
         let post: serde_json::Value = serde_json::from_str(
-            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE)).await.unwrap(),
+            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE))
+                .await
+                .unwrap(),
         )
         .unwrap();
         let files = post["files"].as_object().unwrap();
@@ -260,7 +297,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let pkg = d.path();
         tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
-        tokio::fs::write(pkg.join("src/lib.rs"), b"patched").await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched")
+            .await
+            .unwrap();
 
         let starting = serde_json::json!({
             "files": { "src/lib.rs": "00".repeat(32) },
@@ -274,10 +313,14 @@ mod tests {
         .unwrap();
 
         // Patch list uses the "package/" prefix.
-        let _ = fixup(pkg, &["package/src/lib.rs".to_string()]).await.unwrap();
+        let _ = fixup(pkg, &["package/src/lib.rs".to_string()])
+            .await
+            .unwrap();
 
         let post: serde_json::Value = serde_json::from_str(
-            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE)).await.unwrap(),
+            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE))
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -310,5 +353,187 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SidecarError::Malformed { .. }));
+    }
+
+    /// Regression (read-only checksum file): a real Cargo registry/vendor
+    /// tree marks `.cargo-checksum.json` read-only (`0o444`) for tamper
+    /// detection. The rewrite must still succeed — the hardened
+    /// stage+rename path relaxes the file's mode, swaps a fresh inode in
+    /// atomically, and restores the original `0o444` mode afterward.
+    /// Before the fix the bare in-place `tokio::fs::write` failed `EACCES`
+    /// here, leaving the checksum stale-patched and the crate unbuildable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rewrites_readonly_checksum_file_and_restores_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched lib")
+            .await
+            .unwrap();
+
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "stale",
+        });
+        let checksum = pkg.join(CHECKSUM_FILE);
+        tokio::fs::write(&checksum, serde_json::to_string_pretty(&starting).unwrap())
+            .await
+            .unwrap();
+        // Lock the checksum file down exactly as Cargo would.
+        tokio::fs::set_permissions(&checksum, std::fs::Permissions::from_mode(0o444))
+            .await
+            .unwrap();
+
+        let out = fixup(pkg, &["src/lib.rs".to_string()]).await.unwrap();
+        assert!(out.is_some(), "read-only checksum must still be rewritten");
+
+        // The new hash landed...
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum).await.unwrap()).unwrap();
+        assert_eq!(
+            post["files"]["src/lib.rs"].as_str().unwrap(),
+            expected_sha256(b"patched lib")
+        );
+        // ...and the original read-only mode was restored bit-for-bit.
+        let mode = tokio::fs::metadata(&checksum)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o444,
+            "checksum file must stay read-only after rewrite"
+        );
+    }
+
+    /// Regression (read-only package directory): Cargo also marks the
+    /// crate directory `0o555`. The atomic stage+rename needs write
+    /// permission on the *parent dir* to create its sibling stage file,
+    /// so the write path must temporarily grant directory write and
+    /// restore the exact `0o555` mode afterward. The bare write could
+    /// not stage inside a read-only directory at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rewrites_inside_readonly_package_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched lib")
+            .await
+            .unwrap();
+        let checksum = pkg.join(CHECKSUM_FILE);
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(&checksum, serde_json::to_string_pretty(&starting).unwrap())
+            .await
+            .unwrap();
+        // Lock the directory down, Cargo-cache style.
+        tokio::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let out = fixup(pkg, &["src/lib.rs".to_string()]).await;
+
+        // Re-grant write so the TempDir can clean itself up regardless
+        // of the assertion outcome.
+        tokio::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        assert!(
+            out.expect("fixup in read-only dir must not error")
+                .is_some(),
+            "read-only package dir must still be rewritten",
+        );
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum).await.unwrap()).unwrap();
+        assert_eq!(
+            post["files"]["src/lib.rs"].as_str().unwrap(),
+            expected_sha256(b"patched lib")
+        );
+    }
+
+    /// Atomicity hygiene: the stage+rename commit must leave no
+    /// `.socket-stage-*` litter in the package directory.
+    #[tokio::test]
+    async fn rewrite_leaves_no_stage_litter() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched lib")
+            .await
+            .unwrap();
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(CHECKSUM_FILE),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        fixup(pkg, &["src/lib.rs".to_string()]).await.unwrap();
+
+        let mut entries = tokio::fs::read_dir(pkg).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".socket-stage-") && !name.starts_with(".socket-cow-"),
+                "stage/cow litter leaked into package dir: {name}"
+            );
+        }
+    }
+
+    /// Copy-on-write safety: when `.cargo-checksum.json` is hardlinked
+    /// into a shared store (a vendored tree shared between projects),
+    /// the rewrite must give us a private inode and leave the sibling
+    /// untouched. The atomic rename-over-target achieves this; the old
+    /// in-place write would have mutated the shared inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rewrite_does_not_mutate_hardlinked_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path().join("pkg");
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched lib")
+            .await
+            .unwrap();
+
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        let checksum = pkg.join(CHECKSUM_FILE);
+        let original_json = serde_json::to_string_pretty(&starting).unwrap();
+        tokio::fs::write(&checksum, &original_json).await.unwrap();
+
+        // A sibling in the shared store points at the same inode.
+        let sibling = d.path().join("shared-store-checksum.json");
+        tokio::fs::hard_link(&checksum, &sibling).await.unwrap();
+
+        fixup(&pkg, &["src/lib.rs".to_string()]).await.unwrap();
+
+        // Our copy was rewritten...
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum).await.unwrap()).unwrap();
+        assert_eq!(
+            post["files"]["src/lib.rs"].as_str().unwrap(),
+            expected_sha256(b"patched lib")
+        );
+        // ...but the shared-store sibling kept its original bytes.
+        assert_eq!(
+            tokio::fs::read_to_string(&sibling).await.unwrap(),
+            original_json,
+        );
     }
 }

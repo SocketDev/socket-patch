@@ -1,5 +1,6 @@
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::track_patch_listed;
 
 use crate::args::GlobalArgs;
@@ -11,6 +12,72 @@ use crate::json_envelope::{
 pub struct ListArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
+}
+
+/// Build the `list --json` envelope: one `Discovered` event per manifest
+/// entry, with the rich metadata (vulnerabilities, tier, license,
+/// description, exportedAt) under `details` per the per-command extension
+/// convention.
+///
+/// Patches, vulnerabilities, and files are each emitted in a stable sorted
+/// order (by PURL / advisory ID / path). `HashMap` iteration is otherwise
+/// nondeterministic, so without this the event/vuln/file ordering would
+/// change run-to-run — breaking consumers that diff this output in CI logs.
+/// Mirrors the stable-ordering guarantee `get` already provides for its
+/// vulnerability lists.
+///
+/// Shared by `run` and the unit tests so the tests exercise the exact code
+/// path `list --json` uses, rather than a hand-copied duplicate.
+fn build_list_envelope(manifest: &PatchManifest) -> Envelope {
+    let mut env = Envelope::new(Command::List);
+
+    let mut patch_entries: Vec<_> = manifest.patches.iter().collect();
+    patch_entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (purl, patch) in patch_entries {
+        let mut file_paths: Vec<_> = patch.files.keys().cloned().collect();
+        file_paths.sort();
+        let files = file_paths
+            .into_iter()
+            .map(|path| PatchEventFile {
+                path,
+                verified: false,
+                applied_via: None,
+            })
+            .collect();
+
+        let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
+        vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
+        let vulnerabilities: Vec<_> = vuln_entries
+            .iter()
+            .map(|(id, vuln)| {
+                serde_json::json!({
+                    "id": id,
+                    "cves": vuln.cves,
+                    "summary": vuln.summary,
+                    "severity": vuln.severity,
+                    "description": vuln.description,
+                })
+            })
+            .collect();
+
+        let details = serde_json::json!({
+            "exportedAt": patch.exported_at,
+            "tier": patch.tier,
+            "license": patch.license,
+            "description": patch.description,
+            "vulnerabilities": vulnerabilities,
+        });
+
+        env.record(
+            PatchEvent::new(PatchAction::Discovered, purl.clone())
+                .with_uuid(patch.uuid.clone())
+                .with_files(files)
+                .with_details(details),
+        );
+    }
+
+    env
 }
 
 /// Emit the top-level envelope for `list` in error states. Used for the
@@ -40,7 +107,10 @@ pub async fn run(args: ListArgs) -> i32 {
 
     match read_manifest(&manifest_path).await {
         Ok(Some(manifest)) => {
-            let patch_entries: Vec<_> = manifest.patches.iter().collect();
+            // Sort by PURL so both the JSON envelope and the human-readable
+            // table list packages in a stable order across runs.
+            let mut patch_entries: Vec<_> = manifest.patches.iter().collect();
+            patch_entries.sort_by(|a, b| a.0.cmp(b.0));
             let patches_count = patch_entries.len();
             track_patch_listed(
                 patches_count,
@@ -50,44 +120,7 @@ pub async fn run(args: ListArgs) -> i32 {
             .await;
 
             if args.common.json {
-                let mut env = Envelope::new(Command::List);
-                for (purl, patch) in &patch_entries {
-                    // `list` emits one `Discovered` event per manifest
-                    // entry. The rich metadata (vulnerabilities, tier,
-                    // license, description, exportedAt) lives under
-                    // `details` per the per-command extension convention.
-                    let files = patch
-                        .files
-                        .keys()
-                        .map(|p| PatchEventFile {
-                            path: p.clone(),
-                            verified: false,
-                            applied_via: None,
-                        })
-                        .collect();
-                    let details = serde_json::json!({
-                        "exportedAt": patch.exported_at,
-                        "tier": patch.tier,
-                        "license": patch.license,
-                        "description": patch.description,
-                        "vulnerabilities": patch.vulnerabilities.iter().map(|(id, vuln)| {
-                            serde_json::json!({
-                                "id": id,
-                                "cves": vuln.cves,
-                                "summary": vuln.summary,
-                                "severity": vuln.severity,
-                                "description": vuln.description,
-                            })
-                        }).collect::<Vec<_>>(),
-                    });
-                    env.record(
-                        PatchEvent::new(PatchAction::Discovered, (*purl).clone())
-                            .with_uuid(patch.uuid.clone())
-                            .with_files(files)
-                            .with_details(details),
-                    );
-                }
-                println!("{}", env.to_pretty_json());
+                println!("{}", build_list_envelope(&manifest).to_pretty_json());
             } else if patch_entries.is_empty() {
                 println!("No patches found in manifest.");
             } else {
@@ -103,7 +136,9 @@ pub async fn run(args: ListArgs) -> i32 {
                         println!("  Description: {}", patch.description);
                     }
 
-                    let vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
+                    // Sort vulnerabilities by advisory ID for stable output.
+                    let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
+                    vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
                     if !vuln_entries.is_empty() {
                         println!("  Vulnerabilities ({}):", vuln_entries.len());
                         for (id, vuln) in &vuln_entries {
@@ -118,7 +153,9 @@ pub async fn run(args: ListArgs) -> i32 {
                         }
                     }
 
-                    let file_list: Vec<_> = patch.files.keys().collect();
+                    // Sort patched files by path for stable output.
+                    let mut file_list: Vec<_> = patch.files.keys().collect();
+                    file_list.sort();
                     if !file_list.is_empty() {
                         println!("  Files patched ({}):", file_list.len());
                         for file_path in &file_list {
@@ -149,7 +186,7 @@ mod tests {
     //! so downstream consumers (PR bots, dashboards) can rely on it.
     use super::*;
     use socket_patch_core::manifest::schema::{
-        PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
+        PatchFileInfo, PatchRecord, VulnerabilityInfo,
     };
     use std::collections::HashMap;
 
@@ -191,49 +228,64 @@ mod tests {
         PatchManifest { patches }
     }
 
-    /// Build the envelope the same way `run` would for the given manifest.
-    /// Keeps the test free of binary-spawn overhead while still pinning
-    /// the exact event shape `list --json` produces.
-    fn build_envelope(manifest: &PatchManifest) -> Envelope {
-        let mut env = Envelope::new(Command::List);
-        for (purl, patch) in &manifest.patches {
-            let files = patch
-                .files
-                .keys()
-                .map(|p| PatchEventFile {
-                    path: p.clone(),
-                    verified: false,
-                    applied_via: None,
-                })
-                .collect();
-            let details = serde_json::json!({
-                "exportedAt": patch.exported_at,
-                "tier": patch.tier,
-                "license": patch.license,
-                "description": patch.description,
-                "vulnerabilities": patch.vulnerabilities.iter().map(|(id, vuln)| {
-                    serde_json::json!({
-                        "id": id,
-                        "cves": vuln.cves,
-                        "summary": vuln.summary,
-                        "severity": vuln.severity,
-                        "description": vuln.description,
-                    })
-                }).collect::<Vec<_>>(),
-            });
-            env.record(
-                PatchEvent::new(PatchAction::Discovered, purl.clone())
-                    .with_uuid(patch.uuid.clone())
-                    .with_files(files)
-                    .with_details(details),
-            );
+    /// A manifest with several patches, each carrying multiple
+    /// vulnerabilities and files, all inserted in deliberately
+    /// non-alphabetical order. Used to pin the stable sort order the
+    /// envelope must impose regardless of HashMap iteration.
+    fn multi_entry_manifest() -> PatchManifest {
+        fn record(uuid: &str, vuln_ids: &[&str], file_paths: &[&str]) -> PatchRecord {
+            let mut files = HashMap::new();
+            for fp in file_paths {
+                files.insert(
+                    fp.to_string(),
+                    PatchFileInfo {
+                        before_hash: "b".repeat(64),
+                        after_hash: "a".repeat(64),
+                    },
+                );
+            }
+            let mut vulns = HashMap::new();
+            for id in vuln_ids {
+                vulns.insert(
+                    id.to_string(),
+                    VulnerabilityInfo {
+                        cves: vec![],
+                        summary: "s".to_string(),
+                        severity: "high".to_string(),
+                        description: "d".to_string(),
+                    },
+                );
+            }
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: vulns,
+                description: "desc".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            }
         }
-        env
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/zeta@1.0.0".to_string(),
+            record("uuid-z", &["GHSA-zzzz-2222-3333", "GHSA-aaaa-2222-3333"], &["z/b.js", "z/a.js"]),
+        );
+        patches.insert(
+            "pkg:npm/alpha@1.0.0".to_string(),
+            record("uuid-a", &["GHSA-mmmm-2222-3333"], &["a/zz.js", "a/aa.js"]),
+        );
+        patches.insert(
+            "pkg:npm/mid@1.0.0".to_string(),
+            record("uuid-m", &["GHSA-cccc-2222-3333"], &["m/x.js"]),
+        );
+        PatchManifest { patches }
     }
 
     #[test]
     fn list_emits_discovered_event_per_patch() {
-        let env = build_envelope(&sample_manifest());
+        let env = build_list_envelope(&sample_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["command"], "list");
         assert_eq!(v["status"], "success");
@@ -247,7 +299,7 @@ mod tests {
 
     #[test]
     fn list_event_carries_vulnerability_details() {
-        let env = build_envelope(&sample_manifest());
+        let env = build_list_envelope(&sample_manifest());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         let event = &v["events"][0];
         assert_eq!(event["details"]["tier"], "free");
@@ -261,10 +313,84 @@ mod tests {
 
     #[test]
     fn empty_manifest_emits_empty_events() {
-        let env = build_envelope(&PatchManifest::new());
+        let env = build_list_envelope(&PatchManifest::new());
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["events"].as_array().unwrap().len(), 0);
         assert_eq!(v["summary"]["discovered"], 0);
+    }
+
+    // -- Regression: stable ordering -------------------------------------
+    // `HashMap` iteration order is randomized per run, so without explicit
+    // sorting the events / vulnerabilities / files arrays would shuffle
+    // between invocations. These pin the sorted contract so consumers can
+    // diff `list --json` output in CI logs.
+
+    #[test]
+    fn events_are_sorted_by_purl() {
+        let env = build_list_envelope(&multi_entry_manifest());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        let purls: Vec<&str> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["purl"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            purls,
+            vec![
+                "pkg:npm/alpha@1.0.0",
+                "pkg:npm/mid@1.0.0",
+                "pkg:npm/zeta@1.0.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn vulnerabilities_are_sorted_by_id() {
+        let env = build_list_envelope(&multi_entry_manifest());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        // The zeta entry carries two advisories inserted out of order.
+        let zeta = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["purl"] == "pkg:npm/zeta@1.0.0")
+            .unwrap();
+        let ids: Vec<&str> = zeta["details"]["vulnerabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|vuln| vuln["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["GHSA-aaaa-2222-3333", "GHSA-zzzz-2222-3333"]);
+    }
+
+    #[test]
+    fn files_are_sorted_by_path() {
+        let env = build_list_envelope(&multi_entry_manifest());
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        let zeta = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["purl"] == "pkg:npm/zeta@1.0.0")
+            .unwrap();
+        let paths: Vec<&str> = zeta["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["z/a.js", "z/b.js"]);
+    }
+
+    #[test]
+    fn ordering_is_deterministic_across_builds() {
+        // Two independent builds of the same manifest must be byte-identical.
+        let manifest = multi_entry_manifest();
+        let a = build_list_envelope(&manifest).to_pretty_json();
+        let b = build_list_envelope(&manifest).to_pretty_json();
+        assert_eq!(a, b);
     }
 }

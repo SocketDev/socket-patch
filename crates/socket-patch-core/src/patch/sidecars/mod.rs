@@ -217,10 +217,7 @@ mod tests {
         let record = out.expect("gem should return a record");
         assert_eq!(record.ecosystem, "gem");
         let advisory = record.advisory.expect("gem must carry an advisory");
-        assert_eq!(
-            advisory.code,
-            SidecarAdvisoryCode::GemBundleInstallReverts
-        );
+        assert_eq!(advisory.code, SidecarAdvisoryCode::GemBundleInstallReverts);
     }
 
     #[tokio::test]
@@ -231,6 +228,200 @@ mod tests {
             "pkg:weirdo/x@1",
             d.path(),
             &["x".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    /// Regression: an empty `patched` list short-circuits to `None`
+    /// *before* the PURL is classified, even for an ecosystem that
+    /// would otherwise always emit an advisory (pypi). Guards the
+    /// `patched.is_empty()` early return at the top of `dispatch_fixup`
+    /// against being reordered below the advisory arms (which would
+    /// emit spurious advisories for no-op applies).
+    #[tokio::test]
+    async fn empty_patched_short_circuits_before_advisory() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup("pkg:pypi/requests@2.28.0", d.path(), &[], &empty_files())
+            .await
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "no files patched ⇒ no sidecar record, even for advisory ecosystems"
+        );
+    }
+
+    // ── Full-path dispatch coverage ──────────────────────────────────
+    // The tests above this point exercise advisory ecosystems and the
+    // None paths. The ones below drive `dispatch_fixup` end-to-end for
+    // the *file-touching* ecosystems (cargo rewrite, nuget delete) and
+    // the error boundary — the wiring between `dispatch_fixup` and the
+    // per-ecosystem fixups that the direct `cargo::fixup`/`nuget::fixup`
+    // unit tests don't cover.
+
+    /// Cargo PURL routes through `dispatch_fixup` to the checksum
+    /// rewriter and the resulting record denormalizes purl + ecosystem
+    /// and carries the rewritten-file entry.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_dispatch_rewrites_checksum_and_builds_record() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), b"patched lib")
+            .await
+            .unwrap();
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(".cargo-checksum.json"),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let out = dispatch_fixup(
+            "pkg:cargo/mycrate@1.0.0",
+            pkg,
+            &["src/lib.rs".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+
+        let record = out.expect("cargo dispatch must produce a record");
+        assert_eq!(record.ecosystem, "cargo");
+        assert_eq!(record.purl, "pkg:cargo/mycrate@1.0.0");
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+        assert_eq!(record.files[0].action, SidecarFileAction::Rewritten);
+        assert!(record.advisory.is_none());
+    }
+
+    /// Cargo crate with no `.cargo-checksum.json` → the sub-fixup
+    /// returns `None`, so `dispatch_fixup` produces no record (not an
+    /// empty-files record).
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_dispatch_without_checksum_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup(
+            "pkg:cargo/mycrate@1.0.0",
+            d.path(),
+            &["src/lib.rs".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    /// A malformed `.cargo-checksum.json` makes the sub-fixup error;
+    /// `dispatch_fixup` must propagate the `SidecarError` (the apply
+    /// boundary converts it to a `sidecar_fixup_failed` advisory) and
+    /// must NOT swallow it into `Ok(None)`.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_dispatch_propagates_malformed_error() {
+        let d = tempfile::tempdir().unwrap();
+        tokio::fs::write(d.path().join(".cargo-checksum.json"), b"not json")
+            .await
+            .unwrap();
+        let err = dispatch_fixup(
+            "pkg:cargo/mycrate@1.0.0",
+            d.path(),
+            &["src/lib.rs".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SidecarError::Malformed { .. }));
+    }
+
+    /// NuGet PURL routes through `dispatch_fixup` to the metadata
+    /// neutralizer; the on-disk `.nupkg.metadata` is deleted and the
+    /// record records it as `Deleted`.
+    #[cfg(feature = "nuget")]
+    #[tokio::test]
+    async fn nuget_dispatch_deletes_metadata_and_builds_record() {
+        let d = tempfile::tempdir().unwrap();
+        tokio::fs::write(d.path().join(".nupkg.metadata"), b"{}")
+            .await
+            .unwrap();
+
+        let out = dispatch_fixup(
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            d.path(),
+            &["lib/x.dll".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+
+        let record = out.expect("nuget dispatch must produce a record");
+        assert_eq!(record.ecosystem, "nuget");
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, ".nupkg.metadata");
+        assert_eq!(record.files[0].action, SidecarFileAction::Deleted);
+        assert!(record.advisory.is_none());
+        assert!(tokio::fs::metadata(d.path().join(".nupkg.metadata"))
+            .await
+            .is_err());
+    }
+
+    /// NuGet package with neither metadata nor signature → no record.
+    #[cfg(feature = "nuget")]
+    #[tokio::test]
+    async fn nuget_dispatch_nothing_to_do_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup(
+            "pkg:nuget/Newtonsoft.Json@13.0.3",
+            d.path(),
+            &["lib/x.dll".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    /// Go PURL routes through `dispatch_fixup` to the advisory-only
+    /// path and denormalizes the ecosystem name to `golang`.
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn golang_dispatch_returns_structured_advisory() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup(
+            "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+            d.path(),
+            &["gin.go".to_string()],
+            &empty_files(),
+        )
+        .await
+        .unwrap();
+        let record = out.expect("golang should return a record");
+        assert_eq!(record.ecosystem, "golang");
+        assert!(record.files.is_empty());
+        let advisory = record.advisory.expect("golang must carry an advisory");
+        assert_eq!(advisory.code, SidecarAdvisoryCode::GoModVerifyFails);
+        assert_eq!(advisory.severity, SidecarSeverity::Warning);
+    }
+
+    /// When the `cargo` feature is disabled, a `pkg:cargo/` PURL is
+    /// unrecognized by `Ecosystem::from_purl` and `dispatch_fixup`
+    /// returns `None` rather than attempting (or panicking on) a fixup.
+    #[cfg(not(feature = "cargo"))]
+    #[tokio::test]
+    async fn cargo_purl_without_feature_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_fixup(
+            "pkg:cargo/mycrate@1.0.0",
+            d.path(),
+            &["src/lib.rs".to_string()],
             &empty_files(),
         )
         .await

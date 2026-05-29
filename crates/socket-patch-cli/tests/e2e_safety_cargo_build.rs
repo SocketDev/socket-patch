@@ -569,48 +569,37 @@ fn apply_with_missing_files_field_reports_sidecar_fixup_failed() {
     );
 }
 
-/// Cargo sidecar write-error path: `.cargo-checksum.json` is
-/// valid JSON (so `read_to_string` succeeds, parse succeeds,
-/// update succeeds in memory) but the file is read-only, so the
-/// final `tokio::fs::write` returns `EACCES`. The fixup wraps
-/// that as `SidecarError::Io` and the boundary surfaces it as
-/// `sidecar_fixup_failed` severity error.
+/// Regression (read-only checksum file): a real Cargo registry/vendor
+/// tree marks `.cargo-checksum.json` read-only (`0o444`) for tamper
+/// detection. The sidecar must STILL rewrite it — the hardened
+/// stage+rename write path relaxes the file's mode, swaps a fresh
+/// inode in atomically, and restores `0o444` afterward.
 ///
-/// Covers lines 94-99 of cargo.rs (the write `map_err`) — a
-/// region the parse/read/no-files-field tests cannot reach.
+/// Before the fix the bare in-place `tokio::fs::write` failed `EACCES`
+/// here and surfaced a `sidecar_fixup_failed` error, leaving the
+/// checksum stale-patched and the crate unbuildable in exactly the
+/// real-world (read-only-registry) case the fixup exists to handle.
 ///
-/// Skipped when running as root (chmod 0444 is bypassed by uid 0,
-/// which collapses this test into the success path and produces a
-/// false negative). On normal dev/CI the test fires fully.
+/// Runs under any uid: even where the kernel grants root implicit
+/// write, the success assertions (content rewritten, mode restored)
+/// hold, so there is no root-skip false-negative to dodge.
 #[cfg(unix)]
 #[test]
-fn apply_with_readonly_checksum_reports_sidecar_fixup_failed() {
+fn apply_with_readonly_checksum_still_rewrites_it() {
     use std::os::unix::fs::PermissionsExt;
-    if uid_is_root() {
-        eprintln!("SKIP: chmod 0444 negative tests no-op as root");
-        return;
-    }
     let root = tempfile::tempdir().unwrap();
     let consumer = stage_consumer(root.path());
     stage_socket_manifest(&consumer);
 
-    // Source file write doesn't touch the checksum, so locking the
-    // checksum down to 0444 (r--r--r--) only blocks the sidecar's
-    // final rewrite — exactly the path we want to exercise.
+    // Lock the checksum file down exactly as Cargo would for a
+    // registry/vendor source.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
-    let mut perms = std::fs::metadata(&checksum).unwrap().permissions();
-    perms.set_mode(0o444);
-    std::fs::set_permissions(&checksum, perms).unwrap();
+    std::fs::set_permissions(&checksum, std::fs::Permissions::from_mode(0o444)).unwrap();
 
     let (_code, stdout, _stderr) = run(
         &consumer,
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
     );
-
-    // Restore writable perms so tempdir cleanup can unlink.
-    let mut restore = std::fs::metadata(&checksum).unwrap().permissions();
-    restore.set_mode(0o644);
-    let _ = std::fs::set_permissions(&checksum, restore);
 
     // Patch landed — source file is in a writable subdir.
     assert_eq!(
@@ -618,6 +607,23 @@ fn apply_with_readonly_checksum_reports_sidecar_fixup_failed() {
         PATCHED_LIB_RS,
     );
 
+    // The read-only checksum was rewritten to match the patched
+    // source (raw SHA256, the cargo format).
+    let post: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&checksum).unwrap()).unwrap();
+    assert_eq!(
+        post["files"]["src/lib.rs"].as_str().unwrap(),
+        sha256_hex(PATCHED_LIB_RS.as_bytes()),
+        "checksum entry must reflect the patched source"
+    );
+
+    // The original `0o444` mode was restored bit-for-bit.
+    let mode = std::fs::metadata(&checksum).unwrap().permissions().mode() & 0o7777;
+    // Re-grant write so tempdir cleanup can unlink.
+    let _ = std::fs::set_permissions(&checksum, std::fs::Permissions::from_mode(0o644));
+    assert_eq!(mode, 0o444, "checksum file must stay read-only after rewrite");
+
+    // The sidecar reports a successful rewrite — not a failure advisory.
     let env = parse_json_envelope(&stdout);
     let cargo = env["sidecars"]
         .as_array()
@@ -625,34 +631,19 @@ fn apply_with_readonly_checksum_reports_sidecar_fixup_failed() {
         .iter()
         .find(|s| s["ecosystem"] == "cargo")
         .expect("cargo record");
-    let advisory = cargo.get("advisory").expect("advisory");
-    assert_eq!(advisory["code"], "sidecar_fixup_failed");
-    assert_eq!(advisory["severity"], "error");
-}
-
-/// Helper: detect uid 0 without pulling in `libc`. Tests that rely
-/// on chmod 0444 being honored must short-circuit under root
-/// because the kernel grants uid 0 implicit write permission
-/// regardless of mode bits.
-///
-/// Uses `id -u` rather than a direct `getuid` syscall to avoid a
-/// `libc` dev-dep just for this one detection. Falls back to
-/// "not root" if `id` is missing or its output is garbled — better
-/// to attempt the test (and possibly false-pass) than to skip it
-/// silently because of a missing helper binary.
-#[cfg(unix)]
-fn uid_is_root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| {
-            String::from_utf8(o.stdout)
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .map(|s| s == "0")
-        .unwrap_or(false)
+    let rewrote = cargo["files"].as_array().is_some_and(|files| {
+        files
+            .iter()
+            .any(|f| f["path"] == ".cargo-checksum.json" && f["action"] == "rewritten")
+    });
+    assert!(
+        rewrote,
+        "expected a rewritten .cargo-checksum.json file entry; got {cargo}"
+    );
+    assert!(
+        cargo.get("advisory").map(|a| a.is_null()).unwrap_or(true),
+        "successful rewrite must not carry a failure advisory; got {cargo}"
+    );
 }
 
 /// Third Malformed branch: when `.cargo-checksum.json` exists but

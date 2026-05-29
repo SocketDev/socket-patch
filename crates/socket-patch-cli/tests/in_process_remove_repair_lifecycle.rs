@@ -456,6 +456,59 @@ async fn repair_with_no_manifest_emits_error() {
     assert_eq!(repair_run(make_repair_args(tmp.path(), "file")).await, 1);
 }
 
+/// Regression: a repair where a missing artifact fails to download must
+/// exit non-zero. The blob the manifest references is absent from disk AND
+/// the mock server has no route for it (→ 404 / not found), so the fetch
+/// fails. Before the fix `run()` reported success (exit 0) even though it
+/// had marked the run a partial failure and emitted a `Failed` event —
+/// hiding the failure from any CI guarding on the exit code.
+#[tokio::test]
+#[serial]
+async fn repair_download_failure_exits_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A valid-format (64 hex) afterHash the server will never serve.
+    let after_hash = git_sha256(b"never served by the mock\n");
+
+    // Mock server with NO blob route → every fetch 404s.
+    let server = MockServer::start().await;
+
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{ "patches": {{
+                "pkg:npm/fetch-fail@1.0.0": {{
+                    "uuid": "17171717-1717-4171-8171-171717171717",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{ "package/x.js": {{
+                        "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "afterHash": "{after_hash}"
+                    }}}},
+                    "vulnerabilities": {{}}, "description": "x",
+                    "license": "MIT", "tier": "free"
+                }}
+            }}}}"#
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("SOCKET_API_URL", server.uri());
+    std::env::set_var("SOCKET_API_TOKEN", "fake");
+    std::env::set_var("SOCKET_ORG_SLUG", ORG);
+    let code = repair_run(make_repair_args(tmp.path(), "file")).await;
+    std::env::remove_var("SOCKET_API_URL");
+    std::env::remove_var("SOCKET_API_TOKEN");
+    std::env::remove_var("SOCKET_ORG_SLUG");
+
+    assert_eq!(
+        code, 1,
+        "a failed artifact download must surface as a non-zero exit"
+    );
+    // The blob must not have been written.
+    assert!(!socket.join("blobs").join(&after_hash).exists());
+}
+
 #[tokio::test]
 #[serial]
 async fn repair_offline_with_present_blobs_succeeds() {

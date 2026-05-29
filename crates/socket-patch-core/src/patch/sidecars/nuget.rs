@@ -20,6 +20,8 @@
 
 use std::path::Path;
 
+use crate::patch::apply::DirWriteGuard;
+
 use super::{
     SidecarAdvisory, SidecarAdvisoryCode, SidecarError, SidecarFile, SidecarFileAction,
     SidecarPayload, SidecarSeverity,
@@ -41,7 +43,21 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
     let mut files = Vec::new();
 
     let metadata_path = pkg_path.join(METADATA_FILE);
-    match tokio::fs::remove_file(&metadata_path).await {
+
+    // `unlink(2)` needs write permission on the *parent directory*, not
+    // on the file. NuGet caches can live inside a read-only (`0o555`)
+    // tree — the same tamper-proofing layout the apply path hardened
+    // against for Cargo/Go (see `apply::DirWriteGuard`). Without the
+    // guard a bare `remove_file` fails `EACCES` exactly in the
+    // real-cache case, leaving the stale-hash metadata in place so every
+    // future `dotnet restore` flags the (correctly) patched package as
+    // tampered. Grant directory-write for the unlink, then restore the
+    // directory's exact mode — even if the unlink itself errors.
+    let dir_guard = DirWriteGuard::acquire(Some(pkg_path)).await;
+    let remove_result = tokio::fs::remove_file(&metadata_path).await;
+    dir_guard.restore().await;
+
+    match remove_result {
         Ok(()) => files.push(SidecarFile {
             path: METADATA_FILE.to_string(),
             action: SidecarFileAction::Deleted,
@@ -150,6 +166,57 @@ mod tests {
         let adv = payload.advisory.expect("expected advisory");
         assert_eq!(adv.code, SidecarAdvisoryCode::NugetSignedPackageTampered);
         assert_eq!(adv.severity, SidecarSeverity::Warning);
+    }
+
+    /// Regression (read-only package directory): NuGet caches — like
+    /// Cargo's registry and Go's module cache — can live inside a
+    /// directory the host marks read-only (`0o555`) for tamper
+    /// detection. Removing `.nupkg.metadata` requires *write permission
+    /// on the parent directory*, not on the file itself, so a bare
+    /// `remove_file` fails `EACCES` there — leaving the stale-hash
+    /// metadata in place and every future `dotnet restore` flagging the
+    /// (correctly) patched package as tampered. The fixup must grant
+    /// directory-write for the unlink and restore the original mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deletes_metadata_inside_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::write(pkg.join(METADATA_FILE), b"{}")
+            .await
+            .unwrap();
+        // Lock the package directory down exactly as a tamper-proofed
+        // cache would.
+        tokio::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let out = fixup(pkg).await;
+
+        // Capture the post-fixup directory mode BEFORE re-granting write
+        // for cleanup — the guard must have restored it to 0o555 itself.
+        let mode = tokio::fs::metadata(pkg).await.unwrap().permissions().mode() & 0o7777;
+
+        // Re-grant write so the TempDir can clean itself up regardless
+        // of the assertion outcome.
+        tokio::fs::set_permissions(pkg, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let payload = out
+            .expect("delete inside a read-only dir must not error")
+            .expect("metadata existed, expect a payload");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Deleted);
+        // The metadata is actually gone.
+        assert!(tokio::fs::metadata(pkg.join(METADATA_FILE)).await.is_err());
+        // ...and the directory's original read-only mode was restored.
+        assert_eq!(
+            mode, 0o555,
+            "package dir mode must be restored after the unlink"
+        );
     }
 
     /// Signed package WITH metadata: the typed payload now carries

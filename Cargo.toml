@@ -3,16 +3,16 @@ members = ["crates/socket-patch-core", "crates/socket-patch-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "3.1.0"
+version = "3.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/SocketDev/socket-patch"
 
 [workspace.dependencies]
-socket-patch-core = { path = "crates/socket-patch-core", version = "=3.1.0" }
+socket-patch-core = { path = "crates/socket-patch-core", version = "=3.2.0" }
 clap = { version = "=4.5.60", features = ["derive", "env"] }
 serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.149"
+serde_json = { version = "=1.0.149", features = ["preserve_order"] }
 sha2 = "=0.10.9"
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", features = ["rustls-tls", "json"], default-features = false }

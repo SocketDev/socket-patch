@@ -47,6 +47,8 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>)> {
         ("--yes", None),
         ("--debug", None),
         ("--no-telemetry", None),
+        ("--break-lock", None),
+        ("--lock-timeout", Some("30")),
     ]
 }
 
@@ -195,6 +197,8 @@ fn env_vars_populate_global_args() {
         ("SOCKET_SILENT", "true"),
         ("SOCKET_DRY_RUN", "true"),
         ("SOCKET_YES", "true"),
+        ("SOCKET_LOCK_TIMEOUT", "30"),
+        ("SOCKET_BREAK_LOCK", "true"),
         ("SOCKET_DEBUG", "true"),
         ("SOCKET_TELEMETRY_DISABLED", "true"),
     ];
@@ -234,6 +238,8 @@ fn env_vars_populate_global_args() {
         assert!(args.common.silent);
         assert!(args.common.dry_run);
         assert!(args.common.yes);
+        assert_eq!(args.common.lock_timeout, Some(30));
+        assert!(args.common.break_lock);
         assert!(args.common.debug);
         assert!(args.common.no_telemetry);
     } else {
@@ -349,4 +355,139 @@ fn bool_env_vars_reject_zero_and_falsey() {
             None => std::env::remove_var(&k),
         }
     }
+}
+
+/// Names of every `SOCKET_*` env var that `GlobalArgs` binds, so tests that
+/// need a clean slate can save/clear/restore them in one place.
+const GLOBAL_ENV_VARS: &[&str] = &[
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+];
+
+fn save_and_clear_global_env() -> Vec<(&'static str, Option<String>)> {
+    let saved: Vec<(&'static str, Option<String>)> = GLOBAL_ENV_VARS
+        .iter()
+        .map(|&k| (k, std::env::var(k).ok()))
+        .collect();
+    for &k in GLOBAL_ENV_VARS {
+        std::env::remove_var(k);
+    }
+    saved
+}
+
+fn restore_global_env(saved: Vec<(&'static str, Option<String>)>) {
+    for (k, orig) in saved {
+        match orig {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+}
+
+/// Regression for the documented precedence (`CLI arg > env var > default`,
+/// see the module header in `args.rs`): when both a CLI flag and its env var
+/// are set, the CLI value must win. Covers a string field (`--api-url`) and a
+/// bool field set on the CLI while the env says falsey. Env-only resolution is
+/// asserted too so we know the env var really was live.
+#[test]
+#[serial_test::serial]
+fn cli_arg_overrides_env_var() {
+    let saved = save_and_clear_global_env();
+
+    // String field: env set, CLI overrides.
+    std::env::set_var("SOCKET_API_URL", "https://env-api.example.com");
+    let cli = Cli::try_parse_from([
+        "socket-patch",
+        "list",
+        "--api-url",
+        "https://cli-api.example.com",
+    ])
+    .expect("parse");
+    let socket_patch_cli::Commands::List(args) = cli.command else {
+        panic!("expected List");
+    };
+    assert_eq!(
+        args.common.api_url, "https://cli-api.example.com",
+        "CLI --api-url must override SOCKET_API_URL"
+    );
+
+    // Sanity: with the CLI flag absent, the env value resolves through.
+    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let socket_patch_cli::Commands::List(args) = cli.command else {
+        panic!("expected List");
+    };
+    assert_eq!(
+        args.common.api_url, "https://env-api.example.com",
+        "with no CLI flag the env var must resolve through"
+    );
+
+    // Bool field: CLI `--offline` wins over a falsey env value.
+    std::env::set_var("SOCKET_OFFLINE", "0");
+    let cli = Cli::try_parse_from(["socket-patch", "list", "--offline"]).expect("parse");
+    let socket_patch_cli::Commands::List(args) = cli.command else {
+        panic!("expected List");
+    };
+    assert!(
+        args.common.offline,
+        "CLI --offline must win over SOCKET_OFFLINE=0"
+    );
+
+    restore_global_env(saved);
+}
+
+/// Regression: with neither CLI flags nor env vars set, clap must populate the
+/// documented production defaults (the `default_value = ".."` attributes). This
+/// is the production path that `GlobalArgs::default()` deliberately does *not*
+/// mirror for `api_url`/`proxy_url`, so it needs its own coverage — and
+/// `api_client_overrides()` must therefore forward those concrete URLs.
+#[test]
+#[serial_test::serial]
+fn production_defaults_populate_when_unset() {
+    let saved = save_and_clear_global_env();
+
+    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let socket_patch_cli::Commands::List(args) = cli.command else {
+        panic!("expected List");
+    };
+    let c = &args.common;
+    assert_eq!(c.cwd, std::path::PathBuf::from("."));
+    assert_eq!(c.manifest_path, ".socket/manifest.json");
+    assert_eq!(c.api_url, "https://api.socket.dev");
+    assert_eq!(c.proxy_url, "https://patches-api.socket.dev");
+    assert_eq!(c.download_mode, "diff");
+    assert!(c.api_token.is_none());
+    assert!(c.org.is_none());
+    assert!(c.ecosystems.is_none());
+    assert!(!c.offline && !c.global && !c.json && !c.verbose && !c.silent);
+    assert!(!c.dry_run && !c.yes && !c.break_lock && !c.debug && !c.no_telemetry);
+    assert!(c.lock_timeout.is_none());
+    assert!(c.global_prefix.is_none());
+
+    // On the production path (unlike GlobalArgs::default()) the URLs are
+    // non-empty, so api_client_overrides must forward them.
+    let o = c.api_client_overrides();
+    assert_eq!(o.api_url.as_deref(), Some("https://api.socket.dev"));
+    assert_eq!(o.proxy_url.as_deref(), Some("https://patches-api.socket.dev"));
+    assert!(o.api_token.is_none());
+    assert!(o.org_slug.is_none());
+
+    restore_global_env(saved);
 }

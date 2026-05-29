@@ -16,6 +16,14 @@ pub fn compute_git_sha256_from_bytes(data: &[u8]) -> String {
 /// Compute Git-compatible SHA256 hash from an async reader with known size.
 ///
 /// This streams the content through the hasher without loading it all into memory.
+///
+/// The `size` is written into the Git object header *before* the body is read,
+/// so it must match the number of bytes the reader actually yields. If it does
+/// not (for example, the underlying file was truncated or extended between the
+/// time its size was measured and the time it was read), the resulting hash
+/// would correspond to no real Git object. Rather than silently return a
+/// corrupt hash, this function reports an [`io::Error`] when the byte count
+/// disagrees with `size`.
 pub async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
     size: u64,
     mut reader: R,
@@ -25,12 +33,23 @@ pub async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
     hasher.update(header.as_bytes());
 
     let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+
+    if total != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "git sha256: declared size {size} does not match {total} bytes read from stream"
+            ),
+        ));
     }
 
     Ok(hex::encode(hasher.finalize()))
@@ -47,6 +66,24 @@ mod tests {
         assert_eq!(hash.len(), 64);
         // Verify it's consistent
         assert_eq!(hash, compute_git_sha256_from_bytes(b""));
+    }
+
+    /// Known-answer vectors computed with the actual Git SHA256 object format
+    /// (`SHA256("blob <size>\0<content>")`). These pin the algorithm to real
+    /// Git output so a regression cannot hide behind the self-consistent
+    /// reader-vs-bytes comparisons elsewhere in this module.
+    #[test]
+    fn test_git_known_answer_vectors() {
+        // `printf 'blob 0\0' | shasum -a 256`
+        assert_eq!(
+            compute_git_sha256_from_bytes(b""),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+        );
+        // `printf 'blob 13\0Hello, World!' | shasum -a 256`
+        assert_eq!(
+            compute_git_sha256_from_bytes(b"Hello, World!"),
+            "e118a058f018dda253bb692320c940091b15e4f19067e12fff110606a111f5da",
+        );
     }
 
     #[test]
@@ -79,11 +116,52 @@ mod tests {
         let sync_hash = compute_git_sha256_from_bytes(content);
 
         let cursor = tokio::io::BufReader::new(&content[..]);
-        let async_hash =
-            compute_git_sha256_from_reader(content.len() as u64, cursor)
-                .await
-                .unwrap();
+        let async_hash = compute_git_sha256_from_reader(content.len() as u64, cursor)
+            .await
+            .unwrap();
 
         assert_eq!(sync_hash, async_hash);
+    }
+
+    /// Exercise the streaming loop across many buffer-sized reads (the 8192
+    /// byte buffer is filled multiple times). Guards against off-by-one or
+    /// partial-read mistakes in the chunked update loop.
+    #[tokio::test]
+    async fn test_async_reader_multiple_chunks() {
+        let content: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let sync_hash = compute_git_sha256_from_bytes(&content);
+
+        let cursor = tokio::io::BufReader::new(&content[..]);
+        let async_hash = compute_git_sha256_from_reader(content.len() as u64, cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(sync_hash, async_hash);
+    }
+
+    /// A declared size larger than the stream (e.g. the file was truncated
+    /// after its size was measured) must be reported as an error, not hashed
+    /// into a silently-corrupt object id.
+    #[tokio::test]
+    async fn test_async_reader_size_too_large_errors() {
+        let content = b"short";
+        let cursor = tokio::io::BufReader::new(&content[..]);
+        let result = compute_git_sha256_from_reader(content.len() as u64 + 100, cursor).await;
+
+        let err = result.expect_err("size larger than stream must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A declared size smaller than the stream (e.g. the file grew after its
+    /// size was measured) must likewise be reported rather than producing a
+    /// hash whose header disagrees with its body.
+    #[tokio::test]
+    async fn test_async_reader_size_too_small_errors() {
+        let content = b"this stream is longer than declared";
+        let cursor = tokio::io::BufReader::new(&content[..]);
+        let result = compute_git_sha256_from_reader(4, cursor).await;
+
+        let err = result.expect_err("size smaller than stream must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

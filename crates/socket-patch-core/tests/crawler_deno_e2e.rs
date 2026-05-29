@@ -22,15 +22,12 @@ fn options_at(root: &Path) -> CrawlerOptions {
 }
 
 /// Stage a JSR package: `<root>/<scope>/<name>/<version>/mod.ts`.
-async fn stage_jsr_pkg(
-    root: &Path,
-    scope: &str,
-    name: &str,
-    version: &str,
-) -> std::path::PathBuf {
+async fn stage_jsr_pkg(root: &Path, scope: &str, name: &str, version: &str) -> std::path::PathBuf {
     let pkg = root.join(scope).join(name).join(version);
     tokio::fs::create_dir_all(&pkg).await.unwrap();
-    tokio::fs::write(pkg.join("mod.ts"), b"export default 1;").await.unwrap();
+    tokio::fs::write(pkg.join("mod.ts"), b"export default 1;")
+        .await
+        .unwrap();
     pkg
 }
 
@@ -70,13 +67,13 @@ async fn find_by_purls_non_jsr_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = DenoCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:npm/lodash@4.17.21".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:npm/lodash@4.17.21".to_string()])
         .await
         .unwrap();
-    assert!(result.is_empty(), "non-jsr PURLs must be ignored by DenoCrawler");
+    assert!(
+        result.is_empty(),
+        "non-jsr PURLs must be ignored by DenoCrawler"
+    );
 }
 
 // ── crawl_all ─────────────────────────────────────────────────
@@ -123,7 +120,10 @@ async fn crawl_all_skips_dirs_not_starting_with_at() {
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
     assert!(names.contains(&"path"));
-    assert!(!names.contains(&"foo"), "non-`@`-prefixed dir must be skipped");
+    assert!(
+        !names.contains(&"foo"),
+        "non-`@`-prefixed dir must be skipped"
+    );
 }
 
 // ── get_jsr_cache_paths ────────────────────────────────────────
@@ -176,7 +176,10 @@ async fn get_jsr_cache_paths_local_no_marker_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     // No deno.json / .jsonc / .lock — not a Deno project.
     let crawler = DenoCrawler;
-    let paths = crawler.get_jsr_cache_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_jsr_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     assert!(paths.is_empty());
 }
 
@@ -185,7 +188,9 @@ async fn get_jsr_cache_paths_local_no_marker_returns_empty() {
 async fn get_jsr_cache_paths_local_with_deno_json_falls_back_to_cache() {
     let project = tempfile::tempdir().unwrap();
     let deno_home = tempfile::tempdir().unwrap();
-    tokio::fs::write(project.path().join("deno.json"), b"{}").await.unwrap();
+    tokio::fs::write(project.path().join("deno.json"), b"{}")
+        .await
+        .unwrap();
     let jsr = deno_home.path().join("npm").join("jsr.io");
     tokio::fs::create_dir_all(&jsr).await.unwrap();
 
@@ -193,7 +198,10 @@ async fn get_jsr_cache_paths_local_with_deno_json_falls_back_to_cache() {
     std::env::set_var("DENO_DIR", deno_home.path());
 
     let crawler = DenoCrawler;
-    let paths = crawler.get_jsr_cache_paths(&options_at(project.path())).await.unwrap();
+    let paths = crawler
+        .get_jsr_cache_paths(&options_at(project.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev {
         std::env::set_var("DENO_DIR", v);

@@ -1,22 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 use super::types::{CrawledPackage, CrawlerOptions};
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
 pub struct ComposerCrawler;
 
-/// Composer 2 installed.json format: `{"packages": [...]}`
-#[derive(Deserialize)]
-struct InstalledJsonV2 {
-    packages: Vec<ComposerPackageEntry>,
-}
-
-/// A single package entry from installed.json.
-#[derive(Deserialize)]
+/// A single package entry distilled from installed.json. Only the two
+/// fields the crawler needs are retained; everything else (source,
+/// dist, autoload, ...) is ignored.
 struct ComposerPackageEntry {
     name: String,
     version: String,
@@ -81,19 +74,29 @@ impl ComposerCrawler {
             let entries = read_installed_json(vendor_path).await;
             for entry in entries {
                 if let Some((namespace, name)) = entry.name.split_once('/') {
-                    let purl =
-                        crate::utils::purl::build_composer_purl(namespace, name, &entry.version);
-
-                    if seen.contains(&purl) {
+                    // Skip packages that installed.json lists but that are
+                    // not actually on disk (stale metadata, custom install
+                    // paths). This keeps crawl_all consistent with
+                    // find_by_purls, which only returns packages whose
+                    // vendor directory exists.
+                    let pkg_path = vendor_path.join(namespace).join(name);
+                    if !is_dir(&pkg_path).await {
                         continue;
                     }
-                    seen.insert(purl.clone());
 
-                    let pkg_path = vendor_path.join(namespace).join(name);
+                    // Composer's installed.json stores the *pretty*
+                    // version (often `v6.4.1`); PURLs use the bare numeric
+                    // version, so normalize before building the PURL.
+                    let version = normalize_version(&entry.version).to_string();
+                    let purl = crate::utils::purl::build_composer_purl(namespace, name, &version);
+
+                    if !seen.insert(purl.clone()) {
+                        continue;
+                    }
 
                     packages.push(CrawledPackage {
                         name: name.to_string(),
-                        version: entry.version,
+                        version,
                         namespace: Some(namespace.to_string()),
                         purl,
                         path: pkg_path,
@@ -115,10 +118,8 @@ impl ComposerCrawler {
 
         // Build a name -> version lookup from installed.json
         let entries = read_installed_json(vendor_path).await;
-        let installed: HashMap<String, String> = entries
-            .into_iter()
-            .map(|e| (e.name, e.version))
-            .collect();
+        let installed: HashMap<String, String> =
+            entries.into_iter().map(|e| (e.name, e.version)).collect();
 
         for purl in purls {
             if let Some(((namespace, name), version)) =
@@ -131,9 +132,12 @@ impl ComposerCrawler {
                     continue;
                 }
 
-                // Verify version matches installed.json
+                // Verify version matches installed.json. Compare on the
+                // normalized version so a `v`-prefixed installed.json
+                // version (`v6.4.1`) matches a bare PURL version (`6.4.1`)
+                // and vice versa.
                 if let Some(installed_version) = installed.get(&full_name) {
-                    if installed_version == version {
+                    if normalize_version(installed_version) == normalize_version(version) {
                         result.insert(
                             purl.clone(),
                             CrawledPackage {
@@ -238,9 +242,32 @@ async fn get_composer_home() -> Option<PathBuf> {
     None
 }
 
+/// Normalize a Composer version string for PURL identity.
+///
+/// Composer's `installed.json` records the *pretty* version, which for
+/// many packages (symfony, twig, ...) carries a leading `v` taken from
+/// the upstream git tag (e.g. `v6.4.1`). PURLs use the bare numeric
+/// version (`6.4.1`), so strip a single leading `v`/`V` when it
+/// directly precedes a digit. Versions that don't fit that shape (e.g.
+/// `dev-main`, `1.0.x-dev`) are returned untouched.
+fn normalize_version(version: &str) -> &str {
+    let mut chars = version.chars();
+    if matches!(chars.next(), Some('v') | Some('V'))
+        && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    {
+        return &version[1..];
+    }
+    version
+}
+
 /// Read and parse `vendor/composer/installed.json`.
 ///
-/// Supports both Composer 1 (flat JSON array) and Composer 2 (`{"packages": [...]}`) formats.
+/// Supports both Composer 1 (flat JSON array) and Composer 2
+/// (`{"packages": [...]}`) formats. Parsing is intentionally lenient:
+/// the file is read as untyped JSON and entries are extracted one at a
+/// time, so a single malformed entry (missing/non-string `name` or
+/// `version`, or extra unexpected fields) is skipped rather than
+/// discarding every package in the file.
 async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
     let installed_path = vendor_path.join("composer").join("installed.json");
 
@@ -249,17 +276,35 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
         Err(_) => return Vec::new(),
     };
 
-    // Try Composer 2 format first (object with packages key)
-    if let Ok(v2) = serde_json::from_str::<InstalledJsonV2>(&content) {
-        return v2.packages;
-    }
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
 
-    // Fall back to Composer 1 format (flat array)
-    if let Ok(v1) = serde_json::from_str::<Vec<ComposerPackageEntry>>(&content) {
-        return v1;
-    }
+    // Composer 2 wraps the list in `{"packages": [...]}`; Composer 1 is
+    // a bare top-level array.
+    let entries = match root.get("packages").and_then(|p| p.as_array()) {
+        Some(arr) => arr,
+        None => match root.as_array() {
+            Some(arr) => arr,
+            None => return Vec::new(),
+        },
+    };
 
-    Vec::new()
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?;
+            let version = entry.get("version")?.as_str()?;
+            if name.is_empty() || version.is_empty() {
+                return None;
+            }
+            Some(ComposerPackageEntry {
+                name: name.to_string(),
+                version: version.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Check whether a path is a directory.
@@ -448,6 +493,154 @@ mod tests {
 
         let packages = crawler.crawl_all(&options).await;
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_version() {
+        // `v`-prefixed semver versions get the prefix stripped.
+        assert_eq!(normalize_version("v6.4.1"), "6.4.1");
+        assert_eq!(normalize_version("V6.4.1"), "6.4.1");
+        // Bare versions pass through untouched.
+        assert_eq!(normalize_version("6.4.1"), "6.4.1");
+        // A leading `v` not followed by a digit is part of the version
+        // and must be preserved.
+        assert_eq!(normalize_version("dev-main"), "dev-main");
+        assert_eq!(normalize_version("vendor-tag"), "vendor-tag");
+        assert_eq!(normalize_version("v"), "v");
+        assert_eq!(normalize_version(""), "");
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_strips_v_prefix_from_purl() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        // symfony tags releases as `v6.4.1`; installed.json keeps that.
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "symfony/console", "version": "v6.4.1"}]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("symfony").join("console"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        // The emitted PURL and version are the bare (canonical) form.
+        assert_eq!(packages[0].purl, "pkg:composer/symfony/console@6.4.1");
+        assert_eq!(packages[0].version, "6.4.1");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_matches_v_prefixed_installed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "symfony/console", "version": "v6.4.1"}]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("symfony").join("console"))
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        // A canonical (bare) PURL must match the `v`-prefixed installed
+        // version, and a `v`-prefixed PURL must match too.
+        let purls = vec![
+            "pkg:composer/symfony/console@6.4.1".to_string(),
+            "pkg:composer/symfony/console@v6.4.1".to_string(),
+        ];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains_key("pkg:composer/symfony/console@6.4.1"));
+        assert!(result.contains_key("pkg:composer/symfony/console@v6.4.1"));
+    }
+
+    #[tokio::test]
+    async fn test_read_installed_json_skips_malformed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path();
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        // One valid entry surrounded by malformed neighbours: an entry
+        // missing `version`, one missing `name`, and a non-object. A
+        // single bad entry must not discard the whole file.
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "good/pkg", "version": "1.0.0"},
+                {"name": "bad/no-version"},
+                {"version": "2.0.0"},
+                "not-an-object"
+            ]}"#,
+        )
+        .await
+        .unwrap();
+
+        let entries = read_installed_json(vendor_dir).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "good/pkg");
+        assert_eq!(entries[0].version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_skips_package_missing_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        // installed.json lists two packages but only one has a vendor
+        // directory on disk.
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "monolog/monolog", "version": "3.5.0"},
+                {"name": "ghost/pkg", "version": "1.0.0"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "monolog");
     }
 
     #[tokio::test]

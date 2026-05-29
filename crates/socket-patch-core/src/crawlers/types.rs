@@ -222,6 +222,91 @@ mod tests {
         assert_eq!(Ecosystem::from_purl("not-a-purl"), None);
     }
 
+    /// The matcher keys on `pkg:<type>/` with the trailing slash. A type that
+    /// merely *starts with* a known type name (e.g. `npmlock`, `gemfire`) must
+    /// not be misclassified, and a type with no trailing slash is not a package
+    /// coordinate. This guards against someone loosening the prefix check.
+    #[test]
+    fn test_from_purl_requires_exact_type_with_slash() {
+        // Near-miss types that share a prefix with a real type.
+        assert_eq!(Ecosystem::from_purl("pkg:npmlock/foo@1.0"), None);
+        assert_eq!(Ecosystem::from_purl("pkg:gemfire/foo@1.0"), None);
+        assert_eq!(Ecosystem::from_purl("pkg:pypiserver/foo@1.0"), None);
+        // Type present but no trailing slash → not a coordinate.
+        assert_eq!(Ecosystem::from_purl("pkg:npm"), None);
+        assert_eq!(Ecosystem::from_purl("pkg:pypi"), None);
+        // Empty / scheme-only inputs.
+        assert_eq!(Ecosystem::from_purl(""), None);
+        assert_eq!(Ecosystem::from_purl("pkg:"), None);
+    }
+
+    /// PURLs frequently carry qualifiers (`?artifact_id=`, `?platform=`,
+    /// `?classifier=&ext=`, `?repository_url=`). Classification keys off the
+    /// type prefix and must ignore anything after the coordinate.
+    #[test]
+    fn test_from_purl_ignores_qualifiers() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:npm/lodash@4.17.21?foo=bar"),
+            Some(Ecosystem::Npm)
+        );
+        assert_eq!(
+            Ecosystem::from_purl(
+                "pkg:pypi/requests@2.28.0?artifact_id=requests-2.28.0-py3-none-any.whl"
+            ),
+            Some(Ecosystem::Pypi)
+        );
+        assert_eq!(
+            Ecosystem::from_purl("pkg:gem/nokogiri@1.16.0?platform=x86_64-linux"),
+            Some(Ecosystem::Gem)
+        );
+    }
+
+    /// cli_name (the `--ecosystems` token) and display_name (user-facing)
+    /// intentionally diverge for several ecosystems. Lock the divergence so a
+    /// future "cleanup" can't accidentally collapse the two.
+    #[test]
+    fn test_cli_name_display_name_divergence() {
+        assert_eq!(Ecosystem::Pypi.cli_name(), "pypi");
+        assert_eq!(Ecosystem::Pypi.display_name(), "python");
+        assert_eq!(Ecosystem::Gem.cli_name(), "gem");
+        assert_eq!(Ecosystem::Gem.display_name(), "ruby");
+        #[cfg(feature = "golang")]
+        {
+            assert_eq!(Ecosystem::Golang.cli_name(), "golang");
+            assert_eq!(Ecosystem::Golang.display_name(), "go");
+        }
+        #[cfg(feature = "composer")]
+        {
+            assert_eq!(Ecosystem::Composer.cli_name(), "composer");
+            assert_eq!(Ecosystem::Composer.display_name(), "php");
+        }
+    }
+
+    /// Every entry returned by `all()` must round-trip through `cli_name()` →
+    /// `from_purl(...)` so the dispatch tables can never drift apart silently.
+    #[test]
+    fn test_all_ecosystems_self_consistent() {
+        for eco in Ecosystem::all() {
+            // Names are non-empty and stable.
+            assert!(!eco.cli_name().is_empty());
+            assert!(!eco.display_name().is_empty());
+            // A synthetic PURL built from the type re-classifies to itself.
+            // Deno is the one type whose PURL token (`jsr`) differs from its
+            // cli_name (`deno`), so it is exercised separately below.
+            #[cfg(feature = "deno")]
+            if *eco == Ecosystem::Deno {
+                continue;
+            }
+            let purl = format!("pkg:{}/example@1.0.0", eco.cli_name());
+            assert_eq!(
+                Ecosystem::from_purl(&purl),
+                Some(*eco),
+                "round-trip failed for {}",
+                eco.cli_name()
+            );
+        }
+    }
+
     #[cfg(feature = "cargo")]
     #[test]
     fn test_from_purl_cargo() {
@@ -295,6 +380,34 @@ mod tests {
         assert!(!Ecosystem::Cargo.supports_release_variants());
         #[cfg(feature = "nuget")]
         assert!(!Ecosystem::Nuget.supports_release_variants());
+        #[cfg(feature = "golang")]
+        assert!(!Ecosystem::Golang.supports_release_variants());
+        #[cfg(feature = "composer")]
+        assert!(!Ecosystem::Composer.supports_release_variants());
+        #[cfg(feature = "deno")]
+        assert!(!Ecosystem::Deno.supports_release_variants());
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_from_purl_deno_jsr() {
+        // JSR packages use the `pkg:jsr/` type but route to Ecosystem::Deno.
+        assert_eq!(
+            Ecosystem::from_purl("pkg:jsr/@std/path@0.220.0"),
+            Some(Ecosystem::Deno)
+        );
+        // There is no `pkg:deno/` type; deno's npm-layout packages stay npm.
+        assert_eq!(
+            Ecosystem::from_purl("pkg:npm/chalk@5.3.0"),
+            Some(Ecosystem::Npm)
+        );
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_deno_properties() {
+        assert_eq!(Ecosystem::Deno.cli_name(), "deno");
+        assert_eq!(Ecosystem::Deno.display_name(), "deno");
     }
 
     #[test]

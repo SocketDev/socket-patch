@@ -14,9 +14,7 @@ use std::path::Path;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use socket_patch_core::manifest::schema::PatchFileInfo;
-use socket_patch_core::patch::package::{
-    read_archive_filtered, read_archive_to_map, ArchiveError,
-};
+use socket_patch_core::patch::package::{read_archive_filtered, read_archive_to_map, ArchiveError};
 use tar::Builder;
 
 /// Helper: write a small gzipped tar archive containing `(name,

@@ -35,8 +35,9 @@ pub enum CowAction {
     /// Path was a regular private file (one link, not a symlink).
     /// Caller can mutate it directly.
     AlreadyPrivate,
-    /// Path was a symlink. We removed the link and put a fresh
-    /// regular file with the same content in its place. The link
+    /// Path was a symlink. We atomically replaced the link with a
+    /// fresh regular file holding the same content (staged in the same
+    /// directory and renamed over the link in one step). The link
     /// target is untouched.
     BrokeSymlink,
     /// Path was a hardlinked regular file (`nlink > 1`). We copied
@@ -64,10 +65,21 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
         // current target content. We need it on disk as a regular
         // file at `path` so the patch write lands on our copy.
         let target_bytes = tokio::fs::read(path).await?;
-        // Remove the symlink. This only deletes the link itself; the
-        // target file (in the store, in a sibling project, wherever)
-        // is unaffected.
-        tokio::fs::remove_file(path).await?;
+        // Stage the private copy in the same directory, then
+        // atomically rename it OVER the symlink. `rename(2)` operates
+        // on the final path component itself — it never follows the
+        // symlink — so this replaces the link with our regular file
+        // while leaving the link's *target* (the store entry / sibling
+        // project) untouched.
+        //
+        // We deliberately do NOT `remove_file(path)` first. Unlinking
+        // the symlink before the replacement is committed would open a
+        // window in which the package file simply does not exist: if
+        // the staged write then failed (ENOSPC, EPERM on an immutable
+        // target, a crash), the original would be gone with nothing to
+        // roll back to. The rename-over-symlink is a single atomic
+        // step — on any failure `path` still holds the original link.
+        // This mirrors the hardlink branch below and `write_atomic`.
         write_via_stage_rename(path, &target_bytes).await?;
         return Ok(CowAction::BrokeSymlink);
     }
@@ -113,12 +125,15 @@ async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .expect("cow stage path always has a file_name — callers pass package-internal files");
-    let stage: PathBuf = parent.join(format!(
-        ".socket-cow-{}-{}",
-        stem,
-        uuid::Uuid::new_v4()
-    ));
-    tokio::fs::write(&stage, bytes).await?;
+    let stage: PathBuf = parent.join(format!(".socket-cow-{}-{}", stem, uuid::Uuid::new_v4()));
+    // Stage write. If this fails *after* creating the file (e.g. a
+    // mid-write ENOSPC), the partial stage would otherwise leak as a
+    // `.socket-cow-*` turd, so clean it up before propagating — same
+    // discipline as `apply::write_atomic`'s write arm.
+    if let Err(e) = tokio::fs::write(&stage, bytes).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
     // `rename` over the target is atomic on POSIX and best-effort on
     // Windows (`MoveFileExW` with REPLACE_EXISTING via std).
     match tokio::fs::rename(&stage, path).await {
@@ -227,6 +242,112 @@ mod tests {
         // Mutate the link path; target stays put.
         tokio::fs::write(&link, b"patched").await.unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"shared bytes");
+    }
+
+    /// Helper: count `.socket-cow-*` stage files left in a directory.
+    #[cfg(unix)]
+    fn leftover_stage_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
+            .count()
+    }
+
+    /// Realistic pnpm shape: `node_modules/<pkg>` is a *symlink* into
+    /// the content store, and the store entry is itself *hardlinked*
+    /// across projects. Breaking the symlink must:
+    ///   - leave the project path a private, single-link regular file,
+    ///   - leave the store entry's content AND its sibling hardlink
+    ///     completely untouched (the whole point of CoW),
+    ///   - leave no `.socket-cow-*` stage litter behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_to_hardlinked_store_entry_is_fully_isolated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The content store entry + a sibling project's hardlink to it.
+        let store = dir.path().join("store-entry.txt");
+        let sibling = dir.path().join("other-project-hardlink.txt");
+        tokio::fs::write(&store, b"shared bytes").await.unwrap();
+        tokio::fs::hard_link(&store, &sibling).await.unwrap();
+        // Our project links to the store entry via a symlink.
+        let link = dir.path().join("our-project-link.txt");
+        tokio::fs::symlink(&store, &link).await.unwrap();
+        assert_eq!(tokio::fs::metadata(&store).await.unwrap().nlink(), 2);
+
+        let action = break_hardlink_if_needed(&link).await.unwrap();
+        assert_eq!(action, CowAction::BrokeSymlink);
+
+        // Our path is now a private regular file (not a symlink), and
+        // its inode is distinct from the store entry.
+        let link_meta = tokio::fs::symlink_metadata(&link).await.unwrap();
+        assert!(link_meta.file_type().is_file());
+        assert!(!link_meta.file_type().is_symlink());
+        assert_ne!(
+            link_meta.ino(),
+            tokio::fs::metadata(&store).await.unwrap().ino()
+        );
+
+        // Store entry + its sibling hardlink are byte-for-byte intact,
+        // and still share their inode (nlink unchanged at 2).
+        assert_eq!(tokio::fs::metadata(&store).await.unwrap().nlink(), 2);
+        assert_eq!(tokio::fs::read(&store).await.unwrap(), b"shared bytes");
+        assert_eq!(tokio::fs::read(&sibling).await.unwrap(), b"shared bytes");
+
+        // Mutating our copy must not bleed into the store or its sibling.
+        tokio::fs::write(&link, b"patched").await.unwrap();
+        assert_eq!(tokio::fs::read(&store).await.unwrap(), b"shared bytes");
+        assert_eq!(tokio::fs::read(&sibling).await.unwrap(), b"shared bytes");
+
+        // No stage litter survives the successful break.
+        assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// Success-path litter check: neither the symlink break nor the
+    /// hardlink break may leave a `.socket-cow-*` stage file behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn break_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let target = dir.path().join("t.txt");
+        tokio::fs::write(&target, b"x").await.unwrap();
+        let link = dir.path().join("l.txt");
+        tokio::fs::symlink(&target, &link).await.unwrap();
+        break_hardlink_if_needed(&link).await.unwrap();
+
+        let a = dir.path().join("a.txt");
+        tokio::fs::write(&a, b"y").await.unwrap();
+        let b = dir.path().join("b.txt");
+        tokio::fs::hard_link(&a, &b).await.unwrap();
+        break_hardlink_if_needed(&b).await.unwrap();
+
+        assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// Idempotency: breaking a symlink yields a private regular file,
+    /// and a second call on the now-regular path is a clean
+    /// `AlreadyPrivate` no-op (no re-break, no litter).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idempotent_after_breaking_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("store.txt");
+        let link = dir.path().join("link.txt");
+        tokio::fs::write(&target, b"bytes").await.unwrap();
+        tokio::fs::symlink(&target, &link).await.unwrap();
+
+        assert_eq!(
+            break_hardlink_if_needed(&link).await.unwrap(),
+            CowAction::BrokeSymlink
+        );
+        assert_eq!(
+            break_hardlink_if_needed(&link).await.unwrap(),
+            CowAction::AlreadyPrivate
+        );
+        assert_eq!(leftover_stage_count(dir.path()), 0);
     }
 
     /// Idempotency: calling twice in a row on a regular file is fine

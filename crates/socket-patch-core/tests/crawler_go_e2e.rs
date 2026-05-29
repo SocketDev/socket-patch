@@ -114,10 +114,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let crawler = GoCrawler;
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:not-golang/foo@1.0".to_string()],
-        )
+        .find_by_purls(tmp.path(), &["pkg:not-golang/foo@1.0".to_string()])
         .await
         .unwrap();
     assert!(result.is_empty());
@@ -146,7 +143,10 @@ async fn get_module_cache_paths_local_no_go_mod_returns_empty() {
     let crawler = GoCrawler;
     let prev_cache = std::env::var("GOMODCACHE").ok();
     std::env::remove_var("GOMODCACHE");
-    let paths = crawler.get_module_cache_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
     if let Some(v) = prev_cache {
         std::env::set_var("GOMODCACHE", v);
     }
@@ -157,15 +157,21 @@ async fn get_module_cache_paths_local_no_go_mod_returns_empty() {
 #[serial]
 async fn get_module_cache_paths_with_go_mod_returns_cache() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("go.mod"), b"module example.com/test\n\ngo 1.21\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        tmp.path().join("go.mod"),
+        b"module example.com/test\n\ngo 1.21\n",
+    )
+    .await
+    .unwrap();
     let cache = tempfile::tempdir().unwrap();
     let prev = std::env::var("GOMODCACHE").ok();
     std::env::set_var("GOMODCACHE", cache.path());
 
     let crawler = GoCrawler;
-    let paths = crawler.get_module_cache_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("GOMODCACHE");
     if let Some(v) = prev {
@@ -263,7 +269,11 @@ async fn find_by_purls_module_dir_missing_returns_empty() {
 async fn crawl_all_finds_nested_versioned_module() {
     let tmp = tempfile::tempdir().unwrap();
     // Stage <cache>/github.com/gin-gonic/gin@v1.9.1/
-    let module_dir = tmp.path().join("github.com").join("gin-gonic").join("gin@v1.9.1");
+    let module_dir = tmp
+        .path()
+        .join("github.com")
+        .join("gin-gonic")
+        .join("gin@v1.9.1");
     tokio::fs::create_dir_all(&module_dir).await.unwrap();
 
     let crawler = GoCrawler;
@@ -287,7 +297,9 @@ async fn crawl_all_finds_nested_versioned_module() {
 async fn crawl_all_skips_cache_metadata_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let cache_meta = tmp.path().join("cache");
-    tokio::fs::create_dir_all(cache_meta.join("download").join("module@v1.0.0")).await.unwrap();
+    tokio::fs::create_dir_all(cache_meta.join("download").join("module@v1.0.0"))
+        .await
+        .unwrap();
 
     let crawler = GoCrawler;
     let opts = CrawlerOptions {
@@ -297,7 +309,10 @@ async fn crawl_all_skips_cache_metadata_dir() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.is_empty(), "cache/ subtree must be skipped; got {result:?}");
+    assert!(
+        result.is_empty(),
+        "cache/ subtree must be skipped; got {result:?}"
+    );
 }
 
 /// With GOMODCACHE and GOPATH both unset, `get_gomodcache` falls
@@ -306,9 +321,12 @@ async fn crawl_all_skips_cache_metadata_dir() {
 #[serial]
 async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("go.mod"), b"module example.com/test\n\ngo 1.21\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        tmp.path().join("go.mod"),
+        b"module example.com/test\n\ngo 1.21\n",
+    )
+    .await
+    .unwrap();
     let prev_gomod = std::env::var("GOMODCACHE").ok();
     let prev_gopath = std::env::var("GOPATH").ok();
     let prev_home = std::env::var("HOME").ok();
@@ -317,7 +335,10 @@ async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
     std::env::set_var("HOME", tmp.path());
 
     let crawler = GoCrawler;
-    let paths = crawler.get_module_cache_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     if let Some(v) = prev_gomod {
         std::env::set_var("GOMODCACHE", v);
@@ -342,9 +363,12 @@ async fn get_module_cache_paths_home_go_pkg_mod_fallback() {
 #[serial]
 async fn get_module_cache_paths_gopath_fallback_when_gomodcache_unset() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::write(tmp.path().join("go.mod"), b"module example.com/test\n\ngo 1.21\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        tmp.path().join("go.mod"),
+        b"module example.com/test\n\ngo 1.21\n",
+    )
+    .await
+    .unwrap();
     let gopath = tempfile::tempdir().unwrap();
     let expected = gopath.path().join("pkg").join("mod");
     let prev_gomod = std::env::var("GOMODCACHE").ok();
@@ -353,7 +377,10 @@ async fn get_module_cache_paths_gopath_fallback_when_gomodcache_unset() {
     std::env::set_var("GOPATH", gopath.path());
 
     let crawler = GoCrawler;
-    let paths = crawler.get_module_cache_paths(&options_at(tmp.path())).await.unwrap();
+    let paths = crawler
+        .get_module_cache_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
 
     std::env::remove_var("GOPATH");
     if let Some(v) = prev_gomod {

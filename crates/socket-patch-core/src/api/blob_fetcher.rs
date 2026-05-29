@@ -76,10 +76,7 @@ pub type OnProgress = Box<dyn Fn(&str, usize, usize) + Send + Sync>;
 /// Only checks `afterHash` blobs because those are the patched file
 /// contents needed for applying patches. `beforeHash` blobs are
 /// downloaded on-demand during rollback.
-pub async fn get_missing_blobs(
-    manifest: &PatchManifest,
-    blobs_path: &Path,
-) -> HashSet<String> {
+pub async fn get_missing_blobs(manifest: &PatchManifest, blobs_path: &Path) -> HashSet<String> {
     let after_hash_blobs = get_after_hash_blobs(manifest);
     let mut missing = HashSet::new();
 
@@ -140,7 +137,11 @@ where
         .into_iter()
         .map(|item| {
             let (hash, error) = into_pair(item);
-            BlobFetchResult { hash, success: false, error: Some(error) }
+            BlobFetchResult {
+                hash,
+                success: false,
+                error: Some(error),
+            }
         })
         .collect();
     let failed = results.len();
@@ -204,8 +205,7 @@ pub async fn fetch_blobs_by_hash(
         };
     }
 
-    let download_result =
-        download_hashes(&to_download, blobs_path, client, on_progress).await;
+    let download_result = download_hashes(&to_download, blobs_path, client, on_progress).await;
 
     FetchMissingBlobsResult {
         total: hashes.len(),
@@ -269,14 +269,16 @@ pub async fn fetch_missing_sources(
             None => FetchMissingBlobsResult::default(),
         },
         DownloadMode::Package => match sources.packages_path {
-            Some(dir) => fetch_missing_archives_inner(
-                manifest,
-                dir,
-                ArchiveKind::Package,
-                client,
-                on_progress,
-            )
-            .await,
+            Some(dir) => {
+                fetch_missing_archives_inner(
+                    manifest,
+                    dir,
+                    ArchiveKind::Package,
+                    client,
+                    on_progress,
+                )
+                .await
+            }
             None => FetchMissingBlobsResult::default(),
         },
     }
@@ -302,7 +304,10 @@ async fn fetch_missing_archives_inner(
 
     if let Err(e) = tokio::fs::create_dir_all(archives_dir).await {
         return all_failed_result(missing.iter(), |u| {
-            (u.clone(), format!("Cannot create archives directory: {}", e))
+            (
+                u.clone(),
+                format!("Cannot create archives directory: {}", e),
+            )
         });
     }
 
@@ -390,6 +395,13 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
         lines.push(format!("Downloaded {} blob(s)", result.downloaded));
     }
 
+    if result.skipped > 0 {
+        lines.push(format!(
+            "{} blob(s) already present locally",
+            result.skipped
+        ));
+    }
+
     if result.failed > 0 {
         lines.push(format!("Failed to download {} blob(s)", result.failed));
 
@@ -411,10 +423,31 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
         }
     }
 
+    // `total > 0` but nothing downloaded, skipped, or failed should not be
+    // reachable, but guard against emitting a misleading blank string.
+    if lines.is_empty() {
+        return "All blobs are present locally.".to_string();
+    }
+
     lines.join("\n")
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
+
+/// Compare an expected blob hash against the hash computed from the
+/// downloaded bytes.
+///
+/// Git object hashes are hex, and hex is case-insensitive. The content
+/// hasher ([`compute_git_sha256_from_bytes`]) always emits lowercase, but
+/// [`ApiClient::fetch_blob`]'s validator accepts uppercase hex too — so a
+/// manifest (or server) that uses uppercase would download byte-for-byte
+/// correct content and then be wrongly rejected by a case-sensitive
+/// comparison. Compare ignoring ASCII case to keep the two consistent.
+///
+/// [`compute_git_sha256_from_bytes`]: crate::hash::git_sha256::compute_git_sha256_from_bytes
+fn blob_hash_matches(expected: &str, actual: &str) -> bool {
+    expected.eq_ignore_ascii_case(actual)
+}
 
 /// Download a list of blob hashes sequentially, writing each to
 /// `blobs_path/<hash>`.
@@ -438,7 +471,7 @@ async fn download_hashes(
             Ok(Some(data)) => {
                 // Verify content hash matches expected hash before writing
                 let actual_hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&data);
-                if actual_hash != *hash {
+                if !blob_hash_matches(hash, &actual_hash) {
                     results.push(BlobFetchResult {
                         hash: hash.clone(),
                         success: false,
@@ -511,11 +544,7 @@ mod tests {
             files.insert(
                 format!("package/file{}.js", i),
                 PatchFileInfo {
-                    before_hash: format!(
-                        "before{}{}",
-                        "0".repeat(58),
-                        format!("{:06}", i)
-                    ),
+                    before_hash: format!("before{}{}", "0".repeat(58), format!("{:06}", i)),
                     after_hash: ah.to_string(),
                 },
             );
@@ -564,7 +593,9 @@ mod tests {
         let h2 = "b".repeat(64);
 
         // Write h1 to disk so it is NOT missing
-        tokio::fs::write(blobs_path.join(&h1), b"data").await.unwrap();
+        tokio::fs::write(blobs_path.join(&h1), b"data")
+            .await
+            .unwrap();
 
         let manifest = make_manifest_with_hashes(&[&h1, &h2]);
         let missing = get_missing_blobs(&manifest, &blobs_path).await;
@@ -593,7 +624,10 @@ mod tests {
             skipped: 0,
             results: Vec::new(),
         };
-        assert_eq!(format_fetch_result(&result), "All blobs are present locally.");
+        assert_eq!(
+            format_fetch_result(&result),
+            "All blobs are present locally."
+        );
     }
 
     #[test]
@@ -659,9 +693,21 @@ mod tests {
             failed: 0,
             skipped: 0,
             results: vec![
-                BlobFetchResult { hash: "a".repeat(64), success: true, error: None },
-                BlobFetchResult { hash: "b".repeat(64), success: true, error: None },
-                BlobFetchResult { hash: "c".repeat(64), success: true, error: None },
+                BlobFetchResult {
+                    hash: "a".repeat(64),
+                    success: true,
+                    error: None,
+                },
+                BlobFetchResult {
+                    hash: "b".repeat(64),
+                    success: true,
+                    error: None,
+                },
+                BlobFetchResult {
+                    hash: "c".repeat(64),
+                    success: true,
+                    error: None,
+                },
             ],
         };
         let output = format_fetch_result(&result);
@@ -795,15 +841,101 @@ mod tests {
         let manifest = make_manifest_with_uuids(&["11111111-1111-4111-8111-111111111111"]);
         let (client, _) = crate::api::client::get_api_client_from_env(None).await;
 
-        let res = fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None)
-            .await;
+        let res =
+            fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
         assert_eq!(res.total, 0);
         assert_eq!(res.downloaded, 0);
         assert_eq!(res.failed, 0);
 
-        let res = fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None)
-            .await;
+        let res =
+            fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
         assert_eq!(res.total, 0);
+    }
+
+    // ── Regression: skipped accounting in format ─────────────────────
+
+    #[test]
+    fn test_format_all_skipped_is_not_blank() {
+        // Regression: `fetch_blobs_by_hash` can return total>0 with every
+        // blob already on disk (downloaded=0, failed=0, skipped=N). The
+        // formatter must surface that rather than returning a blank line.
+        let result = FetchMissingBlobsResult {
+            total: 2,
+            downloaded: 0,
+            failed: 0,
+            skipped: 2,
+            results: vec![
+                BlobFetchResult {
+                    hash: "a".repeat(64),
+                    success: true,
+                    error: None,
+                },
+                BlobFetchResult {
+                    hash: "b".repeat(64),
+                    success: true,
+                    error: None,
+                },
+            ],
+        };
+        let output = format_fetch_result(&result);
+        assert!(!output.trim().is_empty(), "must not be blank: {:?}", output);
+        assert!(output.contains("2 blob(s) already present"));
+        assert!(!output.contains("Downloaded"));
+        assert!(!output.contains("Failed"));
+    }
+
+    #[test]
+    fn test_format_downloaded_and_skipped_mix() {
+        let result = FetchMissingBlobsResult {
+            total: 3,
+            downloaded: 1,
+            failed: 0,
+            skipped: 2,
+            results: vec![
+                BlobFetchResult {
+                    hash: "a".repeat(64),
+                    success: true,
+                    error: None,
+                },
+                BlobFetchResult {
+                    hash: "b".repeat(64),
+                    success: true,
+                    error: None,
+                },
+                BlobFetchResult {
+                    hash: "c".repeat(64),
+                    success: true,
+                    error: None,
+                },
+            ],
+        };
+        let output = format_fetch_result(&result);
+        assert!(output.contains("Downloaded 1 blob(s)"));
+        assert!(output.contains("2 blob(s) already present"));
+    }
+
+    // ── Regression: hash comparison is case-insensitive ──────────────
+
+    #[test]
+    fn test_blob_hash_matches_is_case_insensitive() {
+        // Hex is case-insensitive. `compute_git_sha256_from_bytes` emits
+        // lowercase, but `is_valid_sha256_hex` accepts uppercase, so the
+        // verification must treat the two as equal (otherwise valid
+        // uppercase-hash content is wrongly rejected as a mismatch).
+        let lower = "abc123".to_string() + &"0".repeat(58);
+        let upper = lower.to_ascii_uppercase();
+        assert!(blob_hash_matches(&upper, &lower));
+        assert!(blob_hash_matches(&lower, &upper));
+        assert!(blob_hash_matches(&lower, &lower));
+    }
+
+    #[test]
+    fn test_blob_hash_matches_rejects_genuine_mismatch() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        assert!(!blob_hash_matches(&a, &b));
+        // Differing length is still a mismatch.
+        assert!(!blob_hash_matches(&a, "aa"));
     }
 
     #[test]
