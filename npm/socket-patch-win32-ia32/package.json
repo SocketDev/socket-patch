@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-win32-ia32",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "socket-patch binary for Windows ia32",
   "os": [
     "win32"

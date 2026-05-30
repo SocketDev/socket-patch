@@ -2403,7 +2403,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket-patch-cli"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "base64",
  "clap",
@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "socket-patch-core"
-version = "3.2.0"
+version = "3.3.0"
 dependencies = [
  "flate2",
  "fs2",
