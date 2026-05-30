@@ -238,6 +238,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
         prune: false,
         sync: true,
         all_releases: false,
+        vex: Default::default(),
     };
     // Avoid borrow problem with into_iter
     let _ = &mut args;
@@ -299,6 +300,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         prune: false,
         sync: true,
         all_releases: false,
+        vex: Default::default(),
     };
     let _ = scan_run(scan_args).await;
 
@@ -320,6 +322,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: true,
+        vex: Default::default(),
     };
     let _ = apply_run(apply_args).await;
 
@@ -374,6 +377,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     };
     let _ = scan_run(scan_args).await;
 
@@ -449,6 +453,7 @@ async fn pypi_crawler_finds_real_installed_six() {
         prune: false,
         sync: false,
         all_releases: false,
+        vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
 }

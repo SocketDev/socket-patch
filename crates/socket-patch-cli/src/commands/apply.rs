@@ -21,8 +21,10 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
+    VexSummary,
 };
 
 /// Overlay every regular file from `src` into `dst` via hard link (falling
@@ -68,6 +70,13 @@ pub struct ApplyArgs {
     /// Skip pre-application hash verification (apply even if package version differs).
     #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
     pub force: bool,
+
+    /// On a successful apply, also generate an OpenVEX 0.2.0 document.
+    /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
+    /// standalone `vex` command. A requested-but-failed VEX makes the
+    /// whole command exit non-zero even when patches applied cleanly.
+    #[command(flatten)]
+    pub vex: VexEmbedArgs,
 }
 
 /// True when every file the engine verified for this package is already
@@ -282,6 +291,23 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 .filter(|r| r.success && !r.files_patched.is_empty())
                 .count();
 
+            // Embedded VEX: only on a successful apply and only when
+            // `--vex <path>` was passed. Re-read the manifest fresh so
+            // verification observes the just-applied on-disk state. The
+            // result is folded into the JSON envelope / human output
+            // below and flips the exit code on failure (per the
+            // fail-the-command contract). `None` => not requested.
+            let vex_result = if success && args.vex.vex.is_some() {
+                let params = args.vex.to_build_params();
+                Some(
+                    generate_vex_from_manifest_path(&args.common, &params, &manifest_path)
+                        .await,
+                )
+            } else {
+                None
+            };
+            let vex_failed = matches!(vex_result, Some(Err(_)));
+
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
@@ -311,6 +337,19 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 }
                 if !success {
                     env.mark_partial_failure();
+                }
+                match &vex_result {
+                    Some(Ok(summary)) => {
+                        env.vex = Some(VexSummary {
+                            path: args.vex.vex.as_ref().unwrap().display().to_string(),
+                            statements: summary.statements,
+                            format: "openvex-0.2.0".to_string(),
+                        });
+                    }
+                    Some(Err(e)) => {
+                        env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                    }
+                    None => {}
                 }
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent && !results.is_empty() {
@@ -389,6 +428,24 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 }
             }
 
+            // Human-readable VEX status (JSON mode already folded the
+            // outcome into the envelope above).
+            if !args.common.json && !args.common.silent {
+                match &vex_result {
+                    Some(Ok(summary)) => {
+                        println!(
+                            "Wrote OpenVEX document with {} statement(s) to {}",
+                            summary.statements,
+                            args.vex.vex.as_ref().unwrap().display(),
+                        );
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("Error: VEX generation failed: {}", e.message);
+                    }
+                    None => {}
+                }
+            }
+
             // Track telemetry
             if success {
                 track_patch_applied(patched_count, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
@@ -396,7 +453,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 track_patch_apply_failed("One or more patches failed to apply", args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
             }
 
-            if success { 0 } else { 1 }
+            // A requested-but-failed VEX flips an otherwise-successful
+            // apply to a non-zero exit (fail-the-command contract).
+            if success && !vex_failed {
+                0
+            } else {
+                1
+            }
         }
         Err(e) => {
             track_patch_apply_failed(&e, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;

@@ -14,6 +14,20 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ## [Unreleased]
 
+### Added
+
+- **Inline OpenVEX generation on `apply` and `scan` via `--vex <path>`.** A
+  single successful `apply`/`scan` can now both patch and emit the OpenVEX
+  0.2.0 attestation, instead of requiring a separate `socket-patch vex` step.
+  The `--vex-product` / `--vex-no-verify` / `--vex-doc-id` / `--vex-compact`
+  flags mirror the standalone `vex` knobs (and reuse the `SOCKET_VEX_*` env
+  vars). The document is always written to the given path (never stdout, so it
+  never races `--json`), built from the post-run manifest and verified against
+  on-disk state. JSON output gains a top-level `vex` summary
+  (`{ path, statements, format }`). A requested-but-failed VEX makes the
+  command exit non-zero even when the apply/scan itself succeeded, surfacing a
+  stable error code in the envelope.
+
 ## [3.2.0] — 2026-05-29
 
 A repo-wide correctness, security, and filesystem-safety hardening pass: every

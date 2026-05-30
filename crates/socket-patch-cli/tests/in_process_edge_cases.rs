@@ -59,6 +59,7 @@ fn default_apply(cwd: &Path) -> ApplyArgs {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: false,
+        vex: Default::default(),
     }
 }
 

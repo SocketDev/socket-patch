@@ -307,6 +307,7 @@ fn scan_args(tmp: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         prune: false,
         sync: false,
         all_releases,
+        vex: Default::default(),
     }
 }
 

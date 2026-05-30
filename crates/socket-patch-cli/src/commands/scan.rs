@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
 
@@ -289,6 +290,87 @@ pub struct ScanArgs {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub all_releases: bool,
+
+    /// On a successful scan, also generate an OpenVEX 0.2.0 document.
+    /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
+    /// standalone `vex` command. The document is built from the manifest
+    /// as it stands after the scan (including any `--apply`/`--sync`
+    /// writes) and verified against on-disk state. A requested-but-failed
+    /// VEX makes the command exit non-zero.
+    #[command(flatten)]
+    pub vex: VexEmbedArgs,
+}
+
+/// Embedded-VEX side-effect for `scan`'s JSON terminal returns. When
+/// `--vex` was requested and `base_code` is 0, generate the OpenVEX
+/// document from the post-scan manifest and fold the outcome into
+/// `result` — a `vex` object on success, or `status: "error"` + `error`
+/// on failure (per the fail-the-command contract). Returns the final exit
+/// code: `base_code` when not requested / skipped / on VEX success, `1`
+/// when VEX generation failed. Caller prints `result` after this returns.
+async fn embed_vex_into_json(
+    common: &GlobalArgs,
+    vex_args: &VexEmbedArgs,
+    manifest_path: &Path,
+    base_code: i32,
+    result: &mut serde_json::Value,
+) -> i32 {
+    if vex_args.vex.is_none() || base_code != 0 {
+        return base_code;
+    }
+    let params = vex_args.to_build_params();
+    match generate_vex_from_manifest_path(common, &params, manifest_path).await {
+        Ok(summary) => {
+            result["vex"] = serde_json::json!({
+                "path": vex_args.vex.as_ref().unwrap().display().to_string(),
+                "statements": summary.statements,
+                "format": "openvex-0.2.0",
+            });
+            0
+        }
+        Err(e) => {
+            result["status"] = serde_json::json!("error");
+            result["error"] = serde_json::json!({
+                "code": e.code,
+                "message": e.message,
+            });
+            1
+        }
+    }
+}
+
+/// Embedded-VEX side-effect for `scan`'s human-readable terminal returns.
+/// Prints a one-line note (or error) and returns the final exit code:
+/// `base_code` when not requested / skipped / on VEX success, `1` on VEX
+/// failure. No-op unless `--vex` was set and `base_code` is 0.
+async fn embed_vex_human(
+    common: &GlobalArgs,
+    vex_args: &VexEmbedArgs,
+    manifest_path: &Path,
+    base_code: i32,
+) -> i32 {
+    if vex_args.vex.is_none() || base_code != 0 {
+        return base_code;
+    }
+    let params = vex_args.to_build_params();
+    match generate_vex_from_manifest_path(common, &params, manifest_path).await {
+        Ok(summary) => {
+            if !common.silent {
+                println!(
+                    "Wrote OpenVEX document with {} statement(s) to {}",
+                    summary.statements,
+                    vex_args.vex.as_ref().unwrap().display(),
+                );
+            }
+            0
+        }
+        Err(e) => {
+            if !common.silent {
+                eprintln!("Error: VEX generation failed: {}", e.message);
+            }
+            1
+        }
+    }
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
@@ -300,6 +382,12 @@ pub async fn run(args: ScanArgs) -> i32 {
     // but legal (all three end up true).
     let apply = args.apply || args.sync;
     let prune = args.prune || args.sync;
+
+    // Resolved up-front (rather than at the GC site) because the embedded
+    // `--vex` side-effect reads the manifest at several terminal returns,
+    // including the early "no packages" exit before the GC block.
+    let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = manifest_path.parent().unwrap().to_path_buf();
 
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
@@ -360,27 +448,39 @@ pub async fn run(args: ScanArgs) -> i32 {
         if show_progress {
             eprintln!();
         }
+        // Telemetry: empty-scan still counts as a successful scan.
+        track_patch_scanned(
+            0,
+            0,
+            0,
+            false,
+            args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+            false,
+            telemetry_token.as_deref(),
+            telemetry_org.as_deref(),
+        )
+        .await;
         if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
             // user "uninstalled everything" is too destructive. Bots
             // that need full cleanup can call `repair` explicitly. No
             // `gc` field emitted because the user didn't request one.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "success",
-                    "scannedPackages": 0,
-                    "packagesWithPatches": 0,
-                    "totalPatches": 0,
-                    "freePatches": 0,
-                    "paidPatches": 0,
-                    "canAccessPaidPatches": false,
-                    "packages": [],
-                    "updates": [],
-                }))
-                .unwrap()
-            );
+            let mut result = serde_json::json!({
+                "status": "success",
+                "scannedPackages": 0,
+                "packagesWithPatches": 0,
+                "totalPatches": 0,
+                "freePatches": 0,
+                "paidPatches": 0,
+                "canAccessPaidPatches": false,
+                "packages": [],
+                "updates": [],
+            });
+            let code =
+                embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            return code;
         } else if args.common.global || args.common.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
@@ -396,19 +496,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             install_cmds.push_str("/composer");
             println!("No packages found. Run {install_cmds} install first.");
         }
-        // Telemetry: empty-scan still counts as a successful scan.
-        track_patch_scanned(
-            0,
-            0,
-            0,
-            false,
-            args.common.ecosystems.clone().unwrap_or_default().as_slice(),
-            false,
-            telemetry_token.as_deref(),
-            telemetry_org.as_deref(),
-        )
-        .await;
-        return 0;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Build ecosystem summary
@@ -580,8 +668,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
     // non-JSON table-print path (counts `updates_available`).
-    let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path.parent().unwrap().to_path_buf();
+    // (`manifest_path`/`socket_dir` are resolved at the top of `run`.)
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
     let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
 
@@ -731,8 +818,11 @@ pub async fn run(args: ScanArgs) -> i32 {
                 };
             }
 
+            let final_code =
+                embed_vex_into_json(&args.common, &args.vex, &manifest_path, apply_code, &mut result)
+                    .await;
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            return apply_code;
+            return final_code;
         }
 
         // --- GC-only path (no --apply, just --prune) --------------------
@@ -749,15 +839,17 @@ pub async fn run(args: ScanArgs) -> i32 {
             };
         }
 
+        let final_code =
+            embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
-        return 0;
+        return final_code;
     }
 
     let use_color = stdout_is_tty();
 
     if all_packages_with_patches.is_empty() {
         println!("\nNo patches available for installed packages.");
-        return 0;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     let mut updates_available = 0usize;
@@ -898,7 +990,7 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     if downloadable_count == 0 {
         println!("\nNo downloadable patches (paid subscription required).");
-        return 0;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Fetch full PatchSearchResult for each package that has patches
@@ -946,7 +1038,7 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     if selected.is_empty() {
         println!("No patches selected.");
-        return 0;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Display detailed summary of selected patches before confirming
@@ -1013,7 +1105,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         println!("\nTo apply a patch, run:");
         println!("  socket-patch get <package-name-or-purl>");
         println!("  socket-patch get <CVE-ID>");
-        return 0;
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Download and apply
@@ -1052,7 +1144,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
     }
 
-    code
+    embed_vex_human(&args.common, &args.vex, &manifest_path, code).await
 }
 
 pub(crate) fn severity_order(s: &str) -> u8 {

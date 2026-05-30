@@ -176,6 +176,8 @@ socket-patch scan [options]
 | `--sync` | Sugar for `--apply --prune`. The canonical bot-mode flag. |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
 | `--all-releases` | Store patches for every release/distribution variant, not just the installed one — makes the manifest portable across environments (e.g. cross-platform CI caches) |
+| `--vex <path>` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan). (env: `SOCKET_VEX`) |
+| `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 > Use `--dry-run` to preview what `--apply`/`--prune`/`--sync` would do without mutating disk.
 
@@ -204,6 +206,9 @@ socket-patch scan --ecosystems npm
 
 # Scan global packages
 socket-patch scan -g
+
+# Scan + apply + emit an OpenVEX attestation in one pass
+socket-patch scan --json --sync --yes --vex socket.vex.json
 ```
 
 ### `apply`
@@ -219,6 +224,8 @@ socket-patch apply [options]
 | Flag | Description |
 |------|-------------|
 | `-f, --force` | Skip pre-application hash verification (apply even if package version differs) |
+| `--vex <path>` | On a successful apply, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan). (env: `SOCKET_VEX`) |
+| `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 **Examples:**
 ```bash
@@ -236,6 +243,9 @@ socket-patch apply --offline
 
 # JSON output for CI/CD
 socket-patch apply --json
+
+# Apply and emit an OpenVEX attestation in one step
+socket-patch apply --vex socket.vex.json
 ```
 
 ### `rollback`
@@ -468,6 +478,26 @@ trivy image --vex socket.vex.json <image>
 ```
 
 Run `socket-patch get` or `socket-patch scan --sync` first — `vex` errors with `no_patches` against an empty manifest.
+
+### Inline VEX on `apply` / `scan`
+
+You don't need a separate `vex` invocation: pass `--vex <path>` to `apply` or `scan` and the same OpenVEX document is generated as a side-effect of a successful run.
+
+```bash
+# Patch and attest in one step
+socket-patch apply --vex socket.vex.json
+
+# Discover, apply, prune, and attest — the full bot-mode pass
+socket-patch scan --json --sync --yes --vex socket.vex.json
+```
+
+The `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, and `--vex-compact` flags mirror the standalone command's `--product` / `--no-verify` / `--doc-id` / `--compact` knobs.
+
+Contract:
+
+- The document is **always written to the file** (never stdout), so it never collides with the command's own `--json` output. JSON mode adds a top-level `vex` summary — `{ path, statements, format }` — to the envelope (`apply`) / result (`scan`).
+- It's built from the manifest **as it stands after the run** (including any `--apply`/`--sync` writes) and verified against on-disk state unless `--vex-no-verify` is set. Generated for real applies, `--dry-run`, and read-only scans alike.
+- **Fail-the-command:** if `--vex` was requested but generation fails (no detectable product, empty/missing manifest, nothing verified, unwritable path), the command exits non-zero **even when the apply/scan itself succeeded**, with a stable error code in the JSON output.
 
 ## Scripting & CI/CD
 
