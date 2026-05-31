@@ -1,6 +1,6 @@
 {
   "name": "@socketsecurity/socket-patch-linux-x64-gnu",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "socket-patch binary for Linux x64 (glibc)",
   "os": [
     "linux"
