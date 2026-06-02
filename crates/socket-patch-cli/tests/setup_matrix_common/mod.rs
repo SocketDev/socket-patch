@@ -255,13 +255,20 @@ fn run_case(case: &Case) -> RunResult {
         for (k, v) in &env {
             cmd.args(["-e", &format!("{k}={v}")]);
         }
-        // Mount the hook wheel into the container at a fixed path.
+        // Mount the hook wheel into the container, PRESERVING its PEP 427
+        // filename (pip/uv/pdm reject a wheel whose filename isn't a valid
+        // `{name}-{ver}-{tags}.whl`, so we must not rename it on mount).
         if let Some(w) = &wheel {
+            let name = w
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("hook wheel filename");
+            let dest = format!("/tmp/{name}");
             cmd.args([
                 "-v",
-                &format!("{}:/tmp/socket_patch_hook.whl:ro", w.display()),
+                &format!("{}:{}:ro", w.display(), dest),
                 "-e",
-                "SOCKET_PATCH_HOOK_WHEEL=/tmp/socket_patch_hook.whl",
+                &format!("SOCKET_PATCH_HOOK_WHEEL={dest}"),
             ]);
         }
         cmd.arg(format!("socket-patch-test-{}:latest", case.image));

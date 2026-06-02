@@ -1,14 +1,17 @@
 //! setup-matrix: pypi ecosystem (pip / uv / poetry / pdm / hatch).
 //!
 //! Python installers have no native post-install hook, so `socket-patch
-//! setup` instead commits a `socket-patch[hook]` dependency whose wheel
-//! ships a startup `.pth` that re-applies patches after install
-//! (package-manager-agnostic). pip and uv are now wired for this, so their
-//! `baseline_with_setup` / `alt_content_patchset` cases should APPLY (the
-//! harness builds the hook wheel and the driver installs it + fires an
-//! interpreter). poetry / pdm / hatch and the nested-workspace layouts are
-//! not yet wired (BASELINE GAP) — a follow-up. The negative-control /
-//! empty / wrong-target cases must still NOT apply.
+//! setup` instead commits a `socket-patch-hook` dependency whose wheel ships
+//! a startup `.pth` that re-applies patches after install
+//! (package-manager-agnostic). pip, uv and hatch are wired + verified in
+//! Docker: their `baseline_with_setup` / `alt_content_patchset` cases APPLY
+//! (the harness builds the hook wheel and the driver installs it + fires an
+//! interpreter). poetry / pdm are resolver-based — their `add`/`install`/`run`
+//! re-resolve the whole manifest (now incl. the committed `socket-patch-hook`)
+//! against a package index, which the hermetic test can't provide, so they
+//! remain BASELINE GAPs (the mechanism is PM-agnostic and proven by the
+//! others). Nested-workspace layouts are also still gaps. The negative-control
+//! / empty / wrong-target cases must NOT apply for any of them.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_pypi`
 #![cfg(feature = "setup-e2e")]

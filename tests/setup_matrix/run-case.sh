@@ -322,8 +322,14 @@ pth_install_into_venv() { # $1=venv dir  $2=pip|uv
   [ -n "${SOCKET_PATCH_HOOK_WHEEL:-}" ] && [ -f "${SOCKET_PATCH_HOOK_WHEEL:-}" ] || {
     note "no SOCKET_PATCH_HOOK_WHEEL; pth hook not installed (gap)"; return 0; }
   case "$flavor" in
-    pip) "$venv/bin/pip" install --quiet --no-deps "$SOCKET_PATCH_HOOK_WHEEL" || note "hook wheel install failed" ;;
     uv)  uv pip install --python "$venv/bin/python" --quiet --no-deps "$SOCKET_PATCH_HOOK_WHEEL" || note "hook wheel install failed" ;;
+    *)   # pip-compatible venv (pip / poetry / pdm). Use the venv's own
+         # python so it targets that interpreter's site-packages; ensurepip
+         # if the venv was created without pip.
+         "$venv/bin/python" -m pip --version >/dev/null 2>&1 \
+           || "$venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+         "$venv/bin/python" -m pip install --quiet --no-deps "$SOCKET_PATCH_HOOK_WHEEL" \
+           || note "hook wheel install failed" ;;
   esac
   # The hook resolves `socket-patch` off PATH (it isn't pip-installed here).
   ln -sf "$SP_BIN" "$venv/bin/socket-patch" 2>/dev/null || true
@@ -355,9 +361,24 @@ run_install() {
       pth_install_into_venv venv uv
       uv pip install --python venv/bin/python --quiet "$SM_PACKAGE==$SM_VERSION"
       pth_trigger venv ;;
+    # poetry / pdm are resolver-based: `add` re-resolves the whole manifest
+    # (which setup edited to add `socket-patch-hook`) against a package index.
+    # In this hermetic test the hook wheel isn't published, so resolution
+    # fails — these PMs can't be exercised without a local index, so they stay
+    # documented gaps (baseline_supported:false). The .pth mechanism itself is
+    # package-manager-agnostic (proven by pip/uv/hatch).
     poetry) poetry config virtualenvs.in-project true --local && poetry add --no-interaction "$SM_PACKAGE@$SM_VERSION" ;;
     pdm)   pdm config python.use_venv true >/dev/null 2>&1; pdm add "$SM_PACKAGE==$SM_VERSION" ;;
-    hatch) HATCH_DATA_DIR="$PWD/.hatch" hatch env create && HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "import ${SM_PACKAGE//-/_}" ;;
+    hatch)
+      HATCH_DATA_DIR="$PWD/.hatch" hatch env create
+      HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "import ${SM_PACKAGE//-/_}"
+      # hatch manages its env outside .venv; install the hook + fire an
+      # interpreter through `hatch run`.
+      if [ "$SM_RUN_SETUP" = 1 ] && [ -n "${SOCKET_PATCH_HOOK_WHEEL:-}" ] && [ -f "${SOCKET_PATCH_HOOK_WHEEL:-}" ]; then
+        HATCH_DATA_DIR="$PWD/.hatch" hatch run pip install --no-deps "$SOCKET_PATCH_HOOK_WHEEL" \
+          || note "hatch hook wheel install failed"
+      fi
+      HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "pass" || true ;;
     cargo) cargo fetch ;;
     bundler) bundle config set --local path vendor/bundle && bundle install ;;
     go)    GOFLAGS=-mod=mod go mod download "$SM_PACKAGE@$SM_VERSION" ;;
@@ -556,11 +577,19 @@ run_file() { # $1 = absolute path to the resolved package file
       esac ;;
     deno) deno run -A "$1" ;;
     pypi)
+      # Run the patched module with the in-project venv interpreter directly.
+      # Going through `<pm> run` re-resolves the project, which (after setup)
+      # includes the committed `socket-patch-hook` dependency — unpublished in
+      # this hermetic test, so the resolve would fail for a reason unrelated to
+      # whether six.py is patched. Direct execution faithfully runs the on-disk
+      # patched file and observes its marker. (hatch manages its env outside
+      # an in-project .venv, and its skip-install env doesn't re-resolve, so it
+      # keeps using `hatch run`.)
       case "$SM_PM" in
-        uv)     uv run python "$1" ;;
-        poetry) poetry run python "$1" ;;
-        pdm)    pdm run python "$1" ;;
-        hatch)  hatch run python "$1" ;;
+        uv)     ./venv/bin/python "$1" ;;
+        poetry) ./.venv/bin/python "$1" ;;
+        pdm)    ./.venv/bin/python "$1" ;;
+        hatch)  HATCH_DATA_DIR="$PWD/.hatch" hatch run python "$1" ;;
         pip)    ./venv/bin/python "$1" ;;
         *)      python3 "$1" ;;
       esac ;;
