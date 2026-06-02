@@ -55,6 +55,13 @@
       "patchset": "alt",
       "expect_applied": true,
       "description": "Different patch set: a second fixture whose blob carries the ALT marker. Proves the applied bytes track the active manifest (alt marker present, primary marker absent)."
+    },
+    {
+      "id": "patch_missing",
+      "run_setup": true,
+      "patchset": "none",
+      "expect_applied": false,
+      "description": "Ablation: setup runs and the install hook fires, but NO patch set is committed (no .socket/). The install must run UNPATCHED — proving the committed patch is what changes the code, not setup/install alone."
     }
   ],
 
@@ -189,7 +196,14 @@
       "run_setup": false,
       "patchset": "primary",
       "expect_applied": false,
-      "description": "Negative control: workspace install without setup must NOT apply."
+      "description": "Ablation (setup not run): workspace install without setup must NOT apply — the hook is the cause."
+    },
+    {
+      "id": "workspace_patch_missing",
+      "run_setup": true,
+      "patchset": "none",
+      "expect_applied": false,
+      "description": "Ablation (patch missing): workspace setup + install with NO committed patch set must run unpatched across the workspace."
     }
   ],
   "workspace_targets": [
@@ -246,7 +260,14 @@
       "run_setup": false,
       "patchset": "primary",
       "expect_applied": false,
-      "description": "Negative control: polyglot monorepo install without setup must NOT apply."
+      "description": "Ablation (setup not run): polyglot monorepo install without setup must NOT apply."
+    },
+    {
+      "id": "monorepo_patch_missing",
+      "run_setup": true,
+      "patchset": "none",
+      "expect_applied": false,
+      "description": "Ablation (patch missing): polyglot monorepo setup + install with NO committed patch set must run unpatched."
     }
   ],
   "monorepo_targets": [

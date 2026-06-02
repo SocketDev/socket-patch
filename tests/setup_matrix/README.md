@@ -37,10 +37,17 @@ wrappers).
   hatch · cargo · bundler · go · mvn · composer · dotnet · deno.
 - **Scenarios (single-project):**
   - `baseline_with_setup` — setup + install ⇒ patch applied *(ideal)*.
-  - `no_setup_control` — install only ⇒ NOT applied *(the hook is the cause)*.
-  - `empty_patchset` — empty manifest ⇒ NOT applied.
+  - `no_setup_control` — **ablation (setup not run)**: install only ⇒ NOT applied *(the hook is the cause)*.
+  - `patch_missing` — **ablation (patch missing)**: setup runs and the hook fires, but no `.socket/` patch set is committed ⇒ runs UNPATCHED *(the committed patch is the cause)*.
+  - `empty_patchset` — manifest present but with zero patches ⇒ NOT applied.
   - `wrong_target_patchset` — manifest targets a different package ⇒ NOT applied.
   - `alt_content_patchset` — a second patch set ⇒ its marker applied *(content tracks the manifest)*.
+
+  The two **ablations** are the controls that confirm `setup` is correct:
+  each is identical to `baseline_with_setup` except for the single removed
+  factor (the setup step, or the committed patch), and each must run
+  unpatched. The workspace and monorepo layouts carry the same pair
+  (`*_no_setup`, `*_patch_missing`).
 
 ## Layouts
 
@@ -57,7 +64,7 @@ own `*_targets` / `*_scenarios` sections in `matrix.json`):
   dependency hoists / lands in the pnpm store and is patched once) and
   **pip** (nested `requirements.txt` files) + **uv** (uv workspace, one
   shared `.venv`) as Python gaps. Scenarios: `workspace_with_setup`,
-  `workspace_no_setup`.
+  `workspace_no_setup`, `workspace_patch_missing`.
 - **`monorepo`** — a **polyglot all-ecosystem repo**: an npm workspace
   alongside python/rust/go/php/ruby/nuget/deno manifests. Confirms `setup`
   works in a mixed environment — it must configure the npm hooks and
@@ -65,7 +72,7 @@ own `*_targets` / `*_scenarios` sections in `matrix.json`):
   patches the npm slice. Runs in the npm image (the only one with the npm
   toolchain), so the foreign manifests are present to test setup's
   robustness, not installed. Scenarios: `monorepo_with_setup`,
-  `monorepo_no_setup`.
+  `monorepo_no_setup`, `monorepo_patch_missing`.
 
 > Real-world wiring note surfaced by the workspace layout: the install
 > hook's `apply` must run with the package manager's per-script cwd (root

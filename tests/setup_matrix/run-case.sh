@@ -153,6 +153,14 @@ EOF
 }
 
 build_fixture() {
+  # Ablation: no patch set committed at all (no .socket/). Even with a
+  # working install hook, apply finds no manifest and no-ops, so the
+  # install must run unpatched. Distinct from `empty` (manifest present
+  # but with zero patches).
+  if [ "$SM_PATCHSET" = none ]; then
+    note "no patch fixture committed (ablation: patch missing)"
+    return
+  fi
   mkdir -p .socket/blobs
   case "$SM_PATCHSET" in
     empty)
