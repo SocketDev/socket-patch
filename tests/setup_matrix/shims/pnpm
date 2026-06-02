@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# setup-matrix test shim for `pnpm`.
+#
+# For pnpm projects `socket-patch setup` writes the hook
+#   pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm
+# `pnpm dlx` always downloads from the registry, so it cannot be satisfied
+# from a local file: dependency. This shim, prepended to PATH, intercepts
+# `pnpm dlx @socketsecurity/socket-patch …` (and `pnpm exec …`) and execs
+# the locally-built binary; every other `pnpm` invocation — crucially the
+# real `pnpm install` / `pnpm add` — is delegated unchanged to the real
+# pnpm.
+#
+# TEST FIXTURE only. Reference copy; run-case.sh embeds an identical copy.
+set -uo pipefail
+
+sp_bin="${SOCKET_PATCH_BIN:-socket-patch}"
+shim_dir="${SETUP_MATRIX_SHIM_DIR:-}"
+
+clean_path="$PATH"
+if [ -n "$shim_dir" ]; then
+  clean_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$shim_dir" | paste -sd: -)"
+fi
+real_pnpm="$(PATH="$clean_path" command -v pnpm 2>/dev/null || true)"
+
+if [ "${1:-}" = "dlx" ] || [ "${1:-}" = "exec" ]; then
+  case "${2:-}" in
+    @socketsecurity/socket-patch|@socketsecurity/socket-patch@*)
+      shift 2
+      exec "$sp_bin" "$@"
+      ;;
+  esac
+fi
+
+if [ -n "$real_pnpm" ]; then
+  exec "$real_pnpm" "$@"
+fi
+echo "setup-matrix pnpm shim: real pnpm not found: $*" >&2
+exit 127

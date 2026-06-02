@@ -21,6 +21,18 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 RUN curl -fsSL https://bun.sh/install | bash \
  && ln -s /root/.bun/bin/bun /usr/local/bin/bun
 
+# Enable pnpm and yarn via corepack (bundled with Node 20). The
+# setup-matrix suite (tests/setup_matrix/) drives all four npm-family
+# package managers — npm, yarn, pnpm, bun — through the `socket-patch
+# setup` install-hook flow. `corepack prepare … --activate` pins and
+# activates a known version so the binaries resolve without a network
+# round-trip at test time. Additive: the existing docker_e2e_npm tests
+# are unaffected.
+RUN corepack enable \
+ && corepack prepare pnpm@9.15.0 --activate \
+ && corepack prepare yarn@1.22.22 --activate
+
 # Verify versions are sane at image-build time so a broken NodeSource setup
 # fails the image build rather than every downstream test.
-RUN node --version && npm --version && bun --version && socket-patch --version
+RUN node --version && npm --version && bun --version \
+ && pnpm --version && yarn --version && socket-patch --version

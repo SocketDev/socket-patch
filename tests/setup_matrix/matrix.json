@@ -1,0 +1,169 @@
+{
+  "_comment": [
+    "Declarative source of truth for the `socket-patch setup` end-to-end test matrix.",
+    "Consumed by BOTH scripts/setup-matrix.sh (jq) and the Rust wrappers",
+    "crates/socket-patch-cli/tests/setup_matrix_<eco>.rs (serde_json).",
+    "",
+    "A 'case' is the cross-product (target x scenario). expect_applied comes from",
+    "the scenario (the ASPIRATIONAL ideal); baseline_supported on the target says",
+    "whether `setup` ACTUALLY wires a working install hook today. The classifier in",
+    "the orchestrator compares actual vs both: meeting the ideal => pass; failing the",
+    "ideal but matching the recorded baseline => known_gap (non-blocking); diverging",
+    "from the baseline in the wrong direction => regression (blocking the optional job).",
+    "",
+    "Packages, PURLs, manifest keys and install layouts are reused verbatim from the",
+    "existing tests/docker_e2e_<eco>.rs so the fixtures are known-valid.",
+    "NOTE: pypi uses NO `package/` prefix in the manifest key (the python crawler",
+    "reports the site-packages root); every other ecosystem uses `package/<rel>`."
+  ],
+
+  "marker": "SOCKET-PATCH-SETUP-MATRIX-MARKER",
+  "alt_marker": "SOCKET-PATCH-SETUP-MATRIX-ALT-MARKER",
+
+  "scenarios": [
+    {
+      "id": "baseline_with_setup",
+      "run_setup": true,
+      "patchset": "primary",
+      "expect_applied": true,
+      "description": "Prepare deps + committed patch set, run `socket-patch setup`, run the native install. The install hook should apply the patch (the ideal)."
+    },
+    {
+      "id": "no_setup_control",
+      "run_setup": false,
+      "patchset": "primary",
+      "expect_applied": false,
+      "description": "Negative control: identical fixture but setup is NOT run. With no hook configured, the install must NOT apply the patch."
+    },
+    {
+      "id": "empty_patchset",
+      "run_setup": true,
+      "patchset": "empty",
+      "expect_applied": false,
+      "description": "Different patch set: an empty manifest. Even with setup, nothing should be applied."
+    },
+    {
+      "id": "wrong_target_patchset",
+      "run_setup": true,
+      "patchset": "wrong",
+      "expect_applied": false,
+      "description": "Different patch set: a manifest that patches a different, non-installed package. The installed package must be left untouched."
+    },
+    {
+      "id": "alt_content_patchset",
+      "run_setup": true,
+      "patchset": "alt",
+      "expect_applied": true,
+      "description": "Different patch set: a second fixture whose blob carries the ALT marker. Proves the applied bytes track the active manifest (alt marker present, primary marker absent)."
+    }
+  ],
+
+  "targets": [
+    {
+      "ecosystem": "npm", "pm": "npm", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "yarn", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "pnpm", "image": "npm", "hook_family": "pnpm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "bun", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+
+    {
+      "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+    {
+      "ecosystem": "pypi", "pm": "uv", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+    {
+      "ecosystem": "pypi", "pm": "poetry", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+    {
+      "ecosystem": "pypi", "pm": "pdm", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+    {
+      "ecosystem": "pypi", "pm": "hatch", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+
+    {
+      "ecosystem": "cargo", "pm": "cargo", "image": "cargo", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "cfg-if", "version": "1.0.0", "purl": "pkg:cargo/cfg-if@1.0.0",
+      "manifest_key": "package/src/lib.rs", "apply_ecosystems": "cargo"
+    },
+
+    {
+      "ecosystem": "gem", "pm": "bundler", "image": "gem", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "colorize", "version": "1.1.0", "purl": "pkg:gem/colorize@1.1.0",
+      "manifest_key": "package/lib/colorize.rb", "apply_ecosystems": "gem"
+    },
+
+    {
+      "ecosystem": "golang", "pm": "go", "image": "golang", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "github.com/gin-gonic/gin", "version": "v1.9.1",
+      "purl": "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
+      "manifest_key": "package/gin.go", "apply_ecosystems": "golang"
+    },
+
+    {
+      "ecosystem": "maven", "pm": "mvn", "image": "maven", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "org.apache.commons:commons-lang3", "version": "3.12.0",
+      "purl": "pkg:maven/org.apache.commons/commons-lang3@3.12.0",
+      "manifest_key": "package/commons-lang3-3.12.0.pom", "apply_ecosystems": "maven"
+    },
+
+    {
+      "ecosystem": "composer", "pm": "composer", "image": "composer", "hook_family": "composer-event",
+      "baseline_supported": false,
+      "package": "monolog/monolog", "version": "3.5.0", "purl": "pkg:composer/monolog/monolog@3.5.0",
+      "manifest_key": "package/src/Monolog/Logger.php", "apply_ecosystems": "composer"
+    },
+
+    {
+      "ecosystem": "nuget", "pm": "dotnet", "image": "nuget", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "Newtonsoft.Json", "version": "13.0.3", "purl": "pkg:nuget/newtonsoft.json@13.0.3",
+      "manifest_key": "package/LICENSE.md", "apply_ecosystems": "nuget"
+    },
+
+    {
+      "ecosystem": "deno", "pm": "deno", "image": "deno", "hook_family": "npm-via-deno",
+      "baseline_supported": false,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# setup-matrix test shim for `npx`.
+#
+# The hook that `socket-patch setup` writes into package.json is
+#   npx @socketsecurity/socket-patch apply --silent --ecosystems npm
+# In a hermetic test we do NOT want `npx` to fetch the published wrapper
+# package from the npm registry — we want it to run the locally-built
+# binary under test. This shim, prepended to PATH, intercepts exactly that
+# invocation and execs the local binary; every other `npx` call is
+# delegated to the real `npx`.
+#
+# This is a TEST FIXTURE, not a change to socket-patch behavior. It is the
+# standalone/reference copy; tests/setup_matrix/run-case.sh embeds an
+# identical copy inline so the driver is self-contained when piped into a
+# container. Keep the two in sync.
+set -uo pipefail
+
+sp_bin="${SOCKET_PATCH_BIN:-socket-patch}"
+shim_dir="${SETUP_MATRIX_SHIM_DIR:-}"
+
+# Resolve the real npx by searching PATH with our own shim dir removed.
+clean_path="$PATH"
+if [ -n "$shim_dir" ]; then
+  clean_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$shim_dir" | paste -sd: -)"
+fi
+real_npx="$(PATH="$clean_path" command -v npx 2>/dev/null || true)"
+
+# If any argument names our package, drop everything up to and including it
+# and exec the local binary with the remaining apply args.
+i=0
+for arg in "$@"; do
+  case "$arg" in
+    @socketsecurity/socket-patch|@socketsecurity/socket-patch@*|@socketsecurity/socket-patch/*)
+      shift "$((i + 1))"
+      exec "$sp_bin" "$@"
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+if [ -n "$real_npx" ]; then
+  exec "$real_npx" "$@"
+fi
+echo "setup-matrix npx shim: real npx not found and args are not our package: $*" >&2
+exit 127

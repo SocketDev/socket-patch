@@ -577,3 +577,75 @@ jobs:
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test
         run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}
+
+  # ----------------------------------------------------------------------
+  # Experimental `setup`-flow matrix (NON-BLOCKING).
+  #
+  # For each ecosystem/package manager, drives the full intended flow —
+  # prepare deps + a committed patch set, run `socket-patch setup`, run
+  # the native install, check whether the patch was applied — plus the
+  # negative controls (no setup, empty/wrong/alt patch sets). See
+  # tests/setup_matrix/ and scripts/setup-matrix.sh.
+  #
+  # This is EXPERIMENTAL and intentionally not required to pass yet:
+  # `setup` only configures npm-family install hooks today, so most
+  # non-npm `baseline_with_setup` cases are EXPECTED to fail (a baseline
+  # of what `setup` must eventually support). `continue-on-error: true`
+  # means this job never blocks a PR — it must ALSO be left OUT of the
+  # repo's required status checks (configured in the branch-protection
+  # UI, not in this file). The orchestrator exits non-zero only on a
+  # *regression* vs the recorded baseline; the full per-case result set
+  # is uploaded as a JSON artifact for inspection.
+  # ----------------------------------------------------------------------
+  setup-matrix:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ecosystem: [npm, pypi, cargo, gem, golang, maven, composer, nuget, deno]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        # `driver: docker` — the per-ecosystem image's `FROM
+        # socket-patch-test-base:latest` only resolves when buildx talks
+        # directly to the host docker daemon (see e2e-docker above).
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver: docker
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Build base image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.base
+          tags: socket-patch-test-base:latest
+          load: true
+
+      - name: Build ${{ matrix.ecosystem }} image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: tests/docker/Dockerfile.${{ matrix.ecosystem }}
+          tags: socket-patch-test-${{ matrix.ecosystem }}:latest
+          load: true
+
+      - name: Run ${{ matrix.ecosystem }} setup-matrix
+        run: scripts/setup-matrix.sh run --ecosystem ${{ matrix.ecosystem }} --out "report-${{ matrix.ecosystem }}.json"
+
+      - name: Upload ${{ matrix.ecosystem }} setup-matrix report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: setup-matrix-${{ matrix.ecosystem }}
+          path: report-${{ matrix.ecosystem }}.json
+          if-no-files-found: warn

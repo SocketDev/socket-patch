@@ -108,3 +108,18 @@ Fixtures are synthetic. Real Socket patches are not required to exist
 for the tested PURLs — what's validated is that the crawler discovers
 real installed packages and the CLI dispatches correctly through the
 ecosystem.
+
+## Related: the `setup`-flow matrix
+
+A separate, **experimental** suite lives under `tests/setup_matrix/` and
+reuses these same per-ecosystem images. Where `docker_e2e_*` drives
+`scan → apply` explicitly, the setup-matrix instead runs `socket-patch
+setup` and then a *native install* to check whether the configured
+install hook applies the patch on its own — the thing `setup` is meant
+to enable. It also adds the npm-family package managers (pnpm/yarn via
+corepack) and the Python ones (uv/poetry/pdm/hatch), which is why
+`Dockerfile.npm` and `Dockerfile.pypi` install those tools. See
+`tests/setup_matrix/README.md` for details and the
+`scripts/setup-matrix.sh` runner. That suite's CI job (`setup-matrix`)
+is **non-blocking** (`continue-on-error: true`) and is expected to fail
+for ecosystems whose hooks `setup` does not yet configure.
