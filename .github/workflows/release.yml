@@ -43,27 +43,14 @@ jobs:
             echo "::error::CHANGELOG.md does not exist at the repository root."
             exit 1
           fi
-          # A release is valid two ways:
-          #   1. An explicit `## [X.Y.Z]` / `## X.Y.Z` heading already exists
-          #      (notes written by hand), OR
-          #   2. The `## [Unreleased]` section is non-empty — the
-          #      post-publish `changelog-rollover` job stamps it as
-          #      `## [X.Y.Z] — DATE` after publishing.
+          # A release requires an explicit `## [X.Y.Z]` / `## X.Y.Z` heading
+          # (notes written by hand in the version-bump PR).
           if grep -qE "^## \[?${VERSION}\]?( |$)" CHANGELOG.md; then
             echo "Found explicit CHANGELOG heading for ${VERSION}."
             exit 0
           fi
-          unreleased_content=$(awk '
-            /^## \[Unreleased\]/ { inblock=1; next }
-            inblock && /^## / { inblock=0 }
-            inblock && NF { print }
-          ' CHANGELOG.md)
-          if [ -n "$unreleased_content" ]; then
-            echo "No explicit ${VERSION} heading, but [Unreleased] has content — it will be rolled over after publish."
-            exit 0
-          fi
           echo "::error::CHANGELOG.md has no release notes for ${VERSION}."
-          echo "::error::Add entries under \`## [Unreleased]\` (preferred — they roll over automatically), or a \`## [${VERSION}] — $(date +%Y-%m-%d)\` heading, before re-running."
+          echo "::error::Add a \`## [${VERSION}] — $(date +%Y-%m-%d)\` heading with release notes before re-running."
           exit 1
 
   build:
@@ -443,46 +430,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/
-
-  # After every artifact has published, stamp the CHANGELOG: promote the
-  # `## [Unreleased]` section to `## [<version>] — <date>` and leave a fresh
-  # empty `[Unreleased]` for the next cycle, then commit it back to the
-  # release branch. Idempotent — a no-op when a `## [<version>]` heading was
-  # written by hand. Runs last so a failed publish never rewrites history.
-  changelog-rollover:
-    needs: [version, github-release, cargo-publish, npm-publish, pypi-publish]
-    if: ${{ !inputs.dry-run }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout release branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.ref_name }}
-          # persist-credentials defaults to true so the rollover commit can
-          # be pushed back to the branch below.
-
-      - name: Roll [Unreleased] over to the released version
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-        run: bash scripts/rollover-changelog.sh "$VERSION"
-
-      - name: Commit and push if changed
-        # Pass workflow contexts through env vars (never interpolate
-        # `${{ }}` directly into the shell) so a branch name can't inject
-        # code into this run block — see zizmor's template-injection audit.
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if git diff --quiet -- CHANGELOG.md; then
-            echo "CHANGELOG.md unchanged (heading already present); nothing to commit."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          # [skip ci] so this housekeeping commit doesn't retrigger CI.
-          git commit -m "chore(changelog): roll [Unreleased] over to v${VERSION} [skip ci]"
-          git push origin "HEAD:${REF_NAME}"
