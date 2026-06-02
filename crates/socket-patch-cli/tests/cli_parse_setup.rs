@@ -75,9 +75,34 @@ fn json_long_form() {
 }
 
 #[test]
-fn remove_defaults_false_and_long_form() {
-    assert!(!parse_setup(&[]).remove);
-    assert!(parse_setup(&["--remove"]).remove);
+fn check_long_form() {
+    let args = parse_setup(&["--check"]);
+    assert!(args.check);
+    assert!(!args.remove);
+}
+
+#[test]
+fn remove_long_form() {
+    let args = parse_setup(&["--remove"]);
+    assert!(args.remove);
+    assert!(!args.check);
+}
+
+#[test]
+fn check_and_remove_conflict() {
+    let result = Cli::try_parse_from(["socket-patch", "setup", "--check", "--remove"]);
+    let err = match result {
+        Ok(_) => panic!("--check + --remove must conflict"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn defaults_check_and_remove_false() {
+    let args = parse_setup(&[]);
+    assert!(!args.check);
+    assert!(!args.remove);
 }
 
 #[test]
@@ -111,6 +136,8 @@ fn unknown_flag_is_error() {
 async fn run_empty_tempdir_exits_zero() {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let args = SetupArgs {
+        check: false,
+        remove: false,
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tempdir.path().to_path_buf(),
             dry_run: false,
@@ -118,7 +145,6 @@ async fn run_empty_tempdir_exits_zero() {
             json: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
-        remove: false,
     };
     let exit = run(args).await;
     assert_eq!(

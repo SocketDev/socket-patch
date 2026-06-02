@@ -334,3 +334,143 @@ fn setup_partial_failure_exits_nonzero_when_applying() {
     let root = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
     assert!(root.contains("socket-patch"), "valid file should still be updated");
 }
+
+// ---------------------------------------------------------------------------
+// `setup --check` — read-only verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_check_configured_project_exits_zero() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkg = tmp.path().join("package.json");
+    write(&pkg, r#"{ "name": "x", "version": "1.0.0" }"#);
+    // Configure it first.
+    let (c, _) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(c, 0);
+
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "configured project should pass --check; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "configured");
+    assert_eq!(v["needsConfiguration"], 0);
+}
+
+#[test]
+fn setup_check_unconfigured_project_exits_nonzero() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), r#"{ "name": "x", "scripts": { "build": "tsc" } }"#);
+
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    assert_eq!(code, 1, "unconfigured project must fail --check; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "needs_configuration");
+    assert_eq!(v["needsConfiguration"], 1);
+}
+
+#[test]
+fn setup_check_no_files_exits_zero() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "no files should still exit 0; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "no_files");
+}
+
+#[test]
+fn setup_check_does_not_modify_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkg = tmp.path().join("package.json");
+    let original = "{ \"name\": \"x\", \"scripts\": { \"build\": \"tsc\" } }";
+    write(&pkg, original);
+    run_setup(tmp.path(), &["--check"]);
+    assert_eq!(
+        std::fs::read_to_string(&pkg).unwrap(),
+        original,
+        "--check must never write"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `setup --remove` — revert the install hooks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_remove_round_trips_and_preserves_other_scripts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkg = tmp.path().join("package.json");
+    write(&pkg, r#"{ "name": "x", "scripts": { "build": "tsc" } }"#);
+
+    // Configure, then remove.
+    let (c1, _) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(c1, 0);
+    let after_setup = std::fs::read_to_string(&pkg).unwrap();
+    assert!(after_setup.contains("socket-patch"));
+
+    let (code, stdout) = run_setup(tmp.path(), &["--remove", "--yes"]);
+    assert_eq!(code, 0, "remove should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["removed"], 1);
+
+    let after = std::fs::read_to_string(&pkg).unwrap();
+    assert!(!after.contains("socket-patch"), "socket-patch must be gone; got:\n{after}");
+    let parsed: serde_json::Value = serde_json::from_str(&after).expect("valid JSON");
+    // Full revert: lifecycle keys gone, sibling script preserved.
+    assert_eq!(parsed["scripts"]["build"], "tsc");
+    assert!(parsed["scripts"].get("postinstall").is_none());
+    assert!(parsed["scripts"].get("dependencies").is_none());
+
+    // And --check now reports it needs configuration again.
+    let (c2, _) = run_setup(tmp.path(), &["--check"]);
+    assert_eq!(c2, 1, "after remove, --check must fail again");
+}
+
+#[test]
+fn setup_remove_dry_run_does_not_modify_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pkg = tmp.path().join("package.json");
+    write(&pkg, r#"{ "name": "x", "version": "1.0.0" }"#);
+    let (c1, _) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(c1, 0);
+    let configured = std::fs::read_to_string(&pkg).unwrap();
+
+    let (code, stdout) = run_setup(tmp.path(), &["--remove", "--dry-run"]);
+    assert_eq!(code, 0, "remove dry-run should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "dry_run");
+    assert_eq!(v["dryRun"], true);
+    assert_eq!(v["wouldRemove"], 1);
+
+    assert_eq!(
+        std::fs::read_to_string(&pkg).unwrap(),
+        configured,
+        "remove --dry-run must not modify package.json"
+    );
+}
+
+#[test]
+fn setup_remove_nothing_to_remove_exits_zero() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), r#"{ "name": "x", "scripts": { "build": "tsc" } }"#);
+
+    let (code, stdout) = run_setup(tmp.path(), &["--remove", "--yes"]);
+    assert_eq!(code, 0, "nothing to remove should exit 0; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "not_configured");
+    assert_eq!(v["removed"], 0);
+}
+
+#[test]
+fn setup_check_and_remove_are_mutually_exclusive() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), r#"{ "name": "x" }"#);
+
+    // clap conflict → usage error (exit 2), not a normal run.
+    let out = Command::new(binary())
+        .args(["setup", "--check", "--remove"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_ne!(out.status.code(), Some(0), "--check + --remove must be rejected");
+}
