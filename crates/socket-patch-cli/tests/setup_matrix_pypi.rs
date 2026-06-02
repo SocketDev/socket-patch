@@ -1,9 +1,14 @@
 //! setup-matrix: pypi ecosystem (pip / uv / poetry / pdm / hatch).
 //!
-//! Python installers have no native post-install hook and `socket-patch
-//! setup` is a no-op for them, so the `baseline_with_setup` /
-//! `alt_content_patchset` cases are EXPECTED to fail here (BASELINE
-//! GAP). The negative-control / empty / wrong-target cases should pass.
+//! Python installers have no native post-install hook, so `socket-patch
+//! setup` instead commits a `socket-patch[hook]` dependency whose wheel
+//! ships a startup `.pth` that re-applies patches after install
+//! (package-manager-agnostic). pip and uv are now wired for this, so their
+//! `baseline_with_setup` / `alt_content_patchset` cases should APPLY (the
+//! harness builds the hook wheel and the driver installs it + fires an
+//! interpreter). poetry / pdm / hatch and the nested-workspace layouts are
+//! not yet wired (BASELINE GAP) — a follow-up. The negative-control /
+//! empty / wrong-target cases must still NOT apply.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_pypi`
 #![cfg(feature = "setup-e2e")]

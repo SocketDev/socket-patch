@@ -75,6 +75,12 @@ fn json_long_form() {
 }
 
 #[test]
+fn remove_defaults_false_and_long_form() {
+    assert!(!parse_setup(&[]).remove);
+    assert!(parse_setup(&["--remove"]).remove);
+}
+
+#[test]
 fn all_flags_combined() {
     let args = parse_setup(&["--cwd", "/tmp/x", "--dry-run", "-y", "--json"]);
     assert_eq!(args.common.cwd, PathBuf::from("/tmp/x"));
@@ -112,6 +118,7 @@ async fn run_empty_tempdir_exits_zero() {
             json: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
+        remove: false,
     };
     let exit = run(args).await;
     assert_eq!(

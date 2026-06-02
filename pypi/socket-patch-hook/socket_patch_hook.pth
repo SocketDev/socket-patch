@@ -1,0 +1,1 @@
+import os; exec("try:\n import socket_patch_hook as _h; _h.run()\nexcept Exception: pass") if (os.environ.get('SOCKET_PATCH_HOOK','').strip().lower() not in ('off','0','false','no') and os.environ.get('SOCKET_NO_HOOK','').strip().lower() not in ('1','true','yes','on')) else None
