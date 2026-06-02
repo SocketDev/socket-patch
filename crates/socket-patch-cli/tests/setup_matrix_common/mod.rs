@@ -94,6 +94,7 @@ struct Case {
     apply_ecosystems: String,
     marker: String,
     alt_marker: String,
+    layout: String,
 }
 
 impl Case {
@@ -121,13 +122,24 @@ impl Case {
             ("SM_APPLY_ECOSYSTEMS".into(), self.apply_ecosystems.clone()),
             ("SM_MARKER".into(), self.marker.clone()),
             ("SM_ALT_MARKER".into(), self.alt_marker.clone()),
+            ("SM_LAYOUT".into(), self.layout.clone()),
         ]
     }
 }
 
-/// Load every case for a given (ecosystem, pm) by crossing that target
-/// with all scenarios in the spec.
-fn load_cases(ecosystem: &str, pm: &str) -> Vec<Case> {
+/// Load every case for a given (ecosystem, pm) by crossing the matching
+/// target in `targets_key` with every scenario in `scenarios_key`,
+/// tagging each with `layout`. `targets_key`/`scenarios_key` select the
+/// spec section: ("targets","scenarios") for single projects,
+/// ("workspace_targets","workspace_scenarios") for nested workspaces,
+/// ("monorepo_targets","monorepo_scenarios") for the polyglot monorepo.
+fn load_section(
+    targets_key: &str,
+    scenarios_key: &str,
+    layout: &str,
+    ecosystem: &str,
+    pm: &str,
+) -> Vec<Case> {
     let text = std::fs::read_to_string(matrix_path())
         .unwrap_or_else(|e| panic!("read matrix.json: {e}"));
     let spec: serde_json::Value =
@@ -135,15 +147,15 @@ fn load_cases(ecosystem: &str, pm: &str) -> Vec<Case> {
     let marker = spec["marker"].as_str().unwrap_or("").to_string();
     let alt_marker = spec["alt_marker"].as_str().unwrap_or("").to_string();
 
-    let target = spec["targets"]
+    let target = spec[targets_key]
         .as_array()
-        .expect("targets array")
+        .unwrap_or_else(|| panic!("{targets_key} array missing"))
         .iter()
         .find(|t| t["ecosystem"] == ecosystem && t["pm"] == pm)
-        .unwrap_or_else(|| panic!("no target for {ecosystem}/{pm} in matrix.json"));
+        .unwrap_or_else(|| panic!("no {targets_key} entry for {ecosystem}/{pm}"));
 
     let mut cases = Vec::new();
-    for s in spec["scenarios"].as_array().expect("scenarios array") {
+    for s in spec[scenarios_key].as_array().expect("scenarios array") {
         let scenario = s["id"].as_str().unwrap().to_string();
         cases.push(Case {
             id: format!("{ecosystem}/{pm}/{scenario}"),
@@ -162,6 +174,7 @@ fn load_cases(ecosystem: &str, pm: &str) -> Vec<Case> {
             apply_ecosystems: target["apply_ecosystems"].as_str().unwrap().to_string(),
             marker: marker.clone(),
             alt_marker: alt_marker.clone(),
+            layout: layout.to_string(),
         });
     }
     cases
@@ -222,22 +235,44 @@ fn run_case(case: &Case) -> RunResult {
     }
 }
 
-/// Run every scenario for one (ecosystem, pm) and assert each meets the
-/// ASPIRATIONAL expectation. Soft-skips when Docker / the ecosystem
-/// image is unavailable (container mode) — matching the `docker_e2e_*`
-/// convention where Rust integration tests have no native "skipped".
+/// Run the single-project scenarios for one (ecosystem, pm).
 pub fn run_pm(ecosystem: &str, pm: &str) {
+    run_cases(
+        &format!("{ecosystem}/{pm}"),
+        load_section("targets", "scenarios", "single", ecosystem, pm),
+    );
+}
+
+/// Run the nested-workspace scenarios for one (ecosystem, pm).
+pub fn run_workspace_pm(ecosystem: &str, pm: &str) {
+    run_cases(
+        &format!("{ecosystem}/{pm} [workspace]"),
+        load_section("workspace_targets", "workspace_scenarios", "workspace", ecosystem, pm),
+    );
+}
+
+/// Run the polyglot all-ecosystem monorepo scenarios.
+pub fn run_monorepo() {
+    run_cases(
+        "monorepo",
+        load_section("monorepo_targets", "monorepo_scenarios", "monorepo", "monorepo", "mono"),
+    );
+}
+
+/// Execute a set of cases and assert each meets the ASPIRATIONAL
+/// expectation. Soft-skips when Docker / the ecosystem image is
+/// unavailable (container mode) — matching the `docker_e2e_*` convention
+/// where Rust integration tests have no native "skipped".
+fn run_cases(label: &str, cases: Vec<Case>) {
     if !host_mode() && !docker_on_path() {
-        eprintln!("skip {ecosystem}/{pm}: docker not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on host)");
+        eprintln!("skip {label}: docker not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on host)");
         return;
     }
-
-    let cases = load_cases(ecosystem, pm);
     if !host_mode() {
         if let Some(c) = cases.first() {
             if !image_present(&c.image) {
                 eprintln!(
-                    "skip {ecosystem}/{pm}: image socket-patch-test-{}:latest not present \
+                    "skip {label}: image socket-patch-test-{}:latest not present \
                      (build it: scripts/setup-matrix.sh build --ecosystem {})",
                     c.image, c.image
                 );
@@ -267,12 +302,11 @@ pub fn run_pm(ecosystem: &str, pm: &str) {
 
     assert!(
         failures.is_empty(),
-        "{}/{}: {} of {} setup-matrix case(s) did not meet the aspirational \
+        "{}: {} of {} setup-matrix case(s) did not meet the aspirational \
          expectation. BASELINE GAP entries are the experimental TODO list \
          (this suite is non-blocking in CI); REGRESSION / LEAK entries are \
          real problems:\n{}",
-        ecosystem,
-        pm,
+        label,
         failures.len(),
         cases.len(),
         failures.join("\n")

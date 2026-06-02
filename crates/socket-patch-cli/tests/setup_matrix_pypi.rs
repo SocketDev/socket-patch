@@ -35,3 +35,18 @@ fn pdm() {
 fn hatch() {
     smc::run_pm("pypi", "hatch");
 }
+
+// ── Nested-workspace layouts (EXPECTED BASELINE GAP) ──────────────────
+// uv workspace (root + members, one shared .venv) and a pip
+// nested-requirements monorepo. Python has no post-install hook, so
+// these don't apply today — but the install itself must succeed.
+
+#[test]
+fn pip_workspace() {
+    smc::run_workspace_pm("pypi", "pip");
+}
+
+#[test]
+fn uv_workspace() {
+    smc::run_workspace_pm("pypi", "uv");
+}

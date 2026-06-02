@@ -35,12 +35,45 @@ wrappers).
 
 - **Package managers:** npm, yarn, pnpm, bun · pip, uv, poetry, pdm,
   hatch · cargo · bundler · go · mvn · composer · dotnet · deno.
-- **Scenarios:**
+- **Scenarios (single-project):**
   - `baseline_with_setup` — setup + install ⇒ patch applied *(ideal)*.
   - `no_setup_control` — install only ⇒ NOT applied *(the hook is the cause)*.
   - `empty_patchset` — empty manifest ⇒ NOT applied.
   - `wrong_target_patchset` — manifest targets a different package ⇒ NOT applied.
   - `alt_content_patchset` — a second patch set ⇒ its marker applied *(content tracks the manifest)*.
+
+## Layouts
+
+The driver's `SM_LAYOUT` selects the project shape (each layout has its
+own `*_targets` / `*_scenarios` sections in `matrix.json`):
+
+- **`single`** *(default)* — one project, one dependency. The 16-PM grid above.
+- **`workspace`** — a **nested workspace/monorepo**: a root + several
+  members (incl. a deeply-nested one and a member that does *not* use the
+  patched package). Models real-world monorepo deployments and exercises
+  `setup`'s workspace handling — npm/yarn write the hook to **every**
+  member, pnpm only to the **root** — plus the cross-workspace apply on a
+  single root install. Covered PMs: **npm, pnpm, yarn** (apply; the
+  dependency hoists / lands in the pnpm store and is patched once) and
+  **pip** (nested `requirements.txt` files) + **uv** (uv workspace, one
+  shared `.venv`) as Python gaps. Scenarios: `workspace_with_setup`,
+  `workspace_no_setup`.
+- **`monorepo`** — a **polyglot all-ecosystem repo**: an npm workspace
+  alongside python/rust/go/php/ruby/nuget/deno manifests. Confirms `setup`
+  works in a mixed environment — it must configure the npm hooks and
+  **not choke** on the foreign manifests; a root `npm install` then
+  patches the npm slice. Runs in the npm image (the only one with the npm
+  toolchain), so the foreign manifests are present to test setup's
+  robustness, not installed. Scenarios: `monorepo_with_setup`,
+  `monorepo_no_setup`.
+
+> Real-world wiring note surfaced by the workspace layout: the install
+> hook's `apply` must run with the package manager's per-script cwd (root
+> for the project, the member dir for each member) — so member
+> postinstalls find no manifest and no-op while the root applies. Forcing
+> a single cwd makes every member target the root manifest and fail
+> mid-install with "no packages found on disk". The driver therefore does
+> **not** pin `SOCKET_CWD`.
 
 ## Result classification
 
@@ -76,9 +109,14 @@ scripts/setup-matrix.sh run --ecosystem npm
 scripts/setup-matrix.sh run --ecosystem pypi --pm uv
 scripts/setup-matrix.sh run --scenario no_setup_control
 
+# Run the nested-workspace and polyglot-monorepo cases.
+scripts/setup-matrix.sh run --scenario workspace_with_setup
+scripts/setup-matrix.sh run --scenario monorepo_with_setup
+
 # Query the last results (agent-friendly JSON).
 scripts/setup-matrix.sh query --status known_gap
 scripts/setup-matrix.sh query --status regression
+scripts/setup-matrix.sh query --layout workspace
 scripts/setup-matrix.sh list --json
 
 # Host mode (no Docker; needs the toolchains + a built binary on PATH).
@@ -95,9 +133,11 @@ SOCKET_PATCH_TEST_HOST=1 cargo test -p socket-patch-cli --features setup-e2e --t
 
 ## Files
 
-- `matrix.json` — declarative case list (targets × scenarios) + markers.
-- `run-case.sh` — self-contained flow driver (one case → JSON result);
-  generates the runner shims inline so it can be piped into a container.
+- `matrix.json` — declarative case list: `targets`×`scenarios` (single),
+  `workspace_targets`×`workspace_scenarios`, `monorepo_targets`×`monorepo_scenarios`, + markers.
+- `run-case.sh` — self-contained flow driver (one case → JSON result),
+  layout-aware (`SM_LAYOUT=single|workspace|monorepo`); generates the
+  runner shims inline so it can be piped into a container.
 - `shims/{npx,pnpm}` — reference copies of the PATH shims that route
   `npx`/`pnpm dlx @socketsecurity/socket-patch` to the locally-built
   binary (so the hook runs the binary under test, not a registry fetch).
@@ -105,7 +145,8 @@ SOCKET_PATCH_TEST_HOST=1 cargo test -p socket-patch-cli --features setup-e2e --t
 - `../docker/Dockerfile.{npm,pypi,…}` — the per-ecosystem images
   (npm/pypi extended with the extra package managers).
 - `../../crates/socket-patch-cli/tests/setup_matrix_<eco>.rs` — thin Rust
-  wrappers around the same driver.
+  wrappers around the same driver (incl. `setup_matrix_monorepo.rs`; the
+  npm/pypi wrappers add `*_workspace` tests).
 
 ## Adding a package manager / ecosystem
 

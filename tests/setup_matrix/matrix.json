@@ -165,5 +165,96 @@
       "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
       "manifest_key": "package/index.js", "apply_ecosystems": "npm"
     }
+  ],
+
+  "_workspace_comment": [
+    "Nested-workspace layouts (run-case.sh SM_LAYOUT=workspace): a root +",
+    "several workspace members (incl. a deeply-nested one and a member that",
+    "does NOT use the patched package). Models real monorepos and exercises",
+    "`setup`'s workspace handling — npm/yarn write the hook to every member,",
+    "pnpm only to the root — plus the cross-workspace apply on the root",
+    "install. npm/yarn/pnpm should apply (baseline_supported true); Python",
+    "workspaces (uv workspace, pip nested-requirements) are gaps."
+  ],
+  "workspace_scenarios": [
+    {
+      "id": "workspace_with_setup",
+      "run_setup": true,
+      "patchset": "primary",
+      "expect_applied": true,
+      "description": "Nested workspace: setup at root, then a root-level install must apply the patch to the (hoisted/store-linked) dependency used across members."
+    },
+    {
+      "id": "workspace_no_setup",
+      "run_setup": false,
+      "patchset": "primary",
+      "expect_applied": false,
+      "description": "Negative control: workspace install without setup must NOT apply."
+    }
+  ],
+  "workspace_targets": [
+    {
+      "ecosystem": "npm", "pm": "npm", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "pnpm", "image": "npm", "hook_family": "pnpm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "npm", "pm": "yarn", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    },
+    {
+      "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    },
+    {
+      "ecosystem": "pypi", "pm": "uv", "image": "pypi", "hook_family": "none",
+      "baseline_supported": false,
+      "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
+      "manifest_key": "six.py", "apply_ecosystems": "pypi"
+    }
+  ],
+
+  "_monorepo_comment": [
+    "Polyglot monorepo (SM_LAYOUT=monorepo): an npm workspace alongside",
+    "python/rust/go/php/ruby/nuget/deno manifests. Confirms `setup` works in",
+    "a mixed environment — it must configure the npm hooks and NOT choke on",
+    "the foreign manifests; a root `npm install` then patches the npm slice.",
+    "Runs in the npm image (the only one with the npm toolchain); the foreign",
+    "manifests are present to test setup's robustness, not installed."
+  ],
+  "monorepo_scenarios": [
+    {
+      "id": "monorepo_with_setup",
+      "run_setup": true,
+      "patchset": "primary",
+      "expect_applied": true,
+      "description": "All ecosystems present: setup at root, then npm install applies the patch to the npm workspace dependency; setup must not error on the foreign manifests."
+    },
+    {
+      "id": "monorepo_no_setup",
+      "run_setup": false,
+      "patchset": "primary",
+      "expect_applied": false,
+      "description": "Negative control: polyglot monorepo install without setup must NOT apply."
+    }
+  ],
+  "monorepo_targets": [
+    {
+      "ecosystem": "monorepo", "pm": "mono", "image": "npm", "hook_family": "npm",
+      "baseline_supported": true,
+      "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
+      "manifest_key": "package/index.js", "apply_ecosystems": "npm"
+    }
   ]
 }

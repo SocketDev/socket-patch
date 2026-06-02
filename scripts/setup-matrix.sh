@@ -47,23 +47,29 @@ usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
 need jq
 [ -f "$MATRIX" ] || die "matrix spec not found: $MATRIX"
 
-# Emit one TSV row per case (target x scenario), honoring filters.
+# Emit one TSV row per case, honoring filters. Covers all three layouts:
+# single (targets x scenarios), workspace (workspace_targets x
+# workspace_scenarios) and monorepo (monorepo_targets x monorepo_scenarios).
 # Columns: id eco pm image hook_family baseline_supported package version
 #          purl manifest_key apply_ecosystems scenario patchset run_setup
-#          expect_applied
+#          expect_applied layout
 cases_tsv() { # $1=eco-filter ("" = all)  $2=pm-filter  $3=scenario-filter
   jq -r --arg eco "${1:-}" --arg pm "${2:-}" --arg scn "${3:-}" '
-    .marker as $m | .alt_marker as $am |
-    .targets[] as $t | .scenarios[] as $s |
-    select($eco == "" or $t.ecosystem == $eco) |
-    select($pm  == "" or $t.pm        == $pm)  |
-    select($scn == "" or $s.id        == $scn) |
-    [ ($t.ecosystem + "/" + $t.pm + "/" + $s.id),
-      $t.ecosystem, $t.pm, $t.image, $t.hook_family,
-      ($t.baseline_supported|tostring),
-      $t.package, $t.version, $t.purl, $t.manifest_key, $t.apply_ecosystems,
-      $s.id, $s.patchset, ($s.run_setup|tostring), ($s.expect_applied|tostring)
-    ] | @tsv
+    def rows($targets; $scenarios; $layout):
+      $targets[] as $t | $scenarios[] as $s
+      | select($eco == "" or $t.ecosystem == $eco)
+      | select($pm  == "" or $t.pm        == $pm)
+      | select($scn == "" or $s.id        == $scn)
+      | [ ($t.ecosystem + "/" + $t.pm + "/" + $s.id),
+          $t.ecosystem, $t.pm, $t.image, ($t.hook_family // ""),
+          ($t.baseline_supported|tostring),
+          $t.package, $t.version, $t.purl, $t.manifest_key, $t.apply_ecosystems,
+          $s.id, $s.patchset, ($s.run_setup|tostring), ($s.expect_applied|tostring),
+          $layout ]
+      | @tsv;
+    rows(.targets; .scenarios; "single"),
+    rows((.workspace_targets // []); (.workspace_scenarios // []); "workspace"),
+    rows((.monorepo_targets // []);  (.monorepo_scenarios // []);  "monorepo")
   ' "$MATRIX"
 }
 
@@ -101,9 +107,9 @@ cmd_list() {
             scenario:$s.id, image:$t.image, hook_family:$t.hook_family,
             baseline_supported:$t.baseline_supported, expect_applied:$s.expect_applied } ]' "$MATRIX"
   else
-    printf '%-44s %-9s %-8s %-22s %s\n' ID ECO PM SCENARIO EXPECT
-    cases_tsv "" "" "" | while IFS=$'\t' read -r id eco pm image hook bsup pkg ver purl key aeco scn pset rsetup expect; do
-      printf '%-44s %-9s %-8s %-22s %s\n' "$id" "$eco" "$pm" "$scn" "$expect"
+    printf '%-46s %-9s %-8s %-11s %-22s %s\n' ID ECO PM LAYOUT SCENARIO EXPECT
+    cases_tsv "" "" "" | while IFS=$'\t' read -r id eco pm image hook bsup pkg ver purl key aeco scn pset rsetup expect layout; do
+      printf '%-46s %-9s %-8s %-11s %-22s %s\n' "$id" "$eco" "$pm" "$layout" "$scn" "$expect"
     done
   fi
 }
@@ -142,14 +148,15 @@ cmd_run() {
   fi
 
   local total=0
-  while IFS=$'\t' read -r id eco_ pm_ image hook bsup pkg ver purl key aeco scn_ pset rsetup expect; do
+  while IFS=$'\t' read -r id eco_ pm_ image hook bsup pkg ver purl key aeco scn_ pset rsetup expect layout; do
     [ -z "$id" ] && continue
     total=$((total+1))
-    echo ">> [$total] $id" >&2
+    echo ">> [$total] $id (layout=$layout)" >&2
 
     # Common SM_* env for the driver.
     local -a base_env=(
       "SM_ID=$id" "SM_ECOSYSTEM=$eco_" "SM_PM=$pm_" "SM_SCENARIO=$scn_"
+      "SM_LAYOUT=$layout"
       "SM_PATCHSET=$pset" "SM_RUN_SETUP=$([ "$rsetup" = true ] && echo 1 || echo 0)"
       "SM_EXPECT_APPLIED=$([ "$expect" = true ] && echo 1 || echo 0)"
       "SM_PACKAGE=$pkg" "SM_VERSION=$ver" "SM_PURL=$purl"
@@ -182,7 +189,7 @@ cmd_run() {
     if [ "$expect" = true ] && [ "$bsup" = true ]; then bl=true; fi
 
     if [ -n "$result" ] && printf '%s' "$result" | jq -e . >/dev/null 2>&1; then
-      printf '%s\n' "$result" | jq -c --argjson bl "$bl" --arg img "$image" --arg hk "$hook" '
+      printf '%s\n' "$result" | jq -c --argjson bl "$bl" --arg img "$image" --arg hk "$hook" --arg lay "$layout" '
         . as $r |
         ($r.actual_applied == $r.expect_applied) as $ideal |
         ($r.actual_applied == $bl) as $base |
@@ -190,15 +197,15 @@ cmd_run() {
          elif $ideal and ($base|not) then "progress"
          elif ($ideal|not) and $base then "known_gap"
          else "regression" end) as $cls |
-        $r + {baseline_applied:$bl, classification:$cls, image:$img, hook_family:$hk, driver_rc:'"$rc"'}
+        $r + {baseline_applied:$bl, classification:$cls, layout:$lay, image:$img, hook_family:$hk, driver_rc:'"$rc"'}
       ' >> "$jsonl"
     else
       # No parseable result — surface as an error case.
       jq -nc --arg id "$id" --arg eco "$eco_" --arg pm "$pm_" --arg scn "$scn_" \
-             --arg pset "$pset" --arg img "$image" --arg hk "$hook" --argjson bl "$bl" '
+             --arg pset "$pset" --arg img "$image" --arg hk "$hook" --arg lay "$layout" --argjson bl "$bl" '
         { id:$id, ecosystem:$eco, pm:$pm, scenario:$scn, patchset:$pset,
           expect_applied:null, actual_applied:null, baseline_applied:$bl,
-          classification:"error", image:$img, hook_family:$hk, driver_rc:'"$rc"',
+          classification:"error", layout:$lay, image:$img, hook_family:$hk, driver_rc:'"$rc"',
           notes:"driver produced no parseable result" }' >> "$jsonl"
     fi
   done < <(cases_tsv "$eco" "$pm" "$scn")
@@ -239,21 +246,23 @@ print_summary() { # $1 = results file
 
 # --------------------------------------------------------------------- query / results
 cmd_query() {
-  local status="" eco="" pm="" scn=""
+  local status="" eco="" pm="" scn="" lay=""
   while [ $# -gt 0 ]; do case "$1" in
     --status) status="$2"; shift 2;;
     --ecosystem) eco="$2"; shift 2;;
     --pm) pm="$2"; shift 2;;
     --scenario) scn="$2"; shift 2;;
+    --layout) lay="$2"; shift 2;;
     *) die "query: unknown arg '$1'";;
   esac; done
   [ -f "$LATEST" ] || die "no results yet — run '$0 run' first"
-  jq --arg st "$status" --arg eco "$eco" --arg pm "$pm" --arg scn "$scn" '
+  jq --arg st "$status" --arg eco "$eco" --arg pm "$pm" --arg scn "$scn" --arg lay "$lay" '
     [ .cases[]
       | select($st  == "" or .classification == $st)
       | select($eco == "" or .ecosystem == $eco)
       | select($pm  == "" or .pm == $pm)
-      | select($scn == "" or .scenario == $scn) ]' "$LATEST"
+      | select($scn == "" or .scenario == $scn)
+      | select($lay == "" or .layout == $lay) ]' "$LATEST"
 }
 
 cmd_results() {

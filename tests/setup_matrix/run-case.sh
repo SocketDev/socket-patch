@@ -60,6 +60,7 @@ SM_MANIFEST_KEY="${SM_MANIFEST_KEY:-package/index.js}"
 SM_APPLY_ECOSYSTEMS="${SM_APPLY_ECOSYSTEMS:-npm}"
 SM_MARKER="${SM_MARKER:-SOCKET-PATCH-SETUP-MATRIX-MARKER}"
 SM_ALT_MARKER="${SM_ALT_MARKER:-SOCKET-PATCH-SETUP-MATRIX-ALT-MARKER}"
+SM_LAYOUT="${SM_LAYOUT:-single}"
 
 ZEROHASH="0000000000000000000000000000000000000000000000000000000000000000"
 UUID="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -303,8 +304,144 @@ resolve_target() {
   esac
 }
 
+# --- workspace scaffold (root + nested members) ----------------------
+# Models a real monorepo where multiple (incl. deeply-nested) workspace
+# members depend on the package being patched, plus a member that does
+# NOT — so `setup`'s workspace handling (npm: every member; pnpm: root
+# only) and the root install's cross-workspace apply are both exercised.
+ws_member_js() { # $1=dir $2=name (declares the dep)
+  mkdir -p "$1"
+  cat > "$1/package.json" <<EOF
+{ "name": "$2", "version": "0.0.0", "dependencies": { "$SM_PACKAGE": "$SM_VERSION" } }
+EOF
+}
+
+scaffold_workspace() {
+  case "$SM_PM" in
+    npm|yarn)
+      cat > package.json <<'EOF'
+{ "name": "sm-root", "version": "0.0.0", "private": true,
+  "workspaces": ["packages/*", "packages/group/*"] }
+EOF
+      ws_member_js packages/app "@sm/app"
+      ws_member_js packages/lib "@sm/lib"
+      ws_member_js packages/group/nested "@sm/nested"
+      mkdir -p packages/util   # member with NO dependency on the patched pkg
+      printf '{ "name": "@sm/util", "version": "0.0.0", "private": true }\n' > packages/util/package.json ;;
+    pnpm)
+      printf '{ "name": "sm-root", "version": "0.0.0", "private": true }\n' > package.json
+      cat > pnpm-workspace.yaml <<'EOF'
+packages:
+  - 'packages/*'
+  - 'packages/group/*'
+EOF
+      ws_member_js packages/app "@sm/app"
+      ws_member_js packages/lib "@sm/lib"
+      ws_member_js packages/group/nested "@sm/nested"
+      mkdir -p packages/util
+      printf '{ "name": "@sm/util", "version": "0.0.0", "private": true }\n' > packages/util/package.json ;;
+    uv)
+      # uv workspace: virtual root + members; the shared dep is installed
+      # into one root .venv by `uv sync`.
+      cat > pyproject.toml <<EOF
+[project]
+name = "sm-root"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = ["$SM_PACKAGE==$SM_VERSION"]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv]
+package = false
+EOF
+      for m in app lib; do
+        mkdir -p "packages/$m"
+        cat > "packages/$m/pyproject.toml" <<EOF
+[project]
+name = "sm-$m"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.uv]
+package = false
+EOF
+      done ;;
+    pip)
+      # pip "workspace" = nested requirements files installed into one venv.
+      mkdir -p packages/app packages/lib
+      echo "$SM_PACKAGE==$SM_VERSION" > packages/app/requirements.txt
+      echo "$SM_PACKAGE==$SM_VERSION" > packages/lib/requirements.txt
+      printf -- '-r packages/app/requirements.txt\n-r packages/lib/requirements.txt\n' > requirements.txt ;;
+  esac
+}
+
+run_install_workspace() {
+  case "$SM_PM" in
+    npm)  npm install --silent --no-audit --no-fund ;;
+    yarn) yarn install --silent ;;
+    pnpm) pnpm install --no-frozen-lockfile ;;
+    uv)   uv sync ;;
+    pip)  python3 -m venv venv && ./venv/bin/pip install --disable-pip-version-check --quiet --no-cache-dir -r requirements.txt ;;
+  esac
+}
+
+# --- all-ecosystem monorepo scaffold ---------------------------------
+# A polyglot repo: an npm workspace (the slice `setup` supports AND the
+# npm image can install) alongside python/rust/go/php/ruby/nuget/deno
+# manifests. The point is to confirm `setup` works in this environment —
+# it must configure the npm hooks and NOT choke on the foreign manifests.
+scaffold_monorepo() {
+  cat > package.json <<'EOF'
+{ "name": "sm-monorepo", "version": "0.0.0", "private": true,
+  "workspaces": ["packages/js-*"] }
+EOF
+  ws_member_js packages/js-app "@mono/js-app"
+  ws_member_js packages/js-nested "@mono/js-nested"
+  mkdir -p packages/py-svc
+  cat > packages/py-svc/pyproject.toml <<'EOF'
+[project]
+name = "py-svc"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = ["six==1.16.0"]
+EOF
+  printf 'six==1.16.0\n' > packages/py-svc/requirements.txt
+  mkdir -p packages/rust-lib/src
+  printf '[package]\nname = "rust-lib"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\ncfg-if = "=1.0.0"\n' > packages/rust-lib/Cargo.toml
+  printf '// lib\n' > packages/rust-lib/src/lib.rs
+  mkdir -p packages/go-mod && printf 'module mono/go\n\ngo 1.21\n' > packages/go-mod/go.mod
+  mkdir -p packages/php-web && printf '{ "name": "mono/php", "require": { "monolog/monolog": "3.5.0" } }\n' > packages/php-web/composer.json
+  mkdir -p packages/ruby-gem && printf "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n" > packages/ruby-gem/Gemfile
+  mkdir -p packages/deno-app && printf '{ "name": "mono/deno", "version": "0.0.0" }\n' > packages/deno-app/deno.json
+  mkdir -p packages/nuget-app && printf '<Project Sdk="Microsoft.NET.Sdk"></Project>\n' > packages/nuget-app/app.csproj
+}
+
+run_install_monorepo() {
+  npm install --silent --no-audit --no-fund
+}
+
+# --- resolve candidate on-disk file(s) for verification --------------
+# For single layout: one path. For workspace/monorepo: search the tree
+# (hoisted root node_modules, pnpm store, member dirs, shared venv).
+resolve_targets() {
+  local rel="${SM_MANIFEST_KEY#package/}"
+  local base; base="$(basename "$rel")"
+  if [ "$SM_LAYOUT" = single ]; then
+    resolve_target
+    return
+  fi
+  case "$SM_ECOSYSTEM" in
+    npm|deno|monorepo) find "$PWD" -path "*/node_modules/$SM_PACKAGE/$rel" 2>/dev/null ;;
+    pypi)              find "$PWD" -name "$base" 2>/dev/null ;;
+    *)                 resolve_target ;;
+  esac
+}
+
 # ============================ main ====================================
-log "binary: $SP_BIN ($("$SP_BIN" --version 2>/dev/null || echo '??'))"
+log "binary: $SP_BIN ($("$SP_BIN" --version 2>/dev/null || echo '??'))  layout=$SM_LAYOUT"
 
 WORKDIR="${SM_WORKDIR:-$(mktemp -d)}"
 PROJ="$WORKDIR/proj"
@@ -313,19 +450,23 @@ cd "$PROJ" || { emit_result false null null null "" fail; exit 0; }
 note "proj=$PROJ"
 
 # 0. dependencies + committed patch set
-scaffold_project
+case "$SM_LAYOUT" in
+  workspace) scaffold_workspace ;;
+  monorepo)  scaffold_monorepo ;;
+  *)         scaffold_project ;;
+esac
 build_fixture
 
-# npm-family (incl. deno-via-npm) need the runner shim so the hook's
-# `npx`/`pnpm dlx @socketsecurity/socket-patch` resolves to $SP_BIN.
-case "$SM_PM" in
-  npm|yarn|pnpm|bun|deno)
-    SHIM_DIR="$PROJ/.sp-shims"
-    write_shims "$SHIM_DIR"
-    export SETUP_MATRIX_SHIM_DIR="$SHIM_DIR"
-    export PATH="$SHIM_DIR:$PATH"
-    log "shims installed at $SHIM_DIR (PATH prepended)" ;;
-esac
+# npm-family (incl. deno-via-npm and the monorepo's npm slice) need the
+# runner shim so the hook's `npx`/`pnpm dlx @socketsecurity/socket-patch`
+# resolves to $SP_BIN instead of the npm registry.
+if [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun|deno)$ ]] || [ "$SM_LAYOUT" = monorepo ]; then
+  SHIM_DIR="$PROJ/.sp-shims"
+  write_shims "$SHIM_DIR"
+  export SETUP_MATRIX_SHIM_DIR="$SHIM_DIR"
+  export PATH="$SHIM_DIR:$PATH"
+  log "shims installed at $SHIM_DIR (PATH prepended)"
+fi
 
 # Hermetic apply env inherited by the install hook's `socket-patch apply`.
 # NOTE: SOCKET_OFFLINE/SOCKET_FORCE must be "true"/"false" — the apply
@@ -335,7 +476,14 @@ esac
 # "1".
 export SOCKET_OFFLINE=true SOCKET_FORCE=true SOCKET_API_TOKEN=fake SOCKET_ORG_SLUG=test-org
 export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENTAL_NUGET=1
-export SOCKET_CWD="$PROJ"
+# NOTE: deliberately do NOT export SOCKET_CWD. The install hook's apply
+# must run with whatever cwd the package manager sets for the lifecycle
+# script — the project root for a single project, and the *member* dir
+# for each workspace member. In a workspace, member postinstalls thus
+# find no manifest in their own dir and no-op (exit 0), while the root
+# postinstall (manifest present) applies. Forcing SOCKET_CWD=root would
+# make every member apply target the root manifest and fail with "no
+# packages found on disk" mid-install, breaking `npm install`.
 
 # 1. setup (configures hooks; no-op where there is no package.json)
 SETUP_EXIT="null"
@@ -347,25 +495,36 @@ if [ "$SM_RUN_SETUP" = 1 ]; then
 fi
 
 # 2. native install (this is where a configured hook fires)
-log "running install for pm=$SM_PM"
-run_install; INSTALL_EXIT=$?
+log "running install for pm=$SM_PM (layout=$SM_LAYOUT)"
+case "$SM_LAYOUT" in
+  workspace) run_install_workspace ;;
+  monorepo)  run_install_monorepo ;;
+  *)         run_install ;;
+esac
+INSTALL_EXIT=$?
 log "install exit=$INSTALL_EXIT"
 
-# 3. verify
-TARGET="$(resolve_target || true)"
-log "resolved target: ${TARGET:-<none>}"
+# 3. verify — applied if ANY discovered copy of the patched file carries
+# the expected marker (covers hoisting, the pnpm store, member dirs and
+# the shared venv in workspace/monorepo layouts).
+check_marker="$SM_MARKER"
+[ "$SM_PATCHSET" = alt ] && check_marker="$SM_ALT_MARKER"
 APPLIED=false
 PRIMARY_PRESENT=null
-if [ -n "$TARGET" ] && [ -f "$TARGET" ]; then
-  # The marker we expect depends on the patch set.
-  check_marker="$SM_MARKER"
-  [ "$SM_PATCHSET" = alt ] && check_marker="$SM_ALT_MARKER"
-  if grep -q "$check_marker" "$TARGET" 2>/dev/null; then APPLIED=true; fi
-  if grep -q "$SM_MARKER" "$TARGET" 2>/dev/null; then PRIMARY_PRESENT=true; else PRIMARY_PRESENT=false; fi
-  log "marker '$check_marker' present: $APPLIED"
-else
-  note "target file not found"
-fi
+TARGET=""
+n_found=0
+while IFS= read -r cand; do
+  [ -n "$cand" ] && [ -f "$cand" ] || continue
+  n_found=$((n_found + 1))
+  [ -z "$TARGET" ] && TARGET="$cand"
+  if grep -q "$check_marker" "$cand" 2>/dev/null; then APPLIED=true; TARGET="$cand"; fi
+  if grep -q "$SM_MARKER" "$cand" 2>/dev/null; then PRIMARY_PRESENT=true; fi
+done < <(resolve_targets)
+[ "$PRIMARY_PRESENT" = null ] && [ "$n_found" -gt 0 ] && PRIMARY_PRESENT=false
+note "candidate files found: $n_found"
+log "resolved target: ${TARGET:-<none>} (candidates=$n_found)"
+[ "$n_found" -eq 0 ] && note "target file not found"
+log "marker '$check_marker' present: $APPLIED"
 
 # Driver-level status: did actual match the aspirational expectation?
 want=$([ "$SM_EXPECT_APPLIED" = 1 ] && echo true || echo false)

@@ -31,3 +31,25 @@ fn pnpm() {
 fn bun() {
     smc::run_pm("npm", "bun");
 }
+
+// ── Nested-workspace layouts ──────────────────────────────────────────
+// A root + several members (incl. a deeply-nested one and a member with
+// no dependency on the patched package). Exercises `setup`'s workspace
+// handling (npm/yarn write the hook to every member; pnpm only to the
+// root) plus the cross-workspace apply on the root install. These should
+// PASS — they're real regression guards, not gap documentation.
+
+#[test]
+fn npm_workspace() {
+    smc::run_workspace_pm("npm", "npm");
+}
+
+#[test]
+fn pnpm_workspace() {
+    smc::run_workspace_pm("npm", "pnpm");
+}
+
+#[test]
+fn yarn_workspace() {
+    smc::run_workspace_pm("npm", "yarn");
+}
