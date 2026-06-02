@@ -39,6 +39,16 @@ deno = ["socket-patch-core/deno"]
 # `tests/docker_e2e_*.rs`. Tests in this suite require either a running
 # Docker daemon OR `SOCKET_PATCH_TEST_HOST=1` (host-toolchain mode).
 docker-e2e = []
+# Enables the experimental `setup` end-to-end test matrix under
+# `tests/setup_matrix_*.rs`, which drives the `socket-patch setup` →
+# native-install → patch-applied flow across every ecosystem/package
+# manager via `tests/setup_matrix/run-case.sh`. Same runtime requirement
+# as docker-e2e (Docker daemon OR `SOCKET_PATCH_TEST_HOST=1`). These
+# tests are ASPIRATIONAL: they assert the ideal (install applies the
+# patch) and are EXPECTED to fail for ecosystems whose install hooks
+# `setup` does not yet configure. Kept off `--all-features`-required CI;
+# the dedicated `setup-matrix` CI job runs them non-blocking.
+setup-e2e = []
 
 [dev-dependencies]
 sha2 = { workspace = true }
