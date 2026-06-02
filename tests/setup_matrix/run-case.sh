@@ -136,6 +136,20 @@ SHIM
 }
 
 # --- committed patch fixture ------------------------------------------
+# The patched blob is RUNNABLE code that emits the marker on stdout when the
+# file is executed, so verification can RUN the patched module with the
+# ecosystem's standard runner (node/bun/python) and observe the marker at
+# runtime — not merely scan the file for the string. Compiled/loaded
+# ecosystems we can't execute keep an inert comment (verified by reading the
+# file; see `run_file`).
+marker_blob() { # $1 = marker  -> runnable payload on stdout
+  case "$SM_ECOSYSTEM" in
+    npm|deno|monorepo) printf 'console.log("%s");\n' "$1" ;;
+    pypi)              printf 'print("%s")\n' "$1" ;;
+    *)                 printf '/* %s */\n' "$1" ;;
+  esac
+}
+
 write_manifest() { # $1=purl $2=key $3=afterHash
   cat > .socket/manifest.json <<EOF
 {
@@ -164,25 +178,31 @@ build_fixture() {
     return
   fi
   mkdir -p .socket/blobs
+  # Per-case scratch file for the blob. MUST NOT be a fixed path like
+  # /tmp/sm_blob: the Rust matrix wrappers run the package-manager test fns in
+  # parallel, so a shared path races (one case hashes a blob another just
+  # overwrote → afterHash mismatch → apply no-ops).
+  local blob_tmp; blob_tmp="$(mktemp)"
   case "$SM_PATCHSET" in
     empty)
       printf '{"patches":{}}\n' > .socket/manifest.json
       note "empty manifest" ;;
     wrong)
       # A patch for a package that is NOT installed: nothing should match.
-      local body="/* $SM_MARKER */"; printf '%s\n' "$body" > /tmp/sm_blob
-      local h; h="$(git_sha256 /tmp/sm_blob)"; cp /tmp/sm_blob ".socket/blobs/$h"
+      marker_blob "$SM_MARKER" > "$blob_tmp"
+      local h; h="$(git_sha256 "$blob_tmp")"; cp "$blob_tmp" ".socket/blobs/$h"
       write_manifest "$WRONG_PURL" "$SM_MANIFEST_KEY" "$h"
       note "manifest targets absent purl $WRONG_PURL" ;;
     alt)
-      local body="/* $SM_ALT_MARKER */"; printf '%s\n' "$body" > /tmp/sm_blob
-      local h; h="$(git_sha256 /tmp/sm_blob)"; cp /tmp/sm_blob ".socket/blobs/$h"
+      marker_blob "$SM_ALT_MARKER" > "$blob_tmp"
+      local h; h="$(git_sha256 "$blob_tmp")"; cp "$blob_tmp" ".socket/blobs/$h"
       write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" ;;
     *) # primary
-      local body="/* $SM_MARKER */"; printf '%s\n' "$body" > /tmp/sm_blob
-      local h; h="$(git_sha256 /tmp/sm_blob)"; cp /tmp/sm_blob ".socket/blobs/$h"
+      marker_blob "$SM_MARKER" > "$blob_tmp"
+      local h; h="$(git_sha256 "$blob_tmp")"; cp "$blob_tmp" ".socket/blobs/$h"
       write_manifest "$SM_PURL" "$SM_MANIFEST_KEY" "$h" ;;
   esac
+  rm -f "$blob_tmp"
 }
 
 # --- per-PM project scaffold (must exist before setup runs) -----------
@@ -467,24 +487,54 @@ reset_modules() {
   rm -rf node_modules packages/*/node_modules 2>/dev/null || true
 }
 
-# Resolve every on-disk copy of the patched file and decide whether the patch
-# was applied (marker present). Sets APPLIED / PRIMARY_PRESENT / TARGET.
+# Execute a single patched file with the ecosystem's STANDARD runner so the
+# patched code actually runs; its stdout/stderr (where the marker would be
+# printed) is emitted for the caller to inspect. npm→node, bun→bun, deno→deno,
+# pip→the venv's python3, uv→uv run, poetry/pdm/hatch→their `run`. For
+# compiled/loaded ecosystems we cannot execute (cargo/go/maven/nuget/gem/
+# composer) we `cat` the file so its inert marker comment is still observed —
+# matching the previous file-based behavior for those gaps.
+run_file() { # $1 = absolute path to the resolved package file
+  case "$SM_ECOSYSTEM" in
+    npm|monorepo)
+      case "$SM_PM" in
+        bun) bun "$1" ;;
+        *)   node "$1" ;;
+      esac ;;
+    deno) deno run -A "$1" ;;
+    pypi)
+      case "$SM_PM" in
+        uv)     uv run python "$1" ;;
+        poetry) poetry run python "$1" ;;
+        pdm)    pdm run python "$1" ;;
+        hatch)  hatch run python "$1" ;;
+        pip)    ./venv/bin/python "$1" ;;
+        *)      python3 "$1" ;;
+      esac ;;
+    *) cat "$1" ;;
+  esac
+}
+
+# Decide whether the patch was applied by RUNNING every on-disk copy of the
+# patched file and checking whether the marker appears in its runtime output.
+# Sets APPLIED / PRIMARY_PRESENT / TARGET.
 verify_applied() {
   local check_marker="$SM_MARKER"
   [ "$SM_PATCHSET" = alt ] && check_marker="$SM_ALT_MARKER"
   APPLIED=false
   PRIMARY_PRESENT=null
   TARGET=""
-  local n_found=0 cand
+  local n_found=0 cand out
   while IFS= read -r cand; do
     [ -n "$cand" ] && [ -f "$cand" ] || continue
     n_found=$((n_found + 1))
     [ -z "$TARGET" ] && TARGET="$cand"
-    if grep -q "$check_marker" "$cand" 2>/dev/null; then APPLIED=true; TARGET="$cand"; fi
-    if grep -q "$SM_MARKER" "$cand" 2>/dev/null; then PRIMARY_PRESENT=true; fi
+    out="$(run_file "$cand" 2>&1)"
+    if printf '%s' "$out" | grep -q "$check_marker"; then APPLIED=true; TARGET="$cand"; fi
+    if printf '%s' "$out" | grep -q "$SM_MARKER"; then PRIMARY_PRESENT=true; fi
   done < <(resolve_targets)
   [ "$PRIMARY_PRESENT" = null ] && [ "$n_found" -gt 0 ] && PRIMARY_PRESENT=false
-  log "verify: marker '$check_marker' present=$APPLIED (candidates=$n_found, target=${TARGET:-<none>})"
+  log "verify(run): marker '$check_marker' in runtime output=$APPLIED (candidates=$n_found, target=${TARGET:-<none>})"
 }
 
 # npm-family is the surface `setup` actually configures today — the only place
