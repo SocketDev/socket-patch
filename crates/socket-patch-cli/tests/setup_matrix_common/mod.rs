@@ -330,22 +330,40 @@ fn run_cases(label: &str, cases: Vec<Case>) {
     );
 }
 
-/// Validate the `setup --check` / `setup --remove` round-trip fields emitted by
-/// the driver. Returns a failure message if the inverse of setup did not hold:
-/// after configuring, `--check` must pass (0); `--remove` must succeed (0) and
-/// strip socket-patch from package.json; and `--check` must then fail again
-/// (non-zero). Returns `None` on success.
+/// Validate the behavioral `(setup)·(install)` round-trip emitted by the driver.
+/// Verifies — through real install cycles, not by reading package.json — that:
+///
+/// 1. `setup --check` fails before setup, passes after setup, fails after
+///    `setup --remove` (and remove itself succeeds);
+/// 2. the patch is NOT applied before setup and NOT applied after remove
+///    (the after-setup application is covered separately by the main
+///    `actual_applied == expect_applied` assertion).
+///
+/// Returns a failure message describing any violation, or `None` on success.
 fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
     let parsed = res.parsed.as_ref()?;
     let int = |k: &str| parsed.get(k).and_then(|v| v.as_i64());
     let boolean = |k: &str| parsed.get(k).and_then(|v| v.as_bool());
 
+    let mut problems = Vec::new();
+
+    // (2) patch application bookends — only ever true while the hook is wired.
+    if boolean("applied_before_setup") == Some(true) {
+        problems.push("patch applied BEFORE setup (no hook should be configured yet)".to_string());
+    }
+    if boolean("applied_after_remove") == Some(true) {
+        problems.push("patch still applied AFTER remove (hook should be gone)".to_string());
+    }
+
+    // (1) `setup --check` tracks the configured state: false → true → false.
+    let check_before = int("check_before_setup_exit");
     let check_setup = int("check_after_setup_exit");
     let remove = int("remove_exit");
     let check_remove = int("check_after_remove_exit");
-    let clean = boolean("remove_clean");
 
-    let mut problems = Vec::new();
+    if check_before == Some(0) {
+        problems.push("check-before-setup exit=0 (want non-zero; not configured yet)".to_string());
+    }
     if check_setup != Some(0) {
         problems.push(format!("check-after-setup exit={check_setup:?} (want 0)"));
     }
@@ -355,15 +373,12 @@ fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
     if check_remove == Some(0) {
         problems.push("check-after-remove exit=0 (want non-zero; hook still present)".to_string());
     }
-    if clean == Some(false) {
-        problems.push("socket-patch still present in package.json after remove".to_string());
-    }
 
     if problems.is_empty() {
         return None;
     }
     Some(format!(
-        "  - {}: check/remove round-trip failed [{}]\n{}",
+        "  - {}: setup/install behavioral round-trip failed [{}]\n{}",
         case.id,
         problems.join("; "),
         indent(&res.raw)

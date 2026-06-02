@@ -77,13 +77,14 @@ log()  { printf '[setup-matrix:%s] %s\n' "$SM_ID" "$*"; }
 json_str() { printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 emit_result() {
   local actual="$1" primary_present="$2" setup_exit="$3" install_exit="$4" target="$5" status="$6"
-  printf '{"id":"%s","ecosystem":"%s","pm":"%s","scenario":"%s","patchset":"%s","run_setup":%s,"expect_applied":%s,"actual_applied":%s,"primary_marker_present":%s,"setup_exit":%s,"install_exit":%s,"check_after_setup_exit":%s,"remove_exit":%s,"check_after_remove_exit":%s,"remove_clean":%s,"target":"%s","status":"%s","notes":"%s"}\n' \
+  printf '{"id":"%s","ecosystem":"%s","pm":"%s","scenario":"%s","patchset":"%s","run_setup":%s,"expect_applied":%s,"actual_applied":%s,"applied_before_setup":%s,"applied_after_remove":%s,"primary_marker_present":%s,"setup_exit":%s,"install_exit":%s,"check_before_setup_exit":%s,"check_after_setup_exit":%s,"remove_exit":%s,"check_after_remove_exit":%s,"target":"%s","status":"%s","notes":"%s"}\n' \
     "$(json_str "$SM_ID")" "$(json_str "$SM_ECOSYSTEM")" "$(json_str "$SM_PM")" \
     "$(json_str "$SM_SCENARIO")" "$(json_str "$SM_PATCHSET")" \
     "$([ "$SM_RUN_SETUP" = 1 ] && echo true || echo false)" \
     "$([ "$SM_EXPECT_APPLIED" = 1 ] && echo true || echo false)" \
-    "$actual" "$primary_present" "$setup_exit" "$install_exit" \
-    "${CHECK_AFTER_SETUP_EXIT:-null}" "${REMOVE_EXIT:-null}" "${CHECK_AFTER_REMOVE_EXIT:-null}" "${REMOVE_CLEAN:-null}" \
+    "$actual" "${APPLIED_BEFORE_SETUP:-null}" "${APPLIED_AFTER_REMOVE:-null}" "$primary_present" \
+    "$setup_exit" "$install_exit" \
+    "${CHECK_BEFORE_SETUP_EXIT:-null}" "${CHECK_AFTER_SETUP_EXIT:-null}" "${REMOVE_EXIT:-null}" "${CHECK_AFTER_REMOVE_EXIT:-null}" \
     "$(json_str "$target")" "$(json_str "$status")" "$(json_str "$NOTES")" >&3
 }
 
@@ -449,6 +450,49 @@ resolve_targets() {
   esac
 }
 
+# --- native install dispatch (layout-aware) --------------------------
+do_install() {
+  case "$SM_LAYOUT" in
+    workspace) run_install_workspace ;;
+    monorepo)  run_install_monorepo ;;
+    *)         run_install ;;
+  esac
+}
+
+# Wipe installed modules so the NEXT install re-fetches a pristine copy and
+# re-fires the lifecycle hook. This is what lets us observe the patch-apply
+# BEHAVIOR (marker present/absent on a freshly installed file) at each stage
+# of the (setup)·(install) sequence, rather than inspecting package.json.
+reset_modules() {
+  rm -rf node_modules packages/*/node_modules 2>/dev/null || true
+}
+
+# Resolve every on-disk copy of the patched file and decide whether the patch
+# was applied (marker present). Sets APPLIED / PRIMARY_PRESENT / TARGET.
+verify_applied() {
+  local check_marker="$SM_MARKER"
+  [ "$SM_PATCHSET" = alt ] && check_marker="$SM_ALT_MARKER"
+  APPLIED=false
+  PRIMARY_PRESENT=null
+  TARGET=""
+  local n_found=0 cand
+  while IFS= read -r cand; do
+    [ -n "$cand" ] && [ -f "$cand" ] || continue
+    n_found=$((n_found + 1))
+    [ -z "$TARGET" ] && TARGET="$cand"
+    if grep -q "$check_marker" "$cand" 2>/dev/null; then APPLIED=true; TARGET="$cand"; fi
+    if grep -q "$SM_MARKER" "$cand" 2>/dev/null; then PRIMARY_PRESENT=true; fi
+  done < <(resolve_targets)
+  [ "$PRIMARY_PRESENT" = null ] && [ "$n_found" -gt 0 ] && PRIMARY_PRESENT=false
+  log "verify: marker '$check_marker' present=$APPLIED (candidates=$n_found, target=${TARGET:-<none>})"
+}
+
+# npm-family is the surface `setup` actually configures today — the only place
+# the behavioral check/remove round-trip is expected to do real work.
+is_npm_family() {
+  [[ "$SM_PM" =~ ^(npm|yarn|pnpm|bun)$ ]] || [ "$SM_LAYOUT" = monorepo ]
+}
+
 # ============================ main ====================================
 log "binary: $SP_BIN ($("$SP_BIN" --version 2>/dev/null || echo '??'))  layout=$SM_LAYOUT"
 
@@ -494,76 +538,82 @@ export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENT
 # make every member apply target the root manifest and fail with "no
 # packages found on disk" mid-install, breaking `npm install`.
 
-# 1. setup (configures hooks; no-op where there is no package.json)
+# 1-3. Configure + install + verify.
+#
+# For npm-family cases that run setup we exercise the FULL behavioral sequence
+# — (install)·(setup)·(install)·(remove)·(install) — observing both the patch
+# marker and `setup --check` at each stage. A clean reinstall precedes every
+# observation so the lifecycle hook acts on a pristine package. This verifies
+# behavior end-to-end rather than reading package.json:
+#   * patch: NOT applied before setup → applied after setup → NOT applied after remove
+#   * check: fails before setup → passes after setup → fails after remove
+#
+# Every other case (run_setup=0, or non-npm-family ecosystems) keeps the simple
+# single-install flow, preserving the existing aspirational expect_applied
+# classification untouched.
 SETUP_EXIT="null"
+CHECK_BEFORE_SETUP_EXIT="null"
 CHECK_AFTER_SETUP_EXIT="null"
-if [ "$SM_RUN_SETUP" = 1 ]; then
+REMOVE_EXIT="null"
+CHECK_AFTER_REMOVE_EXIT="null"
+APPLIED_BEFORE_SETUP=null
+APPLIED_AFTER_REMOVE=null
+INSTALL_EXIT="null"
+
+if is_npm_family && [ "$SM_RUN_SETUP" = 1 ]; then
+  # (1) BEFORE setup: no hook configured → install must NOT apply the patch.
+  log "[before-setup] install for pm=$SM_PM (layout=$SM_LAYOUT)"
+  do_install; log "[before-setup] install exit=$?"
+  verify_applied; APPLIED_BEFORE_SETUP="$APPLIED"
+
+  # (2) check must report "needs configuration" (non-zero) before setup.
+  "$SP_BIN" setup --check --json; CHECK_BEFORE_SETUP_EXIT=$?
+  log "check-before-setup exit=$CHECK_BEFORE_SETUP_EXIT"
+
+  # (3) setup, then check must report "configured" (zero).
   log "running: socket-patch setup --yes"
   "$SP_BIN" setup --yes --json; SETUP_EXIT=$?
   log "setup exit=$SETUP_EXIT"
   [ -f package.json ] && { log "package.json scripts after setup:"; grep -A6 '"scripts"' package.json || true; }
-
-  # Read-only verification: a project we just configured must pass --check
-  # (exit 0). Recorded for the harness; does not touch disk.
-  log "running: socket-patch setup --check (after setup)"
   "$SP_BIN" setup --check --json; CHECK_AFTER_SETUP_EXIT=$?
   log "check-after-setup exit=$CHECK_AFTER_SETUP_EXIT"
-fi
 
-# 2. native install (this is where a configured hook fires)
-log "running install for pm=$SM_PM (layout=$SM_LAYOUT)"
-case "$SM_LAYOUT" in
-  workspace) run_install_workspace ;;
-  monorepo)  run_install_monorepo ;;
-  *)         run_install ;;
-esac
-INSTALL_EXIT=$?
-log "install exit=$INSTALL_EXIT"
+  # (4) AFTER setup: clean reinstall → the hook fires → MAIN applied result.
+  reset_modules
+  log "[after-setup] install for pm=$SM_PM (layout=$SM_LAYOUT)"
+  do_install; INSTALL_EXIT=$?
+  log "[after-setup] install exit=$INSTALL_EXIT"
+  verify_applied   # sets the canonical APPLIED / PRIMARY_PRESENT / TARGET
 
-# 3. verify — applied if ANY discovered copy of the patched file carries
-# the expected marker (covers hoisting, the pnpm store, member dirs and
-# the shared venv in workspace/monorepo layouts).
-check_marker="$SM_MARKER"
-[ "$SM_PATCHSET" = alt ] && check_marker="$SM_ALT_MARKER"
-APPLIED=false
-PRIMARY_PRESENT=null
-TARGET=""
-n_found=0
-while IFS= read -r cand; do
-  [ -n "$cand" ] && [ -f "$cand" ] || continue
-  n_found=$((n_found + 1))
-  [ -z "$TARGET" ] && TARGET="$cand"
-  if grep -q "$check_marker" "$cand" 2>/dev/null; then APPLIED=true; TARGET="$cand"; fi
-  if grep -q "$SM_MARKER" "$cand" 2>/dev/null; then PRIMARY_PRESENT=true; fi
-done < <(resolve_targets)
-[ "$PRIMARY_PRESENT" = null ] && [ "$n_found" -gt 0 ] && PRIMARY_PRESENT=false
-note "candidate files found: $n_found"
-log "resolved target: ${TARGET:-<none>} (candidates=$n_found)"
-[ "$n_found" -eq 0 ] && note "target file not found"
-log "marker '$check_marker' present: $APPLIED"
-
-# 4. remove round-trip — only meaningful where setup configured hooks.
-# Done LAST (after install + verify) so it cannot disturb the apply check.
-# Asserts the inverse of setup: --remove strips the hook, --check then fails,
-# and `socket-patch` no longer appears in the root package.json.
-REMOVE_EXIT="null"
-CHECK_AFTER_REMOVE_EXIT="null"
-REMOVE_CLEAN="null"
-if [ "$SM_RUN_SETUP" = 1 ] && [ -f package.json ]; then
+  # (5) remove, then check must report "needs configuration" (non-zero) again.
   log "running: socket-patch setup --remove --yes"
   "$SP_BIN" setup --remove --yes --json; REMOVE_EXIT=$?
   log "remove exit=$REMOVE_EXIT"
-  log "package.json scripts after remove:"; grep -A6 '"scripts"' package.json || true
-
-  log "running: socket-patch setup --check (after remove)"
+  [ -f package.json ] && { log "package.json scripts after remove:"; grep -A6 '"scripts"' package.json || true; }
   "$SP_BIN" setup --check --json; CHECK_AFTER_REMOVE_EXIT=$?
   log "check-after-remove exit=$CHECK_AFTER_REMOVE_EXIT"
 
-  if grep -q "socket-patch" package.json 2>/dev/null; then
-    REMOVE_CLEAN=false; note "remove left socket-patch in root package.json"
-  else
-    REMOVE_CLEAN=true
+  # (6) AFTER remove: clean reinstall → no hook → must NOT apply the patch.
+  # Preserve the main (after-setup) result while re-probing the disk.
+  _MAIN_APPLIED="$APPLIED"; _MAIN_PRIMARY="$PRIMARY_PRESENT"; _MAIN_TARGET="$TARGET"
+  reset_modules
+  log "[after-remove] install for pm=$SM_PM (layout=$SM_LAYOUT)"
+  do_install; log "[after-remove] install exit=$?"
+  verify_applied; APPLIED_AFTER_REMOVE="$APPLIED"
+  APPLIED="$_MAIN_APPLIED"; PRIMARY_PRESENT="$_MAIN_PRIMARY"; TARGET="$_MAIN_TARGET"
+else
+  # Simple flow: optional setup (no-op where there is no package.json), one
+  # install, one verify.
+  if [ "$SM_RUN_SETUP" = 1 ]; then
+    log "running: socket-patch setup --yes"
+    "$SP_BIN" setup --yes --json; SETUP_EXIT=$?
+    log "setup exit=$SETUP_EXIT"
+    [ -f package.json ] && { log "package.json scripts after setup:"; grep -A6 '"scripts"' package.json || true; }
   fi
+  log "running install for pm=$SM_PM (layout=$SM_LAYOUT)"
+  do_install; INSTALL_EXIT=$?
+  log "install exit=$INSTALL_EXIT"
+  verify_applied
 fi
 
 # Driver-level status: did actual match the aspirational expectation?
