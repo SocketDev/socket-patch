@@ -154,6 +154,171 @@ pub fn update_package_json_object(
     (modified, new_postinstall, new_dependencies)
 }
 
+/// Strip every socket-patch segment out of a single lifecycle script.
+///
+/// Scripts are joined with `" && "` (that is exactly how
+/// [`generate_updated_script`] prepends the patch command), so splitting on
+/// the same separator and dropping any segment that is a socket-patch invocation
+/// reverses the setup edit, whether the command was added to an empty script
+/// (`"<cmd>"`) or prepended to an existing one (`"<cmd> && build"`).
+///
+/// Returns `(changed, new_value)`:
+/// - `(false, Some(original))` — no socket-patch segment found; leave as-is.
+/// - `(true, Some(rest))` — patch segment(s) removed, other commands survive.
+/// - `(true, None)` — the script was *only* socket-patch; the key should be
+///   deleted entirely.
+pub fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
+    let trimmed = script.trim();
+    if trimmed.is_empty() {
+        return (false, None);
+    }
+
+    let segments: Vec<&str> = trimmed.split(" && ").collect();
+    let kept: Vec<&str> = segments
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !script_is_configured(s))
+        .collect();
+
+    if kept.len() == segments.len() {
+        // Nothing matched a socket-patch pattern (and no empty segments) —
+        // unchanged.
+        return (false, Some(trimmed.to_string()));
+    }
+
+    if kept.is_empty() {
+        (true, None)
+    } else {
+        (true, Some(kept.join(" && ")))
+    }
+}
+
+/// Status of a remove operation on a single package.json object.
+#[derive(Debug, Clone)]
+pub struct ScriptRemoveStatus {
+    pub modified: bool,
+    pub old_postinstall: String,
+    pub new_postinstall: Option<String>,
+    pub old_dependencies: String,
+    pub new_dependencies: Option<String>,
+}
+
+/// Remove socket-patch from both lifecycle scripts in a package.json object.
+///
+/// Full revert: an emptied `postinstall`/`dependencies` key is deleted, and if
+/// `scripts` ends up empty the whole `scripts` key is dropped too — undoing
+/// exactly what [`update_package_json_object`] added. Returns a
+/// [`ScriptRemoveStatus`] describing what changed.
+pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> ScriptRemoveStatus {
+    let read_script = |pj: &serde_json::Value, key: &str| -> String {
+        pj.get("scripts")
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let old_postinstall = read_script(package_json, "postinstall");
+    let old_dependencies = read_script(package_json, "dependencies");
+
+    let (pi_changed, new_postinstall) = remove_socket_patch_from_script(&old_postinstall);
+    let (dep_changed, new_dependencies) = remove_socket_patch_from_script(&old_dependencies);
+
+    // Only treat as modified when a socket-patch segment was actually present.
+    let pi_had_patch = pi_changed && script_is_configured(&old_postinstall);
+    let dep_had_patch = dep_changed && script_is_configured(&old_dependencies);
+    let modified = pi_had_patch || dep_had_patch;
+
+    if !modified {
+        return ScriptRemoveStatus {
+            modified: false,
+            new_postinstall: Some(old_postinstall.clone()),
+            old_postinstall,
+            new_dependencies: Some(old_dependencies.clone()),
+            old_dependencies,
+        };
+    }
+
+    // We can only mutate scripts on an object root with an object `scripts`.
+    // Anything else has nothing to remove and is handled by the no-op path
+    // above (its scripts read as empty).
+    if let Some(scripts) = package_json
+        .get_mut("scripts")
+        .and_then(|s| s.as_object_mut())
+    {
+        if pi_had_patch {
+            match &new_postinstall {
+                Some(s) => {
+                    scripts.insert(
+                        "postinstall".to_string(),
+                        serde_json::Value::String(s.clone()),
+                    );
+                }
+                None => {
+                    scripts.remove("postinstall");
+                }
+            }
+        }
+        if dep_had_patch {
+            match &new_dependencies {
+                Some(s) => {
+                    scripts.insert(
+                        "dependencies".to_string(),
+                        serde_json::Value::String(s.clone()),
+                    );
+                }
+                None => {
+                    scripts.remove("dependencies");
+                }
+            }
+        }
+
+        // If `scripts` is now empty, drop the key entirely for a clean revert.
+        if scripts.is_empty() {
+            if let Some(obj) = package_json.as_object_mut() {
+                obj.remove("scripts");
+            }
+        }
+    }
+
+    ScriptRemoveStatus {
+        modified,
+        old_postinstall,
+        new_postinstall,
+        old_dependencies,
+        new_dependencies,
+    }
+}
+
+/// Parse package.json content and remove socket-patch lifecycle scripts.
+/// Returns `(modified, new_content, status)`.
+pub fn remove_package_json_content(
+    content: &str,
+) -> Result<(bool, String, ScriptRemoveStatus), String> {
+    let mut package_json: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("Invalid package.json: {e}"))?;
+
+    if !package_json.is_object() {
+        return Err("Invalid package.json: root is not a JSON object".to_string());
+    }
+
+    // Refuse to touch a malformed (present but non-object) `scripts` value.
+    if let Some(scripts) = package_json.get("scripts") {
+        if !scripts.is_null() && !scripts.is_object() {
+            return Err("Invalid package.json: \"scripts\" is not a JSON object".to_string());
+        }
+    }
+
+    let status = remove_package_json_object(&mut package_json);
+
+    if !status.modified {
+        return Ok((false, content.to_string(), status));
+    }
+
+    let new_content = serde_json::to_string_pretty(&package_json).unwrap() + "\n";
+    Ok((true, new_content, status))
+}
+
 /// Parse package.json content and update it with socket-patch scripts.
 /// Returns (modified, new_content, old_postinstall, new_postinstall,
 /// old_dependencies, new_dependencies).
@@ -544,6 +709,130 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&new_content).unwrap();
         assert!(parsed["scripts"]["postinstall"].is_string());
         assert!(parsed["scripts"]["dependencies"].is_string());
+    }
+
+    // ── remove_socket_patch_from_script ─────────────────────────────
+
+    #[test]
+    fn test_remove_script_only_socket_patch_deletes_key() {
+        let (changed, new) = remove_socket_patch_from_script(
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm",
+        );
+        assert!(changed);
+        assert_eq!(new, None);
+    }
+
+    #[test]
+    fn test_remove_script_strips_prefix_keeps_rest() {
+        let (changed, new) = remove_socket_patch_from_script(
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo done",
+        );
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("echo done"));
+    }
+
+    #[test]
+    fn test_remove_script_no_socket_patch_unchanged() {
+        let (changed, new) = remove_socket_patch_from_script("echo done && tsc");
+        assert!(!changed);
+        assert_eq!(new.as_deref(), Some("echo done && tsc"));
+    }
+
+    #[test]
+    fn test_remove_script_legacy_pattern() {
+        let (changed, new) = remove_socket_patch_from_script("socket-patch apply && echo done");
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("echo done"));
+    }
+
+    #[test]
+    fn test_remove_script_empty() {
+        let (changed, new) = remove_socket_patch_from_script("");
+        assert!(!changed);
+        assert_eq!(new, None);
+    }
+
+    // ── remove_package_json_object ──────────────────────────────────
+
+    #[test]
+    fn test_remove_object_deletes_lifecycle_keys() {
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": {
+                "postinstall": "npx @socketsecurity/socket-patch apply --silent --ecosystems npm",
+                "dependencies": "npx @socketsecurity/socket-patch apply --silent --ecosystems npm"
+            }
+        });
+        let status = remove_package_json_object(&mut pkg);
+        assert!(status.modified);
+        // Both keys were only socket-patch, so they (and the now-empty
+        // `scripts` object) are removed entirely.
+        assert!(pkg.get("scripts").is_none());
+    }
+
+    #[test]
+    fn test_remove_object_keeps_sibling_scripts() {
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": {
+                "build": "tsc",
+                "postinstall": "npx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo hi"
+            }
+        });
+        let status = remove_package_json_object(&mut pkg);
+        assert!(status.modified);
+        assert_eq!(pkg["scripts"]["build"], "tsc");
+        assert_eq!(pkg["scripts"]["postinstall"], "echo hi");
+    }
+
+    #[test]
+    fn test_remove_object_noop_when_not_configured() {
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": { "build": "tsc" }
+        });
+        let status = remove_package_json_object(&mut pkg);
+        assert!(!status.modified);
+        assert_eq!(pkg["scripts"]["build"], "tsc");
+    }
+
+    // ── remove_package_json_content ─────────────────────────────────
+
+    #[test]
+    fn test_remove_content_roundtrip_with_update() {
+        // update then remove must return to a no-socket-patch state.
+        let original = r#"{"name":"x","scripts":{"build":"tsc"}}"#;
+        let (_, updated, ..) =
+            update_package_json_content(original, PackageManager::Npm).unwrap();
+        assert!(updated.contains("socket-patch"));
+
+        let (modified, removed, _) = remove_package_json_content(&updated).unwrap();
+        assert!(modified);
+        assert!(!removed.contains("socket-patch"));
+        let parsed: serde_json::Value = serde_json::from_str(&removed).unwrap();
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+        assert!(parsed["scripts"].get("postinstall").is_none());
+        assert!(parsed["scripts"].get("dependencies").is_none());
+    }
+
+    #[test]
+    fn test_remove_content_idempotent() {
+        let configured = r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
+        let (modified1, removed, _) = remove_package_json_content(configured).unwrap();
+        assert!(modified1);
+        let (modified2, _, _) = remove_package_json_content(&removed).unwrap();
+        assert!(!modified2);
+    }
+
+    #[test]
+    fn test_remove_content_invalid_json_errors() {
+        assert!(remove_package_json_content("not json").is_err());
+    }
+
+    #[test]
+    fn test_remove_content_non_object_scripts_errors() {
+        let result = remove_package_json_content(r#"{"name":"x","scripts":"build"}"#);
+        assert!(result.is_err());
     }
 
     #[test]

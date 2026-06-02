@@ -106,6 +106,13 @@ impl Case {
         self.expect_applied && self.baseline_supported
     }
 
+    /// npm-family package managers (plus the polyglot monorepo's npm slice)
+    /// are the surface `setup` actually configures today — the only cases
+    /// where the check/remove round-trip is expected to do real work.
+    fn is_npm_family(&self) -> bool {
+        matches!(self.pm.as_str(), "npm" | "yarn" | "pnpm" | "bun") || self.layout == "monorepo"
+    }
+
     fn sm_env(&self) -> Vec<(String, String)> {
         vec![
             ("SM_ID".into(), self.id.clone()),
@@ -298,6 +305,16 @@ fn run_cases(label: &str, cases: Vec<Case>) {
                 case.id, case.expect_applied, res.actual_applied, tag, indent(&res.raw)
             ));
         }
+
+        // check/remove round-trip — only asserted for npm-family cases that
+        // ran setup (the surface setup configures today). For other
+        // ecosystems setup writes nothing, so the round-trip is a no-op and
+        // we leave it untagged, consistent with the BASELINE GAP convention.
+        if case.run_setup && case.is_npm_family() {
+            if let Some(msg) = round_trip_failure(case, &res) {
+                failures.push(msg);
+            }
+        }
     }
 
     assert!(
@@ -311,6 +328,46 @@ fn run_cases(label: &str, cases: Vec<Case>) {
         cases.len(),
         failures.join("\n")
     );
+}
+
+/// Validate the `setup --check` / `setup --remove` round-trip fields emitted by
+/// the driver. Returns a failure message if the inverse of setup did not hold:
+/// after configuring, `--check` must pass (0); `--remove` must succeed (0) and
+/// strip socket-patch from package.json; and `--check` must then fail again
+/// (non-zero). Returns `None` on success.
+fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
+    let parsed = res.parsed.as_ref()?;
+    let int = |k: &str| parsed.get(k).and_then(|v| v.as_i64());
+    let boolean = |k: &str| parsed.get(k).and_then(|v| v.as_bool());
+
+    let check_setup = int("check_after_setup_exit");
+    let remove = int("remove_exit");
+    let check_remove = int("check_after_remove_exit");
+    let clean = boolean("remove_clean");
+
+    let mut problems = Vec::new();
+    if check_setup != Some(0) {
+        problems.push(format!("check-after-setup exit={check_setup:?} (want 0)"));
+    }
+    if remove != Some(0) {
+        problems.push(format!("remove exit={remove:?} (want 0)"));
+    }
+    if check_remove == Some(0) {
+        problems.push("check-after-remove exit=0 (want non-zero; hook still present)".to_string());
+    }
+    if clean == Some(false) {
+        problems.push("socket-patch still present in package.json after remove".to_string());
+    }
+
+    if problems.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  - {}: check/remove round-trip failed [{}]\n{}",
+        case.id,
+        problems.join("; "),
+        indent(&res.raw)
+    ))
 }
 
 fn indent(s: &str) -> String {

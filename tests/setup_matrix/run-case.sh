@@ -77,12 +77,13 @@ log()  { printf '[setup-matrix:%s] %s\n' "$SM_ID" "$*"; }
 json_str() { printf '%s' "$1" | tr -d '\r' | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 emit_result() {
   local actual="$1" primary_present="$2" setup_exit="$3" install_exit="$4" target="$5" status="$6"
-  printf '{"id":"%s","ecosystem":"%s","pm":"%s","scenario":"%s","patchset":"%s","run_setup":%s,"expect_applied":%s,"actual_applied":%s,"primary_marker_present":%s,"setup_exit":%s,"install_exit":%s,"target":"%s","status":"%s","notes":"%s"}\n' \
+  printf '{"id":"%s","ecosystem":"%s","pm":"%s","scenario":"%s","patchset":"%s","run_setup":%s,"expect_applied":%s,"actual_applied":%s,"primary_marker_present":%s,"setup_exit":%s,"install_exit":%s,"check_after_setup_exit":%s,"remove_exit":%s,"check_after_remove_exit":%s,"remove_clean":%s,"target":"%s","status":"%s","notes":"%s"}\n' \
     "$(json_str "$SM_ID")" "$(json_str "$SM_ECOSYSTEM")" "$(json_str "$SM_PM")" \
     "$(json_str "$SM_SCENARIO")" "$(json_str "$SM_PATCHSET")" \
     "$([ "$SM_RUN_SETUP" = 1 ] && echo true || echo false)" \
     "$([ "$SM_EXPECT_APPLIED" = 1 ] && echo true || echo false)" \
     "$actual" "$primary_present" "$setup_exit" "$install_exit" \
+    "${CHECK_AFTER_SETUP_EXIT:-null}" "${REMOVE_EXIT:-null}" "${CHECK_AFTER_REMOVE_EXIT:-null}" "${REMOVE_CLEAN:-null}" \
     "$(json_str "$target")" "$(json_str "$status")" "$(json_str "$NOTES")" >&3
 }
 
@@ -495,11 +496,18 @@ export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENT
 
 # 1. setup (configures hooks; no-op where there is no package.json)
 SETUP_EXIT="null"
+CHECK_AFTER_SETUP_EXIT="null"
 if [ "$SM_RUN_SETUP" = 1 ]; then
   log "running: socket-patch setup --yes"
   "$SP_BIN" setup --yes --json; SETUP_EXIT=$?
   log "setup exit=$SETUP_EXIT"
   [ -f package.json ] && { log "package.json scripts after setup:"; grep -A6 '"scripts"' package.json || true; }
+
+  # Read-only verification: a project we just configured must pass --check
+  # (exit 0). Recorded for the harness; does not touch disk.
+  log "running: socket-patch setup --check (after setup)"
+  "$SP_BIN" setup --check --json; CHECK_AFTER_SETUP_EXIT=$?
+  log "check-after-setup exit=$CHECK_AFTER_SETUP_EXIT"
 fi
 
 # 2. native install (this is where a configured hook fires)
@@ -533,6 +541,30 @@ note "candidate files found: $n_found"
 log "resolved target: ${TARGET:-<none>} (candidates=$n_found)"
 [ "$n_found" -eq 0 ] && note "target file not found"
 log "marker '$check_marker' present: $APPLIED"
+
+# 4. remove round-trip — only meaningful where setup configured hooks.
+# Done LAST (after install + verify) so it cannot disturb the apply check.
+# Asserts the inverse of setup: --remove strips the hook, --check then fails,
+# and `socket-patch` no longer appears in the root package.json.
+REMOVE_EXIT="null"
+CHECK_AFTER_REMOVE_EXIT="null"
+REMOVE_CLEAN="null"
+if [ "$SM_RUN_SETUP" = 1 ] && [ -f package.json ]; then
+  log "running: socket-patch setup --remove --yes"
+  "$SP_BIN" setup --remove --yes --json; REMOVE_EXIT=$?
+  log "remove exit=$REMOVE_EXIT"
+  log "package.json scripts after remove:"; grep -A6 '"scripts"' package.json || true
+
+  log "running: socket-patch setup --check (after remove)"
+  "$SP_BIN" setup --check --json; CHECK_AFTER_REMOVE_EXIT=$?
+  log "check-after-remove exit=$CHECK_AFTER_REMOVE_EXIT"
+
+  if grep -q "socket-patch" package.json 2>/dev/null; then
+    REMOVE_CLEAN=false; note "remove left socket-patch in root package.json"
+  else
+    REMOVE_CLEAN=true
+  fi
+fi
 
 # Driver-level status: did actual match the aspirational expectation?
 want=$([ "$SM_EXPECT_APPLIED" = 1 ] && echo true || echo false)

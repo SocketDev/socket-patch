@@ -1,7 +1,10 @@
 use std::path::Path;
 use tokio::fs;
 
-use super::detect::{is_setup_configured_str, update_package_json_content, PackageManager};
+use super::detect::{
+    is_setup_configured_str, remove_package_json_content, update_package_json_content,
+    PackageManager,
+};
 
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
@@ -103,6 +106,101 @@ pub async fn update_package_json(
             new_script: String::new(),
             old_dependencies_script: String::new(),
             new_dependencies_script: String::new(),
+            error: Some(e),
+        },
+    }
+}
+
+/// Result of removing socket-patch from a single package.json.
+#[derive(Debug, Clone)]
+pub struct RemoveResult {
+    pub path: String,
+    pub status: RemoveStatus,
+    /// Previous `postinstall` script (empty if absent).
+    pub old_script: String,
+    /// New `postinstall` value: `None` means the key was deleted.
+    pub new_script: Option<String>,
+    pub old_dependencies_script: String,
+    pub new_dependencies_script: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveStatus {
+    /// socket-patch was present and has been (or would be) removed.
+    Removed,
+    /// Nothing to remove — the file is not configured for socket-patch.
+    NotConfigured,
+    Error,
+}
+
+/// Remove socket-patch lifecycle scripts from a single package.json file.
+///
+/// Mirrors [`update_package_json`] but in reverse. Needs no [`PackageManager`]:
+/// it strips any known socket-patch pattern regardless of how it was written.
+pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> RemoveResult {
+    let path_str = package_json_path.display().to_string();
+
+    let content = match fs::read_to_string(package_json_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            return RemoveResult {
+                path: path_str,
+                status: RemoveStatus::Error,
+                old_script: String::new(),
+                new_script: None,
+                old_dependencies_script: String::new(),
+                new_dependencies_script: None,
+                error: Some(e.to_string()),
+            };
+        }
+    };
+
+    match remove_package_json_content(&content) {
+        Ok((modified, new_content, status)) => {
+            if !modified {
+                return RemoveResult {
+                    path: path_str,
+                    status: RemoveStatus::NotConfigured,
+                    old_script: status.old_postinstall,
+                    new_script: status.new_postinstall,
+                    old_dependencies_script: status.old_dependencies,
+                    new_dependencies_script: status.new_dependencies,
+                    error: None,
+                };
+            }
+
+            if !dry_run {
+                if let Err(e) = fs::write(package_json_path, &new_content).await {
+                    return RemoveResult {
+                        path: path_str,
+                        status: RemoveStatus::Error,
+                        old_script: status.old_postinstall,
+                        new_script: status.new_postinstall,
+                        old_dependencies_script: status.old_dependencies,
+                        new_dependencies_script: status.new_dependencies,
+                        error: Some(e.to_string()),
+                    };
+                }
+            }
+
+            RemoveResult {
+                path: path_str,
+                status: RemoveStatus::Removed,
+                old_script: status.old_postinstall,
+                new_script: status.new_postinstall,
+                old_dependencies_script: status.old_dependencies,
+                new_dependencies_script: status.new_dependencies,
+                error: None,
+            }
+        }
+        Err(e) => RemoveResult {
+            path: path_str,
+            status: RemoveStatus::Error,
+            old_script: String::new(),
+            new_script: None,
+            old_dependencies_script: String::new(),
+            new_dependencies_script: None,
             error: Some(e),
         },
     }
@@ -345,5 +443,82 @@ mod tests {
         assert!(result.new_script.contains("socket-patch apply"));
         assert!(result.new_script.contains("echo hi"));
         assert_eq!(fs::read_to_string(&pkg).await.unwrap(), original);
+    }
+
+    // ── remove_package_json ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent.json");
+        let result = remove_package_json(&missing, false).await;
+        assert_eq!(result.status, RemoveStatus::Error);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_remove_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        let result = remove_package_json(&pkg, false).await;
+        assert_eq!(result.status, RemoveStatus::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn test_remove_writes_and_strips_socket_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        // Configure first, then remove.
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        update_package_json(&pkg, false, PackageManager::Npm).await;
+
+        let result = remove_package_json(&pkg, false).await;
+        assert_eq!(result.status, RemoveStatus::Removed);
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        assert!(!content.contains("socket-patch"));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+    }
+
+    #[tokio::test]
+    async fn test_remove_dry_run_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        let original = r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
+        fs::write(&pkg, original).await.unwrap();
+        let result = remove_package_json(&pkg, true).await;
+        assert_eq!(result.status, RemoveStatus::Removed);
+        // File must be byte-identical after a dry-run.
+        assert_eq!(fs::read_to_string(&pkg).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn test_remove_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        update_package_json(&pkg, false, PackageManager::Npm).await;
+
+        let r1 = remove_package_json(&pkg, false).await;
+        assert_eq!(r1.status, RemoveStatus::Removed);
+        let r2 = remove_package_json(&pkg, false).await;
+        assert_eq!(r2.status, RemoveStatus::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn test_remove_invalid_json_errors_and_leaves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, "not json!!!").await.unwrap();
+        let result = remove_package_json(&pkg, false).await;
+        assert_eq!(result.status, RemoveStatus::Error);
+        assert_eq!(fs::read_to_string(&pkg).await.unwrap(), "not json!!!");
     }
 }
