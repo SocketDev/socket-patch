@@ -503,7 +503,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
 ///   * `requirements.txt` — pip-compile / bare requirements
 ///   * `uv.lock` — uv-managed projects (PEP 751 export sibling is
 ///     `pylock.toml` but in practice `uv.lock` is what ships)
-async fn is_python_project(cwd: &Path) -> bool {
+pub async fn is_python_project(cwd: &Path) -> bool {
     let markers = [
         "pyproject.toml",
         "setup.py",

@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
+toml_edit = { workspace = true }
 once_cell = { workspace = true }
 qbsdiff = { workspace = true }
 tar = { workspace = true }

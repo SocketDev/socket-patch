@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "socket-patch-hook"
+version = "3.3.0"
+description = "Auto-apply Socket security patches after install via a package-manager-agnostic .pth startup hook"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    { name = "Socket Security" }
+]
+keywords = ["security", "patch", "hook", "dependencies", "pth"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development :: Build Tools",
+]
+# Intentionally NO dependency on socket-patch: the hook is version-agnostic and
+# invokes whatever `socket-patch` CLI is on PATH (or pip-installed in the env),
+# no-opping if none is present. This keeps the committed `socket-patch-hook`
+# dependency a single stable token that never needs a version bump, and lets the
+# CLI be provisioned independently (pip, pipx, a GitHub Action, system install).
+# (The canonical build is scripts/build-pypi-wheels.py, which also lays down the
+# startup .pth; this block keeps the directory a valid project for `pip install .`.)
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/SocketDev/socket-patch"
+Repository = "https://github.com/SocketDev/socket-patch"
+
+[tool.setuptools]
+packages = ["socket_patch_hook"]

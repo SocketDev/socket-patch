@@ -25,11 +25,40 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 /// Path to the built binary under test (host mode passes this to the
 /// driver via `SOCKET_PATCH_BIN`).
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+/// Build the pure-python `socket-patch-hook` wheel once and cache the path.
+/// The pypi cases need it to exercise the `.pth` post-install hook; returns
+/// `None` if the build fails (those cases then degrade to a gap). Requires
+/// `python3` on PATH (always present in the pypi image / host pypi runs).
+fn hook_wheel() -> Option<PathBuf> {
+    static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let root = workspace_root();
+        let dist = root.join("target/setup-matrix-hook");
+        std::fs::create_dir_all(&dist).ok()?;
+        let version = env!("CARGO_PKG_VERSION");
+        let ok = Command::new("python3")
+            .arg(root.join("scripts/build-pypi-wheels.py"))
+            .args(["--version", version, "--hook-only", "--dist"])
+            .arg(&dist)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let wheel = dist.join(format!("socket_patch_hook-{version}-py3-none-any.whl"));
+        wheel.exists().then_some(wheel)
+    })
+    .clone()
 }
 
 /// Workspace root = two levels up from this crate's manifest dir.
@@ -199,6 +228,14 @@ fn run_case(case: &Case) -> RunResult {
     let driver = driver_path();
     let env = case.sm_env();
 
+    // The pypi cases need the prebuilt hook wheel to exercise the `.pth`
+    // post-install hook; other ecosystems ignore it.
+    let wheel = if case.ecosystem == "pypi" {
+        hook_wheel()
+    } else {
+        None
+    };
+
     let output = if host_mode() {
         let mut cmd = Command::new("bash");
         cmd.arg(&driver);
@@ -206,6 +243,9 @@ fn run_case(case: &Case) -> RunResult {
             cmd.env(k, v);
         }
         cmd.env("SOCKET_PATCH_BIN", binary());
+        if let Some(w) = &wheel {
+            cmd.env("SOCKET_PATCH_HOOK_WHEEL", w);
+        }
         cmd.output().expect("spawn bash driver")
     } else {
         let script = std::fs::read_to_string(&driver)
@@ -214,6 +254,22 @@ fn run_case(case: &Case) -> RunResult {
         cmd.args(["run", "--rm"]);
         for (k, v) in &env {
             cmd.args(["-e", &format!("{k}={v}")]);
+        }
+        // Mount the hook wheel into the container, PRESERVING its PEP 427
+        // filename (pip/uv/pdm reject a wheel whose filename isn't a valid
+        // `{name}-{ver}-{tags}.whl`, so we must not rename it on mount).
+        if let Some(w) = &wheel {
+            let name = w
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("hook wheel filename");
+            let dest = format!("/tmp/{name}");
+            cmd.args([
+                "-v",
+                &format!("{}:{}:ro", w.display(), dest),
+                "-e",
+                &format!("SOCKET_PATCH_HOOK_WHEEL={dest}"),
+            ]);
         }
         cmd.arg(format!("socket-patch-test-{}:latest", case.image));
         cmd.args(["bash", "-c", &script]);

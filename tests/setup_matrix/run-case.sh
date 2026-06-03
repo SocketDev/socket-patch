@@ -227,7 +227,22 @@ EOF
 { "name": "sm-proj", "version": "0.0.0", "nodeModulesDir": "auto" }
 EOF
       ;;
-    pip|uv) : ;;
+    pip)
+      # A requirements.txt makes `setup` detect a pip project and add the
+      # `socket-patch[hook]` dependency to it.
+      printf '%s==%s\n' "$SM_PACKAGE" "$SM_VERSION" > requirements.txt ;;
+    uv)
+      # A PEP 621 pyproject + uv.lock makes `setup` detect a uv project.
+      cat > pyproject.toml <<EOF
+[project]
+name = "sm-proj"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = ["$SM_PACKAGE==$SM_VERSION"]
+
+[tool.uv]
+EOF
+      : > uv.lock ;;
     poetry)
       cat > pyproject.toml <<EOF
 [tool.poetry]
@@ -295,6 +310,39 @@ EOF
   esac
 }
 
+# --- pypi .pth hook helpers -------------------------------------------
+# When `setup` configured the hook (SM_RUN_SETUP=1) and a prebuilt hook
+# wheel is available, install it into the venv so its startup `.pth`
+# lands in site-packages, and point the binary the hook spawns at $SP_BIN.
+# This is the hermetic stand-in for `pip install -r requirements.txt`
+# resolving the committed `socket-patch[hook]` dependency from PyPI.
+pth_install_into_venv() { # $1=venv dir  $2=pip|uv
+  local venv="$1" flavor="$2"
+  [ "$SM_RUN_SETUP" = 1 ] || return 0
+  [ -n "${SOCKET_PATCH_HOOK_WHEEL:-}" ] && [ -f "${SOCKET_PATCH_HOOK_WHEEL:-}" ] || {
+    note "no SOCKET_PATCH_HOOK_WHEEL; pth hook not installed (gap)"; return 0; }
+  case "$flavor" in
+    uv)  uv pip install --python "$venv/bin/python" --quiet --no-deps "$SOCKET_PATCH_HOOK_WHEEL" || note "hook wheel install failed" ;;
+    *)   # pip-compatible venv (pip / poetry / pdm). Use the venv's own
+         # python so it targets that interpreter's site-packages; ensurepip
+         # if the venv was created without pip.
+         "$venv/bin/python" -m pip --version >/dev/null 2>&1 \
+           || "$venv/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+         "$venv/bin/python" -m pip install --quiet --no-deps "$SOCKET_PATCH_HOOK_WHEEL" \
+           || note "hook wheel install failed" ;;
+  esac
+  # The hook resolves `socket-patch` off PATH (it isn't pip-installed here).
+  ln -sf "$SP_BIN" "$venv/bin/socket-patch" 2>/dev/null || true
+}
+
+# Start an interpreter so the `.pth` hook fires (models a CI app start /
+# the next python invocation after install). No-op if there is no venv.
+pth_trigger() { # $1=venv dir
+  local venv="$1"
+  [ -x "$venv/bin/python" ] || return 0
+  PATH="$PWD/$venv/bin:$PATH" "$venv/bin/python" -c "pass" >/dev/null 2>&1 || true
+}
+
 # --- per-PM native install (the hook, if configured, fires here) ------
 run_install() {
   case "$SM_PM" in
@@ -303,11 +351,34 @@ run_install() {
     pnpm)  pnpm install --no-frozen-lockfile ;;
     bun)   bun add "$SM_PACKAGE@$SM_VERSION" ;;
     deno)  deno install --allow-scripts ;;
-    pip)   python3 -m venv venv && ./venv/bin/pip install --disable-pip-version-check --quiet --no-cache-dir "$SM_PACKAGE==$SM_VERSION" ;;
-    uv)    uv venv venv && uv pip install --python venv/bin/python --quiet "$SM_PACKAGE==$SM_VERSION" ;;
+    pip)
+      python3 -m venv venv
+      pth_install_into_venv venv pip
+      ./venv/bin/pip install --disable-pip-version-check --quiet --no-cache-dir "$SM_PACKAGE==$SM_VERSION"
+      pth_trigger venv ;;
+    uv)
+      uv venv venv
+      pth_install_into_venv venv uv
+      uv pip install --python venv/bin/python --quiet "$SM_PACKAGE==$SM_VERSION"
+      pth_trigger venv ;;
+    # poetry / pdm are resolver-based: `add` re-resolves the whole manifest
+    # (which setup edited to add `socket-patch-hook`) against a package index.
+    # In this hermetic test the hook wheel isn't published, so resolution
+    # fails — these PMs can't be exercised without a local index, so they stay
+    # documented gaps (baseline_supported:false). The .pth mechanism itself is
+    # package-manager-agnostic (proven by pip/uv/hatch).
     poetry) poetry config virtualenvs.in-project true --local && poetry add --no-interaction "$SM_PACKAGE@$SM_VERSION" ;;
     pdm)   pdm config python.use_venv true >/dev/null 2>&1; pdm add "$SM_PACKAGE==$SM_VERSION" ;;
-    hatch) HATCH_DATA_DIR="$PWD/.hatch" hatch env create && HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "import ${SM_PACKAGE//-/_}" ;;
+    hatch)
+      HATCH_DATA_DIR="$PWD/.hatch" hatch env create
+      HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "import ${SM_PACKAGE//-/_}"
+      # hatch manages its env outside .venv; install the hook + fire an
+      # interpreter through `hatch run`.
+      if [ "$SM_RUN_SETUP" = 1 ] && [ -n "${SOCKET_PATCH_HOOK_WHEEL:-}" ] && [ -f "${SOCKET_PATCH_HOOK_WHEEL:-}" ]; then
+        HATCH_DATA_DIR="$PWD/.hatch" hatch run pip install --no-deps "$SOCKET_PATCH_HOOK_WHEEL" \
+          || note "hatch hook wheel install failed"
+      fi
+      HATCH_DATA_DIR="$PWD/.hatch" hatch run python -c "pass" || true ;;
     cargo) cargo fetch ;;
     bundler) bundle config set --local path vendor/bundle && bundle install ;;
     go)    GOFLAGS=-mod=mod go mod download "$SM_PACKAGE@$SM_VERSION" ;;
@@ -324,7 +395,10 @@ resolve_target() {
   local base; base="$(basename "$rel")"
   case "$SM_ECOSYSTEM" in
     npm|deno)  printf '%s\n' "$PWD/node_modules/$SM_PACKAGE/$rel" ;;
-    pypi)      find "$PWD" -name "$base" 2>/dev/null | head -1 ;;
+    # Exclude vendored copies (pip/setuptools bundle their own six.py under
+    # */_vendor/*); the patch lands in the installed package at the
+    # site-packages root.
+    pypi)      find "$PWD" -name "$base" -not -path '*/_vendor/*' 2>/dev/null | head -1 ;;
     cargo)     find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -path "*/${SM_PACKAGE}-${SM_VERSION}/${rel}" 2>/dev/null | head -1 ;;
     gem)       find "$PWD/vendor" -path "*/${SM_PACKAGE}-${SM_VERSION}/${rel}" 2>/dev/null | head -1 ;;
     golang)    local gmc; gmc="$(go env GOMODCACHE 2>/dev/null || echo "${GOPATH:-$HOME/go}/pkg/mod")"; find "$gmc" -path "*/$(basename "$SM_PACKAGE")@${SM_VERSION}/${rel}" 2>/dev/null | head -1 ;;
@@ -465,7 +539,7 @@ resolve_targets() {
   fi
   case "$SM_ECOSYSTEM" in
     npm|deno|monorepo) find "$PWD" -path "*/node_modules/$SM_PACKAGE/$rel" 2>/dev/null ;;
-    pypi)              find "$PWD" -name "$base" 2>/dev/null ;;
+    pypi)              find "$PWD" -name "$base" -not -path '*/_vendor/*' 2>/dev/null ;;
     *)                 resolve_target ;;
   esac
 }
@@ -503,11 +577,19 @@ run_file() { # $1 = absolute path to the resolved package file
       esac ;;
     deno) deno run -A "$1" ;;
     pypi)
+      # Run the patched module with the in-project venv interpreter directly.
+      # Going through `<pm> run` re-resolves the project, which (after setup)
+      # includes the committed `socket-patch-hook` dependency — unpublished in
+      # this hermetic test, so the resolve would fail for a reason unrelated to
+      # whether six.py is patched. Direct execution faithfully runs the on-disk
+      # patched file and observes its marker. (hatch manages its env outside
+      # an in-project .venv, and its skip-install env doesn't re-resolve, so it
+      # keeps using `hatch run`.)
       case "$SM_PM" in
-        uv)     uv run python "$1" ;;
-        poetry) poetry run python "$1" ;;
-        pdm)    pdm run python "$1" ;;
-        hatch)  hatch run python "$1" ;;
+        uv)     ./venv/bin/python "$1" ;;
+        poetry) ./.venv/bin/python "$1" ;;
+        pdm)    ./.venv/bin/python "$1" ;;
+        hatch)  HATCH_DATA_DIR="$PWD/.hatch" hatch run python "$1" ;;
         pip)    ./venv/bin/python "$1" ;;
         *)      python3 "$1" ;;
       esac ;;
@@ -579,6 +661,9 @@ fi
 # "1".
 export SOCKET_OFFLINE=true SOCKET_FORCE=true SOCKET_API_TOKEN=fake SOCKET_ORG_SLUG=test-org
 export SOCKET_TELEMETRY_DISABLED=1 SOCKET_EXPERIMENTAL_MAVEN=1 SOCKET_EXPERIMENTAL_NUGET=1
+# Isolate the pypi `.pth` hook's change-detection stamp per case so runs
+# don't bleed into each other (the stamp lives under XDG_CACHE_HOME).
+export XDG_CACHE_HOME="$WORKDIR/.cache"
 # NOTE: deliberately do NOT export SOCKET_CWD. The install hook's apply
 # must run with whatever cwd the package manager sets for the lifecycle
 # script — the project root for a single project, and the *member* dir

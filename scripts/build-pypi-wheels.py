@@ -190,6 +190,11 @@ def build_wheel(
         f"Summary: {metadata['description']}\n"
         f"License: {metadata['license']}\n"
         f"Requires-Python: {metadata['requires_python']}\n"
+        # `pip install socket-patch[hook]` additionally installs the
+        # package-manager-agnostic .pth post-install hook (a separate
+        # pure-python wheel). Unpinned so the hook can update independently.
+        f"Provides-Extra: hook\n"
+        f'Requires-Dist: socket-patch-hook; extra == "hook"\n'
     )
     if metadata.get("readme"):
         metadata_header += "Description-Content-Type: text/markdown\n"
@@ -237,6 +242,79 @@ def build_wheel(
     return wheel_path
 
 
+DIST_NAME_HOOK = "socket_patch_hook"
+PKG_NAME_HOOK = "socket-patch-hook"
+
+
+def build_hook_wheel(version: str, hook_dir: Path, dist_dir: Path) -> Path:
+    """Build the pure-python ``socket-patch-hook`` wheel (``py3-none-any``).
+
+    Unlike the platform wheels, this ships no binary. It contains the
+    ``socket_patch_hook`` package and — crucially — a top-level
+    ``socket_patch_hook.pth`` that pip installs into the site-packages root, so
+    Python executes it at interpreter startup. It depends on ``socket-patch``
+    (the binary wheel) for the actual ``apply``.
+    """
+    init_path = hook_dir / "socket_patch_hook" / "__init__.py"
+    pth_path = hook_dir / "socket_patch_hook.pth"
+    readme_path = hook_dir / "README.md"
+    init_py = init_path.read_bytes()
+    pth = pth_path.read_bytes()
+    readme = readme_path.read_text() if readme_path.exists() else ""
+
+    wheel_name = f"{DIST_NAME_HOOK}-{version}-py3-none-any.whl"
+    wheel_path = dist_dir / wheel_name
+    dist_info = f"{DIST_NAME_HOOK}-{version}.dist-info"
+
+    files = []
+    # The package module.
+    files.append((f"{DIST_NAME_HOOK}/__init__.py", init_py, False))
+    # The startup hook — at the wheel root so it installs to site-packages.
+    files.append(("socket_patch_hook.pth", pth, False))
+
+    # No Requires-Dist on socket-patch: the hook is version-agnostic and finds
+    # whatever `socket-patch` CLI is on PATH at runtime (provisioned separately).
+    metadata_content = (
+        f"Metadata-Version: 2.1\n"
+        f"Name: {PKG_NAME_HOOK}\n"
+        f"Version: {version}\n"
+        f"Summary: Package-manager-agnostic post-install patch hook for socket-patch\n"
+        f"License: MIT\n"
+        f"Requires-Python: >=3.8\n"
+    )
+    if readme:
+        metadata_content += "Description-Content-Type: text/markdown\n"
+        metadata_content += f"\n{readme}"
+    files.append((f"{dist_info}/METADATA", metadata_content.encode(), False))
+
+    # Pure-python: Root-Is-Purelib true so the .pth lands in site-packages.
+    wheel_content = (
+        "Wheel-Version: 1.0\n"
+        "Generator: build-pypi-wheels.py\n"
+        "Root-Is-Purelib: true\n"
+        "Tag: py3-none-any\n"
+    ).encode()
+    files.append((f"{dist_info}/WHEEL", wheel_content, False))
+
+    record_lines = []
+    for name, data, _ in files:
+        record_lines.append(f"{name},{sha256_digest(data)},{len(data)}")
+    record_name = f"{dist_info}/RECORD"
+    record_lines.append(f"{record_name},,")
+    files.append((record_name, "\n".join(record_lines).encode(), False))
+
+    with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data, _ in files:
+            info_obj = zipfile.ZipInfo(name)
+            info_obj.external_attr = (
+                stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
+            ) << 16
+            info_obj.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info_obj, data)
+
+    return wheel_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build platform-tagged PyPI wheels for socket-patch"
@@ -248,8 +326,8 @@ def main():
     )
     parser.add_argument(
         "--artifacts",
-        required=True,
-        help="Directory containing build artifacts",
+        default=None,
+        help="Directory containing build artifacts (required unless --hook-only)",
     )
     parser.add_argument(
         "--dist",
@@ -261,22 +339,51 @@ def main():
         default=None,
         help="Directory containing pyproject.toml (default: pypi/socket-patch relative to script)",
     )
+    parser.add_argument(
+        "--hook-dir",
+        default=None,
+        help="Directory of the socket-patch-hook package (default: pypi/socket-patch-hook)",
+    )
+    parser.add_argument(
+        "--hook-only",
+        action="store_true",
+        help="Build only the pure-python socket-patch-hook wheel (no binary artifacts needed)",
+    )
+    parser.add_argument(
+        "--skip-hook",
+        action="store_true",
+        help="Skip building the socket-patch-hook wheel",
+    )
     args = parser.parse_args()
 
-    artifacts_dir = Path(args.artifacts)
     dist_dir = Path(args.dist)
     dist_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    hook_dir = Path(args.hook_dir) if args.hook_dir else repo_root / "pypi" / "socket-patch-hook"
+
+    built = []
+    skipped = []
+
+    # The pure-python hook wheel needs no platform artifacts.
+    if args.hook_only:
+        wheel_path = build_hook_wheel(args.version, hook_dir, dist_dir)
+        size_kb = wheel_path.stat().st_size / 1024
+        print(f"Built hook wheel: {wheel_path.name} ({size_kb:.1f} KB)")
+        return
+
+    if not args.artifacts:
+        parser.error("--artifacts is required unless --hook-only is given")
+
+    artifacts_dir = Path(args.artifacts)
 
     if args.pyproject_dir:
         pyproject_dir = Path(args.pyproject_dir)
     else:
-        pyproject_dir = Path(__file__).resolve().parent.parent / "pypi" / "socket-patch"
+        pyproject_dir = repo_root / "pypi" / "socket-patch"
 
     metadata = read_pyproject_metadata(pyproject_dir)
     init_py = read_init_py(pyproject_dir)
-
-    built = []
-    skipped = []
 
     for target, info in TARGETS.items():
         archive_ext = info["archive_ext"]
@@ -299,6 +406,12 @@ def main():
         size_mb = wheel_path.stat().st_size / (1024 * 1024)
         print(f"  -> {wheel_path.name} ({size_mb:.1f} MB)")
         built.append(wheel_path)
+
+    if not args.skip_hook:
+        hook_wheel = build_hook_wheel(args.version, hook_dir, dist_dir)
+        size_kb = hook_wheel.stat().st_size / 1024
+        print(f"  -> {hook_wheel.name} ({size_kb:.1f} KB)  [pure-python hook]")
+        built.append(hook_wheel)
 
     print(f"\nBuilt {len(built)} wheel(s) in {dist_dir}/")
     if skipped:

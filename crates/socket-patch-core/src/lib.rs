@@ -5,5 +5,6 @@ pub mod hash;
 pub mod manifest;
 pub mod package_json;
 pub mod patch;
+pub mod pth_hook;
 pub mod utils;
 pub mod vex;

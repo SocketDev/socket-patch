@@ -1,0 +1,13 @@
+# socket-patch post-install hook — installed by the `socket-patch-hook` wheel.
+# Re-applies this project's committed Socket security patches (.socket/) after a
+# pip/uv/poetry/etc. install reverts a patched file. At interpreter startup it
+# does a cheap "did the installed packages change?" check and, only then, runs
+# `socket-patch apply --offline`. Fail-open: every error is swallowed so it can
+# never break interpreter startup, and it does nothing unless this environment's
+# project has a committed .socket/manifest.json.
+#   Disable (this interpreter):  SOCKET_PATCH_HOOK=off   (or SOCKET_NO_HOOK=1)
+#   Remove (this project):       socket-patch setup --remove  then  pip uninstall socket-patch-hook
+#   Details:                     https://github.com/SocketDev/socket-patch
+# (Lines starting with `#` are ignored by Python's site module; the single
+#  `import` line below is the only code it executes.)
+import os; exec("try:\n import socket_patch_hook as _h; _h.run()\nexcept Exception: pass") if (os.environ.get('SOCKET_PATCH_HOOK','').strip().lower() not in ('off','0','false','no') and os.environ.get('SOCKET_NO_HOOK','').strip().lower() not in ('1','true','yes','on')) else None

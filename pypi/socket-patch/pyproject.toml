@@ -21,6 +21,14 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 
+[project.optional-dependencies]
+# `pip install socket-patch[hook]` additionally installs the
+# package-manager-agnostic .pth startup hook that re-applies patches after
+# install. Unpinned so the hook updates independently of the CLI. `setup`
+# itself commits a bare `socket-patch-hook` dependency (the hook needs no
+# specific CLI version — it runs whatever `socket-patch` is on PATH).
+hook = ["socket-patch-hook"]
+
 [project.urls]
 Homepage = "https://github.com/SocketDev/socket-patch"
 Repository = "https://github.com/SocketDev/socket-patch"

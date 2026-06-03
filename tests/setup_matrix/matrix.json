@@ -92,14 +92,14 @@
     },
 
     {
-      "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "pth",
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
     {
-      "ecosystem": "pypi", "pm": "uv", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "ecosystem": "pypi", "pm": "uv", "image": "pypi", "hook_family": "pth",
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
@@ -116,8 +116,8 @@
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
     {
-      "ecosystem": "pypi", "pm": "hatch", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "ecosystem": "pypi", "pm": "hatch", "image": "pypi", "hook_family": "pth",
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
