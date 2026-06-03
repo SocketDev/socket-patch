@@ -40,10 +40,14 @@ Don't add this by hand. Run, in your project:
 socket-patch setup
 ```
 
-That commits a `socket-patch-hook` dependency to your repo (the dependency
-itself is the source of truth — there's no separate marker file), so the hook
-activates automatically in CI after install. Remove it with `socket-patch setup
---remove` followed by `pip uninstall socket-patch-hook`.
+That commits a `socket-patch[hook]` dependency to your repo — the `[hook]`
+extra on the main `socket-patch` package, which pulls in both the CLI and this
+wheel (you never reference `socket-patch-hook` directly). The committed
+dependency is the source of truth — there's no separate marker file. The hook
+then activates automatically in CI after install. Remove it with `socket-patch
+setup --remove` followed by `pip uninstall socket-patch-hook`. (Classic Poetry
+can't express an extra as a bare key, so there `setup` writes the equivalent
+`socket-patch = { extras = ["hook"] }`.)
 
 ## Disabling at runtime
 

@@ -2,16 +2,19 @@
 
 use std::path::Path;
 
-/// The dependency `setup` adds to activate the hook: the standalone, version-
-/// agnostic hook wheel (it has no dependency on the CLI — the hook runs whatever
-/// `socket-patch` is on PATH). A bare token so the committed line never needs a
-/// version bump.
-pub const HOOK_DEP: &str = "socket-patch-hook";
+/// The dependency `setup` adds (PEP 508 form, used for `requirements.txt` and
+/// PEP 621 `[project].dependencies`): the `socket-patch[hook]` extra, which
+/// pulls both the socket-patch CLI and the socket-patch-hook wheel (the `.pth`
+/// carrier). A single, familiar line. Classic Poetry can't express an extra as
+/// a bare key, so [`super::edit`] emits the equivalent
+/// `socket-patch = { extras = ["hook"] }` there instead.
+pub const HOOK_DEP: &str = "socket-patch[hook]";
 
 /// Substrings (space-insensitive, lower-cased) that mean the hook is already
-/// declared — the standalone wheel, the `socket-patch[hook]` convenience extra,
-/// or the underscore spelling.
-const HOOK_MARKERS: &[&str] = &["socket-patch-hook", "socket_patch_hook", "socket-patch[hook]"];
+/// declared — the `socket-patch[hook]` extra, the standalone wheel, or the
+/// underscore spelling. (The Poetry `extras = ["hook"]` form is detected
+/// structurally by [`super::edit`], not by this textual check.)
+const HOOK_MARKERS: &[&str] = &["socket-patch[hook]", "socket-patch-hook", "socket_patch_hook"];
 
 /// Which Python dependency-management style a project uses. Drives both which
 /// manifest/table `setup` edits and which lockfile (if any) to refresh.

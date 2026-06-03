@@ -14,7 +14,7 @@
 
 use std::path::Path;
 use tokio::fs;
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, spec_is_hook, HOOK_DEP};
 
@@ -287,13 +287,33 @@ fn poetry_add(doc: &mut DocumentMut) -> Result<bool, String> {
     let poetry = ensure_table(tool, "poetry", true)?;
     let deps = ensure_table(poetry, "dependencies", false)?;
 
-    // The hook is a standalone, version-agnostic dependency — add it as its own
-    // key rather than mutating the user's `socket-patch` entry. `"*"` because
-    // the hook needs no specific version (it runs whatever CLI is on PATH).
+    // Classic Poetry can't express `socket-patch[hook]` as a key, so declare
+    // the equivalent: `socket-patch` carrying the `hook` extra. Already wired
+    // if a bare `socket-patch-hook` key exists or the extra is already present.
     if deps.contains_key("socket-patch-hook") {
         return Ok(false);
     }
-    deps.insert("socket-patch-hook", Item::Value(Value::from("*")));
+    if let Some(item) = deps.get_mut("socket-patch") {
+        if item_has_hook_extra(item) {
+            return Ok(false);
+        }
+        // An existing `socket-patch` dep (bare string or a table): merge the
+        // `hook` extra in place, preserving its version / source / markers.
+        if let Some(tbl) = item.as_table_like_mut() {
+            let mut extras = tbl
+                .get("extras")
+                .and_then(Item::as_array)
+                .cloned()
+                .unwrap_or_default();
+            extras.push("hook");
+            tbl.insert("extras", Item::Value(Value::Array(extras)));
+        } else {
+            let version = item.as_str().map(str::to_string).unwrap_or_else(|| "*".to_string());
+            deps.insert("socket-patch", Item::Value(hook_inline_table(&version)));
+        }
+        return Ok(true);
+    }
+    deps.insert("socket-patch", Item::Value(hook_inline_table("*")));
     Ok(true)
 }
 
@@ -309,7 +329,47 @@ fn poetry_remove(doc: &mut DocumentMut) -> bool {
         Some(d) => d,
         None => return false,
     };
-    deps.remove("socket-patch-hook").is_some()
+
+    let mut changed = false;
+    // Drop a legacy bare `socket-patch-hook` key if present.
+    if deps.remove("socket-patch-hook").is_some() {
+        changed = true;
+    }
+    // Strip the `hook` extra from a `socket-patch` dep table, leaving the rest
+    // of the spec intact.
+    if let Some(tbl) = deps.get_mut("socket-patch").and_then(Item::as_table_like_mut) {
+        if let Some(extras) = tbl.get_mut("extras").and_then(Item::as_array_mut) {
+            let before = extras.len();
+            extras.retain(|v| v.as_str() != Some("hook"));
+            if extras.len() != before {
+                changed = true;
+            }
+            if extras.is_empty() {
+                tbl.remove("extras");
+            }
+        }
+    }
+    changed
+}
+
+/// Build `{ version = "<v>", extras = ["hook"] }`.
+fn hook_inline_table(version: &str) -> Value {
+    let mut it = InlineTable::new();
+    it.insert("version", Value::from(version));
+    let mut extras = Array::new();
+    extras.push("hook");
+    it.insert("extras", Value::Array(extras));
+    Value::InlineTable(it)
+}
+
+/// True if a dependency item (inline table or sub-table) already carries the
+/// `hook` extra.
+fn item_has_hook_extra(item: &Item) -> bool {
+    item.as_table_like()
+        .and_then(|t| t.get("extras"))
+        .and_then(Item::as_array)
+        .map(|a| a.iter().any(|v| v.as_str() == Some("hook")))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -322,27 +382,27 @@ mod tests {
     fn test_requirements_add() {
         let out = requirements_add("requests==2.31.0\n").unwrap().unwrap();
         assert!(out.contains("requests==2.31.0"));
-        assert!(out.contains("socket-patch-hook"));
+        assert!(out.contains("socket-patch[hook]"));
         assert!(out.ends_with('\n'));
     }
 
     #[test]
     fn test_requirements_add_no_trailing_newline() {
         let out = requirements_add("requests").unwrap().unwrap();
-        assert_eq!(out, "requests\nsocket-patch-hook\n");
+        assert_eq!(out, "requests\nsocket-patch[hook]\n");
     }
 
     #[test]
     fn test_requirements_add_idempotent() {
-        // Both the standalone wheel and the legacy `[hook]` extra are recognized.
+        // The extra, the standalone wheel, and a pinned variant are all recognized.
+        assert!(requirements_add("socket-patch[hook]\n").unwrap().is_none());
         assert!(requirements_add("socket-patch-hook\n").unwrap().is_none());
         assert!(requirements_add("socket-patch-hook==3.3.0\n").unwrap().is_none());
-        assert!(requirements_add("socket-patch[hook]\n").unwrap().is_none());
     }
 
     #[test]
     fn test_requirements_remove() {
-        let out = requirements_remove("requests\nsocket-patch-hook\n")
+        let out = requirements_remove("requests\nsocket-patch[hook]\n")
             .unwrap()
             .unwrap();
         assert_eq!(out, "requests\n");
@@ -359,7 +419,7 @@ mod tests {
     fn test_pep621_add_to_existing_array() {
         let toml = "[project]\nname = \"x\"\ndependencies = [\"requests\"]\n";
         let out = pyproject_add(toml).unwrap().unwrap();
-        assert!(out.contains("socket-patch-hook"));
+        assert!(out.contains("socket-patch[hook]"));
         assert!(out.contains("requests"));
         // Re-parse to confirm validity + idempotency.
         assert!(pyproject_add(&out).unwrap().is_none());
@@ -371,7 +431,7 @@ mod tests {
         let out = pyproject_add(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
         let deps = doc["project"]["dependencies"].as_array().unwrap();
-        assert!(deps.iter().any(|v| v.as_str() == Some("socket-patch-hook")));
+        assert!(deps.iter().any(|v| v.as_str() == Some("socket-patch[hook]")));
     }
 
     #[test]
@@ -381,79 +441,74 @@ mod tests {
         assert!(out.contains("[build-system]"));
         assert!(out.contains("version = \"1.0\""));
         assert!(out.contains("requests"));
-        assert!(out.contains("socket-patch-hook"));
+        assert!(out.contains("socket-patch[hook]"));
     }
 
     #[test]
     fn test_pep621_remove() {
-        let toml = "[project]\ndependencies = [\"requests\", \"socket-patch-hook\"]\n";
+        let toml = "[project]\ndependencies = [\"requests\", \"socket-patch[hook]\"]\n";
         let out = pyproject_remove(toml).unwrap().unwrap();
-        assert!(!out.contains("socket-patch-hook"));
+        assert!(!out.contains("socket-patch[hook]"));
         assert!(out.contains("requests"));
     }
 
-    // ── pyproject Poetry (standalone hook key, no extras-merging) ─────
+    // ── pyproject Poetry (the `socket-patch[hook]` equivalent: the
+    //    `socket-patch` dep carrying the `hook` extra) ─────────────────
 
     #[test]
-    fn test_poetry_add_new_key() {
+    fn test_poetry_add_new_dep() {
         let toml = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\npython = \"^3.9\"\n";
         let out = pyproject_add(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
-        assert_eq!(
-            doc["tool"]["poetry"]["dependencies"]["socket-patch-hook"].as_str(),
-            Some("*")
+        assert!(
+            item_has_hook_extra(&doc["tool"]["poetry"]["dependencies"]["socket-patch"]),
+            "poetry dep must carry the hook extra; got:\n{out}"
         );
         // Idempotent.
         assert!(pyproject_add(&out).unwrap().is_none());
     }
 
     #[test]
-    fn test_poetry_leaves_existing_socket_patch_untouched() {
-        // An existing `socket-patch` dependency must NOT be mutated; we only add
-        // the standalone `socket-patch-hook` key.
+    fn test_poetry_merges_extra_into_existing_dep() {
+        // An existing `socket-patch = "^3.3.0"` gains the hook extra, version kept.
         let toml = "[tool.poetry]\nname = \"x\"\n[tool.poetry.dependencies]\nsocket-patch = \"^3.3.0\"\n";
         let out = pyproject_add(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
+        let item = &doc["tool"]["poetry"]["dependencies"]["socket-patch"];
+        assert!(item_has_hook_extra(item), "hook extra must be added");
         assert_eq!(
-            doc["tool"]["poetry"]["dependencies"]["socket-patch"].as_str(),
+            item.as_table_like().and_then(|t| t.get("version")).and_then(Item::as_str),
             Some("^3.3.0"),
-            "existing socket-patch dep must be left intact"
-        );
-        assert_eq!(
-            doc["tool"]["poetry"]["dependencies"]["socket-patch-hook"].as_str(),
-            Some("*")
+            "existing version must be preserved"
         );
     }
 
     #[test]
     fn test_poetry_subtable_dependency_preserved() {
-        // A `[tool.poetry.dependencies.socket-patch]` sub-table (version/source)
-        // must survive untouched; only the standalone hook key is added.
+        // A `[tool.poetry.dependencies.socket-patch]` sub-table gains the hook
+        // extra while keeping its version / source.
         let toml = "[tool.poetry.dependencies.socket-patch]\nversion = \"^3.3.0\"\ngit = \"https://example.com/x.git\"\n";
         let out = pyproject_add(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
         let sp = &doc["tool"]["poetry"]["dependencies"]["socket-patch"];
+        assert!(item_has_hook_extra(sp), "hook extra must be added");
         assert_eq!(
             sp.as_table_like().and_then(|t| t.get("git")).and_then(Item::as_str),
             Some("https://example.com/x.git"),
             "sub-table keys must survive"
-        );
-        assert_eq!(
-            doc["tool"]["poetry"]["dependencies"]["socket-patch-hook"].as_str(),
-            Some("*")
         );
         // Idempotent.
         assert!(pyproject_add(&out).unwrap().is_none());
     }
 
     #[test]
-    fn test_poetry_remove() {
-        let toml = "[tool.poetry.dependencies]\nsocket-patch-hook = \"*\"\npython = \"^3.9\"\n";
+    fn test_poetry_remove_strips_extra() {
+        let toml = "[tool.poetry.dependencies]\nsocket-patch = {version = \"*\", extras = [\"hook\"]}\npython = \"^3.9\"\n";
         let out = pyproject_remove(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
-        assert!(doc["tool"]["poetry"]["dependencies"]
-            .get("socket-patch-hook")
-            .is_none());
+        assert!(!item_has_hook_extra(
+            &doc["tool"]["poetry"]["dependencies"]["socket-patch"]
+        ));
         assert!(doc["tool"]["poetry"]["dependencies"].get("python").is_some());
     }
 
@@ -467,7 +522,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v.as_str() == Some("socket-patch-hook")));
+            .any(|v| v.as_str() == Some("socket-patch[hook]")));
     }
 
     #[test]
@@ -483,9 +538,8 @@ mod tests {
         let toml = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\npython = \"^3.9\"\n\n[project.urls]\nHome = \"https://example.com\"\n";
         let out = pyproject_add(toml).unwrap().unwrap();
         let doc = out.parse::<DocumentMut>().unwrap();
-        assert_eq!(
-            doc["tool"]["poetry"]["dependencies"]["socket-patch-hook"].as_str(),
-            Some("*"),
+        assert!(
+            item_has_hook_extra(&doc["tool"]["poetry"]["dependencies"]["socket-patch"]),
             "must edit the poetry table, not create [project].dependencies; got:\n{out}"
         );
         assert!(doc.get("project").and_then(|p| p.get("dependencies")).is_none());
@@ -494,7 +548,7 @@ mod tests {
     #[test]
     fn test_requirements_preserves_crlf() {
         let out = requirements_add("requests\r\n").unwrap().unwrap();
-        assert_eq!(out, "requests\r\nsocket-patch-hook\r\n");
+        assert_eq!(out, "requests\r\nsocket-patch[hook]\r\n");
         let removed = requirements_remove(&out).unwrap().unwrap();
         assert_eq!(removed, "requests\r\n");
     }
@@ -508,7 +562,7 @@ mod tests {
         let res = add_hook_dependency(&req, ManifestKind::Requirements, false).await;
         assert_eq!(res.status, PthStatus::Updated);
         let body = tokio::fs::read_to_string(&req).await.unwrap();
-        assert_eq!(body, "socket-patch-hook\n");
+        assert_eq!(body, "socket-patch[hook]\n");
     }
 
     #[tokio::test]

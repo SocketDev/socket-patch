@@ -421,12 +421,27 @@ jobs:
       - name: Copy README for PyPI package
         run: cp README.md pypi/socket-patch/README.md
 
-      - name: Build platform wheels
+      - name: Build wheels (platform socket-patch + pure-python socket-patch-hook)
         run: |
           VERSION="${{ needs.version.outputs.version }}"
+          # Builds the platform-tagged socket-patch wheels AND the pure-python
+          # socket-patch-hook wheel (the .pth carrier behind `socket-patch[hook]`).
           python scripts/build-pypi-wheels.py --version "$VERSION" --artifacts artifacts --dist dist
+          # socket-patch and socket-patch-hook are two distinct PyPI projects.
+          # Publish each from its own dir so trusted publishing mints an OIDC
+          # token scoped to the right project (one upload spanning both projects
+          # can be rejected). Each project needs its own trusted publisher on
+          # PyPI; register a "pending" publisher for socket-patch-hook before the
+          # first release (repo + workflow `release.yml` + this environment).
+          mkdir -p dist-hook
+          mv dist/socket_patch_hook-*.whl dist-hook/
 
-      - name: Publish to PyPI
+      - name: Publish socket-patch to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist/
+
+      - name: Publish socket-patch-hook to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          packages-dir: dist-hook/

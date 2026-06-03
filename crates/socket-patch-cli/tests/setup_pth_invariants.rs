@@ -50,7 +50,7 @@ fn pip_requirements_gets_hook_dep() {
     assert_eq!(entry["kind"], "pth");
 
     let req = read(&tmp.path().join("requirements.txt"));
-    assert!(req.contains("socket-patch-hook"), "got:\n{req}");
+    assert!(req.contains("socket-patch[hook]"), "got:\n{req}");
     assert!(req.contains("requests==2.31.0"), "must preserve existing deps");
 
     // The committed dependency is the source of truth — no separate marker file.
@@ -72,7 +72,7 @@ fn uv_pyproject_array_edited_and_format_preserved() {
     assert_eq!(v["pythonPackageManager"], "uv");
 
     let py = read(&tmp.path().join("pyproject.toml"));
-    assert!(py.contains("socket-patch-hook"));
+    assert!(py.contains("socket-patch[hook]"));
     assert!(py.contains("[tool.uv]"), "unrelated tables preserved");
     assert!(py.contains("name = \"x\""));
 }
@@ -88,7 +88,7 @@ fn idempotent_second_run_reports_already_configured() {
     assert_eq!(v["status"], "already_configured");
     let req = read(&tmp.path().join("requirements.txt"));
     assert_eq!(
-        req.matches("socket-patch-hook").count(),
+        req.matches("socket-patch[hook]").count(),
         1,
         "must not duplicate the hook dependency"
     );
@@ -120,7 +120,7 @@ fn remove_reverses_dep() {
     let (code, v) = run_setup(tmp.path(), &["--remove"]);
     assert_eq!(code, 0, "payload={v}");
     let req = read(&tmp.path().join("requirements.txt"));
-    assert!(!req.contains("socket-patch-hook"), "got:\n{req}");
+    assert!(!req.contains("socket-patch[hook]"), "got:\n{req}");
     assert!(req.contains("requests"));
 }
 
@@ -149,7 +149,7 @@ fn polyglot_configures_both_npm_and_python() {
     assert!(kinds.contains(&"pth"));
 
     assert!(read(&tmp.path().join("package.json")).contains("socket-patch"));
-    assert!(read(&tmp.path().join("pyproject.toml")).contains("socket-patch-hook"));
+    assert!(read(&tmp.path().join("pyproject.toml")).contains("socket-patch[hook]"));
 }
 
 #[test]
