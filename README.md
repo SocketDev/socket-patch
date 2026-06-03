@@ -383,18 +383,44 @@ socket-patch repair --json
 
 ### `setup`
 
-Configure `package.json` postinstall scripts to automatically apply patches after `npm install`.
+Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
+
+- **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches.
+- **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
 
 **Usage:**
 ```bash
-socket-patch setup [options]
+socket-patch setup            # configure (interactive)
+socket-patch setup --check    # verify configured; non-zero exit if not (CI gate)
+socket-patch setup --remove   # revert what setup added
 ```
 
-No command-specific options — see [Global Options](#global-options) (`--dry-run`, `--yes`, `--json`, `--cwd` are the relevant ones).
+**Command-specific options** (plus all [Global Options](#global-options) — `--dry-run`, `--yes`, `--json`, `--cwd`):
+| Flag | Description |
+|------|-------------|
+| `--check` | Read-only verification that every manifest is configured; exits non-zero if any still needs setup. Never writes (safe in CI). Conflicts with `--remove`. |
+| `--remove` | Revert the install hooks `setup` added (npm `package.json` scripts and the Python `socket-patch[hook]` dependency). |
+
+#### Disabling / opting out (Python hook)
+
+The Python hook is designed to be easy to skip or remove:
+
+- **Per interpreter / CI step:** set `SOCKET_PATCH_HOOK=off` (or `SOCKET_NO_HOOK=1`). This is checked *before any hook code runs*, so it fully bypasses the hook for that process.
+- **Remove from a project:** `socket-patch setup --remove`, then `pip uninstall socket-patch-hook`.
+- **Never opted in:** if you don't run `setup`, there is no hook — it is opt-in by design.
+
+#### What the Python hook does, and its safety model
+
+On interpreter startup, *only when the set of installed packages changed*, the hook runs `socket-patch apply --offline --ecosystems pypi` for the project that owns the current virtualenv, re-applying only the patches committed in that project's `.socket/`. Specifically:
+
+- It is **anchored to the virtualenv** it is installed in (not the working directory), so a `python` started from an unrelated directory cannot pull in a foreign `.socket/manifest.json`.
+- It **verifies each file's hash before patching** and **never writes outside the installed package directory** (path-escaping manifest keys are refused).
+- It resolves the `socket-patch` binary from the **installed `socket-patch` package** (not from `PATH`), so an unexpected binary on `PATH` is not executed.
+- It runs **offline** (no network at startup) and is **fail-open** (any error is swallowed; it can never abort the interpreter).
 
 **Examples:**
 ```bash
-# Interactive setup
+# Interactive setup (npm and/or Python, auto-detected)
 socket-patch setup
 
 # Non-interactive
@@ -402,6 +428,9 @@ socket-patch setup -y
 
 # Preview changes
 socket-patch setup --dry-run
+
+# Verify configuration in CI (exits non-zero if not set up)
+socket-patch setup --check
 
 # JSON output for scripting
 socket-patch setup --json -y

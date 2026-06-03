@@ -62,25 +62,35 @@ def _site_packages_dir():
 
 
 def _find_project_root():
-    """Locate the directory containing ``.socket/manifest.json``.
+    """Locate the project whose committed ``.socket/manifest.json`` this
+    environment opted into. Returns ``None`` (hook no-ops) if none is found.
 
-    Tries, in order: an upward walk from the current working directory, then the
-    parents of ``VIRTUAL_ENV`` and ``sys.prefix`` (covering the common deploy
-    shape where the venv lives at ``<project>/.venv``). Returns ``None`` when no
-    committed manifest is found -- in which case the hook is a no-op, so a wheel
-    that happens to be installed in an unrelated environment does nothing.
+    SECURITY — which manifest do we trust? When running inside a virtualenv we
+    anchor the search to the **venv** (``sys.prefix``), NOT the current working
+    directory: the committed ``socket-patch[hook]`` dependency installed this
+    hook into THIS venv, so the owning project is an ancestor of the venv (e.g.
+    ``<project>/.venv``). Anchoring to the venv ties the patches we apply to the
+    project that opted in, instead of whatever ``.socket/`` happens to sit above
+    the cwd — which could belong to an unrelated or hostile parent/sibling
+    project (a `python` started from elsewhere must not pull in a foreign
+    manifest). Only when there is no venv (a system / container interpreter,
+    where there is nothing to anchor to) do we fall back to the cwd.
     """
-    starts = []
-    try:
-        starts.append(os.getcwd())
-    except OSError:
-        pass
-    for env_dir in (os.environ.get("VIRTUAL_ENV"), getattr(sys, "prefix", None)):
-        if env_dir:
-            starts.append(os.path.dirname(os.path.abspath(env_dir)))
+    in_venv = getattr(sys, "prefix", "") != getattr(sys, "base_prefix", getattr(sys, "prefix", ""))
+    anchors = []
+    if in_venv:
+        anchors.append(sys.prefix)
+        env_venv = os.environ.get("VIRTUAL_ENV")
+        if env_venv:
+            anchors.append(env_venv)
+    else:
+        try:
+            anchors.append(os.getcwd())
+        except OSError:
+            pass
 
     seen = set()
-    for start in starts:
+    for start in anchors:
         try:
             d = os.path.abspath(start)
         except OSError:
@@ -177,22 +187,16 @@ def _write_stamp(path, value):
 
 
 def _resolve_binary():
-    """Locate the ``socket-patch`` binary, version-agnostically.
+    """Locate the ``socket-patch`` binary to run.
 
-    Prefers whatever ``socket-patch`` is on ``PATH`` (a pip/pipx/system/GitHub
-    Action-provisioned CLI), then falls back to the binary bundled in a
-    pip-installed ``socket_patch`` package if one happens to be in the env. The
-    hook does not depend on the CLI, so either may be absent — in which case we
-    return ``None`` and the hook no-ops.
+    SECURITY — order matters. We prefer the binary **bundled in the installed
+    ``socket_patch`` package** (the one `socket-patch[hook]` pulls in: a
+    RECORD-tracked file resolved by the dependency solver) and only fall back to
+    ``PATH`` if that package isn't present. Resolving via ``PATH`` first would
+    let a malicious ``socket-patch`` placed earlier on ``PATH`` (or `.` on PATH)
+    be executed at every interpreter startup. Returns ``None`` if neither is
+    found, in which case the hook no-ops.
     """
-    try:
-        import shutil
-
-        found = shutil.which("socket-patch")
-        if found:
-            return found
-    except Exception:
-        pass
     try:
         import socket_patch
 
@@ -203,7 +207,12 @@ def _resolve_binary():
                 return path
     except Exception:
         pass
-    return None
+    try:
+        import shutil
+
+        return shutil.which("socket-patch")
+    except Exception:
+        return None
 
 
 def _apply(binary, project_root):

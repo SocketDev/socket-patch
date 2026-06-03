@@ -117,6 +117,28 @@ pub fn normalize_file_path(file_name: &str) -> &str {
     }
 }
 
+/// True if a (post-`normalize_file_path`) manifest key is a safe relative path
+/// that stays inside the package directory when joined to it.
+///
+/// SECURITY: manifest file keys come from a committed `.socket/manifest.json`,
+/// which the auto-running install hook applies without explicit user action. An
+/// unvalidated key like `../../home/u/.bashrc` or `/etc/cron.d/x` would let a
+/// poisoned manifest write OUTSIDE site-packages (arbitrary-file write → code
+/// execution) via `pkg_path.join(key)` — `Path::join` discards the base on an
+/// absolute key, and `..` components walk out. We reject anything that isn't a
+/// plain relative path (no absolute/root/prefix components, no `..`, no NUL).
+pub fn is_safe_relative_subpath(normalized: &str) -> bool {
+    use std::path::Component;
+    if normalized.is_empty() || normalized.contains('\0') {
+        return false;
+    }
+    let path = Path::new(normalized);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Verify a single file can be patched.
 pub async fn verify_file_patch(
     pkg_path: &Path,
@@ -124,6 +146,17 @@ pub async fn verify_file_patch(
     file_info: &PatchFileInfo,
 ) -> VerifyResult {
     let normalized = normalize_file_path(file_name);
+    // SECURITY: never resolve a key that escapes the package directory.
+    if !is_safe_relative_subpath(normalized) {
+        return VerifyResult {
+            file: file_name.to_string(),
+            status: VerifyStatus::NotFound,
+            message: Some("Unsafe patch path (escapes package directory)".to_string()),
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        };
+    }
     let filepath = pkg_path.join(normalized);
 
     let is_new_file = file_info.before_hash.is_empty();
@@ -297,6 +330,13 @@ pub async fn apply_file_patch(
     expected_hash: &str,
 ) -> Result<(), std::io::Error> {
     let normalized = normalize_file_path(file_name);
+    // SECURITY: refuse to write through a key that escapes the package dir.
+    if !is_safe_relative_subpath(normalized) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unsafe patch path (escapes package directory): {file_name}"),
+        ));
+    }
     let filepath = pkg_path.join(normalized);
 
     // Hash-check the in-memory content BEFORE touching disk. Removes
@@ -608,6 +648,18 @@ pub async fn apply_package_patch(
 
     // First, verify all files
     for (file_name, file_info) in files {
+        // SECURITY: reject any manifest key that would escape the package dir
+        // (absolute path or `..`). Abort the whole package apply before any
+        // disk write — NOT skippable by `--force`, since a path escape is never
+        // a legitimate patch target.
+        if !is_safe_relative_subpath(normalize_file_path(file_name)) {
+            result.success = false;
+            result.error = Some(format!(
+                "Refusing patch with unsafe file path (escapes package directory): {file_name}"
+            ));
+            return result;
+        }
+
         let mut verify_result = verify_file_patch(pkg_path, file_name, file_info).await;
 
         if verify_result.status != VerifyStatus::Ready
@@ -946,6 +998,64 @@ mod tests {
             normalize_file_path("packagefoo/bar.js"),
             "packagefoo/bar.js"
         );
+    }
+
+    #[test]
+    fn test_is_safe_relative_subpath() {
+        // Legitimate manifest keys (post-normalize) are accepted.
+        for ok in [
+            "six.py",
+            "index.js",
+            "lib/server.js",
+            "pydantic_ai/models/openai.py",
+            "./a.py",
+        ] {
+            assert!(is_safe_relative_subpath(ok), "should accept {ok:?}");
+        }
+        // Path escapes are rejected on every platform.
+        for bad in [
+            "../etc/passwd",
+            "../../home/u/.bashrc",
+            "/etc/passwd",
+            "a/../../b",
+            "foo/..",
+            "",
+            "with\0null",
+            "/",
+        ] {
+            assert!(!is_safe_relative_subpath(bad), "should reject {bad:?}");
+        }
+        // Windows drive/UNC prefixes are absolute only on Windows (on Unix a
+        // backslash is an ordinary filename char, so the path stays under the
+        // package dir and is harmless).
+        #[cfg(windows)]
+        for bad in ["\\\\server\\share\\x", "C:\\Windows\\x"] {
+            assert!(!is_safe_relative_subpath(bad), "should reject {bad:?}");
+        }
+        // The `package/`-prefixed escape that previously slipped through:
+        // `package//etc/passwd` normalizes to `/etc/passwd`.
+        assert!(!is_safe_relative_subpath(normalize_file_path("package//etc/passwd")));
+    }
+
+    #[tokio::test]
+    async fn test_apply_file_patch_rejects_escaping_path() {
+        // apply_file_patch must refuse to write outside the package dir even if
+        // the (attacker-chosen) content hashes to the declared afterHash.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("site-packages");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        let content = b"pwned\n";
+        let after = compute_git_sha256_from_bytes(content);
+        for key in ["../escape.txt", "../../etc/whatever", "/abs/whatever"] {
+            let res = apply_file_patch(&pkg, key, content, &after).await;
+            assert!(res.is_err(), "must reject {key:?}");
+            assert!(
+                res.unwrap_err().to_string().contains("Unsafe patch path"),
+                "wrong error for {key:?}"
+            );
+        }
+        // Nothing was written outside the package dir.
+        assert!(!dir.path().join("escape.txt").exists());
     }
 
     #[tokio::test]

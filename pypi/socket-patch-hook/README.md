@@ -20,6 +20,25 @@ real patching (hash verification, atomic writes, locking) is done by the
 Because it rides on Python's interpreter-startup `.pth` mechanism (not on any
 one installer's hooks), it works the same under every Python package manager.
 
+## Safety
+
+A `.pth` that runs code at startup deserves a careful safety model. This one:
+
+- **Fail-open** — every code path is wrapped so it can never raise into the
+  interpreter; the worst outcome of any bug is that patches aren't re-applied.
+- **Venv-anchored** — it applies only the `.socket/manifest.json` of the project
+  that owns the virtualenv it's installed in, never whatever `.socket/` happens
+  to sit above the current working directory.
+- **Hash-verified, in-tree only** — the underlying `socket-patch apply` verifies
+  each file's hash before patching and refuses manifest keys that would write
+  outside the installed package directory.
+- **Trusted binary** — it runs the `socket-patch` binary from the installed
+  `socket-patch` package, not the first one found on `PATH`.
+- **Offline + cheap** — no network at startup; the no-change path is a couple of
+  syscalls. It only spawns `socket-patch` when installed packages changed.
+- **Opt-in + easy off** — present only when a project committed it; disable any
+  interpreter with `SOCKET_PATCH_HOOK=off`.
+
 ## Activating it
 
 Don't add this by hand. Run, in your project:
