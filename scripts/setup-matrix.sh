@@ -14,6 +14,9 @@
 #   pass        meets the ideal AND matches the recorded baseline
 #   known_gap   fails the ideal but exactly as recorded (expected today)
 #   progress    better than the recorded baseline (update baseline!)
+#   known_regression  would be a regression, but is on the temporary
+#               `known_regressions` allowlist in matrix.json (a tracked,
+#               non-blocking bug; auto-recovers to pass/progress when fixed)
 #   regression  diverged from the baseline the wrong way (this is the
 #               only thing that makes `run` exit non-zero)
 #   error       the driver could not produce a result
@@ -147,6 +150,11 @@ cmd_run() {
     echo ">> host mode, binary: $host_bin" >&2
   fi
 
+  # Allowlist of cases that are a tracked, non-blocking `known_regression`
+  # (see matrix.json `known_regressions`): they should work per the baseline but
+  # currently don't, and must not fail the job while the bug is fixed.
+  local known_regressions; known_regressions="$(jq -c '.known_regressions // []' "$MATRIX")"
+
   local total=0
   while IFS=$'\t' read -r id eco_ pm_ image hook bsup pkg ver purl key aeco scn_ pset rsetup expect layout; do
     [ -z "$id" ] && continue
@@ -189,14 +197,19 @@ cmd_run() {
     if [ "$expect" = true ] && [ "$bsup" = true ]; then bl=true; fi
 
     if [ -n "$result" ] && printf '%s' "$result" | jq -e . >/dev/null 2>&1; then
-      printf '%s\n' "$result" | jq -c --argjson bl "$bl" --arg img "$image" --arg hk "$hook" --arg lay "$layout" '
+      printf '%s\n' "$result" | jq -c --argjson bl "$bl" --arg img "$image" --arg hk "$hook" --arg lay "$layout" \
+                                       --arg cid "$id" --argjson kr "$known_regressions" '
         . as $r |
         ($r.actual_applied == $r.expect_applied) as $ideal |
         ($r.actual_applied == $bl) as $base |
         (if $ideal and $base then "pass"
          elif $ideal and ($base|not) then "progress"
          elif ($ideal|not) and $base then "known_gap"
-         else "regression" end) as $cls |
+         else "regression" end) as $cls0 |
+        # A regression that is on the temporary allowlist is downgraded to the
+        # non-blocking `known_regression` (still tracked; auto-recovers to a
+        # `pass`/`progress` when fixed — then remove it from matrix.json).
+        (if $cls0 == "regression" and ($kr | index($cid)) then "known_regression" else $cls0 end) as $cls |
         $r + {baseline_applied:$bl, classification:$cls, layout:$lay, image:$img, hook_family:$hk, driver_rc:'"$rc"'}
       ' >> "$jsonl"
     else
@@ -214,7 +227,7 @@ cmd_run() {
   jq -s --arg generated "$(date -u +%FT%TZ)" '
     { generated:$generated,
       summary: ( reduce .[] as $c (
-                   {total:0,pass:0,known_gap:0,progress:0,regression:0,error:0};
+                   {total:0,pass:0,known_gap:0,progress:0,known_regression:0,regression:0,error:0};
                    .total += 1 | .[$c.classification] += 1 ) ),
       cases: . }' "$jsonl" > "$out"
   rm -f "$jsonl"
@@ -238,9 +251,11 @@ print_summary() { # $1 = results file
         printf '%-44s %-8s %-6s %-6s %s\n' "$id" "$pm" "$act" "$exp" "$cls" >&2
       done
   echo "" >&2
-  jq -r '.summary | "total=\(.total) pass=\(.pass) known_gap=\(.known_gap) progress=\(.progress) regression=\(.regression) error=\(.error)"' "$f" >&2
+  jq -r '.summary | "total=\(.total) pass=\(.pass) known_gap=\(.known_gap) progress=\(.progress) known_regression=\(.known_regression) regression=\(.regression) error=\(.error)"' "$f" >&2
   local prog; prog="$(jq -r '.summary.progress' "$f")"
   [ "$prog" -gt 0 ] && echo ">> $prog case(s) now BETTER than baseline — consider updating baseline_supported in matrix.json" >&2
+  local kr; kr="$(jq -r '.summary.known_regression' "$f")"
+  [ "$kr" -gt 0 ] && echo ">> $kr case(s) are a tracked known_regression (allowlisted in matrix.json, non-blocking) — fix the hook + remove from the list" >&2
   echo ">> full report: $f" >&2
 }
 

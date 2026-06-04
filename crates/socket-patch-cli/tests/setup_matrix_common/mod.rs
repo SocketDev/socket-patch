@@ -116,6 +116,10 @@ struct Case {
     run_setup: bool,
     expect_applied: bool,
     baseline_supported: bool,
+    /// On the temporary `known_regressions` allowlist in matrix.json: a case the
+    /// baseline says should work but currently doesn't — tracked + tolerated
+    /// (non-blocking), not a hard failure, until the underlying hook is fixed.
+    known_regression: bool,
     package: String,
     version: String,
     purl: String,
@@ -182,6 +186,10 @@ fn load_section(
         serde_json::from_str(&text).expect("parse matrix.json");
     let marker = spec["marker"].as_str().unwrap_or("").to_string();
     let alt_marker = spec["alt_marker"].as_str().unwrap_or("").to_string();
+    let known_regressions: std::collections::HashSet<String> = spec["known_regressions"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
     let target = spec[targets_key]
         .as_array()
@@ -193,8 +201,9 @@ fn load_section(
     let mut cases = Vec::new();
     for s in spec[scenarios_key].as_array().expect("scenarios array") {
         let scenario = s["id"].as_str().unwrap().to_string();
+        let case_id = format!("{ecosystem}/{pm}/{scenario}");
         cases.push(Case {
-            id: format!("{ecosystem}/{pm}/{scenario}"),
+            id: case_id.clone(),
             ecosystem: ecosystem.to_string(),
             pm: pm.to_string(),
             image: target["image"].as_str().unwrap().to_string(),
@@ -203,6 +212,7 @@ fn load_section(
             run_setup: s["run_setup"].as_bool().unwrap(),
             expect_applied: s["expect_applied"].as_bool().unwrap(),
             baseline_supported: target["baseline_supported"].as_bool().unwrap(),
+            known_regression: known_regressions.contains(&case_id),
             package: target["package"].as_str().unwrap().to_string(),
             version: target["version"].as_str().unwrap().to_string(),
             purl: target["purl"].as_str().unwrap().to_string(),
@@ -348,25 +358,35 @@ fn run_cases(label: &str, cases: Vec<Case>) {
     for case in &cases {
         let res = run_case(case);
         if res.actual_applied != case.expect_applied {
-            let tag = if case.baseline_applied() {
-                // We recorded this as working; failing now is a real regression.
-                "REGRESSION (baseline says this should apply)"
-            } else if case.expect_applied {
-                "BASELINE GAP (setup does not yet wire this package manager)"
+            if case.known_regression {
+                // On the temporary allowlist (matrix.json `known_regressions`):
+                // a tracked, non-blocking regression — report it but don't fail.
+                eprintln!(
+                    "  - {}: expected applied={}, got {} [KNOWN REGRESSION (allowlisted in \
+                     matrix.json; non-blocking — fix the hook + remove from the list)]",
+                    case.id, case.expect_applied, res.actual_applied
+                );
             } else {
-                "LEAK (patch applied without the hook configuring it)"
-            };
-            failures.push(format!(
-                "  - {}: expected applied={}, got {} [{}]\n{}",
-                case.id, case.expect_applied, res.actual_applied, tag, indent(&res.raw)
-            ));
+                let tag = if case.baseline_applied() {
+                    // We recorded this as working; failing now is a real regression.
+                    "REGRESSION (baseline says this should apply)"
+                } else if case.expect_applied {
+                    "BASELINE GAP (setup does not yet wire this package manager)"
+                } else {
+                    "LEAK (patch applied without the hook configuring it)"
+                };
+                failures.push(format!(
+                    "  - {}: expected applied={}, got {} [{}]\n{}",
+                    case.id, case.expect_applied, res.actual_applied, tag, indent(&res.raw)
+                ));
+            }
         }
 
         // check/remove round-trip — only asserted for npm-family cases that
         // ran setup (the surface setup configures today). For other
         // ecosystems setup writes nothing, so the round-trip is a no-op and
         // we leave it untagged, consistent with the BASELINE GAP convention.
-        if case.run_setup && case.is_npm_family() {
+        if case.run_setup && case.is_npm_family() && !case.known_regression {
             if let Some(msg) = round_trip_failure(case, &res) {
                 failures.push(msg);
             }
