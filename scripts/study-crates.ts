@@ -1,11 +1,15 @@
 #!/usr/bin/env -S npx tsx
 /**
- * study-crates.ts — drive `claude` once per non-test source file in each crate.
+ * study-crates.ts — drive `claude` once per file in each crate.
  *
- * For every `crates/*\/src/**\/*.rs` file, this spawns a non-interactive Claude
- * Code session with a configurable prompt, streams its output live to stdout,
- * logs incremental progress, and aggregates every session's final result into a
- * single `SUMMARY.md` (plus raw stream logs per file).
+ * By default it walks every `crates/*\/src/**\/*.rs` source file. With
+ * `--target tests` (or `--tests`) it instead walks every `crates/*\/tests/**\/*.rs`
+ * file — integration tests, test harnesses, and shared setup modules
+ * (e.g. `tests/common/mod.rs`). `--target all` does both. For each discovered
+ * file it spawns a non-interactive Claude Code session with a configurable
+ * prompt, streams its output live to stdout, logs incremental progress, and
+ * aggregates every session's final result into a single `SUMMARY.md` (plus raw
+ * stream logs per file).
  *
  * Each session runs with `--dangerously-skip-permissions` and full autonomy
  * (Claude may read/edit code, run commands, etc.). Sessions run sequentially by
@@ -28,6 +32,10 @@
  *   # Fully programmatic prompt via a TS module:
  *   npx tsx scripts/study-crates.ts --prompt-file scripts/study-crates.config.example.ts
  *
+ *   # Audit every test file/harness one at a time for reward-hacked tests:
+ *   npx tsx scripts/study-crates.ts --tests \
+ *     --prompt-file scripts/harden-tests.config.ts
+ *
  * Options:
  *   -p, --prompt <template>   Prompt template string. Placeholders: {file},
  *                             {abspath}, {crate}, {name}, {stem}, {relInCrate}.
@@ -38,6 +46,10 @@
  *   --model <model>           Model passed to claude --model.
  *   --filter <regex>          Only files whose repo-relative path matches.
  *   --crate <name>            Limit to a single crate dir name.
+ *   --target <src|tests|all>  Which files to study (default: src). `tests`
+ *                             walks each crate's tests/ dir (integration tests,
+ *                             harnesses, shared setup modules); `all` does both.
+ *   --tests                   Shorthand for --target tests.
  *   --concurrency <n>         Parallel sessions (default: 1 = sequential).
  *   --timeout <sec>           Per-file timeout in seconds (default: 1800).
  *   --dry-run                 List files + rendered prompts; run nothing.
@@ -74,9 +86,22 @@ export interface FileCtx {
   name: string;
   /** Basename without extension, e.g. "lib". */
   stem: string;
-  /** Path relative to the crate's src dir, e.g. "api/client.rs". */
+  /**
+   * Path relative to the crate root dir the file was discovered under
+   * (its `src/` dir for source files, its `tests/` dir for test files),
+   * e.g. "api/client.rs" or "common/mod.rs".
+   */
   relInCrate: string;
+  /**
+   * True when this file came from the crate's `tests/` directory
+   * (an integration test, test harness, or shared setup module) rather
+   * than from `src/`. Prompt renderers can branch on this.
+   */
+  isTest: boolean;
 }
+
+/** Which files study-crates discovers and feeds to claude. */
+export type StudyTarget = "src" | "tests" | "all";
 
 type PromptRenderer = (ctx: FileCtx) => string;
 
@@ -124,6 +149,7 @@ interface Args {
   model?: string;
   filter?: string;
   crate?: string;
+  target: StudyTarget;
   concurrency: number;
   timeoutSec: number;
   dryRun: boolean;
@@ -133,6 +159,7 @@ interface Args {
 function parseArgs(argv: string[]): Args {
   const a: Args = {
     out: "study-output",
+    target: "src",
     concurrency: 1,
     timeoutSec: 1800,
     dryRun: false,
@@ -164,6 +191,18 @@ function parseArgs(argv: string[]): Args {
         break;
       case "--crate":
         a.crate = next();
+        break;
+      case "--target": {
+        const v = next();
+        if (v !== "src" && v !== "tests" && v !== "all") {
+          fail(`--target must be one of: src, tests, all (got "${v}")`);
+        }
+        a.target = v;
+        break;
+      }
+      case "--tests":
+        // Convenience shorthand for `--target tests`.
+        a.target = "tests";
         break;
       case "--concurrency":
         a.concurrency = Math.max(1, parseInt(next(), 10) || 1);
@@ -201,6 +240,13 @@ Usage: npx tsx scripts/study-crates.ts [options]
   --model <model>           Model passed to claude --model.
   --filter <regex>          Only files whose repo-relative path matches.
   --crate <name>            Limit to a single crate dir name.
+  --target <src|tests|all>  Which files to study (default: src).
+                            src   = non-test source under each crate's src/.
+                            tests = integration tests, test harnesses, and
+                                    shared setup modules under each crate's
+                                    tests/ dir.
+                            all   = both src and tests.
+  --tests                   Shorthand for --target tests.
   --concurrency <n>         Parallel sessions (default: 1).
   --timeout <sec>           Per-file timeout in seconds (default: 1800).
   --dry-run                 List files + rendered prompts; run nothing.
@@ -233,32 +279,45 @@ function discoverFiles(args: Args): FileCtx[] {
   const filterRe = args.filter ? new RegExp(args.filter) : undefined;
   const files: FileCtx[] = [];
 
+  // Each crate root we scan, tagged with whether its files are tests. `relInCrate`
+  // is taken relative to the root dir, so it stays meaningful in both modes.
+  const roots: Array<{ subdir: string; isTest: boolean }> = [];
+  if (args.target === "src" || args.target === "all") {
+    roots.push({ subdir: "src", isTest: false });
+  }
+  if (args.target === "tests" || args.target === "all") {
+    roots.push({ subdir: "tests", isTest: true });
+  }
+
   for (const crate of crates) {
-    const srcDir = join(CRATES_DIR, crate, "src");
-    let exists = false;
-    try {
-      exists = statSync(srcDir).isDirectory();
-    } catch {
-      exists = false;
-    }
-    if (!exists) continue;
+    for (const root of roots) {
+      const rootDir = join(CRATES_DIR, crate, root.subdir);
+      let exists = false;
+      try {
+        exists = statSync(rootDir).isDirectory();
+      } catch {
+        exists = false;
+      }
+      if (!exists) continue;
 
-    const abs: string[] = [];
-    walkRs(srcDir, abs);
-    abs.sort();
+      const abs: string[] = [];
+      walkRs(rootDir, abs);
+      abs.sort();
 
-    for (const abspath of abs) {
-      const file = relative(REPO_ROOT, abspath).split("\\").join("/");
-      if (filterRe && !filterRe.test(file)) continue;
-      const name = basename(abspath);
-      files.push({
-        file,
-        abspath,
-        crate,
-        name,
-        stem: name.replace(/\.rs$/, ""),
-        relInCrate: relative(srcDir, abspath).split("\\").join("/"),
-      });
+      for (const abspath of abs) {
+        const file = relative(REPO_ROOT, abspath).split("\\").join("/");
+        if (filterRe && !filterRe.test(file)) continue;
+        const name = basename(abspath);
+        files.push({
+          file,
+          abspath,
+          crate,
+          name,
+          stem: name.replace(/\.rs$/, ""),
+          relInCrate: relative(rootDir, abspath).split("\\").join("/"),
+          isTest: root.isTest,
+        });
+      }
     }
   }
   return files;
@@ -492,9 +551,15 @@ function writeSummary(
   const totalMs = results.reduce((s, r) => s + r.durationMs, 0);
 
   const lines: string[] = [];
-  lines.push("# Crate Source Study");
+  const title =
+    args.target === "tests"
+      ? "Crate Test Study"
+      : args.target === "all"
+        ? "Crate Source + Test Study"
+        : "Crate Source Study";
+  lines.push(`# ${title}`);
   lines.push("");
-  lines.push(`Generated by \`scripts/study-crates.ts\`.`);
+  lines.push(`Generated by \`scripts/study-crates.ts\` (target: ${args.target}).`);
   lines.push("");
   lines.push("## Totals");
   lines.push("");
@@ -565,7 +630,13 @@ async function main(): Promise<void> {
   const renderer = await loadRenderer(args);
 
   if (args.dryRun) {
-    console.log(`Discovered ${files.length} non-test source file(s):\n`);
+    const label =
+      args.target === "tests"
+        ? "test"
+        : args.target === "all"
+          ? "source + test"
+          : "non-test source";
+    console.log(`Discovered ${files.length} ${label} file(s):\n`);
     for (const ctx of files) {
       console.log(`• ${ctx.file}`);
       const prompt = renderer(ctx);
