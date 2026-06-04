@@ -27,7 +27,10 @@ fs2 = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+# `cargo` is a default feature (npm + PyPI are unconditional). Mirror the CLI's
+# defaults so a plain `cargo build` of the workspace ships cargo support; other
+# ecosystems stay opt-in.
+default = ["cargo"]
 cargo = []
 golang = []
 maven = []

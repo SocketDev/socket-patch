@@ -1,4 +1,6 @@
 pub mod api;
+#[cfg(feature = "cargo")]
+pub mod cargo_setup;
 pub mod constants;
 pub mod crawlers;
 pub mod hash;

@@ -37,6 +37,87 @@ struct PatchToRollback {
     patch: PatchRecord,
 }
 
+// ── local-cargo redirect helpers ─────────────────────────────────────────────
+// Local cargo rolls back by dropping the project-local `[patch]` redirect +
+// patched copy (no in-place restore, no before-blob). Inert stubs in a build
+// without the `cargo` feature.
+
+/// True for a cargo PURL in local mode (no `--global` / `--global-prefix`).
+#[cfg(feature = "cargo")]
+fn is_local_cargo(purl: &str, common: &GlobalArgs) -> bool {
+    use socket_patch_core::crawlers::Ecosystem;
+    !common.global
+        && common.global_prefix.is_none()
+        && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
+}
+
+/// Copy of `manifest` with local-cargo PURLs removed — used for the
+/// before-blob gate, which those PURLs never need (redirect rollback reads no
+/// blobs). Avoids blocking an offline redirect rollback on absent blobs.
+#[cfg(feature = "cargo")]
+fn exclude_local_cargo(manifest: &PatchManifest, common: &GlobalArgs) -> PatchManifest {
+    PatchManifest {
+        patches: manifest
+            .patches
+            .iter()
+            .filter(|(purl, _)| !is_local_cargo(purl, common))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
+}
+
+#[cfg(not(feature = "cargo"))]
+fn exclude_local_cargo(manifest: &PatchManifest, _common: &GlobalArgs) -> PatchManifest {
+    manifest.clone()
+}
+
+/// Roll back a local-cargo redirect (drop the `[patch]` entry + copy), or
+/// `None` if `purl` isn't a local-cargo target (caller falls back to in-place
+/// rollback).
+#[cfg(feature = "cargo")]
+async fn try_rollback_local_cargo(
+    purl: &str,
+    pkg_path: &Path,
+    patch: &PatchRecord,
+    common: &GlobalArgs,
+) -> Option<RollbackResult> {
+    use socket_patch_core::patch::cargo_redirect::remove_cargo_redirect;
+    if !is_local_cargo(purl, common) {
+        return None;
+    }
+    // Only registry-cache crates use the redirect model; a vendored crate
+    // (under `<cwd>/vendor/`) was patched in place and rolls back in place.
+    // The crawler searches `vendor/` exclusively when it exists, so a path
+    // under it is the reliable "vendored" discriminator (mirrors apply).
+    if pkg_path.starts_with(common.cwd.join("vendor")) {
+        return None;
+    }
+    let mut result = RollbackResult {
+        package_key: purl.to_string(),
+        package_path: pkg_path.display().to_string(),
+        success: true,
+        files_verified: Vec::new(),
+        files_rolled_back: patch.files.keys().cloned().collect(),
+        error: None,
+    };
+    if let Err(e) = remove_cargo_redirect(purl, &common.cwd, common.dry_run).await {
+        result.success = false;
+        result.files_rolled_back.clear();
+        result.error = Some(e.to_string());
+    }
+    Some(result)
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn try_rollback_local_cargo(
+    _purl: &str,
+    _pkg_path: &Path,
+    _patch: &PatchRecord,
+    _common: &GlobalArgs,
+) -> Option<RollbackResult> {
+    None
+}
+
 fn find_patches_to_rollback(
     manifest: &PatchManifest,
     identifier: Option<&str>,
@@ -416,8 +497,12 @@ async fn rollback_patches_inner(
             .collect(),
     };
 
-    // Check for missing beforeHash blobs
-    let missing_blobs = get_missing_before_blobs(&filtered_manifest, &blobs_path).await;
+    // Check for missing beforeHash blobs. Local-cargo PURLs are excluded:
+    // their rollback just drops the `[patch]` redirect + copy and reads no
+    // blobs, so a missing before-blob must not block an offline redirect
+    // rollback.
+    let gate_manifest = exclude_local_cargo(&filtered_manifest, &args.common);
+    let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.common.offline {
             if !args.common.silent && !args.common.json {
@@ -535,14 +620,22 @@ async fn rollback_patches_inner(
                 None => continue,
             };
 
-            let result = rollback_package_patch(
-                purl,
-                pkg_path,
-                &patch.files,
-                &blobs_path,
-                args.common.dry_run,
-            )
-            .await;
+            // Local cargo drops the project-local redirect; everything else —
+            // npm/pypi, and cargo under --global — restores in place. In a
+            // build without the `cargo` feature this is an inert `None`.
+            let result = match try_rollback_local_cargo(purl, pkg_path, patch, &args.common).await {
+                Some(r) => r,
+                None => {
+                    rollback_package_patch(
+                        purl,
+                        pkg_path,
+                        &patch.files,
+                        &blobs_path,
+                        args.common.dry_run,
+                    )
+                    .await
+                }
+            };
 
             if !result.success {
                 has_errors = true;
