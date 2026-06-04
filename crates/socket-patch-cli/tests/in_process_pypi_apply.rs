@@ -322,6 +322,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         force: true,
+        check: false,
         vex: Default::default(),
     };
     let _ = apply_run(apply_args).await;

@@ -1,5 +1,9 @@
 pub mod apply;
 pub mod apply_lock;
+#[cfg(feature = "cargo")]
+pub mod cargo_config;
+#[cfg(feature = "cargo")]
+pub mod cargo_redirect;
 pub mod cow;
 pub mod diff;
 pub mod file_hash;

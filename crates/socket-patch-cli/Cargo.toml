@@ -28,7 +28,12 @@ regex = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+# Shipped defaults: npm + PyPI are always compiled in (no feature gate); `cargo`
+# is on by default so released binaries and `cargo install socket-patch-cli`
+# patch Rust deps and run the build-time guard out of the box. The remaining
+# ecosystems stay opt-in. Build `--no-default-features` for a minimal
+# (npm + PyPI only) binary — its `apply --check` then fails closed.
+default = ["cargo"]
 cargo = ["socket-patch-core/cargo"]
 golang = ["socket-patch-core/golang"]
 maven = ["socket-patch-core/maven"]
