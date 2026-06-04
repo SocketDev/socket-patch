@@ -2453,6 +2453,9 @@ dependencies = [
 [[package]]
 name = "socket-patch-guard"
 version = "3.3.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "socket2"

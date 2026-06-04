@@ -566,15 +566,23 @@ fn real_cargo_guard_fails_build_on_stale_patch() {
     );
     write_blob(&socket, &after_v2, &v2);
 
-    // Default (strict) guarded build → drift → FAIL (no stale artifact shipped).
+    // Guarded build with a stale committed patch → guard detects drift → build
+    // FAILS (fail-closed; no stale artifact shipped). This v2 patch is API-
+    // compatible, so the guard's heal reconciles it and the build fails with the
+    // RECOVERABLE message ("regenerated … re-run the build"); the v1→v2 mismatch
+    // is what makes the committed copy stale.
     let drift = cargo_run(&consumer, &["build", "--offline"], &env);
     let stderr = String::from_utf8_lossy(&drift.stderr);
     assert!(
         !drift.status.success(),
         "guarded build with a stale committed patch MUST fail (fail-closed).\nstderr:\n{stderr}"
     );
+    // Assert the SPECIFIC recoverable-drift message, not a generic substring:
+    // cargo's "failed to run custom build command for `socket-patch-guard …`"
+    // boilerplate contains "socket-patch" on ANY build-script failure, which
+    // would let this pass even if the guard failed for an unrelated reason.
     assert!(
-        stderr.contains("out of sync") || stderr.contains("socket-patch"),
-        "failure should carry the guard's drift message.\nstderr:\n{stderr}"
+        stderr.contains("regenerated") && stderr.to_lowercase().contains("re-run"),
+        "failure must carry the guard's recoverable-drift message.\nstderr:\n{stderr}"
     );
 }

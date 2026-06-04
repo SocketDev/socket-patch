@@ -8,6 +8,13 @@
 // deliberately avoided here because `include!` pastes this file mid-`build.rs`,
 // where inner docs are illegal. Keep it free of any I/O so it stays trivially
 // testable; `build.rs` performs the side effects.
+//
+// The guard has exactly ONE mode: fail-closed. It verifies the committed cargo
+// patches match the manifest (`apply --check`); on drift it tries to heal
+// (`apply`), then fails the build (the current build already compiled the stale
+// copy) — so a build never silently uses stale/unpatched sources. There is no
+// drift-tolerating `warn`/`off` mode: an unrecoverable state or a missing CLI
+// fails the build (an unconfigured project with no root is simply not guarded).
 
 /// What the guard should do, computed purely from environment values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +43,11 @@ pub fn plan(root: Option<&str>, bin: Option<&str>) -> Plan {
 
 /// The `cargo:` directives that make this build script re-run only when the
 /// dependency set (`Cargo.lock`) or patch set (`.socket/manifest.json`) under
-/// `root` changes (plus the env vars).
+/// `root` changes (plus the two env vars the guard reads).
 pub fn rerun_keys(root: &str) -> Vec<String> {
     vec![
         "cargo:rerun-if-env-changed=SOCKET_PATCH_ROOT".to_string(),
         "cargo:rerun-if-env-changed=SOCKET_PATCH_BIN".to_string(),
-        "cargo:rerun-if-env-changed=SOCKET_PATCH_GUARD".to_string(),
         format!("cargo:rerun-if-changed={root}/Cargo.lock"),
         format!("cargo:rerun-if-changed={root}/.socket/manifest.json"),
     ]
@@ -49,7 +55,7 @@ pub fn rerun_keys(root: &str) -> Vec<String> {
 
 /// Args for the read-only drift probe: `apply --check ...`. Exit 0 = the
 /// committed patched copies match the manifest (cargo is compiling correct
-/// patches); non-zero = drift (stale copy or a patch that silently fell back
+/// patches); non-zero = drift (stale copy, or a patch that silently fell back
 /// to an unpatched version). Read-only, lock-free, offline.
 pub fn check_args(root: &str) -> Vec<String> {
     vec![
@@ -63,9 +69,9 @@ pub fn check_args(root: &str) -> Vec<String> {
     ]
 }
 
-/// Args for the (warn-mode) heal: a real `apply` that regenerates the copies.
-/// `--offline`: cargo already downloaded the sources during resolution, and
-/// the patch artifacts are committed under `.socket/`.
+/// Args for the heal: a real `apply` that regenerates the copies to match the
+/// manifest. `--offline`: cargo already downloaded the sources during
+/// resolution, and the patch artifacts are committed under `.socket/`.
 pub fn apply_args(root: &str) -> Vec<String> {
     vec![
         "apply".to_string(),
@@ -77,90 +83,76 @@ pub fn apply_args(root: &str) -> Vec<String> {
     ]
 }
 
-/// How the guard reacts to drift / a missing binary. From `SOCKET_PATCH_GUARD`:
-/// unset/other = `Error` (fail-closed, the default), `warn` = heal + continue
-/// (accept a one-build lag), `off` = skip the guard entirely (loud).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuardMode {
-    Error,
-    Warn,
-    Off,
-}
-
-pub fn guard_mode(env: Option<&str>) -> GuardMode {
-    match env {
-        Some("off") => GuardMode::Off,
-        Some("warn") => GuardMode::Warn,
-        _ => GuardMode::Error,
-    }
-}
-
 /// Outcome of running the read-only `apply --check` probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckOutcome {
+pub enum Probe {
     /// `apply --check` exited 0: committed patches are in sync — cargo compiled
     /// correct, patched sources this build.
     InSync,
     /// `apply --check` exited non-zero: the committed copies cargo is compiling
     /// are stale, or a patched dependency resolved to an unpatched version.
     Drift,
-    /// The probe binary could not be spawned at all (carries the OS error).
-    ProbeFailed(String),
+    /// The probe couldn't run at all (e.g. the binary isn't on `PATH`); carries
+    /// the OS error text.
+    ProbeError(String),
 }
 
-/// What `build.rs` should do after the probe.
+/// What `build.rs` should do after the initial probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Build proceeds (correct patches were compiled).
     Proceed,
-    /// Regenerate via `apply`, emit `cargo:warning`, continue (warn mode).
-    HealAndWarn(String),
-    /// `cargo:warning` then continue (a softened skip).
-    Warn(String),
-    /// Panic — fail the build. Does NOT heal (no working-tree mutation in a
-    /// failed build).
+    /// Run `apply` to heal, then re-probe (see [`fail_message_after_heal`]).
+    Heal,
+    /// Panic — fail the build (fail-closed).
     Fail(String),
 }
 
-/// Map the probe outcome + mode to the build-script action.
-///
-/// Fail-closed by design: in the default (`Error`) mode a drift FAILS the build
-/// so a stale/unpatched artifact is never produced. `Warn` heals and continues
-/// (the pre-fix lazy behavior, with a one-build lag). A binary that can't be
-/// spawned fails in `Error` and warns in `Warn`. (`Off` is handled by the
-/// caller before probing; the catch-all keeps this total.)
-pub fn decide(check: &CheckOutcome, mode: GuardMode) -> Action {
-    match check {
-        CheckOutcome::InSync => Action::Proceed,
-        CheckOutcome::Drift => match mode {
-            GuardMode::Error => Action::Fail(
-                "socket-patch: the committed cargo patches under .socket/cargo-patches/ are \
-                 out of sync with .socket/manifest.json (a copy is stale, or a patched \
-                 dependency resolved to an unpatched version). This build was FAILED to \
-                 avoid compiling against stale/unpatched sources. Run \
-                 `socket-patch apply --ecosystems cargo`, commit the regenerated \
-                 .socket/cargo-patches/ + .cargo/config.toml, and rebuild. (Set \
-                 SOCKET_PATCH_GUARD=warn to heal-and-continue with a one-build lag.)"
-                    .to_string(),
-            ),
-            GuardMode::Warn => Action::HealAndWarn(
-                "socket-patch: cargo patches were out of sync and have been regenerated. \
-                 This build may have compiled against stale patches — re-run the build to \
-                 pick up the regenerated sources."
-                    .to_string(),
-            ),
-            GuardMode::Off => Action::Proceed,
-        },
-        CheckOutcome::ProbeFailed(err) => match mode {
-            GuardMode::Error => Action::Fail(format!(
-                "socket-patch: could not run `apply --check` ({err}); it is required to \
-                 verify cargo patches are in sync. Install the `socket-patch` binary, set \
-                 SOCKET_PATCH_BIN to its path, or set SOCKET_PATCH_GUARD=warn to bypass."
-            )),
-            GuardMode::Warn => Action::Warn(format!(
-                "socket-patch guard skipped: could not run the patch check ({err})"
-            )),
-            GuardMode::Off => Action::Proceed,
-        },
+/// Decide from the initial `apply --check`: in sync → proceed; drift → heal;
+/// the probe couldn't run → fail-closed (the CLI is required).
+pub fn decide_initial(probe: &Probe) -> Action {
+    match probe {
+        Probe::InSync => Action::Proceed,
+        Probe::Drift => Action::Heal,
+        Probe::ProbeError(err) => Action::Fail(probe_error_message(err)),
     }
+}
+
+/// The panic message after a heal + re-probe. The build always fails here (the
+/// current build already compiled the stale copy); the message differs by
+/// whether the heal reconciled the state:
+/// * re-probe in sync → the heal worked → "regenerated, re-run the build";
+/// * re-probe still drift → unrecoverable (e.g. a patched dep resolved to an
+///   unpatched version, or corrupt/missing data) → tell the user to inspect;
+/// * re-probe errored → the CLI stopped working mid-heal.
+pub fn fail_message_after_heal(reprobe: &Probe, detail: &str) -> String {
+    match reprobe {
+        Probe::InSync => "socket-patch: cargo patches were out of date and have been \
+             regenerated under .socket/cargo-patches/ to match .socket/manifest.json. \
+             Re-run the build to compile against the up-to-date patches (this build was \
+             failed to avoid using stale patches)."
+            .to_string(),
+        Probe::Drift => {
+            let mut msg = "socket-patch: cargo patches are out of sync and could NOT be \
+                 reconciled by `apply` — a patched dependency may have resolved to a version \
+                 the manifest does not patch, or the patch data/manifest is corrupt or \
+                 missing. Run `socket-patch apply --ecosystems cargo` and inspect."
+                .to_string();
+            let detail = detail.trim();
+            if !detail.is_empty() {
+                msg.push_str("\n  detail: ");
+                msg.push_str(detail);
+            }
+            msg
+        }
+        Probe::ProbeError(err) => probe_error_message(err),
+    }
+}
+
+fn probe_error_message(err: &str) -> String {
+    format!(
+        "socket-patch: could not run `apply --check` ({err}); the socket-patch CLI is \
+         required to verify cargo patches are in sync. Install it or set SOCKET_PATCH_BIN \
+         to its path."
+    )
 }

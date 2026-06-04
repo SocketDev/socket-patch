@@ -63,10 +63,11 @@ pip install socket-patch
 cargo install socket-patch-cli
 ```
 
-By default this builds with npm and PyPI support. For additional ecosystems:
+By default this builds with npm, PyPI, and Cargo support. For additional
+ecosystems:
 
 ```bash
-cargo install socket-patch-cli --features cargo,golang,maven,composer,nuget
+cargo install socket-patch-cli --features golang,maven,composer,nuget,deno
 ```
 
 ## Quick Start

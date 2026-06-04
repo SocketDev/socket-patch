@@ -12,3 +12,8 @@ readme = "README.md"
 # `[dependencies]` entry. Zero runtime dependencies — it links one tiny rlib
 # into the consumer's graph.
 [dependencies]
+
+# Test-only: the same-tick heal R&D experiment scaffolds a throwaway cargo
+# workspace. Dev-deps are excluded from the published crate.
+[dev-dependencies]
+tempfile = { workspace = true }

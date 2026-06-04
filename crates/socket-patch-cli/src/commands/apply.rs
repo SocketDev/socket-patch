@@ -263,9 +263,20 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
     let manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
-        // The caller already guarded manifest existence; treat anything else as
-        // "nothing to verify".
-        _ => return 0,
+        // The caller already confirmed the manifest file exists. `Ok(None)` means
+        // it vanished since (TOCTOU) → nothing to verify. An `Err` means it exists
+        // but is unreadable/corrupt: fail-closed (report drift) rather than
+        // silently passing — the guard treats exit 0 as "in sync".
+        Ok(None) => return 0,
+        Err(e) => {
+            if !args.common.silent && !args.common.json {
+                eprintln!(
+                    "Cargo patch redirect check could not read the manifest ({e}); \
+                     treating as drift (fail-closed)."
+                );
+            }
+            return 1;
+        }
     };
 
     let desired: HashSet<String> = if cargo_in_local_scope(&args.common) {
@@ -299,6 +310,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                         Drift::MissingCopy { purl }
                         | Drift::StaleCopy { purl, .. }
                         | Drift::MissingEntry { purl }
+                        | Drift::WrongEntryPath { purl, .. }
                         | Drift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
                         Drift::OrphanEntry { name } => name.clone(),
                     };
@@ -323,10 +335,21 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
 #[cfg(not(feature = "cargo"))]
 async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
+    // Fail-closed: `--check` is the cargo patch-redirect audit. A socket-patch
+    // built WITHOUT the `cargo` feature cannot verify those redirects, so it must
+    // NOT report "in sync" (exit 0). The build-time guard probes whatever
+    // `socket-patch` is on the build machine's PATH; if a feature-off binary
+    // answered 0 here, the guard would silently proceed against possibly
+    // stale/unpatched copies — defeating its whole purpose. Exit non-zero with a
+    // clear reason so the guard fails the build instead.
     if !args.common.silent && !args.common.json {
-        println!("`--check` verifies cargo patch redirects; this build has no cargo support.");
+        eprintln!(
+            "socket-patch: this build has no cargo support, so it cannot verify cargo \
+             patch redirects (`--check`). Install a socket-patch built with the `cargo` \
+             feature, or point SOCKET_PATCH_BIN at one."
+        );
     }
-    0
+    2
 }
 
 /// True when every file the engine verified for this package is already

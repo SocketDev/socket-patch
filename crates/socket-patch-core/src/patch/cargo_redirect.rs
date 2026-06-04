@@ -41,6 +41,16 @@ pub enum Drift {
     },
     /// No managed `[patch.crates-io]` entry exists for an in-scope PURL.
     MissingEntry { purl: String },
+    /// A socket-owned `[patch.crates-io]` entry exists but its `path` points at a
+    /// different version's copy than the manifest desires. cargo keys `[patch]` by
+    /// name (the version lives in the path), so the build would redirect to the
+    /// wrong/unused copy and silently link unpatched code while the copy-hash
+    /// checks pass.
+    WrongEntryPath {
+        purl: String,
+        expected: String,
+        found: Option<String>,
+    },
     /// A socket-owned `[patch.crates-io]` entry exists with no desired PURL.
     OrphanEntry { name: String },
     /// `Cargo.lock` resolved this crate to version(s) that do NOT include the
@@ -72,6 +82,16 @@ impl std::fmt::Display for Drift {
             Drift::MissingEntry { purl } => {
                 write!(f, "missing [patch.crates-io] entry for {purl}")
             }
+            Drift::WrongEntryPath {
+                purl,
+                expected,
+                found,
+            } => write!(
+                f,
+                "[patch.crates-io] entry for {purl} points at {} but should be {expected} \
+                 — cargo would redirect to the wrong copy and link the UNPATCHED crate",
+                found.as_deref().unwrap_or("<none>")
+            ),
             Drift::OrphanEntry { name } => {
                 write!(
                     f,
@@ -93,9 +113,11 @@ impl std::fmt::Display for Drift {
 }
 
 /// Parse `<root>/Cargo.lock` into `name -> {resolved versions}`. Returns `None`
-/// when the lockfile is absent/unreadable (the version cross-check is then
-/// skipped — e.g. libraries that don't commit a lockfile). Reads only the
-/// project lockfile: no registry, no network.
+/// when the lockfile is absent, unreadable, unparseable, or missing the
+/// `[[package]]` array — in every such case the version cross-check is skipped
+/// (a malformed lock would itself break a real `cargo build`, so this only
+/// affects an offline audit on a clone where cargo isn't invoked). Reads only
+/// the project lockfile: no registry, no network.
 async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String, HashSet<String>>> {
     let content = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
         .await
@@ -222,7 +244,7 @@ pub async fn apply_cargo_redirect(
         result.error = Some(format!("failed to update .cargo/config.toml: {e}"));
         return result;
     }
-    // [env] SOCKET_PATCH_ROOT is only needed by the runtime hook; best-effort.
+    // [env] SOCKET_PATCH_ROOT is only needed by the build-time guard; best-effort.
     let _ = cargo_config::ensure_env_root(project_root, false).await;
 
     result
@@ -353,6 +375,13 @@ pub async fn verify_cargo_redirect_state(
         // build links the unpatched crate — a silent-stale hole the copy/entry
         // checks below can't see. (A crate absent from the lock is harmless —
         // it isn't built — so we only flag a present-but-different resolution.)
+        //
+        // Known limitation: when the graph resolves the crate to MULTIPLE
+        // versions and the patched version is one of them, this passes — but any
+        // co-resolved *other* version still links the unpatched registry crate
+        // (cargo's single `[patch]` entry only redirects the matching version).
+        // We do not flag that, since duplicate-version graphs are common and
+        // patching only one version is often intentional.
         if let Some(versions) = locked.as_ref().and_then(|l| l.get(name)) {
             if !versions.contains(version) {
                 let mut locked_versions: Vec<String> = versions.iter().cloned().collect();
@@ -391,7 +420,22 @@ pub async fn verify_cargo_redirect_state(
         }
 
         match entries.get(name) {
-            Some(info) if info.socket_owned => {}
+            Some(info) if info.socket_owned => {
+                // The entry must also point at THIS version's copy. cargo keys
+                // `[patch]` by name (the version lives in the path), so a
+                // socket-owned entry left pointing at another version's copy
+                // (an aborted/partial apply, a bad merge, a hand-edit) silently
+                // redirects cargo to the wrong/unused copy while the copy-hash
+                // checks above pass. Mirror the apply hot path (`redirect_in_sync`).
+                let expected = expected_patch_path(name, version);
+                if info.path.as_deref() != Some(expected.as_str()) {
+                    drifts.push(Drift::WrongEntryPath {
+                        purl: purl.clone(),
+                        expected,
+                        found: info.path.clone(),
+                    });
+                }
+            }
             _ => drifts.push(Drift::MissingEntry { purl: purl.clone() }),
         }
     }
@@ -1027,6 +1071,68 @@ mod tests {
         assert!(verify_cargo_redirect_state(root, &manifest, &desired)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_flags_wrong_entry_path() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_cargo_redirect(
+            "pkg:cargo/cfg-if@1.0.0",
+            "cfg-if",
+            "1.0.0",
+            &pristine,
+            root,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:cargo/cfg-if@1.0.0".to_string(),
+            crate::manifest::schema::PatchRecord {
+                uuid: "u".into(),
+                exported_at: "t".into(),
+                files: files.clone(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let desired: HashSet<String> = ["pkg:cargo/cfg-if@1.0.0".to_string()].into_iter().collect();
+
+        // Clean → Ok.
+        assert!(verify_cargo_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
+
+        // Repoint the socket-owned entry at a DIFFERENT version's copy (e.g. a
+        // stale entry left by a version bump) while the 1.0.0 copy stays byte-
+        // correct. cargo keys `[patch]` by name, so this silently redirects to
+        // the wrong copy — verify must flag it, NOT pass as in-sync. (Mirrors the
+        // apply hot-path `redirect_in_sync` path check.)
+        cargo_config::ensure_patch_entry(root, "cfg-if", "9.9.9", false)
+            .await
+            .unwrap();
+        let drifts = verify_cargo_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(
+            drifts
+                .iter()
+                .any(|d| matches!(d, Drift::WrongEntryPath { .. })),
+            "stale entry path must be flagged as drift: {drifts:?}"
+        );
+        // It exists + is socket-owned, so it must NOT be reported missing.
+        assert!(!drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingEntry { .. })));
     }
 
     #[tokio::test]

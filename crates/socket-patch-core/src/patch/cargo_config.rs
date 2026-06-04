@@ -34,7 +34,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 /// `path` is under this prefix is how socket ownership is recognised.
 pub const CARGO_PATCHES_DIR: &str = ".socket/cargo-patches";
 
-/// The `[env]` key carrying the project root for the runtime hook.
+/// The `[env]` key carrying the project root for the build-time guard.
 const ENV_ROOT_KEY: &str = "SOCKET_PATCH_ROOT";
 
 /// Info about one `[patch.crates-io]` entry, for reconcile / verify.
@@ -81,7 +81,7 @@ pub async fn drop_patch_entry(
     edit_config(project_root, dry_run, |c| remove_patch_entry(c, name)).await
 }
 
-/// Upsert `[env] SOCKET_PATCH_ROOT = { value = ".socket", relative = true }`.
+/// Upsert `[env] SOCKET_PATCH_ROOT = { value = ".", relative = true }`.
 /// Idempotent. Returns whether the file changed.
 pub async fn ensure_env_root(project_root: &Path, dry_run: bool) -> Result<bool, String> {
     edit_config(project_root, dry_run, upsert_env_root).await

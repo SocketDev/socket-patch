@@ -100,45 +100,43 @@ mod tests {
         );
     }
 
+    // ── single fail-closed mode: decide_initial ──────────────────────
     #[test]
-    fn guard_mode_defaults_to_error() {
-        assert_eq!(guard_mode(None), GuardMode::Error);
-        assert_eq!(guard_mode(Some("1")), GuardMode::Error);
-        assert_eq!(guard_mode(Some("error")), GuardMode::Error);
-        assert_eq!(guard_mode(Some("warn")), GuardMode::Warn);
-        assert_eq!(guard_mode(Some("off")), GuardMode::Off);
+    fn decide_initial_in_sync_proceeds() {
+        assert_eq!(decide_initial(&Probe::InSync), Action::Proceed);
     }
 
     #[test]
-    fn decide_in_sync_always_proceeds() {
-        for mode in [GuardMode::Error, GuardMode::Warn, GuardMode::Off] {
-            assert_eq!(decide(&CheckOutcome::InSync, mode), Action::Proceed);
-        }
+    fn decide_initial_drift_heals() {
+        assert_eq!(decide_initial(&Probe::Drift), Action::Heal);
     }
 
     #[test]
-    fn decide_drift_fails_closed_by_default() {
-        // The core fix: drift in the default (Error) mode FAILS the build.
+    fn decide_initial_probe_error_fails_closed() {
+        // A missing/unspawnable CLI fails the build — no escape hatch.
         assert!(matches!(
-            decide(&CheckOutcome::Drift, GuardMode::Error),
+            decide_initial(&Probe::ProbeError("no such file".to_string())),
             Action::Fail(_)
         ));
     }
 
+    // ── after-heal messaging (the build always fails here) ────────────
     #[test]
-    fn decide_drift_in_warn_heals_and_continues_not_panics() {
-        // Pins the bug the old `interpret` had (Failed always panicked):
-        // warn mode must NOT fail on drift — it heals and continues.
-        assert!(matches!(
-            decide(&CheckOutcome::Drift, GuardMode::Warn),
-            Action::HealAndWarn(_)
-        ));
+    fn after_heal_in_sync_says_regenerated_and_rerun() {
+        let m = fail_message_after_heal(&Probe::InSync, "");
+        assert!(m.contains("regenerated") && m.to_lowercase().contains("re-run"), "{m}");
     }
 
     #[test]
-    fn decide_probe_failure_respects_mode() {
-        let pf = CheckOutcome::ProbeFailed("no such file".to_string());
-        assert!(matches!(decide(&pf, GuardMode::Error), Action::Fail(_)));
-        assert!(matches!(decide(&pf, GuardMode::Warn), Action::Warn(_)));
+    fn after_heal_still_drift_is_unrecoverable_and_includes_detail() {
+        let m = fail_message_after_heal(&Probe::Drift, "resolved version 1.0.1");
+        assert!(m.contains("could NOT be reconciled"), "{m}");
+        assert!(m.contains("resolved version 1.0.1"), "detail must be surfaced: {m}");
+    }
+
+    #[test]
+    fn after_heal_probe_error_reports_cli() {
+        let m = fail_message_after_heal(&Probe::ProbeError("boom".to_string()), "");
+        assert!(m.contains("could not run") && m.contains("boom"), "{m}");
     }
 }
