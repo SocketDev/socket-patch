@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/socket-patch-core", "crates/socket-patch-cli"]
+members = [
+    "crates/socket-patch-core",
+    "crates/socket-patch-cli",
+    "crates/socket-patch-guard",
+]
 resolver = "2"
 
 [workspace.package]

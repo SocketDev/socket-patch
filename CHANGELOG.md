@@ -16,6 +16,37 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **Project-local cargo `[patch]`-redirect backend (local mode).** Patching a
+  Rust dependency from the registry cache no longer mutates the shared
+  `$CARGO_HOME` registry in place. Instead `apply` writes a project-local
+  patched **copy** under `.socket/cargo-patches/<name>-<version>/` and a managed
+  `[patch.crates-io]` entry (+ `[env] SOCKET_PATCH_ROOT`) into
+  `.cargo/config.toml`, so patches are project-scoped and the registry stays
+  pristine for sibling projects. `rollback` cleanly drops the entry + copy
+  (leaving `setup` state — the guard dependency + `[env]` — intact).
+  `apply --check` is a new read-only, lock-free, offline auditor that verifies
+  the committed copies/config match the manifest **and** cross-checks
+  `Cargo.lock` (flagging a patched dependency that silently resolved to an
+  unpatched version); it exits non-zero on drift (for CI / GitHub-App use).
+  Vendored crates (`vendor/`) and `--global` cargo keep the existing in-place
+  `.cargo-checksum.json` rewrite path unchanged.
+- **`socket-patch-guard` crate + `setup` cargo support.** `socket-patch setup`
+  now also configures Rust projects: it adds a tiny `socket-patch-guard`
+  build-dependency to every workspace member and writes `[env]
+  SOCKET_PATCH_ROOT`. The guard's build script runs `socket-patch apply --check`
+  on every relevant `cargo build` and is **fail-closed**: if the committed
+  patched copies are out of sync with `.socket/manifest.json` (a stale copy, or
+  a patched dependency that resolved to an unpatched version), the build
+  **fails** rather than silently compiling stale/unpatched sources — closing the
+  CI footgun where a one-shot build could ship an unpatched binary. The fix is
+  run-order-independent (it checks the static committed state, not when the
+  build script happens to run). `SOCKET_PATCH_GUARD=warn` opts into
+  heal-and-continue (one extra build to take effect); `=off` disables the guard
+  with a loud warning. The user's own `build.rs` is never touched. For CI, run
+  `socket-patch apply --check --ecosystems cargo` as an explicit pipeline gate
+  (it ignores `SOCKET_PATCH_GUARD`). `setup --check` / `setup --remove` cover the
+  round-trip. *(Pre-GA: `socket-patch-guard` will be published to crates.io;
+  airgapped users vendor it.)*
 - **Inline OpenVEX generation on `apply` and `scan` via `--vex <path>`.** A
   single successful `apply`/`scan` can now both patch and emit the OpenVEX
   0.2.0 attestation, instead of requiring a separate `socket-patch vex` step.
@@ -27,6 +58,16 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   (`{ path, statements, format }`). A requested-but-failed VEX makes the
   command exit non-zero even when the apply/scan itself succeeded, surfacing a
   stable error code in the envelope.
+
+### Changed
+
+- **Local cargo `apply` now redirects instead of patching in place.** Registry
+  crates patched by a previous (in-place) version leave a mutated shared
+  registry + rewritten `.cargo-checksum.json` behind; the new local backend
+  never touches the registry, so those stay dirty until cargo re-fetches.
+  `apply` now prints a one-line **warning** when it detects such a crate
+  (suppressed under `--offline`, so the build-time guard stays quiet) and points
+  at restoring the pristine copy. No automatic registry cleanup is performed.
 
 ## [3.2.0] — 2026-05-29
 

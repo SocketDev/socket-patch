@@ -1,4 +1,9 @@
 use clap::Args;
+#[cfg(feature = "cargo")]
+use socket_patch_core::cargo_setup::{
+    add_guard_dep, discover_cargo_project, is_guard_dep_present, remove_guard_dep, CargoEditResult,
+    CargoSetupStatus,
+};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
@@ -24,6 +29,26 @@ fn manager_name(pm: PackageManager) -> &'static str {
     match pm {
         PackageManager::Npm => "npm",
         PackageManager::Pnpm => "pnpm",
+    }
+}
+
+/// Compose the `+`-joined telemetry manager tag across the ecosystems in scope
+/// (e.g. `npm+pypi+cargo`), or `none`.
+fn telemetry_manager_str(npm: bool, py: bool, cargo: bool, npm_pm: PackageManager) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if npm {
+        parts.push(manager_name(npm_pm));
+    }
+    if py {
+        parts.push("pypi");
+    }
+    if cargo {
+        parts.push("cargo");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join("+")
     }
 }
 
@@ -247,6 +272,196 @@ fn update_status_str(s: &UpdateStatus) -> &'static str {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Cargo (project-local [patch]-redirect guard) helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Feature-agnostic summary of the cargo branch's contribution to a
+/// setup/remove run. Built by [`build_cargo_outcome`] (a no-op `Default` when
+/// the `cargo` feature is off), so the shared reporting code never has to name
+/// the cargo-only types.
+#[derive(Default)]
+struct CargoOutcome {
+    /// A cargo project was discovered (gates the `no_files` decision).
+    present: bool,
+    /// Items changed (guard dep added/removed + `[env]` written/removed).
+    changed: usize,
+    already: usize,
+    errors: usize,
+    /// Envelope `files[]` entries (kind = `cargo` / `cargo_env`).
+    json_files: Vec<serde_json::Value>,
+    /// Human-readable preview lines (already formatted).
+    preview: Vec<String>,
+}
+
+/// Build the cargo outcome for a setup (`remove=false`) or remove
+/// (`remove=true`) run at the given `dry_run` setting.
+#[cfg(feature = "cargo")]
+async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> CargoOutcome {
+    use socket_patch_core::patch::cargo_config;
+
+    let project = match discover_cargo_project(&common.cwd).await {
+        Some(p) => p,
+        None => return CargoOutcome::default(),
+    };
+
+    let mut out = CargoOutcome {
+        present: true,
+        ..Default::default()
+    };
+
+    // Per-member guard dependency edits.
+    let version = guard_version();
+    let mut results: Vec<(String, CargoEditResult)> = Vec::new();
+    for member in &project.members {
+        let res = if remove {
+            remove_guard_dep(member, dry_run).await
+        } else {
+            add_guard_dep(member, &version, dry_run).await
+        };
+        results.push(("cargo".to_string(), res));
+    }
+
+    // The shared `[env] SOCKET_PATCH_ROOT` at the workspace root.
+    let config_path = project.root.join(".cargo/config.toml");
+    let env_change = if remove {
+        cargo_config::drop_env_root(&project.root, dry_run).await
+    } else {
+        cargo_config::ensure_env_root(&project.root, dry_run).await
+    };
+    results.push(("cargo_env".to_string(), env_result(&config_path, env_change)));
+
+    // Aggregate counts + render envelope entries / preview lines.
+    let mut added_paths: Vec<String> = Vec::new();
+    for (kind, r) in &results {
+        match r.status {
+            CargoSetupStatus::Updated => {
+                out.changed += 1;
+                added_paths.push(r.path.clone());
+            }
+            CargoSetupStatus::AlreadyConfigured => out.already += 1,
+            CargoSetupStatus::Error => out.errors += 1,
+        }
+        out.json_files.push(serde_json::json!({
+            "kind": kind,
+            "path": r.path,
+            "status": cargo_status_str(&r.status, remove),
+            "error": r.error,
+        }));
+    }
+
+    if !added_paths.is_empty() {
+        let header = if remove {
+            "Cargo: remove socket-patch-guard + [env] SOCKET_PATCH_ROOT from:"
+        } else {
+            "Cargo: add socket-patch-guard + [env] SOCKET_PATCH_ROOT to:"
+        };
+        out.preview.push(header.to_string());
+        for p in &added_paths {
+            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+        }
+    }
+
+    out
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> CargoOutcome {
+    CargoOutcome::default()
+}
+
+/// The guard version string `setup` writes — major.minor of this CLI, so the
+/// committed dep tracks the installed `socket-patch`.
+#[cfg(feature = "cargo")]
+fn guard_version() -> String {
+    let v = env!("CARGO_PKG_VERSION");
+    let mut parts = v.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(major), Some(minor)) => format!("{major}.{minor}"),
+        _ => v.to_string(),
+    }
+}
+
+#[cfg(feature = "cargo")]
+fn cargo_status_str(s: &CargoSetupStatus, for_remove: bool) -> &'static str {
+    match (s, for_remove) {
+        (CargoSetupStatus::Updated, false) => "updated",
+        (CargoSetupStatus::Updated, true) => "removed",
+        (CargoSetupStatus::AlreadyConfigured, false) => "already_configured",
+        (CargoSetupStatus::AlreadyConfigured, true) => "not_configured",
+        (CargoSetupStatus::Error, _) => "error",
+    }
+}
+
+#[cfg(feature = "cargo")]
+fn env_result(config_path: &Path, change: Result<bool, String>) -> CargoEditResult {
+    match change {
+        Ok(true) => CargoEditResult {
+            path: config_path.display().to_string(),
+            status: CargoSetupStatus::Updated,
+            error: None,
+        },
+        Ok(false) => CargoEditResult {
+            path: config_path.display().to_string(),
+            status: CargoSetupStatus::AlreadyConfigured,
+            error: None,
+        },
+        Err(e) => CargoEditResult {
+            path: config_path.display().to_string(),
+            status: CargoSetupStatus::Error,
+            error: Some(e),
+        },
+    }
+}
+
+/// Append cargo check entries (one per member + one for `[env]`) to the shared
+/// `run_check` entries list. Returns whether a cargo project was found.
+#[cfg(feature = "cargo")]
+async fn append_cargo_check_entries(
+    common: &GlobalArgs,
+    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    use socket_patch_core::patch::cargo_config;
+
+    let project = match discover_cargo_project(&common.cwd).await {
+        Some(p) => p,
+        None => return false,
+    };
+    for member in &project.members {
+        let (state, err) = match tokio::fs::read_to_string(member).await {
+            Ok(content) => {
+                if is_guard_dep_present(&content) {
+                    (CheckState::Configured, None)
+                } else {
+                    (CheckState::NeedsConfiguration, None)
+                }
+            }
+            Err(e) => (CheckState::Error, Some(e.to_string())),
+        };
+        entries.push(("cargo", member.display().to_string(), state, err));
+    }
+    let env_ok = cargo_config::env_root_present(&project.root).await;
+    entries.push((
+        "cargo_env",
+        project.root.join(".cargo/config.toml").display().to_string(),
+        if env_ok {
+            CheckState::Configured
+        } else {
+            CheckState::NeedsConfiguration
+        },
+        None,
+    ));
+    true
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn append_cargo_check_entries(
+    _common: &GlobalArgs,
+    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    false
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // check
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -263,14 +478,11 @@ enum CheckState {
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     if !args.common.json {
-        println!("Searching for package.json / Python manifests...");
+        println!("Searching for package.json / Python / Cargo manifests...");
     }
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(&args.common).await;
-    if npm_files.is_empty() && py_plan.is_none() {
-        return report_no_files(args, "no_files");
-    }
 
     // (kind, path, state, error)
     let mut entries: Vec<(&'static str, String, CheckState, Option<String>)> = Vec::new();
@@ -311,6 +523,12 @@ async fn run_check(args: &SetupArgs) -> i32 {
             };
             entries.push(("pth", path.display().to_string(), state, err));
         }
+    }
+
+    append_cargo_check_entries(&args.common, &mut entries).await;
+
+    if entries.is_empty() {
+        return report_no_files(args, "no_files");
     }
 
     let configured = entries.iter().filter(|(_, _, s, _)| *s == CheckState::Configured).count();
@@ -395,12 +613,13 @@ fn render_removed(new: &Option<String>) -> String {
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     if !common.json {
-        println!("Searching for package.json / Python manifests...");
+        println!("Searching for package.json / Python / Cargo manifests...");
     }
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
-    if npm_files.is_empty() && py_plan.is_none() {
+    let cargo_preview = build_cargo_outcome(common, true, true).await;
+    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present {
         return report_no_files(args, "no_files");
     }
 
@@ -415,13 +634,15 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     };
 
     if !common.json {
-        print_remove_preview(&npm_preview, &py_preview, common);
+        print_remove_preview(&npm_preview, &py_preview, &cargo_preview, common);
     }
 
     let n_remove = npm_preview.iter().filter(|r| r.status == RemoveStatus::Removed).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count();
+        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
+        + cargo_preview.changed;
     let preview_errs = npm_preview.iter().filter(|r| r.status == RemoveStatus::Error).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo_preview.errors;
 
     // Nothing to remove: clean (exit 0) or some file errored (exit 1).
     if n_remove == 0 {
@@ -430,6 +651,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 if preview_errs > 0 { "error" } else { "not_configured" },
                 &npm_preview,
                 &py_preview,
+                &cargo_preview,
                 &[],
             );
         } else if preview_errs > 0 {
@@ -443,7 +665,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // Dry-run: preview already shown; report and exit without writing.
     if common.dry_run {
         if common.json {
-            print_remove_envelope("dry_run", &npm_preview, &py_preview, &[]);
+            print_remove_envelope("dry_run", &npm_preview, &py_preview, &cargo_preview, &[]);
         } else {
             println!("\nSummary:");
             println!("  {n_remove} item(s) would have socket-patch removed");
@@ -481,20 +703,25 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, true, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
+    // Real cargo removal (guard dep + [env] root).
+    let cargo_results = build_cargo_outcome(common, true, false).await;
 
     let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
-        + py_results.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo_results.errors;
 
     if common.json {
         print_remove_envelope(
             if errs > 0 { "partial_failure" } else { "success" },
             &npm_results,
             &py_results,
+            &cargo_results,
             &warnings,
         );
     } else {
         let removed = npm_results.iter().filter(|r| r.status == RemoveStatus::Removed).count()
-            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count();
+            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
+            + cargo_results.changed;
         println!("\nSummary:");
         println!("  {removed} item(s) had socket-patch removed");
         if errs > 0 {
@@ -506,6 +733,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         if py_plan.is_some() {
             println!("\nAlso run `pip uninstall socket-patch-hook` to remove the installed .pth.");
         }
+        if cargo_results.present {
+            println!(
+                "\nNote: existing patched-crate copies under .socket/cargo-patches/ and any \
+                 managed [patch.crates-io] entries are removed on `socket-patch rollback`."
+            );
+        }
     }
 
     if errs > 0 {
@@ -515,7 +748,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     }
 }
 
-fn print_remove_preview(npm: &[RemoveResult], py: &[PthEditResult], common: &GlobalArgs) {
+fn print_remove_preview(
+    npm: &[RemoveResult],
+    py: &[PthEditResult],
+    cargo: &CargoOutcome,
+    common: &GlobalArgs,
+) {
     let to_remove: Vec<_> = npm.iter().filter(|r| r.status == RemoveStatus::Removed).collect();
     let py_remove: Vec<_> = py.iter().filter(|r| r.status == PthStatus::Updated).collect();
     println!("\nProposed changes:\n");
@@ -538,20 +776,30 @@ fn print_remove_preview(npm: &[RemoveResult], py: &[PthEditResult], common: &Glo
         }
         println!();
     }
+    if !cargo.preview.is_empty() {
+        for line in &cargo.preview {
+            println!("{line}");
+        }
+        println!();
+    }
 }
 
 fn print_remove_envelope(
     status: &str,
     npm: &[RemoveResult],
     py: &[PthEditResult],
+    cargo: &CargoOutcome,
     warnings: &[String],
 ) {
     let removed = npm.iter().filter(|r| r.status == RemoveStatus::Removed).count()
-        + py.iter().filter(|r| r.status == PthStatus::Updated).count();
+        + py.iter().filter(|r| r.status == PthStatus::Updated).count()
+        + cargo.changed;
     let not_cfg = npm.iter().filter(|r| r.status == RemoveStatus::NotConfigured).count()
-        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count();
+        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
+        + cargo.already;
     let errors = npm.iter().filter(|r| r.status == RemoveStatus::Error).count()
-        + py.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo.errors;
 
     let mut files: Vec<serde_json::Value> = npm
         .iter()
@@ -580,6 +828,9 @@ fn print_remove_envelope(
             "error": r.error,
         })
     }));
+    // cargo.json_files already use the remove vocabulary
+    // (removed/not_configured/error), built by `build_cargo_outcome`.
+    files.extend(cargo.json_files.iter().cloned());
 
     let mut obj = serde_json::json!({
         "status": status,
@@ -610,8 +861,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
+    // Cargo preview (dry-run); `.present` also tells us a cargo project exists.
+    let cargo_preview = build_cargo_outcome(common, false, true).await;
 
-    if npm_files.is_empty() && py_plan.is_none() {
+    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present {
         if common.json {
             println!(
                 "{}",
@@ -625,19 +878,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            println!("No package.json or Python project found");
+            println!("No package.json, Python, or Cargo project found");
         }
         return 0;
     }
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
-    let telemetry_manager = match (!npm_files.is_empty(), py_plan.is_some()) {
-        (true, true) => format!("{}+pypi", manager_name(npm_pm)),
-        (true, false) => manager_name(npm_pm).to_string(),
-        (false, true) => "pypi".to_string(),
-        (false, false) => "none".to_string(),
-    };
+    let telemetry_manager = telemetry_manager_str(
+        !npm_files.is_empty(),
+        py_plan.is_some(),
+        cargo_preview.present,
+        npm_pm,
+    );
     track_patch_setup(
         &telemetry_manager,
         common.api_token.as_deref(),
@@ -656,13 +909,15 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     };
 
     if !common.json {
-        print_setup_preview(&npm_preview, &py_preview, common);
+        print_setup_preview(&npm_preview, &py_preview, &cargo_preview, common);
     }
 
     let n_changes = npm_preview.iter().filter(|r| r.status == UpdateStatus::Updated).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count();
+        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
+        + cargo_preview.changed;
     let preview_errors = npm_preview.iter().filter(|r| r.status == UpdateStatus::Error).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo_preview.errors;
 
     if n_changes == 0 {
         if common.json {
@@ -670,6 +925,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 if preview_errors > 0 { "error" } else { "already_configured" },
                 &npm_preview,
                 &py_preview,
+                &cargo_preview,
                 npm_pm,
                 py_plan.as_ref(),
                 &[],
@@ -688,6 +944,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 "dry_run",
                 &npm_preview,
                 &py_preview,
+                &cargo_preview,
                 npm_pm,
                 py_plan.as_ref(),
                 &[],
@@ -729,22 +986,27 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
+    // Real cargo edit (guard dep + [env] root).
+    let cargo_results = build_cargo_outcome(common, false, false).await;
 
     let errors = npm_results.iter().filter(|r| r.status == UpdateStatus::Error).count()
-        + py_results.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo_results.errors;
 
     if common.json {
         print_setup_envelope(
             if errors > 0 { "partial_failure" } else { "success" },
             &npm_results,
             &py_results,
+            &cargo_results,
             npm_pm,
             py_plan.as_ref(),
             &warnings,
         );
     } else {
         let updated = npm_results.iter().filter(|r| r.status == UpdateStatus::Updated).count()
-            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count();
+            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
+            + cargo_results.changed;
         println!("\nSummary:");
         println!("  {updated} item(s) updated");
         if errors > 0 {
@@ -760,6 +1022,12 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 plan.pm.as_str()
             );
         }
+        if cargo_results.present {
+            println!(
+                "\nCommit Cargo.toml (socket-patch-guard), .cargo/config.toml, and your \
+                 .socket/ patches so the guard re-applies cargo patches in CI."
+            );
+        }
     }
 
     if errors > 0 {
@@ -769,7 +1037,12 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     }
 }
 
-fn print_setup_preview(npm: &[UpdateResult], py: &[PthEditResult], common: &GlobalArgs) {
+fn print_setup_preview(
+    npm: &[UpdateResult],
+    py: &[PthEditResult],
+    cargo: &CargoOutcome,
+    common: &GlobalArgs,
+) {
     let npm_changes: Vec<_> = npm.iter().filter(|r| r.status == UpdateStatus::Updated).collect();
     let py_changes: Vec<_> = py.iter().filter(|r| r.status == PthStatus::Updated).collect();
 
@@ -786,11 +1059,20 @@ fn print_setup_preview(npm: &[UpdateResult], py: &[PthEditResult], common: &Glob
             println!("  + {}", pathdiff(&r.path, &common.cwd));
         }
     }
+    if !cargo.preview.is_empty() {
+        println!();
+        for line in &cargo.preview {
+            println!("{line}");
+        }
+    }
 
     let npm_already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count();
     let py_already = py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count();
-    if npm_already + py_already > 0 {
-        println!("\nAlready configured (will skip): {}", npm_already + py_already);
+    if npm_already + py_already + cargo.already > 0 {
+        println!(
+            "\nAlready configured (will skip): {}",
+            npm_already + py_already + cargo.already
+        );
     }
 
     let errs: Vec<&str> = npm
@@ -816,16 +1098,20 @@ fn print_setup_envelope(
     status: &str,
     npm: &[UpdateResult],
     py: &[PthEditResult],
+    cargo: &CargoOutcome,
     npm_pm: PackageManager,
     py_plan: Option<&PythonPlan>,
     warnings: &[String],
 ) {
     let updated = npm.iter().filter(|r| r.status == UpdateStatus::Updated).count()
-        + py.iter().filter(|r| r.status == PthStatus::Updated).count();
+        + py.iter().filter(|r| r.status == PthStatus::Updated).count()
+        + cargo.changed;
     let already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count()
-        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count();
+        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
+        + cargo.already;
     let errors = npm.iter().filter(|r| r.status == UpdateStatus::Error).count()
-        + py.iter().filter(|r| r.status == PthStatus::Error).count();
+        + py.iter().filter(|r| r.status == PthStatus::Error).count()
+        + cargo.errors;
 
     let mut files: Vec<serde_json::Value> = npm
         .iter()
@@ -846,6 +1132,7 @@ fn print_setup_envelope(
             "error": r.error,
         })
     }));
+    files.extend(cargo.json_files.iter().cloned());
 
     let mut obj = serde_json::json!({
         "status": status,

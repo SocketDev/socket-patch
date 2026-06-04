@@ -1,0 +1,14 @@
+[package]
+name = "socket-patch-guard"
+description = "Build-time guard that keeps socket-patch's project-local cargo patches in sync — its build script re-runs `socket-patch apply` whenever the dependency set (Cargo.lock) or patch set (.socket/manifest.json) changes. Add it under [dependencies] and run `socket-patch setup`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+# The crate is intentionally a near-empty library: all of the work happens in
+# `build.rs`, which the consumer's build runs because the guard is a normal
+# `[dependencies]` entry. Zero runtime dependencies — it links one tiny rlib
+# into the consumer's graph.
+[dependencies]

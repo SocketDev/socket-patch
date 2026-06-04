@@ -2451,6 +2451,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket-patch-guard"
+version = "3.3.0"
+
+[[package]]
 name = "socket2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

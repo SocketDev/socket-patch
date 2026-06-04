@@ -8,9 +8,16 @@ use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
 };
 use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
+#[cfg(feature = "cargo")]
+use socket_patch_core::patch::cargo_redirect::{
+    apply_cargo_redirect, reconcile_cargo_redirects, verify_cargo_redirect_state,
+};
+#[cfg(feature = "cargo")]
+use socket_patch_core::utils::purl::parse_cargo_purl;
 
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
@@ -71,12 +78,255 @@ pub struct ApplyArgs {
     #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
     pub force: bool,
 
+    /// Read-only: verify that the committed cargo patch redirects match the
+    /// manifest (for CI / GitHub-App auditing), exiting non-zero on drift.
+    /// Lock-free and offline-safe — it does not crawl, fetch, or mutate.
+    #[arg(
+        long = "check",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub check: bool,
+
     /// On a successful apply, also generate an OpenVEX 0.2.0 document.
     /// `--vex <path>` is the trigger; the `--vex-*` knobs mirror the
     /// standalone `vex` command. A requested-but-failed VEX makes the
     /// whole command exit non-zero even when patches applied cleanly.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+}
+
+// ── local-cargo redirect helpers ─────────────────────────────────────────────
+// Cargo's project-local `[patch]`-redirect backend (local mode only). In a
+// build WITHOUT the `cargo` feature these are inert stubs so the dispatch sites
+// stay branch-free and `Ecosystem::Cargo` (which only exists under that
+// feature) is never named outside a gated block.
+
+/// True for a cargo PURL in local mode (no `--global` / `--global-prefix`),
+/// which redirects to a project-local patched copy rather than patching in
+/// place in the shared registry.
+#[cfg(feature = "cargo")]
+fn is_local_cargo(purl: &str, common: &GlobalArgs) -> bool {
+    !common.global
+        && common.global_prefix.is_none()
+        && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
+}
+
+/// True if a resolved crate path lives under `<cwd>/vendor/` (a vendored
+/// crate, patched in place) rather than the registry cache (redirected).
+#[cfg(feature = "cargo")]
+fn is_under_vendor(pkg_path: &Path, cwd: &Path) -> bool {
+    pkg_path.starts_with(cwd.join("vendor"))
+}
+
+/// Whether local-cargo redirects are in scope (local mode + cargo not filtered
+/// out by `--ecosystems`). Gates reconcile / `--check` so we never touch cargo
+/// state when the user scoped to other ecosystems.
+#[cfg(feature = "cargo")]
+fn cargo_in_local_scope(common: &GlobalArgs) -> bool {
+    if common.global || common.global_prefix.is_some() {
+        return false;
+    }
+    match &common.ecosystems {
+        None => true,
+        Some(list) => list.iter().any(|e| e.eq_ignore_ascii_case("cargo")),
+    }
+}
+
+/// Materialise a local-cargo redirect for `purl`, or `None` if `purl` isn't a
+/// local-cargo target (the caller then falls back to in-place apply).
+#[cfg(feature = "cargo")]
+async fn try_local_cargo_apply(
+    purl: &str,
+    pkg_path: &Path,
+    patch: &PatchRecord,
+    sources: &PatchSources<'_>,
+    common: &GlobalArgs,
+    force: bool,
+) -> Option<ApplyResult> {
+    if !is_local_cargo(purl, common) {
+        return None;
+    }
+    let (name, version) = parse_cargo_purl(purl)?;
+    // The redirect model targets registry-cache crates
+    // (`$CARGO_HOME/registry/src/...`). A VENDORED crate (under `<cwd>/vendor/`)
+    // is already project-local + committed, so the shared-registry isolation the
+    // redirect solves doesn't apply, and `[patch.crates-io]` doesn't compose
+    // with source replacement — vendored crates keep the in-place sidecar path.
+    // The crawler searches `vendor/` *exclusively* when it exists, so the
+    // reliable discriminator is whether the resolved path is under it.
+    if is_under_vendor(pkg_path, &common.cwd) {
+        return None; // vendored crate → fall through to in-place apply
+    }
+    warn_if_dirty_registry(purl, pkg_path, patch, common).await;
+    Some(
+        apply_cargo_redirect(
+            purl,
+            name,
+            version,
+            pkg_path,
+            &common.cwd,
+            &patch.files,
+            sources,
+            Some(&patch.uuid),
+            common.dry_run,
+            force,
+        )
+        .await,
+    )
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn try_local_cargo_apply(
+    _purl: &str,
+    _pkg_path: &Path,
+    _patch: &PatchRecord,
+    _sources: &PatchSources<'_>,
+    _common: &GlobalArgs,
+    _force: bool,
+) -> Option<ApplyResult> {
+    None
+}
+
+/// Warn-only migration aid: detect a shared-registry crate that the legacy
+/// in-place backend already patched (a source file hashing to its `afterHash`,
+/// with `after != before`) and point the user at restoring the pristine copy.
+/// The project-local backend never mutates the registry, so it stays dirty
+/// until cargo re-fetches. Suppressed under `--offline` (the guard's mode) so
+/// it surfaces on a human's manual apply without spamming every build.
+#[cfg(feature = "cargo")]
+async fn warn_if_dirty_registry(
+    purl: &str,
+    pkg_path: &Path,
+    patch: &PatchRecord,
+    common: &GlobalArgs,
+) {
+    use socket_patch_core::patch::apply::normalize_file_path;
+    use socket_patch_core::patch::file_hash::compute_file_git_sha256;
+
+    if common.offline || common.silent || common.json {
+        return;
+    }
+    if !pkg_path.join(".cargo-checksum.json").exists() {
+        return;
+    }
+    for (file_name, info) in &patch.files {
+        if info.before_hash == info.after_hash || info.after_hash.is_empty() {
+            continue;
+        }
+        let on_disk = pkg_path.join(normalize_file_path(file_name));
+        if let Ok(h) = compute_file_git_sha256(&on_disk).await {
+            if h == info.after_hash {
+                eprintln!(
+                    "warning: the shared registry crate for {purl} at {} appears to have been \
+                     patched in place by the legacy cargo backend. The project-local backend \
+                     leaves the registry untouched and uses a copy under .socket/cargo-patches/; \
+                     cargo restores the pristine source on re-fetch (or delete the crate dir).",
+                    pkg_path.display()
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// After the apply loop: prune local-cargo redirects whose patches were
+/// dropped from the manifest. No-op unless local cargo is in scope.
+#[cfg(feature = "cargo")]
+async fn reconcile_local_cargo(common: &GlobalArgs, target_manifest_purls: &HashSet<String>) {
+    if !cargo_in_local_scope(common) {
+        return;
+    }
+    let desired: HashSet<String> = target_manifest_purls
+        .iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        .cloned()
+        .collect();
+    let removed = reconcile_cargo_redirects(&common.cwd, &desired, common.dry_run).await;
+    if !removed.is_empty() && !common.silent && !common.json {
+        let verb = if common.dry_run { "Would remove" } else { "Removed" };
+        println!("{verb} {} stale cargo patch redirect(s):", removed.len());
+        for purl in &removed {
+            println!("  {purl}");
+        }
+    }
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn reconcile_local_cargo(_common: &GlobalArgs, _target_manifest_purls: &HashSet<String>) {}
+
+/// Read-only verification of committed cargo redirects (CI / GitHub-App audit).
+/// Lock-free, crawl-free, offline-safe. Exits 0 when in sync, 1 on drift.
+#[cfg(feature = "cargo")]
+async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
+    use socket_patch_core::patch::cargo_redirect::Drift;
+
+    let manifest = match read_manifest(manifest_path).await {
+        Ok(Some(m)) => m,
+        // The caller already guarded manifest existence; treat anything else as
+        // "nothing to verify".
+        _ => return 0,
+    };
+
+    let desired: HashSet<String> = if cargo_in_local_scope(&args.common) {
+        manifest
+            .patches
+            .keys()
+            .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    match verify_cargo_redirect_state(&args.common.cwd, &manifest, &desired).await {
+        Ok(()) => {
+            if args.common.json {
+                println!("{}", Envelope::new(Command::Apply).to_pretty_json());
+            } else if !args.common.silent {
+                println!(
+                    "Cargo patch redirects are in sync ({} checked).",
+                    desired.len()
+                );
+            }
+            0
+        }
+        Err(drifts) => {
+            if args.common.json {
+                let mut env = Envelope::new(Command::Apply);
+                for d in &drifts {
+                    let purl = match d {
+                        Drift::MissingCopy { purl }
+                        | Drift::StaleCopy { purl, .. }
+                        | Drift::MissingEntry { purl }
+                        | Drift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
+                        Drift::OrphanEntry { name } => name.clone(),
+                    };
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, purl)
+                            .with_reason("cargo_redirect_drift", d.to_string()),
+                    );
+                }
+                env.mark_partial_failure();
+                println!("{}", env.to_pretty_json());
+            } else if !args.common.silent {
+                eprintln!("Cargo patch redirects are OUT OF SYNC:");
+                for d in &drifts {
+                    eprintln!("  {d}");
+                }
+                eprintln!("Run `socket-patch apply` to regenerate them.");
+            }
+            1
+        }
+    }
+}
+
+#[cfg(not(feature = "cargo"))]
+async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
+    if !args.common.silent && !args.common.json {
+        println!("`--check` verifies cargo patch redirects; this build has no cargo support.");
+    }
+    0
 }
 
 /// True when every file the engine verified for this package is already
@@ -214,6 +464,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
             println!("No .socket folder found, skipping patch application.");
         }
         return 0;
+    }
+
+    // Read-only cargo-redirect verification for CI / GitHub-App auditing.
+    // Branches BEFORE the lock (so concurrent builds don't contend) and
+    // before any crawl/fetch; it reads only the manifest + committed copies +
+    // `.cargo/config.toml`, so it is always offline-safe.
+    if args.check {
+        return run_check(&args, &manifest_path).await;
     }
 
     // Serialize against concurrent socket-patch runs targeting the same
@@ -667,6 +925,13 @@ async fn apply_patches_inner(
         .flat_map(|purls| purls.iter().cloned())
         .collect();
 
+    // Local cargo: prune redirects whose patches were dropped from the
+    // manifest (orphans). Done here — before the crawl + the "no packages
+    // found" early returns — so orphans are reconciled even when the manifest
+    // now lists zero in-scope cargo patches (the all-removed case). No-op
+    // unless local cargo is in scope.
+    reconcile_local_cargo(&args.common, &target_manifest_purls).await;
+
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
         global: args.common.global,
@@ -813,16 +1078,35 @@ async fn apply_patches_inner(
                 packages_path: Some(&packages_path),
                 diffs_path: Some(&diffs_path),
             };
-            let result = apply_package_patch(
+            // Local cargo redirects to a project-local patched copy
+            // (`apply_cargo_redirect`); everything else — npm/pypi, and cargo
+            // under --global/--global-prefix — patches in place via
+            // `apply_package_patch`. In a build without the `cargo` feature
+            // `try_local_cargo_apply` is an inert `None`.
+            let result = match try_local_cargo_apply(
                 purl,
                 pkg_path,
-                &patch.files,
+                patch,
                 &sources,
-                Some(&patch.uuid),
-                args.common.dry_run,
+                &args.common,
                 args.force,
             )
-            .await;
+            .await
+            {
+                Some(r) => r,
+                None => {
+                    apply_package_patch(
+                        purl,
+                        pkg_path,
+                        &patch.files,
+                        &sources,
+                        Some(&patch.uuid),
+                        args.common.dry_run,
+                        args.force,
+                    )
+                    .await
+                }
+            };
 
             if !result.success {
                 has_errors = true;

@@ -949,6 +949,8 @@ pub async fn download_and_apply_patches(
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
+            // get never runs the read-only cargo-redirect verifier.
+            check: false,
             // get drives apply internally; embedded VEX is opt-in on the
             // top-level command, never on this internal invocation.
             vex: Default::default(),
@@ -1533,6 +1535,8 @@ async fn save_and_apply_patch(
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
+            // get never runs the read-only cargo-redirect verifier.
+            check: false,
             // get drives apply internally; embedded VEX is opt-in on the
             // top-level command, never on this internal invocation.
             vex: Default::default(),

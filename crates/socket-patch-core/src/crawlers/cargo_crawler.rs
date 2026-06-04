@@ -363,7 +363,7 @@ impl CargoCrawler {
     ///
     /// This is only a fallback for when `Cargo.toml` itself cannot be
     /// parsed; for registry crates the manifest is authoritative.
-    fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
+    pub(crate) fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
         let mut first_dotted: Option<usize> = None;
         let mut last_any: Option<usize> = None;
         for (i, _) in dir_name.match_indices('-') {
