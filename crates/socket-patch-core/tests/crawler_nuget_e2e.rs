@@ -90,7 +90,10 @@ async fn find_by_purls_legacy_layout_finds_package() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(ORG_PURL_A).unwrap().path, pkg_dir);
+    let pkg = result.get(ORG_PURL_A).expect("must find by purl");
+    assert_eq!(pkg.path, pkg_dir);
+    assert_eq!(pkg.name, "Newtonsoft.Json");
+    assert_eq!(pkg.version, "13.0.3");
 }
 
 /// PURL with a case-mismatched name. NuGet package names are
@@ -104,7 +107,7 @@ async fn find_by_purls_legacy_layout_finds_package() {
 #[tokio::test]
 async fn find_by_purls_case_insensitive_legacy_layout() {
     let tmp = tempfile::tempdir().unwrap();
-    let _pkg_dir = stage_legacy_pkg(tmp.path(), "newtonsoft.json", "13.0.3").await;
+    let staged = stage_legacy_pkg(tmp.path(), "newtonsoft.json", "13.0.3").await;
 
     let crawler = NuGetCrawler;
     let result = crawler
@@ -117,10 +120,20 @@ async fn find_by_purls_case_insensitive_legacy_layout() {
         "package must be found via either fast or case-insensitive path"
     );
     let found = result.get(ORG_PURL_A).unwrap();
-    // Either casing is acceptable; the contract is "matched something".
-    assert!(
-        found.path.exists(),
-        "returned path must exist; got {:?}",
+    // The reported name/version always preserve the PURL's original casing.
+    assert_eq!(found.name, "Newtonsoft.Json");
+    assert_eq!(found.version, "13.0.3");
+    // Either casing of the on-disk dir is acceptable, but the returned path
+    // must resolve to the one dir we actually staged — not some unrelated
+    // path that merely happens to exist. canonicalize folds the case so the
+    // assertion holds on both case-sensitive (Linux) and case-insensitive
+    // (macOS/Windows) filesystems.
+    let found_canon = std::fs::canonicalize(&found.path)
+        .unwrap_or_else(|e| panic!("returned path must exist: {:?}: {e}", found.path));
+    let staged_canon = std::fs::canonicalize(&staged).unwrap();
+    assert_eq!(
+        found_canon, staged_canon,
+        "returned path must resolve to the staged package dir; got {:?}",
         found.path
     );
 }
@@ -167,10 +180,28 @@ async fn crawl_all_discovers_global_cache_layout() {
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 2);
-    // The crawler lowercases the discovered name from the directory.
-    let purls: Vec<String> = result.iter().map(|p| p.purl.to_ascii_lowercase()).collect();
-    assert!(purls.iter().any(|p| p.contains("newtonsoft.json")));
-    assert!(purls.iter().any(|p| p.contains("serilog")));
+    // The crawler lowercases the discovered name from the directory, so the
+    // emitted PURLs must be exactly the lowercased originals — substring
+    // matching would accept a wrong version or a malformed PURL.
+    let mut purls: Vec<String> = result.iter().map(|p| p.purl.clone()).collect();
+    purls.sort_unstable();
+    let mut expected = vec![ORG_PURL_A.to_ascii_lowercase(), ORG_PURL_B.to_ascii_lowercase()];
+    expected.sort_unstable();
+    assert_eq!(
+        purls, expected,
+        "expected exactly the two staged PURLs (lowercased); got {result:?}"
+    );
+    // Names and versions must round-trip too.
+    let nj = result
+        .iter()
+        .find(|p| p.name == "newtonsoft.json")
+        .expect("newtonsoft.json must be discovered");
+    assert_eq!(nj.version, "13.0.3");
+    let serilog = result
+        .iter()
+        .find(|p| p.name == "serilog")
+        .expect("serilog must be discovered");
+    assert_eq!(serilog.version, "4.0.0");
 }
 
 #[tokio::test]
@@ -187,10 +218,27 @@ async fn crawl_all_discovers_legacy_layout() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(
-        result.len() >= 2,
-        "legacy layout must be discovered; got {result:?}"
+    // Legacy layout preserves the original folder casing in the name/version,
+    // so the PURLs are the un-lowercased originals. Assert the exact set —
+    // `>= 2` would tolerate phantom packages or a botched parse.
+    let mut purls: Vec<String> = result.iter().map(|p| p.purl.clone()).collect();
+    purls.sort_unstable();
+    let mut expected = vec![ORG_PURL_A.to_string(), ORG_PURL_B.to_string()];
+    expected.sort_unstable();
+    assert_eq!(
+        purls, expected,
+        "legacy layout must yield exactly the two staged PURLs; got {result:?}"
     );
+    let nj = result
+        .iter()
+        .find(|p| p.name == "Newtonsoft.Json")
+        .expect("Newtonsoft.Json must be discovered with original casing");
+    assert_eq!(nj.version, "13.0.3");
+    let serilog = result
+        .iter()
+        .find(|p| p.name == "Serilog")
+        .expect("Serilog must be discovered with original casing");
+    assert_eq!(serilog.version, "4.0.0");
 }
 
 #[tokio::test]
@@ -376,6 +424,12 @@ async fn find_by_purls_with_lib_dir_marker_succeeds() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
+    let pkg = result.get(ORG_PURL_A).expect("lib/-only dir must match");
+    // It must resolve to the global-cache dir we staged (lib/ marker path),
+    // not some other coincidental match.
+    assert_eq!(pkg.path, pkg_dir);
+    assert_eq!(pkg.name, "Newtonsoft.Json");
+    assert_eq!(pkg.version, "13.0.3");
 }
 
 #[path = "common/mod.rs"]
@@ -421,7 +475,19 @@ async fn crawl_all_handles_unreadable_version_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg_name_dir = tmp.path().join("blocked-name");
     tokio::fs::create_dir(&pkg_name_dir).await.unwrap();
+    // Stage a VALID version subdir DIRECTLY inside the name dir *before*
+    // blocking it. `pkg_name_dir` is itself the package-name directory, so the
+    // version folder must be its direct child (scan_global_cache_package
+    // read_dir's it). Without the chmod this would be discovered as
+    // `pkg:nuget/blocked-name@1.0.0`, proving the chmod — not an empty dir — is
+    // what suppresses it. Otherwise the assertion would be vacuous.
+    let ver_dir = pkg_name_dir.join("1.0.0");
+    tokio::fs::create_dir_all(ver_dir.join("lib")).await.unwrap();
     common::chmod_unreadable(&pkg_name_dir);
+    // Stage a readable sibling package so we prove the top-level scan actually
+    // ran and only the blocked name dir was dropped — not that scanning bailed
+    // out entirely.
+    let _ = stage_global_cache_pkg(tmp.path(), "Serilog", "4.0.0").await;
 
     let crawler = NuGetCrawler;
     let opts = CrawlerOptions {
@@ -433,7 +499,13 @@ async fn crawl_all_handles_unreadable_version_dir() {
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&pkg_name_dir);
 
-    assert!(result.is_empty(), "unreadable version dir must yield empty");
+    // The blocked name dir contributes nothing; the readable sibling is found.
+    let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert_eq!(
+        purls,
+        vec![ORG_PURL_B.to_ascii_lowercase().as_str()],
+        "only the readable sibling must be discovered; got {result:?}"
+    );
 }
 
 /// `scan_package_dir` skips entries that are not directories — covers
@@ -479,12 +551,6 @@ async fn crawl_all_missing_pkg_path_returns_empty() {
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
-}
-
-// Marker so ORG_PURL_B import isn't unused.
-#[allow(dead_code)]
-fn _used_in_doc() -> &'static str {
-    ORG_PURL_B
 }
 
 // ── NuGetCrawler construction ─────────────────────────────────

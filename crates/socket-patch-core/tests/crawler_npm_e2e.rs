@@ -422,7 +422,21 @@ async fn find_by_purls_unscoped_package() {
         .find_by_purls(&nm, &["pkg:npm/lodash@4.17.21".to_string()])
         .await
         .unwrap();
-    assert_eq!(result.len(), 1);
+    assert_eq!(result.len(), 1, "exactly one match expected");
+    // Map MUST be keyed by the requested purl, and the resolved package
+    // must describe lodash@4.17.21 (not some other staged dir).
+    let pkg = result
+        .get("pkg:npm/lodash@4.17.21")
+        .expect("result must be keyed by the requested purl");
+    assert_eq!(pkg.name, "lodash");
+    assert_eq!(pkg.version, "4.17.21");
+    assert_eq!(pkg.namespace, None);
+    assert_eq!(pkg.purl, "pkg:npm/lodash@4.17.21");
+    assert_eq!(
+        pkg.path,
+        nm.join("lodash"),
+        "path must point at the on-disk package dir"
+    );
 }
 
 #[tokio::test]
@@ -436,7 +450,19 @@ async fn find_by_purls_scoped_package() {
         .find_by_purls(&nm, &["pkg:npm/@types/node@20.0.0".to_string()])
         .await
         .unwrap();
-    assert_eq!(result.len(), 1);
+    assert_eq!(result.len(), 1, "exactly one match expected");
+    let pkg = result
+        .get("pkg:npm/@types/node@20.0.0")
+        .expect("result must be keyed by the requested scoped purl");
+    assert_eq!(pkg.name, "node");
+    assert_eq!(pkg.version, "20.0.0");
+    assert_eq!(pkg.namespace.as_deref(), Some("@types"));
+    assert_eq!(pkg.purl, "pkg:npm/@types/node@20.0.0");
+    assert_eq!(
+        pkg.path,
+        nm.join("@types").join("node"),
+        "scoped path must include the @scope segment"
+    );
 }
 
 #[tokio::test]
@@ -558,9 +584,30 @@ async fn crawl_all_discovers_unscoped_and_scoped() {
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
-    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"lodash"));
-    assert!(names.contains(&"node"));
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly the two staged packages, no spurious entries; got {result:?}"
+    );
+
+    let lodash = result
+        .iter()
+        .find(|p| p.name == "lodash")
+        .expect("lodash must be discovered");
+    assert_eq!(lodash.version, "4.17.21");
+    assert_eq!(lodash.namespace, None);
+    assert_eq!(lodash.purl, "pkg:npm/lodash@4.17.21");
+
+    let node = result
+        .iter()
+        .find(|p| p.name == "node")
+        .expect("@types/node must be discovered");
+    assert_eq!(node.version, "20.0.0");
+    assert_eq!(node.namespace.as_deref(), Some("@types"));
+    assert_eq!(
+        node.purl, "pkg:npm/@types/node@20.0.0",
+        "scoped purl must carry the namespace"
+    );
 }
 
 #[tokio::test]
@@ -591,10 +638,18 @@ async fn crawl_all_recurses_into_workspace_packages() {
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
-    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(
-        names.contains(&"lodash"),
-        "workspace recursion must discover nested node_modules; got {names:?}"
+    let lodash = result.iter().find(|p| p.name == "lodash").unwrap_or_else(|| {
+        panic!(
+            "workspace recursion must discover nested node_modules; got {:?}",
+            result.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(lodash.version, "4.17.21");
+    assert_eq!(lodash.purl, "pkg:npm/lodash@4.17.21");
+    assert_eq!(
+        lodash.path,
+        pkg_dir.join("node_modules").join("lodash"),
+        "discovered path must be the nested workspace location"
     );
 }
 
@@ -634,6 +689,13 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
     assert!(
         !names.contains(&"also-not"),
         "SKIP_DIRS dir must be skipped"
+    );
+    // Exactly the one real workspace package — proves the skips are not
+    // merely absent-by-accident alongside unexpected extras.
+    assert_eq!(
+        result.len(),
+        1,
+        "only the real workspace package survives the skip rules; got {names:?}"
     );
 }
 
@@ -754,12 +816,77 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
+
+    // Assert each expected package is present AT its staged version — a
+    // regression that mis-mapped a dir to the wrong metadata, or that
+    // surfaced the hidden/file entries as packages, would change this set.
+    let ver = |n: &str| -> Option<&str> {
+        result
+            .iter()
+            .find(|p| p.name == n)
+            .map(|p| p.version.as_str())
+    };
+    assert_eq!(ver("outer"), Some("1.0.0"));
+    assert_eq!(ver("inner"), Some("2.0.0"));
+    assert_eq!(ver("scoped-pkg"), Some("3.0.0"));
+    assert_eq!(ver("scoped-dep"), Some("4.0.0"));
+    assert_eq!(ver("leaf"), Some("5.0.0"));
+
+    // The scoped entries must retain their namespaces in the purl.
+    let scoped = result.iter().find(|p| p.name == "scoped-pkg").unwrap();
+    assert_eq!(scoped.namespace.as_deref(), Some("@scope"));
+    assert_eq!(scoped.purl, "pkg:npm/@scope/scoped-pkg@3.0.0");
+    let leaf = result.iter().find(|p| p.name == "leaf").unwrap();
+    assert_eq!(leaf.namespace.as_deref(), Some("@nest"));
+    assert_eq!(leaf.purl, "pkg:npm/@nest/leaf@5.0.0");
+
+    // The hidden dir, README.md, and top-level-file.txt must NOT appear
+    // as packages: exactly the five real packages, nothing else.
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"outer"));
-    assert!(names.contains(&"inner"));
-    assert!(names.contains(&"scoped-pkg"));
-    assert!(names.contains(&"scoped-dep"));
-    assert!(names.contains(&"leaf"));
+    assert_eq!(
+        result.len(),
+        5,
+        "only the five real packages, no hidden/file entries; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn crawl_all_discovers_deeply_nested_transitive_deps() {
+    // The npm crawler recurses `node_modules` at UNBOUNDED depth, so a patch
+    // targeting a deeply-nested *transitive* dependency is discovered — and thus
+    // patchable — exactly like a direct dependency (apply is path-agnostic). The
+    // other nested tests stage only 2 levels; this pins 4, so a regression that
+    // capped recursion depth (or stopped descending after the first nested
+    // node_modules) would surface here. See CLI_CONTRACT "Setup command contract"
+    // → "Monorepo / multi-project discovery model".
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+
+    // a → b → c → d, each staged in the previous package's own node_modules.
+    let a_nm = nm.join("a").join("node_modules");
+    let b_nm = a_nm.join("b").join("node_modules");
+    let c_nm = b_nm.join("c").join("node_modules");
+    stage_npm_pkg(&nm, "a", "1.0.0").await;
+    stage_npm_pkg(&a_nm, "b", "2.0.0").await;
+    stage_npm_pkg(&b_nm, "c", "3.0.0").await;
+    stage_npm_pkg(&c_nm, "d", "4.0.0").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let ver = |n: &str| -> Option<&str> {
+        result.iter().find(|p| p.name == n).map(|p| p.version.as_str())
+    };
+    assert_eq!(ver("a"), Some("1.0.0"), "direct dep at depth 1");
+    assert_eq!(ver("b"), Some("2.0.0"), "transitive at depth 2");
+    assert_eq!(ver("c"), Some("3.0.0"), "transitive at depth 3");
+    assert_eq!(
+        ver("d"),
+        Some("4.0.0"),
+        "the depth-4 transitive dep must still be discovered (unbounded recursion)"
+    );
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(result.len(), 4, "exactly the four chained packages; got {names:?}");
 }
 
 #[tokio::test]

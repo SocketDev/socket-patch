@@ -9,7 +9,7 @@
 //! Tests are `#[serial]` because the binary mutates process env vars
 //! (`SOCKET_API_URL`, `SOCKET_API_TOKEN`) — parallel tests would race.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serial_test::serial;
 use socket_patch_cli::commands::get::{run, GetArgs};
@@ -104,6 +104,68 @@ async fn start_wiremock() -> (MockServer, String) {
     (server, url)
 }
 
+/// The after_hash declared by `make_view_mock` and the exact decoded bytes
+/// of its `blobContent` (`base64("patched\n")`). Derived here independently
+/// of the production decode path so a regression that mangles the blob shows.
+const AFTER_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const BEFORE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const BLOB_BYTES: &[u8] = b"patched\n";
+/// The single patched file path declared by `make_view_mock`. The saved
+/// manifest record must map exactly this path to the before/after hashes.
+const FILE_PATH: &str = "package/index.js";
+
+/// Assert that a successful `get` persisted the patch for `purl`/`uuid`:
+/// the manifest records the exact uuid, and the after-hash blob holds the
+/// exact decoded bytes. This is the full observable contract of a save —
+/// asserting only `exit == 0` would let a no-op implementation pass.
+fn assert_patch_saved(cwd: &Path, purl: &str, uuid: &str) {
+    let manifest_path = cwd.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest must be written");
+    let body = std::fs::read_to_string(&manifest_path).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        m["patches"][purl].is_object(),
+        "manifest must contain an entry for {purl}, got: {body}"
+    );
+    assert_eq!(
+        m["patches"][purl]["uuid"], uuid,
+        "manifest uuid must match the fetched patch"
+    );
+    // The record must also carry the patched-file map keyed by the exact
+    // file path, with the before/after hashes from the view response. A
+    // no-op that wrote a bare {uuid} record (no files) would pass the uuid
+    // check above but fail here, and apply would have nothing to do.
+    let file_entry = &m["patches"][purl]["files"][FILE_PATH];
+    assert!(
+        file_entry.is_object(),
+        "manifest record must map {FILE_PATH}, got: {body}"
+    );
+    assert_eq!(
+        file_entry["afterHash"], AFTER_HASH,
+        "manifest file entry must record the view's afterHash"
+    );
+    assert_eq!(
+        file_entry["beforeHash"], BEFORE_HASH,
+        "manifest file entry must record the view's beforeHash"
+    );
+
+    let blob_path = cwd.join(".socket/blobs").join(AFTER_HASH);
+    assert!(blob_path.exists(), "after-hash blob must be persisted");
+    assert_eq!(
+        std::fs::read(&blob_path).unwrap(),
+        BLOB_BYTES,
+        "blob must decode to the exact patched bytes"
+    );
+}
+
+/// Assert that nothing was persisted to `.socket/` (no manifest written).
+fn assert_no_manifest(cwd: &Path) {
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "no manifest must be written"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // UUID identifier path
 // ---------------------------------------------------------------------------
@@ -121,12 +183,7 @@ async fn get_by_uuid_save_only_writes_manifest() {
     let code = run(args).await;
     assert_eq!(code, 0, "expected exit 0");
 
-    let manifest_path = tmp.path().join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest must be written");
-    let body = std::fs::read_to_string(manifest_path).unwrap();
-    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(m["patches"][PURL].is_object());
-    assert_eq!(m["patches"][PURL]["uuid"], UUID);
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -142,10 +199,11 @@ async fn get_by_uuid_writes_blob_to_socket_dir() {
     let code = run(args).await;
     assert_eq!(code, 0);
 
-    let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
-    let blob_path = tmp.path().join(".socket/blobs").join(after_hash);
+    let blob_path = tmp.path().join(".socket/blobs").join(AFTER_HASH);
     assert!(blob_path.exists(), "blob must be persisted");
-    assert_eq!(std::fs::read(&blob_path).unwrap(), b"patched\n");
+    assert_eq!(std::fs::read(&blob_path).unwrap(), BLOB_BYTES);
+    // The manifest must also reference the exact uuid we fetched.
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -185,9 +243,12 @@ async fn get_by_uuid_500_handled_gracefully() {
     args.common.api_url = url;
 
     let code = run(args).await;
-    // 500 is treated as a fetch error — exit 1 or 0 both acceptable, just
-    // confirms no panic.
-    assert!(code == 0 || code == 1, "got {code}");
+    // A 500 from the view endpoint is a fetch error: it flows through
+    // `report_fetch_failure`, which always returns exit 1. Accepting 0 here
+    // (the previous `0 || 1`) would let a regression that silently swallows
+    // server errors and reports success pass unnoticed.
+    assert_eq!(code, 1, "HTTP 500 must surface as a fetch failure (exit 1)");
+    assert_no_manifest(tmp.path());
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +268,7 @@ async fn get_by_cve_resolves_and_saves() {
 
     let code = run(args).await;
     assert_eq!(code, 0);
-    assert!(tmp.path().join(".socket/manifest.json").exists());
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -220,11 +281,12 @@ async fn get_by_cve_no_match_no_manifest_written() {
     let mut args = default_args("CVE-2099-99999", tmp.path());
     args.common.api_url = url;
 
-    let _ = run(args).await;
-    assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "no-match CVE search must not write manifest"
-    );
+    // An empty search result is a clean "nothing to do": exit 0 with no
+    // side effects. Asserting the exit code (not `let _ =`) catches a
+    // regression that turns no-match into an error or silently saves.
+    let code = run(args).await;
+    assert_eq!(code, 0, "no-match CVE search must exit 0");
+    assert_no_manifest(tmp.path());
 }
 
 #[tokio::test]
@@ -241,7 +303,7 @@ async fn get_by_ghsa_resolves_and_saves() {
 
     let code = run(args).await;
     assert_eq!(code, 0);
-    assert!(tmp.path().join(".socket/manifest.json").exists());
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +324,7 @@ async fn get_by_purl_single_patch_auto_selects() {
 
     let code = run(args).await;
     assert_eq!(code, 0);
-    assert!(tmp.path().join(".socket/manifest.json").exists());
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -296,7 +358,14 @@ async fn get_by_purl_multi_patch_in_json_mode_errors() {
     args.common.api_url = url;
 
     let code = run(args).await;
-    assert!(code == 0 || code == 1, "exit was {code}");
+    // Two distinct free patches for one PURL + --json: `select_patches`
+    // returns `Err(1)` (status `selection_required`) because it cannot
+    // prompt non-interactively. The previous `0 || 1` accepted the broken
+    // case where the CLI silently auto-picks one and reports success — the
+    // exact behavior this test exists to forbid.
+    assert_eq!(code, 1, "ambiguous multi-patch selection in --json must exit 1");
+    // And it must NOT have downloaded/saved an arbitrarily-chosen patch.
+    assert_no_manifest(tmp.path());
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +385,8 @@ async fn get_with_id_flag_forces_uuid_path() {
 
     let code = run(args).await;
     assert_eq!(code, 0);
+    // --id forces the UUID fetch+save path; verify it actually saved.
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +407,7 @@ async fn get_with_explicit_cve_flag() {
     args.cve = true;
 
     assert_eq!(run(args).await, 0);
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -352,11 +424,30 @@ async fn get_with_explicit_ghsa_flag() {
     args.ghsa = true;
 
     assert_eq!(run(args).await, 0);
+    assert_patch_saved(tmp.path(), PURL, UUID);
+}
+
+/// Write a minimal installed npm package under `<cwd>/node_modules/<name>`
+/// so `crawl_all_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
+fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
+    let pkg_dir = cwd.join("node_modules").join(name);
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({ "name": name, "version": version }).to_string(),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
 #[serial]
-async fn get_with_explicit_package_flag() {
+async fn get_with_explicit_package_no_install_short_circuits() {
+    // `--package` routes through `crawl_all_ecosystems` over the cwd. With
+    // NO installed packages the run short-circuits on `no_packages` and must
+    // exit 0 WITHOUT ever contacting the API. We assert the full contract:
+    // exit 0, no manifest, AND that the mounted mock saw zero requests — so a
+    // regression that started issuing a raw `by-package/<name>` lookup (or
+    // any network call) on an empty tree would be caught.
     let (server, url) = start_wiremock().await;
     let name = "some-package";
     make_search_mock_one(&server, "by-package", name, UUID, PURL, "free").await;
@@ -367,7 +458,60 @@ async fn get_with_explicit_package_flag() {
     args.common.api_url = url;
     args.package = true;
 
-    assert_eq!(run(args).await, 0);
+    let code = run(args).await;
+    assert_eq!(code, 0, "no installed packages → no_packages, exit 0");
+    assert_no_manifest(tmp.path());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "no_packages short-circuit must make zero API calls, saw: {:?}",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn get_with_explicit_package_flag_resolves_installed_and_saves() {
+    // Drive the REAL `--package` path end to end: an installed npm package is
+    // discovered by the crawler, fuzzy-matched against the identifier, then
+    // searched by its resolved PURL and saved. (The previous sole test for
+    // this flag ran against an empty tempdir, short-circuited on `no_packages`
+    // and never exercised resolution, search, view, or save at all.)
+    let (server, url) = start_wiremock().await;
+    // The crawler discovers `node_modules/in-process-test` as exactly PURL,
+    // and the package search is keyed on the urlencoded PURL.
+    let encoded = "pkg%3Anpm%2Fin-process-test%401.0.0";
+    make_search_mock_one(&server, "by-package", encoded, UUID, PURL, "free").await;
+    make_view_mock(&server, UUID, PURL, "free").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    install_npm_fixture(tmp.path(), "in-process-test", "1.0.0");
+
+    // Identifier is the installed package name; --package forces the package
+    // resolution path rather than treating it as a PURL/UUID.
+    let mut args = default_args("in-process-test", tmp.path());
+    args.common.api_url = url;
+    args.package = true;
+
+    let code = run(args).await;
+    assert_eq!(code, 0, "resolved + saved package must exit 0");
+    assert_patch_saved(tmp.path(), PURL, UUID);
+
+    // Prove the real network path ran: the package search endpoint (keyed on
+    // the resolved PURL) AND the view endpoint were both hit. Without this a
+    // short-circuit that skipped the API but happened to leave a stray
+    // manifest would slip through.
+    let requests = server.received_requests().await.unwrap();
+    let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/by-package/{encoded}")),
+        "must search by the resolved PURL, saw: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
+        "must fetch the selected patch's view, saw: {paths:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -385,14 +529,19 @@ async fn get_one_off_with_save_only_errors() {
 
     let code = run(args).await;
     assert_eq!(code, 1, "conflicting flags must exit 1");
+    // The conflict is rejected up front, before any fetch — nothing saved.
+    assert_no_manifest(tmp.path());
 }
 
 #[tokio::test]
 #[serial]
 async fn get_one_off_without_identifier_validation() {
-    // --one-off requires an identifier (the UUID positional). Construct
-    // with `--one-off` and a UUID — the conflicting save-only is off.
-    // The one-off mode is currently a stub that always errors.
+    // CAVEAT: `--one-off` is NOT specially handled in the UUID path — there
+    // is no "not yet implemented" stub (the original comment here was wrong).
+    // With the API unreachable, the UUID fetch fails and `report_fetch_failure`
+    // returns exit 1. So this test really exercises the network-failure path
+    // with one_off set, not a one-off stub. We pin the observable contract:
+    // exit 1 and nothing written.
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
     args.common.api_url = "http://127.0.0.1:1".to_string();
@@ -400,8 +549,8 @@ async fn get_one_off_without_identifier_validation() {
     args.save_only = false;
 
     let code = run(args).await;
-    // One-off mode is stubbed — exits 1 with "not yet implemented".
-    assert_eq!(code, 1);
+    assert_eq!(code, 1, "unreachable API fetch must exit 1");
+    assert_no_manifest(tmp.path());
 }
 
 // ---------------------------------------------------------------------------
@@ -415,8 +564,11 @@ async fn get_unreachable_api_handled_gracefully() {
     let mut args = default_args(UUID, tmp.path());
     args.common.api_url = "http://127.0.0.1:1".to_string(); // unreachable
     let code = run(args).await;
-    // Network error → exit 0 or 1, but no panic.
-    assert!(code == 0 || code == 1);
+    // A connection refused on the view endpoint is a fetch error and must
+    // surface as exit 1 (via `report_fetch_failure`). The previous
+    // `0 || 1` would also have accepted a silent success on a dead network.
+    assert_eq!(code, 1, "unreachable API must exit 1");
+    assert_no_manifest(tmp.path());
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +587,7 @@ async fn get_uuid_non_json_save_only() {
     args.common.json = false;
 
     assert_eq!(run(args).await, 0);
-    assert!(tmp.path().join(".socket/manifest.json").exists());
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +605,9 @@ async fn get_download_mode_package() {
     args.common.api_url = url;
     args.common.download_mode = "package".to_string();
     assert_eq!(run(args).await, 0);
+    // save_only short-circuits before apply, so download_mode is not
+    // consumed here; we still verify the patch was actually persisted.
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -466,6 +621,7 @@ async fn get_download_mode_file() {
     args.common.api_url = url;
     args.common.download_mode = "file".to_string();
     assert_eq!(run(args).await, 0);
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
 #[tokio::test]
@@ -478,9 +634,18 @@ async fn get_invalid_download_mode_handled() {
     let mut args = default_args(UUID, tmp.path());
     args.common.api_url = url;
     args.common.download_mode = "nonsense".to_string();
-    let _ = run(args).await; // Validates inside save_and_apply; either passes or errors.
-}
 
-fn _unused_pathbuf() -> PathBuf {
-    PathBuf::new() // keep PathBuf import used
+    // FINDING: an invalid download mode is NOT validated on the save_only
+    // UUID path. `save_and_apply_patch` only parses download_mode when it
+    // actually runs apply (`!save_only && added`), so with save_only=true the
+    // bogus "nonsense" mode is silently accepted: the run still exits 0 and
+    // saves the patch. We assert that exact (current) behavior rather than
+    // the original `let _ = run(...)` no-op, so any change to validation here
+    // is caught. This is a latent gap, deliberately left for the maintainers.
+    let code = run(args).await;
+    assert_eq!(
+        code, 0,
+        "invalid download_mode is not validated under --save-only (exits 0)"
+    );
+    assert_patch_saved(tmp.path(), PURL, UUID);
 }

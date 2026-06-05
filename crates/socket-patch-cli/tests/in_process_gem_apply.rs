@@ -207,13 +207,50 @@ async fn gem_install_scan_sync_patches_real_file() {
         vex: Default::default(),
     };
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(code, 0, "scan --sync should succeed when the patch applies cleanly");
 
-    let after = std::fs::read(&lib_file).expect("read after");
+    // The apply must have driven the REAL code path end to end:
+    //   crawler discovers the gem -> POSTs its purl to /batch -> fetches the
+    //   blob from /view/{UUID} -> writes it. Assert every link so the apply
+    //   cannot "pass" via an incidental fetch or a short-circuit.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server recorded requests");
+    let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
+    let batch_path = format!("/v0/orgs/{ORG}/patches/batch");
+    let discovered = requests.iter().any(|r| {
+        r.url.path() == batch_path && String::from_utf8_lossy(&r.body).contains(purl.as_str())
+    });
     assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", lib_file.display()
+        discovered,
+        "crawler did not discover the installed gem: no batch request carried {purl}"
+    );
+    let view_path = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
+    let view_hits = requests
+        .iter()
+        .filter(|r| r.url.path() == view_path)
+        .count();
+    assert!(
+        view_hits >= 1,
+        "view endpoint never fetched — apply short-circuited (paths seen: {:?})",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+
+    // Verify the file on disk is EXACTLY the patched fixture, byte-for-byte.
+    // A substring/marker search would tolerate a partial or corrupted write;
+    // exact equality (derived independently from `original` + marker) does not.
+    let after = std::fs::read(&lib_file).expect("read after");
+    assert_ne!(after, original, "file unchanged — patch was not applied");
+    assert_eq!(
+        after, patched,
+        "applied file does not match the patched fixture byte-for-byte"
+    );
+    // And the on-disk content must hash to the patch's declared afterHash.
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "post-apply file hash does not match the patch afterHash"
     );
 }
 
@@ -225,7 +262,10 @@ async fn gem_crawler_finds_real_installed_gem() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _ = install_colorize(tmp.path());
+    let lib_file = install_colorize(tmp.path());
+    // A scan WITHOUT --sync is read-only; capture the installed file so we can
+    // prove it is left byte-for-byte untouched after discovery.
+    let before_scan = std::fs::read(&lib_file).expect("read colorize.rb before scan");
 
     let server = MockServer::start().await;
     let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
@@ -268,4 +308,32 @@ async fn gem_crawler_finds_real_installed_gem() {
         vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
+
+    // Exit 0 alone is vacuous: a scan that discovers NOTHING also exits 0.
+    // Prove the crawler actually found the installed gem by asserting the
+    // batch request carried its purl. Without discovery, no such request
+    // (or an empty one) would have been sent.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server recorded requests");
+    let batch_path = format!("/v0/orgs/{ORG}/patches/batch");
+    let discovered = requests.iter().any(|r| {
+        r.url.path() == batch_path
+            && String::from_utf8_lossy(&r.body).contains(purl.as_str())
+    });
+    assert!(
+        discovered,
+        "crawler did not discover the installed gem: no batch request carried {purl}"
+    );
+
+    // A discovery-only scan (no --sync, no --apply) must not mutate any
+    // installed file. This catches a regression where scan silently writes
+    // patches behind the user's back during a read-only pass.
+    let after_scan = std::fs::read(&lib_file).expect("read colorize.rb after scan");
+    assert_eq!(
+        after_scan, before_scan,
+        "read-only scan mutated the installed gem file at {}",
+        lib_file.display()
+    );
 }

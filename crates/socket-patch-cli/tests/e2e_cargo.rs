@@ -30,14 +30,56 @@ fn run(args: &[&str], cwd: &std::path::Path) -> Output {
         .expect("Failed to run socket-patch binary")
 }
 
+/// Run `socket-patch scan --json ...`, assert the process succeeded, and
+/// return the parsed JSON envelope from stdout.
+///
+/// Parsing (rather than substring matching) means a malformed or missing
+/// envelope fails the test loudly instead of slipping past a `.contains()`
+/// check. Doing this offline is safe: the package *count* is derived from the
+/// local crawl and is emitted regardless of whether the API query succeeds.
+fn scan_json(cwd: &std::path::Path) -> serde_json::Value {
+    let output = run(&["scan", "--json", "--cwd", cwd.to_str().unwrap()], cwd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "scan --json should exit 0, got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json must emit valid JSON ({e}), got:\n{stdout}"));
+    // The discovery contract is "success" — guard the envelope shape so a
+    // regression that swaps the status (or drops the field, yielding Null)
+    // is caught here rather than slipping past the count assertion below.
+    assert_eq!(
+        value["status"], "success",
+        "scan --json envelope must report status=success; got:\n{value:#}"
+    );
+    value
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Verify that `socket-patch scan` discovers crates in a fake registry layout.
+/// Verify that `socket-patch scan` discovers crates in a registry-cache layout
+/// (`$CARGO_HOME/registry/src/index.crates.io-*/<name>-<version>/`).
 #[test]
 fn scan_discovers_fake_registry_crates() {
     let dir = tempfile::tempdir().unwrap();
+
+    // The crawler only falls back to scanning the global `$CARGO_HOME`
+    // registry when the cwd actually looks like a Rust project (has a
+    // `Cargo.toml` / `Cargo.lock`). Without this manifest the registry path
+    // is never exercised and discovery silently returns zero — which the old
+    // `contains("packages")` assertion happily accepted via the
+    // "No packages found" message. Provide the manifest so the registry
+    // branch is genuinely taken.
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
 
     // Set up a fake CARGO_HOME/registry/src/index.crates.io-xxx/ structure
     let index_dir = dir
@@ -65,20 +107,41 @@ fn scan_discovers_fake_registry_crates() {
     )
     .unwrap();
 
-    // Run scan (will fail to connect to API, but we just check discovery)
+    // --- JSON path: assert the exact discovered count, not just "non-zero".
+    let json = scan_json(dir.path());
+    assert_eq!(
+        json["scannedPackages"], 2,
+        "scan must discover exactly the two registry crates (serde + tokio); got:\n{json:#}"
+    );
+
+    // --- Human path: the count must be attributed to the *cargo* ecosystem,
+    // proving the registry crawler (not some accidental npm/pypi pickup) is
+    // what found them. This also guards against the old loophole where the
+    // failure message "No packages found" satisfied a `contains("packages")`
+    // check.
     let output = run(&["scan", "--cwd", dir.path().to_str().unwrap()], dir.path());
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}{stderr}");
-
-    // Should discover the crates (output mentions "Found X packages")
+    // Match the exact ecosystem summary, not two loose substrings. The old
+    // `contains("Found 2 packages") && contains("cargo")` was satisfied by an
+    // incidental "cargo" anywhere (the proxy banner, the
+    // "npm/yarn/pnpm/pip/cargo" install hint, a PURL) and would NOT have
+    // caught a stray non-cargo pickup, e.g. `Found 2 packages (1 cargo, 1
+    // npm)`. Requiring `(2 cargo)` proves all of the count is attributed to
+    // the registry crawler.
     assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover crate packages, got:\n{combined}"
+        combined.contains("Found 2 packages (2 cargo)"),
+        "Expected human scan to report exactly 'Found 2 packages (2 cargo)', got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("No packages found"),
+        "scan reported no packages despite a populated registry:\n{combined}"
     );
 }
 
-/// Verify that `socket-patch scan` discovers crates in a vendor layout.
+/// Verify that `socket-patch scan` discovers crates in a vendor layout
+/// (`<cwd>/vendor/<name>/`).
 #[test]
 fn scan_discovers_vendor_crates() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,19 +157,28 @@ fn scan_discovers_vendor_crates() {
     )
     .unwrap();
 
-    // Run scan with JSON output to avoid API calls
-    let output = run(
-        &["scan", "--json", "--cwd", dir.path().to_str().unwrap()],
-        dir.path(),
+    // --- JSON path: exactly one vendored crate must be discovered.
+    let json = scan_json(dir.path());
+    assert_eq!(
+        json["scannedPackages"], 1,
+        "scan must discover exactly the one vendored crate (serde); got:\n{json:#}"
     );
+
+    // --- Human path: the discovery must be attributed to the cargo ecosystem,
+    // and must NOT report "No packages found" (the old loophole).
+    let output = run(&["scan", "--cwd", dir.path().to_str().unwrap()], dir.path());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // JSON output should show scannedPackages >= 1 (the vendor crate)
-    // or at minimum the scan should report finding packages
     let combined = format!("{stdout}{stderr}");
+    // Exact ecosystem summary — see the registry test for why the two-loose-
+    // substring form was a loophole. `(1 cargo)` proves the single discovered
+    // package is the vendored crate and not an accidental npm/pypi pickup.
     assert!(
-        combined.contains("scannedPackages") || combined.contains("Found"),
-        "Expected scan output, got:\n{combined}"
+        combined.contains("Found 1 packages (1 cargo)"),
+        "Expected human scan to report exactly 'Found 1 packages (1 cargo)', got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("No packages found"),
+        "scan reported no packages despite a populated vendor dir:\n{combined}"
     );
 }

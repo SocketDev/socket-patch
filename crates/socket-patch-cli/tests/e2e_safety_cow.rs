@@ -34,9 +34,136 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::{
-    assert_run_ok, git_sha256, git_sha256_file, run, write_blob, write_minimal_manifest,
-    PatchEntry,
+    git_sha256, git_sha256_file, json_string, parse_json_envelope, run, write_blob,
+    write_minimal_manifest, PatchEntry,
 };
+
+// ── Envelope assertions ────────────────────────────────────────────────
+//
+// `assert_run_ok` only proves exit==0; a regression could exit 0 while
+// skipping the patch entirely. These helpers run `apply --json` and pin
+// the *structured* outcome so the CoW tests fail loudly if apply ever
+// stops actually applying (or applies the wrong files).
+
+/// Run `socket-patch apply --json` in `root`, assert exit 0 and a clean
+/// `status:"success"` envelope, and return the parsed envelope.
+fn apply_json_ok(root: &Path) -> serde_json::Value {
+    let (code, stdout, stderr) = run(root, &["apply", "--json"]);
+    assert_eq!(
+        code, 0,
+        "apply --json must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("success"),
+        "apply must report status=success, got:\n{stdout}"
+    );
+    env
+}
+
+/// Assert the envelope carries one `applied` event for `purl` whose
+/// `files[].path` set equals `expected_paths`, each `verified:true` and
+/// `appliedVia:"blob"`, and that `summary.applied >= 1` / `failed == 0`.
+/// This pins that apply genuinely took the patch-write path (a skip or
+/// no-op would surface a different action / zero count).
+fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) {
+    let events = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .unwrap_or_else(|| panic!("envelope missing events array: {env}"));
+    let ev = events
+        .iter()
+        .find(|e| json_string(e, "purl") == Some(purl))
+        .unwrap_or_else(|| panic!("no event for purl {purl} in {env}"));
+    assert_eq!(
+        json_string(ev, "action"),
+        Some("applied"),
+        "expected `applied` action for {purl}, got: {ev}"
+    );
+    let files = ev
+        .get("files")
+        .and_then(|f| f.as_array())
+        .unwrap_or_else(|| panic!("applied event missing files array: {ev}"));
+    let mut got: Vec<String> = files
+        .iter()
+        .map(|f| {
+            assert_eq!(
+                f.get("verified").and_then(|v| v.as_bool()),
+                Some(true),
+                "patched file must report verified:true, got: {f}"
+            );
+            assert_eq!(
+                json_string(f, "appliedVia"),
+                Some("blob"),
+                "patched file must be applied via the staged blob, got: {f}"
+            );
+            json_string(f, "path")
+                .unwrap_or_else(|| panic!("file event missing path: {f}"))
+                .to_string()
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<String> = expected_paths.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "applied file set mismatch for {purl}");
+
+    let summary = env
+        .get("summary")
+        .unwrap_or_else(|| panic!("envelope missing summary: {env}"));
+    assert!(
+        summary.get("applied").and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
+        "summary.applied must be >=1: {env}"
+    );
+    assert_eq!(
+        summary.get("failed").and_then(|v| v.as_u64()),
+        Some(0),
+        "summary.failed must be 0 on a clean apply: {env}"
+    );
+}
+
+/// Assert no patch-time temp files leaked into `pkg_dir`.
+///
+/// Two distinct stagers write into the package directory:
+///   * the atomic writer (`apply::write_atomic`) stages `.socket-stage-*`,
+///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
+///     branches) stages `.socket-cow-*`.
+/// Both must be renamed-over on success or unlinked on failure, so a
+/// completed apply — success OR clean failure — must leave neither prefix
+/// behind.
+///
+/// Crucially, this is the assertion that actually polices CoW's stage
+/// cleanup: only the hardlink/symlink/multi-file scenarios drive
+/// `write_via_stage_rename` and thus ever create a `.socket-cow-*` file.
+/// The regular-file scenario takes the `AlreadyPrivate` fast path, which
+/// never stages a CoW copy — so a CoW stage-file leak is invisible there
+/// and only catchable from the link scenarios.
+fn assert_no_patch_litter(pkg_dir: &Path) {
+    let names: Vec<String> = std::fs::read_dir(pkg_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", pkg_dir.display()))
+        .map(|e| {
+            e.unwrap_or_else(|e| panic!("dir entry error in {}: {e}", pkg_dir.display()))
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    // Sanity: the package's own files are present, so we know we scanned
+    // the right (non-empty) directory rather than passing vacuously over
+    // an empty/wrong path.
+    assert!(
+        names.iter().any(|n| n == "package.json") && names.iter().any(|n| n == "index.js"),
+        "package dir {} listing missing expected files, got: {names:?}",
+        pkg_dir.display()
+    );
+    for name in &names {
+        assert!(
+            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
+            "stage / cow temp file leaked into package directory {}: {name}",
+            pkg_dir.display()
+        );
+    }
+}
 
 const TEST_PURL: &str = "pkg:npm/cow-fixture@1.0.0";
 const TEST_UUID: &str = "33333333-3333-4333-8333-333333333333";
@@ -127,7 +254,8 @@ fn apply_breaks_hardlink_before_patching() {
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));
 
     fx.stage_patch();
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // index.js (inside the package) is patched.
     assert_eq!(
@@ -148,6 +276,11 @@ fn apply_breaks_hardlink_before_patching() {
         1,
         "after CoW, the outside file should be a single-link inode"
     );
+    // CoW broke the link via a `.socket-cow-*` stage + rename; that
+    // stage file (and the atomic-writer's `.socket-stage-*`) must be
+    // gone. This is the only scenario class that exercises the CoW
+    // stager, so this is where a stage-cleanup regression would show.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// `node_modules/<pkg>/index.js` is a symlink to an outside file —
@@ -171,7 +304,8 @@ fn apply_replaces_symlink_with_private_file() {
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));
 
     fx.stage_patch();
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // The link has been replaced with a regular file (CoW).
     let post = std::fs::symlink_metadata(fx.index_js()).unwrap();
@@ -190,6 +324,9 @@ fn apply_replaces_symlink_with_private_file() {
         git_sha256(ORIGINAL_BYTES),
         "the symlink target must NOT have been mutated; CoW must replace the link with a private file"
     );
+    // The symlink branch of CoW also stages a `.socket-cow-*` private
+    // copy and renames it over the link; no litter may remain.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// A package with TWO patched files, each hardlinked to a separate
@@ -209,6 +346,17 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     std::fs::write(&outside_b, b"BBB original\n").unwrap();
     std::fs::hard_link(&outside_a, pkg.join("index.js")).unwrap();
     std::fs::hard_link(&outside_b, pkg.join("lib/helper.js")).unwrap();
+
+    // Sanity: both fixtures are genuinely hardlinked (nlink==2) before
+    // apply, so the post-apply nlink==1 checks below prove a real break
+    // rather than a fixture that was never linked.
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().nlink(), 2);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().nlink(), 2);
+    let (ino_a_pre, ino_b_pre) = (
+        std::fs::metadata(&outside_a).unwrap().ino(),
+        std::fs::metadata(&outside_b).unwrap().ino(),
+    );
 
     let before_a = git_sha256(b"AAA original\n");
     let after_a = git_sha256(b"AAA patched!\n");
@@ -235,7 +383,12 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     write_blob(&socket, &after_a, b"AAA patched!\n");
     write_blob(&socket, &after_b, b"BBB patched!\n");
 
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply multi-file");
+    let env = apply_json_ok(fx.root());
+    assert_applied(
+        &env,
+        TEST_PURL,
+        &["package/index.js", "package/lib/helper.js"],
+    );
 
     // Both inside files patched.
     assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), b"AAA patched!\n");
@@ -247,6 +400,45 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     // for every patched file, not just the first.
     assert_eq!(std::fs::read(&outside_a).unwrap(), b"AAA original\n");
     assert_eq!(std::fs::read(&outside_b).unwrap(), b"BBB original\n");
+
+    // Each link was broken: both outside siblings are now single-link
+    // inodes and retain their original inode (the inside copy moved to a
+    // fresh inode, not the sibling). This pins per-file CoW for the
+    // second file too — a loop that broke only the first link would
+    // leave outside_b at nlink==2.
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().nlink(), 1);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().nlink(), 1);
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().ino(), ino_a_pre);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().ino(), ino_b_pre);
+    assert_ne!(
+        std::fs::metadata(pkg.join("index.js")).unwrap().ino(),
+        ino_a_pre,
+        "patched index.js must live in a new private inode"
+    );
+    assert_ne!(
+        std::fs::metadata(pkg.join("lib/helper.js")).unwrap().ino(),
+        ino_b_pre,
+        "patched lib/helper.js must live in a new private inode"
+    );
+
+    // No CoW/stage litter in EITHER directory the per-file stagers
+    // touched: index.js stages in `pkg/`, lib/helper.js stages in
+    // `pkg/lib/`.
+    assert_no_patch_litter(&pkg);
+    let lib_litter: Vec<String> = std::fs::read_dir(pkg.join("lib"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        lib_litter.iter().any(|n| n == "helper.js"),
+        "lib/ listing missing helper.js, got: {lib_litter:?}"
+    );
+    for name in &lib_litter {
+        assert!(
+            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
+            "stage / cow temp file leaked into lib/: {name}"
+        );
+    }
 }
 
 /// Regular files (no hardlink, no symlink) are the common case.
@@ -260,23 +452,18 @@ fn apply_against_regular_file_leaves_no_cow_litter() {
     std::fs::write(fx.index_js(), ORIGINAL_BYTES).unwrap();
     fx.stage_patch();
 
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // File patched.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(PATCHED_BYTES));
 
     // No `.socket-cow-*` or `.socket-stage-*` litter in the package
-    // directory after a successful apply. Stage files are unlinked
-    // after rename; CoW files are unlinked after CoW completes.
-    let pkg_dir = fx.root().join("node_modules/cow-fixture");
-    let mut entries = std::fs::read_dir(&pkg_dir).unwrap();
-    while let Some(Ok(entry)) = entries.next() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        assert!(
-            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
-            "stage / cow temp file leaked into package directory: {name}"
-        );
-    }
+    // directory after a successful apply. (For a regular file the
+    // `AlreadyPrivate` path never stages a `.socket-cow-*` copy, so this
+    // mainly guards the atomic writer's `.socket-stage-*` cleanup here;
+    // the hardlink/symlink tests are what cover the CoW stager.)
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// CoW happens before the atomic write — so on a hash-mismatch
@@ -318,8 +505,55 @@ fn apply_failure_does_not_cow_or_modify() {
     // Wrong bytes under the claimed hash — apply will reject.
     write_blob(&socket, &claimed_after_hash, b"deliberately wrong bytes\n");
 
-    let (code, _stdout, _stderr) = run(fx.root(), &["apply"]);
-    assert_eq!(code, 1, "hash-mismatch apply must exit non-zero");
+    let (code, stdout, stderr) = run(fx.root(), &["apply", "--json"]);
+    assert_eq!(
+        code, 1,
+        "hash-mismatch apply must exit non-zero.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The exit code alone is not enough: a package-not-found or
+    // manifest-read failure ALSO exits 1 and would leave the files
+    // untouched, so the inode/content asserts below would pass
+    // vacuously against a totally broken apply. Pin that the failure
+    // was specifically the pre-write hash-verification gate firing —
+    // that is the precondition for "CoW did not run".
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("partialFailure"),
+        "hash-mismatch apply must report partialFailure: {stdout}"
+    );
+    let summary = env.get("summary").expect("envelope summary");
+    assert_eq!(
+        summary.get("applied").and_then(|v| v.as_u64()),
+        Some(0),
+        "nothing must have been applied: {stdout}"
+    );
+    assert_eq!(
+        summary.get("failed").and_then(|v| v.as_u64()),
+        Some(1),
+        "exactly the one patch must be reported failed: {stdout}"
+    );
+    let ev = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.iter().find(|e| json_string(e, "purl") == Some(TEST_PURL)))
+        .unwrap_or_else(|| panic!("no event for {TEST_PURL}: {stdout}"));
+    assert_eq!(
+        json_string(ev, "action"),
+        Some("failed"),
+        "the patch event must be a failure, not a skip: {ev}"
+    );
+    assert_eq!(
+        json_string(ev, "errorCode"),
+        Some("apply_failed"),
+        "failure must be an apply-time failure (not package_not_installed): {ev}"
+    );
+    let err = json_string(ev, "error").unwrap_or("");
+    assert!(
+        err.contains("Hash verification failed before patch"),
+        "failure must be the pre-write hash-verification gate, got error: {err:?}"
+    );
 
     // Content unchanged on both sides of the hardlink.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));
@@ -332,4 +566,9 @@ fn apply_failure_does_not_cow_or_modify() {
         "failed apply must not break the hardlink"
     );
     assert_eq!(pre_inode, std::fs::metadata(&outside).unwrap().ino());
+
+    // A failed apply must also leave no half-written stage/cow litter
+    // behind: the hash gate fires before any stager runs, so the package
+    // directory must be exactly as clean as on success.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }

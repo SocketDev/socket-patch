@@ -67,6 +67,57 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Plain SHA256 (NOT git-blob) of the content — used as an independent
+/// oracle for the on-disk file after apply. The marker grep alone only
+/// proves the marker is *somewhere* in the file; comparing the full
+/// sha256 against the exact bytes we served proves apply wrote the whole
+/// blob faithfully, catching a partial/garbled/truncated write.
+fn sha256_hex(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+/// Assert the wiremock saw the real scan→sync API path: a batch search
+/// for metadata AND a content fetch via the inline-blob view endpoint.
+/// Without the latter the download→apply content pipeline never ran even
+/// if a marker somehow appeared on disk.
+async fn assert_api_path_exercised(server: &MockServer) {
+    // Use `.expect` (NOT `unwrap_or_default`) so a recording failure surfaces
+    // loudly instead of silently degrading to "no requests seen" — which would
+    // make every assertion below vacuously pass on an empty Vec.
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock should have recorded requests");
+
+    // 1. The batch search POST must have fired AND carried the installed PURL
+    //    in its body. A path-only `.contains("/patches/batch")` check passes
+    //    even if the pypi crawler discovered nothing and sent an empty
+    //    component list, so we assert the discovered PURL actually made it
+    //    onto the wire.
+    let batch = received
+        .iter()
+        .find(|r| format!("{}", r.method) == "POST" && r.url.path().contains("/patches/batch"))
+        .unwrap_or_else(|| panic!("scan should have POSTed /patches/batch; received={received:#?}"));
+    let batch_body = String::from_utf8_lossy(&batch.body);
+    assert!(
+        batch_body.contains(PURL),
+        "batch POST body should reference the discovered pypi purl {PURL}; body={batch_body}"
+    );
+
+    // 2. The blob-download endpoint must have been hit during scan --sync, at
+    //    the EXACT view path for our UUID (a loose `/patches/view/` substring
+    //    would accept a fetch for some other uuid). The offline apply reads the
+    //    blob from the local store, so a green offline apply is only possible
+    //    if scan really downloaded and persisted this blob via this endpoint.
+    assert!(
+        received.iter().any(|r| format!("{}", r.method) == "GET"
+            && r.url.path() == format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
+        "scan --sync should have fetched patch content via /patches/view/{UUID}; received={received:#?}"
+    );
+}
+
 async fn make_mock_server(after_hash: &str) -> MockServer {
     let listener =
         std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
@@ -136,7 +187,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     server
 }
 
-fn local_script(api_url: &str) -> String {
+fn local_script(api_url: &str, expected_sha: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
@@ -155,7 +206,42 @@ ln -sf /workspace/venv .venv
 SIX_PY=$(ls /workspace/venv/lib/python3.*/site-packages/six.py)
 echo "Installed six at: $SIX_PY" >&2
 
-# 2. scan --sync: writes manifest + downloads blob from wiremock.
+# Pristine pre-check: the marker MUST NOT already be present in the freshly
+# pip-installed file. Without this the final marker grep cannot distinguish
+# "apply wrote it" from "it was always there", so the apply assertion would
+# be circular.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
+  echo "FAIL: marker already in $SIX_PY BEFORE apply — fixture not pristine" >&2
+  exit 1
+fi
+
+# 2. scan --json: must DISCOVER the patch via the real batch API before
+#    anything else. A no-op scan also exits 0, so gate on the installed
+#    PURL and the available patch UUID actually appearing in the JSON.
+socket-patch scan --json \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
+  --ecosystems pypi >/tmp/scan.out 2>/tmp/scan.err
+SCAN_RC=$?
+echo "scan exit=$SCAN_RC" >&2
+cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
+
+# 3. scan --sync: writes manifest + downloads blob from wiremock.
 socket-patch scan --json --sync --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems pypi 2>/tmp/sync.err
@@ -163,18 +249,31 @@ SYNC_RC=$?
 echo "sync exit=$SYNC_RC" >&2
 cat /tmp/sync.err >&2 || true
 
-# 3. apply --force --offline: overwrites the installed file using the
+# 4. apply --force --offline: overwrites the installed file using the
 #    blob cached by scan --sync. --force bypasses the (deliberately
-#    mismatched) beforeHash check.
+#    mismatched) beforeHash check. A forced apply MUST report success,
+#    not merely leave a marker behind while reporting failure.
 socket-patch apply --json --force --offline --ecosystems pypi 2>/tmp/apply.err
 APPLY_RC=$?
 echo "apply exit=$APPLY_RC" >&2
 cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
 
-# 4. The on-disk file must now contain the marker.
+# 5. The on-disk file must now contain the marker AND match the served
+#    blob byte-for-byte (an independent sha256 oracle catches a partial
+#    or corrupt write that happens to include the marker).
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
   echo "FAIL: marker not in $SIX_PY" >&2
   head -3 "$SIX_PY" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$SIX_PY" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
+  echo "FAIL: patched six.py content mismatch (expected={expected_sha} actual=$ACTUAL_SHA)" >&2
+  head -5 "$SIX_PY" >&2
   exit 1
 fi
 
@@ -185,7 +284,7 @@ exit 0
     )
 }
 
-fn global_script(api_url: &str) -> String {
+fn global_script(api_url: &str, expected_sha: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
@@ -200,11 +299,43 @@ pip install --disable-pip-version-check --quiet --no-cache-dir \
 SIX_PY=$(python3 -c "import six, sys; sys.stdout.write(six.__file__)")
 echo "Global-installed six at: $SIX_PY" >&2
 
+# Pristine pre-check: marker must NOT already be in the freshly-installed file
+# (otherwise the post-apply marker grep is circular).
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
+  echo "FAIL: marker already in $SIX_PY BEFORE apply — fixture not pristine" >&2
+  exit 1
+fi
+
 # Run in an empty workspace — --global tells socket-patch to scan
 # system site-packages, ignoring the cwd-relative discovery.
 mkdir -p /workspace/proj && cd /workspace/proj
 
-# 2. scan --sync --global.
+# 2. scan --json --global: discovery gate — the global crawler must find
+#    the installed PURL and the available patch UUID via the batch API.
+socket-patch scan --json --global \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
+  --ecosystems pypi >/tmp/scan.out 2>/tmp/scan.err
+SCAN_RC=$?
+echo "scan exit=$SCAN_RC" >&2
+cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --global did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --global did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
+
+# 3. scan --sync --global.
 socket-patch scan --json --sync --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems pypi 2>/tmp/sync.err
@@ -212,15 +343,25 @@ SYNC_RC=$?
 echo "sync exit=$SYNC_RC" >&2
 cat /tmp/sync.err >&2 || true
 
-# 3. apply --global --force --offline.
+# 4. apply --global --force --offline. Must report success.
 socket-patch apply --json --force --offline --global --ecosystems pypi 2>/tmp/apply.err
 APPLY_RC=$?
 echo "apply exit=$APPLY_RC" >&2
 cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
 
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
   echo "FAIL: marker not in $SIX_PY" >&2
   head -3 "$SIX_PY" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$SIX_PY" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
+  echo "FAIL: patched six.py content mismatch (expected={expected_sha} actual=$ACTUAL_SHA)" >&2
+  head -5 "$SIX_PY" >&2
   exit 1
 fi
 
@@ -245,7 +386,7 @@ exit 0
 ///   3. Asserting: (a) venv file inode CHANGED (the hard link was
 ///      broken), (b) cache content hash UNCHANGED (the global cache
 ///      copy is still pristine).
-fn uv_venv_script(api_url: &str) -> String {
+fn uv_venv_script(api_url: &str, expected_sha: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
@@ -270,6 +411,12 @@ ln -sf /workspace/venv .venv
 SIX_PY=$(ls /workspace/venv/lib/python3.*/site-packages/six.py)
 echo "Installed six at: $SIX_PY" >&2
 
+# Pristine pre-check: marker must NOT already be present before apply.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
+  echo "FAIL: marker already in $SIX_PY BEFORE apply — fixture not pristine" >&2
+  exit 1
+fi
+
 SIX_INODE_BEFORE=$(stat -c %i "$SIX_PY")
 SIX_NLINK_BEFORE=$(stat -c %h "$SIX_PY")
 echo "venv six.py inode_before=$SIX_INODE_BEFORE nlink_before=$SIX_NLINK_BEFORE" >&2
@@ -281,13 +428,44 @@ CACHE_TWIN=""
 CACHE_HASH_BEFORE=""
 if [ "$SIX_NLINK_BEFORE" -gt 1 ]; then
   CACHE_TWIN=$(find /root/.cache/uv -inum "$SIX_INODE_BEFORE" 2>/dev/null | head -1 || true)
-  if [ -n "$CACHE_TWIN" ] && [ -f "$CACHE_TWIN" ]; then
-    CACHE_HASH_BEFORE=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
-    echo "cache twin: $CACHE_TWIN hash=$CACHE_HASH_BEFORE" >&2
+  # If the venv file is hard-linked (nlink>1) we MUST be able to locate the
+  # shared cache file — that twin is the whole subject of this test's CoW
+  # assertion. Failing to find it would silently skip the integrity check
+  # below and let a CoW regression pass, so treat a missing twin as a failure
+  # rather than a no-op.
+  if [ -z "$CACHE_TWIN" ] || [ ! -f "$CACHE_TWIN" ]; then
+    echo "FAIL: six.py is hard-linked (nlink=$SIX_NLINK_BEFORE) but no cache twin found under /root/.cache/uv for inode $SIX_INODE_BEFORE — cannot verify CoW isolation" >&2
+    exit 1
   fi
+  CACHE_HASH_BEFORE=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
+  echo "cache twin: $CACHE_TWIN hash=$CACHE_HASH_BEFORE" >&2
 fi
 
-# 4. scan --sync.
+# 4. scan --json: discovery gate.
+socket-patch scan --json \
+  --api-url '{api_url}' --api-token fake --org {ORG} \
+  --ecosystems pypi >/tmp/scan.out 2>/tmp/scan.err
+SCAN_RC=$?
+echo "scan exit=$SCAN_RC" >&2
+cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
+
+# 5. scan --sync.
 socket-patch scan --json --sync --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems pypi 2>/tmp/sync.err
@@ -295,20 +473,31 @@ SYNC_RC=$?
 echo "sync exit=$SYNC_RC" >&2
 cat /tmp/sync.err >&2 || true
 
-# 5. apply --force --offline.
+# 6. apply --force --offline. Must report success.
 socket-patch apply --json --force --offline --ecosystems pypi 2>/tmp/apply.err
 APPLY_RC=$?
 echo "apply exit=$APPLY_RC" >&2
 cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
 
-# 6. The on-disk file must now contain the marker (apply happened).
+# 7. The on-disk file must now contain the marker AND match the served
+#    blob byte-for-byte (apply happened, completely and correctly).
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$SIX_PY"; then
   echo "FAIL: marker not in $SIX_PY" >&2
   head -3 "$SIX_PY" >&2
   exit 1
 fi
+ACTUAL_SHA=$(sha256sum "$SIX_PY" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
+  echo "FAIL: patched six.py content mismatch (expected={expected_sha} actual=$ACTUAL_SHA)" >&2
+  head -5 "$SIX_PY" >&2
+  exit 1
+fi
 
-# 7. If the venv file was hard-linked at install time, the apply
+# 8. If the venv file was hard-linked at install time, the apply
 #    pipeline's CoW guard must have broken the link. We verify two
 #    ways:
 #      (a) nlink dropped to 1 — the venv file is no longer shared
@@ -381,6 +570,44 @@ fn uv_tool_script(_api_url: &str, patched_marker: &str) -> String {
         r#"#!/usr/bin/env bash
 set -uo pipefail
 
+mkdir -p /workspace/proj && cd /workspace/proj
+
+# Helper: parse scannedPackages from scan JSON on stdin. Does NOT default a
+# parse failure to 0 — a missing field or malformed JSON is itself a
+# regression and must surface, not silently degrade.
+parse_scanned() {{
+  python3 -c "import sys,json; print(json.load(sys.stdin)['scannedPackages'])"
+}}
+
+# 0. BASELINE scan BEFORE installing the uv tool. This captures whatever the
+#    Debian dist-packages baseline contributes on its own. An absolute
+#    threshold (>= N) is reward-hackable: if dist-packages alone already has
+#    >= N packages, a completely broken uv-tools discovery branch still passes.
+#    Measuring the DELTA introduced by `uv tool install` isolates the
+#    uv-tools contribution and can only be satisfied if that layout was
+#    actually walked.
+BASELINE_OUT=$(socket-patch scan --json --global --ecosystems pypi 2>/tmp/baseline.err)
+BASELINE_RC=$?
+cat /tmp/baseline.err >&2 || true
+if [ "$BASELINE_RC" -ne 0 ]; then
+  echo "FAIL: baseline scan exited $BASELINE_RC (expected 0)" >&2
+  echo "$BASELINE_OUT" | head -50 >&2
+  exit 1
+fi
+BASELINE=$(echo "$BASELINE_OUT" | parse_scanned)
+if [ "$?" -ne 0 ]; then
+  echo "FAIL: could not parse scannedPackages from baseline scan JSON" >&2
+  echo "$BASELINE_OUT" | head -50 >&2
+  exit 1
+fi
+case "$BASELINE" in
+  ''|*[!0-9]*)
+    echo "FAIL: baseline scannedPackages is not a non-negative integer: '$BASELINE'" >&2
+    exit 1
+    ;;
+esac
+echo "baseline scanned packages (pre uv-tool-install): $BASELINE" >&2
+
 # 1. uv tool install. httpie@3.2.2 is a real pypi package.
 uv tool install --python python3 httpie==3.2.2 >&2
 
@@ -389,32 +616,59 @@ uv tool install --python python3 httpie==3.2.2 >&2
 INIT_PY=$(ls /root/.local/share/uv/tools/httpie/lib/python3.*/site-packages/httpie/__init__.py)
 echo "Installed httpie at: $INIT_PY" >&2
 
-# The pypi docker e2e module's wiremock is keyed on pkg:pypi/six@1.16.0
-# by default; for this uv-tool test the wiremock route hasn't been
-# extended. So we just verify the crawler enumerates the package
-# (proving the uv tools layout is discovered end-to-end). A real
-# apply would need a wiremock route per-tool, which is out of scope
-# for the coverage objective.
-mkdir -p /workspace/proj && cd /workspace/proj
-
-# 3. scan --global with the tools root as global_prefix. The crawler
-#    should enumerate the uv-installed tool packages. The JSON output
-#    reports a `scannedPackages` count but doesn't enumerate by name
-#    (only patched packages are listed). Asserting the count is high
-#    enough (>= the 17 deps uv pulled in for httpie above) is what
-#    proves the uv tools layout was discovered.
+# 3. scan --global AGAIN. The crawler should now additionally enumerate the
+#    uv-installed tool packages under ~/.local/share/uv/tools/. The JSON
+#    output reports a `scannedPackages` count but doesn't enumerate by name
+#    (only patched packages are listed), so we compare the count against the
+#    baseline.
 SCAN_OUT=$(socket-patch scan --json --global --ecosystems pypi 2>/tmp/scan.err)
 SCAN_RC=$?
 echo "scan exit=$SCAN_RC" >&2
 cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  echo "$SCAN_OUT" | head -50 >&2
+  exit 1
+fi
 
-# 4. Extract scannedPackages from the JSON. Asserting > 5 is enough
-#    headroom that we know more than just whatever Debian ships in
-#    /usr/lib/python3/dist-packages got picked up.
-SCANNED=$(echo "$SCAN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('scannedPackages', 0))")
-echo "scanned packages: $SCANNED" >&2
-if [ "$SCANNED" -lt 5 ]; then
-  echo "FAIL: scan found only $SCANNED packages; expected >= 5 (httpie + deps)" >&2
+# 4. Extract scannedPackages. A non-numeric/empty SCANNED would slip past
+#    `[ "" -lt N ]` (that test errors out and the `if` is skipped), so we
+#    validate it is a plain integer before comparing.
+SCANNED=$(echo "$SCAN_OUT" | parse_scanned)
+PARSE_RC=$?
+if [ "$PARSE_RC" -ne 0 ]; then
+  echo "FAIL: could not parse scannedPackages from scan JSON (rc=$PARSE_RC)" >&2
+  echo "$SCAN_OUT" | head -50 >&2
+  exit 1
+fi
+echo "scanned packages (post uv-tool-install): $SCANNED" >&2
+case "$SCANNED" in
+  ''|*[!0-9]*)
+    echo "FAIL: scannedPackages is not a non-negative integer: '$SCANNED'" >&2
+    echo "$SCAN_OUT" | head -50 >&2
+    exit 1
+    ;;
+esac
+
+# `uv tool install httpie` lands ENTIRELY under ~/.local/share/uv/tools/ —
+# it never touches dist-packages. So if the uv-tools discovery branch is
+# broken/dead, the second scan equals the first and the delta is exactly 0.
+# Any positive delta therefore proves the uv tools layout was actually walked,
+# independent of how large the dist-packages baseline happens to be (the old
+# absolute `>= 10` check was reward-hackable: the ~79-package dist-packages
+# baseline alone cleared it while uv-tools discovery could be completely dead).
+#
+# httpie pulls in a dozen-ish deps, but the scannedPackages count dedupes by
+# package name, so deps that overlap dist-packages (requests, urllib3, idna,
+# certifi, …) don't add. Empirically the net-new contribution is ~6 (httpie
+# itself plus its uniquely-named deps like Pygments/requests-toolbelt/
+# multidict). Require >= 3: comfortably above the broken-branch value of 0 and
+# below the observed 6, so it stays robust to minor dep churn without ever
+# passing when the uv tools root is not scanned.
+DELTA=$((SCANNED - BASELINE))
+echo "scanned-packages delta from uv tool install: $DELTA" >&2
+if [ "$DELTA" -lt 3 ]; then
+  echo "FAIL: uv tool install added only $DELTA scanned packages (baseline=$BASELINE post=$SCANNED); expected >= 3 net-new from the uv tools venv. uv tools layout likely not discovered." >&2
   echo "$SCAN_OUT" | head -50 >&2
   exit 1
 fi
@@ -467,15 +721,20 @@ async fn pypi_local_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&api_url, &local_script(&api_url));
+    let expected_sha = sha256_hex(PATCHED_PY);
+    let out = run_container(&api_url, &local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "pypi local apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // Both stage gates must have fired — discovery AND the apply/content
+    // check — not just the script reaching its tail.
+    assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 #[tokio::test]
@@ -486,15 +745,18 @@ async fn pypi_global_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&api_url, &global_script(&api_url));
+    let expected_sha = sha256_hex(PATCHED_PY);
+    let out = run_container(&api_url, &global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "pypi global apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 /// uv-managed venv install + apply. Verifies the apply pipeline's
@@ -509,15 +771,18 @@ async fn pypi_uv_venv_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&api_url, &uv_venv_script(&api_url));
+    let expected_sha = sha256_hex(PATCHED_PY);
+    let out = run_container(&api_url, &uv_venv_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "pypi uv venv apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 /// `uv tool install` + socket-patch scan. Proves the uv-tools

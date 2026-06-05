@@ -1,11 +1,15 @@
 #!/usr/bin/env -S npx tsx
 /**
- * study-crates.ts — drive `claude` once per non-test source file in each crate.
+ * study-crates.ts — drive `claude` once per file in each crate.
  *
- * For every `crates/*\/src/**\/*.rs` file, this spawns a non-interactive Claude
- * Code session with a configurable prompt, streams its output live to stdout,
- * logs incremental progress, and aggregates every session's final result into a
- * single `SUMMARY.md` (plus raw stream logs per file).
+ * By default it walks every `crates/*\/src/**\/*.rs` source file. With
+ * `--target tests` (or `--tests`) it instead walks every `crates/*\/tests/**\/*.rs`
+ * file — integration tests, test harnesses, and shared setup modules
+ * (e.g. `tests/common/mod.rs`). `--target all` does both. For each discovered
+ * file it spawns a non-interactive Claude Code session with a configurable
+ * prompt, streams its output live to stdout, logs incremental progress, and
+ * aggregates every session's final result into a single `SUMMARY.md` (plus raw
+ * stream logs per file).
  *
  * Each session runs with `--dangerously-skip-permissions` and full autonomy
  * (Claude may read/edit code, run commands, etc.). Sessions run sequentially by
@@ -28,6 +32,10 @@
  *   # Fully programmatic prompt via a TS module:
  *   npx tsx scripts/study-crates.ts --prompt-file scripts/study-crates.config.example.ts
  *
+ *   # Audit every test file/harness one at a time for reward-hacked tests:
+ *   npx tsx scripts/study-crates.ts --tests \
+ *     --prompt-file scripts/harden-tests.config.ts
+ *
  * Options:
  *   -p, --prompt <template>   Prompt template string. Placeholders: {file},
  *                             {abspath}, {crate}, {name}, {stem}, {relInCrate}.
@@ -38,6 +46,10 @@
  *   --model <model>           Model passed to claude --model.
  *   --filter <regex>          Only files whose repo-relative path matches.
  *   --crate <name>            Limit to a single crate dir name.
+ *   --target <src|tests|all>  Which files to study (default: src). `tests`
+ *                             walks each crate's tests/ dir (integration tests,
+ *                             harnesses, shared setup modules); `all` does both.
+ *   --tests                   Shorthand for --target tests.
  *   --concurrency <n>         Parallel sessions (default: 1 = sequential).
  *   --timeout <sec>           Per-file timeout in seconds (default: 1800).
  *   --dry-run                 List files + rendered prompts; run nothing.
@@ -52,6 +64,10 @@ import { createInterface } from "node:readline";
 import {
   mkdirSync,
   writeFileSync,
+  appendFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
   createWriteStream,
   readdirSync,
   statSync,
@@ -74,9 +90,22 @@ export interface FileCtx {
   name: string;
   /** Basename without extension, e.g. "lib". */
   stem: string;
-  /** Path relative to the crate's src dir, e.g. "api/client.rs". */
+  /**
+   * Path relative to the crate root dir the file was discovered under
+   * (its `src/` dir for source files, its `tests/` dir for test files),
+   * e.g. "api/client.rs" or "common/mod.rs".
+   */
   relInCrate: string;
+  /**
+   * True when this file came from the crate's `tests/` directory
+   * (an integration test, test harness, or shared setup module) rather
+   * than from `src/`. Prompt renderers can branch on this.
+   */
+  isTest: boolean;
 }
+
+/** Which files study-crates discovers and feeds to claude. */
+export type StudyTarget = "src" | "tests" | "all";
 
 type PromptRenderer = (ctx: FileCtx) => string;
 
@@ -124,8 +153,10 @@ interface Args {
   model?: string;
   filter?: string;
   crate?: string;
+  target: StudyTarget;
   concurrency: number;
   timeoutSec: number;
+  offset: number;
   dryRun: boolean;
   help: boolean;
 }
@@ -133,8 +164,10 @@ interface Args {
 function parseArgs(argv: string[]): Args {
   const a: Args = {
     out: "study-output",
+    target: "src",
     concurrency: 1,
     timeoutSec: 1800,
+    offset: 0,
     dryRun: false,
     help: false,
   };
@@ -165,11 +198,26 @@ function parseArgs(argv: string[]): Args {
       case "--crate":
         a.crate = next();
         break;
+      case "--target": {
+        const v = next();
+        if (v !== "src" && v !== "tests" && v !== "all") {
+          fail(`--target must be one of: src, tests, all (got "${v}")`);
+        }
+        a.target = v;
+        break;
+      }
+      case "--tests":
+        // Convenience shorthand for `--target tests`.
+        a.target = "tests";
+        break;
       case "--concurrency":
         a.concurrency = Math.max(1, parseInt(next(), 10) || 1);
         break;
       case "--timeout":
         a.timeoutSec = Math.max(1, parseInt(next(), 10) || 1800);
+        break;
+      case "--offset":
+        a.offset = Math.max(0, parseInt(next(), 10) || 0);
         break;
       case "--dry-run":
         a.dryRun = true;
@@ -201,8 +249,17 @@ Usage: npx tsx scripts/study-crates.ts [options]
   --model <model>           Model passed to claude --model.
   --filter <regex>          Only files whose repo-relative path matches.
   --crate <name>            Limit to a single crate dir name.
+  --target <src|tests|all>  Which files to study (default: src).
+                            src   = non-test source under each crate's src/.
+                            tests = integration tests, test harnesses, and
+                                    shared setup modules under each crate's
+                                    tests/ dir.
+                            all   = both src and tests.
+  --tests                   Shorthand for --target tests.
   --concurrency <n>         Parallel sessions (default: 1).
   --timeout <sec>           Per-file timeout in seconds (default: 1800).
+  --offset <n>              Skip the first <n> files in the deterministic order
+                            (default: 0). Use to resume after a crash.
   --dry-run                 List files + rendered prompts; run nothing.
   -h, --help                Show this help.
 
@@ -233,34 +290,51 @@ function discoverFiles(args: Args): FileCtx[] {
   const filterRe = args.filter ? new RegExp(args.filter) : undefined;
   const files: FileCtx[] = [];
 
+  // Each crate root we scan, tagged with whether its files are tests. `relInCrate`
+  // is taken relative to the root dir, so it stays meaningful in both modes.
+  const roots: Array<{ subdir: string; isTest: boolean }> = [];
+  if (args.target === "src" || args.target === "all") {
+    roots.push({ subdir: "src", isTest: false });
+  }
+  if (args.target === "tests" || args.target === "all") {
+    roots.push({ subdir: "tests", isTest: true });
+  }
+
   for (const crate of crates) {
-    const srcDir = join(CRATES_DIR, crate, "src");
-    let exists = false;
-    try {
-      exists = statSync(srcDir).isDirectory();
-    } catch {
-      exists = false;
-    }
-    if (!exists) continue;
+    for (const root of roots) {
+      const rootDir = join(CRATES_DIR, crate, root.subdir);
+      let exists = false;
+      try {
+        exists = statSync(rootDir).isDirectory();
+      } catch {
+        exists = false;
+      }
+      if (!exists) continue;
 
-    const abs: string[] = [];
-    walkRs(srcDir, abs);
-    abs.sort();
+      const abs: string[] = [];
+      walkRs(rootDir, abs);
+      abs.sort();
 
-    for (const abspath of abs) {
-      const file = relative(REPO_ROOT, abspath).split("\\").join("/");
-      if (filterRe && !filterRe.test(file)) continue;
-      const name = basename(abspath);
-      files.push({
-        file,
-        abspath,
-        crate,
-        name,
-        stem: name.replace(/\.rs$/, ""),
-        relInCrate: relative(srcDir, abspath).split("\\").join("/"),
-      });
+      for (const abspath of abs) {
+        const file = relative(REPO_ROOT, abspath).split("\\").join("/");
+        if (filterRe && !filterRe.test(file)) continue;
+        const name = basename(abspath);
+        files.push({
+          file,
+          abspath,
+          crate,
+          name,
+          stem: name.replace(/\.rs$/, ""),
+          relInCrate: relative(rootDir, abspath).split("\\").join("/"),
+          isTest: root.isTest,
+        });
+      }
     }
   }
+  // Impose a single, stable total order over the full set so the global index
+  // (and therefore --offset) is deterministic across runs and independent of
+  // crate/root traversal nesting. Sort by repo-relative POSIX path.
+  files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
   return files;
 }
 
@@ -478,23 +552,88 @@ async function runPool<T, R>(
 }
 
 // ---------------------------------------------------------------------------
+// Result persistence (for crash-resume via --offset)
+// ---------------------------------------------------------------------------
+
+/**
+ * Path of the machine-readable result log. One JSON object per line, appended
+ * as each file completes, so a crashed sweep can be resumed with --offset
+ * without losing the work already done. `writeSummary` reads this back to
+ * build a SUMMARY.md spanning every pass, not just the current one.
+ */
+function resultsLogPath(outDir: string): string {
+  return join(outDir, "results.jsonl");
+}
+
+/** Append one completed file's result to the resume log (atomic per call). */
+function appendResult(outDir: string, r: FileResult): void {
+  try {
+    appendFileSync(resultsLogPath(outDir), JSON.stringify(r) + "\n");
+  } catch (err) {
+    // Persistence is best-effort: a failed append must not abort the sweep.
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`  ! could not persist result for ${r.ctx.file}: ${message}`);
+  }
+}
+
+/**
+ * Load all previously-logged results, de-duplicated by file (last write wins,
+ * so a re-run of the same file in a later pass supersedes the earlier one).
+ * Returns an empty array if the log is absent or unreadable.
+ */
+function loadPriorResults(outDir: string): FileResult[] {
+  const path = resultsLogPath(outDir);
+  if (!existsSync(path)) return [];
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const byFile = new Map<string, FileResult>();
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const r = JSON.parse(trimmed) as FileResult;
+      if (r?.ctx?.file) byFile.set(r.ctx.file, r);
+    } catch {
+      // Skip a corrupt/truncated line (e.g. a crash mid-write) rather than fail.
+    }
+  }
+  return [...byFile.values()];
+}
+
+// ---------------------------------------------------------------------------
 // Aggregation
 // ---------------------------------------------------------------------------
 
 function writeSummary(
   outDir: string,
-  results: FileResult[],
+  unordered: FileResult[],
   args: Args,
 ): string {
+  // Results may arrive out of discovery order (concurrency) or merged from a
+  // resume log (Map iteration); impose the same stable path order used for
+  // discovery so the report is deterministic across runs.
+  const results = [...unordered].sort((a, b) =>
+    a.ctx.file < b.ctx.file ? -1 : a.ctx.file > b.ctx.file ? 1 : 0,
+  );
   const ok = results.filter((r) => r.ok);
   const failed = results.filter((r) => !r.ok);
   const totalCost = results.reduce((s, r) => s + r.costUsd, 0);
   const totalMs = results.reduce((s, r) => s + r.durationMs, 0);
 
   const lines: string[] = [];
-  lines.push("# Crate Source Study");
+  const title =
+    args.target === "tests"
+      ? "Crate Test Study"
+      : args.target === "all"
+        ? "Crate Source + Test Study"
+        : "Crate Source Study";
+  lines.push(`# ${title}`);
   lines.push("");
-  lines.push(`Generated by \`scripts/study-crates.ts\`.`);
+  lines.push(`Generated by \`scripts/study-crates.ts\` (target: ${args.target}).`);
   lines.push("");
   lines.push("## Totals");
   lines.push("");
@@ -557,21 +696,43 @@ async function main(): Promise<void> {
     return;
   }
 
-  const files = discoverFiles(args);
-  if (files.length === 0) {
+  const allFiles = discoverFiles(args);
+  if (allFiles.length === 0) {
     fail("No matching source files found.");
+  }
+  if (args.offset >= allFiles.length) {
+    fail(
+      `--offset ${args.offset} skips all ${allFiles.length} discovered file(s); nothing to do.`,
+    );
+  }
+  // Resume support: skip the first `offset` files in the deterministic order.
+  const files =
+    args.offset > 0 ? allFiles.slice(args.offset) : allFiles;
+  if (args.offset > 0) {
+    console.log(
+      `Skipping first ${args.offset} of ${allFiles.length} file(s) (--offset); ` +
+        `${files.length} remaining.`,
+    );
   }
 
   const renderer = await loadRenderer(args);
 
   if (args.dryRun) {
-    console.log(`Discovered ${files.length} non-test source file(s):\n`);
-    for (const ctx of files) {
-      console.log(`• ${ctx.file}`);
+    const label =
+      args.target === "tests"
+        ? "test"
+        : args.target === "all"
+          ? "source + test"
+          : "non-test source";
+    console.log(`Discovered ${files.length} ${label} file(s):\n`);
+    files.forEach((ctx, i) => {
+      // Global index (incl. --offset) so the printed number is the value to
+      // pass as --offset to resume from this file.
+      console.log(`• [${args.offset + i}] ${ctx.file}`);
       const prompt = renderer(ctx);
       const preview = prompt.length > 240 ? prompt.slice(0, 237) + "..." : prompt;
       console.log(`    prompt: ${preview.replace(/\n/g, " ")}`);
-    }
+    });
     console.log(
       `\n(dry run — nothing executed; ${files.length} session(s) would run, ` +
         `concurrency ${args.concurrency})`,
@@ -582,6 +743,19 @@ async function main(): Promise<void> {
   const outDir = resolve(process.cwd(), args.out);
   const rawDir = join(outDir, "raw");
   mkdirSync(rawDir, { recursive: true });
+
+  // Resume support: a fresh run (offset 0) starts the result log clean so a
+  // prior sweep's entries don't leak into this report. A resume (offset > 0)
+  // keeps the log and appends to it, so SUMMARY.md spans every pass.
+  if (args.offset === 0) {
+    rmSync(resultsLogPath(outDir), { force: true });
+  } else {
+    const priorCount = loadPriorResults(outDir).length;
+    console.log(
+      `Resuming: ${priorCount} prior result(s) loaded from ` +
+        `${resultsLogPath(outDir)} will be merged into the report.`,
+    );
+  }
 
   console.log(
     `Studying ${files.length} file(s) with ${CLAUDE_BIN} ` +
@@ -594,8 +768,30 @@ async function main(): Promise<void> {
   const total = files.length;
 
   const results = await runPool(files, args.concurrency, async (ctx, i) => {
-    const prompt = renderer(ctx);
-    const r = await runOne(ctx, prompt, args, i, total, rawDir);
+    // Never let one file's failure abort the whole sweep: any unexpected throw
+    // (e.g. a renderer that blows up on this ctx) is recorded as a failed
+    // result and the pool moves on. runOne itself already resolves on
+    // spawn/timeout/non-zero errors rather than rejecting.
+    let r: FileResult;
+    try {
+      const prompt = renderer(ctx);
+      r = await runOne(ctx, prompt, args, i, total, rawDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(`  ✗ skipped ${ctx.file}: ${message}`);
+      r = {
+        ctx,
+        ok: false,
+        reason: `unhandled error: ${message}`,
+        summary: "",
+        costUsd: 0,
+        durationMs: 0,
+        numTurns: 0,
+      };
+    }
+    // Persist immediately so a later crash can resume via --offset without
+    // losing this file's work.
+    appendResult(outDir, r);
     done++;
     runningCost += r.costUsd;
     console.log(
@@ -604,17 +800,31 @@ async function main(): Promise<void> {
     return r;
   });
 
-  // Preserve discovery order in the report regardless of completion order.
-  const summaryPath = writeSummary(outDir, results, args);
+  // Merge this pass with any prior passes recorded in the resume log (last
+  // write per file wins, handled by loadPriorResults) so SUMMARY.md reflects
+  // every file studied across resumes, not just this invocation. writeSummary
+  // re-imposes the deterministic file order.
+  const merged = loadPriorResults(outDir);
+  const summaryPath = writeSummary(outDir, merged, args);
 
-  const ok = results.filter((r) => r.ok).length;
-  const failed = results.length - ok;
+  const thisOk = results.filter((r) => r.ok).length;
+  const thisFailed = results.length - thisOk;
+  const mergedOk = merged.filter((r) => r.ok).length;
+  const mergedFailed = merged.length - mergedOk;
   console.log("\n──────────────────────────────────────────");
-  console.log(`Done: ${ok} succeeded, ${failed} failed of ${total}.`);
-  console.log(`Total cost: $${runningCost.toFixed(4)}`);
+  console.log(
+    `This pass: ${thisOk} succeeded, ${thisFailed} failed of ${total}.`,
+  );
+  if (args.offset > 0 || merged.length !== results.length) {
+    console.log(
+      `Overall (incl. prior passes): ${mergedOk} succeeded, ` +
+        `${mergedFailed} failed of ${merged.length}.`,
+    );
+  }
+  console.log(`Total cost (this pass): $${runningCost.toFixed(4)}`);
   console.log(`Summary written to ${summaryPath}`);
   console.log(`Raw streams in ${rawDir}`);
-  if (failed > 0) process.exitCode = 1;
+  if (mergedFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {

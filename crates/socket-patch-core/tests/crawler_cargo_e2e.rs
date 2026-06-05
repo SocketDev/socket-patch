@@ -143,8 +143,11 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
         std::env::set_var("HOME", v);
     }
 
-    assert!(
-        paths.iter().any(|p| p == &stamp_dir),
+    // Exactly the one staged index dir — proves the fallback resolved to
+    // $HOME/.cargo (not some ambient CARGO_HOME) and listed nothing else.
+    assert_eq!(
+        paths,
+        vec![stamp_dir],
         "HOME/.cargo fallback registry must be discovered; got {paths:?}"
     );
 }
@@ -162,7 +165,12 @@ async fn find_by_purls_registry_layout_finds_crate() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(ORG_PURL).unwrap().path, pkg);
+    let found = result.get(ORG_PURL).unwrap();
+    assert_eq!(found.path, pkg);
+    assert_eq!(found.name, "serde");
+    assert_eq!(found.version, "1.0.200");
+    assert_eq!(found.purl, ORG_PURL);
+    assert_eq!(found.namespace, None);
 }
 
 #[tokio::test]
@@ -176,7 +184,13 @@ async fn find_by_purls_vendor_layout_finds_crate() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(ORG_PURL).unwrap().path, pkg);
+    let found = result.get(ORG_PURL).unwrap();
+    assert_eq!(found.path, pkg);
+    assert_eq!(found.name, "serde");
+    assert_eq!(found.version, "1.0.200");
+    assert_eq!(found.purl, ORG_PURL);
+    // Vendor dir name carries no version, so this proves the version was
+    // read from the manifest, not invented from the directory name.
 }
 
 #[tokio::test]
@@ -230,7 +244,29 @@ async fn crawl_all_via_registry_layout() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert!(result.len() >= 2);
+    // Exact contents, not just a `>= 2` floor: a regression that drops a
+    // crate, mangles a version, or emits a spurious extra entry must fail.
+    let mut found: Vec<(String, String, String)> = result
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.purl.clone()))
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (
+                "serde".to_string(),
+                "1.0.200".to_string(),
+                "pkg:cargo/serde@1.0.200".to_string()
+            ),
+            (
+                "tokio".to_string(),
+                "1.40.0".to_string(),
+                "pkg:cargo/tokio@1.40.0".to_string()
+            ),
+        ],
+        "crawl_all must surface exactly serde@1.0.200 and tokio@1.40.0; got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -356,11 +392,17 @@ async fn find_by_purls_verify_fallback_via_dir_name() {
     .unwrap();
 
     let crawler = CargoCrawler;
+    let purl = "pkg:cargo/workspace-crate@0.1.0";
     let result = crawler
-        .find_by_purls(tmp.path(), &["pkg:cargo/workspace-crate@0.1.0".to_string()])
+        .find_by_purls(tmp.path(), &[purl.to_string()])
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "verify must fall back to dir name");
+    let found = result.get(purl).unwrap();
+    assert_eq!(found.path, pkg, "must resolve to the workspace crate dir");
+    assert_eq!(found.name, "workspace-crate");
+    assert_eq!(found.version, "0.1.0");
+    assert_eq!(found.purl, purl);
 }
 
 /// `version.workspace = true` in a top-level `[package]` block must
@@ -462,6 +504,9 @@ async fn crawl_all_dedups_same_purl() {
         1,
         "duplicate purls must dedup; got {result:?}"
     );
+    assert_eq!(result[0].purl, "pkg:cargo/foo@1.0.0");
+    assert_eq!(result[0].name, "foo");
+    assert_eq!(result[0].version, "1.0.0");
 }
 
 /// `get_crate_source_paths` in local mode without a vendor dir but
@@ -637,5 +682,7 @@ async fn get_crate_source_paths_local_cargo_toml_with_registry_src() {
         std::env::remove_var("CARGO_HOME");
     }
 
-    assert!(paths.iter().any(|p| p == &index_dir));
+    // Only one index dir was staged, so the result must be exactly it —
+    // not merely "contains" it among arbitrary extras.
+    assert_eq!(paths, vec![index_dir]);
 }

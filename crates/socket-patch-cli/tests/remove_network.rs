@@ -28,6 +28,40 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
+/// Every `SOCKET_*` env var the `remove` binary consults (clap-flattened
+/// `GlobalArgs` plus runtime toggles). The spawned child inherits the parent
+/// process environment, so any of these leaking in from the developer's shell
+/// or CI could satisfy the behaviour under test *instead of* the argv —
+/// masking a regression. Most dangerous here: an ambient `SOCKET_OFFLINE`
+/// would make the `--offline` test (2) pass even if the `--offline` *flag*
+/// handling regressed, and `SOCKET_MANIFEST_PATH`/`SOCKET_CWD` could point the
+/// binary at a different manifest than the one `manifest_has_entry` reads back.
+/// `run_remove` scrubs all of these from the child, then sets only the four it
+/// controls, so each assertion exercises the flag/argv path and nothing else.
+const SOCKET_ENV_VARS: &[&str] = &[
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_FORCE",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+];
+
 const ORG_SLUG: &str = "test-org";
 const PURL: &str = "pkg:npm/remove-network-test@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -91,9 +125,18 @@ async fn mount_before_blob(mock: &MockServer, before: &[u8], before_hash: &str) 
 fn run_remove(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String) {
     let mut argv: Vec<&str> = vec!["remove", PURL, "--json", "--yes"];
     argv.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&argv)
-        .current_dir(cwd)
+    let mut cmd = Command::new(binary());
+    cmd.args(&argv).current_dir(cwd);
+    // Hermeticity: drop every SOCKET_* var the child might inherit from the
+    // ambient environment before re-setting only the four this test controls.
+    // Without this, an ambient `SOCKET_OFFLINE` could make the `--offline`
+    // test pass for the wrong reason (env, not flag), and a stray
+    // `SOCKET_MANIFEST_PATH`/`SOCKET_CWD` could aim the binary at the wrong
+    // manifest. The set must be re-set *after* scrubbing.
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .env("SOCKET_API_URL", api_url)
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
@@ -130,6 +173,23 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
         !manifest_has_entry(&socket),
         "online remove must drop the manifest entry; stdout=\n{stdout}"
     );
+
+    // The whole point of this test (and what gives the `--offline` test its
+    // teeth) is that the online path ACTUALLY downloads the missing blob.
+    // Verify the mock was hit for the exact beforeHash; a path that succeeds
+    // without ever fetching would otherwise leave this guarantee unproven.
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{before_hash}");
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    let fetched = reqs.iter().filter(|r| r.url.path() == blob_path).count();
+    assert!(
+        fetched >= 1,
+        "online remove must fetch the missing beforeHash blob ({blob_path}); \
+         observed request paths={:?}",
+        reqs.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
 }
 
 /// `--offline` must NOT contact the network: with the beforeHash blob
@@ -161,5 +221,23 @@ async fn remove_offline_does_not_fetch_and_keeps_entry() {
     assert!(
         manifest_has_entry(&socket),
         "remove --offline must NOT delete the entry when rollback can't run; stdout=\n{stdout}"
+    );
+
+    // The strict-airgap contract is "never contact the network on ANY
+    // command". Exit code + preserved entry alone don't prove that: a
+    // regressed binary could fetch the (armed) blob and still fail rollback
+    // downstream for some other reason. Assert the mock saw NO traffic at
+    // all — this is what actually makes the test name ("does_not_fetch")
+    // true and catches the original `offline = false` hardcode.
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    assert!(
+        reqs.is_empty(),
+        "remove --offline must not contact the network at all; observed requests={:?}",
+        reqs.iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_string()))
+            .collect::<Vec<_>>()
     );
 }

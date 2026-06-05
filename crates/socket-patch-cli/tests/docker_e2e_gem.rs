@@ -55,6 +55,70 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Plain SHA-256 of the bytes (no git blob header) — matches what
+/// `sha256sum` reports inside the container, so the test can assert the
+/// installed file is byte-identical to the patch blob, not merely that
+/// it contains the marker substring.
+fn plain_sha256(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+/// Shared verification block for both scripts. Expects `GEM_FILE`,
+/// `EXPECTED_SHA`, and `APPLY_EXIT` to be set, plus the JSON captured in
+/// `/tmp/scan.json` and `/tmp/apply.json`.
+///
+/// This asserts on the *real structured output* of the run, not just a
+/// substring marker:
+///   - scan's JSON shows the colorize patch was discovered AND synced
+///     (`"action": "added"`). NOTE: scan's process exit code is
+///     deliberately NOT gated — a non-zero scan exit from an unrelated
+///     transitive package without a patch must not fail a pipeline whose
+///     target patch was found and synced.
+///   - apply exited 0 and its JSON reports the patch was actually
+///     `"applied"`, hash-`"verified": true`, with `summary.applied == 1`
+///     — this rejects a no-op "success" that patches nothing.
+///   - the installed file contains the marker AND is byte-for-byte
+///     identical to the patch blob the API served (exact sha256), so
+///     truncated/garbled/appended writes can't slip through.
+fn verify_snippet() -> &'static str {
+    r#"
+# --- scan: must have discovered and synced the colorize patch ---
+grep -qF 'pkg:gem/colorize@1.1.0' /tmp/scan.json || {
+  echo "FAIL: scan json missing colorize purl" >&2; cat /tmp/scan.json >&2; exit 1; }
+grep -qF '"action": "added"' /tmp/scan.json || {
+  echo "FAIL: scan did not sync (add) the patch" >&2; cat /tmp/scan.json >&2; exit 1; }
+
+# --- apply: must exit 0 and report a real applied+verified patch ---
+if [ "${APPLY_EXIT:-1}" != "0" ]; then
+  echo "FAIL: apply exited non-zero (${APPLY_EXIT:-unset})" >&2; cat /tmp/apply.json >&2; exit 1
+fi
+for needle in '"status": "success"' '"action": "applied"' '"verified": true' '"applied": 1' 'pkg:gem/colorize@1.1.0'; do
+  grep -qF "$needle" /tmp/apply.json || {
+    echo "FAIL: apply json missing [$needle]" >&2; cat /tmp/apply.json >&2; exit 1; }
+done
+
+# --- installed file: marker present AND byte-identical to the patch blob ---
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GEM_FILE"; then
+  echo "FAIL: marker not in $GEM_FILE" >&2
+  head -3 "$GEM_FILE" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$GEM_FILE" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "FAIL: $GEM_FILE content sha256 ($ACTUAL_SHA) != expected ($EXPECTED_SHA)" >&2
+  echo "---- actual file ----" >&2
+  cat "$GEM_FILE" >&2
+  exit 1
+fi
+
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+}
+
 async fn make_mock_server(after_hash: &str) -> MockServer {
     let listener =
         std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
@@ -118,10 +182,12 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     server
 }
 
-fn local_script(api_url: &str) -> String {
+fn local_script(api_url: &str, expected_sha: &str) -> String {
+    let verify = verify_snippet();
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
+EXPECTED_SHA='{expected_sha}'
 
 mkdir -p /workspace/proj && cd /workspace/proj
 RUBY_VER=$(ruby -e 'puts RUBY_VERSION.split(".").take(2).join(".") + ".0"')
@@ -135,31 +201,25 @@ GEM_FILE="$INSTALL_DIR/gems/colorize-1.1.0/lib/colorize.rb"
 [ -f "$GEM_FILE" ] || {{ echo "FAIL: $GEM_FILE missing" >&2; exit 1; }}
 echo "Installed to: $GEM_FILE" >&2
 
+# scan exit code is intentionally not gated (see verify_snippet); capture JSON.
 socket-patch scan --json --sync --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems gem 2>/tmp/sync.err
+  --ecosystems gem > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --ecosystems gem 2>/tmp/apply.err
+socket-patch apply --json --force --offline --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
+APPLY_EXIT=$?
 cat /tmp/apply.err >&2
-
-if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GEM_FILE"; then
-  echo "FAIL: marker not in $GEM_FILE" >&2
-  head -3 "$GEM_FILE" >&2
-  exit 1
-fi
-
-echo "===PATCH VERIFIED===" >&2
-echo "===E2E PASS==="
-exit 0
-"#
+{verify}"#
     )
 }
 
-fn global_script(api_url: &str) -> String {
+fn global_script(api_url: &str, expected_sha: &str) -> String {
+    let verify = verify_snippet();
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
+EXPECTED_SHA='{expected_sha}'
 
 # gem install without --install-dir uses the system gem dir.
 gem install --no-document colorize -v 1.1.0 > /tmp/install.log 2>&1 || {{
@@ -173,24 +233,16 @@ echo "Global-installed at: $GEM_FILE" >&2
 
 mkdir -p /workspace/proj && cd /workspace/proj
 
+# scan exit code is intentionally not gated (see verify_snippet); capture JSON.
 socket-patch scan --json --sync --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems gem 2>/tmp/sync.err
+  --ecosystems gem > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --global --ecosystems gem 2>/tmp/apply.err
+socket-patch apply --json --force --offline --global --ecosystems gem > /tmp/apply.json 2>/tmp/apply.err
+APPLY_EXIT=$?
 cat /tmp/apply.err >&2
-
-if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GEM_FILE"; then
-  echo "FAIL: marker not in $GEM_FILE" >&2
-  head -3 "$GEM_FILE" >&2
-  exit 1
-fi
-
-echo "===PATCH VERIFIED===" >&2
-echo "===E2E PASS==="
-exit 0
-"#
+{verify}"#
     )
 }
 
@@ -228,6 +280,26 @@ fn run_container(script: &str) -> std::process::Output {
     cmd.output().expect("docker run")
 }
 
+/// Assert the wiremock actually served BOTH the metadata discovery
+/// (batch) AND the patch-content fetch (view). The in-container `echo`
+/// markers alone can't prove the real network path ran — a build that
+/// short-circuits the API (cached layer, stubbed fetch, or a marker
+/// written by some unrelated mechanism) could still emit them. Requiring
+/// the server to have observed the batch POST and the per-UUID blob GET
+/// proves the genuine scan→download→apply code path executed end to end.
+async fn assert_api_path_exercised(server: &MockServer) {
+    let received = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<String> = received.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("/patches/batch")),
+        "scan should have called /patches/batch; received={paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains(&format!("/patches/view/{UUID}"))),
+        "scan --sync should have fetched patch content via /patches/view/{UUID}; received={paths:#?}"
+    );
+}
+
 #[tokio::test]
 async fn gem_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_RB);
@@ -236,7 +308,8 @@ async fn gem_local_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&local_script(&api_url));
+    let expected_sha = plain_sha256(PATCHED_RB);
+    let out = run_container(&local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -245,6 +318,7 @@ async fn gem_local_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 #[tokio::test]
@@ -255,7 +329,8 @@ async fn gem_global_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&global_script(&api_url));
+    let expected_sha = plain_sha256(PATCHED_RB);
+    let out = run_container(&global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -264,4 +339,5 @@ async fn gem_global_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }

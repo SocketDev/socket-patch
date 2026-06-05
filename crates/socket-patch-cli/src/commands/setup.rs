@@ -6,6 +6,7 @@ use socket_patch_core::cargo_setup::{
 };
 #[cfg(feature = "golang")]
 use socket_patch_core::go_setup::{self, GoSetupStatus};
+use socket_patch_core::gem_setup::{self, GemSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
@@ -41,6 +42,7 @@ fn telemetry_manager_str(
     py: bool,
     cargo: bool,
     go: bool,
+    gem: bool,
     npm_pm: PackageManager,
 ) -> String {
     let mut parts: Vec<&str> = Vec::new();
@@ -55,6 +57,9 @@ fn telemetry_manager_str(
     }
     if go {
         parts.push("golang");
+    }
+    if gem {
+        parts.push("gem");
     }
     if parts.is_empty() {
         "none".to_string()
@@ -501,8 +506,147 @@ async fn finalize_go(_common: &GlobalArgs) -> Vec<String> {
     Vec::new()
 }
 
-/// Combine two ecosystem outcomes (cargo + go) into one for the shared
-/// preview/envelope printers, which take a single [`SetupOutcome`].
+// ─────────────────────────────────────────────────────────────────────────
+// Gem (Bundler plugin) helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build the gem branch's contribution to a setup/remove run: add (or remove)
+/// the managed `plugin "socket-patch"` block in the Gemfile + the generated
+/// `.socket/bundler-plugin/` plugin files. Gem is an unconditional ecosystem,
+/// so (unlike cargo/go) this is never feature-gated.
+async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+        Some(p) => p,
+        None => return SetupOutcome::default(),
+    };
+
+    let mut out = SetupOutcome {
+        present: true,
+        ..Default::default()
+    };
+
+    let results = if remove {
+        gem_setup::remove_plugin_directive(&project, dry_run).await
+    } else {
+        gem_setup::add_plugin_directive(&project, dry_run).await
+    };
+
+    let mut added_paths: Vec<String> = Vec::new();
+    for r in &results {
+        match r.status {
+            GemSetupStatus::Updated => {
+                out.changed += 1;
+                added_paths.push(r.path.clone());
+            }
+            GemSetupStatus::AlreadyConfigured => out.already += 1,
+            GemSetupStatus::Error => out.errors += 1,
+        }
+        out.json_files.push(serde_json::json!({
+            "kind": r.kind,
+            "path": r.path,
+            "status": gem_status_str(&r.status, remove),
+            "error": r.error,
+        }));
+    }
+
+    if !added_paths.is_empty() {
+        let header = if remove {
+            "Gem: remove the socket-patch Bundler plugin wiring from:"
+        } else {
+            "Gem: add the socket-patch Bundler plugin wiring to:"
+        };
+        out.preview.push(header.to_string());
+        for p in &added_paths {
+            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+        }
+    }
+
+    out
+}
+
+fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
+    match (s, for_remove) {
+        (GemSetupStatus::Updated, false) => "updated",
+        (GemSetupStatus::Updated, true) => "removed",
+        (GemSetupStatus::AlreadyConfigured, false) => "already_configured",
+        (GemSetupStatus::AlreadyConfigured, true) => "not_configured",
+        (GemSetupStatus::Error, _) => "error",
+    }
+}
+
+/// Materialise gem patches right after wiring the plugin (the "automatic" step)
+/// so the first `bundle install` finds them already applied. Best-effort and
+/// offline; a non-zero exit becomes a warning — the plugin heals on the next
+/// `bundle install`. Mirrors [`finalize_go`].
+async fn finalize_gem(common: &GlobalArgs) -> Vec<String> {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return vec![format!(
+                "could not locate socket-patch to materialize gem patches ({e}); \
+                 run `socket-patch apply --ecosystems gem`"
+            )]
+        }
+    };
+    let root = common.cwd.display().to_string();
+    match tokio::process::Command::new(&exe)
+        .args(["apply", "--offline", "--ecosystems", "gem", "--cwd", &root, "--silent"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => Vec::new(),
+        Ok(o) => vec![format!(
+            "materializing gem patches exited with {}; the Bundler plugin will heal on next `bundle install`",
+            o.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
+        )],
+        Err(e) => vec![format!(
+            "could not run apply to materialize gem patches ({e}); the Bundler plugin will heal on next `bundle install`"
+        )],
+    }
+}
+
+/// Append gem check entries (the Gemfile `plugin` directive + the generated
+/// plugin dir) to the shared `run_check` entries list. Returns whether a
+/// Bundler project was found. Checks the SETUP wiring only — patch consistency
+/// is `apply --check`.
+async fn append_gem_check_entries(
+    common: &GlobalArgs,
+    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    let project = match gem_setup::discover_bundler_project(&common.cwd).await {
+        Some(p) => p,
+        None => return false,
+    };
+    let (state, err) = match tokio::fs::read_to_string(&project.gemfile).await {
+        Ok(content) => {
+            if gem_setup::is_plugin_directive_present(&content) {
+                (CheckState::Configured, None)
+            } else {
+                (CheckState::NeedsConfiguration, None)
+            }
+        }
+        Err(e) => (CheckState::Error, Some(e.to_string())),
+    };
+    entries.push(("gemfile", project.gemfile.display().to_string(), state, err));
+    let dir_state = if gem_setup::plugin_files_present(&project.root).await {
+        CheckState::Configured
+    } else {
+        CheckState::NeedsConfiguration
+    };
+    entries.push((
+        "gem_plugin",
+        gem_setup::plugin_dir(&project.root).display().to_string(),
+        dir_state,
+        None,
+    ));
+    true
+}
+
+/// Combine two ecosystem outcomes into one for the shared preview/envelope
+/// printers, which take a single [`SetupOutcome`].
 fn merge_outcomes(mut a: SetupOutcome, b: SetupOutcome) -> SetupOutcome {
     a.present |= b.present;
     a.changed += b.changed;
@@ -665,7 +809,7 @@ enum CheckState {
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     if !args.common.json {
-        println!("Searching for package.json / Python / Cargo / Go manifests...");
+        println!("Searching for package.json / Python / Cargo / Go / Bundler manifests...");
     }
 
     let npm_files = discover(args).await;
@@ -714,6 +858,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
 
     append_cargo_check_entries(&args.common, &mut entries).await;
     append_go_check_entries(&args.common, &mut entries).await;
+    append_gem_check_entries(&args.common, &mut entries).await;
 
     if entries.is_empty() {
         return report_no_files(args, "no_files");
@@ -801,19 +946,26 @@ fn render_removed(new: &Option<String>) -> String {
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     if !common.json {
-        println!("Searching for package.json / Python / Cargo / Go manifests...");
+        println!("Searching for package.json / Python / Cargo / Go / Bundler manifests...");
     }
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
     let cargo_preview = build_cargo_outcome(common, true, true).await;
     let go_preview = build_go_outcome(common, true, true).await;
-    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present && !go_preview.present {
+    let gem_preview = build_gem_outcome(common, true, true).await;
+    if npm_files.is_empty()
+        && py_plan.is_none()
+        && !cargo_preview.present
+        && !go_preview.present
+        && !gem_preview.present
+    {
         return report_no_files(args, "no_files");
     }
     let cargo_present = cargo_preview.present;
     let go_present = go_preview.present;
-    let cargo_preview = merge_outcomes(cargo_preview, go_preview);
+    let gem_present = gem_preview.present;
+    let cargo_preview = merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview);
 
     // Preview (dry_run=true never writes).
     let mut npm_preview = Vec::new();
@@ -895,9 +1047,15 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, true, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go removal (guard dep/[env] root; go guard package + imports).
-    let cargo_results =
-        merge_outcomes(build_cargo_outcome(common, true, false).await, build_go_outcome(common, true, false).await);
+    // Real cargo + go + gem removal (guard dep/[env] root; go guard package +
+    // imports; gem Gemfile `plugin` block + generated plugin dir).
+    let cargo_results = merge_outcomes(
+        merge_outcomes(
+            build_cargo_outcome(common, true, false).await,
+            build_go_outcome(common, true, false).await,
+        ),
+        build_gem_outcome(common, true, false).await,
+    );
 
     let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
         + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
@@ -937,6 +1095,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 "\nNote: the Go guard wiring was removed; existing patched-module copies under \
                  .socket/go-patches/ and managed go.mod `replace` directives are removed on \
                  `socket-patch rollback`."
+            );
+        }
+        if gem_present {
+            println!(
+                "\nNote: the Bundler plugin wiring was removed; already-patched gems on disk are \
+                 reverted by a fresh `bundle install` (or `socket-patch rollback`)."
             );
         }
     }
@@ -1061,11 +1225,17 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
-    // Cargo + Go previews (dry-run); `.present` also tells us each project exists.
+    // Cargo + Go + Gem previews (dry-run); `.present` also tells us each project exists.
     let cargo_preview = build_cargo_outcome(common, false, true).await;
     let go_preview = build_go_outcome(common, false, true).await;
+    let gem_preview = build_gem_outcome(common, false, true).await;
 
-    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present && !go_preview.present {
+    if npm_files.is_empty()
+        && py_plan.is_none()
+        && !cargo_preview.present
+        && !go_preview.present
+        && !gem_preview.present
+    {
         if common.json {
             println!(
                 "{}",
@@ -1079,14 +1249,15 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            println!("No package.json, Python, Cargo, or Go project found");
+            println!("No package.json, Python, Cargo, Go, or Bundler project found");
         }
         return 0;
     }
 
     let cargo_present = cargo_preview.present;
     let go_present = go_preview.present;
-    let cargo_preview = merge_outcomes(cargo_preview, go_preview);
+    let gem_present = gem_preview.present;
+    let cargo_preview = merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview);
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
@@ -1095,6 +1266,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_plan.is_some(),
         cargo_present,
         go_present,
+        gem_present,
         npm_pm,
     );
     track_patch_setup(
@@ -1192,15 +1364,25 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go edits (cargo guard dep/[env] root; go guard package +
-    // per-main blank imports).
-    let cargo_results =
-        merge_outcomes(build_cargo_outcome(common, false, false).await, build_go_outcome(common, false, false).await);
+    // Real cargo + go + gem edits (cargo guard dep/[env] root; go guard package +
+    // per-main blank imports; gem Gemfile `plugin` block + generated plugin dir).
+    let cargo_results = merge_outcomes(
+        merge_outcomes(
+            build_cargo_outcome(common, false, false).await,
+            build_go_outcome(common, false, false).await,
+        ),
+        build_gem_outcome(common, false, false).await,
+    );
 
     // Materialise the go.mod `replace` redirects now so the first `go test`/run
     // is already in sync (the "automatic" step). Best-effort → warnings only.
     if go_present {
         warnings.extend(finalize_go(common).await);
+    }
+    // Materialise gem patches now so the first `bundle install` finds them
+    // applied. Best-effort → warnings only.
+    if gem_present {
+        warnings.extend(finalize_gem(common).await);
     }
 
     let errors = npm_results.iter().filter(|r| r.status == UpdateStatus::Error).count()
@@ -1249,6 +1431,14 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                  .socket/ patches. Enforcement: `go test ./...` gates at CI time (the guard \
                  reads the patch state in-process, so the test cache re-runs it on any drift), \
                  and the init() guard gates every `go run`/binary launch."
+            );
+        }
+        if gem_present {
+            println!(
+                "\nCommit the Gemfile (the `plugin` block), .socket/bundler-plugin/, and your \
+                 .socket/ patches so the Bundler plugin re-applies gem patches on every \
+                 `bundle install` (including cached/no-op installs in CI). The socket-patch CLI \
+                 must be on PATH wherever `bundle install` runs."
             );
         }
     }

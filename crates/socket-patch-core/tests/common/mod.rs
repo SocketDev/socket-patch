@@ -33,21 +33,60 @@ pub fn uid_is_root() -> bool {
     false
 }
 
-/// Set mode 0o000 on a directory so subsequent `read_dir` returns Err.
+/// Set mode 0o000 on a path so a subsequent read of it returns Err.
 /// Used by permission-error tests; must call `chmod_readable` to
 /// restore before the tempdir is dropped or cleanup will fail.
+///
+/// Crucially, this *verifies the precondition actually took hold*
+/// before returning: every consumer concludes "crawler returned
+/// empty ⟹ it short-circuited on the read Err arm", which is only a
+/// valid inference if the path is genuinely unreadable. On any
+/// environment where chmod 000 is a no-op (root — callers guard with
+/// `uid_is_root`, but the guard shells out to `id` and is
+/// best-effort; or an exotic/overlay FS, or a process holding
+/// CAP_DAC_OVERRIDE), a silent no-op would let those tests pass for
+/// the wrong reason — a crawler that read the path fine and merely
+/// found nothing (e.g. the composer test's empty `installed.json`)
+/// would still satisfy `assert!(result.is_empty())`. We refuse to
+/// hand back a falsely-prepared fixture: if the path is still
+/// readable after the chmod, we panic loudly here rather than let a
+/// vacuous green slip through downstream.
 #[cfg(unix)]
 pub fn chmod_unreadable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o000);
     std::fs::set_permissions(path, perms).expect("chmod 000 must succeed");
+
+    // Confirm the mode change genuinely denies reads. Branch on the
+    // kind so this works for both the directory fixtures (read_dir
+    // must fail) and the single-file fixture (opening for read must
+    // fail). `metadata`/`is_dir` only needs traverse on the parent,
+    // which the tempdir still grants, so it remains accurate here.
+    let still_readable = if path.is_dir() {
+        std::fs::read_dir(path).is_ok()
+    } else {
+        std::fs::File::open(path).is_ok()
+    };
+    assert!(
+        !still_readable,
+        "chmod 000 did not make {path:?} unreadable — permission-error \
+         fixture is not actually prepared (running as root, or on a \
+         filesystem/capability set that ignores mode bits). Any test \
+         relying on this would pass vacuously; failing loudly instead.",
+    );
 }
 
+/// Restore a path to an owner-accessible mode after a
+/// `chmod_unreadable`. The restore is mandatory: tempdir teardown
+/// (and any later read of the path) needs it, so a failure here must
+/// be surfaced, not swallowed. Always called on a path the test owns
+/// and that exists, so 0o700 reliably succeeds; if it ever doesn't,
+/// that's a real regression we want to see.
 #[cfg(unix)]
 pub fn chmod_readable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o700);
-    let _ = std::fs::set_permissions(path, perms);
+    std::fs::set_permissions(path, perms).expect("chmod restore (0o700) must succeed");
 }
 
 /// Subprocess stub for the `CommandRunner` trait.

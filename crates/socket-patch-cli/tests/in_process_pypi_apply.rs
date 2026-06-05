@@ -243,17 +243,26 @@ async fn pypi_install_scan_sync_patches_real_file() {
     // Avoid borrow problem with into_iter
     let _ = &mut args;
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    // A successful scan --sync that discovers + applies the patch must
+    // exit 0. Accepting `|| code == 1` would let a failed apply (which
+    // also exits 1) pass, so we require the success code.
+    assert_eq!(code, 0, "scan --sync should succeed (exit 0)");
 
-    // The on-disk file should now contain the marker — proving the
-    // full install→scan→apply chain patched a real pip-installed file.
+    // The on-disk file must be byte-for-byte the patched content the
+    // mock served — not merely "contains the marker somewhere", which
+    // would also pass if apply corrupted/truncated the rest of the file.
     let after = std::fs::read(&six_path).expect("read patched six.py");
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "patched marker not found in {}; file size: {}",
-        six_path.display(),
-        after.len()
+    assert_ne!(after, original, "file was not modified by scan --sync");
+    assert_eq!(
+        after, patched,
+        "patched file does not match the served blob byte-for-byte"
+    );
+    // And its real on-disk hash must equal the served afterHash, proving
+    // the apply landed exactly the content keyed by the manifest.
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "on-disk hash does not match served afterHash"
     );
 }
 
@@ -302,7 +311,22 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         all_releases: false,
         vex: Default::default(),
     };
-    let _ = scan_run(scan_args).await;
+    let scan_code = scan_run(scan_args).await;
+    assert_eq!(scan_code, 0, "scan --sync should succeed (exit 0)");
+
+    // scan --sync itself applies the patch, so the marker is already on
+    // disk here. If we asserted the marker now, the subsequent apply
+    // --force would be a no-op the test could never detect. Revert the
+    // file to its pristine bytes so the apply step has real work to do —
+    // this is what makes the apply path actually under test.
+    std::fs::write(&six_path, &original).expect("revert six.py");
+    let reverted = std::fs::read(&six_path).expect("read reverted six.py");
+    assert_eq!(reverted, original, "failed to revert file before apply");
+    assert_eq!(
+        git_sha256(&reverted),
+        before_hash,
+        "reverted file must match the served beforeHash"
+    );
 
     // 2. Now run apply --offline --force separately. Exercises the
     // read-only-cache path in apply.rs.
@@ -325,13 +349,20 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         check: false,
         vex: Default::default(),
     };
-    let _ = apply_run(apply_args).await;
+    let apply_code = apply_run(apply_args).await;
+    assert_eq!(apply_code, 0, "apply --offline --force should succeed (exit 0)");
 
+    // The apply step (not scan) must have re-patched the reverted file
+    // to exactly the served blob.
     let after = std::fs::read(&six_path).expect("read after apply");
-    assert!(
-        after.windows(b"SOCKET-PATCH-MARKER-APPLY-FORCE".len())
-            .any(|w| w == b"SOCKET-PATCH-MARKER-APPLY-FORCE"),
-        "marker not found post-apply"
+    assert_eq!(
+        after, patched,
+        "apply --force did not produce the served blob byte-for-byte"
+    );
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "on-disk hash after apply does not match served afterHash"
     );
 }
 
@@ -380,12 +411,49 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         all_releases: false,
         vex: Default::default(),
     };
-    let _ = scan_run(scan_args).await;
+    // Require success: otherwise an early crash (before the apply path
+    // is ever reached) would leave the file untouched and let this test
+    // pass without ever exercising the dry-run apply logic it guards.
+    let dry_code = scan_run(scan_args).await;
+    assert_eq!(dry_code, 0, "scan --apply --dry-run should succeed (exit 0)");
 
     let after = std::fs::read(&six_path).expect("read after dry-run");
     assert_eq!(
         after, original,
         "dry-run must not modify the installed file"
+    );
+    assert_eq!(
+        git_sha256(&after),
+        before_hash,
+        "dry-run changed the file hash"
+    );
+
+    // "File unchanged" alone is a vacuous oracle: it is satisfied just as
+    // well by a crawler that discovered nothing or a scan that no-op'd
+    // before ever reaching the apply path. To prove the dry-run path
+    // actually had real work to *decline*, assert the crawler discovered
+    // six and queried the batch endpoint with its PURL — the same
+    // observable proof of discovery used by the crawler sanity test.
+    let purl = format!("pkg:pypi/{PYPI_PACKAGE}@{PYPI_VERSION}");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let batch_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        !batch_bodies.is_empty(),
+        "dry-run never queried the batch endpoint — discovery did not run, \
+         so the file being unmodified proves nothing about dry-run apply"
+    );
+    assert!(
+        batch_bodies.iter().any(|b| b.contains(&purl)),
+        "dry-run batch request did not include the discovered six PURL {purl}; \
+         the unchanged file does not prove dry-run suppressed a real patch; \
+         bodies: {batch_bodies:?}"
     );
 }
 
@@ -457,4 +525,26 @@ async fn pypi_crawler_finds_real_installed_six() {
         vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
+
+    // scan exits 0 even when it discovers nothing, so the exit code
+    // alone does not prove the crawler found six. Verify the crawler
+    // actually sent six's PURL to the batch endpoint — that is the
+    // observable proof of discovery.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let batch_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        !batch_bodies.is_empty(),
+        "crawler never queried the batch endpoint"
+    );
+    assert!(
+        batch_bodies.iter().any(|b| b.contains(&purl)),
+        "batch request did not include the discovered six PURL {purl}; bodies: {batch_bodies:?}"
+    );
 }

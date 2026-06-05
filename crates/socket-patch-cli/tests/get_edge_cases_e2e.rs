@@ -18,6 +18,18 @@ const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
 const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
 
+/// Collect the paths of every request the mock actually received. Used to
+/// prove which code path the binary really took (vs. fabricating the right
+/// envelope without touching the network it claims to touch).
+async fn received_paths(mock: &MockServer) -> Vec<String> {
+    mock.received_requests()
+        .await
+        .expect("wiremock must record received requests")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect()
+}
+
 #[test]
 fn get_one_off_and_save_only_together_errors() {
     // The two flags are mutually exclusive — using both must fail.
@@ -97,10 +109,11 @@ async fn get_with_id_flag_selects_specific_patch() {
 
     // --id is a boolean type-tag: it tells the binary that the
     // positional identifier is a UUID, bypassing the auto-detection
-    // step. Pair it with the UUID as the positional.
+    // step. Pair it with the UUID as the positional. With --id the
+    // by-package endpoint must NOT be consulted — the fetch goes
+    // straight to view/{UUID_B}, so we must observe UUID_B (the
+    // selected patch) coming back, never UUID_A.
     let tmp = tempfile::tempdir().unwrap();
-    // Mock the view endpoint for the SELECTED UUID — passing --id with
-    // the UUID positional should go through the fetch-by-UUID path.
     let _ = purl;
     let _ = encoded;
     let out = Command::new(binary())
@@ -123,9 +136,45 @@ async fn get_with_id_flag_selects_specific_patch() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        code, 0,
+        "--id fetch-by-UUID of a free patch must succeed; stdout={stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert_eq!(v["found"], 1, "exactly one patch fetched; stdout={stdout}");
+    assert_eq!(v["downloaded"], 1, "the patch must be downloaded; stdout={stdout}");
+    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "exactly one patch record; stdout={stdout}");
+    // The crux: --id <UUID_B> must select UUID_B specifically, not the
+    // first patch (UUID_A) that the by-package listing would surface.
+    assert_eq!(
+        patches[0]["uuid"], UUID_B,
+        "--id must select the requested UUID, not the listing's first entry; stdout={stdout}"
+    );
+    assert_ne!(
+        patches[0]["uuid"], UUID_A,
+        "must not have fallen back to the by-package first match; stdout={stdout}"
+    );
+    assert_eq!(patches[0]["action"], "added", "stdout={stdout}");
+
+    // Prove the route, not just the payload: --id must fetch view/{UUID_B}
+    // directly and must NEVER consult the by-package listing (which is mounted
+    // as a trap returning BOTH UUIDs). Asserting only patches[0].uuid==UUID_B
+    // is satisfiable by a broken impl that lists by-package and happens to
+    // dedup/sort to UUID_B; the request log is what makes this airtight.
+    let paths = received_paths(&mock).await;
     assert!(
-        code == 0 || code == 1,
-        "--id type-tag must not crash; code={code}; stdout={stdout}"
+        paths.iter().any(|p| p.ends_with(&format!("/patches/view/{UUID_B}"))),
+        "--id must fetch view/{UUID_B} directly; recorded paths={paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/by-package/")),
+        "--id must NOT consult the by-package listing; recorded paths={paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with(&format!("/patches/view/{UUID_A}"))),
+        "--id must not fetch the non-selected UUID_A; recorded paths={paths:?}"
     );
 }
 
@@ -162,9 +211,28 @@ async fn get_with_no_matching_purl_emits_not_found() {
         .current_dir(tmp.path())
         .output()
         .expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an empty (but successful) lookup is exit 0, not an error"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "not_found");
+    assert_eq!(v["status"], "not_found", "stdout={stdout}");
+    assert_eq!(v["found"], 0, "stdout={stdout}");
+    assert_eq!(v["downloaded"], 0, "stdout={stdout}");
+    assert_eq!(
+        v["patches"].as_array().expect("patches array").len(),
+        0,
+        "no patches on not_found; stdout={stdout}"
+    );
+    // not_found must come from a real (empty) by-package lookup, not from a
+    // short-circuit that never queried the API at all.
+    let paths = received_paths(&mock).await;
+    assert!(
+        paths.iter().any(|p| p.contains(&format!("/by-package/{encoded}"))),
+        "the by-package endpoint must actually be queried; recorded paths={paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -204,28 +272,52 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a recognized-but-paywalled patch is not an error exit"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let status = v["status"].as_str().expect("status");
+    // The mock returned exactly one paid patch and canAccessPaidPatches=false,
+    // so the deterministic outcome is paid_required — not a vague "anything
+    // but success". The patch must NOT have been downloaded.
+    assert_eq!(v["status"], "paid_required", "stdout={stdout}");
+    assert_eq!(v["found"], 1, "the paid patch was found; stdout={stdout}");
+    assert_eq!(v["downloaded"], 0, "must not download a paid patch; stdout={stdout}");
+    assert_eq!(v["applied"], 0, "must not apply a paid patch; stdout={stdout}");
+    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "stdout={stdout}");
+    assert_eq!(patches[0]["uuid"], UUID_A, "stdout={stdout}");
+    assert_eq!(patches[0]["tier"], "paid", "stdout={stdout}");
+    // paid_required must be the verdict of a real proxy lookup, and the binary
+    // must NOT have attempted to download the paid blob via any view endpoint.
+    let paths = received_paths(&mock).await;
     assert!(
-        status == "paid_required" || status == "not_found" || status == "error",
-        "single paid patch without token must not succeed; got: {v}"
+        paths.iter().any(|p| p.contains(&format!("/patch/by-package/{encoded}"))),
+        "the public proxy by-package endpoint must be queried; recorded paths={paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/view/")),
+        "a paywalled patch must not be downloaded via a view endpoint; recorded paths={paths:?}"
     );
 }
 
 #[tokio::test]
 async fn get_with_invalid_search_purl_falls_through() {
-    // A bare string that doesn't match UUID/CVE/GHSA/PURL — should be
-    // treated as a package-name search via the search-by-package path.
+    // A bare string that doesn't match UUID/CVE/GHSA/PURL is treated as a
+    // package-name search (IdentifierType::Package). That path first
+    // enumerates installed packages in the cwd; with an empty working dir
+    // there are no packages to match, so the binary must short-circuit to
+    // a `no_packages` envelope (exit 0) BEFORE it ever queries the API.
+    // We mount the by-package mock to fail the test loudly if the binary
+    // ever reaches the network on an empty workspace.
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(wiremock::matchers::path_regex(format!(
             "^/v0/orgs/{ORG_SLUG}/patches/by-package/.+$"
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "patches": [],
-            "canAccessPaidPatches": false,
-        })))
+        .respond_with(ResponseTemplate::new(500).set_body_string("network must not be reached"))
         .mount(&mock)
         .await;
 
@@ -247,11 +339,37 @@ async fn get_with_invalid_search_purl_falls_through() {
         .current_dir(tmp.path())
         .output()
         .expect("run");
-    let code = out.status.code().unwrap_or(-1);
-    assert!(code == 0 || code == 1, "package-name fallback must not crash");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "package-name fallback over an empty workspace is a clean exit 0"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let _: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    // Deterministic outcome: the un-typed identifier fell through to the
+    // package search, which found nothing installed.
+    assert_eq!(v["status"], "no_packages", "stdout={stdout}");
+    assert_eq!(
+        v["patches"].as_array().expect("patches array").len(),
+        0,
+        "stdout={stdout}"
+    );
+    // It must NOT have been misrouted to e.g. a successful download or a
+    // not_found from an unintended API call.
+    assert_ne!(v["status"], "success", "stdout={stdout}");
+    // The mock returns 500; if the binary had queried it the run would have
+    // surfaced an error status instead of no_packages.
+    assert_ne!(v["status"], "error", "should not have reached the API; stdout={stdout}");
+    // The strongest guarantee: the binary must short-circuit BEFORE any
+    // network call on an empty workspace. Inspecting the status alone is a
+    // disjoint-outcome loophole (a broken impl could hit the 500 mock and
+    // still coerce the result to no_packages). The request log makes "never
+    // touched the network" non-negotiable.
+    let paths = received_paths(&mock).await;
+    assert!(
+        paths.is_empty(),
+        "package-name fallback over an empty workspace must not hit the API; recorded paths={paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -300,7 +418,26 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
         "paid patch via authenticated path must succeed; stdout={stdout}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "success");
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert_eq!(v["found"], 1, "stdout={stdout}");
+    assert_eq!(
+        v["downloaded"], 1,
+        "authenticated paid fetch must actually download; stdout={stdout}"
+    );
+    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "stdout={stdout}");
+    assert_eq!(
+        patches[0]["uuid"], UUID_A,
+        "must return the requested UUID; stdout={stdout}"
+    );
+    assert_eq!(patches[0]["action"], "added", "stdout={stdout}");
+    // The authenticated path must reach the org-scoped view endpoint directly
+    // (bypassing the public proxy), proving the download was a real fetch.
+    let paths = received_paths(&mock).await;
+    assert!(
+        paths.iter().any(|p| p.ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_A}"))),
+        "authenticated paid fetch must hit the org-scoped view endpoint; recorded paths={paths:?}"
+    );
 }
 
 #[test]

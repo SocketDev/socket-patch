@@ -20,6 +20,28 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Strong oracle: the file at `path` must now contain EXACTLY the expected
+/// patched bytes, its git-sha256 must equal the manifest's afterHash, and
+/// the patch must have been non-trivial (before != after). A broken apply
+/// that no-ops, writes garbage, or silently reports success without touching
+/// the file cannot satisfy all three.
+fn assert_patched(path: &Path, expected: &[u8], before_hash: &str, after_hash: &str) {
+    assert_ne!(
+        before_hash, after_hash,
+        "test fixture is degenerate: before/after hashes are equal"
+    );
+    let after = std::fs::read(path).expect("read patched file");
+    assert_eq!(
+        after, expected,
+        "patched file content does not match the expected after-bytes at {path:?}"
+    );
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "patched file does not hash to the manifest afterHash at {path:?}"
+    );
+}
+
 fn has(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
@@ -104,11 +126,14 @@ async fn yarn_install_then_apply_patches_file() {
         return;
     }
 
+    // yarn install reported success above, so the dependency MUST be on
+    // disk. A missing file here is a real regression (broken/changed
+    // install layout), not a reason to silently skip the assertions.
     let ms_index = tmp.path().join("node_modules/ms/index.js");
-    if !ms_index.exists() {
-        println!("SKIP: ms/index.js not present after yarn install");
-        return;
-    }
+    assert!(
+        ms_index.exists(),
+        "yarn install succeeded but node_modules/ms/index.js is missing at {ms_index:?}"
+    );
 
     let original = std::fs::read(&ms_index).expect("read ms/index.js");
     let before_hash = git_sha256(&original);
@@ -124,12 +149,7 @@ async fn yarn_install_then_apply_patches_file() {
 
     let code = apply_run(default_apply(tmp.path())).await;
     assert_eq!(code, 0, "apply must succeed against yarn-installed package");
-    let after = std::fs::read(&ms_index).expect("read patched");
-    assert!(
-        after.windows(b"SOCKET-PATCH-YARN-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-YARN-MARKER"),
-        "marker missing in yarn-installed file"
-    );
+    assert_patched(&ms_index, &patched, &before_hash, &after_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,12 +187,25 @@ async fn pnpm_install_then_apply_patches_file() {
     }
 
     // pnpm creates node_modules/<pkg> as a symlink into .pnpm store.
-    // The crawler should follow the symlink + find the package.
-    let ms_index = tmp.path().join("node_modules/ms/index.js");
-    if !ms_index.exists() {
-        println!("SKIP: ms/index.js not present after pnpm install");
-        return;
-    }
+    // The crawler should follow the symlink + find the package. This is
+    // the entire point of the test, so assert the symlink layout is real
+    // — if pnpm ever produced a hoisted (non-symlinked) layout instead,
+    // we would not be exercising the symlink-following path and must know.
+    let ms_dir = tmp.path().join("node_modules/ms");
+    let ms_meta = std::fs::symlink_metadata(&ms_dir)
+        .expect("node_modules/ms must exist after pnpm install");
+    assert!(
+        ms_meta.file_type().is_symlink(),
+        "pnpm test premise broken: node_modules/ms is not a symlink ({:?}); \
+         the symlink-following path is not being exercised",
+        ms_meta.file_type()
+    );
+
+    let ms_index = ms_dir.join("index.js");
+    assert!(
+        ms_index.exists(),
+        "ms/index.js must resolve through the pnpm symlink"
+    );
 
     let original = std::fs::read(&ms_index).expect("read ms/index.js");
     let before_hash = git_sha256(&original);
@@ -187,24 +220,29 @@ async fn pnpm_install_then_apply_patches_file() {
     std::fs::write(blobs.join(&after_hash), &patched).unwrap();
 
     let code = apply_run(default_apply(tmp.path())).await;
-    assert!(
-        code == 0 || code == 1,
-        "apply against pnpm layout exit code {code}"
+    assert_eq!(
+        code, 0,
+        "apply must succeed against the pnpm symlinked layout"
     );
-    // Verify the read-through worked. pnpm-style symlinks resolve to
-    // the .pnpm store; apply should write through the symlink.
-    let after = std::fs::read(&ms_index).expect("read patched");
-    if !after
-        .windows(b"SOCKET-PATCH-PNPM-MARKER".len())
-        .any(|w| w == b"SOCKET-PATCH-PNPM-MARKER")
-    {
-        // Some pnpm layouts use isolated node_modules — the file may
-        // be at a different path. Document but don't fail.
-        println!(
-            "NOTE: marker not found in pnpm-installed file (likely isolated layout); \
-             coverage of the dispatch path still recorded."
-        );
-    }
+    // The crawler must have followed node_modules/ms -> .pnpm/... and the
+    // patched bytes must be readable through that symlink. Exact-content +
+    // hash check; a no-op or store-miss cannot pass.
+    assert_patched(&ms_index, &patched, &before_hash, &after_hash);
+
+    // Prove the symlink was genuinely followed into the .pnpm store rather
+    // than apply creating a hoisted shadow copy beside the symlink: the
+    // canonical (real, fully-resolved) path must live under .pnpm AND it is
+    // that real file which must carry the patched bytes.
+    let real = std::fs::canonicalize(&ms_index).expect("canonicalize pnpm symlink");
+    assert_ne!(
+        real, ms_index,
+        "ms/index.js did not resolve through a symlink; pnpm store layout not exercised"
+    );
+    assert!(
+        real.components().any(|c| c.as_os_str() == ".pnpm"),
+        "pnpm symlink did not resolve into the .pnpm store: {real:?}"
+    );
+    assert_patched(&real, &patched, &before_hash, &after_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,12 +280,22 @@ async fn npm_workspaces_monorepo_apply() {
         println!("SKIP: npm install (monorepo) failed");
         return;
     }
-    // npm workspaces hoist to root node_modules.
-    let ms_index = tmp.path().join("node_modules/ms/index.js");
-    if !ms_index.exists() {
-        println!("SKIP: ms not hoisted to root in this npm version");
-        return;
-    }
+    // npm workspaces normally hoist `ms` to the root node_modules, but some
+    // npm versions nest it under the workspace package instead. Accept
+    // either location, but do NOT silently skip: a successful install must
+    // place ms *somewhere* — its total absence is a real regression.
+    let root_ms = tmp.path().join("node_modules/ms/index.js");
+    let nested_ms = pkg_a.join("node_modules/ms/index.js");
+    let ms_index = if root_ms.exists() {
+        root_ms
+    } else if nested_ms.exists() {
+        nested_ms
+    } else {
+        panic!(
+            "npm install (monorepo) succeeded but ms/index.js exists at \
+             neither {root_ms:?} nor {nested_ms:?}"
+        );
+    };
 
     let original = std::fs::read(&ms_index).expect("read");
     let before_hash = git_sha256(&original);
@@ -263,6 +311,9 @@ async fn npm_workspaces_monorepo_apply() {
 
     let code = apply_run(default_apply(tmp.path())).await;
     assert_eq!(code, 0, "monorepo apply must succeed");
+    // A zero exit code alone is not proof of work — verify the hoisted
+    // file was actually rewritten with the patched bytes.
+    assert_patched(&ms_index, &patched, &before_hash, &after_hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -313,13 +364,12 @@ gem 'colorize', '1.1.0'
             }
         }
     }
-    let lib_file = match lib_file {
-        Some(p) => p,
-        None => {
-            println!("SKIP: colorize.rb not found after bundle install");
-            return;
-        }
-    };
+    // bundle install reported success, so the gem and its lib file MUST be
+    // present under the vendored bundle. A miss here is a real regression
+    // (changed vendor layout / gem-discovery break), not a skip.
+    let lib_file = lib_file.unwrap_or_else(|| {
+        panic!("bundle install succeeded but colorize-1.1.0/lib/colorize.rb was not found under {bundle_root:?}")
+    });
 
     let original = std::fs::read(&lib_file).expect("read");
     let before_hash = git_sha256(&original);
@@ -354,10 +404,5 @@ gem 'colorize', '1.1.0'
     args.common.ecosystems = Some(vec!["gem".to_string()]);
     let code = apply_run(args).await;
     assert_eq!(code, 0, "bundler-installed gem must be patchable");
-    let after = std::fs::read(&lib_file).expect("read patched");
-    assert!(
-        after.windows(b"SOCKET-PATCH-BUNDLER-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-BUNDLER-MARKER"),
-        "marker missing in bundler-installed gem"
-    );
+    assert_patched(&lib_file, &patched, &before_hash, &after_hash);
 }

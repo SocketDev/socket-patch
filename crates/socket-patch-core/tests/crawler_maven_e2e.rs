@@ -239,9 +239,12 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
         std::env::remove_var("HOME");
     }
 
-    assert!(
-        paths.iter().any(|p| p == &m2),
-        "HOME/.m2/repository fallback must be discovered; got {paths:?}"
+    // Production returns exactly the single resolved repo path — assert the
+    // whole vec, not just membership, so a stray extra/wrong path also fails.
+    assert_eq!(
+        paths,
+        vec![m2],
+        "HOME/.m2/repository fallback must be the sole discovered repo"
     );
 }
 
@@ -376,7 +379,16 @@ async fn find_by_purls_finds_package_in_m2_layout() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(purl).unwrap().path, pkg_dir);
+    let pkg = result.get(purl).expect("requested purl must be the map key");
+    assert_eq!(pkg.path, pkg_dir, "path must point at the version dir");
+    assert_eq!(pkg.name, "commons-lang3", "name = artifactId");
+    assert_eq!(pkg.version, "3.12.0");
+    assert_eq!(
+        pkg.namespace,
+        Some("org.apache.commons".to_string()),
+        "namespace = groupId"
+    );
+    assert_eq!(pkg.purl, purl, "purl must round-trip the request");
 }
 
 #[tokio::test]
@@ -420,10 +432,31 @@ async fn crawl_all_discovers_packages_in_repo() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
+    // `>= 2` would pass on garbage/duplicate packages — assert the exact
+    // coordinates were discovered and nothing extra leaked in.
+    let purls: std::collections::HashSet<&str> =
+        result.iter().map(|p| p.purl.as_str()).collect();
     assert!(
-        result.len() >= 2,
-        "must discover both packages; got {result:?}"
+        purls.contains("pkg:maven/org.apache.commons/commons-lang3@3.12.0"),
+        "commons-lang3 must be discovered; got {result:?}"
     );
+    assert!(
+        purls.contains("pkg:maven/com.google.guava/guava@32.1.3-jre"),
+        "guava must be discovered; got {result:?}"
+    );
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly the two staged packages, no spurious extras; got {result:?}"
+    );
+    // Spot-check field decomposition on one entry.
+    let lang3 = result
+        .iter()
+        .find(|p| p.purl == "pkg:maven/org.apache.commons/commons-lang3@3.12.0")
+        .unwrap();
+    assert_eq!(lang3.name, "commons-lang3");
+    assert_eq!(lang3.version, "3.12.0");
+    assert_eq!(lang3.namespace, Some("org.apache.commons".to_string()));
 }
 
 #[tokio::test]
@@ -491,7 +524,11 @@ async fn get_maven_repo_paths_with_pom_xml_returns_repo() {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
     }
 
-    assert!(paths.iter().any(|p| p == repo.path()));
+    assert_eq!(
+        paths,
+        vec![repo.path().to_path_buf()],
+        "pom.xml marker + MAVEN_REPO_LOCAL must yield exactly that repo"
+    );
 }
 
 #[tokio::test]
@@ -516,7 +553,11 @@ async fn get_maven_repo_paths_with_build_gradle_returns_repo() {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
     }
 
-    assert!(paths.iter().any(|p| p == repo.path()));
+    assert_eq!(
+        paths,
+        vec![repo.path().to_path_buf()],
+        "build.gradle marker + MAVEN_REPO_LOCAL must yield exactly that repo"
+    );
 }
 
 #[tokio::test]
@@ -541,7 +582,11 @@ async fn get_maven_repo_paths_with_build_gradle_kts_returns_repo() {
         std::env::set_var("MAVEN_REPO_LOCAL", v);
     }
 
-    assert!(paths.iter().any(|p| p == repo.path()));
+    assert_eq!(
+        paths,
+        vec![repo.path().to_path_buf()],
+        "build.gradle.kts marker + MAVEN_REPO_LOCAL must yield exactly that repo"
+    );
 }
 
 #[tokio::test]
@@ -573,8 +618,9 @@ async fn get_maven_repo_paths_m2_home_fallback() {
         std::env::set_var("M2_HOME", v);
     }
 
-    assert!(
-        paths.iter().any(|p| p == &repo_dir),
-        "M2_HOME/repository fallback must work; got {paths:?}"
+    assert_eq!(
+        paths,
+        vec![repo_dir],
+        "M2_HOME/repository fallback must be the sole discovered repo; got {paths:?}"
     );
 }

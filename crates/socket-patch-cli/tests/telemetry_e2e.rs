@@ -122,10 +122,13 @@ async fn setup_mock(
         .mount(&mock)
         .await;
     if let Some(body) = fetch_uuid_response {
-        // Match any GET against /v0/orgs/{slug}/patches/{uuid}
+        // Match the real fetch_patch endpoint:
+        // GET /v0/orgs/{slug}/patches/view/{uuid}. (An earlier version of
+        // this regex omitted the `view/` segment, so it never matched and
+        // the "success" test silently exercised the not_found failure path.)
         Mock::given(method("GET"))
             .and(wiremock::matchers::path_regex(format!(
-                "^/v0/orgs/{ORG_SLUG}/patches/[0-9a-f-]+$"
+                "^/v0/orgs/{ORG_SLUG}/patches/view/[0-9a-f-]+$"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&mock)
@@ -163,6 +166,24 @@ async fn scan_emits_patch_scanned_telemetry_on_success() {
         count, 1,
         "scan must POST exactly one patch_scanned telemetry event"
     );
+    // The batch succeeded (200), so no failure event may be emitted —
+    // guards against a regression that fires both the success and the
+    // all-batches-failed event.
+    let failed = telemetry_post_count(&mock, Some("patch_scan_failed")).await;
+    assert_eq!(failed, 0, "successful scan must not POST patch_scan_failed");
+    // Prove the scan actually queried the batch endpoint (not a vacuous
+    // pass on an empty crawl).
+    let batch_hits = mock
+        .received_requests()
+        .await
+        .expect("recording enabled")
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path().ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
+        })
+        .count();
+    assert!(batch_hits >= 1, "scan must POST to the patches/batch endpoint");
 }
 
 #[tokio::test]
@@ -177,8 +198,18 @@ async fn scan_skips_telemetry_in_airgap_mode() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
 
-    let (_code, _stdout, _stderr) =
+    let (code, stdout, stderr) =
         run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[("SOCKET_OFFLINE", "1")]);
+
+    // Guard against a vacuous pass: prove scan actually ran its body (it
+    // crawled node_modules and reported the one package) rather than
+    // crashing before the telemetry-suppression point, which would also
+    // yield zero POSTs.
+    assert_eq!(code, 0, "offline scan must still succeed; stderr={stderr}");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("scan stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(v["status"], "success", "offline scan status; stdout={stdout}");
+    assert_eq!(v["scannedPackages"], 1, "offline scan must crawl the one package; stdout={stdout}");
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
@@ -214,7 +245,7 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "lodash", "4.17.20");
 
-    let (_code, _stdout, _stderr) = run_cmd(
+    let (code, stdout, stderr) = run_cmd(
         tmp.path(),
         &mock.uri(),
         "get",
@@ -222,17 +253,42 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
         &[],
     );
 
-    // Either patch_fetched (success) or patch_fetch_failed (downstream
-    // apply step failed for some test-env reason) is acceptable —
-    // either way, we just need the get command to have fired *some*
-    // telemetry against the UUID path. The pivotal invariant is that
-    // telemetry happens at all, not the exact terminal event.
+    // The mock serves the patch on the real `patches/view/{uuid}` endpoint,
+    // so this is a genuine SUCCESS: get must fire exactly one
+    // `patch_fetched` event and zero `patch_fetch_failed` events. (A
+    // disjoint "fetched OR failed >= 1" assert would silently pass on the
+    // not_found failure path — which is what happened while the mock regex
+    // omitted the `view/` segment.)
+    assert_eq!(
+        code, 0,
+        "get --id of a served free patch must exit 0 (stdout={stdout} stderr={stderr})"
+    );
     let fetched = telemetry_post_count(&mock, Some("patch_fetched")).await;
     let failed = telemetry_post_count(&mock, Some("patch_fetch_failed")).await;
+    assert_eq!(
+        fetched, 1,
+        "get --id UUID success must POST exactly one patch_fetched event \
+         (saw fetched={fetched} failed={failed}); stdout={stdout}"
+    );
+    assert_eq!(
+        failed, 0,
+        "get --id UUID success must NOT POST any patch_fetch_failed event \
+         (saw fetched={fetched} failed={failed}); stdout={stdout}"
+    );
+    // Prove the mock actually served the patch (i.e. the view endpoint was
+    // matched), so patch_fetched reflects a real fetch rather than a stub.
+    let received = mock.received_requests().await.expect("recording enabled");
+    let view_hits = received
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::GET
+                && r.url.path().contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
+        })
+        .count();
     assert!(
-        fetched + failed >= 1,
-        "get --id UUID must POST a patch_fetched or patch_fetch_failed event \
-         (saw fetched={fetched} failed={failed})"
+        view_hits >= 1,
+        "get must GET the patches/view/{{uuid}} endpoint; saw paths: {:?}",
+        received.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
     );
 }
 
@@ -258,12 +314,30 @@ async fn get_skips_telemetry_in_airgap_mode() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "lodash", "4.17.20");
 
-    let (_code, _stdout, _stderr) = run_cmd(
+    let (_code, stdout, _stderr) = run_cmd(
         tmp.path(),
         &mock.uri(),
         "get",
         &["--id", UUID],
         &[("SOCKET_OFFLINE", "1")],
+    );
+
+    // Anti-vacuous guard: get must have reached the fetch step (it queries
+    // the view endpoint regardless of airgap) — proving it ran far enough
+    // to hit the telemetry-suppression point. A crash before that would
+    // also produce zero telemetry POSTs and falsely "pass".
+    let received = mock.received_requests().await.expect("recording enabled");
+    let view_hits = received
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::GET
+                && r.url.path().contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
+        })
+        .count();
+    assert!(
+        view_hits >= 1,
+        "offline get must still query the view endpoint; saw paths: {:?}; stdout={stdout}",
+        received.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
     );
 
     let count = telemetry_post_count(&mock, None).await;
@@ -298,13 +372,23 @@ async fn apply_skips_telemetry_in_airgap_mode() {
     )
     .unwrap();
 
-    let (_code, _stdout, _stderr) = run_cmd(
+    let (_code, stdout, _stderr) = run_cmd(
         tmp.path(),
         &mock.uri(),
         "apply",
         &[],
         &[("SOCKET_OFFLINE", "1")],
     );
+
+    // Anti-vacuous guard: apply must have run its command body and emitted
+    // its JSON result envelope (with a summary), proving the suppression
+    // wasn't a side effect of an early crash. (Apply on an empty manifest
+    // currently reports partialFailure — a separately tracked design gap —
+    // so we assert on the envelope shape, not the status string.)
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("apply stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(v["command"], "apply", "apply must emit its command envelope; stdout={stdout}");
+    assert!(v.get("summary").is_some(), "apply envelope must carry a summary; stdout={stdout}");
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
@@ -397,6 +481,21 @@ async fn scan_falls_back_to_proxy_on_401_and_tags_telemetry() {
         stderr.contains("falling back to public patch API proxy"),
         "stderr must carry the fallback warning; got: {stderr}"
     );
+    // The retry must actually reach the proxy — otherwise the fallback
+    // "succeeded" only because the crawl was empty.
+    let proxy_hits = proxy_mock
+        .received_requests()
+        .await
+        .expect("recording enabled")
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::GET && r.url.path().starts_with("/patch/by-package/")
+        })
+        .count();
+    assert!(
+        proxy_hits >= 1,
+        "fallback must query the proxy by-package endpoint"
+    );
 
     // The post-fallback telemetry POST must include `fallback_to_proxy: true`.
     let received = auth_mock
@@ -469,6 +568,23 @@ async fn scan_does_not_fall_back_on_500() {
         !stderr.contains("falling back"),
         "5xx must NOT trigger fallback; stderr was: {stderr}"
     );
+    // Prove the auth batch endpoint was actually exercised (returned 500),
+    // so the zero-proxy-hits assertion below isn't a vacuous pass caused by
+    // an empty crawl that never queried anything at all.
+    let auth_batch_hits = auth_mock
+        .received_requests()
+        .await
+        .expect("recording enabled")
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path().ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
+        })
+        .count();
+    assert!(
+        auth_batch_hits >= 1,
+        "scan must have queried the auth batch endpoint (which returned 500)"
+    );
     let proxy_hits = proxy_mock
         .received_requests()
         .await
@@ -498,13 +614,22 @@ async fn list_skips_telemetry_in_airgap_mode() {
     )
     .unwrap();
 
-    let (_code, _stdout, _stderr) = run_cmd(
+    let (code, stdout, stderr) = run_cmd(
         tmp.path(),
         &mock.uri(),
         "list",
         &[],
         &[("SOCKET_OFFLINE", "1")],
     );
+
+    // Anti-vacuous guard: list must have run to a successful completion
+    // (it's a local command) rather than crashing before the telemetry
+    // decision, which would also yield zero POSTs.
+    assert_eq!(code, 0, "offline list must succeed; stderr={stderr}");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("list stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(v["command"], "list", "list must emit its command envelope; stdout={stdout}");
+    assert_eq!(v["status"], "success", "offline list status; stdout={stdout}");
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(count, 0, "SOCKET_OFFLINE=1 must suppress patch_listed");

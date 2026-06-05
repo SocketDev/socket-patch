@@ -27,6 +27,33 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
 }
 
+/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
+/// scrubbed from the child process.
+///
+/// Every flag these tests rely on has an env fallback: `--product`/
+/// `SOCKET_VEX_PRODUCT`, `--no-verify`/`SOCKET_VEX_NO_VERIFY`, `--doc-id`/
+/// `SOCKET_VEX_DOC_ID`, `--output`/`SOCKET_VEX_OUTPUT`, `--compact`/
+/// `SOCKET_VEX_COMPACT`, plus the `GlobalArgs` set (`SOCKET_JSON`,
+/// `SOCKET_OFFLINE`, `SOCKET_ECOSYSTEMS`, `SOCKET_GLOBAL_PREFIX`,
+/// `SOCKET_CWD`, `SOCKET_MANIFEST_PATH`, `SOCKET_API_TOKEN`, …). If the
+/// ambient environment leaks any of these into the child, a test silently
+/// stops exercising the path it names — an exported `SOCKET_VEX_NO_VERIFY`
+/// would route the verify-mode tests through the no-verify path (so the
+/// on-disk hash check is never run), and an exported `SOCKET_VEX_PRODUCT`
+/// would defeat both auto-detect tests by supplying the product the test
+/// claims the binary inferred. Removing the whole prefix from the child
+/// (the parent env is never mutated, so tests stay independent and need no
+/// serialization) makes the explicit CLI flags the sole source of truth.
+fn cli() -> Command {
+    let mut cmd = Command::new(binary());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 /// Write `manifest` to `<cwd>/.socket/manifest.json`.
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
@@ -111,7 +138,7 @@ fn no_verify_emits_valid_openvex() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -196,7 +223,7 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -226,7 +253,7 @@ fn empty_manifest_exits_non_zero_with_no_doc() {
     let cwd = tmp.path();
     write_manifest(cwd, &PatchManifest::new());
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -237,7 +264,14 @@ fn empty_manifest_exits_non_zero_with_no_doc() {
         ])
         .output()
         .expect("invoke vex");
-    assert!(!out.status.success(), "empty manifest must be non-zero exit");
+    // Empty manifest is the soft "nothing to attest" case → exit 1
+    // (distinct from a missing/unreadable manifest, which is exit 2).
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "empty manifest must exit 1 (no_patches). stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // Nothing on stdout — the VEX itself isn't written.
     assert!(
         out.stdout.is_empty(),
@@ -245,13 +279,17 @@ fn empty_manifest_exits_non_zero_with_no_doc() {
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Error"));
+    assert!(stderr.contains("Error"), "got: {stderr}");
+    assert!(
+        stderr.contains("Manifest is empty"),
+        "stderr must explain the manifest is empty, not some other error. got: {stderr}"
+    );
 }
 
 #[test]
 fn missing_manifest_exits_non_zero() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -262,9 +300,17 @@ fn missing_manifest_exits_non_zero() {
         ])
         .output()
         .expect("invoke vex");
-    assert!(!out.status.success());
+    // Missing manifest is a hard failure → exit 2 (not the soft exit-1
+    // "empty manifest" case).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing manifest must exit 2 (manifest_not_found). stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "no doc when manifest is missing");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Manifest not found"));
+    assert!(stderr.contains("Manifest not found"), "got: {stderr}");
 }
 
 #[test]
@@ -272,7 +318,7 @@ fn json_envelope_requires_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), &PatchManifest::new());
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -311,7 +357,7 @@ fn json_envelope_with_output_emits_both() {
     write_manifest(cwd, &manifest);
     let vex_path = cwd.join("out.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -375,7 +421,7 @@ fn auto_detect_prefers_git_remote_over_package_json() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
         .output()
         .expect("invoke vex");
@@ -415,7 +461,7 @@ fn auto_detect_uses_package_json() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -463,6 +509,30 @@ fn verify_mode_includes_applied_omits_unapplied() {
     .unwrap();
     // No matching file on disk → verify reports file_not_found.
 
+    // Third package: the file IS present, but it still holds the
+    // ORIGINAL (un-patched) content — i.e. the patch was never applied.
+    // This is the case that distinguishes a real hash check from a
+    // presence-only check: an implementation that emitted a statement
+    // for any package whose file merely exists would wrongly include
+    // this one. Verify-mode must hash the file, see it equals
+    // `beforeHash` (not `afterHash`), and omit it as `not_applied`.
+    let tampered_pkg = nm.join("tampered-pkg");
+    std::fs::create_dir_all(&tampered_pkg).unwrap();
+    std::fs::write(
+        tampered_pkg.join("package.json"),
+        r#"{"name":"tampered-pkg","version":"3.0.0"}"#,
+    )
+    .unwrap();
+    let original_content = b"original un-patched index";
+    let before_hash_tampered = compute_git_sha256_from_bytes(original_content);
+    // The "patched" content we claim the patch produces, but never write.
+    let after_hash_tampered = compute_git_sha256_from_bytes(b"what the patch would write");
+    assert_ne!(
+        before_hash_tampered, after_hash_tampered,
+        "before/after hashes must differ or the scenario is degenerate"
+    );
+    std::fs::write(tampered_pkg.join("index.js"), original_content).unwrap();
+
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         "pkg:npm/applied-pkg@1.0.0".to_string(),
@@ -486,9 +556,20 @@ fn verify_mode_includes_applied_omits_unapplied() {
             &["CVE-UNAPPLIED"],
         ),
     );
+    manifest.patches.insert(
+        "pkg:npm/tampered-pkg@3.0.0".to_string(),
+        make_record(
+            "33333333-3333-4333-8333-333333333333",
+            "package/index.js",
+            before_hash_tampered.as_str(),
+            after_hash_tampered.as_str(),
+            "GHSA-tampered",
+            &["CVE-TAMPERED"],
+        ),
+    );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -504,19 +585,50 @@ fn verify_mode_includes_applied_omits_unapplied() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    let doc: Value = serde_json::from_str(&stdout).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(stmts.len(), 1, "only the verified patch should appear");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "only the patch whose on-disk file hashes to afterHash should appear; \
+         the un-applied (file missing) and tampered (file at beforeHash) \
+         patches must both be omitted. doc:\n{stdout}"
+    );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-applied");
-
-    // Warning surfaced on stderr.
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The lone statement's subcomponent must be the genuinely-applied pkg.
+    let subs = stmts[0]["products"][0]["subcomponents"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["@id"], "pkg:npm/applied-pkg@1.0.0");
+    // Neither omitted vuln may leak anywhere into the emitted document.
     assert!(
-        stderr.contains("unapplied-pkg") && stderr.contains("omitting"),
-        "stderr should warn about omitted patch. got: {stderr}"
+        !stdout.contains("GHSA-unapplied"),
+        "the unapplied patch's vuln must not appear in the VEX doc:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("GHSA-tampered"),
+        "the tampered (file-present-but-unpatched) patch's vuln must not \
+         appear in the VEX doc — a presence-only check would wrongly emit \
+         it:\n{stdout}"
     );
 
-    maybe_validate_with_vexctl(&String::from_utf8_lossy(&out.stdout));
+    // Both omissions must surface on stderr, each routed with its own
+    // verification reason (the warning format is
+    // "omitting patch for <purl> from VEX (<reason>)").
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unapplied-pkg") && stderr.contains("file_not_found"),
+        "stderr should warn that unapplied-pkg was omitted as file_not_found. \
+         got: {stderr}"
+    );
+    assert!(
+        stderr.contains("tampered-pkg") && stderr.contains("not_applied"),
+        "stderr should warn that tampered-pkg was omitted as not_applied — \
+         this is what proves the on-disk hash was actually checked. \
+         got: {stderr}"
+    );
+
+    maybe_validate_with_vexctl(&stdout);
 }
 
 #[test]
@@ -540,7 +652,7 @@ fn verify_mode_all_failed_exits_non_zero() {
 
     // No node_modules, no package directory — ecosystem dispatch returns
     // empty map, every patch lands in `failed` → no statements → exit 1.
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -550,10 +662,22 @@ fn verify_mode_all_failed_exits_non_zero() {
         ])
         .output()
         .expect("invoke vex");
-    assert!(!out.status.success());
+    // All patches failed verification → soft "nothing to attest" → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "all-failed verify must exit 1 (no_applicable_patches). stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("No applied patches"));
+    assert!(stderr.contains("No applied patches"), "got: {stderr}");
+    // The single ghost patch must be reported as omitted (it was found
+    // in neither node_modules nor a package dir → package_not_found).
+    assert!(
+        stderr.contains("ghost") && stderr.contains("package_not_found"),
+        "stderr should name the omitted ghost patch and its reason. got: {stderr}"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -604,7 +728,7 @@ fn verify_mode_resolves_qualified_pypi_purl() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",

@@ -49,6 +49,10 @@ fn encode_module_path_no_uppercase_passthrough() {
 #[test]
 fn decode_module_path_inverts_encode() {
     let encoded = encode_module_path("github.com/Sirupsen/logrus");
+    // Pin the intermediate encoding too, so a buggy encode that happens to
+    // be inverted by an equally-buggy decode can't slip through the
+    // round-trip.
+    assert_eq!(encoded, "github.com/!sirupsen/logrus");
     assert_eq!(decode_module_path(&encoded), "github.com/Sirupsen/logrus");
 }
 
@@ -95,7 +99,15 @@ async fn find_by_purls_finds_module_in_cache() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(ORG_PURL).unwrap().path, pkg);
+    let found = result.get(ORG_PURL).unwrap();
+    assert_eq!(found.path, pkg);
+    // The path alone is not enough: a regression that mis-splits the module
+    // path or drops the version would still return the right directory while
+    // emitting garbage metadata. Pin every field of the CrawledPackage.
+    assert_eq!(found.name, "gin");
+    assert_eq!(found.version, "v1.9.1");
+    assert_eq!(found.namespace.as_deref(), Some("github.com/gin-gonic"));
+    assert_eq!(found.purl, ORG_PURL);
 }
 
 #[tokio::test]
@@ -214,11 +226,33 @@ async fn crawl_all_handles_unreadable_cache_path() {
     assert!(result.is_empty(), "unreadable cache must yield empty");
 }
 
-/// `GoCrawler::default()` should forward to `new()`.
-#[test]
-fn go_crawler_default_and_new_construct_cleanly() {
-    let _a = GoCrawler::default();
-    let _b = GoCrawler::new();
+/// `GoCrawler::default()` should forward to `new()` — and the two must be
+/// behaviorally identical, not merely both constructible.
+#[tokio::test]
+async fn go_crawler_default_and_new_construct_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = stage_go_module(tmp.path(), "github.com/gin-gonic/gin", "v1.9.1").await;
+
+    let a = GoCrawler::default();
+    let b = GoCrawler::new();
+
+    let ra = a
+        .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    let rb = b
+        .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(ra.len(), 1);
+    assert_eq!(rb.len(), 1);
+    assert_eq!(ra.get(ORG_PURL).unwrap().path, pkg);
+    assert_eq!(
+        ra.get(ORG_PURL).unwrap().path,
+        rb.get(ORG_PURL).unwrap().path,
+        "default() and new() must behave identically"
+    );
 }
 
 /// A `module` directive with no path (`module`) must not match — the
@@ -246,20 +280,35 @@ fn decode_module_path_trailing_bang_is_dropped() {
 }
 
 /// `find_by_purls` with a directory matching the module name but the
-/// path missing — exercise the `is_dir(module_dir)` false branch.
+/// requested *version* missing — exercise the `is_dir(module_dir)` false
+/// branch. A positive control (a different version of the same module that
+/// IS present and IS matched) proves the empty result is selective, not a
+/// blanket "find nothing" regression.
 #[tokio::test]
 async fn find_by_purls_module_dir_missing_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    // Note: stage NO module dir for this purl.
+    // Stage v1.9.1 but NOT the requested v9.9.9.
+    let present = stage_go_module(tmp.path(), "github.com/gin-gonic/gin", "v1.9.1").await;
+
     let crawler = GoCrawler;
+    let missing_purl = "pkg:golang/github.com/gin-gonic/gin@v9.9.9".to_string();
     let result = crawler
-        .find_by_purls(
-            tmp.path(),
-            &["pkg:golang/github.com/gin-gonic/gin@v1.9.1".to_string()],
-        )
+        .find_by_purls(tmp.path(), &[missing_purl.clone()])
         .await
         .unwrap();
-    assert!(result.is_empty());
+    assert!(
+        result.is_empty(),
+        "missing version must yield empty; got {result:?}"
+    );
+
+    // Positive control: the version that IS on disk must be found, proving
+    // the empty result above is not because the lookup is simply broken.
+    let present_result = crawler
+        .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(present_result.len(), 1);
+    assert_eq!(present_result.get(ORG_PURL).unwrap().path, present);
 }
 
 /// `crawl_all` over a cache with a versioned subdir several levels deep
@@ -288,6 +337,8 @@ async fn crawl_all_finds_nested_versioned_module() {
     assert_eq!(result[0].name, "gin");
     assert_eq!(result[0].version, "v1.9.1");
     assert_eq!(result[0].namespace.as_deref(), Some("github.com/gin-gonic"));
+    assert_eq!(result[0].purl, ORG_PURL);
+    assert_eq!(result[0].path, module_dir);
 }
 
 /// `cache` directory inside the module cache is metadata, must be
@@ -301,6 +352,13 @@ async fn crawl_all_skips_cache_metadata_dir() {
         .await
         .unwrap();
 
+    // Positive control: a real versioned module at the same depth as the
+    // pruned cache entry. Without this, an empty result could mean "skip
+    // works" OR "crawl is totally broken"; the control forces the skip to be
+    // SELECTIVE — the real module must be found while the cache/ subtree is
+    // not.
+    let real = stage_go_module(tmp.path(), "github.com/gin-gonic/gin", "v1.9.1").await;
+
     let crawler = GoCrawler;
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
@@ -309,9 +367,16 @@ async fn crawl_all_skips_cache_metadata_dir() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
+    assert_eq!(
+        result.len(),
+        1,
+        "exactly the real module must survive; cache/ pruned; got {result:?}"
+    );
+    assert_eq!(result[0].purl, ORG_PURL);
+    assert_eq!(result[0].path, real);
     assert!(
-        result.is_empty(),
-        "cache/ subtree must be skipped; got {result:?}"
+        !result.iter().any(|p| p.path.starts_with(&cache_meta)),
+        "no package may come from the cache/ metadata subtree; got {result:?}"
     );
 }
 

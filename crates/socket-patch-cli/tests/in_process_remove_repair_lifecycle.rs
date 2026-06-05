@@ -127,6 +127,10 @@ async fn remove_by_uuid_finds_correct_purl() {
     let tmp = tempfile::tempdir().unwrap();
     write_root(tmp.path());
     let uuid = "abcdef01-2345-4789-8abc-def012345678";
+    // A decoy with a DIFFERENT uuid that must be left untouched. Without it,
+    // a single-entry manifest can't distinguish "removed the entry matching
+    // the uuid" from "removed every entry" — both leave 0 patches.
+    let decoy_uuid = "99999999-9999-4999-8999-999999999999";
 
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
@@ -136,6 +140,12 @@ async fn remove_by_uuid_finds_correct_purl() {
             r#"{{ "patches": {{
                 "pkg:npm/uuid-remove@1.0.0": {{
                     "uuid": "{uuid}",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {{}}, "vulnerabilities": {{}},
+                    "description": "x", "license": "MIT", "tier": "free"
+                }},
+                "pkg:npm/decoy-keep@2.0.0": {{
+                    "uuid": "{decoy_uuid}",
                     "exportedAt": "2024-01-01T00:00:00Z",
                     "files": {{}}, "vulnerabilities": {{}},
                     "description": "x", "license": "MIT", "tier": "free"
@@ -162,7 +172,21 @@ async fn remove_by_uuid_finds_correct_purl() {
     let m: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
-    assert_eq!(m["patches"].as_object().unwrap().len(), 0);
+    let patches = m["patches"].as_object().unwrap();
+    // Exactly the uuid-matched purl is gone; the decoy survives intact.
+    assert_eq!(patches.len(), 1, "only the uuid-matched entry must be removed");
+    assert!(
+        !patches.contains_key("pkg:npm/uuid-remove@1.0.0"),
+        "the entry whose uuid matched the identifier must be removed"
+    );
+    assert!(
+        patches.contains_key("pkg:npm/decoy-keep@2.0.0"),
+        "the non-matching decoy must be left untouched"
+    );
+    assert_eq!(
+        patches["pkg:npm/decoy-keep@2.0.0"]["uuid"], decoy_uuid,
+        "the surviving entry must still be the decoy"
+    );
 }
 
 #[tokio::test]
@@ -171,7 +195,17 @@ async fn remove_no_matching_purl_exits_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#).unwrap();
+    // A real entry that does NOT match the identifier. Removing nothing must
+    // be a true no-op: not-found exits 1 AND must not delete the bystander.
+    let manifest_json = r#"{ "patches": {
+        "pkg:npm/bystander@1.0.0": {
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": {}, "vulnerabilities": {},
+            "description": "x", "license": "MIT", "tier": "free"
+        }
+    } }"#;
+    std::fs::write(socket.join("manifest.json"), manifest_json).unwrap();
 
     let args = RemoveArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -187,6 +221,13 @@ async fn remove_no_matching_purl_exits_not_found() {
         skip_rollback: true,
     };
     assert_eq!(remove_run(args).await, 1);
+    // The bystander entry must remain — a non-match deletes nothing.
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
+    let patches = m["patches"].as_object().unwrap();
+    assert_eq!(patches.len(), 1, "a non-matching identifier must remove nothing");
+    assert!(patches.contains_key("pkg:npm/bystander@1.0.0"));
 }
 
 #[tokio::test]
@@ -195,7 +236,8 @@ async fn remove_invalid_manifest_emits_error() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
+    let original = "{ not json";
+    std::fs::write(socket.join("manifest.json"), original).unwrap();
 
     let args = RemoveArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -211,6 +253,13 @@ async fn remove_invalid_manifest_emits_error() {
         skip_rollback: true,
     };
     assert_eq!(remove_run(args).await, 1);
+    // A manifest it could not parse must be left byte-for-byte intact — remove
+    // must never silently overwrite/truncate it into a valid empty manifest.
+    assert_eq!(
+        std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+        original,
+        "unparseable manifest must not be clobbered on error"
+    );
 }
 
 #[tokio::test]
@@ -231,6 +280,11 @@ async fn remove_no_manifest_emits_not_found() {
         skip_rollback: true,
     };
     assert_eq!(remove_run(args).await, 1);
+    // Removing from a non-existent manifest must not conjure one into being.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "remove against a missing manifest must not create one"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +360,30 @@ async fn repair_diff_mode_downloads_diff_archives() {
     std::env::remove_var("SOCKET_ORG_SLUG");
     assert_eq!(code, 0, "repair --download-mode diff must succeed");
 
-    // The diff archive should be on disk at .socket/diffs/<uuid>.tar.gz.
+    // The diff archive should be on disk at .socket/diffs/<uuid>.tar.gz, and
+    // its bytes must be exactly what the server served — a corrupt/empty
+    // write would otherwise still satisfy a bare `exists()` check.
     let archive_path = socket.join(format!("diffs/{uuid}.tar.gz"));
     assert!(
         archive_path.exists(),
         "diff archive must be persisted to {}",
         archive_path.display()
     );
+    assert_eq!(
+        std::fs::read(&archive_path).unwrap(),
+        fake_archive,
+        "persisted diff archive bytes must match the served body"
+    );
+    // Prove the real download path ran (not a short-circuit): the diff
+    // endpoint must have actually been requested.
+    let hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/diff/{uuid}"))
+        .count();
+    assert_eq!(hits, 1, "diff endpoint must be fetched exactly once");
 }
 
 #[tokio::test]
@@ -366,7 +437,21 @@ async fn repair_package_mode_downloads_package_archives() {
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
     assert_eq!(code, 0);
-    assert!(socket.join(format!("packages/{uuid}.tar.gz")).exists());
+    let archive_path = socket.join(format!("packages/{uuid}.tar.gz"));
+    assert!(archive_path.exists());
+    assert_eq!(
+        std::fs::read(&archive_path).unwrap(),
+        archive_bytes,
+        "persisted package archive bytes must match the served body"
+    );
+    let hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/package/{uuid}"))
+        .count();
+    assert_eq!(hits, 1, "package endpoint must be fetched exactly once");
 }
 
 #[tokio::test]
@@ -412,40 +497,103 @@ async fn repair_file_mode_downloads_individual_blobs() {
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");
     assert_eq!(code, 0);
-    assert!(socket.join("blobs").join(&after_hash).exists());
+    let blob_path = socket.join("blobs").join(&after_hash);
+    assert!(blob_path.exists());
+    // Content-addressed: the stored blob must contain exactly the served
+    // bytes, and re-hashing it must reproduce the manifest's afterHash.
+    let stored = std::fs::read(&blob_path).unwrap();
+    assert_eq!(stored, blob_content, "stored blob bytes must match served body");
+    assert_eq!(
+        git_sha256(&stored),
+        after_hash,
+        "stored blob must hash back to its content-addressed name"
+    );
+    let hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/blob/{after_hash}"))
+        .count();
+    assert_eq!(hits, 1, "blob endpoint must be fetched exactly once");
 }
 
 #[tokio::test]
 #[serial]
 async fn repair_dry_run_does_not_download() {
     let tmp = tempfile::tempdir().unwrap();
+
+    // Critically: run dry-run while ONLINE (offline = false) and with a mock
+    // server that WOULD happily serve the missing blob. The only thing that
+    // can stop the download is the dry_run flag being honoured. The previous
+    // version of this test also set offline = true and had no server, so a
+    // `dry_run` that was silently ignored would still pass vacuously (network
+    // blocked by airgap, not by dry-run logic).
+    let blob_content = b"would-be-downloaded blob\n";
+    let after_hash = git_sha256(blob_content);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/blob/{after_hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_content.to_vec()))
+        .mount(&server)
+        .await;
+
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
         socket.join("manifest.json"),
-        r#"{ "patches": {
-            "pkg:npm/dryrun@1.0.0": {
+        format!(
+            r#"{{ "patches": {{
+            "pkg:npm/dryrun@1.0.0": {{
                 "uuid": "15151515-1515-4151-8151-151515151515",
                 "exportedAt": "2024-01-01T00:00:00Z",
-                "files": { "package/x.js": {
+                "files": {{ "package/x.js": {{
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
-                }},
-                "vulnerabilities": {}, "description": "x",
+                    "afterHash":  "{after_hash}"
+                }}}},
+                "vulnerabilities": {{}}, "description": "x",
                 "license": "MIT", "tier": "free"
-            }
-        }}"#,
+            }}
+        }}}}"#
+        ),
     )
     .unwrap();
 
     let mut args = make_repair_args(tmp.path(), "file");
     args.common.dry_run = true;
-    args.common.offline = true;
-    assert_eq!(repair_run(args).await, 0);
-    // Nothing should be downloaded.
+    args.common.offline = false;
+
+    std::env::set_var("SOCKET_API_URL", server.uri());
+    std::env::set_var("SOCKET_API_TOKEN", "fake");
+    std::env::set_var("SOCKET_ORG_SLUG", ORG);
+    let code = repair_run(args).await;
+    std::env::remove_var("SOCKET_API_URL");
+    std::env::remove_var("SOCKET_API_TOKEN");
+    std::env::remove_var("SOCKET_ORG_SLUG");
+    assert_eq!(code, 0, "dry-run repair must succeed");
+
+    // The blob the server offered must NOT be on disk.
+    assert!(
+        !socket.join("blobs").join(&after_hash).exists(),
+        "dry-run must not write the missing blob to disk"
+    );
     assert!(
         !socket.join("blobs").exists() || socket.join("blobs").read_dir().unwrap().count() == 0,
         "dry-run must not download blobs"
+    );
+    // The decisive check: the blob endpoint must never have been requested.
+    // If dry_run were ignored, fetch_missing_sources would have hit it.
+    let hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with(&format!("/v0/orgs/{ORG}/patches/")))
+        .count();
+    assert_eq!(
+        hits, 0,
+        "dry-run must not issue any patch-artifact download requests"
     );
 }
 
@@ -543,4 +691,12 @@ async fn repair_offline_with_present_blobs_succeeds() {
     let mut args = make_repair_args(tmp.path(), "file");
     args.common.offline = true;
     assert_eq!(repair_run(args).await, 0);
+    // The referenced blob is in use, so offline cleanup must leave it intact.
+    let kept = blobs.join(&hash);
+    assert!(kept.exists(), "a referenced blob must survive repair");
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        blob,
+        "the surviving blob's content must be unchanged"
+    );
 }

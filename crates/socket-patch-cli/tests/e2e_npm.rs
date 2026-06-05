@@ -255,8 +255,32 @@ fn test_npm_dry_run() {
         "file should not change after get --no-apply"
     );
 
-    // Dry-run should succeed but leave file untouched.
-    assert_run_ok(cwd, &["apply", "--dry-run"], "apply --dry-run");
+    // Dry-run should report that the patch *would* apply, but leave the
+    // file untouched. Asserting only "file unchanged" is a loophole: a
+    // dry-run that silently does nothing (never even detecting the saved
+    // patch) would pass it. Use the JSON envelope to require a `verified`
+    // event for our exact PURL so a no-op dry-run regresses loudly.
+    let (stdout, _) = assert_run_ok(
+        cwd,
+        &["apply", "--dry-run", "--json"],
+        "apply --dry-run --json",
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("apply --dry-run --json should emit JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        env["dryRun"],
+        serde_json::Value::Bool(true),
+        "envelope should be flagged dryRun"
+    );
+    let events = env["events"].as_array().expect("envelope events array");
+    let verified: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["action"] == "verified").collect();
+    assert_eq!(
+        verified.len(),
+        1,
+        "dry-run should report exactly one verifiable patch, got: {events:#?}"
+    );
+    assert_eq!(verified[0]["purl"].as_str().unwrap(), NPM_PURL);
 
     assert_eq!(
         git_sha256_file(&index_js),
@@ -328,10 +352,36 @@ fn test_npm_global_lifecycle() {
         "scan -g --json",
     );
     let scan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        scan["status"], "success",
+        "scan envelope should report success, got: {scan:#?}"
+    );
     let scanned = scan["scannedPackages"]
         .as_u64()
         .expect("scannedPackages should be a number");
     assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+
+    // A bare count is a loophole: scan could enumerate *some* package while
+    // failing to discover minimist or match its patch, and `scanned >= 1`
+    // would still pass. Require that the scan actually surfaced our exact
+    // PURL *with* the expected patch UUID in `packages`.
+    let packages = scan["packages"].as_array().expect("scan packages array");
+    let minimist = packages
+        .iter()
+        .find(|p| p["purl"].as_str() == Some(NPM_PURL))
+        .unwrap_or_else(|| panic!("scan should discover {NPM_PURL}, got packages: {packages:#?}"));
+    let patches = minimist["patches"]
+        .as_array()
+        .expect("discovered package should carry a patches array");
+    assert!(
+        patches.iter().any(|p| p["uuid"].as_str() == Some(NPM_UUID)),
+        "scan should match patch {NPM_UUID} for minimist, got patches: {patches:#?}"
+    );
+    assert!(
+        scan["packagesWithPatches"].as_u64().unwrap_or(0) >= 1,
+        "packagesWithPatches should be >= 1, got: {}",
+        scan["packagesWithPatches"]
+    );
 
     // -- GET: download + apply patch globally --------------------------------
     assert_run_ok(
@@ -359,6 +409,7 @@ fn test_npm_global_lifecycle() {
         .collect();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), NPM_UUID);
+    assert_eq!(patches[0]["purl"].as_str().unwrap(), NPM_PURL);
 
     // -- ROLLBACK: restore original file globally ----------------------------
     assert_run_ok(
@@ -480,9 +531,35 @@ fn test_npm_apply_force() {
         "corrupted file should have a different hash"
     );
 
-    // Normal apply should fail due to hash mismatch.
-    let (code, _stdout, _stderr) = run(cwd, &["apply"]);
-    assert_ne!(code, 0, "apply without --force should fail on hash mismatch");
+    // Normal apply should fail *specifically* because of the hash mismatch
+    // — not for some unrelated reason (missing patch, crash, lock error)
+    // that would also yield a non-zero exit and let a regression hide. Use
+    // the JSON envelope to pin the failure to our PURL and its reason.
+    let (code, stdout, stderr) = run(cwd, &["apply", "--json"]);
+    assert_ne!(
+        code, 0,
+        "apply without --force should fail on hash mismatch.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("apply --json should emit JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        env["status"], "partialFailure",
+        "envelope should report partialFailure, got: {env:#?}"
+    );
+    let events = env["events"].as_array().expect("envelope events array");
+    let failed: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["action"] == "failed").collect();
+    assert_eq!(
+        failed.len(),
+        1,
+        "exactly one failed event expected, got: {events:#?}"
+    );
+    assert_eq!(failed[0]["purl"].as_str().unwrap(), NPM_PURL);
+    let err_msg = failed[0]["error"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        err_msg.contains("hash") && err_msg.contains("match"),
+        "failure should be a hash mismatch on the patched file, got error: {err_msg:?}"
+    );
 
     // Apply with --force should succeed.
     assert_run_ok(cwd, &["apply", "--force"], "apply --force");
@@ -516,13 +593,38 @@ fn test_npm_macos_global_auto_discovery() {
         "scan -g --json failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // Output should be valid JSON with scannedPackages field
+    // Output should be a well-formed success envelope. We cannot assert a
+    // package count (the host's global prefix is uncontrolled and may be
+    // empty), but checking only `is_u64()` is a loophole: a regression that
+    // emits a malformed/error envelope while still printing *some* number
+    // would slip through. Pin the full envelope shape and its internal
+    // invariant instead.
     let scan: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("invalid JSON from scan -g: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        scan["status"], "success",
+        "scan -g envelope should report success, got: {scan:#?}"
+    );
+    let scanned = scan["scannedPackages"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("scannedPackages should be a number, got: {}", scan["scannedPackages"]));
+    let with_patches = scan["packagesWithPatches"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("packagesWithPatches should be a number, got: {}", scan["packagesWithPatches"]));
+    let packages = scan["packages"]
+        .as_array()
+        .expect("scan -g should emit a packages array");
+    // Discovery invariant: every package-with-a-patch was a scanned package,
+    // and the `packages` list (packages carrying patches) cannot exceed the
+    // total scanned count.
     assert!(
-        scan["scannedPackages"].is_u64(),
-        "scannedPackages should be a number, got: {}",
-        scan["scannedPackages"]
+        with_patches <= scanned,
+        "packagesWithPatches ({with_patches}) must not exceed scannedPackages ({scanned})"
+    );
+    assert_eq!(
+        packages.len() as u64,
+        with_patches,
+        "packages array length should equal packagesWithPatches"
     );
 }
 
@@ -553,6 +655,13 @@ fn test_npm_uuid_shortcut() {
         "index.js should match afterHash after UUID shortcut"
     );
 
+    // The shortcut must behave like `get`: the manifest must actually record
+    // our patch, not merely exist as an empty stub.
     let manifest_path = cwd.join(".socket/manifest.json");
     assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let patch = &manifest["patches"][NPM_PURL];
+    assert!(patch.is_object(), "manifest should contain {NPM_PURL} after UUID shortcut");
+    assert_eq!(patch["uuid"].as_str().unwrap(), NPM_UUID);
 }

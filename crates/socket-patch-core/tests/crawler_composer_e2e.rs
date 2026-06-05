@@ -79,24 +79,60 @@ async fn find_by_purls_finds_package_in_vendor() {
         .unwrap();
     assert_eq!(result.len(), 1);
     let pkg = result.get(ORG_PURL).unwrap();
+    // Assert the *full* distilled package, not just its path: a regression
+    // that mislabels name/namespace/version/purl would otherwise stay green.
     assert_eq!(
         pkg.path,
         tmp.path().join("vendor").join("monolog").join("monolog")
     );
+    assert_eq!(pkg.name, "monolog");
+    assert_eq!(pkg.namespace.as_deref(), Some("monolog"));
+    assert_eq!(pkg.version, "3.5.0");
+    assert_eq!(pkg.purl, ORG_PURL);
 }
 
 #[tokio::test]
 async fn find_by_purls_no_installed_json_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
-    tokio::fs::create_dir(&vendor).await.unwrap();
+    // Stage the package directory on disk so the ONLY thing missing is
+    // installed.json. Without this, find_by_purls returns empty because the
+    // pkg dir is absent (the `is_dir` guard) — masking whether the missing
+    // installed.json actually gates the result. A control below proves the
+    // dir is discoverable once installed.json exists.
+    let pkg_dir = vendor.join("monolog").join("monolog");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
 
     let crawler = ComposerCrawler;
     let result = crawler
         .find_by_purls(&vendor, &[ORG_PURL.to_string()])
         .await
         .unwrap();
-    assert!(result.is_empty());
+    assert!(
+        result.is_empty(),
+        "package on disk but no installed.json must not match; got {result:?}"
+    );
+
+    // Control: write installed.json listing the same package and confirm it
+    // is now found. This proves the empty result above was caused by the
+    // missing installed.json, not by an unrelated short-circuit.
+    let composer_dir = vendor.join("composer");
+    tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+    tokio::fs::write(
+        composer_dir.join("installed.json"),
+        br#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"}]}"#,
+    )
+    .await
+    .unwrap();
+    let result = crawler
+        .find_by_purls(&vendor, &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "control: same package must match once installed.json exists"
+    );
 }
 
 #[tokio::test]
@@ -149,6 +185,12 @@ async fn crawl_all_via_installed_json_returns_packages() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].name, "monolog");
     assert_eq!(result[0].namespace.as_deref(), Some("monolog"));
+    assert_eq!(result[0].version, "3.5.0");
+    assert_eq!(result[0].purl, ORG_PURL);
+    assert_eq!(
+        result[0].path,
+        tmp.path().join("vendor").join("monolog").join("monolog")
+    );
 }
 
 #[tokio::test]
@@ -163,16 +205,39 @@ async fn crawl_all_with_corrupt_installed_json_returns_empty() {
     tokio::fs::write(tmp.path().join("composer.json"), b"{}")
         .await
         .unwrap();
+    // Stage a real package directory on disk. If a regression ever made
+    // crawl_all fall back to directory-walking when installed.json fails to
+    // parse, this package would leak through — so its absence from the
+    // result proves the corrupt JSON (not a missing dir) is what yields
+    // empty. The control below confirms the dir is discoverable.
+    let pkg_dir = vendor.join("monolog").join("monolog");
+    tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
 
     let crawler = ComposerCrawler;
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
-        global_prefix: Some(vendor),
+        global_prefix: Some(vendor.clone()),
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty(), "corrupt JSON must yield empty crawl");
+
+    // Control: replace the corrupt file with a valid one listing that same
+    // package and confirm crawl_all now surfaces it.
+    tokio::fs::write(
+        composer.join("installed.json"),
+        br#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"}]}"#,
+    )
+    .await
+    .unwrap();
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(
+        result.len(),
+        1,
+        "control: valid installed.json over the same dir must surface the package"
+    );
+    assert_eq!(result[0].purl, ORG_PURL);
 }
 
 // ── get_vendor_paths ──────────────────────────────────────────
@@ -297,9 +362,10 @@ async fn get_vendor_paths_global_via_composer_home_env() {
         std::env::set_var("COMPOSER_HOME", v);
     }
 
-    assert!(
-        paths.iter().any(|p| p == &vendor),
-        "COMPOSER_HOME-derived vendor dir must be returned; got {paths:?}"
+    assert_eq!(
+        paths,
+        vec![vendor],
+        "COMPOSER_HOME-derived vendor dir must be the sole returned path"
     );
 }
 
@@ -347,9 +413,10 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
         std::env::remove_var("PATH");
     }
 
-    assert!(
-        paths.iter().any(|p| p == &vendor),
-        "HOME/.composer fallback vendor dir must be returned; got {paths:?}"
+    assert_eq!(
+        paths,
+        vec![vendor],
+        "HOME/.composer fallback vendor dir must be the sole returned path"
     );
 }
 
@@ -399,9 +466,10 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
         std::env::remove_var("PATH");
     }
 
-    assert!(
-        paths.iter().any(|p| p == &vendor),
-        "HOME/.config/composer fallback vendor dir must be returned; got {paths:?}"
+    assert_eq!(
+        paths,
+        vec![vendor],
+        "HOME/.config/composer fallback vendor dir must be the sole returned path"
     );
 }
 
@@ -472,7 +540,17 @@ async fn find_by_purls_handles_unreadable_installed_json() {
     let composer = vendor.join("composer");
     tokio::fs::create_dir_all(&composer).await.unwrap();
     let installed = composer.join("installed.json");
-    tokio::fs::write(&installed, r#"{"packages":[]}"#)
+    // List the requested package AND stage its dir on disk, so the only
+    // barrier to a match is the unreadable file. With an empty
+    // `{"packages":[]}` (the prior fixture) the result would be empty even
+    // if the read succeeded, making the test vacuous.
+    tokio::fs::write(
+        &installed,
+        br#"{"packages":[{"name":"monolog/monolog","version":"3.5.0"}]}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::create_dir_all(vendor.join("monolog").join("monolog"))
         .await
         .unwrap();
     common::chmod_unreadable(&installed);
@@ -482,11 +560,23 @@ async fn find_by_purls_handles_unreadable_installed_json() {
         .find_by_purls(&vendor, &[ORG_PURL.to_string()])
         .await
         .unwrap();
-    common::chmod_readable(&installed);
 
     assert!(
         result.is_empty(),
-        "unreadable installed.json must yield empty"
+        "unreadable installed.json must yield empty even when the pkg dir exists; got {result:?}"
+    );
+
+    // Control: once readable, the same staged package must be found —
+    // proving the empty result above was caused by the unreadable file.
+    common::chmod_readable(&installed);
+    let result = crawler
+        .find_by_purls(&vendor, &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "control: readable installed.json must surface the staged package"
     );
 }
 
@@ -522,6 +612,9 @@ async fn crawl_all_dedups_across_vendor_paths() {
         1,
         "duplicates inside installed.json must dedup"
     );
+    assert_eq!(result[0].purl, ORG_PURL);
+    assert_eq!(result[0].name, "monolog");
+    assert_eq!(result[0].namespace.as_deref(), Some("monolog"));
 }
 
 #[tokio::test]

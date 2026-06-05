@@ -154,6 +154,43 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
         "apply must succeed; stdout={stdout}; stderr={stderr}"
     );
 
+    // The whole point of this test is the ONLINE fetch path: the blob was
+    // neither pre-staged in `.socket/blobs/` nor present anywhere on disk,
+    // so the only way the file can end up with after-content is by the
+    // binary actually GETting it from the blob endpoint. Assert the mock
+    // recorded that request — otherwise a future regression that resolved
+    // the content some other way (or short-circuited) would stay green.
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == blob_path),
+        "apply must fetch the missing blob from the API; \
+         got requests={:?}",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+    // The fetch path must have actually applied the patch (not silently
+    // no-op'd to a green exit). Assert the JSON summary, not just exit code.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "online fetch must apply exactly one patch; stdout={stdout}"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "online fetch must not record any failures; stdout={stdout}"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["purl"] == purl && e["action"] != "failed"),
+        "must emit a non-failed event for the patched purl; events={events:?}"
+    );
+
     // The file under node_modules should now contain the patched bytes.
     let patched_path = tmp
         .path()
@@ -202,16 +239,36 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
         &mock.uri(),
         &["--ecosystems", "pypi"],
     );
-    // Exit code is 1 today (apply reports "nothing in scope" as a
-    // partial-failure / not-success state); both 0 and 1 are acceptable
-    // — what matters is that the file is NOT touched.
-    assert!(
-        code == 0 || code == 1,
-        "expected 0 or 1; got {code}; stdout={stdout}; stderr={stderr}"
+    // Filtering out npm leaves nothing in scope: apply reports this as a
+    // partial-failure (exit 1, status "partialFailure", all-zero summary).
+    // Pin the exact contract — a disjoint `0 || 1` accept would let a
+    // regression that flipped the exit code (or started "succeeding" while
+    // silently doing nothing) slip through.
+    assert_eq!(
+        code, 1,
+        "ecosystem filter with nothing in scope must exit 1; stdout={stdout}; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "apply");
+    assert_eq!(v["status"], "partialFailure");
     assert_eq!(v["summary"]["applied"], 0);
+    // Nothing in the npm ecosystem may even be discovered/downloaded once
+    // it's filtered out — guards against the filter being applied only at
+    // the write step while still crawling/fetching the excluded packages.
+    assert_eq!(v["summary"]["discovered"], 0, "filtered npm must not be discovered");
+    assert_eq!(v["summary"]["downloaded"], 0, "filtered npm must not be downloaded");
+    assert_eq!(v["summary"]["failed"], 0, "skipping out-of-scope is not a failure");
+    // The excluded npm patch must not appear as an applied/patched event —
+    // an empty `events` array or one without our purl is fine, but a
+    // "patched" event for the skipped purl would mean the filter leaked.
+    if let Some(events) = v["events"].as_array() {
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["purl"] == purl && e["action"] == "patched"),
+            "ecosystem filter must not patch the excluded npm purl; events={events:?}"
+        );
+    }
 
     // Node_modules file must be UNCHANGED.
     let content =
@@ -265,14 +322,24 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
     assert_eq!(code, 0, "dry-run must succeed; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["dryRun"], true);
+    // Dry-run must report it would patch but never actually applies.
+    assert_eq!(
+        v["summary"]["applied"], 0,
+        "dry-run must not count any applied patch; stdout={stdout}"
+    );
     let events = v["events"].as_array().expect("events array");
-    let actions: Vec<&str> = events
-        .iter()
-        .map(|e| e["action"].as_str().unwrap())
-        .collect();
+    // The verified event must be for OUR purl, not some unrelated event;
+    // and dry-run must NOT emit a real "patched"/"applied" action.
     assert!(
-        actions.contains(&"verified"),
-        "dry-run must emit verified event; got actions={actions:?}"
+        events.iter().any(|e| e["purl"] == "pkg:npm/dryrun-target@1.0.0"
+            && e["action"] == "verified"),
+        "dry-run must emit a verified event for the target purl; events={events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["action"] != "patched" && e["action"] != "applied"),
+        "dry-run must not emit a patched/applied action; events={events:?}"
     );
 
     // File content must be UNCHANGED.
@@ -328,11 +395,23 @@ async fn apply_with_force_overrides_hash_mismatch() {
     // With force on a HashMismatch, the diff path bails because the
     // on-disk hash still doesn't match `before_hash`, but the blob
     // fallback should kick in and overwrite the file with the
-    // afterHash content.
+    // afterHash content. Assert the run reports a real success — a
+    // green exit with applied==0 would mean --force silently skipped.
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "--force must apply the patch past the hash mismatch; stdout={stdout}"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .all(|e| e["action"] != "failed"),
+        "--force run must not emit a failed event; events={events:?}"
+    );
     let content =
         std::fs::read(tmp.path().join("node_modules/force-target/index.js")).unwrap();
     assert_eq!(content, after, "--force must overwrite file with afterHash content");
-    let _ = v;
 }
 
 #[tokio::test]
@@ -395,18 +474,23 @@ async fn apply_pypi_package_uses_python_crawler() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
 
-    // Pypi crawler looks for installed packages under site-packages.
-    // For an in-cwd install we use `.venv/lib/python3.X/site-packages`
-    // (the python_crawler probes multiple paths). Simplest: emulate
-    // pip's layout with `.venv/lib/site-packages/<pkg>/`.
-    let pkg_dir = tmp
-        .path()
-        .join(".venv/lib/python3.12/site-packages/pypi_target");
-    std::fs::create_dir_all(&pkg_dir).expect("create pypi pkg dir");
-    std::fs::write(pkg_dir.join("index.js"), before).expect("write source"); // file_path matches patch
-    let dist_info = tmp
-        .path()
-        .join(".venv/lib/python3.12/site-packages/pypi_target-1.0.0.dist-info");
+    // Pypi crawler discovers a project-local venv via filesystem probing
+    // (`find_local_venv_site_packages` → `find_site_packages_under`), so this is
+    // fully deterministic and does NOT depend on a real Python on PATH. The
+    // probed layout is platform-specific: `.venv/Lib/site-packages` on Windows,
+    // `.venv/lib/python3.*/site-packages` on Unix — stage whichever this runner
+    // will actually look in. The crawler returns the *site-packages* dir as the
+    // package path, and apply joins it with the patch file key after stripping
+    // the `package/` prefix — so the patch key `package/index.js` resolves to
+    // `<site-packages>/index.js`. Write the source there so apply can patch it.
+    let site_packages = if cfg!(windows) {
+        tmp.path().join(".venv").join("Lib").join("site-packages")
+    } else {
+        tmp.path().join(".venv").join("lib").join("python3.12").join("site-packages")
+    };
+    std::fs::create_dir_all(&site_packages).expect("create site-packages");
+    std::fs::write(site_packages.join("index.js"), before).expect("write source");
+    let dist_info = site_packages.join("pypi_target-1.0.0.dist-info");
     std::fs::create_dir_all(&dist_info).unwrap();
     std::fs::write(
         dist_info.join("METADATA"),
@@ -426,11 +510,11 @@ async fn apply_pypi_package_uses_python_crawler() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&after_hash), after).unwrap();
 
-    // Run apply restricted to pypi. The python crawler may or may not
-    // locate the package depending on environment (it depends on what
-    // python is available + path probing). The test's purpose is to
-    // exercise the dispatch + crawler invocation paths, so we just
-    // assert apply exits cleanly without panicking.
+    // Run apply restricted to pypi. With the venv staged on disk and the
+    // after-blob pre-cached, this must locate the package via the python
+    // crawler and patch it — exercising the pypi dispatch branch end to
+    // end, not just "without panicking". `VIRTUAL_ENV` is cleared so an
+    // ambient venv in CI can't redirect discovery away from our `.venv`.
     let out = Command::new(binary())
         .args([
             "apply",
@@ -441,15 +525,38 @@ async fn apply_pypi_package_uses_python_crawler() {
         ])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
-    // Either 0 (found + patched) or 1 (no python on PATH / package not
-    // located) — both confirm the dispatch path was taken without
-    // panicking.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        code, 0,
+        "pypi apply must find + patch the package; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "exactly one pypi patch must be applied; stdout={stdout}"
+    );
+    // The pypi crawler must have been the one to resolve the package: the
+    // patched event carries the pypi PURL.
+    let events = v["events"].as_array().expect("events array");
     assert!(
-        code == 0 || code == 1,
-        "pypi apply must not panic; got {code}"
+        events
+            .iter()
+            .any(|e| e["purl"] == "pkg:pypi/pypi_target@1.0.0"
+                && e["action"] != "failed"),
+        "must emit a non-failed event for the pypi purl; got events={events:?}"
+    );
+
+    // The on-disk source file under site-packages must now hold after-content.
+    let patched = std::fs::read(site_packages.join("index.js")).expect("read patched");
+    assert_eq!(
+        patched, after,
+        "pypi apply must overwrite site-packages file with after-content"
     );
 }
 
@@ -494,6 +601,11 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
     assert_eq!(
         code, 0,
         "apply with cached blob must succeed without network; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "cached-blob apply must apply exactly one patch; stdout={stdout}"
     );
 
     // File was patched.

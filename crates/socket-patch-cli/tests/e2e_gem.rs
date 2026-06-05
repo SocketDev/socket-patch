@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
+use wiremock::matchers::{method, path_regex};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -209,9 +211,119 @@ fn assert_original_hashes(gem_dir: &Path, original_hashes: &HashMap<String, Stri
 // Scan tests (no network needed)
 // ---------------------------------------------------------------------------
 
-/// Verify that `socket-patch scan` discovers gems in a vendor/bundle layout.
-#[test]
-fn scan_discovers_vendored_gems() {
+/// Parse `scan --json` stdout into a Value, with diagnostics on failure.
+fn parse_scan_json(stdout: &str, stderr: &str) -> serde_json::Value {
+    serde_json::from_str(stdout).unwrap_or_else(|e| {
+        panic!("scan --json must emit valid JSON ({e}).\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    })
+}
+
+/// Minimal, dependency-free percent-decoder for `%XX`-escaped path segments.
+/// Independent of the production encoder so it cannot rubber-stamp a buggy one.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Start a mock Socket *public proxy* that answers every per-package lookup
+/// with an empty (no-patch) result. Returns the running server.
+///
+/// In proxy mode (no API token — `run()` strips `SOCKET_API_TOKEN`) the scan
+/// issues one `GET /patch/by-package/<percent-encoded-purl>` per discovered
+/// package. Capturing those requests lets us assert the *exact* PURLs the
+/// gem crawler synthesized — name, version, and `pkg:gem/` ecosystem — rather
+/// than trusting a self-reported count.
+async fn start_proxy() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/patch/by-package/.+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Decoded set of PURLs the scan requested from the proxy's by-package route.
+async fn requested_purls(server: &MockServer) -> Vec<String> {
+    let reqs = server.received_requests().await.unwrap_or_default();
+    reqs.iter()
+        .filter(|r| format!("{}", r.method) == "GET")
+        .filter_map(|r| {
+            let p = r.url.path();
+            p.strip_prefix("/patch/by-package/")
+                .map(|seg| percent_decode(seg))
+        })
+        .collect()
+}
+
+/// Run `scan --json` against a freshly-started mock proxy and return both the
+/// parsed JSON envelope and the exact set of PURLs the crawler sent upstream.
+///
+/// The blocking subprocess is offloaded so the in-process mock server (running
+/// on the same runtime) can service the scan's HTTP requests concurrently.
+async fn scan_via_proxy(project_dir: &Path) -> (serde_json::Value, Vec<String>) {
+    let server = start_proxy().await;
+    let proxy_uri = server.uri();
+    let dir = project_dir.to_path_buf();
+    let (code, stdout, stderr) = tokio::task::spawn_blocking(move || {
+        let cwd = dir.to_str().unwrap().to_string();
+        run(
+            &dir,
+            &[
+                "scan",
+                "--json",
+                "--cwd",
+                &cwd,
+                "--proxy-url",
+                &proxy_uri,
+            ],
+        )
+    })
+    .await
+    .expect("scan task panicked");
+
+    assert_eq!(
+        code, 0,
+        "scan --json should exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let json = parse_scan_json(&stdout, &stderr);
+    assert_eq!(
+        json["status"], "success",
+        "scan status should be success.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let purls = requested_purls(&server).await;
+    (json, purls)
+}
+
+/// Verify that `socket-patch scan` discovers gems in a vendor/bundle layout
+/// AND parses each one into the correct `pkg:gem/<name>@<version>` PURL.
+///
+/// The crawl is offline (no real Ruby/network), but a mock public proxy
+/// captures the per-package lookups the scan fires, so we assert the *exact*
+/// PURLs the crawler synthesized — not merely a self-reported count. A
+/// regression that mis-parses `rails-7.1.0` (wrong name/version split),
+/// mis-classifies the ecosystem, double-counts, or lets another crawler leak
+/// in now fails loudly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_discovers_vendored_gems() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -235,24 +347,38 @@ fn scan_discovers_vendored_gems() {
     let nokogiri_dir = gems_dir.join("nokogiri-1.15.4");
     std::fs::create_dir_all(nokogiri_dir.join("lib")).unwrap();
 
-    let output = Command::new(binary())
-        .args(["scan", "--cwd", project_dir.to_str().unwrap()])
-        .current_dir(&project_dir)
-        .output()
-        .expect("Failed to run socket-patch binary");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{stdout}{stderr}");
+    let (json, mut purls) = scan_via_proxy(&project_dir).await;
 
-    assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover vendored gems, got:\n{combined}"
+    // Exactly the two vendored gems — not zero (crawler regression) and not a
+    // larger number (ambient discovery leaking in).
+    assert_eq!(
+        json["scannedPackages"].as_u64(),
+        Some(2),
+        "scan should discover exactly the two vendored gems (rails, nokogiri)"
+    );
+    // Shape invariants the contract guarantees.
+    assert!(json["packages"].is_array(), "packages must be an array");
+    assert!(json["updates"].is_array(), "updates must be an array");
+
+    // The crawler must have produced EXACTLY these two PURLs and queried the
+    // proxy for each — proving correct name/version split and `pkg:gem/`
+    // ecosystem tagging, not just a count of two unknown things.
+    purls.sort();
+    assert_eq!(
+        purls,
+        vec![
+            "pkg:gem/nokogiri@1.15.4".to_string(),
+            "pkg:gem/rails@7.1.0".to_string(),
+        ],
+        "scan must look up the two gems by their exact PURLs"
     );
 }
 
-/// Verify that `socket-patch scan` discovers gems with gemspec markers.
-#[test]
-fn scan_discovers_gems_with_gemspec() {
+/// Verify that `socket-patch scan` discovers gems with gemspec markers
+/// (the `.gemspec`-without-`lib/` discovery path, distinct from the lib/ path)
+/// and parses the gemspec-only gem into the correct PURL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_discovers_gems_with_gemspec() {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -273,18 +399,22 @@ fn scan_discovers_gems_with_gemspec() {
     std::fs::create_dir_all(&net_http_dir).unwrap();
     std::fs::write(net_http_dir.join("net-http.gemspec"), "# gemspec\n").unwrap();
 
-    let output = Command::new(binary())
-        .args(["scan", "--json", "--cwd", project_dir.to_str().unwrap()])
-        .current_dir(&project_dir)
-        .output()
-        .expect("Failed to run socket-patch binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
+    let (json, purls) = scan_via_proxy(&project_dir).await;
 
-    assert!(
-        combined.contains("scannedPackages") || combined.contains("Found"),
-        "Expected scan output, got:\n{combined}"
+    // The single gemspec-only gem must be discovered — exactly one, proving the
+    // .gemspec marker path works (a regression there would yield zero).
+    assert_eq!(
+        json["scannedPackages"].as_u64(),
+        Some(1),
+        "scan should discover exactly the one gemspec-marked gem (net-http)"
+    );
+    // ...and it must be parsed into the right PURL. `net-http-0.4.1` is a
+    // hyphenated name immediately before the version, so a sloppy
+    // last-hyphen split could mangle it — pin the exact result.
+    assert_eq!(
+        purls,
+        vec!["pkg:gem/net-http@0.4.1".to_string()],
+        "scan must look up the gemspec-only gem by its exact PURL"
     );
 }
 

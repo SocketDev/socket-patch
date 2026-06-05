@@ -89,6 +89,32 @@ fn remove_long_form() {
 }
 
 #[test]
+fn ecosystems_flag_parses_on_setup() {
+    // Setup command contract, property 2 ("ecosystem-scoped"): `setup` accepts
+    // the global `--ecosystems` filter (long form + the `-e` short form, CSV
+    // split). This pins the *parse* surface only; whether `setup` actually
+    // restricts its work to the named ecosystems at runtime is a separate
+    // (currently unimplemented) guarantee, RED-guarded in setup_contract_gaps.rs.
+    let long = parse_setup(&["--ecosystems", "npm,cargo"]);
+    assert_eq!(
+        long.common.ecosystems.as_deref(),
+        Some(&["npm".to_string(), "cargo".to_string()][..]),
+        "setup must parse the CSV --ecosystems filter (long form)"
+    );
+    let short = parse_setup(&["-e", "pypi"]);
+    assert_eq!(
+        short.common.ecosystems.as_deref(),
+        Some(&["pypi".to_string()][..]),
+        "setup must accept the -e short form"
+    );
+    // Default: no filter ⇒ act on every detected ecosystem.
+    assert!(
+        parse_setup(&[]).common.ecosystems.is_none(),
+        "no --ecosystems ⇒ None"
+    );
+}
+
+#[test]
 fn check_and_remove_conflict() {
     let result = Cli::try_parse_from(["socket-patch", "setup", "--check", "--remove"]);
     let err = match result {
@@ -190,5 +216,236 @@ fn subprocess_no_files_json_shape() {
         v["files"].as_array().expect("array").len(),
         0,
         "'files' must be an empty array for status 'no_files'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: the REAL setup path — a package.json present must actually be
+// configured (status "success", count incremented) AND the file on disk must
+// gain the postinstall hook. Without this, an impl that always short-circuits
+// to `no_files` (or reports success without writing) would pass every other
+// test in this file.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subprocess_configures_real_package_json() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let pkg_path = tempdir.path().join("package.json");
+    std::fs::write(&pkg_path, r#"{"name":"demo","version":"1.0.0"}"#).expect("write package.json");
+
+    let exe = env!("CARGO_BIN_EXE_socket-patch");
+    let output = Command::new(exe)
+        .arg("setup")
+        .arg("--cwd")
+        .arg(tempdir.path())
+        .arg("--json")
+        .arg("--yes")
+        // Keep this test off the network: a successful setup fires telemetry.
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("spawn socket-patch");
+
+    assert!(
+        output.status.success(),
+        "setup on a real package.json must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON, got {stdout:?}: {e}"));
+
+    // The envelope must reflect a real change, not a no-op / no_files.
+    assert_eq!(
+        v["status"], "success",
+        "a package.json that needed setup must report status 'success'; payload: {v}"
+    );
+    assert_eq!(
+        v["updated"], 1,
+        "exactly one manifest must be updated; payload: {v}"
+    );
+    assert_eq!(v["alreadyConfigured"], 0, "payload: {v}");
+    assert_eq!(v["errors"], 0, "payload: {v}");
+    assert_eq!(
+        v["packageManager"], "npm",
+        "default manager for a bare package.json is npm; payload: {v}"
+    );
+
+    let files = v["files"].as_array().expect("'files' must be an array");
+    let pkg_entries: Vec<&serde_json::Value> = files
+        .iter()
+        .filter(|f| f["kind"] == "package_json")
+        .collect();
+    assert_eq!(
+        pkg_entries.len(),
+        1,
+        "exactly one package_json file entry expected; payload: {v}"
+    );
+    let entry = pkg_entries[0];
+    assert_eq!(
+        entry["status"], "updated",
+        "the package.json entry must report status 'updated'; entry: {entry}"
+    );
+    assert!(
+        entry["error"].is_null(),
+        "a successful update must carry no error; entry: {entry}"
+    );
+    assert!(
+        entry["path"]
+            .as_str()
+            .map(|p| p.ends_with("package.json"))
+            .unwrap_or(false),
+        "the entry path must point at the package.json; entry: {entry}"
+    );
+
+    // The decisive check: the file on disk must actually carry the hook now.
+    let after = std::fs::read_to_string(&pkg_path).expect("read package.json back");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&after).expect("package.json must stay valid JSON after setup");
+    let postinstall = parsed["scripts"]["postinstall"]
+        .as_str()
+        .unwrap_or_else(|| panic!("scripts.postinstall must be set after setup; file: {after}"));
+    assert!(
+        postinstall.contains("socket-patch apply"),
+        "postinstall must invoke `socket-patch apply`, got {postinstall:?}"
+    );
+    // Original metadata must be preserved, not clobbered.
+    assert_eq!(parsed["name"], "demo", "setup must preserve existing fields");
+    assert_eq!(parsed["version"], "1.0.0", "setup must preserve existing fields");
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: --dry-run must PREVIEW only — report what it would do but leave
+// the package.json byte-for-byte unchanged. `dry_run_long_form` only proves the
+// flag parses; nothing here proved it is actually honoured at runtime. An impl
+// that ignored --dry-run and wrote the hook anyway would still emit a
+// "dry_run" envelope (that string comes from a separate branch) and pass every
+// other test — so the decisive guard is reading the file back and asserting it
+// did NOT gain the postinstall hook.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subprocess_dry_run_previews_without_writing() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let pkg_path = tempdir.path().join("package.json");
+    let original = r#"{"name":"demo","version":"1.0.0"}"#;
+    std::fs::write(&pkg_path, original).expect("write package.json");
+
+    let exe = env!("CARGO_BIN_EXE_socket-patch");
+    let output = Command::new(exe)
+        .arg("setup")
+        .arg("--cwd")
+        .arg(tempdir.path())
+        .arg("--dry-run")
+        .arg("--json")
+        .arg("--yes")
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("spawn socket-patch");
+
+    assert!(
+        output.status.success(),
+        "dry-run setup must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON, got {stdout:?}: {e}"));
+
+    // The envelope must announce a preview of a real change — not no_files,
+    // not already_configured, not success.
+    assert_eq!(
+        v["status"], "dry_run",
+        "dry-run on a configurable package.json must report status 'dry_run'; payload: {v}"
+    );
+    assert_eq!(v["dryRun"], true, "dryRun flag must be set; payload: {v}");
+    assert_eq!(
+        v["wouldUpdate"], 1,
+        "dry-run must report exactly one would-be update; payload: {v}"
+    );
+    assert_eq!(
+        v["updated"], 1,
+        "the preview counts the manifest it would touch; payload: {v}"
+    );
+    assert_eq!(v["errors"], 0, "payload: {v}");
+    let files = v["files"].as_array().expect("'files' must be an array");
+    let pkg_entries: Vec<&serde_json::Value> = files
+        .iter()
+        .filter(|f| f["kind"] == "package_json")
+        .collect();
+    assert_eq!(
+        pkg_entries.len(),
+        1,
+        "exactly one package_json preview entry expected; payload: {v}"
+    );
+    assert_eq!(
+        pkg_entries[0]["status"], "updated",
+        "the previewed entry must report it would be 'updated'; payload: {v}"
+    );
+
+    // The decisive check: dry-run must NOT have touched the file on disk.
+    let after = std::fs::read_to_string(&pkg_path).expect("read package.json back");
+    assert_eq!(
+        after, original,
+        "--dry-run must leave package.json byte-for-byte unchanged (no write)"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&after).expect("package.json must stay valid JSON");
+    assert!(
+        parsed["scripts"]["postinstall"].is_null(),
+        "--dry-run must NOT add the postinstall hook to disk; file: {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: idempotency — running setup against an already-configured
+// project must report `already_configured` (updated 0), not re-write or claim
+// a fresh success. Guards against an impl that can't tell configured from not.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subprocess_already_configured_is_idempotent() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let pkg_path = tempdir.path().join("package.json");
+    std::fs::write(&pkg_path, r#"{"name":"demo","version":"1.0.0"}"#).expect("write package.json");
+
+    let exe = env!("CARGO_BIN_EXE_socket-patch");
+    let run = || {
+        Command::new(exe)
+            .arg("setup")
+            .arg("--cwd")
+            .arg(tempdir.path())
+            .arg("--json")
+            .arg("--yes")
+            .env("SOCKET_TELEMETRY_DISABLED", "1")
+            .output()
+            .expect("spawn socket-patch")
+    };
+
+    // First run configures it.
+    let first = run();
+    assert!(first.status.success(), "first setup must succeed");
+    let v1: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(first.stdout).expect("utf8")).expect("json");
+    assert_eq!(v1["status"], "success", "first run must configure: {v1}");
+
+    let before_second = std::fs::read_to_string(&pkg_path).expect("read");
+
+    // Second run must be a no-op.
+    let second = run();
+    assert!(second.status.success(), "second setup must succeed");
+    let v2: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(second.stdout).expect("utf8")).expect("json");
+    assert_eq!(
+        v2["status"], "already_configured",
+        "re-running setup on a configured project must report 'already_configured'; payload: {v2}"
+    );
+    assert_eq!(v2["updated"], 0, "no further updates expected; payload: {v2}");
+
+    let after_second = std::fs::read_to_string(&pkg_path).expect("read");
+    assert_eq!(
+        before_second, after_second,
+        "an idempotent re-run must not rewrite package.json"
     );
 }

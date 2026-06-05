@@ -21,9 +21,47 @@ use fs2::FileExt;
 mod common;
 
 use common::{
-    envelope_error_code, json_string, parse_json_envelope, run, write_minimal_manifest,
-    PatchEntry,
+    envelope_error_code, envelope_error_message, json_string, parse_json_envelope, run,
+    write_minimal_manifest, PatchEntry,
 };
+
+/// Assert that a parsed apply envelope proves the binary got *past*
+/// lock acquisition and ran the real apply pipeline — i.e. it is NOT
+/// a lock-contention failure. Centralises the discriminator so the
+/// "lock was released / acquired" tests can't silently pass on empty
+/// or unrelated output the way a bare `!stdout.contains("lock_held")`
+/// substring check would.
+///
+/// Contract derived from the live binary: a lock_held failure emits
+/// `status: "error"` + `error.code: "lock_held"`; a successful
+/// acquisition against this fixture (a package that isn't on disk)
+/// emits `status: "partialFailure"` with no top-level `error` object.
+fn assert_lock_acquired(env: &serde_json::Value) {
+    assert_eq!(
+        json_string(env, "command"),
+        Some("apply"),
+        "envelope should be an apply envelope.\nenvelope: {env}"
+    );
+    assert_ne!(
+        envelope_error_code(env),
+        Some("lock_held"),
+        "apply must NOT report lock_held when the lock is free.\nenvelope: {env}"
+    );
+    assert!(
+        env.get("error").is_none(),
+        "a non-lock apply run must carry no top-level error object.\nenvelope: {env}"
+    );
+    assert_eq!(
+        json_string(env, "status"),
+        Some("partialFailure"),
+        "apply that acquired the lock should run the pipeline to a \
+         partialFailure (synthetic package absent), not an error.\nenvelope: {env}"
+    );
+    assert!(
+        env.get("summary").and_then(|s| s.as_object()).is_some(),
+        "acquired-lock apply must carry a summary object.\nenvelope: {env}"
+    );
+}
 
 /// Stage a minimal `.socket/manifest.json` so `apply` gets past the
 /// "no manifest, exit 0" early-return. The manifest references a
@@ -84,6 +122,24 @@ fn lock_held_returned_to_second_process() {
         "expected errorCode=lock_held.\nenvelope: {env}"
     );
     assert_eq!(json_string(&env, "status"), Some("error"));
+    assert_eq!(json_string(&env, "command"), Some("apply"));
+    // The message is part of the contract surface humans/scripts read.
+    assert_eq!(
+        envelope_error_message(&env),
+        Some("another socket-patch process is operating in this directory"),
+        "lock_held message must be the stable contention string.\nenvelope: {env}"
+    );
+    // Under contention the pipeline never ran: zero applied, no events.
+    assert_eq!(
+        env["summary"]["applied"].as_u64(),
+        Some(0),
+        "nothing may be applied while the lock is held.\nenvelope: {env}"
+    );
+    assert_eq!(
+        env["events"].as_array().map(|e| e.len()),
+        Some(0),
+        "a pre-pipeline lock failure must carry no events.\nenvelope: {env}"
+    );
 }
 
 /// Human-output mode: same contention scenario, no `--json`. The
@@ -96,15 +152,26 @@ fn lock_held_human_mode_mentions_other_process() {
     setup_socket_dir(&socket_dir);
     let _external = take_external_lock(&socket_dir);
 
-    let (code, _stdout, stderr) = run(dir.path(), &["apply"]);
-    assert_eq!(code, 1);
-    // Don't pin the exact phrasing — just confirm the user gets
-    // SOMETHING about another process. The contract is "stderr is
-    // non-empty and the error is recognizable."
+    let (code, stdout, stderr) = run(dir.path(), &["apply"]);
+    assert_eq!(code, 1, "human-mode contention must exit 1.\nstderr:\n{stderr}");
+    // Human mode must NOT leak a JSON envelope to stdout — the error
+    // is a human line on stderr. A regression that printed JSON here
+    // (or emitted nothing) would otherwise slip past a loose
+    // substring check.
     assert!(
-        stderr.to_lowercase().contains("another")
-            && stderr.to_lowercase().contains("process"),
-        "stderr should mention another process holding the lock, got:\n{stderr}"
+        stdout.trim().is_empty(),
+        "human mode must not print a JSON envelope to stdout, got:\n{stdout}"
+    );
+    // Pin the actual contention contract phrase rather than just
+    // "another"+"process": the binary prints the lock_held message and
+    // the actionable unlock/break-lock hint.
+    assert!(
+        stderr.contains("Error: another socket-patch process is operating in this directory"),
+        "stderr should carry the lock_held error line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--break-lock") && stderr.contains("socket-patch unlock"),
+        "stderr should give the actionable unlock/break-lock hint, got:\n{stderr}"
     );
 }
 
@@ -122,14 +189,18 @@ fn lock_released_after_external_drop() {
         let _external = take_external_lock(&socket_dir);
     } // drop releases the OS-level lock
 
-    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json"]);
-    // The synthetic manifest targets a package that doesn't exist
-    // on disk; apply may exit with any of {0 success-with-skips, 1
-    // unmatched-error}. The only thing we assert here: the output
-    // does NOT carry the lock-held error code.
-    assert!(
-        !stdout.contains("lock_held"),
-        "fresh apply after lock release must not report lock_held.\nstdout:\n{stdout}"
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
+    // The synthetic manifest targets a package that isn't on disk, so
+    // apply runs the pipeline to a partialFailure (exit 1). The point
+    // of THIS test is that the released lock is re-acquired: assert the
+    // envelope proves we got past the lock (not the old vacuous
+    // `!stdout.contains("lock_held")`, which a crash to empty stdout or
+    // an unrelated error would also satisfy).
+    let env = parse_json_envelope(&stdout);
+    assert_lock_acquired(&env);
+    assert_eq!(
+        code, 1,
+        "partialFailure against an absent package exits 1.\nstderr:\n{stderr}"
     );
 }
 
@@ -143,61 +214,90 @@ fn lock_file_persists_across_runs() {
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
 
-    // First run.
-    let _ = run(dir.path(), &["apply", "--json"]);
+    // Setup writes only the manifest — the lock file must not exist
+    // yet, so we can prove the first run is what creates it.
+    assert!(
+        !socket_dir.join("apply.lock").exists(),
+        "apply.lock must not exist before the first run"
+    );
 
-    // Lock file should exist after run completes.
+    // First run: must acquire (not lock_held) and create the file.
+    let (_code1, stdout1, _stderr1) = run(dir.path(), &["apply", "--json"]);
+    assert_lock_acquired(&parse_json_envelope(&stdout1));
+
+    // Lock file should persist after the run completes (inode kept so
+    // subsequent acquires don't race on create).
     assert!(
         socket_dir.join("apply.lock").is_file(),
         "apply.lock should persist between runs"
     );
 
-    // Second run must still be able to acquire (file exists, but
-    // no one holds the OS lock). Same "no lock_held in output"
-    // assertion as `lock_released_after_external_drop`.
-    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json"]);
+    // Second run must still be able to acquire (file exists, but no
+    // one holds the OS lock) — full envelope check, not a substring.
+    let (_code2, stdout2, _stderr2) = run(dir.path(), &["apply", "--json"]);
+    assert_lock_acquired(&parse_json_envelope(&stdout2));
+
+    // And the file is still there afterwards.
     assert!(
-        !stdout.contains("lock_held"),
-        "second run on persistent lock file must succeed in acquiring.\nstdout:\n{stdout}"
+        socket_dir.join("apply.lock").is_file(),
+        "apply.lock should still persist after the second run"
     );
 }
 
-/// Two `socket-patch apply` subprocesses started near-simultaneously
-/// must serialize — exactly one exits with `lock_held`. This is the
-/// real-world race: a dev runs `apply` in two terminals at once.
+/// Multiple real `socket-patch apply` subprocesses contending for the
+/// same `.socket/` lock must ALL observe the held lock and refuse —
+/// exactly the real-world race of a dev running `apply` in several
+/// terminals at once.
 ///
-/// We spawn the first as a non-blocking child, then immediately
-/// invoke the second synchronously. Because the synthetic manifest
-/// points at no packages on disk, both runs would normally finish
-/// in tens of ms — too fast to reliably observe the lock collision.
-/// Workaround: have the first process race against a tight
-/// retry-loop in this test rather than against itself, by holding
-/// our external lock briefly to pin the contention window.
+/// Determinism: the synthetic manifest points at no packages on disk,
+/// so a free-running apply finishes in tens of ms — too fast to
+/// reliably catch two binaries colliding with each other. Instead we
+/// pin the contention window by holding the external lock ourselves
+/// for the whole duration that the child processes run, then spawn N
+/// *real* apply binaries concurrently. Because we hold the lock the
+/// entire time they execute, every one of them must report
+/// `lock_held`. After we release, a fresh apply must acquire.
 #[test]
 fn two_apply_subprocesses_serialize() {
+    use std::sync::Arc;
+
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
 
-    // Hold the lock during the apply call so contention is
-    // deterministic. (Without this the two apply runs would race
-    // each other for the ~10ms apply takes, and we'd flake.)
+    // Hold the lock for the entire window the children run in, so the
+    // contention is deterministic rather than a ~10ms flake.
     let external = take_external_lock(&socket_dir);
 
-    // Issue an apply while we hold the lock — must report
-    // lock_held.
-    let (code, stdout, _) = run(dir.path(), &["apply", "--json"]);
-    assert_eq!(code, 1);
-    let env = parse_json_envelope(&stdout);
-    assert_eq!(envelope_error_code(&env), Some("lock_held"));
+    // Spawn several real apply subprocesses at once. They all run
+    // while we hold the lock, so each must fail with lock_held.
+    let cwd: Arc<std::path::PathBuf> = Arc::new(dir.path().to_path_buf());
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let cwd = Arc::clone(&cwd);
+            std::thread::spawn(move || run(&cwd, &["apply", "--json"]))
+        })
+        .collect();
+
+    for h in handles {
+        let (code, stdout, stderr) = h.join().expect("apply child thread panicked");
+        assert_eq!(
+            code, 1,
+            "every contending apply must exit 1.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(
+            envelope_error_code(&env),
+            Some("lock_held"),
+            "every contending apply must report lock_held.\nenvelope: {env}"
+        );
+        assert_eq!(json_string(&env, "status"), Some("error"));
+    }
 
     // Release and re-run — must now succeed in acquiring.
     drop(external);
     let (_code2, stdout2, _) = run(dir.path(), &["apply", "--json"]);
-    assert!(
-        !stdout2.contains("lock_held"),
-        "after lock release apply should acquire.\nstdout:\n{stdout2}"
-    );
+    assert_lock_acquired(&parse_json_envelope(&stdout2));
 }
 
 /// Sanity check that doesn't actually depend on the binary: confirm
@@ -246,16 +346,61 @@ fn break_lock_removes_stale_file_and_records_warning() {
     // we additionally get the audit event.
     std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
 
-    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
     let env = parse_json_envelope(&stdout);
+    // --break-lock breaks the stale file and then acquires cleanly, so
+    // the run must NOT itself be a lock_held failure. Prove the binary
+    // genuinely re-acquired the lock and drove the real apply pipeline
+    // to completion (partialFailure against the absent synthetic
+    // package, no top-level error) — not merely that the errorCode
+    // happened to differ from "lock_held". Without this, a regression
+    // that emitted the audit event but then bailed before acquiring
+    // (or with some other non-lock error) would slip through the
+    // `assert_ne!` + event-presence checks below.
+    assert_lock_acquired(&env);
+    assert_ne!(
+        envelope_error_code(&env),
+        Some("lock_held"),
+        "--break-lock should acquire, not report lock_held.\nenvelope: {env}"
+    );
+    // Same exit contract as every other acquired-then-pipeline run in
+    // this file: partialFailure against an absent package exits 1.
+    assert_eq!(
+        code, 1,
+        "break-lock apply that ran the pipeline to partialFailure must exit 1.\nstderr:\n{stderr}"
+    );
     let events = env["events"].as_array().expect("events array");
-    let has_lock_broken = events.iter().any(|e| {
-        e.get("action").and_then(|v| v.as_str()) == Some("skipped")
-            && e.get("errorCode").and_then(|v| v.as_str()) == Some("lock_broken")
-    });
+    // Exactly one lock_broken audit event, carrying the audit reason
+    // that names the action and the lock path.
+    let lock_broken: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.get("action").and_then(|v| v.as_str()) == Some("skipped")
+                && e.get("errorCode").and_then(|v| v.as_str()) == Some("lock_broken")
+        })
+        .collect();
+    assert_eq!(
+        lock_broken.len(),
+        1,
+        "apply --break-lock should emit exactly one lock_broken skipped event.\nstdout:\n{stdout}"
+    );
+    let reason = lock_broken[0]
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .expect("lock_broken event must carry a reason");
     assert!(
-        has_lock_broken,
-        "apply --break-lock should emit a lock_broken skipped event.\nstdout:\n{stdout}"
+        reason.contains("--break-lock") && reason.contains("apply.lock"),
+        "lock_broken reason should name the action and the lock file, got: {reason}"
+    );
+    // The break is also reflected in the skipped tally.
+    assert!(
+        env["summary"]["skipped"].as_u64().unwrap_or(0) >= 1,
+        "lock_broken should be counted in summary.skipped.\nenvelope: {env}"
+    );
+    // The inode is kept for subsequent acquires.
+    assert!(
+        socket_dir.join("apply.lock").is_file(),
+        "apply.lock should be re-created after --break-lock acquires"
     );
 }
 
@@ -279,6 +424,15 @@ fn lock_timeout_waits_then_reports_held() {
     assert_eq!(code, 1);
     let env = parse_json_envelope(&stdout);
     assert_eq!(envelope_error_code(&env), Some("lock_held"));
+    assert_eq!(json_string(&env, "status"), Some("error"));
+    // The message must reflect that we actually waited the budget —
+    // this distinguishes a real timeout-plumbed `acquire(timeout)`
+    // from an unconditional sleep that ignored the knob.
+    assert_eq!(
+        envelope_error_message(&env),
+        Some("another socket-patch process is operating in this directory (waited 1s)"),
+        "timeout contention message must report the 1s wait budget.\nenvelope: {env}"
+    );
     assert!(
         elapsed >= Duration::from_millis(700),
         "expected at least ~700ms wait under --lock-timeout=1, got {:?}",

@@ -192,6 +192,19 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
     patched.extend_from_slice(b"\n// SOCKET-PATCH-E2E-MARKER\n");
     let after_hash = git_sha256(&patched);
 
+    // Sanity: the fixture must actually change the file, otherwise the
+    // "marker present" assertion below would be vacuously satisfiable.
+    assert_ne!(original, patched, "patched fixture must differ from original");
+    assert_ne!(before_hash, after_hash, "before/after hashes must differ");
+    // Pristine pre-check: the marker must NOT already be on disk, so its
+    // later presence can only come from a real apply writing `patched`.
+    assert!(
+        !original
+            .windows(b"SOCKET-PATCH-E2E-MARKER".len())
+            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
+        "fixture file already contained the marker before apply"
+    );
+
     let server = MockServer::start().await;
     setup_cargo_apply_mock(&server, &before_hash, &after_hash, &patched).await;
 
@@ -227,20 +240,153 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
     std::env::set_var("CARGO_HOME", &cargo_home);
 
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    // A successful sync-apply over a writable registry file must exit 0.
+    // Accepting `0 || 1` would let a fully-failed apply pass.
+    assert_eq!(code, 0, "scan --sync should succeed (exit 0)");
+
+    // Prove the real apply path ran end-to-end: the crawler must have
+    // discovered cfg-if (POST batch), and the apply must have fetched the
+    // patch blob (GET view/<uuid>). Without these, a no-op that left the
+    // file untouched could otherwise sneak through.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
+    let purl = format!("pkg:cargo/{CRATE_NAME}@{CRATE_VERSION}");
+    let hit_batch = requests.iter().any(|r| {
+        r.url.path().ends_with("/patches/batch")
+            && String::from_utf8_lossy(&r.body).contains(&purl)
+    });
+    let hit_view = requests
+        .iter()
+        .any(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")));
+    assert!(hit_batch, "crawler never sent cfg-if to the batch endpoint");
+    assert!(hit_view, "apply never fetched the patch blob (view/<uuid>)");
 
     let after = std::fs::read(&lib_file).expect("read after");
-    // The marker should be in the file. If the apply path didn't run
-    // through (e.g., crawler scoped elsewhere), this fails loudly.
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {} after apply; file size: {}",
-        lib_file.display(),
-        after.len(),
+    // The applied file must be byte-for-byte the patched fixture (not just
+    // "contains the marker somewhere" — that tolerates partial/garbled
+    // writes), and its git-sha256 must equal the advertised afterHash.
+    assert_eq!(
+        after,
+        patched,
+        "applied file does not match the patched fixture (size: {})",
+        after.len()
+    );
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "applied file hash does not match afterHash"
     );
 
     // Restore the env var (don't leak across tests).
+    std::env::remove_var("CARGO_HOME");
+}
+
+/// Safety gate: when the patch's advertised `beforeHash` does NOT match the
+/// on-disk file, apply must REFUSE to write (it cannot trust that the blob is
+/// a valid successor of whatever is actually on disk). The positive test
+/// above only ever feeds a correct `beforeHash`, so a regression that made
+/// apply blindly clobber the file regardless of its current content would
+/// sail through it. This test pins the refusal: the file must be left
+/// byte-for-byte untouched and the run must NOT report success.
+#[tokio::test]
+#[serial]
+async fn cargo_apply_refuses_on_before_hash_mismatch() {
+    if !has_cargo() {
+        println!("SKIP: cargo not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (lib_file, cargo_home) = fetch_cfg_if(tmp.path());
+    let original = std::fs::read(&lib_file).expect("read lib.rs");
+
+    // Advertise a `beforeHash` that deliberately does NOT match the on-disk
+    // file. The real file hashes to `git_sha256(&original)`; we lie and claim
+    // it should hash to the digest of unrelated bytes.
+    let bogus_before_hash = git_sha256(b"this is not what is on disk");
+    assert_ne!(
+        bogus_before_hash,
+        git_sha256(&original),
+        "test bug: bogus beforeHash accidentally matches the real file"
+    );
+
+    // The "patched" content the mock would write IF apply ignored the gate.
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN\n");
+    let after_hash = git_sha256(&patched);
+
+    let server = MockServer::start().await;
+    setup_cargo_apply_mock(&server, &bogus_before_hash, &after_hash, &patched).await;
+
+    make_writable(&lib_file);
+
+    let args = ScanArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().join("proj"),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: true,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["cargo".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            // force MUST stay false: with --force, a hash mismatch is
+            // deliberately downgraded to "ready" and the file WOULD be
+            // overwritten. We are asserting the safe default refuses.
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        batch_size: 100,
+        apply: false,
+        prune: false,
+        sync: true,
+        all_releases: false,
+        vex: Default::default(),
+    };
+    std::env::set_var("CARGO_HOME", &cargo_home);
+
+    let code = scan_run(args).await;
+
+    // Confirm the real apply path actually ran (it discovered the crate and
+    // fetched the blob) — otherwise the "file untouched" assertion below
+    // would be vacuously satisfied by a scan that simply did nothing.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
+    let purl = format!("pkg:cargo/{CRATE_NAME}@{CRATE_VERSION}");
+    let hit_batch = requests.iter().any(|r| {
+        r.url.path().ends_with("/patches/batch")
+            && String::from_utf8_lossy(&r.body).contains(&purl)
+    });
+    assert!(hit_batch, "crawler never sent cfg-if to the batch endpoint");
+
+    // THE safety guarantee: the on-disk file must be byte-for-byte unchanged.
+    // If apply ignored the beforeHash gate and wrote the blob, this fails.
+    let after = std::fs::read(&lib_file).expect("read after");
+    assert_eq!(
+        after, original,
+        "apply clobbered a file whose content did NOT match the advertised \
+         beforeHash — the hash-verification safety gate has regressed"
+    );
+    assert!(
+        !after
+            .windows(b"SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN".len())
+            .any(|w| w == b"SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN"),
+        "the should-not-be-written marker leaked onto disk"
+    );
+
+    // A run that refused to apply its only patch must NOT report success.
+    assert_ne!(
+        code, 0,
+        "scan --sync reported success (exit 0) even though its only patch was \
+         rejected for a beforeHash mismatch and nothing was applied"
+    );
+
     std::env::remove_var("CARGO_HOME");
 }
 
@@ -296,5 +442,30 @@ async fn cargo_crawler_finds_real_fetched_crate() {
         vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
+
+    // Exit 0 alone is NOT proof of discovery: a scan that crawled the
+    // wrong location and found ZERO cargo packages also exits 0. Assert
+    // the crawler actually discovered the fetched crate by confirming the
+    // batch endpoint received a request whose body carries the cfg-if purl.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
+    let batch_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path().ends_with("/patches/batch"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        !batch_bodies.is_empty(),
+        "crawler never queried the batch endpoint — nothing was discovered"
+    );
+    assert!(
+        batch_bodies
+            .iter()
+            .any(|b| b.contains(&purl)),
+        "batch request bodies did not contain the fetched crate purl {purl}; bodies: {batch_bodies:?}"
+    );
+
     std::env::remove_var("CARGO_HOME");
 }

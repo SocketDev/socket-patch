@@ -1109,14 +1109,16 @@ async fn apply_patches_inner(
     let has_any_purls = !partitioned.is_empty();
 
     if all_packages.is_empty() && !has_any_purls {
+        // Nothing in scope: the manifest lists no patches (or every patch was
+        // filtered out by `--ecosystems`). There is genuinely no work to do,
+        // so this is a clean no-op SUCCESS — not a failure. Returning `false`
+        // here used to exit 1 / `partialFailure`, which broke the npm
+        // `postinstall` hook (it runs `apply` on every install, including
+        // fresh projects whose manifest has no matching patches yet).
         if !args.common.silent && !args.common.json {
-            if args.common.global || args.common.global_prefix.is_some() {
-                eprintln!("No global packages found");
-            } else {
-                eprintln!("No package directories found");
-            }
+            println!("No patches to apply.");
         }
-        return Ok((false, Vec::new(), Vec::new()));
+        return Ok((true, Vec::new(), Vec::new()));
     }
 
     if all_packages.is_empty() {
