@@ -61,4 +61,13 @@ hook_pyproject="$REPO_ROOT/pypi/socket-patch-hook/pyproject.toml"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$hook_pyproject"
 rm -f "$hook_pyproject.bak"
 
+# Update the Ruby Bundler-plugin gem version (Phase 2 scaffolding). The in-tree
+# plugin is the active mechanism today; keep the published gem's version in sync
+# so a release publishes a version matching the CLI.
+gemspec="$REPO_ROOT/gem/socket-patch-bundler/socket-patch-bundler.gemspec"
+if [ -f "$gemspec" ]; then
+  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$gemspec"
+  rm -f "$gemspec.bak"
+fi
+
 echo "Synced version to $VERSION"
