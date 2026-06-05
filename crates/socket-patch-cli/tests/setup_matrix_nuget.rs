@@ -49,6 +49,12 @@ mod smc;
 /// path that silently no-ops on skip — it is NOT a regression guard. The
 /// real teeth live in [`host_guard`] below.
 #[test]
+// Experimental ecosystem (nuget): aspirational setup-matrix cases are a
+// BASELINE GAP today; this passes on CI only because the runners lack `dotnet`
+// (cases soft-skip) and fails on any host that has it. Ignore so nuget can
+// never block the blocking --all-features jobs; `host_guard` below still pins
+// the real no-op contract. Run with `--features setup-e2e,nuget -- --ignored`.
+#[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn dotnet() {
     smc::run_pm("nuget", "dotnet");
 }

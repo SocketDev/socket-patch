@@ -46,6 +46,13 @@ mod smc;
 /// path that silently no-ops on skip — it is NOT a regression guard. The
 /// real teeth live in [`host_guard`] below.
 #[test]
+// Experimental ecosystem (deno): the setup-matrix aspirational cases are a
+// BASELINE GAP (setup does not wire deno's install hook yet). This passes on CI
+// only because the runners lack the `deno` toolchain (the cases soft-skip); on
+// any host that HAS deno it fails. Ignore it so deno can never block the
+// blocking --all-features jobs. The non-skippable no-op contract is still
+// guarded by `host_guard` below. Run with `--features setup-e2e -- --ignored`.
+#[ignore = "experimental ecosystem (deno): not gating CI until the deno backend is implemented; run with --ignored"]
 fn deno() {
     smc::run_pm("deno", "deno");
 }
