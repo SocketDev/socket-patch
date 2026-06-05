@@ -172,10 +172,11 @@ in particular, are behavior changes that gate a version bump when implemented).
 ### Per-ecosystem setup support
 
 `setup` installs an automatic-repatch hook for the five ecosystems with a usable post-install / build /
-startup hook (npm, pypi, cargo, gem, golang). The remaining ecosystems are **apply-only**:
-`socket-patch apply` patches them on demand, but there is no hook for `setup` to install, so `setup` is
-a `no_files` no-op for them. These are exactly the ecosystems for which property 7's **manual**
-declaration is intended (so their hand-applied patches still show up in VEX).
+startup hook (npm, pypi, cargo, gem, golang) — plus **composer** when the binary is built with the
+opt-in `composer` feature. The remaining ecosystems are **apply-only**: `socket-patch apply` patches
+them on demand, but there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them.
+These are exactly the ecosystems for which property 7's **manual** declaration is intended (so their
+hand-applied patches still show up in VEX).
 
 | Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
 |---|---|---|---|
@@ -184,7 +185,8 @@ declaration is intended (so their hand-applied patches still show up in VEX).
 | cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]`; the guard crate is published to crates.io each release |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
 | golang | generated `internal/socketpatchguard/` guard package (`guard.go` + `guard_test.go`) + a blank import in each `main` package | every `go test ./...` (CI gate) **and** every `go run` / binary launch (`init()` guard) — fail-closed | self-contained: committed Go source, no published artifact; CLI must be on `PATH` |
-| nuget · maven · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+| composer *(opt-in `composer` feature)* | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH`; only compiled in with `--features composer` (apply support is likewise feature-gated). Without the feature, composer is a `no_files` no-op |
+| nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
 
 ### Monorepo / multi-project discovery model
 
@@ -219,7 +221,8 @@ is patched identically to a direct one. Pinned by
 
 `setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
 consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`.
+`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`,
+`composer`.
 
 **`setup`:**
 

@@ -99,6 +99,8 @@ mod host_guard {
     /// `files` check is not redundant — a regression that mis-detected the
     /// composer manifest could keep `status: "no_files"` while listing files
     /// it touched, or vice versa; both must agree that nothing was done.
+    /// Only meaningful when composer setup is NOT compiled in.
+    #[cfg(not(feature = "composer"))]
     fn assert_no_files_status(stdout: &str, who: &str) {
         let v = parse_obj(stdout, who);
         assert_eq!(
@@ -153,6 +155,11 @@ mod host_guard {
         );
     }
 
+    // Built WITHOUT the `composer` feature, composer setup stubs out, so a
+    // composer-only project is a clean no-op. CI's `--all-features` build enables
+    // `composer`, where the positive round-trip in `composer_setup_round_trips_host`
+    // runs instead (the two are mutually exclusive by cfg).
+    #[cfg(not(feature = "composer"))]
     #[test]
     fn composer_setup_is_a_clean_noop_host() {
         let tmp = tempfile::tempdir().unwrap();
@@ -218,5 +225,72 @@ mod host_guard {
         );
         assert_no_files_status(&out, "remove");
         assert_manifest_pristine(root, "after remove");
+    }
+
+    /// With the `composer` feature compiled in, composer is a REAL setup
+    /// ecosystem: `setup` wires `socket-patch apply` into `composer.json`'s
+    /// post-install/post-update script events, `--check` reflects it, and
+    /// `--remove` restores the manifest byte-for-byte. Non-skippable (no Docker,
+    /// no PHP toolchain) — it edits composer.json directly. This is the positive
+    /// twin of `composer_setup_is_a_clean_noop_host` (the two never co-exist).
+    #[cfg(feature = "composer")]
+    #[test]
+    fn composer_setup_round_trips_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("composer.json"), COMPOSER_JSON).unwrap();
+        let root_s = root.to_str().unwrap();
+
+        let status = |v: &serde_json::Value| v.get("status").and_then(|s| s.as_str()).map(str::to_string);
+
+        // ── check (pristine): not wired yet → needs_configuration / exit 1 ──
+        let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 1, "pre-setup check must fail:\n{out}");
+        assert_eq!(status(&parse_obj(&out, "check (pristine)")).as_deref(), Some("needs_configuration"));
+
+        // ── setup: wires the hook into composer.json → success / updated=1 ──
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "composer setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        let v = parse_obj(&out, "setup");
+        assert_eq!(status(&v).as_deref(), Some("success"), "setup must report success:\n{out}");
+        assert_eq!(v.get("updated").and_then(|n| n.as_i64()), Some(1), "exactly the composer.json updated:\n{out}");
+        // Exactly one `composer`-kind file entry, status `updated`.
+        let files = v["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1, "one composer file entry:\n{out}");
+        assert_eq!(files[0]["kind"], "composer");
+        assert_eq!(files[0]["status"], "updated");
+        // The command landed in BOTH script events on disk.
+        let on_disk = std::fs::read_to_string(root.join("composer.json")).unwrap();
+        let cj: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        for event in ["post-install-cmd", "post-update-cmd"] {
+            let arr = cj["scripts"][event].as_array().unwrap_or_else(|| panic!("{event} missing:\n{on_disk}"));
+            assert!(
+                arr.iter().any(|c| c.as_str().is_some_and(|s| s.contains("socket-patch apply"))),
+                "{event} must carry the re-apply command:\n{on_disk}"
+            );
+        }
+        assert!(cj["require"]["monolog/monolog"] == "3.5.0", "user require preserved:\n{on_disk}");
+
+        // ── idempotent re-setup: already_configured, no change ──
+        let (code, out, _) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0);
+        assert_eq!(status(&parse_obj(&out, "re-setup")).as_deref(), Some("already_configured"), "{out}");
+
+        // ── check (post-setup): configured / exit 0 ──
+        let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 0, "post-setup check must pass:\n{out}");
+        assert_eq!(status(&parse_obj(&out, "check (post-setup)")).as_deref(), Some("configured"));
+
+        // ── remove: strips the hook, restoring composer.json byte-for-byte ──
+        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "composer remove must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(status(&parse_obj(&out, "remove")).as_deref(), Some("success"));
+        // The `scripts` object we created is gone and the dir holds only composer.json.
+        assert_manifest_pristine(root, "after remove");
+
+        // ── check (post-remove): back to needs_configuration / exit 1 ──
+        let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 1, "post-remove check must fail again:\n{out}");
+        assert_eq!(status(&parse_obj(&out, "check (post-remove)")).as_deref(), Some("needs_configuration"));
     }
 }

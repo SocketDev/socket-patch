@@ -391,7 +391,8 @@ Configure your project so patches are **re-applied automatically after install**
 - **Cargo** — adds a `socket-patch-guard` build dependency to each workspace member's `Cargo.toml` plus an `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml`. The guard's build script re-applies patches on every `cargo build` and is **fail-closed** — a build using stale/unpatched sources fails loudly. (Requires the `socket-patch` CLI on `PATH` at build time.)
 - **Go** — generates a committed `internal/socketpatchguard/` guard package plus a blank import in each `main` package. The guard re-applies patches and gates both `go test ./...` (CI) and every `go run` / binary launch via `init()` — **fail-closed**. Fully self-contained committed source. (Requires the `socket-patch` CLI on `PATH`.)
 - **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
-- **Apply-only ecosystems** (nuget · maven · composer · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
+- **Composer (PHP)** *(opt-in `composer` feature)* — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. Only available in a build compiled with `--features composer`. (Requires the `socket-patch` CLI on `PATH`.)
+- **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
 
 **Usage:**
 ```bash
