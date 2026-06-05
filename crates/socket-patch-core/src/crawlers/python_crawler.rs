@@ -98,7 +98,13 @@ async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String
     let mut version: Option<String> = None;
 
     for line in content.lines() {
-        if name.is_some() && version.is_some() {
+        // The header block ends at the first blank line; everything after
+        // it is the free-text description (commonly a README that can
+        // contain literal `Name:`/`Version:` lines). Stop unconditionally
+        // so a malformed METADATA missing both headers falls back to the
+        // reliable `<name>-<version>.dist-info` directory name rather than
+        // mis-parsing prose into a bogus package identity.
+        if line.trim().is_empty() {
             break;
         }
         if let Some(rest) = line.strip_prefix("Name:") {
@@ -106,8 +112,7 @@ async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String
         } else if let Some(rest) = line.strip_prefix("Version:") {
             version = Some(rest.trim().to_string());
         }
-        // Stop at first empty line (end of headers)
-        if line.trim().is_empty() && (name.is_some() || version.is_some()) {
+        if name.is_some() && version.is_some() {
             break;
         }
     }
@@ -850,6 +855,66 @@ mod tests {
         let (name, version) = read_python_metadata(&dist_info).await.unwrap();
         assert_eq!(name, "urllib3");
         assert_eq!(version, "2.0.7");
+    }
+
+    /// A METADATA missing BOTH `Name` and `Version` headers must fall back to
+    /// the directory name — even when the free-text description body contains
+    /// literal `Name:`/`Version:` lines at column 0 (e.g. a README documenting
+    /// those fields, or another package's headers pasted into a changelog).
+    /// The parser must stop at the header/body separator (the first blank
+    /// line) and never mistake prose for a header.
+    #[tokio::test]
+    async fn test_read_python_metadata_ignores_body_name_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let dist_info = dir.path().join("requests-2.28.0.dist-info");
+        tokio::fs::create_dir_all(&dist_info).await.unwrap();
+        tokio::fs::write(
+            dist_info.join("METADATA"),
+            // No real Name/Version headers; the blank line ends the header
+            // block, then the body opens with lines that look like headers.
+            "Metadata-Version: 2.1\nSummary: a package\n\nName: evil\nVersion: 9.9.9\n",
+        )
+        .await
+        .unwrap();
+
+        // Falls back to the directory name, NOT the body's "evil"/"9.9.9".
+        let (name, version) = read_python_metadata(&dist_info).await.unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(version, "2.28.0");
+    }
+
+    /// End-to-end via `crawl_all`: a package whose METADATA has no usable
+    /// headers but whose description body looks like headers is recovered
+    /// under its true (directory-name) identity, not the body's spoofed one.
+    #[tokio::test]
+    async fn test_crawl_all_not_poisoned_by_body_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let venv = dir.path().join(".venv");
+        #[cfg(windows)]
+        let sp = venv.join("Lib").join("site-packages");
+        #[cfg(not(windows))]
+        let sp = venv.join("lib").join("python3.11").join("site-packages");
+        let dist_info = sp.join("urllib3-2.0.7.dist-info");
+        tokio::fs::create_dir_all(&dist_info).await.unwrap();
+        tokio::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\n\nName: spoofed\nVersion: 6.6.6\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = PythonCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "urllib3");
+        assert_eq!(packages[0].version, "2.0.7");
+        assert_eq!(packages[0].purl, "pkg:pypi/urllib3@2.0.7");
     }
 
     /// A stray *file* named `*.dist-info` must NOT be surfaced as a package

@@ -8,7 +8,7 @@ use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remov
 use std::path::Path;
 use std::time::Duration;
 
-use super::rollback::rollback_patches;
+use super::rollback::{all_files_already_original, rollback_patches};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{
@@ -206,15 +206,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .iter()
                     .filter(|r| r.success && !r.files_rolled_back.is_empty())
                     .count();
+                // Reuse rollback's canonical predicate rather than
+                // re-deriving it: the `!files_verified.is_empty()` guard
+                // inside `all_files_already_original` is essential —
+                // `Iterator::all` over an empty slice is vacuously `true`,
+                // so a zero-file (or not-installed) result would otherwise
+                // be miscounted as "already in original state".
                 let already_original = results
                     .iter()
-                    .filter(|r| {
-                        r.success
-                            && r.files_verified.iter().all(|f| {
-                                f.status
-                                    == socket_patch_core::patch::rollback::VerifyRollbackStatus::AlreadyOriginal
-                            })
-                    })
+                    .filter(|r| r.success && all_files_already_original(r))
                     .count();
 
                 if !args.common.json {

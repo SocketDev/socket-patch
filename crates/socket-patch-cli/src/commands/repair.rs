@@ -437,6 +437,16 @@ mod tests {
         std::fs::write(blobs.join(hash), content).unwrap();
     }
 
+    /// Write an archive (`<name>.tar.gz`) under `socket/<subdir>`.
+    fn write_archive(socket: &Path, subdir: &str, name: &str, content: &[u8]) {
+        let dir = socket.join(subdir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.tar.gz")), content).unwrap();
+    }
+
+    // The single UUID referenced by `MANIFEST_JSON` above.
+    const REFERENCED_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
     fn offline_args(cwd: &Path) -> RepairArgs {
         RepairArgs {
             common: GlobalArgs {
@@ -566,6 +576,102 @@ mod tests {
         assert!(
             socket.join("blobs").join(&orphan_hash).exists(),
             "orphan must survive when cleanup is skipped"
+        );
+    }
+
+    /// Cleanup must sweep orphaned diff *and* package archives in addition to
+    /// blobs, and the reclaimed counts/bytes from all three directories must
+    /// aggregate into a single `RepairCounts`. Guards against a regression
+    /// where a cleanup pass uses the wrong directory or drops its tallies.
+    #[tokio::test]
+    async fn cleanup_sweeps_diff_and_package_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+
+        // Referenced archives (named after the manifest UUID) must survive.
+        write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
+        write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
+
+        // Orphan archives (unknown UUIDs) must be swept.
+        let orphan_diff = b"orphan diff archive bytes"; // 25 bytes
+        let orphan_pkg = b"orphan package bytes!!"; // 22 bytes
+        write_archive(&socket, "diffs", "99999999-9999-4999-8999-999999999999", orphan_diff);
+        write_archive(
+            &socket,
+            "packages",
+            "88888888-8888-4888-8888-888888888888",
+            orphan_pkg,
+        );
+
+        let args = offline_args(tmp.path());
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        eprintln!("DBG cleaned={} bytes={}", counts.cleaned, counts.bytes_freed);
+        eprintln!(
+            "DBG diff_orphan_exists={} pkg_orphan_exists={}",
+            socket
+                .join("diffs")
+                .join("99999999-9999-4999-8999-999999999999.tar.gz")
+                .exists(),
+            socket
+                .join("packages")
+                .join("88888888-8888-4888-8888-888888888888.tar.gz")
+                .exists(),
+        );
+        eprintln!("DBG events={:?}", env.events);
+        // Two orphans removed (one diff, one package); the referenced ones stay.
+        assert_eq!(counts.cleaned, 2, "both orphan archives should be swept");
+        assert_eq!(
+            counts.bytes_freed,
+            (orphan_diff.len() + orphan_pkg.len()) as u64,
+            "bytes_freed must aggregate diff + package reclaim"
+        );
+        assert_eq!(env.summary.removed, 2);
+
+        assert!(socket
+            .join("diffs")
+            .join(format!("{REFERENCED_UUID}.tar.gz"))
+            .exists());
+        assert!(socket
+            .join("packages")
+            .join(format!("{REFERENCED_UUID}.tar.gz"))
+            .exists());
+        assert!(!socket
+            .join("diffs")
+            .join("99999999-9999-4999-8999-999999999999.tar.gz")
+            .exists());
+        assert!(!socket
+            .join("packages")
+            .join("88888888-8888-4888-8888-888888888888.tar.gz")
+            .exists());
+    }
+
+    /// Offline mode with a missing artifact: the run must succeed (a warning,
+    /// not a failure), record NO download event, and report zero downloads —
+    /// nothing is fetched and the airgap is honoured. Cleanup still runs.
+    #[tokio::test]
+    async fn offline_missing_artifact_warns_without_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        // No blob on disk → manifest afterHash is "missing". Not dry-run.
+        let args = offline_args(tmp.path());
+
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert!(
+            !has_download_event(&env),
+            "offline mode must not record a download event; events={:?}",
+            env.events
+        );
+        assert_eq!(counts.downloaded, 0);
+        assert_eq!(
+            env.status,
+            Status::Success,
+            "missing artifacts in offline mode are a warning, not a failure"
         );
     }
 }

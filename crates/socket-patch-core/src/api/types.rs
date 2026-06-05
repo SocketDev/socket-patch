@@ -396,6 +396,93 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_response_rejects_snake_case_published_at() {
+        // Pins that the camelCase rename is *strict* on the wire: a payload
+        // using the Rust field name (`published_at`) instead of the API's
+        // `publishedAt` must fail with a missing-field error. Guards against
+        // anyone "relaxing" the contract with serde aliases — which would let
+        // a server/field-name drift go unnoticed.
+        let json = r#"{
+            "uuid": "u1",
+            "purl": "pkg:npm/x@1",
+            "published_at": "2024-01-01",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "A patch",
+            "license": "MIT",
+            "tier": "free"
+        }"#;
+        let err = serde_json::from_str::<PatchResponse>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("publishedAt"),
+            "expected a missing-`publishedAt` error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_batch_package_patches_field_names() {
+        // BatchPackagePatches deliberately has no rename_all (both fields are
+        // single lowercase words). Pin the on-the-wire key names in both
+        // directions so an accidental rename can't silently break the
+        // batch-endpoint contract.
+        let bpp = BatchPackagePatches {
+            purl: "pkg:npm/x@1.0.0".into(),
+            patches: Vec::new(),
+        };
+        let json = serde_json::to_string(&bpp).unwrap();
+        assert!(json.contains("\"purl\""));
+        assert!(json.contains("\"patches\""));
+
+        let back: BatchPackagePatches =
+            serde_json::from_str(r#"{"purl":"pkg:npm/y@2","patches":[]}"#).unwrap();
+        assert_eq!(back.purl, "pkg:npm/y@2");
+        assert!(back.patches.is_empty());
+    }
+
+    #[test]
+    fn test_vulnerability_response_deserialize_standalone() {
+        // VulnerabilityResponse has no rename_all; confirm it deserializes
+        // from the snake/lowercase keys the API emits (the existing test only
+        // exercised the serialize direction in isolation).
+        let json = r#"{
+            "cves": ["CVE-2024-0001", "CVE-2024-0002"],
+            "summary": "Prototype pollution",
+            "severity": "critical",
+            "description": "A prototype pollution vulnerability"
+        }"#;
+        let vr: VulnerabilityResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(vr.cves, vec!["CVE-2024-0001", "CVE-2024-0002"]);
+        assert_eq!(vr.summary, "Prototype pollution");
+        assert_eq!(vr.severity, "critical");
+        assert_eq!(vr.description, "A prototype pollution vulnerability");
+    }
+
+    #[test]
+    fn test_search_response_populated_roundtrip() {
+        // The existing camelCase test round-trips an *empty* patches vec; this
+        // pins a populated PatchSearchResult survives a full serialize ->
+        // deserialize cycle inside its SearchResponse envelope.
+        let sr = SearchResponse {
+            patches: vec![PatchSearchResult {
+                uuid: "u1".into(),
+                purl: "pkg:npm/test@1.0.0".into(),
+                published_at: "2024-06-15T00:00:00Z".into(),
+                description: "A test patch".into(),
+                license: "MIT".into(),
+                tier: "free".into(),
+                vulnerabilities: HashMap::new(),
+            }],
+            can_access_paid_patches: true,
+        };
+        let json = serde_json::to_string(&sr).unwrap();
+        let back: SearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.patches.len(), 1);
+        assert_eq!(back.patches[0].uuid, "u1");
+        assert_eq!(back.patches[0].published_at, "2024-06-15T00:00:00Z");
+        assert!(back.can_access_paid_patches);
+    }
+
+    #[test]
     fn test_search_response_api_payload_deserialize() {
         // Mirrors GET /v0/orgs/<slug>/patches/by-package/<purl>.
         let json = r#"{

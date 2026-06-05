@@ -247,6 +247,17 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
+      # socket-patch-guard is a standalone crate (no dependency on core/cli) that
+      # `socket-patch setup` adds to a user's Cargo.toml as
+      # `socket-patch-guard = "<major.minor>"`. It MUST be published on every
+      # release or cargo setup writes an unresolvable dependency and the user's
+      # `cargo build` fails. Its build.rs is a no-op when SOCKET_PATCH_ROOT is
+      # unset (the case during publish verification), so this builds cleanly.
+      - name: Publish socket-patch-guard
+        run: cargo publish -p socket-patch-guard
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
       - name: Wait for crates.io index update
         run: sleep 30
 

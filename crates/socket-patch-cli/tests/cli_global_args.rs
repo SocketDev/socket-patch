@@ -549,56 +549,46 @@ fn bool_env_vars_reject_zero_and_falsey() {
     restore_global_env(saved);
 }
 
-/// Characterization of how an **empty** boolean env var is handled.
+/// An **empty** boolean env var resolves to `false` — it must NOT crash.
 ///
-/// SUSPECTED PRODUCTION BUG (left unfixed per the audit constraints — see
-/// summary): the `bool_env_vars_reject_zero_and_falsey` doc historically
-/// claimed that an empty string "must NOT engage a bool". It does not — but
-/// it also does not resolve to `false`. `BoolishValueParser` rejects `""`
-/// outright, so `SOCKET_OFFLINE=` (the conventional shell idiom for blanking
-/// a variable without unsetting it) makes clap fail with a `ValueValidation`
-/// error and takes down *every* CLI invocation, on *every* subcommand, for
-/// *every* boolean global. An operator who blanks the var to disable airgap
-/// mode instead gets a hard crash.
-///
-/// This test pins the current (surprising) behavior so any change — including
-/// a fix that makes empty resolve to `false` — is noticed and reviewed rather
-/// than slipping through silently. It does NOT endorse the behavior.
+/// FIXED (2026-06-05): `SOCKET_OFFLINE=` (the conventional shell idiom for
+/// blanking a variable without unsetting it) previously made clap fail with a
+/// `ValueValidation` error via the stock `BoolishValueParser`, which rejects
+/// `""`. That took down *every* CLI invocation, on *every* subcommand, for
+/// *every* boolean global — an operator who blanked the var to disable airgap
+/// mode got a hard crash instead. `args::parse_bool_flag` now maps an empty
+/// (or whitespace-only) value to `false`. This test pins the fixed behavior:
+/// every boolean global parses cleanly to `false` when its env var is empty.
 #[test]
 #[serial_test::serial]
-fn empty_bool_env_var_is_a_hard_error_not_falsey() {
-    let bool_vars = [
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
+fn empty_bool_env_var_resolves_to_false_not_crash() {
+    // (env var, accessor) for every boolean global.
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 10] = [
+        ("SOCKET_OFFLINE", |c| c.offline),
+        ("SOCKET_GLOBAL", |c| c.global),
+        ("SOCKET_JSON", |c| c.json),
+        ("SOCKET_VERBOSE", |c| c.verbose),
+        ("SOCKET_SILENT", |c| c.silent),
+        ("SOCKET_DRY_RUN", |c| c.dry_run),
+        ("SOCKET_YES", |c| c.yes),
+        ("SOCKET_BREAK_LOCK", |c| c.break_lock),
+        ("SOCKET_DEBUG", |c| c.debug),
+        ("SOCKET_TELEMETRY_DISABLED", |c| c.no_telemetry),
     ];
 
     let saved = save_and_clear_global_env();
 
-    for var in bool_vars {
+    for (var, accessor) in bool_vars {
         std::env::set_var(var, "");
         let result = Cli::try_parse_from(["socket-patch", "list"]);
         std::env::remove_var(var);
 
-        let err = result.err().unwrap_or_else(|| {
-            panic!(
-                "{var}= (empty) unexpectedly parsed OK — behavior changed; \
-                 if empty now resolves to a clean falsey, update this test \
-                 and the reject-test doc to match"
-            )
+        let cli = result.unwrap_or_else(|e| {
+            panic!("{var}= (empty) must parse cleanly, got error: {e}")
         });
-        assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::ValueValidation,
-            "{var}= (empty) should fail validation; got {:?}",
-            err.kind(),
+        assert!(
+            !accessor(common_of(&cli)),
+            "{var}= (empty) must resolve to false",
         );
     }
 

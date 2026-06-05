@@ -330,7 +330,7 @@ async fn fetch_missing_archives_inner(
         match fetch_result {
             Ok(Some(data)) => {
                 let archive_path: PathBuf = archives_dir.join(format!("{}.tar.gz", uuid));
-                match tokio::fs::write(&archive_path, &data).await {
+                match write_cache_entry_atomic(&archive_path, &data).await {
                     Ok(()) => {
                         results.push(BlobFetchResult {
                             hash: uuid.clone(),
@@ -434,6 +434,47 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
+/// Write `bytes` to `dest` atomically: stage a temp file in the same
+/// directory, then `rename(2)` it over `dest`.
+///
+/// The destinations here are *content-addressed* cache entries —
+/// `blobs/<hash>` and `archives/<uuid>.tar.gz`. A plain `tokio::fs::write`
+/// truncates-then-writes in place, so an interrupted write (ENOSPC, crash,
+/// killed process) can leave a partial file at the final path. Because the
+/// "is it already downloaded?" check ([`get_missing_blobs`] /
+/// [`get_missing_archives`]) only tests for presence, such a truncated file
+/// is then trusted forever — its content no longer hashes to its name, yet
+/// it is never re-downloaded. Staging in the same directory and renaming
+/// makes the final path always either the complete bytes or absent, never a
+/// torn intermediate, matching the stage+rename discipline used by the
+/// patch-apply and copy-on-write write paths.
+async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = dest.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cache entry path has no parent directory",
+        )
+    })?;
+    let stem = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "blob".to_string());
+    // Leading dot keeps the stage out of editor/glob views; the uuid suffix
+    // keeps concurrent writers of the same entry from colliding.
+    let stage: PathBuf = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    if let Err(e) = tokio::fs::write(&stage, bytes).await {
+        // A partial stage would otherwise leak as a `.socket-dl-*` turd.
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&stage, dest).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Compare an expected blob hash against the hash computed from the
 /// downloaded bytes.
 ///
@@ -485,7 +526,7 @@ async fn download_hashes(
                 }
 
                 let blob_path: PathBuf = blobs_path.join(hash);
-                match tokio::fs::write(&blob_path, &data).await {
+                match write_cache_entry_atomic(&blob_path, &data).await {
                     Ok(()) => {
                         results.push(BlobFetchResult {
                             hash: hash.clone(),
@@ -936,6 +977,45 @@ mod tests {
         assert!(!blob_hash_matches(&a, &b));
         // Differing length is still a mismatch.
         assert!(!blob_hash_matches(&a, "aa"));
+    }
+
+    // ── Atomic cache-entry write ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_write_cache_entry_atomic_writes_exact_bytes_no_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a".repeat(64));
+        write_cache_entry_atomic(&dest, b"blob-content")
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"blob-content");
+        // The stage file must have been renamed away, not left behind: the
+        // directory holds exactly the final entry and nothing dot-prefixed.
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries.len(), 1, "only the final entry should remain: {entries:?}");
+        assert!(
+            !entries[0].starts_with(".socket-dl-"),
+            "no staging turd should survive: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_cache_entry_atomic_replaces_existing_completely() {
+        // A torn rewrite must not be observable: writing over an existing
+        // entry leaves the new bytes whole, never a prefix-of-old + new mix.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("entry");
+        tokio::fs::write(&dest, b"old-and-longer-content")
+            .await
+            .unwrap();
+
+        write_cache_entry_atomic(&dest, b"new").await.unwrap();
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

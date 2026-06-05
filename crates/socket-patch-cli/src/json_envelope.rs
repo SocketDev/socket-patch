@@ -637,4 +637,156 @@ mod tests {
         assert_eq!(obj["action"], "removed");
         assert_eq!(obj["errorCode"], "orphan_blob");
     }
+
+    #[test]
+    fn each_action_bumps_exactly_its_own_counter() {
+        // Guards the 1:1 `Summary::bump` mapping. Recording one event of
+        // every action must leave each counter at exactly 1 — a swapped
+        // arm (e.g. `Updated` bumping `skipped`) would leave one field at
+        // 0 and another at 2. The prior test only checked 3 of 8 counters
+        // and never asserted the untouched ones stayed zero, so a swap
+        // among {discovered, updated, removed, verified} went unnoticed.
+        let mut env = Envelope::new(Command::Scan);
+        for action in [
+            PatchAction::Discovered,
+            PatchAction::Downloaded,
+            PatchAction::Applied,
+            PatchAction::Updated,
+            PatchAction::Skipped,
+            PatchAction::Failed,
+            PatchAction::Removed,
+            PatchAction::Verified,
+        ] {
+            env.record(PatchEvent::new(action, "pkg:npm/foo@1.0.0"));
+        }
+        let s = &env.summary;
+        assert_eq!(s.discovered, 1, "discovered");
+        assert_eq!(s.downloaded, 1, "downloaded");
+        assert_eq!(s.applied, 1, "applied");
+        assert_eq!(s.updated, 1, "updated");
+        assert_eq!(s.skipped, 1, "skipped");
+        assert_eq!(s.failed, 1, "failed");
+        assert_eq!(s.removed, 1, "removed");
+        assert_eq!(s.verified, 1, "verified");
+        assert_eq!(env.events.len(), 8);
+
+        // And the same mapping must survive serialization with the
+        // documented camelCase field names — pins both the bump arm and
+        // the `rename_all` so a consumer reading `summary.removed` can't
+        // silently get `verified`'s count.
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        for field in [
+            "discovered",
+            "downloaded",
+            "applied",
+            "updated",
+            "skipped",
+            "failed",
+            "removed",
+            "verified",
+        ] {
+            assert_eq!(v["summary"][field], 1, "summary.{field} via JSON");
+        }
+    }
+
+    #[test]
+    fn sidecars_omitted_when_empty_present_when_recorded() {
+        // `sidecars` uses `skip_serializing_if = "Vec::is_empty"`, so a
+        // run with no fixups must not emit the key at all (rollback,
+        // list, npm-apply consumers branch on its absence).
+        let mut env = Envelope::new(Command::Apply);
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("sidecars"));
+
+        env.record_sidecar(SidecarRecord {
+            purl: "pkg:cargo/foo@1.0.0".into(),
+            ecosystem: "cargo".into(),
+            files: vec![SidecarFile {
+                path: ".cargo-checksum.json".into(),
+                action: SidecarFileAction::Rewritten,
+            }],
+            advisory: None,
+        });
+        assert_eq!(env.sidecars.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        let sidecars = v["sidecars"].as_array().expect("sidecars present once recorded");
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(sidecars[0]["purl"], "pkg:cargo/foo@1.0.0");
+        assert_eq!(sidecars[0]["ecosystem"], "cargo");
+        assert_eq!(sidecars[0]["files"][0]["action"], "rewritten");
+    }
+
+    #[test]
+    fn vex_summary_omitted_when_none_present_when_set() {
+        // `vex` is `skip_serializing_if = "Option::is_none"` — absent on
+        // every run that didn't pass `--vex`, inline (not nested under
+        // `error`) when generation succeeded.
+        let mut env = Envelope::new(Command::Apply);
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("vex"));
+
+        env.vex = Some(VexSummary {
+            path: "/tmp/openvex.json".into(),
+            statements: 3,
+            format: "openvex-0.2.0".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["vex"]["path"], "/tmp/openvex.json");
+        assert_eq!(v["vex"]["statements"], 3);
+        assert_eq!(v["vex"]["format"], "openvex-0.2.0");
+    }
+
+    #[test]
+    fn mark_error_replaces_prior_partial_failure() {
+        // `mark_error` is documented to "replace any prior status". Only
+        // the Error-outranks-later-PartialFailure direction was tested;
+        // this pins the reverse — a PartialFailure escalating to a hard
+        // Error (and attaching the error payload + flipping the exit
+        // code) must take effect.
+        let mut env = Envelope::new(Command::Apply);
+        env.record(
+            PatchEvent::new(PatchAction::Failed, "pkg:npm/bar@2.0.0")
+                .with_error("apply_failed", "boom"),
+        );
+        assert_eq!(env.status, Status::PartialFailure);
+        env.mark_error(EnvelopeError::new("manifest_unreadable", "bad json"));
+        assert_eq!(env.status, Status::Error);
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error"]["code"], "manifest_unreadable");
+    }
+
+    #[test]
+    fn special_statuses_serialize_camel_case() {
+        // The remaining `Status` variants set directly by remove/rollback
+        // /apply (`noManifest`, `notFound`) must spell out in camelCase
+        // exactly as CLI_CONTRACT.md promises — consumers route exit
+        // codes on these strings.
+        for (status, tag) in [
+            (Status::NoManifest, "noManifest"),
+            (Status::PaidRequired, "paidRequired"),
+            (Status::NotFound, "notFound"),
+        ] {
+            let mut env = Envelope::new(Command::Remove);
+            env.status = status;
+            let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+            assert_eq!(v["status"], tag);
+        }
+    }
+
+    #[test]
+    fn dry_run_and_details_round_trip() {
+        // `dryRun` must reflect the flag, and `details` must pass through
+        // schemaless without reshaping.
+        let mut env = Envelope::new(Command::Scan);
+        env.dry_run = true;
+        env.record(
+            PatchEvent::new(PatchAction::Discovered, "pkg:npm/foo@1.0.0")
+                .with_details(serde_json::json!({ "tier": "free", "vulns": [1, 2] })),
+        );
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        assert_eq!(v["dryRun"], true);
+        assert_eq!(v["events"][0]["details"]["tier"], "free");
+        assert_eq!(v["events"][0]["details"]["vulns"], serde_json::json!([1, 2]));
+    }
 }

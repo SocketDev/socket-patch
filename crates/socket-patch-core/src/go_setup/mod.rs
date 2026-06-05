@@ -311,13 +311,79 @@ async fn file_is_package_main(path: &Path) -> bool {
     if has_ignore_build_tag(&content) {
         return false;
     }
-    content.lines().any(|l| {
-        let l = match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        };
-        l.trim() == "package main"
-    })
+    // The package clause is the first non-blank, non-comment line. Strip BOTH
+    // comment forms first: a `//`-line comment alone is not enough, because a
+    // library file's doc/example block comment can contain a line that reads
+    // `package main` (`/* … package main … */`). Counting that would drop a
+    // `package main` import file into a non-main dir and break the build with
+    // two conflicting package clauses. We also must stop AT the package clause,
+    // not scan the whole file, for the same reason.
+    let cleaned = strip_go_comments(&content);
+    for line in cleaned.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // First code line: it is the package clause. `package` + name, any
+        // amount of whitespace between (gofmt uses one space, but a tab or
+        // extra spaces are still valid Go and must not be a false negative).
+        let mut toks = t.split_whitespace();
+        return toks.next() == Some("package")
+            && toks.next() == Some("main")
+            && toks.next().is_none();
+    }
+    false
+}
+
+/// Strip Go `//` line comments and `/* … */` block comments from `src`,
+/// preserving newlines so line structure survives. Used only to locate the
+/// package clause, which precedes any string literals, so no string-literal
+/// awareness is needed. Block comments do not nest in Go.
+fn strip_go_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    // 0 = code, 1 = line comment (to EOL), 2 = block comment (to `*/`).
+    let mut state = 0u8;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match state {
+            1 => {
+                if c == b'\n' {
+                    state = 0;
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            2 => {
+                if c == b'*' && next == Some(b'/') {
+                    state = 0;
+                    i += 2;
+                } else {
+                    if c == b'\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                if c == b'/' && next == Some(b'/') {
+                    state = 1;
+                    i += 2;
+                } else if c == b'/' && next == Some(b'*') {
+                    state = 2;
+                    i += 2;
+                } else {
+                    // Preserve the byte. The package clause is ASCII; only
+                    // pre-package code (none) or the clause itself reaches here.
+                    out.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// True if the file's build-constraint header carries the `ignore` tag (either
@@ -499,6 +565,72 @@ mod tests {
             !dirs.contains(&root.join("tool")),
             "+build ignore generator must not make tool/ a main dir"
         );
+    }
+
+    #[tokio::test]
+    async fn test_block_comment_package_main_is_not_a_main_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("go.mod"), "module example.com/app\n\ngo 1.21\n").await;
+        // A library package whose doc comment shows an *example* `package main`
+        // inside a /* … */ block. The real package clause is `lib`, so we must
+        // NOT treat this dir as main (doing so drops a conflicting `package
+        // main` import file and breaks the build).
+        write(
+            &root.join("pkg/doc.go"),
+            "/*\nPackage lib is great.\n\nExample:\n\n\tpackage main\n\n\tfunc main() {}\n*/\npackage lib\n",
+        )
+        .await;
+        // Also a real main dir as a positive control.
+        write(&root.join("main.go"), "package main\n\nfunc main() {}\n").await;
+
+        let dirs = find_main_package_dirs(root).await;
+        assert!(
+            !dirs.contains(&root.join("pkg")),
+            "block-comment example `package main` must not make pkg/ a main dir: {dirs:?}"
+        );
+        assert!(dirs.contains(&root.to_path_buf()), "real main dir still found");
+    }
+
+    #[tokio::test]
+    async fn test_package_main_with_irregular_whitespace_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("go.mod"), "module example.com/app\n\ngo 1.21\n").await;
+        // Valid Go: a tab / multiple spaces between `package` and `main`. Must
+        // still be detected (a false negative here is fail-open: no guard).
+        write(&root.join("cmd/a/main.go"), "package\tmain\n\nfunc main() {}\n").await;
+        write(&root.join("cmd/b/main.go"), "package   main\n\nfunc main() {}\n").await;
+
+        let dirs = find_main_package_dirs(root).await;
+        assert!(dirs.contains(&root.join("cmd/a")), "tab-separated clause detected: {dirs:?}");
+        assert!(dirs.contains(&root.join("cmd/b")), "multi-space clause detected: {dirs:?}");
+    }
+
+    #[tokio::test]
+    async fn test_trailing_block_comment_package_main_after_clause_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("go.mod"), "module example.com/app\n\ngo 1.21\n").await;
+        // The real clause is `lib`; a later block comment mentions `package
+        // main`. Scanning must stop at the (first) clause, not keep going.
+        write(
+            &root.join("pkg/x.go"),
+            "package lib\n\n/* historical note:\npackage main\n*/\n\nfunc Do() {}\n",
+        )
+        .await;
+        let dirs = find_main_package_dirs(root).await;
+        assert!(!dirs.contains(&root.join("pkg")), "trailing block comment must not matter: {dirs:?}");
+    }
+
+    #[test]
+    fn test_strip_go_comments() {
+        assert_eq!(strip_go_comments("package main // hi\n").trim(), "package main");
+        assert_eq!(strip_go_comments("/* a */package lib\n").trim(), "package lib");
+        // Block comment content is removed but newlines are preserved.
+        let cleaned = strip_go_comments("/*\npackage main\n*/\npackage lib\n");
+        let first = cleaned.lines().map(str::trim).find(|l| !l.is_empty());
+        assert_eq!(first, Some("package lib"));
     }
 
     #[tokio::test]

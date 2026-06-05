@@ -327,6 +327,13 @@ async fn cargo_crawler_crawl_all_empty_returns_empty() {
     )
     .await
     .unwrap();
+    // The vendor tree is only scanned when cwd is a Rust project.
+    tokio::fs::write(
+        populated.path().join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+    )
+    .await
+    .unwrap();
     let found = crawler.crawl_all(&options_at(populated.path())).await;
     assert!(
         found.iter().any(|p| p.purl == "pkg:cargo/serde@1.0.200"),

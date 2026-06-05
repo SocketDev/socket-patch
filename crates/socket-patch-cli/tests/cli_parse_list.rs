@@ -301,6 +301,72 @@ fn missing_manifest_json_status_is_error_via_binary() {
 }
 
 // ---------------------------------------------------------------------------
+// Corrupt-manifest error-code tests — a manifest that EXISTS but cannot be
+// parsed (or violates the schema) must report `manifest_invalid`, distinct
+// from `manifest_not_found` (missing file) and `manifest_unreadable` (I/O
+// error). The metadata pre-check in run() handles the missing case before
+// read_manifest is ever called, so without this coverage a corrupt manifest
+// could silently be mislabeled as an I/O error (or vice versa). See the
+// error-code table in CLI_CONTRACT.md.
+// ---------------------------------------------------------------------------
+
+/// Run `list --json` against the compiled binary after writing `body` verbatim
+/// to `<cwd>/.socket/manifest.json`. Returns (exit_code, parsed_json).
+fn run_list_with_manifest_body(body: &str) -> (Option<i32>, serde_json::Value) {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_dir = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(socket_dir.join("manifest.json"), body).unwrap();
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("stdout must be valid JSON envelope");
+    (out.status.code(), v)
+}
+
+#[test]
+fn unparseable_manifest_reports_manifest_invalid_via_binary() {
+    // Garbage that isn't JSON at all -> serde parse error -> InvalidData.
+    let (code, v) = run_list_with_manifest_body("{not json");
+    assert_eq!(code, Some(1), "corrupt manifest must exit 1");
+    assert_eq!(v["command"], "list");
+    assert_eq!(v["status"], "error");
+    // The load-bearing assertion: a manifest that exists but can't be parsed
+    // is `manifest_invalid`, NOT `manifest_unreadable` (an I/O error) and NOT
+    // `manifest_not_found` (a missing file).
+    assert_eq!(
+        v["error"]["code"], "manifest_invalid",
+        "unparseable manifest must be manifest_invalid, got envelope: {v}"
+    );
+}
+
+#[test]
+fn schema_invalid_manifest_reports_manifest_invalid_via_binary() {
+    // Valid JSON, but not a valid manifest (missing the required `patches`
+    // key). read_manifest's validation step rejects it with InvalidData, so
+    // it must also surface as `manifest_invalid`, never `manifest_unreadable`.
+    let (code, v) = run_list_with_manifest_body(r#"{"not_patches": {}}"#);
+    assert_eq!(code, Some(1), "schema-invalid manifest must exit 1");
+    assert_eq!(v["command"], "list");
+    assert_eq!(v["status"], "error");
+    assert_eq!(
+        v["error"]["code"], "manifest_invalid",
+        "schema-invalid manifest must be manifest_invalid, got envelope: {v}"
+    );
+}
+
+#[test]
+fn empty_file_manifest_reports_manifest_invalid_via_binary() {
+    // An empty file is a present-but-unparseable manifest (serde rejects ""),
+    // which is distinct from a missing file. It must NOT be misreported as
+    // manifest_not_found or manifest_unreadable.
+    let (code, v) = run_list_with_manifest_body("");
+    assert_eq!(code, Some(1), "empty manifest file must exit 1");
+    assert_eq!(v["error"]["code"], "manifest_invalid", "got envelope: {v}");
+}
+
+// ---------------------------------------------------------------------------
 // Subprocess content tests — the in-process run() tests above only assert the
 // exit code. run() prints the actual listing to stdout (which cannot be
 // captured in-process), so exit-code-only checks would stay green even if the

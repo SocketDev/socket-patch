@@ -383,6 +383,13 @@ pub async fn run(args: ScanArgs) -> i32 {
     let apply = args.apply || args.sync;
     let prune = args.prune || args.sync;
 
+    // A zero batch size would panic the API-query loop below: both
+    // `all_purls.len().div_ceil(batch_size)` and `all_purls.chunks(batch_size)`
+    // abort the process on a divisor/chunk-size of 0. `--batch-size 0`
+    // (or `SOCKET_BATCH_SIZE=0`) is otherwise unvalidated, so clamp to a
+    // floor of 1 — degrade to one-package batches rather than crash.
+    let batch_size = args.batch_size.max(1);
+
     // Resolved up-front (rather than at the GC site) because the embedded
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
@@ -407,7 +414,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         cwd: args.common.cwd.clone(),
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
-        batch_size: args.batch_size,
+        batch_size,
     };
 
     let scan_target = if args.common.global || args.common.global_prefix.is_some() {
@@ -424,6 +431,16 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     // Crawl packages
     let (all_crawled, eco_counts) = crawl_all_ecosystems(&crawler_options).await;
+
+    // Every PURL the crawl found, captured BEFORE the `--ecosystems`
+    // display/query filter is applied. Prune (below) must reference the
+    // full installed set: `--ecosystems npm` narrows what we *query and
+    // show*, but packages of other ecosystems are still installed. If
+    // prune used the filtered set instead, `scan --ecosystems npm --prune`
+    // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
+    // and delete it (plus its blobs) — silent cross-ecosystem data loss.
+    let installed_purls: HashSet<String> =
+        all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -529,7 +546,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // Query API in batches
     let mut all_packages_with_patches: Vec<BatchPackagePatches> = Vec::new();
     let mut can_access_paid_patches = false;
-    let total_batches = all_purls.len().div_ceil(args.batch_size);
+    let total_batches = all_purls.len().div_ceil(batch_size);
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
 
@@ -537,7 +554,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         eprint!("Querying API for patches... (batch 1/{total_batches})");
     }
 
-    for (batch_idx, chunk) in all_purls.chunks(args.batch_size).enumerate() {
+    for (batch_idx, chunk) in all_purls.chunks(batch_size).enumerate() {
         if show_progress {
             eprint!(
                 "\rQuerying API for patches... (batch {}/{})",
@@ -697,8 +714,10 @@ pub async fn run(args: ScanArgs) -> i32 {
     let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
 
     // Crawl PURLs as a set for prunable detection (manifest entries whose
-    // PURL is not in the current crawl results).
-    let scanned_purls: HashSet<String> = all_purls.iter().cloned().collect();
+    // PURL is not installed). Uses `installed_purls` — the UNFILTERED crawl
+    // — not the `--ecosystems`-narrowed `all_purls`, so a display/query
+    // filter never makes an installed package look prunable.
+    let scanned_purls: HashSet<String> = installed_purls;
 
     if args.common.json {
         let mut result = serde_json::json!({
@@ -878,6 +897,15 @@ pub async fn run(args: ScanArgs) -> i32 {
 
     let mut updates_available = 0usize;
 
+    // Canonical set of PURLs with a newer patch available, computed once via
+    // `detect_updates` (the same source the JSON `updates` array uses). The
+    // table path MUST agree with the JSON path, so reuse that result rather
+    // than re-deriving it: comparing against *any* batch patch (instead of the
+    // first/candidate one `select_patches` would resolve to) over-reports
+    // updates whenever the manifest already holds the newest patch but older
+    // patches also appear in the batch.
+    let update_purls: HashSet<&str> = updates.iter().map(|u| u.purl.as_str()).collect();
+
     // Print table
     println!("\n{}", "=".repeat(100));
     println!(
@@ -930,17 +958,10 @@ pub async fn run(args: ScanArgs) -> i32 {
             vuln_ids.join(", ")
         };
 
-        // Check for updates
-        let has_update = if let Some(ref manifest) = existing_manifest {
-            if let Some(existing) = manifest.patches.get(&pkg.purl) {
-                // If any patch in the batch has a different UUID than what's in manifest, update available
-                pkg.patches.iter().any(|p| p.uuid != existing.uuid)
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Check for updates — consult the canonical `detect_updates` result
+        // (mirrored into `update_purls`) so the human table and JSON `updates`
+        // array never disagree.
+        let has_update = update_purls.contains(pkg.purl.as_str());
         if has_update {
             updates_available += 1;
         }
@@ -1121,6 +1142,19 @@ pub async fn run(args: ScanArgs) -> i32 {
             println!("    {desc}");
         }
         println!();
+    }
+
+    // `--dry-run` is a non-mutating preview (see the global flag's doc and
+    // the JSON path's `dryRun` envelope). The interactive path must honor it
+    // too: stop here, having printed the table and the per-patch plan above,
+    // before the confirm prompt, the download/apply, and the prune GC — all
+    // of which mutate the manifest and `.socket/` on disk.
+    if args.common.dry_run {
+        println!(
+            "\n[dry-run] Would download and apply {} patch(es). No changes made.",
+            selected.len()
+        );
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Prompt to download
@@ -1326,6 +1360,26 @@ mod tests {
         let updates = detect_updates(Some(&m), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].new_uuid, "uuid-b");
+    }
+
+    #[test]
+    fn detect_updates_no_update_when_manifest_holds_candidate_despite_other_patches() {
+        // Regression: the human-readable table once flagged `[UPDATE]` (and
+        // bumped `updates_available`) whenever *any* batch patch differed from
+        // the manifest UUID. But the apply path resolves to the FIRST patch,
+        // so a manifest already holding that candidate is up to date even when
+        // the batch also lists older patches. The table and the JSON `updates`
+        // array must agree; both derive from this function, which compares the
+        // candidate (first) patch only.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-newest")]);
+        let pkgs = vec![batch_with(
+            "pkg:npm/foo@1.0",
+            &["uuid-newest", "uuid-older", "uuid-oldest"],
+        )];
+        assert!(
+            detect_updates(Some(&m), &pkgs).is_empty(),
+            "manifest already holds the candidate (first) patch — no update"
+        );
     }
 
     // ---- detect_prunable ---------------------------------------------------

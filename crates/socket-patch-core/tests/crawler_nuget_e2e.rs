@@ -296,6 +296,16 @@ async fn get_nuget_package_paths_local_discovers_packages_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let pkg = tmp.path().join("packages");
     tokio::fs::create_dir_all(&pkg).await.unwrap();
+    // `packages/` alone is NOT a NuGet marker — it is the conventional
+    // JS/TS monorepo workspace layout — so local discovery is gated on a
+    // .NET project marker. The legacy packages.config layout that owns
+    // `packages/` ships a `packages.config`, so stage one here.
+    tokio::fs::write(
+        tmp.path().join("packages.config"),
+        r#"<?xml version="1.0"?><packages/>"#,
+    )
+    .await
+    .unwrap();
 
     let crawler = NuGetCrawler;
     let paths = crawler
@@ -305,6 +315,31 @@ async fn get_nuget_package_paths_local_discovers_packages_dir() {
     assert!(
         paths.iter().any(|p| p == &pkg),
         "packages/ must be discovered; got {paths:?}"
+    );
+}
+
+/// Regression: a bare `packages/` directory (the JS/TS monorepo
+/// workspace convention) with NO .NET project marker must NOT be
+/// scanned. `crawl_all_ecosystems` runs the NuGet crawler against the
+/// same `cwd` as every other ecosystem, so an ungated scan would
+/// misclassify another ecosystem's workspace tree as NuGet sources.
+#[tokio::test]
+#[serial]
+async fn get_nuget_package_paths_local_ignores_packages_dir_without_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    // pnpm/lerna-style workspace: packages/<lib> but no .csproj/.sln/etc.
+    tokio::fs::create_dir_all(tmp.path().join("packages").join("ui-kit"))
+        .await
+        .unwrap();
+
+    let crawler = NuGetCrawler;
+    let paths = crawler
+        .get_nuget_package_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert!(
+        paths.is_empty(),
+        "non-.NET project's packages/ must be ignored; got {paths:?}"
     );
 }
 
@@ -687,10 +722,15 @@ async fn get_nuget_package_paths_discovers_assets_json_package_folders() {
     tokio::fs::write(obj.join("project.assets.json"), assets)
         .await
         .unwrap();
-    // Also need a project marker to satisfy is_dotnet_project (so the
-    // global-cache fallback path runs as well) — but assets discovery
-    // is independent, so this test exercises the obj-path branch even
-    // without a csproj.
+    // A project marker is required to satisfy the local-mode .NET gate.
+    // `obj/project.assets.json` is a restore artifact that only ever
+    // exists alongside a project file, so staging one is realistic.
+    tokio::fs::write(
+        tmp.path().join("MyProj.csproj"),
+        r#"<Project Sdk="Microsoft.NET.Sdk"></Project>"#,
+    )
+    .await
+    .unwrap();
     let nuget_root = tempfile::tempdir().unwrap();
     let prev = std::env::var("NUGET_PACKAGES").ok();
     std::env::set_var("NUGET_PACKAGES", nuget_root.path());
@@ -730,6 +770,11 @@ async fn get_nuget_package_paths_discovers_assets_json_in_subproject() {
     );
     let assets = serde_json::json!({ "packageFolders": folders }).to_string();
     tokio::fs::write(sub_obj.join("project.assets.json"), assets)
+        .await
+        .unwrap();
+    // The solution root carries a `.sln` marker — required to satisfy
+    // the local-mode .NET gate before subproject obj/ dirs are walked.
+    tokio::fs::write(tmp.path().join("Solution.sln"), "")
         .await
         .unwrap();
 

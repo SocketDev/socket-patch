@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use tokio::fs;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 /// The guard crate's package name.
 pub const GUARD_CRATE: &str = "socket-patch-guard";
@@ -111,13 +111,17 @@ pub fn is_guard_dep_present(content: &str) -> bool {
 
 // ── pure transforms ──────────────────────────────────────────────────────────
 
-fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Table, String> {
+/// Get `parent[key]` as a mutable table, creating an empty `[key]` table if
+/// it's absent. Accepts both standard (`[dependencies]`) and inline
+/// (`dependencies = { … }`) tables via `as_table_like_mut` so it stays in
+/// lockstep with [`is_guard_dep_present`] (which reads via `as_table_like`).
+fn ensure_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut dyn TableLike, String> {
     if !parent.contains_key(key) {
         parent.insert(key, Item::Table(Table::new()));
     }
     parent
         .get_mut(key)
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .ok_or_else(|| format!("`{key}` is not a table"))
 }
 
@@ -140,7 +144,7 @@ fn guard_dep_remove(content: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("Invalid Cargo.toml: {e}"))?;
     let removed = doc
         .get_mut("dependencies")
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .map(|deps| deps.remove(GUARD_CRATE).is_some())
         .unwrap_or(false);
     if !removed {
@@ -184,6 +188,39 @@ mod tests {
         let out = guard_dep_add(toml, "3.3").unwrap().unwrap();
         assert!(out.contains("# my crate"));
         assert!(out.contains("serde = \"1\"  # json"));
+    }
+
+    #[test]
+    fn test_add_into_inline_dependencies_table() {
+        // `dependencies = { … }` is a valid (if uncommon) inline table. The
+        // reader (`is_guard_dep_present`) sees through it via `as_table_like`,
+        // so the writer must too — otherwise add errors on a valid manifest.
+        let toml = "[package]\nname = \"x\"\ndependencies = { serde = \"1\" }\n";
+        let out = guard_dep_add(toml, "3.3").unwrap().unwrap();
+        assert!(is_guard_dep_present(&out));
+        assert!(out.contains("serde = \"1\""));
+        let doc = out.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["dependencies"][GUARD_CRATE].as_str(), Some("3.3"));
+    }
+
+    #[test]
+    fn test_add_inline_dependencies_idempotent() {
+        // Guard already present in an inline table → AlreadyConfigured (Ok(None)),
+        // NOT an error. Mirrors `is_guard_dep_present` returning true here.
+        let toml = "dependencies = { socket-patch-guard = \"3.3\", serde = \"1\" }\n";
+        assert!(is_guard_dep_present(toml));
+        assert!(guard_dep_add(toml, "3.3").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_from_inline_dependencies_table() {
+        // The dangerous case: a `remove` that silently no-ops while the guard
+        // is still present (reports AlreadyConfigured but leaves it behind).
+        let toml = "dependencies = { socket-patch-guard = \"3.3\", serde = \"1\" }\n";
+        assert!(is_guard_dep_present(toml));
+        let out = guard_dep_remove(toml).unwrap().unwrap();
+        assert!(!is_guard_dep_present(&out), "guard must actually be removed");
+        assert!(out.contains("serde = \"1\""));
     }
 
     #[test]

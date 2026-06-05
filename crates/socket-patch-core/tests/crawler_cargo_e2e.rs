@@ -304,6 +304,15 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
     let tmp = tempfile::tempdir().unwrap();
     let vendor = tmp.path().join("vendor");
     tokio::fs::create_dir(&vendor).await.unwrap();
+    // `vendor/` is only treated as cargo sources once we've confirmed
+    // this is a Rust project (`vendor/` is also Composer's and Go's
+    // convention) — so a root Cargo.toml is required.
+    tokio::fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+    )
+    .await
+    .unwrap();
 
     let crawler = CargoCrawler;
     let paths = crawler
@@ -311,6 +320,25 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
         .await
         .unwrap();
     assert_eq!(paths, vec![vendor]);
+}
+
+/// Regression: a `vendor/` directory in a project with no Cargo
+/// manifest (e.g. a Composer/Go project) must NOT be claimed by the
+/// cargo crawler.
+#[tokio::test]
+async fn get_crate_source_paths_vendor_without_cargo_manifest_is_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    tokio::fs::create_dir(tmp.path().join("vendor")).await.unwrap();
+
+    let crawler = CargoCrawler;
+    let paths = crawler
+        .get_crate_source_paths(&options_at(tmp.path()))
+        .await
+        .unwrap();
+    assert!(
+        paths.is_empty(),
+        "vendor/ in a non-Rust project must not be scanned as cargo sources, got {paths:?}"
+    );
 }
 
 #[tokio::test]

@@ -133,8 +133,13 @@ async fn glob_dir(base: &Path) -> Vec<PathBuf> {
         Err(_) => return out,
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-            let manifest = entry.path().join("Cargo.toml");
+        // `entry.file_type()` reflects the dir entry itself, which for a
+        // symlink reports `is_dir() == false` — so a symlinked member
+        // directory (which Cargo accepts and expands) would be silently
+        // skipped. Stat the path instead so symlinks are followed.
+        let path = entry.path();
+        if fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
+            let manifest = path.join("Cargo.toml");
             if fs::metadata(&manifest).await.is_ok() {
                 out.push(manifest);
             }
@@ -253,6 +258,40 @@ mod tests {
         let proj = discover_cargo_project(&member).await.unwrap();
         assert_eq!(proj.root, root, "should resolve up to the workspace root");
         assert_eq!(proj.members, vec![root.join("crates/a/Cargo.toml")]);
+    }
+
+    // A member directory reached through a symlink (Cargo follows symlinked
+    // members when expanding a `crates/*` glob) must still be discovered. The
+    // old `DirEntry::file_type()` gate reported the symlink as a non-directory
+    // and silently dropped it, leaving that member unconfigured by `setup`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_globbed_member_through_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .await;
+        // The real crate lives outside `crates/`; `crates/a` is a symlink to it.
+        write(
+            &root.join("real/Cargo.toml"),
+            "[package]\nname=\"a\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        fs::create_dir_all(root.join("crates")).await.unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("crates/a")).unwrap();
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(
+            proj.members.contains(&root.join("crates/a/Cargo.toml")),
+            "symlinked workspace member must be discovered, got {:?}",
+            proj.members
+        );
+        // It must be the real member, not the virtual-manifest fallback.
+        assert!(!proj.members.contains(&root.join("Cargo.toml")));
+        assert_eq!(proj.members.len(), 1);
     }
 
     #[tokio::test]

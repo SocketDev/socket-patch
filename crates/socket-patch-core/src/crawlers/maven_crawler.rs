@@ -741,6 +741,97 @@ mod tests {
         assert_eq!(pkgs[0].purl, "pkg:maven/com.example/my-app@1.0.0");
     }
 
+    #[test]
+    fn test_parse_pom_realistic_all_sections_no_leak() {
+        // A full-shape POM: parent (groupId inherited), plus every sibling
+        // block a real POM carries — properties, scm, dependencies, build/
+        // plugins — each holding decoy groupId/artifactId/version that must
+        // NOT win over the project's own top-level coordinates. Existing
+        // tests exercise these sections one at a time; this proves they
+        // compose without unbalancing skip-depth or leaking a decoy.
+        let content = r#"<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.apache.commons</groupId>
+    <artifactId>commons-parent</artifactId>
+    <version>52</version>
+  </parent>
+  <artifactId>commons-lang3</artifactId>
+  <version>3.12.0</version>
+  <packaging>jar</packaging>
+  <properties>
+    <maven.compiler.source>1.8</maven.compiler.source>
+  </properties>
+  <scm>
+    <tag>commons-lang3-3.12.0</tag>
+  </scm>
+  <dependencies>
+    <dependency>
+      <groupId>org.junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>5.0.0</version>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>9.9.9</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "org.apache.commons"); // inherited from <parent>
+        assert_eq!(a, "commons-lang3");
+        assert_eq!(v, "3.12.0");
+    }
+
+    #[test]
+    fn test_scan_version_less_child_pom_rescued_by_path() {
+        // Malformed/incomplete metadata: a child POM that omits its own
+        // <version> (Maven would inherit it from <parent>, which this
+        // line-based parser intentionally does not). parse_pom returns None,
+        // so scan_maven_repo must fall back to the on-disk directory layout
+        // and still resolve the correct coordinates.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir
+            .path()
+            .join("com")
+            .join("example")
+            .join("child")
+            .join("2.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("child-2.0.0.pom"),
+            r#"<project>
+  <parent>
+    <groupId>com.example.parent</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.0.0</version>
+  </parent>
+  <artifactId>child</artifactId>
+</project>"#,
+        )
+        .unwrap();
+
+        // The POM alone cannot be parsed (no top-level version).
+        let pom = std::fs::read_to_string(pkg_dir.join("child-2.0.0.pom")).unwrap();
+        assert!(parse_pom_group_artifact_version(&pom).is_none());
+
+        // But scan rescues it from the directory path.
+        let crawler = MavenCrawler::new();
+        let mut seen = HashSet::new();
+        let pkgs = crawler.scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].purl, "pkg:maven/com.example/child@2.0.0");
+        assert_eq!(pkgs[0].name, "child");
+        assert_eq!(pkgs[0].version, "2.0.0");
+        assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+    }
+
     // ---- extract_xml_value tests ----
 
     #[test]

@@ -52,20 +52,28 @@ pub struct BundlerProject {
     pub gemfile: PathBuf,
 }
 
-/// Find the Bundler project at `cwd`: a `Gemfile` (or Bundler's alternate
-/// `gems.rb`) in the directory. Returns `None` when neither is present — a
-/// `Gemfile.lock` alone is not editable, so it does not count.
+/// Find the Bundler project that `cwd` belongs to by walking up to the nearest
+/// directory holding a `Gemfile` (or Bundler's alternate `gems.rb`) — exactly
+/// how `bundle` itself resolves the manifest, and matching the upward search in
+/// [`crate::cargo_setup::discover`] / [`crate::go_setup`]. The discovered
+/// directory (not `cwd`) becomes the project `root`, so `.socket/` and the
+/// plugin dir land next to the Gemfile even when `setup` is run from a
+/// subdirectory. Returns `None` when no ancestor has one — a `Gemfile.lock`
+/// alone is not editable, so it does not count.
 pub async fn discover_bundler_project(cwd: &Path) -> Option<BundlerProject> {
-    for name in ["Gemfile", "gems.rb"] {
-        let candidate = cwd.join(name);
-        if fs::metadata(&candidate).await.is_ok() {
-            return Some(BundlerProject {
-                root: cwd.to_path_buf(),
-                gemfile: candidate,
-            });
+    let mut dir = cwd.to_path_buf();
+    loop {
+        for name in ["Gemfile", "gems.rb"] {
+            let candidate = dir.join(name);
+            if fs::metadata(&candidate).await.is_ok() {
+                return Some(BundlerProject {
+                    root: dir,
+                    gemfile: candidate,
+                });
+            }
         }
+        dir = dir.parent()?.to_path_buf();
     }
-    None
 }
 
 /// Absolute path to the generated plugin directory for a project root.
@@ -198,6 +206,73 @@ mod tests {
     async fn test_discover_none_without_gemfile() {
         let dir = tempfile::tempdir().unwrap();
         assert!(discover_bundler_project(dir.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_discover_walks_up_from_subdirectory() {
+        // A Gemfile at the project root, `setup` invoked from a nested subdir —
+        // `bundle` resolves the Gemfile by walking up, so discovery must too,
+        // and the project root must be the Gemfile's dir (where `.socket/` and
+        // the plugin dir live), NOT the invocation cwd.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), "source 'https://rubygems.org'\n").await;
+        let nested = root.join("lib").join("widgets");
+        fs::create_dir_all(&nested).await.unwrap();
+
+        let proj = discover_bundler_project(&nested)
+            .await
+            .expect("Bundler project must be found from a subdirectory");
+        assert_eq!(proj.root, root, "root is the Gemfile's dir, not the cwd");
+        assert_eq!(proj.gemfile, root.join("Gemfile"));
+        // The plugin dir resolves under the real root, not the subdir.
+        assert_eq!(plugin_dir(&proj.root), root.join(PLUGIN_DIR));
+    }
+
+    #[tokio::test]
+    async fn test_discover_walks_up_finds_gems_rb() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("gems.rb"), "source 'https://rubygems.org'\n").await;
+        let nested = root.join("app");
+        fs::create_dir_all(&nested).await.unwrap();
+        let proj = discover_bundler_project(&nested).await.unwrap();
+        assert_eq!(proj.root, root);
+        assert_eq!(proj.gemfile, root.join("gems.rb"));
+    }
+
+    #[tokio::test]
+    async fn test_discover_prefers_gemfile_over_gems_rb_in_same_dir() {
+        // When both names sit in one directory, `Gemfile` wins (Bundler's own
+        // precedence). The walk-up must not let a `gems.rb` deeper down or the
+        // iteration order flip this.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), "gemfile\n").await;
+        write(&root.join("gems.rb"), "gemsrb\n").await;
+        let proj = discover_bundler_project(root).await.unwrap();
+        assert_eq!(proj.gemfile, root.join("Gemfile"));
+    }
+
+    #[tokio::test]
+    async fn test_discover_returns_nearest_ancestor_gemfile() {
+        // Two Gemfiles in the ancestry: the NEAREST one (the inner project)
+        // must win, never a far-up parent.
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path();
+        write(&outer.join("Gemfile"), "outer\n").await;
+        let inner = outer.join("subproject");
+        fs::create_dir_all(&inner).await.unwrap();
+        write(&inner.join("Gemfile"), "inner\n").await;
+        let nested = inner.join("lib");
+        fs::create_dir_all(&nested).await.unwrap();
+
+        let proj = discover_bundler_project(&nested).await.unwrap();
+        assert_eq!(proj.root, inner, "nearest ancestor Gemfile wins");
+        assert_eq!(
+            fs::read_to_string(&proj.gemfile).await.unwrap(),
+            "inner\n"
+        );
     }
 
     #[test]

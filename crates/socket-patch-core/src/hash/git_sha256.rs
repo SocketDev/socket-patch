@@ -164,4 +164,71 @@ mod tests {
         let err = result.expect_err("size smaller than stream must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    /// An [`AsyncRead`] that yields at most one byte per `read` call, modelling
+    /// a reader that never fills the buffer in a single call (sockets, pipes,
+    /// rate-limited streams). The chunked update loop must reassemble the body
+    /// correctly across many partial reads rather than assuming a single read
+    /// fills the buffer.
+    struct OneBytePerReadReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl tokio::io::AsyncRead for OneBytePerReadReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.pos < self.data.len() && buf.remaining() > 0 {
+                let byte = self.data[self.pos];
+                self.pos += 1;
+                buf.put_slice(&[byte]);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_reader_short_reads_reassemble() {
+        let content: Vec<u8> = (0..20_000u32).map(|i| (i % 97) as u8).collect();
+        let sync_hash = compute_git_sha256_from_bytes(&content);
+
+        let reader = OneBytePerReadReader {
+            data: content.clone(),
+            pos: 0,
+        };
+        let async_hash = compute_git_sha256_from_reader(content.len() as u64, reader)
+            .await
+            .unwrap();
+
+        assert_eq!(sync_hash, async_hash);
+    }
+
+    /// Content whose length is an exact multiple of the 8192-byte internal
+    /// buffer, so the final `read` returns 0 on a buffer boundary rather than
+    /// on a partially-filled buffer. Guards the loop's EOF handling at the
+    /// boundary case.
+    #[tokio::test]
+    async fn test_async_reader_exact_buffer_boundary() {
+        let content: Vec<u8> = (0..16_384u32).map(|i| (i % 251) as u8).collect();
+        let sync_hash = compute_git_sha256_from_bytes(&content);
+
+        let cursor = tokio::io::BufReader::new(&content[..]);
+        let async_hash = compute_git_sha256_from_reader(content.len() as u64, cursor)
+            .await
+            .unwrap();
+
+        assert_eq!(sync_hash, async_hash);
+    }
+
+    /// A zero-length stream with a correctly-declared size of 0 must hash to
+    /// the canonical Git empty-blob id, matching the byte-slice path.
+    #[tokio::test]
+    async fn test_async_reader_empty_stream() {
+        let cursor = tokio::io::BufReader::new(&b""[..]);
+        let async_hash = compute_git_sha256_from_reader(0, cursor).await.unwrap();
+        assert_eq!(async_hash, compute_git_sha256_from_bytes(b""));
+    }
 }

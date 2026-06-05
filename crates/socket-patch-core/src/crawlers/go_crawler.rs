@@ -37,6 +37,12 @@ pub fn decode_module_path(encoded: &str) -> String {
         if ch == '!' {
             if let Some(next) = chars.next() {
                 decoded.push(next.to_ascii_uppercase());
+            } else {
+                // A lone trailing `!` is not a valid escape — Go's encoder
+                // never emits one. Preserve it rather than silently dropping
+                // it, so decoding an unexpected/corrupt directory name never
+                // loses bytes from the path.
+                decoded.push('!');
             }
         } else {
             decoded.push(ch);
@@ -79,9 +85,14 @@ pub fn parse_go_mod_module(content: &str) -> Option<String> {
                 }
                 return Some(inner.to_string());
             }
-            // Unquoted module path
-            if !rest.is_empty() {
-                return Some(rest.to_string());
+            // Unquoted module path. The `module` directive takes a SINGLE
+            // token, so a line like `module foo bar` is malformed (Go rejects
+            // it outright). Return only the first whitespace-delimited token
+            // rather than the whole remainder (`"foo bar"`), which would build
+            // a bogus PURL with a space in the module path and break the later
+            // `split_module_path` namespace/name split.
+            if let Some(token) = rest.split_whitespace().next() {
+                return Some(token.to_string());
             }
         }
     }
@@ -461,6 +472,34 @@ mod tests {
         assert_eq!(parse_go_mod_module("module \"\"\n\ngo 1.21\n"), None);
         // Whitespace-padded variant is equally malformed.
         assert_eq!(parse_go_mod_module("  module \"\"  \n"), None);
+    }
+
+    #[test]
+    fn test_parse_go_mod_module_multi_token_unquoted() {
+        // `module` takes a single token; a multi-token unquoted line is
+        // malformed. We must not return the whole remainder (`"foo bar"`),
+        // which would build a bogus PURL with an embedded space. Take the
+        // first token only.
+        assert_eq!(
+            parse_go_mod_module("module github.com/foo/bar extra junk\ngo 1.21\n"),
+            Some("github.com/foo/bar".to_string())
+        );
+        // Trailing whitespace alone must not be treated as a second token.
+        assert_eq!(
+            parse_go_mod_module("module github.com/foo/bar   \n"),
+            Some("github.com/foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_decode_module_path_lone_trailing_bang_preserved() {
+        // A lone trailing `!` is not a valid Go escape. Decoding must not
+        // silently drop it (data loss on a corrupt directory name) — it is
+        // preserved verbatim instead.
+        assert_eq!(decode_module_path("foo!"), "foo!");
+        assert_eq!(decode_module_path("github.com/foo!"), "github.com/foo!");
+        // A valid escape followed by a lone trailing `!` keeps both.
+        assert_eq!(decode_module_path("!azure!"), "Azure!");
     }
 
     #[test]

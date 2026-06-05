@@ -108,7 +108,11 @@ fn gemfile_remove(content: &str) -> Option<String> {
         out.replace_range(idx..idx + appended.len(), "");
         Some(out)
     } else {
-        Some(content.replace(MANAGED_BLOCK, ""))
+        // Separator edited away: strip just the block. If the block body was
+        // also edited (so this matches nothing), report nothing-removed rather
+        // than a false "Updated" on an unchanged, still-marked file.
+        let stripped = content.replace(MANAGED_BLOCK, "");
+        (stripped != content).then_some(stripped)
     }
 }
 
@@ -213,6 +217,90 @@ mod tests {
         let out = gemfile_add(user).unwrap();
         assert!(out.contains("plugin 'some-other-plugin'"));
         assert!(out.contains("plugin 'socket-patch'"));
+    }
+
+    #[test]
+    fn test_round_trips_without_trailing_newline() {
+        // A Gemfile whose last line has no trailing newline must still restore
+        // byte-for-byte (add appends "\n<block>"; remove strips exactly that).
+        let no_nl = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'";
+        let added = gemfile_add(no_nl).unwrap();
+        assert!(is_plugin_directive_present(&added));
+        assert_eq!(gemfile_remove(&added).unwrap(), no_nl);
+    }
+
+    #[test]
+    fn test_round_trips_empty_gemfile() {
+        let added = gemfile_add("").unwrap();
+        assert!(is_plugin_directive_present(&added));
+        assert_eq!(gemfile_remove(&added).unwrap(), "");
+    }
+
+    #[test]
+    fn test_remove_via_block_fallback_when_separator_edited_away() {
+        // User deleted the blank-line separator, leaving the block glued to a
+        // no-newline final line. find(&appended) misses; the block-only
+        // fallback still strips it.
+        let glued = format!("gem 'x'{MANAGED_BLOCK}");
+        assert!(is_plugin_directive_present(&glued));
+        assert_eq!(gemfile_remove(&glued).unwrap(), "gem 'x'");
+    }
+
+    #[test]
+    fn test_remove_reports_nothing_removed_when_block_body_edited() {
+        // Marker present but the block body was hand-edited so neither the
+        // "\n<block>" nor the bare-block match fires. Removing nothing must NOT
+        // masquerade as a successful edit — the file is still configured.
+        let edited = format!(
+            "gem 'x'\n{MANAGED_MARKER} (added by `socket-patch setup`) >>>\nplugin 'socket-patch' # USER EDIT\n# <<< socket-patch:managed <<<\n"
+        );
+        assert!(is_plugin_directive_present(&edited));
+        assert!(
+            gemfile_remove(&edited).is_none(),
+            "an un-matchable edited block reports nothing-removed, not a no-op Updated"
+        );
+    }
+
+    #[test]
+    fn test_closing_marker_alone_is_not_detected_as_present() {
+        // The "<<<" closing line must not satisfy the ">>>" opening marker.
+        let closing_only = "gem 'x'\n# <<< socket-patch:managed <<<\n";
+        assert!(!is_plugin_directive_present(closing_only));
+    }
+
+    #[tokio::test]
+    async fn test_full_roundtrip_via_gems_rb() {
+        // discover prefers Gemfile, so exercise the gems.rb manifest directly.
+        let dir = tempfile::tempdir().unwrap();
+        let gems_rb = dir.path().join("gems.rb");
+        fs::write(&gems_rb, GEMFILE).await.unwrap();
+        assert_eq!(
+            edit_gemfile_add(&gems_rb, false).await.status,
+            GemSetupStatus::Updated
+        );
+        assert!(is_plugin_directive_present(
+            &fs::read_to_string(&gems_rb).await.unwrap()
+        ));
+        assert_eq!(
+            edit_gemfile_remove(&gems_rb, false).await.status,
+            GemSetupStatus::Updated
+        );
+        assert_eq!(fs::read_to_string(&gems_rb).await.unwrap(), GEMFILE);
+    }
+
+    #[tokio::test]
+    async fn test_remove_dry_run_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        let configured = gemfile_add(GEMFILE).unwrap();
+        fs::write(&gemfile, &configured).await.unwrap();
+        let res = edit_gemfile_remove(&gemfile, true).await;
+        assert_eq!(res.status, GemSetupStatus::Updated);
+        assert_eq!(
+            fs::read_to_string(&gemfile).await.unwrap(),
+            configured,
+            "dry-run remove must not write"
+        );
     }
 
     #[tokio::test]

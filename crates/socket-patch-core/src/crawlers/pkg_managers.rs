@@ -296,4 +296,73 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
     }
+
+    /// The bun-before-pnpm precedence must hold for the *binary* legacy
+    /// lockfile too, not just the text one. `bun_priority_over_pnpm_*`
+    /// only exercises `bun.lock`; pin `bun.lockb` against a `.pnpm/`
+    /// store so a regression that special-cases only the text lockfile
+    /// in the precedence is caught.
+    #[test]
+    fn bun_lockb_priority_over_pnpm() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
+        std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+    }
+
+    /// yarn-berry PnP outranks bun via the ESM loader marker as well as
+    /// `.pnp.cjs`. The existing `yarn_berry_pnp_priority_over_bun` only
+    /// covers `.pnp.cjs`; pin the `.pnp.loader.mjs` path so the
+    /// safety-critical refusal branch can't be masked by bun when an
+    /// install ships only the loader variant.
+    #[test]
+    fn yarn_berry_loader_mjs_priority_over_bun() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.loader.mjs"), "").unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// Layout assumption: detection is *install*-based, not
+    /// lockfile-based, for npm. A lone `package-lock.json` with no
+    /// installed `node_modules/` is a fresh checkout — there's nothing
+    /// on disk to patch — so it must classify as Unknown, not Npm.
+    /// (The npm branch deliberately ignores `package-lock.json`.)
+    #[test]
+    fn npm_lockfile_without_node_modules_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+    }
+
+    /// Robustness: a malformed pnpm marker where `.modules.yaml` is a
+    /// *directory* rather than a file must not trip the pnpm branch
+    /// (the check is `.is_file()`). With no real `.pnpm/` store either,
+    /// a bare `node_modules/` falls through to the npm default.
+    #[test]
+    fn modules_yaml_as_dir_does_not_trigger_pnpm() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/.modules.yaml")).unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+    }
+
+    /// Layout assumption: `node_modules` reached through a symlink to a
+    /// real directory is a valid install (npm/yarn workspaces and some
+    /// CI caches symlink it). `is_dir()` follows symlinks, so a
+    /// `yarn.lock` beside a symlinked `node_modules/` still classifies
+    /// as yarn-classic rather than falling through to Unknown.
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_node_modules_is_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real_modules");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, d.path().join("node_modules")).unwrap();
+        std::fs::write(d.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::YarnClassic);
+    }
 }

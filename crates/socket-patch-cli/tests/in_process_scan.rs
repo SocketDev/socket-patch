@@ -59,6 +59,17 @@ fn write_npm_package(root: &Path, name: &str, version: &str) {
     .unwrap();
 }
 
+/// Lay down a locally-installed RubyGem the gem crawler discovers in
+/// `vendor/bundle/ruby/*/gems/<name>-<version>/` (a `lib/` dir makes it
+/// verify as a real gem). Used to install a *second*-ecosystem package
+/// alongside npm so `--ecosystems npm` filtering can be exercised.
+fn write_gem_package(root: &Path, name: &str, version: &str) {
+    let gem = root
+        .join("vendor/bundle/ruby/3.0.0/gems")
+        .join(format!("{name}-{version}"));
+    std::fs::create_dir_all(gem.join("lib")).unwrap();
+}
+
 async fn mock_batch_empty(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -679,3 +690,178 @@ async fn scan_unreachable_api_does_not_panic() {
     );
 }
 
+
+// ---------------------------------------------------------------------------
+// Regression: --batch-size 0 must not panic
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_batch_size_zero_does_not_panic() {
+    // `--batch-size 0` (or `SOCKET_BATCH_SIZE=0`) is unvalidated at the
+    // parser. A zero divisor/chunk-size would panic the API-query loop
+    // (`len.div_ceil(0)` / `all_purls.chunks(0)`), aborting the process on
+    // any non-empty project. It must instead clamp to a one-package batch
+    // and complete normally.
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = server.uri();
+    args.batch_size = 0;
+
+    // No panic, and the discovered package still reaches the batch endpoint
+    // (proving the loop ran rather than being skipped).
+    assert_eq!(run(args).await, 0);
+    let reqs = recorded(&server).await;
+    let posts = batch_posts(&reqs);
+    assert_eq!(posts.len(), 1, "batch must still be queried with a clamped size");
+    assert!(
+        req_body(posts[0]).contains(PURL),
+        "the discovered purl must be sent even with --batch-size 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: --ecosystems filtering must not let --prune delete installed
+// packages of the filtered-out ecosystems.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
+    // Two ecosystems are installed: an npm package and a RubyGem. The
+    // manifest holds three entries: the installed npm pkg, an *uninstalled*
+    // npm orphan, and the installed gem. We scan with `--ecosystems npm
+    // --prune`.
+    //
+    // Prune must reference what is actually INSTALLED, not what this scan
+    // chose to query. So: the npm orphan is pruned (genuinely gone), the
+    // installed npm entry is kept, and the installed gem entry is kept —
+    // even though `--ecosystems npm` excluded it from the query/display.
+    //
+    // The bug this guards: prune keyed off the `--ecosystems`-filtered crawl
+    // set, so the gem (filtered out, but installed) looked "uninstalled" and
+    // was silently pruned along with its blobs — cross-ecosystem data loss.
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "live-npm", "1.0.0");
+    write_gem_package(tmp.path(), "live-gem", "2.0.0");
+
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        r#"{ "patches": {
+            "pkg:npm/live-npm@1.0.0": {
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {}, "vulnerabilities": {},
+                "description": "live npm", "license": "MIT", "tier": "free"
+            },
+            "pkg:npm/orphan-npm@9.9.9": {
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {}, "vulnerabilities": {},
+                "description": "orphan npm", "license": "MIT", "tier": "free"
+            },
+            "pkg:gem/live-gem@2.0.0": {
+                "uuid": "33333333-3333-4333-8333-333333333333",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {}, "vulnerabilities": {},
+                "description": "live gem", "license": "MIT", "tier": "free"
+            }
+        }}"#,
+    )
+    .unwrap();
+
+    let mut args = default_args(tmp.path());
+    args.common.api_url = server.uri();
+    args.common.ecosystems = Some(vec!["npm".to_string()]);
+    args.prune = true;
+
+    assert_eq!(run(args).await, 0);
+
+    let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let patches = m["patches"].as_object().unwrap();
+
+    assert!(
+        !patches.contains_key("pkg:npm/orphan-npm@9.9.9"),
+        "the genuinely-uninstalled npm orphan must be pruned; got {m}"
+    );
+    assert!(
+        patches.contains_key("pkg:npm/live-npm@1.0.0"),
+        "the installed npm entry must be kept; got {m}"
+    );
+    assert!(
+        patches.contains_key("pkg:gem/live-gem@2.0.0"),
+        "an installed package of a filtered-OUT ecosystem must NOT be pruned; got {m}"
+    );
+    assert_eq!(patches.len(), 2, "exactly the orphan should be removed; got {m}");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: non-JSON --dry-run must not mutate (apply or prune).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn scan_non_json_dry_run_does_not_mutate() {
+    // `--dry-run` is documented as a non-mutating preview. The JSON path
+    // honored it; the interactive (non-JSON) path ignored it and ran the
+    // real download/apply + a mutating prune GC. With a stale manifest entry
+    // present and `--prune` set, an un-honored dry-run would prune it (and
+    // download/write blobs). It must instead preview and leave disk intact.
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    mock_by_package(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = r#"{ "patches": {
+        "pkg:npm/stale@1.0.0": {
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": {}, "vulnerabilities": {},
+            "description": "stale", "license": "MIT", "tier": "free"
+        }
+    }}"#;
+    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
+    let before = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+
+    let mut args = default_args(tmp.path());
+    args.common.api_url = server.uri();
+    args.common.json = false; // interactive path
+    args.prune = true;
+    args.common.dry_run = true;
+
+    assert_eq!(run(args).await, 0);
+
+    // Manifest is byte-for-byte unchanged: neither the apply nor the prune
+    // GC touched it.
+    let after = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
+    assert_eq!(after, before, "non-JSON dry-run must not mutate the manifest");
+    assert!(
+        !socket.join("blobs").exists(),
+        "non-JSON dry-run must not download/write blobs"
+    );
+    // Prove the path actually reached the patch-selection stage (and thus
+    // the dry-run short-circuit), rather than bailing earlier: details for
+    // the discovered package were fetched via the by-package endpoint.
+    let reqs = recorded(&server).await;
+    assert!(
+        by_package_gets(&reqs) >= 1,
+        "non-JSON scan must fetch patch details before the dry-run stop"
+    );
+}

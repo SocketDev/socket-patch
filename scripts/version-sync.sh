@@ -54,4 +54,11 @@ pyproject="$REPO_ROOT/pypi/socket-patch/pyproject.toml"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$pyproject"
 rm -f "$pyproject.bak"
 
+# Update the PyPI hook package version. The release build (build-pypi-wheels.py)
+# injects --version at wheel-build time, so this keeps the source-of-truth
+# pyproject.toml in sync for local builds and avoids a stale version field.
+hook_pyproject="$REPO_ROOT/pypi/socket-patch-hook/pyproject.toml"
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$hook_pyproject"
+rm -f "$hook_pyproject.bak"
+
 echo "Synced version to $VERSION"

@@ -1170,6 +1170,14 @@ async fn apply_patches_inner(
                 .cloned()
                 .unwrap_or_else(|| vec![base_purl.clone()]);
             let mut applied = false;
+            // Did at least one variant reach `apply_package_patch`? A
+            // variant reaches it only after passing the first-file
+            // installed-distribution check (or under `--force`), so an
+            // attempted variant *is* the installed distribution — it must
+            // not be reported as "package_not_installed" even if the patch
+            // itself then fails. Tracks the "matched but failed" case so the
+            // failure message is honest and `unmatched` stays accurate.
+            let mut attempted = false;
 
             for variant_purl in &variants {
                 let patch = match manifest.patches.get(variant_purl) {
@@ -1194,6 +1202,7 @@ async fn apply_patches_inner(
                     }
                 }
 
+                attempted = true;
                 let sources = PatchSources {
                     blobs_path: &blobs_path,
                     packages_path: Some(&packages_path),
@@ -1210,18 +1219,24 @@ async fn apply_patches_inner(
                 )
                 .await;
 
+                // A variant that reached apply is the installed distribution
+                // (it passed the first-file check, or `--force` bypassed it),
+                // so record it as matched whether or not the patch succeeded.
+                // Otherwise a variant that matched on disk but failed to patch
+                // would land in `unmatched` and be misreported by the run
+                // loop as a `package_not_installed` Skipped event — on top of
+                // the Failed event it already emits. Mirrors the npm branch
+                // below, which always marks an attempted PURL matched.
+                matched_manifest_purls.insert(variant_purl.clone());
                 if result.success {
                     applied = true;
-                    results.push(result);
-                    matched_manifest_purls.insert(variant_purl.clone());
                     // No `break`: apply *every* matching variant. PyPI/gem
                     // have exactly one installed distribution (the rest
                     // hash-mismatch and were skipped above), so this
                     // applies a single variant for them; Maven's coexisting
                     // classifier jars each get patched.
-                } else {
-                    results.push(result);
                 }
+                results.push(result);
             }
 
             if applied {
@@ -1229,7 +1244,16 @@ async fn apply_patches_inner(
             } else {
                 has_errors = true;
                 if !args.common.silent && !args.common.json {
-                    eprintln!("Failed to patch {base_purl}: no matching variant found");
+                    if attempted {
+                        // The installed variant was found but its patch could
+                        // not be applied (e.g. a later file mismatched) — a
+                        // genuine apply failure, not a missing package.
+                        eprintln!(
+                            "Failed to patch {base_purl}: the installed variant could not be patched"
+                        );
+                    } else {
+                        eprintln!("Failed to patch {base_purl}: no matching variant found");
+                    }
                 }
             }
         } else {

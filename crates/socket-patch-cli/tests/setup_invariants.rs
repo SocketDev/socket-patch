@@ -622,6 +622,50 @@ fn setup_remove_nothing_to_remove_exits_zero() {
     assert_eq!(v["removed"], 0);
 }
 
+// Regression: in human (non-JSON) mode `setup --remove` ends with
+// "Nothing removed; N item(s) could not be processed (see errors above)."
+// when a manifest fails to parse, but `print_remove_preview` printed NO error
+// section at all — so "(see errors above)" pointed at nothing and the user
+// never saw *why* the file could not be processed. The preview must surface the
+// per-file error so the message is truthful. (The companion setup-path check is
+// `setup_malformed_does_not_claim_already_configured_in_human_mode`; this guards
+// the remove path, whose preview previously had no error branch whatsoever.)
+#[test]
+fn remove_human_mode_surfaces_unprocessable_file_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("package.json"), "not valid json!!!");
+
+    let out = setup_command(tmp.path(), &["setup", "--remove", "--yes"])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "a malformed manifest must exit 1; stdout=\n{stdout}");
+
+    // The "(see errors above)" trailer is only honest if the error was actually
+    // printed above it.
+    assert!(
+        stdout.contains("could not be processed (see errors above)"),
+        "remove must report the unprocessable file; stdout=\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Errors:"),
+        "the preview must include an Errors: section so '(see errors above)' is truthful; stdout=\n{stdout}"
+    );
+    // The concrete parse error (not just a header) must be shown — a bare
+    // "Errors:" header with no detail would still be a regression.
+    assert!(
+        stdout.contains("Invalid package.json"),
+        "the actual per-file error detail must be shown above the trailer; stdout=\n{stdout}"
+    );
+    // The Errors: section must precede the trailer it references.
+    let errors_at = stdout.find("Errors:").expect("Errors header present");
+    let trailer_at = stdout.find("see errors above").expect("trailer present");
+    assert!(
+        errors_at < trailer_at,
+        "the Errors: section must appear ABOVE the '(see errors above)' trailer; stdout=\n{stdout}"
+    );
+}
+
 #[test]
 fn setup_check_and_remove_are_mutually_exclusive() {
     let tmp = tempfile::tempdir().expect("tempdir");

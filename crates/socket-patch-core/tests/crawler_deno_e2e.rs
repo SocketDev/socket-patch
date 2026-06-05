@@ -119,6 +119,27 @@ async fn find_by_purls_non_jsr_purl_skipped() {
     );
 }
 
+/// The scope is part of the lookup key: a PURL must NOT resolve from a
+/// package that exists on disk under a *different* scope. Guards a
+/// regression that drops/ignores the scope segment when joining the
+/// path (which would let `@other/path` satisfy a `@std/path` query).
+#[tokio::test]
+async fn find_by_purls_wrong_scope_not_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Same name + version, but under `@other`, not the queried `@std`.
+    stage_jsr_pkg(tmp.path(), "@other", "path", "0.220.0").await;
+
+    let crawler = DenoCrawler;
+    let result = crawler
+        .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.is_empty(),
+        "a different-scope package must not satisfy the queried PURL, got {result:?}"
+    );
+}
+
 // ── crawl_all ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -152,6 +173,66 @@ async fn crawl_all_enumerates_jsr_packages() {
     assert_eq!(entry.namespace.as_deref(), Some("@std"));
     assert_eq!(entry.version, "0.220.0");
     assert_eq!(entry.path, std_path);
+}
+
+/// `crawl_all` in global mode WITHOUT `--global-prefix` must resolve
+/// the cache from `$DENO_DIR/npm/jsr.io` and actually scan it. The
+/// other DENO_DIR tests only exercise `get_jsr_cache_paths`; this one
+/// guards the full `get_jsr_cache_paths -> scan_jsr_cache` wiring real
+/// `scan --global --ecosystems deno` users hit, so a regression that
+/// resolves the path but fails to feed it into the scan surfaces here.
+#[tokio::test]
+#[serial]
+async fn crawl_all_global_via_deno_dir_env_scans_cache() {
+    let deno_home = tempfile::tempdir().unwrap();
+    let jsr = deno_home.path().join("npm").join("jsr.io");
+    let pkg = stage_jsr_pkg(&jsr, "@std", "path", "0.220.0").await;
+    let _g = EnvGuard::set("DENO_DIR", deno_home.path());
+
+    let crawler = DenoCrawler;
+    let opts = CrawlerOptions {
+        // cwd is irrelevant in global mode; point it somewhere with no
+        // markers to prove the cache came from DENO_DIR, not the cwd.
+        cwd: tempfile::tempdir().unwrap().path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(result.len(), 1, "got {:?}", result);
+    assert_eq!(result[0].purl, ORG_PURL);
+    assert_eq!(result[0].path, pkg);
+}
+
+/// The walk must stop AT the version layer: directory contents *inside*
+/// a version dir (`mod.ts`, a nested `src/`, deeper version-shaped
+/// dirs) are package payload, never separate packages. Guards against a
+/// regression that adds a fourth descent level and emits phantom
+/// packages like `pkg:jsr/@std/path@src`.
+#[tokio::test]
+async fn crawl_all_does_not_recurse_below_version_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
+    // Nested payload dirs under the version — one even shaped like a
+    // version number to bait a fourth-layer walk.
+    tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+    tokio::fs::create_dir_all(pkg.join("0.0.0")).await.unwrap();
+
+    let crawler = DenoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: Some(tmp.path().to_path_buf()),
+        batch_size: 100,
+    };
+    let result = crawler.crawl_all(&opts).await;
+    assert_eq!(
+        result.len(),
+        1,
+        "only the version dir is a package; nested dirs are payload, got {:?}",
+        result.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(result[0].purl, ORG_PURL);
 }
 
 #[tokio::test]

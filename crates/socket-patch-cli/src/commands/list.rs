@@ -170,11 +170,26 @@ pub async fn run(args: ListArgs) -> i32 {
             0
         }
         Ok(None) => {
+            // Defensive: `read_manifest` only returns `Ok(None)` for a
+            // missing file, which the metadata pre-check above already
+            // turned into `manifest_not_found`. Kept so a future loader
+            // change can't silently fall through without an envelope.
             emit_error(&args, "manifest_invalid", "Invalid manifest".to_string());
             1
         }
         Err(e) => {
-            emit_error(&args, "manifest_unreadable", e.to_string());
+            // A manifest that exists but is unparseable (bad JSON or a
+            // schema violation) surfaces as `ErrorKind::InvalidData` — the
+            // contract's `manifest_invalid`. Everything else is a genuine
+            // I/O failure (`manifest_unreadable`). Conflating the two would
+            // tell a consumer to retry on a corrupt file, or to give up on a
+            // transient I/O error. See CLI_CONTRACT.md error-code table.
+            let code = if e.kind() == std::io::ErrorKind::InvalidData {
+                "manifest_invalid"
+            } else {
+                "manifest_unreadable"
+            };
+            emit_error(&args, code, e.to_string());
             1
         }
     }

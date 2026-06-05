@@ -14,7 +14,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `scan` | — | Crawl installed packages for available patches |
 | `list` | — | Print patches in the local manifest |
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
-| `setup` | — | Configure package.json postinstall scripts |
+| `setup` | — | Wire automatic-patching install hooks (npm/pypi/cargo/gem/golang) |
 | `repair` | `gc` | Download missing blobs + clean up unused ones |
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
@@ -109,15 +109,15 @@ in particular, are behavior changes that gate a version bump when implemented).
 2. **Ecosystem-scoped.** `setup`, `setup --check`, and `setup --remove` honor the global
    `--ecosystems` filter and act on only the named ecosystems; with no filter they act on every
    detected ecosystem. *(Intended; **not yet implemented** — `setup` currently ignores `--ecosystems`
-   and always processes npm + python + cargo. RED-guarded.)*
+   and always processes every detected ecosystem (npm + python + cargo + golang + gem). RED-guarded.)*
 
 3. **Consistency after install.** Once an ecosystem is set up, its locally-installed dependencies are
    re-patched to match the manifest after **any** of: a dependency added, updated, or removed; **or** a
    new patch added to the manifest. The re-patch is carried by the ecosystem's install/build hook (npm
    `postinstall`/`dependencies`, the Python `.pth` startup hook, the cargo guard build script, the gem
-   Bundler plugin) which runs `socket-patch apply` after the ecosystem's installer finishes, so patch
-   state always reconverges with the manifest. *(Implemented for npm/pypi/cargo/gem via the support
-   matrix.)*
+   Bundler plugin, the golang guard package) which runs `socket-patch apply` after the ecosystem's
+   installer finishes, so patch state always reconverges with the manifest. *(Implemented for
+   npm/pypi/cargo/gem/golang via the support matrix.)*
 
 4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
    in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
@@ -171,19 +171,20 @@ in particular, are behavior changes that gate a version bump when implemented).
 
 ### Per-ecosystem setup support
 
-`setup` only installs an automatic-repatch hook for the three ecosystems with a native post-install /
-build hook. The remaining ecosystems are **apply-only**: `socket-patch apply` patches them on demand,
-but there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them. These are
-exactly the ecosystems for which property 7's **manual** declaration is intended (so their hand-applied
-patches still show up in VEX).
+`setup` installs an automatic-repatch hook for the five ecosystems with a usable post-install / build /
+startup hook (npm, pypi, cargo, gem, golang). The remaining ecosystems are **apply-only**:
+`socket-patch apply` patches them on demand, but there is no hook for `setup` to install, so `setup` is
+a `no_files` no-op for them. These are exactly the ecosystems for which property 7's **manual**
+declaration is intended (so their hand-applied patches still show up in VEX).
 
 | Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
 |---|---|---|---|
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
-| cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]` |
+| cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]`; the guard crate is published to crates.io each release |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
-| nuget · maven · golang · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+| golang | generated `internal/socketpatchguard/` guard package (`guard.go` + `guard_test.go`) + a blank import in each `main` package | every `go test ./...` (CI gate) **and** every `go run` / binary launch (`init()` guard) — fail-closed | self-contained: committed Go source, no published artifact; CLI must be on `PATH` |
+| nuget · maven · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
 
 ### Monorepo / multi-project discovery model
 

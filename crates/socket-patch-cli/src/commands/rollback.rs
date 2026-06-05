@@ -204,7 +204,7 @@ fn verify_rollback_status_str(status: &VerifyRollbackStatus) -> &'static str {
 /// — a zero-file patch record, or a result whose `files_verified` came
 /// back empty — would be mislabeled "already original" and miscounted as
 /// a no-op even though nothing matched `beforeHash`.
-fn all_files_already_original(result: &RollbackResult) -> bool {
+pub(crate) fn all_files_already_original(result: &RollbackResult) -> bool {
     !result.files_verified.is_empty()
         && result
             .files_verified
@@ -527,7 +527,12 @@ async fn rollback_patches_inner(
             println!("{}", format_fetch_result(&fetch_result));
         }
 
-        let still_missing = get_missing_before_blobs(&filtered_manifest, &blobs_path).await;
+        // Re-check against `gate_manifest` (NOT `filtered_manifest`): the
+        // download only targeted blobs from the local-cargo-excluded gate, so
+        // local-cargo before-hashes must stay excluded here too. Re-checking
+        // the full filtered manifest would re-introduce those never-needed
+        // blobs and spuriously abort a mixed local-cargo rollback.
+        let still_missing = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
         if !still_missing.is_empty() {
             if !args.common.silent && !args.common.json {
                 eprintln!(
@@ -919,5 +924,75 @@ mod tests {
             make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
         ];
         assert_eq!(can_rollback_count(&results), 0);
+    }
+
+    // --- Missing-blob gate consistency ----------------------------------
+    //
+    // The before-blob gate excludes local-cargo PURLs (redirect rollback
+    // reads no blobs). Both the initial missing-blob check AND the
+    // post-download re-check (`still_missing`) must run against the SAME
+    // local-cargo-excluded gate manifest. Re-checking the full filtered
+    // manifest re-introduces local-cargo before-hashes that were never
+    // downloaded, spuriously aborting a mixed rollback.
+
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+
+    fn record_with_file(uuid: &str, path: &str, before_hash: &str) -> PatchRecord {
+        let mut rec = make_record(uuid);
+        let mut files = HashMap::new();
+        files.insert(
+            path.to_string(),
+            PatchFileInfo {
+                before_hash: before_hash.to_string(),
+                after_hash: "after".to_string(),
+            },
+        );
+        rec.files = files;
+        rec
+    }
+
+    /// Regression: a local-cargo before-hash that is absent on disk must NOT
+    /// count as missing once the manifest is run through `exclude_local_cargo`
+    /// — for the initial gate or the post-download re-check. Before the fix
+    /// the re-check used the full filtered manifest, so a present-npm +
+    /// missing-cargo manifest still reported the cargo blob missing and
+    /// aborted the rollback.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn gate_manifest_excludes_local_cargo_before_blobs_from_missing_check() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:cargo/serde@1.0.0".to_string(),
+            record_with_file("uuid-cargo", "src/lib.rs", "cargo_before"),
+        );
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "index.js", "npm_before"),
+        );
+        let manifest = PatchManifest { patches };
+
+        // Local mode (no --global / --global-prefix).
+        let common = crate::args::GlobalArgs::default();
+        assert!(!common.global && common.global_prefix.is_none());
+
+        // Blobs dir holds only the npm before-blob; the cargo one is absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path();
+        tokio::fs::write(blobs.join("npm_before"), b"x").await.unwrap();
+
+        // Full manifest: the cargo before-blob shows up as missing. This is
+        // exactly what the buggy re-check used, spuriously aborting rollback.
+        let full_missing = get_missing_before_blobs(&manifest, blobs).await;
+        assert!(full_missing.contains("cargo_before"));
+
+        // Gate manifest: the local-cargo PURL is excluded, so its before-blob
+        // is not counted as missing. With the npm blob present, the gate (and
+        // the re-check that now reuses it) reports nothing missing.
+        let gate = exclude_local_cargo(&manifest, &common);
+        let gate_missing = get_missing_before_blobs(&gate, blobs).await;
+        assert!(
+            gate_missing.is_empty(),
+            "gate must exclude local-cargo before-blobs, got {gate_missing:?}"
+        );
     }
 }
