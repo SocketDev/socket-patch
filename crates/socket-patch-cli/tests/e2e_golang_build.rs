@@ -1,4 +1,4 @@
-#![cfg(feature = "golang")]
+#![cfg(all(unix, feature = "golang"))]
 //! Full go-toolchain capstone for the Go `replace`-redirect guard: proves the
 //! patched bytes are actually LINKED by `go build`, and that the committed guard
 //! enforces drift at runtime (`init()`) and self-heals.
