@@ -153,6 +153,21 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
         code, 0,
         "apply must succeed; stdout={stdout}; stderr={stderr}"
     );
+    // The fetch path must have actually applied the patch (not silently
+    // no-op'd to a green exit). Assert the JSON summary, not just exit code.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "online fetch must apply exactly one patch; stdout={stdout}"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["purl"] == purl && e["action"] != "failed"),
+        "must emit a non-failed event for the patched purl; events={events:?}"
+    );
 
     // The file under node_modules should now contain the patched bytes.
     let patched_path = tmp
@@ -212,6 +227,17 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "apply");
     assert_eq!(v["summary"]["applied"], 0);
+    // The excluded npm patch must not appear as an applied/patched event —
+    // an empty `events` array or one without our purl is fine, but a
+    // "patched" event for the skipped purl would mean the filter leaked.
+    if let Some(events) = v["events"].as_array() {
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["purl"] == purl && e["action"] == "patched"),
+            "ecosystem filter must not patch the excluded npm purl; events={events:?}"
+        );
+    }
 
     // Node_modules file must be UNCHANGED.
     let content =
@@ -328,11 +354,23 @@ async fn apply_with_force_overrides_hash_mismatch() {
     // With force on a HashMismatch, the diff path bails because the
     // on-disk hash still doesn't match `before_hash`, but the blob
     // fallback should kick in and overwrite the file with the
-    // afterHash content.
+    // afterHash content. Assert the run reports a real success — a
+    // green exit with applied==0 would mean --force silently skipped.
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "--force must apply the patch past the hash mismatch; stdout={stdout}"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .all(|e| e["action"] != "failed"),
+        "--force run must not emit a failed event; events={events:?}"
+    );
     let content =
         std::fs::read(tmp.path().join("node_modules/force-target/index.js")).unwrap();
     assert_eq!(content, after, "--force must overwrite file with afterHash content");
-    let _ = v;
 }
 
 #[tokio::test]
@@ -395,18 +433,18 @@ async fn apply_pypi_package_uses_python_crawler() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
 
-    // Pypi crawler looks for installed packages under site-packages.
-    // For an in-cwd install we use `.venv/lib/python3.X/site-packages`
-    // (the python_crawler probes multiple paths). Simplest: emulate
-    // pip's layout with `.venv/lib/site-packages/<pkg>/`.
-    let pkg_dir = tmp
-        .path()
-        .join(".venv/lib/python3.12/site-packages/pypi_target");
-    std::fs::create_dir_all(&pkg_dir).expect("create pypi pkg dir");
-    std::fs::write(pkg_dir.join("index.js"), before).expect("write source"); // file_path matches patch
-    let dist_info = tmp
-        .path()
-        .join(".venv/lib/python3.12/site-packages/pypi_target-1.0.0.dist-info");
+    // Pypi crawler discovers a project-local venv via filesystem probing
+    // (`find_local_venv_site_packages` → `.venv/lib/python3.*/site-packages`),
+    // so this is fully deterministic and does NOT depend on a real Python on
+    // PATH. The crawler returns the *site-packages* dir as the package path,
+    // and apply joins it with the patch file key after stripping the
+    // `package/` prefix — so the patch key `package/index.js` resolves to
+    // `<site-packages>/index.js`. Write the source there so apply can
+    // actually patch it.
+    let site_packages = tmp.path().join(".venv/lib/python3.12/site-packages");
+    std::fs::create_dir_all(&site_packages).expect("create site-packages");
+    std::fs::write(site_packages.join("index.js"), before).expect("write source");
+    let dist_info = site_packages.join("pypi_target-1.0.0.dist-info");
     std::fs::create_dir_all(&dist_info).unwrap();
     std::fs::write(
         dist_info.join("METADATA"),
@@ -426,11 +464,11 @@ async fn apply_pypi_package_uses_python_crawler() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&after_hash), after).unwrap();
 
-    // Run apply restricted to pypi. The python crawler may or may not
-    // locate the package depending on environment (it depends on what
-    // python is available + path probing). The test's purpose is to
-    // exercise the dispatch + crawler invocation paths, so we just
-    // assert apply exits cleanly without panicking.
+    // Run apply restricted to pypi. With the venv staged on disk and the
+    // after-blob pre-cached, this must locate the package via the python
+    // crawler and patch it — exercising the pypi dispatch branch end to
+    // end, not just "without panicking". `VIRTUAL_ENV` is cleared so an
+    // ambient venv in CI can't redirect discovery away from our `.venv`.
     let out = Command::new(binary())
         .args([
             "apply",
@@ -441,15 +479,38 @@ async fn apply_pypi_package_uses_python_crawler() {
         ])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
+        .env_remove("VIRTUAL_ENV")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
-    // Either 0 (found + patched) or 1 (no python on PATH / package not
-    // located) — both confirm the dispatch path was taken without
-    // panicking.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        code, 0,
+        "pypi apply must find + patch the package; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "exactly one pypi patch must be applied; stdout={stdout}"
+    );
+    // The pypi crawler must have been the one to resolve the package: the
+    // patched event carries the pypi PURL.
+    let events = v["events"].as_array().expect("events array");
     assert!(
-        code == 0 || code == 1,
-        "pypi apply must not panic; got {code}"
+        events
+            .iter()
+            .any(|e| e["purl"] == "pkg:pypi/pypi_target@1.0.0"
+                && e["action"] != "failed"),
+        "must emit a non-failed event for the pypi purl; got events={events:?}"
+    );
+
+    // The on-disk source file under site-packages must now hold after-content.
+    let patched = std::fs::read(site_packages.join("index.js")).expect("read patched");
+    assert_eq!(
+        patched, after,
+        "pypi apply must overwrite site-packages file with after-content"
     );
 }
 
@@ -494,6 +555,11 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
     assert_eq!(
         code, 0,
         "apply with cached blob must succeed without network; stdout={stdout}; stderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "cached-blob apply must apply exactly one patch; stdout={stdout}"
     );
 
     // File was patched.

@@ -19,28 +19,23 @@ fn format_severity_no_color_returns_input_verbatim() {
 
 #[test]
 fn format_severity_critical_wraps_in_red() {
-    let out = format_severity("critical", true);
-    assert!(out.contains("\x1b[31m"), "expected red ANSI 31m; got {out:?}");
-    assert!(out.ends_with("\x1b[0m"));
-    assert!(out.contains("critical"));
+    // Exact envelope: red open + verbatim text + reset, nothing else.
+    assert_eq!(format_severity("critical", true), "\x1b[31mcritical\x1b[0m");
 }
 
 #[test]
 fn format_severity_high_wraps_in_bright_red() {
-    let out = format_severity("high", true);
-    assert!(out.contains("\x1b[91m"), "expected bright-red 91m; got {out:?}");
+    assert_eq!(format_severity("high", true), "\x1b[91mhigh\x1b[0m");
 }
 
 #[test]
 fn format_severity_medium_wraps_in_yellow() {
-    let out = format_severity("medium", true);
-    assert!(out.contains("\x1b[33m"), "expected yellow 33m; got {out:?}");
+    assert_eq!(format_severity("medium", true), "\x1b[33mmedium\x1b[0m");
 }
 
 #[test]
 fn format_severity_low_wraps_in_cyan() {
-    let out = format_severity("low", true);
-    assert!(out.contains("\x1b[36m"), "expected cyan 36m; got {out:?}");
+    assert_eq!(format_severity("low", true), "\x1b[36mlow\x1b[0m");
 }
 
 #[test]
@@ -53,11 +48,14 @@ fn format_severity_unknown_passes_through_unwrapped() {
 
 #[test]
 fn format_severity_case_insensitive() {
-    // The lowercase match must apply to mixed-case input.
-    assert!(format_severity("CRITICAL", true).contains("\x1b[31m"));
-    assert!(format_severity("High", true).contains("\x1b[91m"));
-    assert!(format_severity("MEDIUM", true).contains("\x1b[33m"));
-    assert!(format_severity("Low", true).contains("\x1b[36m"));
+    // The lowercase match must apply to mixed-case input — AND the displayed
+    // text must be the caller's verbatim, original-case string (production
+    // wraps `{s}`, not the lowercased key). Exact-equality catches both a
+    // miscoloured branch and any impl that lowercases the rendered text.
+    assert_eq!(format_severity("CRITICAL", true), "\x1b[31mCRITICAL\x1b[0m");
+    assert_eq!(format_severity("High", true), "\x1b[91mHigh\x1b[0m");
+    assert_eq!(format_severity("MEDIUM", true), "\x1b[33mMEDIUM\x1b[0m");
+    assert_eq!(format_severity("Low", true), "\x1b[36mLow\x1b[0m");
 }
 
 #[test]

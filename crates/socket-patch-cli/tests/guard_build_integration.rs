@@ -69,6 +69,37 @@ fn scaffold() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf
     (tmp, consumer, cargo_home, stub, sentinel, healed)
 }
 
+/// Read the stub's recorded invocations (one `$*` line per call), in order.
+/// Fails loudly if the stub was never invoked at all.
+fn invocations(sentinel: &Path) -> Vec<String> {
+    std::fs::read_to_string(sentinel)
+        .expect("guard should have invoked the stub at least once")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_check(line: &str) -> bool {
+    line.contains("--check")
+}
+
+fn is_heal(line: &str) -> bool {
+    line.contains("apply") && !line.contains("--check")
+}
+
+/// Assert an invocation carries the *full* expected arg set for `root`, not just
+/// an incidental `--check`/`apply` substring. `check` selects probe vs heal.
+fn assert_full_args(line: &str, root: &str, check: bool) {
+    for needle in ["apply", "--offline", "--ecosystems", "cargo", "--cwd", root] {
+        assert!(line.contains(needle), "invocation missing `{needle}`:\n{line}");
+    }
+    assert_eq!(
+        line.contains("--check"),
+        check,
+        "unexpected --check presence (expected check={check}):\n{line}"
+    );
+}
+
 fn build(consumer: &Path, cargo_home: &Path, stub: &Path, extra_env: &[(&str, &str)]) -> Output {
     let mut env: Vec<(&str, &str)> = vec![
         ("CARGO_HOME", cargo_home.to_str().unwrap()),
@@ -95,15 +126,19 @@ fn guard_in_sync_proceeds_without_heal() {
         "in-sync build must succeed.\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let argv = std::fs::read_to_string(&sentinel).expect("guard should have probed");
-    assert!(
-        argv.lines().any(|l| l.contains("--check") && l.contains(consumer.to_str().unwrap())),
-        "guard must probe via `apply --check ... --cwd <root>`:\n{argv}"
+    // Exactly one invocation — the read-only probe — and nothing else: an
+    // in-sync build must probe once and must NOT heal. Counting (not just
+    // "any heal line") closes the loophole of a duplicate/extra probe slipping
+    // through, and `assert_full_args` verifies the real `apply --check
+    // --offline --ecosystems cargo --cwd <root>` arg set, not a bare substring.
+    let inv = invocations(&sentinel);
+    assert_eq!(
+        inv.len(),
+        1,
+        "in-sync build must probe exactly once with no heal:\n{inv:#?}"
     );
-    assert!(
-        !argv.lines().any(|l| l.contains("apply") && !l.contains("--check")),
-        "in-sync build must NOT run a heal `apply`:\n{argv}"
-    );
+    assert!(is_check(&inv[0]), "the sole invocation must be the `apply --check` probe:\n{}", inv[0]);
+    assert_full_args(&inv[0], consumer.to_str().unwrap(), true);
     drop(tmp);
 }
 
@@ -121,17 +156,31 @@ fn guard_recoverable_drift_heals_then_fails_with_rebuild_message() {
     let out = build(&consumer, &cargo_home, &stub, &[("INITIAL_CHECK", "1")]);
     assert!(!out.status.success(), "drift must FAIL the build (fail-closed)");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Assert the SPECIFIC recoverable message (a single AND, not a disjunction):
+    // the heal succeeded and the user is told to re-run. Crucially it must NOT be
+    // the unrecoverable message — a guard that misclassified a healed state as
+    // unrecoverable would still fail the build, so checking only "did it fail"
+    // (or an OR that also accepts the unrecoverable text) would let that pass.
     assert!(
-        stderr.contains("regenerated") || stderr.contains("re-run"),
-        "recoverable drift should report regenerate + rebuild.\nstderr:\n{stderr}"
+        stderr.contains("regenerated"),
+        "recoverable drift should report the patches were regenerated.\nstderr:\n{stderr}"
     );
-    // Probed, healed, then re-probed (3 invocations).
-    let argv = std::fs::read_to_string(&sentinel).unwrap_or_default();
-    assert!(argv.matches("--check").count() >= 2, "should probe before and after heal:\n{argv}");
     assert!(
-        argv.lines().any(|l| l.contains("apply") && !l.contains("--check")),
-        "should run a heal `apply`:\n{argv}"
+        !stderr.contains("could NOT be reconciled"),
+        "a recovered heal must NOT report the unrecoverable message.\nstderr:\n{stderr}"
     );
+    // Exact sequence: probe (drift) → heal `apply` → re-probe (now in sync).
+    // Asserting the ordered triple (not just counts) proves the heal ran
+    // *between* the two probes, which is the whole recoverable contract.
+    let inv = invocations(&sentinel);
+    assert_eq!(inv.len(), 3, "recoverable drift = probe, heal, re-probe (3 calls):\n{inv:#?}");
+    assert!(is_check(&inv[0]), "1st call must be the probe:\n{}", inv[0]);
+    assert!(is_heal(&inv[1]), "2nd call must be the heal `apply`:\n{}", inv[1]);
+    assert!(is_check(&inv[2]), "3rd call must be the re-probe:\n{}", inv[2]);
+    let root = consumer.to_str().unwrap();
+    assert_full_args(&inv[0], root, true);
+    assert_full_args(&inv[1], root, false);
+    assert_full_args(&inv[2], root, true);
     drop(tmp);
 }
 
@@ -161,17 +210,24 @@ fn guard_unrecoverable_drift_fails_closed() {
         stderr.contains("could NOT be reconciled"),
         "unrecoverable drift should report it can't reconcile.\nstderr:\n{stderr}"
     );
-    // Prove it reached the unrecoverable classification via heal-then-reprobe (not
-    // an incidental build failure): ≥2 `--check` probes + a heal `apply` ran.
-    let argv = std::fs::read_to_string(&sentinel).unwrap_or_default();
+    // ...and emphatically NOT the recoverable "regenerated, re-run" message — a
+    // guard that healed but still reports success-style text would be wrong.
     assert!(
-        argv.matches("--check").count() >= 2,
-        "should probe before and after the heal:\n{argv}"
+        !stderr.contains("regenerated"),
+        "unrecoverable drift must NOT claim the patches were regenerated.\nstderr:\n{stderr}"
     );
-    assert!(
-        argv.lines().any(|l| l.contains("apply") && !l.contains("--check")),
-        "should run a heal `apply`:\n{argv}"
-    );
+    // Prove it reached the unrecoverable classification via the exact
+    // heal-then-reprobe sequence (probe → heal → re-probe, still drift), not an
+    // incidental build failure that merely happened to mention socket-patch.
+    let inv = invocations(&sentinel);
+    assert_eq!(inv.len(), 3, "unrecoverable drift = probe, heal, re-probe (3 calls):\n{inv:#?}");
+    assert!(is_check(&inv[0]), "1st call must be the probe:\n{}", inv[0]);
+    assert!(is_heal(&inv[1]), "2nd call must be the heal `apply`:\n{}", inv[1]);
+    assert!(is_check(&inv[2]), "3rd call must be the re-probe:\n{}", inv[2]);
+    let root = consumer.to_str().unwrap();
+    assert_full_args(&inv[0], root, true);
+    assert_full_args(&inv[1], root, false);
+    assert_full_args(&inv[2], root, true);
     drop(tmp);
 }
 
@@ -183,7 +239,7 @@ fn guard_missing_cli_fails_closed() {
         eprintln!("SKIP: cargo not on PATH");
         return;
     }
-    let (tmp, consumer, cargo_home, _stub, _sentinel, _healed) = scaffold();
+    let (tmp, consumer, cargo_home, _stub, sentinel, _healed) = scaffold();
     let missing = tmp.path().join("does-not-exist-socket-patch");
     let out = build(&consumer, &cargo_home, &missing, &[]);
     assert!(!out.status.success(), "a missing CLI must FAIL the build (fail-closed)");
@@ -193,6 +249,18 @@ fn guard_missing_cli_fails_closed() {
     assert!(
         stderr.contains("could not run `apply --check`"),
         "missing CLI should report it can't run the check.\nstderr:\n{stderr}"
+    );
+    // It must be the probe-error path, NOT a heal/drift path: with no runnable
+    // CLI the guard cannot heal or reconcile anything.
+    assert!(
+        !stderr.contains("regenerated") && !stderr.contains("could NOT be reconciled"),
+        "missing-CLI failure must be the probe-error path, not a heal path.\nstderr:\n{stderr}"
+    );
+    // The real (missing) bin can never have recorded an invocation; the stub
+    // from scaffold() is a different path and must stay untouched.
+    assert!(
+        !sentinel.exists(),
+        "an unrunnable CLI cannot have recorded any invocation"
     );
     drop(tmp);
 }

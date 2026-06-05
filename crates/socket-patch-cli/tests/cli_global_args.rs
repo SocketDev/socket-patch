@@ -10,15 +10,24 @@
 //! take an identifier), we supply a dummy value alongside the flag under
 //! test so clap's parser can complete.
 
+use std::path::PathBuf;
+
 use clap::Parser;
+use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::Cli;
 
 /// Subcommands under test. `rollback` is omitted because its only positional
 /// is optional — covered by the no-positional variant. Setup is exercised
 /// even though most globals are no-ops there; the point is to lock in that
 /// every subcommand parses every global flag.
+///
+/// This must list **every** subcommand that flattens `GlobalArgs`. The
+/// `all_subcommands_are_covered` test below introspects clap's own
+/// subcommand table and fails loudly if a new subcommand is added without
+/// being listed here — closing the "someone forgot the flatten on a new
+/// command and nobody noticed" gap this file claims to guard.
 const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
-    "apply", "list", "scan", "setup", "repair", "rollback",
+    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vex",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -26,30 +35,73 @@ const SUBCOMMANDS_WITH_IDENTIFIER: &[&str] = &["get", "remove"];
 
 const DUMMY_IDENTIFIER: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 
-/// (flag, value-or-None) pairs covering every flag on `GlobalArgs`.
-fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>)> {
+/// (flag, value-or-None, verifier) covering every flag on `GlobalArgs`.
+///
+/// The verifier asserts the flag actually lands in its corresponding
+/// `GlobalArgs` field. Parsing-succeeds-only (`is_ok`) is not enough: it
+/// would stay green if a flag were silently dropped, bound to the wrong
+/// field, or mapped to a no-op. Each value is deliberately chosen to differ
+/// from the field's default (e.g. `--download-mode package`, not `diff`) so
+/// the assertion can distinguish "bound" from "left at default".
+fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArgs))> {
     vec![
-        ("--cwd", Some("/tmp")),
-        ("--manifest-path", Some("custom.json")),
-        ("--api-url", Some("https://example.com")),
-        ("--api-token", Some("tok123")),
-        ("--org", Some("acme")),
-        ("--proxy-url", Some("https://proxy.example.com")),
-        ("--ecosystems", Some("npm,pypi")),
-        ("--download-mode", Some("diff")),
-        ("--offline", None),
-        ("--global", None),
-        ("--global-prefix", Some("/opt/global")),
-        ("--json", None),
-        ("--verbose", None),
-        ("--silent", None),
-        ("--dry-run", None),
-        ("--yes", None),
-        ("--debug", None),
-        ("--no-telemetry", None),
-        ("--break-lock", None),
-        ("--lock-timeout", Some("30")),
+        ("--cwd", Some("/tmp"), |c| assert_eq!(c.cwd, PathBuf::from("/tmp"))),
+        ("--manifest-path", Some("custom.json"), |c| {
+            assert_eq!(c.manifest_path, "custom.json")
+        }),
+        ("--api-url", Some("https://example.com"), |c| {
+            assert_eq!(c.api_url, "https://example.com")
+        }),
+        ("--api-token", Some("tok123"), |c| {
+            assert_eq!(c.api_token.as_deref(), Some("tok123"))
+        }),
+        ("--org", Some("acme"), |c| assert_eq!(c.org.as_deref(), Some("acme"))),
+        ("--proxy-url", Some("https://proxy.example.com"), |c| {
+            assert_eq!(c.proxy_url, "https://proxy.example.com")
+        }),
+        ("--ecosystems", Some("npm,pypi"), |c| {
+            assert_eq!(
+                c.ecosystems.as_deref(),
+                Some(&["npm".to_string(), "pypi".to_string()][..])
+            )
+        }),
+        ("--download-mode", Some("package"), |c| {
+            assert_eq!(c.download_mode, "package")
+        }),
+        ("--offline", None, |c| assert!(c.offline)),
+        ("--global", None, |c| assert!(c.global)),
+        ("--global-prefix", Some("/opt/global"), |c| {
+            assert_eq!(c.global_prefix, Some(PathBuf::from("/opt/global")))
+        }),
+        ("--json", None, |c| assert!(c.json)),
+        ("--verbose", None, |c| assert!(c.verbose)),
+        ("--silent", None, |c| assert!(c.silent)),
+        ("--dry-run", None, |c| assert!(c.dry_run)),
+        ("--yes", None, |c| assert!(c.yes)),
+        ("--debug", None, |c| assert!(c.debug)),
+        ("--no-telemetry", None, |c| assert!(c.no_telemetry)),
+        ("--break-lock", None, |c| assert!(c.break_lock)),
+        ("--lock-timeout", Some("30"), |c| assert_eq!(c.lock_timeout, Some(30))),
     ]
+}
+
+/// Extract the flattened `GlobalArgs` from any parsed subcommand. The match
+/// is exhaustive, so adding a `Commands` variant forces an update here —
+/// another tripwire for new subcommands.
+fn common_of(cli: &Cli) -> &GlobalArgs {
+    use socket_patch_cli::Commands::*;
+    match &cli.command {
+        Apply(a) => &a.common,
+        Rollback(a) => &a.common,
+        Get(a) => &a.common,
+        Scan(a) => &a.common,
+        List(a) => &a.common,
+        Remove(a) => &a.common,
+        Setup(a) => &a.common,
+        Repair(a) => &a.common,
+        Unlock(a) => &a.common,
+        Vex(a) => &a.common,
+    }
 }
 
 fn try_parse(subcommand: &str, extra: &[&str]) -> Result<Cli, clap::Error> {
@@ -73,22 +125,68 @@ fn every_global_flag_parses_on_every_subcommand() {
         .collect();
 
     for &subcommand in &all_subcommands {
-        for &(flag, value) in &cases {
+        for &(flag, value, verify) in &cases {
             let extra: Vec<&str> = if let Some(v) = value {
                 vec![flag, v]
             } else {
                 vec![flag]
             };
-            let result = try_parse(subcommand, &extra);
-            assert!(
-                result.is_ok(),
-                "subcommand `{}` failed to parse global flag `{}`: {}",
-                subcommand,
-                flag,
-                result.err().map(|e| e.to_string()).unwrap_or_default(),
-            );
+            let cli = try_parse(subcommand, &extra).unwrap_or_else(|e| {
+                panic!(
+                    "subcommand `{}` failed to parse global flag `{}`: {}",
+                    subcommand, flag, e
+                )
+            });
+            // Not just "parsed" — the value must actually land in the
+            // matching GlobalArgs field on this subcommand. CLI args always
+            // win over env/default, so this is deterministic even under the
+            // parallel serial env tests.
+            verify(common_of(&cli));
         }
     }
+}
+
+/// Tripwire: every subcommand clap knows about must appear in the
+/// `SUBCOMMANDS_*` lists, so the global-flag matrix above genuinely covers
+/// *every* command. If someone adds a subcommand (and forgets to flatten
+/// `GlobalArgs`, or forgets to add it here), this fails loudly instead of
+/// silently leaving the new command untested.
+#[test]
+fn all_subcommands_are_covered() {
+    use clap::CommandFactory;
+
+    let tested: std::collections::HashSet<&str> = SUBCOMMANDS_NO_POSITIONAL
+        .iter()
+        .chain(SUBCOMMANDS_WITH_IDENTIFIER.iter())
+        .copied()
+        .collect();
+
+    let cmd = Cli::command();
+    let real: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        // clap injects an implicit `help` subcommand that takes no globals.
+        .filter(|n| n != "help")
+        .collect();
+
+    // Every real subcommand is exercised by the global-flag matrix.
+    let missing: Vec<&String> = real.iter().filter(|n| !tested.contains(n.as_str())).collect();
+    assert!(
+        missing.is_empty(),
+        "subcommands not covered by the global-flag tests: {:?}. \
+         Add them to SUBCOMMANDS_NO_POSITIONAL / SUBCOMMANDS_WITH_IDENTIFIER \
+         (with a dummy positional if the command requires one).",
+        missing,
+    );
+
+    // And no stale/typo'd names that don't map to a real subcommand.
+    let real_set: std::collections::HashSet<&str> = real.iter().map(|s| s.as_str()).collect();
+    let stale: Vec<&&str> = tested.iter().filter(|n| !real_set.contains(*n)).collect();
+    assert!(
+        stale.is_empty(),
+        "SUBCOMMANDS_* lists name commands clap doesn't have: {:?}",
+        stale,
+    );
 }
 
 /// Short forms (`-s`, `-y`, etc.) are part of the contract too. `-d`
@@ -98,15 +196,20 @@ fn every_global_flag_parses_on_every_subcommand() {
 /// `reserved_short_forms_are_not_assigned` below.
 #[test]
 fn every_global_short_form_parses_on_every_subcommand() {
-    // (short, requires_value) — only flags that actually have a short.
-    let shorts: &[(&str, bool)] = &[
-        ("-o", true),  // --org
-        ("-e", true),  // --ecosystems
-        ("-g", false), // --global
-        ("-j", false), // --json
-        ("-v", false), // --verbose
-        ("-s", false), // --silent
-        ("-y", false), // --yes
+    // (short, value-or-None, verifier) — only flags that actually have a
+    // short. The verifier proves the short maps to the *intended* GlobalArgs
+    // field, not just that it parses (a short silently rebound to a different
+    // field would otherwise stay green).
+    let shorts: &[(&str, Option<&str>, fn(&GlobalArgs))] = &[
+        ("-o", Some("acme"), |c| assert_eq!(c.org.as_deref(), Some("acme"))), // --org
+        ("-e", Some("npm"), |c| {
+            assert_eq!(c.ecosystems.as_deref(), Some(&["npm".to_string()][..]))
+        }), // --ecosystems
+        ("-g", None, |c| assert!(c.global)),  // --global
+        ("-j", None, |c| assert!(c.json)),    // --json
+        ("-v", None, |c| assert!(c.verbose)), // --verbose
+        ("-s", None, |c| assert!(c.silent)),  // --silent
+        ("-y", None, |c| assert!(c.yes)),     // --yes
     ];
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
         .iter()
@@ -115,23 +218,22 @@ fn every_global_short_form_parses_on_every_subcommand() {
         .collect();
 
     for &subcommand in &all_subcommands {
-        for &(short, needs_value) in shorts {
+        for &(short, value, verify) in shorts {
             // `apply` has its own `-f` for --force; we don't test that here
             // because it's local. The shorts we test are all GlobalArgs shorts.
             // `get` has `-p` for --package (local); also not tested here.
-            let extra: Vec<&str> = if needs_value {
-                vec![short, "value"]
+            let extra: Vec<&str> = if let Some(v) = value {
+                vec![short, v]
             } else {
                 vec![short]
             };
-            let result = try_parse(subcommand, &extra);
-            assert!(
-                result.is_ok(),
-                "subcommand `{}` failed to parse short flag `{}`: {}",
-                subcommand,
-                short,
-                result.err().map(|e| e.to_string()).unwrap_or_default(),
-            );
+            let cli = try_parse(subcommand, &extra).unwrap_or_else(|e| {
+                panic!(
+                    "subcommand `{}` failed to parse short flag `{}`: {}",
+                    subcommand, short, e
+                )
+            });
+            verify(common_of(&cli));
         }
     }
 }

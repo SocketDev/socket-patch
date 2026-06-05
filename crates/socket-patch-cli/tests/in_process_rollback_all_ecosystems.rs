@@ -119,10 +119,25 @@ async fn rollback_npm_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
-    assert_eq!(rollback_run(default_rollback_args(tmp.path(), "npm")).await, 0);
+    // The whole point is restoring patched → original, so the two must
+    // differ and the file must start patched. Otherwise a rollback that
+    // does nothing would pass the post-condition vacuously.
+    assert_ne!(original.to_vec(), patched.to_vec());
     assert_eq!(
         std::fs::read(pkg_dir.join("index.js")).unwrap(),
-        original.to_vec()
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
+    assert_eq!(
+        rollback_run(default_rollback_args(tmp.path(), "npm")).await,
+        0,
+        "rollback must report success (exit 0)"
+    );
+    assert_eq!(
+        std::fs::read(pkg_dir.join("index.js")).unwrap(),
+        original.to_vec(),
+        "npm rollback must restore original bytes"
     );
 }
 
@@ -180,7 +195,15 @@ async fn rollback_pypi_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
-    let _ = rollback_run(default_rollback_args(tmp.path(), "pypi")).await;
+    assert_ne!(original.to_vec(), patched.to_vec());
+    assert_eq!(
+        std::fs::read(pkg_dir.join("__init__.py")).unwrap(),
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
+    let code = rollback_run(default_rollback_args(tmp.path(), "pypi")).await;
+    assert_eq!(code, 0, "pypi rollback must report success (exit 0)");
     let after = std::fs::read(pkg_dir.join("__init__.py")).unwrap();
     assert_eq!(
         after, original,
@@ -222,10 +245,19 @@ async fn rollback_gem_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
-    let _ = rollback_run(default_rollback_args(tmp.path(), "gem")).await;
+    assert_ne!(original.to_vec(), patched.to_vec());
     assert_eq!(
         std::fs::read(gem_root.join("lib/rbgem.rb")).unwrap(),
-        original.to_vec()
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
+    let code = rollback_run(default_rollback_args(tmp.path(), "gem")).await;
+    assert_eq!(code, 0, "gem rollback must report success (exit 0)");
+    assert_eq!(
+        std::fs::read(gem_root.join("lib/rbgem.rb")).unwrap(),
+        original.to_vec(),
+        "gem rollback must restore original bytes"
     );
 }
 
@@ -272,10 +304,19 @@ version = "1.0.0"
     // Cargo crawler needs a Cargo.toml in cwd to engage.
     std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
 
-    let _ = rollback_run(default_rollback_args(tmp.path(), "cargo")).await;
+    assert_ne!(original.to_vec(), patched.to_vec());
     assert_eq!(
         std::fs::read(pkg_dir.join("src/lib.rs")).unwrap(),
-        original.to_vec()
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
+    let code = rollback_run(default_rollback_args(tmp.path(), "cargo")).await;
+    assert_eq!(code, 0, "cargo rollback must report success (exit 0)");
+    assert_eq!(
+        std::fs::read(pkg_dir.join("src/lib.rs")).unwrap(),
+        original.to_vec(),
+        "cargo (vendor) rollback must restore original bytes in place"
     );
 }
 
@@ -309,15 +350,24 @@ async fn rollback_golang_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
+    assert_ne!(original.to_vec(), patched.to_vec());
+    assert_eq!(
+        std::fs::read(mod_dir.join("foo.go")).unwrap(),
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
     std::env::set_var("GOMODCACHE", tmp.path());
     let mut args = default_rollback_args(tmp.path(), "golang");
     args.common.global = true;
-    let _ = rollback_run(args).await;
+    let code = rollback_run(args).await;
     std::env::remove_var("GOMODCACHE");
+    assert_eq!(code, 0, "golang rollback must report success (exit 0)");
 
     assert_eq!(
         std::fs::read(mod_dir.join("foo.go")).unwrap(),
-        original.to_vec()
+        original.to_vec(),
+        "golang rollback must restore original bytes"
     );
 }
 
@@ -353,18 +403,27 @@ async fn rollback_maven_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
+    assert_ne!(original.to_vec(), patched.to_vec());
+    assert_eq!(
+        std::fs::read(version_dir.join("LICENSE.txt")).unwrap(),
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
     std::env::set_var("MAVEN_REPO_LOCAL", &repo);
     // Maven crawler is runtime-gated; opt in for the test.
     std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
     let mut args = default_rollback_args(tmp.path(), "maven");
     args.common.global = true;
-    let _ = rollback_run(args).await;
+    let code = rollback_run(args).await;
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+    assert_eq!(code, 0, "maven rollback must report success (exit 0)");
 
     assert_eq!(
         std::fs::read(version_dir.join("LICENSE.txt")).unwrap(),
-        original.to_vec()
+        original.to_vec(),
+        "maven rollback must restore original bytes"
     );
 }
 
@@ -408,10 +467,19 @@ async fn rollback_composer_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
-    let _ = rollback_run(default_rollback_args(tmp.path(), "composer")).await;
+    assert_ne!(original.to_vec(), patched.to_vec());
     assert_eq!(
         std::fs::read(pkg_dir.join("src/lib.php")).unwrap(),
-        original.to_vec()
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
+    let code = rollback_run(default_rollback_args(tmp.path(), "composer")).await;
+    assert_eq!(code, 0, "composer rollback must report success (exit 0)");
+    assert_eq!(
+        std::fs::read(pkg_dir.join("src/lib.php")).unwrap(),
+        original.to_vec(),
+        "composer rollback must restore original bytes"
     );
 }
 
@@ -447,18 +515,27 @@ async fn rollback_nuget_restores_original_content() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&before_hash), original).unwrap();
 
+    assert_ne!(original.to_vec(), patched.to_vec());
+    assert_eq!(
+        std::fs::read(pkg_dir.join("LICENSE.md")).unwrap(),
+        patched.to_vec(),
+        "precondition: file must be in patched state before rollback"
+    );
+
     std::env::set_var("NUGET_PACKAGES", &packages);
     // NuGet crawler is runtime-gated; opt in for the test.
     std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
     let mut args = default_rollback_args(tmp.path(), "nuget");
     args.common.global = true;
-    let _ = rollback_run(args).await;
+    let code = rollback_run(args).await;
     std::env::remove_var("NUGET_PACKAGES");
     std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+    assert_eq!(code, 0, "nuget rollback must report success (exit 0)");
 
     assert_eq!(
         std::fs::read(pkg_dir.join("LICENSE.md")).unwrap(),
-        original.to_vec()
+        original.to_vec(),
+        "nuget rollback must restore original bytes"
     );
 }
 

@@ -19,9 +19,40 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::{
-    binary, cargo_run, git_sha256, has_command, run_with_env, write_blob, write_minimal_manifest,
-    PatchEntry,
+    binary, cargo_run, git_sha256, has_command, json_string, parse_json_envelope, run_with_env,
+    write_blob, write_minimal_manifest, PatchEntry,
 };
+
+/// The exact managed `[patch.crates-io]` entry apply must write — keying the
+/// crate NAME to its version-specific copy path. Asserting the full `key = {
+/// path = ... }` line (not two independent `contains()` substrings) closes the
+/// loophole where a broken impl writes the `[patch.crates-io]` header plus the
+/// copy path under the WRONG key (or no key) and still passes — cargo keys
+/// `[patch]` by name, so the key↔path binding is what actually redirects.
+const EXPECTED_PATCH_LINE: &str =
+    "cfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.0\" }";
+
+/// Parse an `apply --json` envelope and assert it reports a real, successful
+/// patch of `PURL` (status=success, summary.applied≥1, an `applied` event for
+/// the purl). Guards against an apply that exits 0 while reporting nothing
+/// applied (or a failure) yet happens to leave plausible bytes on disk.
+fn assert_applied_envelope(stdout: &str) {
+    let env = parse_json_envelope(stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("success"),
+        "apply envelope status must be success:\n{stdout}"
+    );
+    assert!(
+        env["summary"]["applied"].as_u64().unwrap_or(0) >= 1,
+        "summary.applied must be >= 1:\n{stdout}"
+    );
+    let events = env["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["action"] == "applied" && e["purl"] == PURL),
+        "expected an `applied` event for {PURL}:\n{stdout}"
+    );
+}
 
 const CRATE: &str = "cfg-if";
 const VERSION: &str = "1.0.0";
@@ -128,21 +159,46 @@ fn apply_redirects_and_leaves_registry_pristine() {
         code, 0,
         "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    // The JSON envelope must actually report the patch as applied — not just
+    // exit 0 while reporting nothing (or a partial failure).
+    assert_applied_envelope(&stdout);
 
-    // Project-local patched copy holds the patched bytes.
-    assert_eq!(std::fs::read(copy_lib(&project)).unwrap(), PATCHED);
-    // Managed [patch.crates-io] entry points at the copy.
+    // Project-local patched copy holds EXACTLY the patched bytes, and its
+    // git-sha matches the manifest afterHash (independently derived from
+    // PATCHED) — so the bytes aren't merely non-empty, they're the right ones.
+    let copy_bytes = std::fs::read(copy_lib(&project)).unwrap();
+    assert_eq!(copy_bytes, PATCHED);
+    assert_eq!(git_sha256(&copy_bytes), git_sha256(PATCHED));
+    // Managed [patch.crates-io] entry binds the crate NAME to the copy path.
     let cfg = std::fs::read_to_string(config_toml(&project)).unwrap();
     assert!(
-        cfg.contains("[patch.crates-io]")
-            && cfg.contains(&format!(".socket/cargo-patches/{CRATE}-{VERSION}")),
-        "config.toml missing managed patch entry:\n{cfg}"
+        cfg.contains("[patch.crates-io]"),
+        "config.toml missing [patch.crates-io] table:\n{cfg}"
+    );
+    assert!(
+        cfg.contains(EXPECTED_PATCH_LINE),
+        "config.toml missing the exact `{EXPECTED_PATCH_LINE}` entry \
+         (key must bind to the version-specific copy path):\n{cfg}"
+    );
+    // apply also wires the build-time guard's [env] SOCKET_PATCH_ROOT — the
+    // rollback test depends on this being present so it can prove rollback
+    // leaves it intact. Pin it here at the source.
+    assert!(
+        cfg.contains("SOCKET_PATCH_ROOT"),
+        "apply must wire [env] SOCKET_PATCH_ROOT for the guard:\n{cfg}"
     );
     // The SHARED registry crate is untouched — a sibling project sees pristine.
     assert_eq!(
         std::fs::read(crate_dir.join("src/lib.rs")).unwrap(),
         PRISTINE,
         "registry crate must NOT be mutated by the local redirect"
+    );
+    // The registry checksum sidecar is likewise pristine (the redirect model
+    // must not rewrite the shared registry's .cargo-checksum.json).
+    assert_eq!(
+        std::fs::read_to_string(crate_dir.join(".cargo-checksum.json")).unwrap(),
+        "{\"files\":{},\"package\":\"x\"}",
+        "registry .cargo-checksum.json must NOT be mutated"
     );
 }
 
@@ -154,14 +210,33 @@ fn project_without_manifest_has_no_redirect() {
     stage_registry_crate(&cargo_home, PRISTINE);
     stage_project(&project); // no .socket/manifest.json
 
-    let (code, _stdout, _stderr) = apply(&project, &cargo_home);
+    let (code, stdout, _stderr) = apply(&project, &cargo_home);
     assert_eq!(
         code, 0,
         "apply on a manifest-less project should be a clean no-op"
     );
+    // The envelope must say *why* it was a no-op: noManifest, nothing applied.
+    // Otherwise a broken apply that silently did nothing (or errored) on a real
+    // manifest would also look like a clean exit-0 here.
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("noManifest"),
+        "manifest-less apply must report status=noManifest:\n{stdout}"
+    );
+    assert_eq!(
+        env["summary"]["applied"].as_u64().unwrap_or(u64::MAX),
+        0,
+        "manifest-less apply must apply nothing:\n{stdout}"
+    );
     assert!(
         !config_toml(&project).exists(),
         "no manifest => no [patch] redirect written"
+    );
+    // And no patched copy materialised either.
+    assert!(
+        !project.join(".socket/cargo-patches").exists(),
+        "no manifest => no patched copy tree"
     );
 }
 
@@ -174,12 +249,45 @@ fn reapply_in_sync_is_byte_identical() {
     stage_project(&project);
     stage_manifest(&project, PATCHED);
 
-    assert_eq!(apply(&project, &cargo_home).0, 0);
+    let (c1, out1, err1) = apply(&project, &cargo_home);
+    assert_eq!(c1, 0, "first apply failed.\nstdout:\n{out1}\nstderr:\n{err1}");
+    assert_applied_envelope(&out1);
     let lib1 = std::fs::read(copy_lib(&project)).unwrap();
     let cfg1 = std::fs::read_to_string(config_toml(&project)).unwrap();
+    // The snapshot we're about to prove "byte-identical" must itself be the
+    // CORRECT state — otherwise idempotently reproducing a *wrong* state (e.g.
+    // an apply that never patched) would pass this test.
+    assert_eq!(lib1, PATCHED, "first apply did not patch the copy");
+    assert!(
+        cfg1.contains(EXPECTED_PATCH_LINE),
+        "first apply did not write the managed patch entry:\n{cfg1}"
+    );
 
-    // Second apply hits the in-sync short-circuit: nothing rewritten.
-    assert_eq!(apply(&project, &cargo_home).0, 0);
+    // Second apply must hit the in-sync short-circuit: the envelope must report
+    // the package as already-patched (skipped), NOT re-applied. A regression
+    // that re-copies + re-patches every run would still leave byte-identical
+    // files, so byte-equality alone can't detect it — assert the action.
+    let (c2, out2, err2) = apply(&project, &cargo_home);
+    assert_eq!(c2, 0, "resync apply failed.\nstdout:\n{out2}\nstderr:\n{err2}");
+    let env2 = parse_json_envelope(&out2);
+    assert_eq!(
+        json_string(&env2, "status"),
+        Some("success"),
+        "resync status must be success:\n{out2}"
+    );
+    assert_eq!(
+        env2["summary"]["applied"].as_u64().unwrap_or(u64::MAX),
+        0,
+        "resync must apply nothing (in-sync short-circuit):\n{out2}"
+    );
+    let events2 = env2["events"].as_array().expect("events array");
+    assert!(
+        events2
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["purl"] == PURL),
+        "resync must emit a `skipped` (already-patched) event for {PURL}:\n{out2}"
+    );
+
     assert_eq!(
         std::fs::read(copy_lib(&project)).unwrap(),
         lib1,
@@ -205,12 +313,20 @@ fn self_heal_regenerates_copy_when_manifest_changes() {
 
     // Patch set changes (afterHash + content) — re-apply regenerates the copy.
     stage_manifest(&project, PATCHED_V2);
-    assert_eq!(apply(&project, &cargo_home).0, 0);
+    let (code, stdout, stderr) = apply(&project, &cargo_home);
+    assert_eq!(code, 0, "re-apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    // The manifest drifted from the committed copy, so this must be a real
+    // re-apply (applied event), not an already-patched short-circuit.
+    assert_applied_envelope(&stdout);
+    let regenerated = std::fs::read(copy_lib(&project)).unwrap();
     assert_eq!(
-        std::fs::read(copy_lib(&project)).unwrap(),
-        PATCHED_V2,
+        regenerated, PATCHED_V2,
         "copy must be regenerated to the new patched content"
     );
+    // And distinct from the previous patched content — proves a genuine
+    // regeneration, not a stale leftover that happens to read back.
+    assert_ne!(regenerated, PATCHED, "copy is still the stale v1 content");
+    assert_eq!(git_sha256(&regenerated), git_sha256(PATCHED_V2));
 }
 
 #[test]
@@ -241,6 +357,23 @@ fn rollback_removes_redirect_offline_without_registry() {
     assert_eq!(
         code, 0,
         "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The rollback envelope must report a real removal (rolledBack >= 1), not
+    // exit 0 having done nothing.
+    let rb = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&rb, "status"),
+        Some("success"),
+        "rollback status must be success:\n{stdout}"
+    );
+    assert!(
+        rb["rolledBack"].as_u64().unwrap_or(0) >= 1,
+        "rollback must report >= 1 rolled-back package:\n{stdout}"
+    );
+    assert_eq!(
+        rb["failed"].as_u64().unwrap_or(u64::MAX),
+        0,
+        "rollback must report no failures:\n{stdout}"
     );
 
     // Redirect copy + config entry are gone; the registry stayed pristine.
@@ -288,8 +421,15 @@ fn reconcile_prunes_dropped_patch() {
     )
     .unwrap();
     // Exit code may be non-zero (an empty manifest = "nothing to apply"), but
-    // reconcile runs before that early return and prunes the orphan.
-    let _ = apply(&project, &cargo_home);
+    // reconcile runs before that early return and prunes the orphan. We don't
+    // assert the exact code (it's the early-return path, not the contract under
+    // test) but we DO keep the output for diagnostics and assert the binary ran
+    // rather than crashing (a panic would surface as code -1 / signal).
+    let (rc_code, _rc_out, _rc_err) = apply(&project, &cargo_home);
+    assert!(
+        rc_code >= 0,
+        "apply process crashed/aborted (code {rc_code}) instead of running reconcile"
+    );
 
     assert!(
         !project
@@ -297,10 +437,22 @@ fn reconcile_prunes_dropped_patch() {
             .exists(),
         "orphan copy dir should be pruned by reconcile"
     );
-    let cfg = std::fs::read_to_string(config_toml(&project)).unwrap_or_default();
+    // config.toml must still EXIST (reconcile prunes patch entries but must keep
+    // the [env] setup state) — read it WITHOUT a default fallback so a wrongly
+    // deleted file fails loudly here instead of vacuously passing the !contains
+    // check below.
+    let cfg = std::fs::read_to_string(config_toml(&project))
+        .expect("config.toml must survive reconcile (it holds [env] setup state)");
     assert!(
         !cfg.contains(CRATE),
         "orphan [patch] entry should be pruned:\n{cfg}"
+    );
+    // The [env] SOCKET_PATCH_ROOT setup state must NOT be dropped by reconcile —
+    // it is owned by `setup`/`setup --remove`, independent of whether any
+    // redirects remain (mirrors the production invariant).
+    assert!(
+        cfg.contains("SOCKET_PATCH_ROOT"),
+        "reconcile must NOT remove [env] SOCKET_PATCH_ROOT (setup state):\n{cfg}"
     );
 }
 

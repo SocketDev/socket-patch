@@ -42,6 +42,16 @@ const PLATFORM_OTHER: &str = "arm64-darwin";
 
 const MARKER_INSTALLED: &[u8] = b"\n# SOCKET-GEM-INSTALLED-X86_64\n";
 
+/// The pristine on-disk bytes of the installed gem's `lib/nokogiri.rb`.
+const ORIGINAL_BYTES: &[u8] = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n";
+
+/// The exact bytes a correct apply must produce (original + marker).
+fn patched_bytes() -> Vec<u8> {
+    let mut p = ORIGINAL_BYTES.to_vec();
+    p.extend_from_slice(MARKER_INSTALLED);
+    p
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -226,18 +236,16 @@ fn manifest_keys(cwd: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn file_has_marker(file: &Path, marker: &[u8]) -> bool {
-    let bytes = std::fs::read(file).expect("read file");
-    bytes.windows(marker.len()).any(|w| w == marker)
+fn read_file(file: &Path) -> Vec<u8> {
+    std::fs::read(file).expect("read file")
 }
 
 /// Install the linux gem, compute its hashes, stand up the mock.
 async fn fixture(cwd: &Path) -> (PathBuf, MockServer) {
-    let original = b"module Nokogiri\n  VERSION = '1.16.5'\nend\n".to_vec();
+    let original = ORIGINAL_BYTES.to_vec();
     let file = install_platform_gem(cwd, PLATFORM_INSTALLED, &original);
     let before_hash = git_sha256(&original);
-    let mut patched = original.clone();
-    patched.extend_from_slice(MARKER_INSTALLED);
+    let patched = patched_bytes();
     let after_hash = git_sha256(&patched);
 
     let server = MockServer::start().await;
@@ -252,7 +260,7 @@ async fn narrow_scan_keeps_only_installed_platform() {
     let (gem_file, server) = fixture(tmp.path()).await;
 
     let code = scan_run(scan_args(tmp.path(), server.uri(), false)).await;
-    assert!(code == 0 || code == 1, "scan exit: {code}");
+    assert_eq!(code, 0, "narrow scan+apply over a matching gem must exit 0");
 
     let keys = manifest_keys(tmp.path());
     assert_eq!(
@@ -260,9 +268,10 @@ async fn narrow_scan_keeps_only_installed_platform() {
         vec![qualified(PLATFORM_INSTALLED)],
         "narrow scan must store only the installed platform variant; got {keys:?}"
     );
-    assert!(
-        file_has_marker(&gem_file, MARKER_INSTALLED),
-        "installed platform gem should be patched"
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "installed platform gem must be patched to exactly original+marker bytes"
     );
 }
 
@@ -273,7 +282,7 @@ async fn broad_scan_keeps_all_platforms() {
     let (gem_file, server) = fixture(tmp.path()).await;
 
     let code = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
-    assert!(code == 0 || code == 1, "scan exit: {code}");
+    assert_eq!(code, 0, "broad scan+apply over a matching gem must exit 0");
 
     let mut keys = manifest_keys(tmp.path());
     keys.sort();
@@ -281,10 +290,18 @@ async fn broad_scan_keeps_all_platforms() {
     expected.sort();
     assert_eq!(keys, expected, "broad scan must store every platform variant");
 
-    // Apply still patches only with the installed platform's variant.
+    // Apply still patches only with the installed platform's variant, and
+    // must not splice in the darwin variant's bytes ("DARWIN-MARKER").
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "broad apply must patch with exactly the installed platform's bytes"
+    );
     assert!(
-        file_has_marker(&gem_file, MARKER_INSTALLED),
-        "broad apply should patch with the installed platform variant"
+        !read_file(&gem_file)
+            .windows(b"DARWIN-MARKER".len())
+            .any(|w| w == b"DARWIN-MARKER"),
+        "broad apply must not write the other platform's distribution bytes"
     );
 }
 
@@ -294,9 +311,14 @@ async fn remove_base_purl_clears_all_platforms_and_rolls_back() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (gem_file, server) = fixture(tmp.path()).await;
 
-    let _ = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    let scan_code = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    assert_eq!(scan_code, 0, "broad scan+apply must exit 0 before remove");
     assert_eq!(manifest_keys(tmp.path()).len(), 2);
-    assert!(file_has_marker(&gem_file, MARKER_INSTALLED));
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "gem must be patched before remove"
+    );
 
     let remove_args = RemoveArgs {
         identifier: base_purl(),
@@ -319,9 +341,10 @@ async fn remove_base_purl_clears_all_platforms_and_rolls_back() {
         manifest_keys(tmp.path()).is_empty(),
         "all platform variants should be removed from the manifest"
     );
-    assert!(
-        !file_has_marker(&gem_file, MARKER_INSTALLED),
-        "remove should roll the gem file back to its original bytes"
+    assert_eq!(
+        read_file(&gem_file),
+        ORIGINAL_BYTES,
+        "remove must roll the gem file back to exactly its original bytes"
     );
 }
 
@@ -331,9 +354,14 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (gem_file, server) = fixture(tmp.path()).await;
 
-    let _ = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    let scan_code = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    assert_eq!(scan_code, 0, "broad scan+apply must exit 0 before rollback");
     assert_eq!(manifest_keys(tmp.path()).len(), 2);
-    assert!(file_has_marker(&gem_file, MARKER_INSTALLED));
+    assert_eq!(
+        read_file(&gem_file),
+        patched_bytes(),
+        "gem must be patched before rollback"
+    );
 
     let rollback_args = RollbackArgs {
         identifier: None,
@@ -350,8 +378,9 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     };
     let code = rollback_run(rollback_args).await;
     assert_eq!(code, 0, "rollback-all over broad manifest should exit 0");
-    assert!(
-        !file_has_marker(&gem_file, MARKER_INSTALLED),
-        "rollback should restore the original gem file"
+    assert_eq!(
+        read_file(&gem_file),
+        ORIGINAL_BYTES,
+        "rollback must restore exactly the original gem file bytes"
     );
 }

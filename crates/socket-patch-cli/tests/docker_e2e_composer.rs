@@ -56,6 +56,71 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Plain SHA-256 of the bytes (no git blob header) — matches what
+/// `sha256sum` reports inside the container, so the test can assert the
+/// installed file is byte-identical to the patch blob, not merely that
+/// it contains the marker substring.
+fn plain_sha256(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+/// Shared verification block for both scripts. Expects `PHP_FILE`,
+/// `EXPECTED_SHA`, and `APPLY_EXIT` to be set, plus the JSON captured in
+/// `/tmp/scan.json` and `/tmp/apply.json`.
+///
+/// This asserts on the *real structured output* of the run, not just a
+/// substring marker:
+///   - scan's JSON shows the monolog patch was discovered AND synced
+///     (`"action": "added"`). NOTE: scan's process exit code is
+///     deliberately NOT gated — with a transitive dep that has no patch,
+///     scan reports `"status": "partial_failure"` / exit 1 even though
+///     the monolog patch is found and synced. Gating exit==0 would fail a
+///     genuinely-working pipeline.
+///   - apply exited 0 and its JSON reports the patch was actually
+///     `"applied"`, hash-`"verified": true`, with `summary.applied == 1`
+///     — this rejects a no-op "success" that patches nothing.
+///   - the installed file contains the marker AND is byte-for-byte
+///     identical to the patch blob the API served (exact sha256), so
+///     truncated/garbled/appended writes can't slip through.
+fn verify_snippet() -> &'static str {
+    r#"
+# --- scan: must have discovered and synced the monolog patch ---
+grep -qF 'pkg:composer/monolog/monolog@3.5.0' /tmp/scan.json || {
+  echo "FAIL: scan json missing monolog purl" >&2; cat /tmp/scan.json >&2; exit 1; }
+grep -qF '"action": "added"' /tmp/scan.json || {
+  echo "FAIL: scan did not sync (add) the patch" >&2; cat /tmp/scan.json >&2; exit 1; }
+
+# --- apply: must exit 0 and report a real applied+verified patch ---
+if [ "${APPLY_EXIT:-1}" != "0" ]; then
+  echo "FAIL: apply exited non-zero (${APPLY_EXIT:-unset})" >&2; cat /tmp/apply.json >&2; exit 1
+fi
+for needle in '"status": "success"' '"action": "applied"' '"verified": true' '"applied": 1' 'pkg:composer/monolog/monolog@3.5.0'; do
+  grep -qF "$needle" /tmp/apply.json || {
+    echo "FAIL: apply json missing [$needle]" >&2; cat /tmp/apply.json >&2; exit 1; }
+done
+
+# --- installed file: marker present AND byte-identical to the patch blob ---
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
+  echo "FAIL: marker not in $PHP_FILE" >&2
+  head -3 "$PHP_FILE" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$PHP_FILE" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+  echo "FAIL: $PHP_FILE content sha256 ($ACTUAL_SHA) != expected ($EXPECTED_SHA)" >&2
+  echo "---- actual file ----" >&2
+  cat "$PHP_FILE" >&2
+  exit 1
+fi
+
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+}
+
 async fn make_mock_server(after_hash: &str) -> MockServer {
     let listener =
         std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
@@ -119,10 +184,12 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     server
 }
 
-fn local_script(api_url: &str) -> String {
+fn local_script(api_url: &str, expected_sha: &str) -> String {
+    let verify = verify_snippet();
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
+EXPECTED_SHA='{expected_sha}'
 
 mkdir -p /workspace/proj && cd /workspace/proj
 cat > composer.json <<'EOF'
@@ -136,31 +203,25 @@ PHP_FILE="vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls vendor/monolog/monolog/src/Monolog/ >&2 || true; exit 1; }}
 echo "Installed to: $PHP_FILE" >&2
 
+# scan exit code is intentionally not gated (see verify_snippet); capture JSON.
 socket-patch scan --json --sync --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems composer 2>/tmp/sync.err
+  --ecosystems composer > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --ecosystems composer 2>/tmp/apply.err
+socket-patch apply --json --force --offline --ecosystems composer > /tmp/apply.json 2>/tmp/apply.err
+APPLY_EXIT=$?
 cat /tmp/apply.err >&2
-
-if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
-  echo "FAIL: marker not in $PHP_FILE" >&2
-  head -3 "$PHP_FILE" >&2
-  exit 1
-fi
-
-echo "===PATCH VERIFIED===" >&2
-echo "===E2E PASS==="
-exit 0
-"#
+{verify}"#
     )
 }
 
-fn global_script(api_url: &str) -> String {
+fn global_script(api_url: &str, expected_sha: &str) -> String {
+    let verify = verify_snippet();
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
+EXPECTED_SHA='{expected_sha}'
 
 # composer global require installs into $COMPOSER_HOME/vendor/.
 composer global require --quiet --no-interaction monolog/monolog:3.5.0 > /tmp/install.log 2>&1 || {{
@@ -174,24 +235,16 @@ echo "Global-installed at: $PHP_FILE" >&2
 
 mkdir -p /workspace/proj && cd /workspace/proj
 
+# scan exit code is intentionally not gated (see verify_snippet); capture JSON.
 socket-patch scan --json --sync --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems composer 2>/tmp/sync.err
+  --ecosystems composer > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --global --ecosystems composer 2>/tmp/apply.err
+socket-patch apply --json --force --offline --global --ecosystems composer > /tmp/apply.json 2>/tmp/apply.err
+APPLY_EXIT=$?
 cat /tmp/apply.err >&2
-
-if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
-  echo "FAIL: marker not in $PHP_FILE" >&2
-  head -3 "$PHP_FILE" >&2
-  exit 1
-fi
-
-echo "===PATCH VERIFIED===" >&2
-echo "===E2E PASS==="
-exit 0
-"#
+{verify}"#
     )
 }
 
@@ -237,7 +290,8 @@ async fn composer_local_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&local_script(&api_url));
+    let expected_sha = plain_sha256(PATCHED_PHP);
+    let out = run_container(&local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -256,7 +310,8 @@ async fn composer_global_install_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&global_script(&api_url));
+    let expected_sha = plain_sha256(PATCHED_PHP);
+    let out = run_container(&global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

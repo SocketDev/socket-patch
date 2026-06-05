@@ -43,6 +43,20 @@ fn no_subcommand_returns_display_help_on_missing() {
 fn version_flag_triggers_display_version() {
     let err = expect_err(parse(&["socket-patch", "--version"]));
     assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+
+    // Kind alone would stay green even if the printed version were stale or
+    // hardcoded. The rendered text must carry the *actual* crate version
+    // (from Cargo.toml via CARGO_PKG_VERSION), not some frozen literal.
+    let rendered = err.to_string();
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        rendered.contains(version),
+        "version output {rendered:?} must contain crate version {version:?}"
+    );
+    assert!(
+        rendered.contains("socket-patch"),
+        "version output {rendered:?} must name the binary"
+    );
 }
 
 #[test]
@@ -134,6 +148,17 @@ fn vex_subcommand_parses() {
 
 // ---------- visible aliases ----------
 
+/// Render the top-level `--help` text. The aliases this file guards are
+/// `visible_alias`es: the contract requires them to be discoverable in
+/// `--help`, not merely parseable. A regression from `visible_alias` to a
+/// hidden `alias` keeps the parse tests green but silently drops the name
+/// from help — so the parse assertions alone are not enough.
+fn top_level_help() -> String {
+    let err = expect_err(parse(&["socket-patch", "--help"]));
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    err.to_string()
+}
+
 #[test]
 fn download_alias_parses_as_get() {
     // `download` is the visible_alias for `get` — wrappers in the wild
@@ -144,6 +169,14 @@ fn download_alias_parses_as_get() {
         Commands::Get(args) => assert_eq!(args.identifier, "some-id"),
         _ => panic!("expected Commands::Get via `download` alias"),
     }
+
+    // It must be a *visible* alias: clap lists visible aliases on the `get`
+    // row as `[aliases: download]`. A hidden alias would not appear here.
+    let help = top_level_help();
+    assert!(
+        help.contains("[aliases: download]"),
+        "`download` must be a visible alias of `get` in --help; got:\n{help}"
+    );
 }
 
 #[test]
@@ -151,4 +184,11 @@ fn gc_alias_parses_as_repair() {
     // `gc` is the visible_alias for `repair`.
     let cli = parse(&["socket-patch", "gc"]).expect("`gc` alias must parse as Repair");
     assert!(matches!(cli.command, Commands::Repair(_)));
+
+    // As above: `gc` must remain a visible alias of `repair`.
+    let help = top_level_help();
+    assert!(
+        help.contains("[aliases: gc]"),
+        "`gc` must be a visible alias of `repair` in --help; got:\n{help}"
+    );
 }

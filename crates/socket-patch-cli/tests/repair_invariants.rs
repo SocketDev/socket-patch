@@ -107,15 +107,27 @@ fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
     let (code, stdout) = run_repair(tmp.path(), &[]);
     assert_eq!(code, 1, "expected exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "error");
-    // Failure can land either in the manifest-read path or in inner repair
-    // depending on how the read surfaces the parse error — both are valid
-    // envelope shapes documented in CLI_CONTRACT.md.
+    // A malformed manifest must surface as a deterministic `repair_failed`
+    // envelope whose message names the manifest-parse failure. (A bare
+    // `manifest_not_found` here would mean the invalid file was silently
+    // ignored — exactly the regression this test guards against.)
     let code_str = v["error"]["code"].as_str().expect("error.code");
-    assert!(
-        code_str == "manifest_invalid" || code_str == "repair_failed",
-        "unexpected error.code: {code_str}"
+    assert_eq!(
+        code_str, "repair_failed",
+        "invalid manifest must report repair_failed, got {code_str}"
     );
+    let msg = v["error"]["message"].as_str().expect("error.message");
+    assert!(
+        msg.contains("manifest"),
+        "error message should name the manifest parse failure; got {msg}"
+    );
+    // A parse failure must not be reported as a no-op success: nothing was
+    // cleaned or downloaded.
+    assert_eq!(v["summary"]["removed"], 0);
+    assert_eq!(v["summary"]["downloaded"], 0);
+    assert_eq!(v["events"].as_array().expect("events array").len(), 0);
 }
 
 /// `--offline` (strict airgap, no network) and `--download-only`
@@ -189,6 +201,19 @@ fn repair_offline_with_no_orphans_succeeds_quietly() {
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 0);
     assert_eq!(v["summary"]["downloaded"], 0);
+    assert_eq!(v["summary"]["verified"], 0);
+    // Nothing to do offline with the referenced blob present: no events at all.
+    assert_eq!(
+        v["events"].as_array().expect("events array").len(),
+        0,
+        "no-op repair must emit no events; got {}",
+        v["events"]
+    );
+    // The referenced blob must remain untouched.
+    assert!(
+        socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "referenced blob must survive a no-op repair"
+    );
 }
 
 #[test]
@@ -231,22 +256,48 @@ fn repair_dry_run_does_not_remove_orphan_blob() {
     let (code, stdout) = run_repair(tmp.path(), &["--dry-run"]);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["status"], "success");
     assert_eq!(v["dryRun"], true);
-    // The cleanup event uses action=verified in dry-run mode.
-    let actions: Vec<&str> = v["events"]
-        .as_array()
-        .unwrap()
+
+    // Dry-run must actually DETECT the orphan, not merely emit a generic
+    // "verified" event. The cleanup-preview event reports `count` (orphans
+    // that would be removed) and `checked` (total blobs scanned). With one
+    // referenced blob + one orphan on disk, that's count=1 / checked=2.
+    let events = v["events"].as_array().expect("events array");
+    let verified: Vec<&serde_json::Value> = events
         .iter()
-        .map(|e| e["action"].as_str().unwrap())
+        .filter(|e| e["action"] == "verified")
         .collect();
-    assert!(
-        actions.contains(&"verified"),
-        "dry-run must emit verified event; got actions={actions:?}"
+    assert_eq!(
+        verified.len(),
+        1,
+        "dry-run must emit exactly one cleanup-preview event; got events={events:?}"
     );
-    // Orphan must still exist after dry-run.
+    assert_eq!(
+        verified[0]["details"]["count"], 1,
+        "dry-run must report exactly one would-be-removed orphan; got {}",
+        verified[0]
+    );
+    assert_eq!(
+        verified[0]["details"]["checked"], 2,
+        "dry-run must report both blobs as checked; got {}",
+        verified[0]
+    );
+    // Summary must mirror the preview: one verified, zero actually removed.
+    assert_eq!(v["summary"]["verified"], 1);
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "dry-run must not record any actual removals"
+    );
+
+    // Neither blob may be touched on disk in dry-run mode.
     assert!(
         socket.join("blobs").join(&orphan_hash).exists(),
         "dry-run must not delete orphan blobs"
+    );
+    assert!(
+        socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "dry-run must not delete the referenced blob"
     );
 }
 
@@ -278,6 +329,27 @@ fn repair_download_only_skips_cleanup() {
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("envelope JSON");
+    assert_eq!(v["status"], "success");
+    // The cleanup pass must be skipped entirely: zero removals AND no
+    // cleanup event recorded. (Checking the orphan file alone would also
+    // pass if the command silently no-op'd, so pin the summary/events too.)
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "--download-only must not remove anything"
+    );
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .all(|e| e["action"] != "removed" && e["action"] != "verified"),
+        "--download-only must emit no cleanup event; got events={events:?}"
+    );
+    // Both the referenced blob and the orphan must survive untouched.
+    assert!(
+        socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "referenced blob must survive --download-only"
+    );
     assert!(
         socket.join("blobs").join(&orphan_hash).exists(),
         "--download-only must skip cleanup; orphan should still exist"
@@ -402,6 +474,19 @@ fn repair_honors_manifest_path_override() {
     std::fs::create_dir_all(&custom_dir).unwrap();
     std::fs::write(custom_dir.join("patches.json"), MANIFEST_JSON).unwrap();
 
+    // Negative control: with NO `.socket/manifest.json` and no override,
+    // repair must fail to find a manifest. This proves the success below is
+    // attributable to `--manifest-path` and not to some incidental default
+    // path resolution.
+    let (ctrl_code, ctrl_stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(
+        ctrl_code, 1,
+        "control: repair without override must fail; stdout=\n{ctrl_stdout}"
+    );
+    let cv: serde_json::Value =
+        serde_json::from_str(&ctrl_stdout).expect("control envelope JSON");
+    assert_eq!(cv["error"]["code"], "manifest_not_found");
+
     let out = Command::new(binary())
         .args([
             "repair",
@@ -423,5 +508,10 @@ fn repair_honors_manifest_path_override() {
     );
     let v: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "success");
+    // The override manifest references one blob with no blob on disk, but
+    // offline mode fetches nothing and there are no orphans to remove.
+    assert_eq!(v["summary"]["removed"], 0);
+    assert_eq!(v["summary"]["downloaded"], 0);
 }

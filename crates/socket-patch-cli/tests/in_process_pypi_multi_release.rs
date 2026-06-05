@@ -327,9 +327,27 @@ fn file_has_marker(file: &Path, marker: &[u8]) -> bool {
     bytes.windows(marker.len()).any(|w| w == marker)
 }
 
+/// Markers that belong ONLY to the non-installed variants. They must NEVER
+/// appear in the on-disk six.py: those variants' `beforeHash` does not match
+/// the real file, so a correct apply leaves them untouched. If one shows up,
+/// apply patched the wrong distribution into the file.
+const MARKER_OTHER_WHEEL: &[u8] = b"# OTHER-WHEEL-MARKER\n";
+const MARKER_SDIST: &[u8] = b"# SDIST-MARKER\n";
+
+/// Bytes the installed `six.py` must contain after the installed variant is
+/// applied (original file + the installed marker, exactly).
+struct Fixture {
+    six_path: PathBuf,
+    server: MockServer,
+    /// Original on-disk bytes (rollback/remove must restore these exactly).
+    original: Vec<u8>,
+    /// Expected post-apply bytes (original + installed marker, exactly).
+    patched: Vec<u8>,
+}
+
 /// Common setup: install six, compute the installed variant's hashes,
-/// stand up the mock. Returns (six_path, server).
-async fn fixture(tmp: &Path) -> (PathBuf, MockServer) {
+/// stand up the mock.
+async fn fixture(tmp: &Path) -> Fixture {
     let six_path = install_six(tmp);
     let original = std::fs::read(&six_path).expect("read six.py");
     let before_hash = git_sha256(&original);
@@ -340,7 +358,12 @@ async fn fixture(tmp: &Path) -> (PathBuf, MockServer) {
     let server = MockServer::start().await;
     setup_multi_release_mock(&server, &before_hash).await;
     mount_installed_view(&server, &before_hash, &after_hash, &original, &patched).await;
-    (six_path, server)
+    Fixture {
+        six_path,
+        server,
+        original,
+        patched,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,10 +378,14 @@ async fn narrow_scan_keeps_only_installed_release() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (six_path, server) = fixture(tmp.path()).await;
+    let fx = fixture(tmp.path()).await;
+    let six_path = &fx.six_path;
 
-    let code = scan_run(scan_args(tmp.path(), server.uri(), false)).await;
-    assert!(code == 0 || code == 1, "scan exit: {code}");
+    let code = scan_run(scan_args(tmp.path(), fx.server.uri(), false)).await;
+    assert_eq!(
+        code, 0,
+        "narrow scan (download+apply of the installed variant) must succeed"
+    );
 
     // Manifest holds exactly the installed wheel variant.
     let keys = manifest_keys(tmp.path());
@@ -368,10 +395,21 @@ async fn narrow_scan_keeps_only_installed_release() {
         "narrow scan must store only the installed-dist variant; got {keys:?}"
     );
 
-    // The on-disk file was patched with the installed variant's marker.
+    // The on-disk file is EXACTLY original + installed marker — not merely
+    // "contains the marker somewhere". Bit-for-bit equality also proves the
+    // non-installed variants did not leak any bytes into the file.
+    let on_disk = std::fs::read(six_path).expect("read six.py");
+    assert_eq!(
+        on_disk, fx.patched,
+        "narrow apply must produce exactly original+installed-marker bytes"
+    );
     assert!(
-        file_has_marker(&six_path, MARKER_INSTALLED),
-        "installed variant should have patched six.py"
+        !file_has_marker(six_path, MARKER_OTHER_WHEEL),
+        "other-wheel content must never reach the file"
+    );
+    assert!(
+        !file_has_marker(six_path, MARKER_SDIST),
+        "sdist content must never reach the file"
     );
 }
 
@@ -387,10 +425,15 @@ async fn broad_scan_keeps_all_releases() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (six_path, server) = fixture(tmp.path()).await;
+    let fx = fixture(tmp.path()).await;
+    let six_path = &fx.six_path;
 
-    let code = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
-    assert!(code == 0 || code == 1, "scan exit: {code}");
+    let code = scan_run(scan_args(tmp.path(), fx.server.uri(), true)).await;
+    assert_eq!(
+        code, 0,
+        "broad scan must succeed: only the installed variant applies, the \
+         two non-installed variants must be skipped (hash mismatch), not failed"
+    );
 
     // Manifest holds all three release variants.
     let mut keys = manifest_keys(tmp.path());
@@ -403,10 +446,21 @@ async fn broad_scan_keeps_all_releases() {
     expected.sort();
     assert_eq!(keys, expected, "broad scan must store every variant");
 
-    // Apply still patches with the installed distribution's variant only.
+    // Apply still patches with the installed distribution's variant ONLY:
+    // the file must be exactly original+installed-marker, with no bytes from
+    // the other-wheel or sdist variants leaking in.
+    let on_disk = std::fs::read(six_path).expect("read six.py");
+    assert_eq!(
+        on_disk, fx.patched,
+        "broad apply must patch with the installed variant exactly, nothing else"
+    );
     assert!(
-        file_has_marker(&six_path, MARKER_INSTALLED),
-        "broad apply should still patch with the installed variant"
+        !file_has_marker(six_path, MARKER_OTHER_WHEEL),
+        "other-wheel content must never reach the file"
+    );
+    assert!(
+        !file_has_marker(six_path, MARKER_SDIST),
+        "sdist content must never reach the file"
     );
 }
 
@@ -423,12 +477,18 @@ async fn remove_base_purl_clears_all_variants_and_rolls_back() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (six_path, server) = fixture(tmp.path()).await;
+    let fx = fixture(tmp.path()).await;
+    let six_path = &fx.six_path;
 
     // Broad scan to seed all three variants + apply the installed one.
-    let _ = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    let scan_code = scan_run(scan_args(tmp.path(), fx.server.uri(), true)).await;
+    assert_eq!(scan_code, 0, "seed scan must succeed");
     assert_eq!(manifest_keys(tmp.path()).len(), 3);
-    assert!(file_has_marker(&six_path, MARKER_INSTALLED));
+    assert_eq!(
+        std::fs::read(six_path).expect("read six.py"),
+        fx.patched,
+        "precondition: installed variant should be applied before remove"
+    );
 
     // Remove by base PURL — must match every variant and roll back.
     let remove_args = RemoveArgs {
@@ -436,7 +496,7 @@ async fn remove_base_purl_clears_all_variants_and_rolls_back() {
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
-            api_url: server.uri(),
+            api_url: fx.server.uri(),
             api_token: Some("fake".to_string()),
             json: true,
             yes: true,
@@ -453,10 +513,12 @@ async fn remove_base_purl_clears_all_variants_and_rolls_back() {
         manifest_keys(tmp.path()).is_empty(),
         "all release variants should be removed from the manifest"
     );
-    // File rolled back to original (marker gone).
-    assert!(
-        !file_has_marker(&six_path, MARKER_INSTALLED),
-        "remove should roll the on-disk file back to its original bytes"
+    // File rolled back to its EXACT original bytes — not merely "marker gone"
+    // (a corrupt/truncated restore would also lack the marker but be wrong).
+    assert_eq!(
+        std::fs::read(six_path).expect("read six.py"),
+        fx.original,
+        "remove should roll the on-disk file back to its original bytes exactly"
     );
 }
 
@@ -473,11 +535,17 @@ async fn rollback_all_over_broad_manifest_succeeds() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (six_path, server) = fixture(tmp.path()).await;
+    let fx = fixture(tmp.path()).await;
+    let six_path = &fx.six_path;
 
-    let _ = scan_run(scan_args(tmp.path(), server.uri(), true)).await;
+    let scan_code = scan_run(scan_args(tmp.path(), fx.server.uri(), true)).await;
+    assert_eq!(scan_code, 0, "seed scan must succeed");
     assert_eq!(manifest_keys(tmp.path()).len(), 3);
-    assert!(file_has_marker(&six_path, MARKER_INSTALLED));
+    assert_eq!(
+        std::fs::read(six_path).expect("read six.py"),
+        fx.patched,
+        "precondition: installed variant should be applied before rollback"
+    );
 
     // Rollback everything in the manifest. Before the variant-dedupe fix
     // this exited non-zero (HashMismatch on the two non-installed
@@ -487,7 +555,7 @@ async fn rollback_all_over_broad_manifest_succeeds() {
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tmp.path().to_path_buf(),
             org: Some(ORG.to_string()),
-            api_url: server.uri(),
+            api_url: fx.server.uri(),
             api_token: Some("fake".to_string()),
             json: true,
             ecosystems: Some(vec!["pypi".to_string()]),
@@ -498,8 +566,10 @@ async fn rollback_all_over_broad_manifest_succeeds() {
     let code = rollback_run(rollback_args).await;
     assert_eq!(code, 0, "rollback-all over broad manifest should exit 0");
 
-    assert!(
-        !file_has_marker(&six_path, MARKER_INSTALLED),
-        "rollback should restore the original file bytes"
+    // File restored to its EXACT original bytes.
+    assert_eq!(
+        std::fs::read(six_path).expect("read six.py"),
+        fx.original,
+        "rollback should restore the original file bytes exactly"
     );
 }

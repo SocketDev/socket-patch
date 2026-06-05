@@ -297,10 +297,17 @@ async fn apply_blob_after_hash_mismatch_reports_failure() {
         post, pre,
         "atomic-write contract: hash-mismatch failure must leave the on-disk file byte-identical (no half-written corruption)"
     );
-    // `actual_blob_bytes` is what would have been written by the
-    // broken pre-rebase behavior. Document the contract by negation
-    // — the test reader sees what the OLD behavior was.
-    let _ = actual_blob_bytes;
+    // `actual_blob_bytes` is what the broken pre-rebase behavior would
+    // have written (it trusted the blob without re-hashing). Assert it
+    // explicitly NEVER landed on disk, rather than swallowing it with
+    // `let _` — a regression that writes the unverified blob would now
+    // fail here even if `post == pre` somehow still held.
+    assert_ne!(
+        post.as_slice(),
+        actual_blob_bytes.as_slice(),
+        "unverified blob bytes must never reach the target file"
+    );
+    assert_eq!(post.as_slice(), original, "file must remain the pristine original");
 }
 
 // ---------------------------------------------------------------------------
@@ -400,14 +407,29 @@ async fn apply_with_missing_target_file_reports_failure() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&after_hash), patched).unwrap();
 
+    let target = tmp.path().join("node_modules/nofile/index.js");
+    assert!(!target.exists(), "precondition: target file must be absent");
+
     let code = apply_run(default_apply(tmp.path())).await;
     assert_eq!(code, 1, "missing target file (non-empty beforeHash) must fail");
+    // The non-force failure path must not have conjured the file either.
+    assert!(
+        !target.exists(),
+        "failed apply must not create the missing target file"
+    );
 
     // --force should skip-and-continue rather than fail.
     let mut force_args = default_apply(tmp.path());
     force_args.force = true;
     let code = apply_run(force_args).await;
     assert_eq!(code, 0, "--force must skip missing files and exit 0");
+    // "Skip" means SKIP: --force must not fabricate the missing file
+    // from the afterHash blob. If it did, exit 0 alone would hide that
+    // a non-existent file was silently materialized with patched bytes.
+    assert!(
+        !target.exists(),
+        "--force must skip the missing file, not create it from the blob"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -504,9 +526,23 @@ async fn apply_empty_manifest_is_noop() {
     write_manifest(&socket, r#"{ "patches": {} }"#);
 
     let code = apply_run(default_apply(tmp.path())).await;
-    // Empty manifest → no packages, exit code is 1 because nothing was
-    // in scope.
-    assert!(code == 0 || code == 1);
+    // Empty manifest → no patches in scope → `apply_patches_inner`
+    // returns `success == false`, which maps to exit code 1. This must
+    // be asserted exactly: `code == 0 || code == 1` accepts every
+    // outcome the function can return and would stay green even if the
+    // empty-scope path regressed to a spurious success.
+    assert_eq!(code, 1, "empty manifest is out of scope → exit 1");
+    // A true no-op must not invent files. node_modules was never
+    // created and the manifest must be untouched on disk.
+    assert!(
+        !tmp.path().join("node_modules").exists(),
+        "empty-manifest apply must not create node_modules"
+    );
+    assert_eq!(
+        std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+        r#"{ "patches": {} }"#,
+        "empty-manifest apply must not rewrite the manifest"
+    );
 }
 
 // ---------------------------------------------------------------------------

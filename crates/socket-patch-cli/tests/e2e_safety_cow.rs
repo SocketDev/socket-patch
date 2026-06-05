@@ -34,9 +34,93 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::{
-    assert_run_ok, git_sha256, git_sha256_file, run, write_blob, write_minimal_manifest,
-    PatchEntry,
+    git_sha256, git_sha256_file, json_string, parse_json_envelope, run, write_blob,
+    write_minimal_manifest, PatchEntry,
 };
+
+// ── Envelope assertions ────────────────────────────────────────────────
+//
+// `assert_run_ok` only proves exit==0; a regression could exit 0 while
+// skipping the patch entirely. These helpers run `apply --json` and pin
+// the *structured* outcome so the CoW tests fail loudly if apply ever
+// stops actually applying (or applies the wrong files).
+
+/// Run `socket-patch apply --json` in `root`, assert exit 0 and a clean
+/// `status:"success"` envelope, and return the parsed envelope.
+fn apply_json_ok(root: &Path) -> serde_json::Value {
+    let (code, stdout, stderr) = run(root, &["apply", "--json"]);
+    assert_eq!(
+        code, 0,
+        "apply --json must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("success"),
+        "apply must report status=success, got:\n{stdout}"
+    );
+    env
+}
+
+/// Assert the envelope carries one `applied` event for `purl` whose
+/// `files[].path` set equals `expected_paths`, each `verified:true` and
+/// `appliedVia:"blob"`, and that `summary.applied >= 1` / `failed == 0`.
+/// This pins that apply genuinely took the patch-write path (a skip or
+/// no-op would surface a different action / zero count).
+fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) {
+    let events = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .unwrap_or_else(|| panic!("envelope missing events array: {env}"));
+    let ev = events
+        .iter()
+        .find(|e| json_string(e, "purl") == Some(purl))
+        .unwrap_or_else(|| panic!("no event for purl {purl} in {env}"));
+    assert_eq!(
+        json_string(ev, "action"),
+        Some("applied"),
+        "expected `applied` action for {purl}, got: {ev}"
+    );
+    let files = ev
+        .get("files")
+        .and_then(|f| f.as_array())
+        .unwrap_or_else(|| panic!("applied event missing files array: {ev}"));
+    let mut got: Vec<String> = files
+        .iter()
+        .map(|f| {
+            assert_eq!(
+                f.get("verified").and_then(|v| v.as_bool()),
+                Some(true),
+                "patched file must report verified:true, got: {f}"
+            );
+            assert_eq!(
+                json_string(f, "appliedVia"),
+                Some("blob"),
+                "patched file must be applied via the staged blob, got: {f}"
+            );
+            json_string(f, "path")
+                .unwrap_or_else(|| panic!("file event missing path: {f}"))
+                .to_string()
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<String> = expected_paths.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want, "applied file set mismatch for {purl}");
+
+    let summary = env
+        .get("summary")
+        .unwrap_or_else(|| panic!("envelope missing summary: {env}"));
+    assert!(
+        summary.get("applied").and_then(|v| v.as_u64()).unwrap_or(0) >= 1,
+        "summary.applied must be >=1: {env}"
+    );
+    assert_eq!(
+        summary.get("failed").and_then(|v| v.as_u64()),
+        Some(0),
+        "summary.failed must be 0 on a clean apply: {env}"
+    );
+}
 
 const TEST_PURL: &str = "pkg:npm/cow-fixture@1.0.0";
 const TEST_UUID: &str = "33333333-3333-4333-8333-333333333333";
@@ -127,7 +211,8 @@ fn apply_breaks_hardlink_before_patching() {
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));
 
     fx.stage_patch();
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // index.js (inside the package) is patched.
     assert_eq!(
@@ -171,7 +256,8 @@ fn apply_replaces_symlink_with_private_file() {
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));
 
     fx.stage_patch();
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // The link has been replaced with a regular file (CoW).
     let post = std::fs::symlink_metadata(fx.index_js()).unwrap();
@@ -235,7 +321,12 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     write_blob(&socket, &after_a, b"AAA patched!\n");
     write_blob(&socket, &after_b, b"BBB patched!\n");
 
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply multi-file");
+    let env = apply_json_ok(fx.root());
+    assert_applied(
+        &env,
+        TEST_PURL,
+        &["package/index.js", "package/lib/helper.js"],
+    );
 
     // Both inside files patched.
     assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), b"AAA patched!\n");
@@ -260,18 +351,30 @@ fn apply_against_regular_file_leaves_no_cow_litter() {
     std::fs::write(fx.index_js(), ORIGINAL_BYTES).unwrap();
     fx.stage_patch();
 
-    assert_run_ok(fx.root(), &["apply"], "socket-patch apply");
+    let env = apply_json_ok(fx.root());
+    assert_applied(&env, TEST_PURL, &["package/index.js"]);
 
     // File patched.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(PATCHED_BYTES));
 
     // No `.socket-cow-*` or `.socket-stage-*` litter in the package
     // directory after a successful apply. Stage files are unlinked
-    // after rename; CoW files are unlinked after CoW completes.
+    // after rename; CoW files are unlinked after CoW completes. Iterate
+    // with explicit unwrap so a read_dir error can't silently truncate
+    // the scan and let litter slip through.
     let pkg_dir = fx.root().join("node_modules/cow-fixture");
-    let mut entries = std::fs::read_dir(&pkg_dir).unwrap();
-    while let Some(Ok(entry)) = entries.next() {
-        let name = entry.file_name().to_string_lossy().to_string();
+    let names: Vec<String> = std::fs::read_dir(&pkg_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    // Sanity: the directory listing is non-empty (package.json +
+    // index.js at minimum), so we know we actually inspected entries
+    // rather than scanning an empty/wrong directory.
+    assert!(
+        names.iter().any(|n| n == "index.js") && names.iter().any(|n| n == "package.json"),
+        "package dir listing missing expected files, got: {names:?}"
+    );
+    for name in &names {
         assert!(
             !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
             "stage / cow temp file leaked into package directory: {name}"
@@ -318,8 +421,55 @@ fn apply_failure_does_not_cow_or_modify() {
     // Wrong bytes under the claimed hash — apply will reject.
     write_blob(&socket, &claimed_after_hash, b"deliberately wrong bytes\n");
 
-    let (code, _stdout, _stderr) = run(fx.root(), &["apply"]);
-    assert_eq!(code, 1, "hash-mismatch apply must exit non-zero");
+    let (code, stdout, stderr) = run(fx.root(), &["apply", "--json"]);
+    assert_eq!(
+        code, 1,
+        "hash-mismatch apply must exit non-zero.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // The exit code alone is not enough: a package-not-found or
+    // manifest-read failure ALSO exits 1 and would leave the files
+    // untouched, so the inode/content asserts below would pass
+    // vacuously against a totally broken apply. Pin that the failure
+    // was specifically the pre-write hash-verification gate firing —
+    // that is the precondition for "CoW did not run".
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("partialFailure"),
+        "hash-mismatch apply must report partialFailure: {stdout}"
+    );
+    let summary = env.get("summary").expect("envelope summary");
+    assert_eq!(
+        summary.get("applied").and_then(|v| v.as_u64()),
+        Some(0),
+        "nothing must have been applied: {stdout}"
+    );
+    assert_eq!(
+        summary.get("failed").and_then(|v| v.as_u64()),
+        Some(1),
+        "exactly the one patch must be reported failed: {stdout}"
+    );
+    let ev = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .and_then(|a| a.iter().find(|e| json_string(e, "purl") == Some(TEST_PURL)))
+        .unwrap_or_else(|| panic!("no event for {TEST_PURL}: {stdout}"));
+    assert_eq!(
+        json_string(ev, "action"),
+        Some("failed"),
+        "the patch event must be a failure, not a skip: {ev}"
+    );
+    assert_eq!(
+        json_string(ev, "errorCode"),
+        Some("apply_failed"),
+        "failure must be an apply-time failure (not package_not_installed): {ev}"
+    );
+    let err = json_string(ev, "error").unwrap_or("");
+    assert!(
+        err.contains("Hash verification failed before patch"),
+        "failure must be the pre-write hash-verification gate, got error: {err:?}"
+    );
 
     // Content unchanged on both sides of the hardlink.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));

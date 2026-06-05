@@ -320,8 +320,19 @@ fn dry_run_long_form() {
 #[test]
 fn scan_json_empty_cwd_emits_updates_key() {
     // Spawn the compiled binary against an empty tempdir so no API call
-    // happens (no packages found → early return with all-zero summary).
-    // This locks in the new `updates: []` field in the JSON contract.
+    // happens (no packages found → early "no packages" JSON return).
+    //
+    // NOTE: this exercises the *short-circuit* empty-scan branch in
+    // `scan::run`, where the whole result object — including `updates` — is
+    // a hardcoded literal. It does NOT cover `detect_updates`, the real
+    // function that populates `updates` once packages with patches are
+    // discovered (that path needs live API results and cannot run
+    // hermetically here, and `detect_updates` is `pub(crate)` so it can't
+    // be unit-tested from this integration crate). What this test CAN do is
+    // lock the empty-scan JSON contract *exactly*, so a regression that
+    // drops/renames a key, flips a default count, or leaks an unexpected
+    // `gc`/`apply`/`vex` sub-object onto the read-only default path fails
+    // loudly. See the summary for the uncovered `detect_updates` gap.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = std::process::Command::new(bin)
@@ -343,22 +354,40 @@ fn scan_json_empty_cwd_emits_updates_key() {
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("scan emitted valid JSON");
 
-    assert_eq!(v["status"], "success");
-    assert_eq!(v["scannedPackages"], 0);
-    assert_eq!(v["packagesWithPatches"], 0);
-    assert_eq!(v["totalPatches"], 0);
-    assert!(
-        v["packages"].is_array(),
-        "packages must be an array, got {}",
-        v["packages"]
-    );
-    assert!(
-        v["updates"].is_array(),
-        "updates key must be present and an array — locks contract",
-    );
+    // Exact-shape lock: the empty-scan JSON must be *precisely* this object.
+    // Full-object equality (rather than per-key spot checks) is what makes
+    // the regression net tight — it catches both missing keys (e.g. a
+    // dropped `updates`) and unexpected extra keys (e.g. a `gc`/`apply`
+    // object that must NOT appear when neither was requested, since both
+    // default to false here).
+    let expected = serde_json::json!({
+        "status": "success",
+        "scannedPackages": 0,
+        "packagesWithPatches": 0,
+        "totalPatches": 0,
+        "freePatches": 0,
+        "paidPatches": 0,
+        "canAccessPaidPatches": false,
+        "packages": [],
+        "updates": [],
+    });
     assert_eq!(
-        v["updates"].as_array().unwrap().len(),
-        0,
-        "updates is empty when no packages were scanned"
+        v, expected,
+        "empty-scan JSON contract drifted.\nexpected:\n{}\ngot:\n{}",
+        serde_json::to_string_pretty(&expected).unwrap(),
+        serde_json::to_string_pretty(&v).unwrap(),
+    );
+
+    // Belt-and-suspenders on the two type invariants the contract names,
+    // in case the object above is ever loosened during maintenance.
+    assert!(v["packages"].is_array(), "packages must be an array");
+    assert!(v["updates"].is_array(), "updates must be present and an array");
+    assert!(
+        v.get("gc").is_none(),
+        "no `gc` sub-object may appear when --prune was not passed"
+    );
+    assert!(
+        v.get("apply").is_none(),
+        "no `apply` sub-object may appear when --apply was not passed"
     );
 }

@@ -95,10 +95,29 @@ fn setup_yes_writes_postinstall_script() {
     let postinstall = parsed["scripts"]["postinstall"]
         .as_str()
         .expect("postinstall script must be set");
+    // No lockfile present → npm, which invokes the patch via `npx` and applies
+    // the npm ecosystem. Lock the actual command so a no-op/garbage script
+    // can't pass on a bare substring.
     assert!(
-        postinstall.contains("socket-patch"),
-        "postinstall must invoke socket-patch; got: {postinstall}"
+        postinstall.contains("npx @socketsecurity/socket-patch apply"),
+        "npm postinstall must invoke the patch via npx; got: {postinstall}"
     );
+    assert!(
+        postinstall.contains("--ecosystems npm"),
+        "npm postinstall must scope to the npm ecosystem; got: {postinstall}"
+    );
+    // setup also wires the `dependencies` lifecycle script (covers `npm install
+    // <pkg>` which skips postinstall); it must be present and equal.
+    let deps = parsed["scripts"]["dependencies"]
+        .as_str()
+        .expect("dependencies lifecycle script must be set");
+    assert_eq!(
+        deps, postinstall,
+        "the dependencies hook must mirror the postinstall hook; got: {deps}"
+    );
+    // The original `name`/`version` must be preserved, not clobbered.
+    assert_eq!(parsed["name"], "test-proj");
+    assert_eq!(parsed["version"], "1.0.0");
 }
 
 #[test]
@@ -160,9 +179,23 @@ fn setup_defaults_to_npm_when_no_lockfile() {
 "#,
     );
 
-    let (_, stdout) = run_setup(tmp.path(), &["--yes"]);
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 0, "setup should succeed; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["packageManager"], "npm");
+    assert_eq!(v["status"], "success");
+
+    // The written script must use npm's `npx`, never `pnpm dlx` — otherwise
+    // "detected npm" in the envelope wouldn't match what got written.
+    let after = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    assert!(
+        after.contains("npx @socketsecurity/socket-patch"),
+        "npm projects must use `npx`; got: {after}"
+    );
+    assert!(
+        !after.contains("pnpm dlx"),
+        "npm projects must NOT use `pnpm dlx`; got: {after}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +240,27 @@ fn setup_pnpm_monorepo_only_updates_root() {
         "only the root package.json should be touched in a pnpm monorepo"
     );
 
-    // Workspace packages must NOT have been modified.
-    let a = std::fs::read_to_string(tmp.path().join("packages/a/package.json")).unwrap();
-    assert!(
-        !a.contains("socket-patch"),
-        "workspace package.json must not be touched"
+    // The envelope must list exactly the root entry, not the workspace members.
+    let files = v["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        1,
+        "only the root package.json should appear in files[]; got: {files:?}"
     );
+    let touched = files[0]["path"].as_str().unwrap();
+    assert!(
+        !touched.contains("packages/a") && !touched.contains("packages/b"),
+        "the touched file must be the root, not a workspace member; got: {touched}"
+    );
+
+    // Both workspace packages must NOT have been modified.
+    for member in ["packages/a/package.json", "packages/b/package.json"] {
+        let content = std::fs::read_to_string(tmp.path().join(member)).unwrap();
+        assert!(
+            !content.contains("socket-patch"),
+            "workspace package.json {member} must not be touched; got: {content}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,13 +276,28 @@ fn setup_yes_json_files_entry_has_expected_keys() {
 "#,
     );
 
-    let (_, stdout) = run_setup(tmp.path(), &["--yes"]);
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 0, "setup should succeed; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let files = v["files"].as_array().expect("files array");
     assert_eq!(files.len(), 1);
     let entry = &files[0];
-    assert!(entry["path"].is_string());
-    assert!(entry["status"].is_string());
+    // Lock the actual values, not just the types — an entry of
+    // {"path": "", "status": "error"} would satisfy `is_string()`.
+    assert_eq!(entry["kind"], "package_json", "entry: {entry}");
+    assert_eq!(
+        entry["status"], "updated",
+        "the single updated file must report status=updated; entry: {entry}"
+    );
+    let path = entry["path"].as_str().expect("path string");
+    assert!(
+        path.ends_with("package.json"),
+        "path must point at the package.json we wrote; got: {path}"
+    );
+    assert!(
+        entry["error"].is_null(),
+        "a successfully updated file must carry no error; entry: {entry}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +346,13 @@ fn setup_malformed_does_not_claim_already_configured_in_human_mode() {
     assert!(
         !stdout.contains("already configured with socket-patch"),
         "must not falsely claim everything is already configured; stdout=\n{stdout}"
+    );
+    // And it must positively surface that the file could not be processed —
+    // otherwise a silent (but still exit-1) run would slip past the negative
+    // check above.
+    assert!(
+        stdout.contains("could not be processed"),
+        "human mode must report the unprocessable file; stdout=\n{stdout}"
     );
 }
 
@@ -353,6 +423,12 @@ fn setup_check_configured_project_exits_zero() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "configured");
     assert_eq!(v["needsConfiguration"], 0);
+    assert_eq!(v["errors"], 0);
+    // The package.json must be counted as configured, not silently absent.
+    assert_eq!(v["configured"], 1, "the lone manifest must be counted; stdout=\n{stdout}");
+    let files = v["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["status"], "configured");
 }
 
 #[test]
@@ -382,7 +458,13 @@ fn setup_check_does_not_modify_file() {
     let pkg = tmp.path().join("package.json");
     let original = "{ \"name\": \"x\", \"scripts\": { \"build\": \"tsc\" } }";
     write(&pkg, original);
-    run_setup(tmp.path(), &["--check"]);
+    // The check must actually run and report this unconfigured manifest (exit
+    // 1) — discarding the outcome would let a no-op binary pass the
+    // "didn't write" assertion vacuously.
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    assert_eq!(code, 1, "unconfigured --check must exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "needs_configuration");
     assert_eq!(
         std::fs::read_to_string(&pkg).unwrap(),
         original,
@@ -472,5 +554,23 @@ fn setup_check_and_remove_are_mutually_exclusive() {
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
-    assert_ne!(out.status.code(), Some(0), "--check + --remove must be rejected");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Must be a clap *usage* error (exit 2), not a normal run that happened to
+    // fail (exit 1) — `assert_ne!(.., 0)` would accept either and mask a
+    // dropped `conflicts_with` constraint.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--check + --remove must be a clap usage error (exit 2); stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    // clap reports the conflict on stderr and must not have run setup.
+    assert!(
+        stderr.contains("--check") && stderr.contains("--remove"),
+        "usage error must name the conflicting flags; stderr=\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "rejected invocation must not emit a normal result envelope; stdout=\n{stdout}"
+    );
 }

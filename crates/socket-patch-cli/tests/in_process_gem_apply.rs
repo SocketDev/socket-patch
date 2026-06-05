@@ -207,13 +207,40 @@ async fn gem_install_scan_sync_patches_real_file() {
         vex: Default::default(),
     };
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(code, 0, "scan --sync should succeed when the patch applies cleanly");
 
-    let after = std::fs::read(&lib_file).expect("read after");
+    // The apply must have driven the REAL code path: the patch blob is only
+    // available from the view endpoint, so it must have been fetched. This
+    // guards against a short-circuit that "passes" without touching the file.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server recorded requests");
+    let view_path = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
+    let view_hits = requests
+        .iter()
+        .filter(|r| r.url.path() == view_path)
+        .count();
     assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", lib_file.display()
+        view_hits >= 1,
+        "view endpoint never fetched — apply short-circuited (paths seen: {:?})",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+
+    // Verify the file on disk is EXACTLY the patched fixture, byte-for-byte.
+    // A substring/marker search would tolerate a partial or corrupted write;
+    // exact equality (derived independently from `original` + marker) does not.
+    let after = std::fs::read(&lib_file).expect("read after");
+    assert_ne!(after, original, "file unchanged — patch was not applied");
+    assert_eq!(
+        after, patched,
+        "applied file does not match the patched fixture byte-for-byte"
+    );
+    // And the on-disk content must hash to the patch's declared afterHash.
+    assert_eq!(
+        git_sha256(&after),
+        after_hash,
+        "post-apply file hash does not match the patch afterHash"
     );
 }
 
@@ -268,4 +295,22 @@ async fn gem_crawler_finds_real_installed_gem() {
         vex: Default::default(),
     };
     assert_eq!(scan_run(args).await, 0);
+
+    // Exit 0 alone is vacuous: a scan that discovers NOTHING also exits 0.
+    // Prove the crawler actually found the installed gem by asserting the
+    // batch request carried its purl. Without discovery, no such request
+    // (or an empty one) would have been sent.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server recorded requests");
+    let batch_path = format!("/v0/orgs/{ORG}/patches/batch");
+    let discovered = requests.iter().any(|r| {
+        r.url.path() == batch_path
+            && String::from_utf8_lossy(&r.body).contains(purl.as_str())
+    });
+    assert!(
+        discovered,
+        "crawler did not discover the installed gem: no batch request carried {purl}"
+    );
 }

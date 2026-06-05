@@ -53,7 +53,7 @@ fn apply_and_parse(
     package_root: &Path,
     extra_env: &[(&str, &str)],
 ) -> serde_json::Value {
-    let (_code, stdout, stderr) = run_with_env(
+    let (code, stdout, stderr) = run_with_env(
         cwd,
         &[
             "apply",
@@ -70,7 +70,85 @@ fn apply_and_parse(
             "socket-patch apply emitted no JSON.\nstderr:\n{stderr}"
         );
     }
-    parse_json_envelope(&stdout)
+    let env = parse_json_envelope(&stdout);
+
+    // Run-level contract: a sidecar record is meaningless unless the
+    // underlying patch actually landed *and the run reported success*.
+    // Every test in this file stages exactly one offline patch that
+    // must apply cleanly, so lock the whole-run shape here once. This
+    // closes the loophole where a regression that flips the run to
+    // partialFailure / non-zero exit, mis-records the patch event, or
+    // drops the summary count would still slip past the per-ecosystem
+    // `sidecars[]` assertions below.
+    assert_eq!(
+        code, 0,
+        "apply must exit 0 on a clean offline apply.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        env["command"], "apply",
+        "envelope.command must be `apply`.\nenv: {env}"
+    );
+    assert_eq!(
+        env["status"], "success",
+        "apply must report status=success (not partialFailure/error).\nenv: {env}"
+    );
+    assert_eq!(
+        env["dryRun"], false,
+        "these applies are NOT dry runs — bytes must hit disk.\nenv: {env}"
+    );
+    assert_eq!(
+        env.get("error"),
+        None,
+        "a successful apply must carry no top-level error.\nenv: {env}"
+    );
+    let summary = &env["summary"];
+    assert_eq!(
+        summary["applied"], 1,
+        "exactly one package must be applied.\nenv: {env}"
+    );
+    assert_eq!(
+        summary["failed"], 0,
+        "no patch event may be `failed`.\nenv: {env}"
+    );
+    // The real apply path must have recorded an `applied` patch event —
+    // proves the sidecar rode on an actual on-disk patch rather than a
+    // fabricated / short-circuited record.
+    let events = env["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope.events must be an array.\nenv: {env}"));
+    assert!(
+        events.iter().any(|e| e["action"] == "applied"),
+        "apply must record at least one `applied` event.\nenv: {env}"
+    );
+
+    env
+}
+
+/// Assert the per-ecosystem contract that a `sidecars[]` record JOINs
+/// to an `applied` `events[]` record by `purl` (the documented schema
+/// invariant downstream consumers rely on), and that the run produced
+/// exactly the one sidecar record this test staged. Both the sidecar
+/// `purl` and the event `purl` derive from the same `package_key`, so a
+/// mismatch here means the wiring between the apply loop and the
+/// sidecar emitter regressed.
+fn assert_sidecar_joins_applied_event(env: &serde_json::Value, record: &serde_json::Value) {
+    let sidecars = env["sidecars"].as_array().expect("sidecars array");
+    assert_eq!(
+        sidecars.len(),
+        1,
+        "exactly one sidecar record expected for a single staged package.\nenv: {env}"
+    );
+    let purl = record["purl"]
+        .as_str()
+        .unwrap_or_else(|| panic!("sidecar record.purl must be a string.\nrecord: {record}"));
+    assert!(!purl.is_empty(), "sidecar record.purl must be non-empty");
+    let events = env["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["purl"] == record["purl"] && e["action"] == "applied"),
+        "sidecar record (purl={purl}) must JOIN to an `applied` event of the same purl.\nenv: {env}"
+    );
 }
 
 /// Locate the first `envelope.sidecars[]` record matching the given
@@ -151,6 +229,7 @@ fn pypi_apply_emits_pypi_record_stale_advisory() {
     assert_eq!(std::fs::read(&target).unwrap(), patched);
 
     let record = find_sidecar_record(&env, "pypi");
+    assert_sidecar_joins_applied_event(&env, record);
     assert_eq!(
         record["purl"], "pkg:pypi/requests@2.28.0",
         "record must denormalize the PURL.\nrecord: {record}"
@@ -225,6 +304,7 @@ fn gem_apply_emits_gem_bundle_install_reverts_advisory() {
     assert_eq!(std::fs::read(&target).unwrap(), patched);
 
     let record = find_sidecar_record(&env, "gem");
+    assert_sidecar_joins_applied_event(&env, record);
     assert_eq!(record["purl"], "pkg:gem/rails@7.1.0");
     let files = record["files"].as_array().expect("files array");
     assert!(
@@ -237,6 +317,13 @@ fn gem_apply_emits_gem_bundle_install_reverts_advisory() {
         "code contract: gem must emit gem_bundle_install_reverts"
     );
     assert_eq!(advisory["severity"], "warning");
+    assert!(
+        advisory["message"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "advisory.message must be non-empty.\nrecord: {record}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -293,6 +380,7 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
     assert_eq!(std::fs::read(&target).unwrap(), patched);
 
     let record = find_sidecar_record(&env, "golang");
+    assert_sidecar_joins_applied_event(&env, record);
     assert_eq!(
         record["purl"],
         "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
@@ -308,6 +396,13 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
         "code contract: golang must emit go_mod_verify_fails"
     );
     assert_eq!(advisory["severity"], "warning");
+    assert!(
+        advisory["message"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "advisory.message must be non-empty.\nrecord: {record}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -375,6 +470,12 @@ fn nuget_apply_deletes_metadata_and_records_files() {
     );
 
     let record = find_sidecar_record(&env, "nuget");
+    assert_sidecar_joins_applied_event(&env, record);
+    assert_eq!(
+        record["purl"].as_str().map(|s| s.to_lowercase()),
+        Some("pkg:nuget/newtonsoft.json@13.0.3".to_string()),
+        "record must carry the package PURL.\nrecord: {record}"
+    );
     let files = record["files"].as_array().expect("files array");
     assert_eq!(
         files.len(),
@@ -474,9 +575,11 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
     assert!(!pkg_dir.join(".nupkg.metadata").exists());
 
     let record = find_sidecar_record(&env, "nuget");
+    assert_sidecar_joins_applied_event(&env, record);
     let files = record["files"].as_array().expect("files array");
     assert_eq!(files.len(), 1, "metadata deletion expected");
     assert_eq!(files[0]["path"], ".nupkg.metadata");
+    assert_eq!(files[0]["action"], "deleted");
     // No advisory — the non-UTF8 file is NOT a `.nupkg.sha512`
     // marker (its name isn't even valid UTF-8), so the signed-
     // package branch stays cold.
@@ -548,6 +651,7 @@ fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
     assert_eq!(std::fs::read(&target).unwrap(), patched);
 
     let record = find_sidecar_record(&env, "nuget");
+    assert_sidecar_joins_applied_event(&env, record);
     let advisory = record.get("advisory").expect("advisory");
     assert_eq!(advisory["code"], "sidecar_fixup_failed");
     assert_eq!(advisory["severity"], "error");
@@ -620,7 +724,19 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
         ],
     );
 
+    // Patch landed and the signature marker did NOT get clobbered.
+    assert_eq!(std::fs::read(&target).unwrap(), patched);
+    assert!(
+        pkg_dir.join("newtonsoft.json.13.0.3.nupkg.sha512").exists(),
+        "signed-package fixup must leave the .nupkg.sha512 marker in place"
+    );
+    assert!(
+        !pkg_dir.join(".nupkg.metadata").exists(),
+        "signed-package fixup must still delete .nupkg.metadata"
+    );
+
     let record = find_sidecar_record(&env, "nuget");
+    assert_sidecar_joins_applied_event(&env, record);
 
     // Files[] still carries the metadata deletion — even in the
     // signed-package case the new schema does NOT collapse this

@@ -287,8 +287,10 @@ async fn scan_without_prune_omits_gc_field() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    let (_, stdout, _) = run_scan(tmp.path(), &mock.uri(), &[]);
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "scan must succeed; stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success");
     assert!(
         v.as_object().unwrap().get("gc").is_none(),
         "scan without --prune/--sync must NOT emit `gc`; got: {v}"
@@ -695,14 +697,38 @@ async fn scan_handles_api_500_error_gracefully() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
-    let (code, _stdout, _stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
-    // Scan tolerates batch search failure: it reports an empty result
-    // rather than crashing. Exit code may be 0 or 1 depending on
-    // whether the error is fatal — both are acceptable; we just want
-    // to confirm the binary doesn't panic.
+    let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
+
+    // The binary must still emit a well-formed JSON envelope (no panic /
+    // no garbage on stdout) even when the API is down.
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("scan must emit valid JSON even on API failure; err={e}; stdout={stdout}; stderr={stderr}")
+    });
+
+    // CONTRACT (scan.rs:598-600): "If every batch errored, surface this as
+    // a full scan failure rather than silently reporting zero patches
+    // (which historically looked identical to 'no patches for these
+    // packages')." Here there is exactly one package → exactly one batch,
+    // and it returns 500, so EVERY batch failed. scan must therefore NOT
+    // present this as a clean success. A scan that emits status="success"
+    // / exit 0 with scannedPackages=1, totalPatches=0 is reporting the
+    // failure as "scanned the package, found no patches" — the precise
+    // masquerade the comment promises not to do.
+    assert_ne!(
+        v["status"], "success",
+        "scan must NOT report status=success when every API batch failed (500); \
+         envelope={v}; stderr={stderr}"
+    );
+    assert_ne!(
+        code, 0,
+        "scan must exit non-zero when every API batch failed (500); \
+         got exit code {code}; envelope={v}; stderr={stderr}"
+    );
+    // It must not crash, either — a panic/abort would surface as 101 or a
+    // negative/signal code, never the deliberate failure exit.
     assert!(
-        code == 0 || code == 1,
-        "scan must not crash on 500; got exit code {code}"
+        code > 0 && code < 100,
+        "scan must fail cleanly (not crash) on 500; got exit code {code}; stderr={stderr}"
     );
 }
 

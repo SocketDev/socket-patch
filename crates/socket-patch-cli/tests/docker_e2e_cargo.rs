@@ -115,10 +115,25 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     server
 }
 
-fn local_script(api_url: &str) -> String {
+/// Compute the git-blob SHA256 of a file the same way the binary does:
+/// `SHA256("blob <len>\0" ++ content)`. Emitted as a bash snippet so the
+/// container can verify on-disk bytes against an *independently* computed
+/// expected hash (passed in from the Rust side via [`git_sha256`]).
+const GIT_SHA256_FN: &str = r#"
+git_sha256() {
+  # $1 = path. Prints the git-blob sha256 of the file's exact bytes.
+  local p="$1" size
+  size=$(stat -c%s "$p")
+  { printf 'blob %s\0' "$size"; cat "$p"; } | sha256sum | awk '{print $1}'
+}
+"#;
+
+fn local_script(api_url: &str, expected_hash: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
+{git_sha256_fn}
+EXPECTED_HASH='{expected_hash}'
 
 # Minimal Rust project depending on cfg-if at a pinned version.
 mkdir -p /workspace/proj/src && cd /workspace/proj
@@ -140,21 +155,81 @@ LIB_RS=$(ls "$CARGO_HOME/registry/src/"*/cfg-if-1.0.0/src/lib.rs 2>/dev/null | h
 [ -f "$LIB_RS" ] || {{ echo "FAIL: cfg-if lib.rs not in registry/src" >&2; exit 1; }}
 echo "Fetched to: $LIB_RS" >&2
 
+# Pre-apply guard: the freshly-fetched upstream file must NOT already be
+# the patched content. This proves apply does the work rather than the
+# fixture (or a previous run) having pre-seeded the marker/bytes.
+HASH_BEFORE=$(git_sha256 "$LIB_RS")
+echo "hash_before=$HASH_BEFORE expected=$EXPECTED_HASH" >&2
+if [ "$HASH_BEFORE" = "$EXPECTED_HASH" ]; then
+  echo "FAIL: pristine cfg-if lib.rs already equals patched content (test would be vacuous)" >&2
+  exit 1
+fi
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$LIB_RS"; then
+  echo "FAIL: pristine cfg-if lib.rs already contains the marker before apply" >&2
+  exit 1
+fi
+
 # Cargo registry source files are read-only by default. Apply's unix
 # fix-permissions code makes them writable, but we chmod up-front
 # too in case anything else stomps on it.
 chmod u+w "$LIB_RS" || true
 
 # scan --sync writes manifest + blob; the cargo crawler with --global
-# probes $CARGO_HOME/registry/src/.
+# probes $CARGO_HOME/registry/src/. Note: in this fixture scan's own
+# apply pass matches 0 files (the all-zeros beforeHash doesn't match the
+# real cfg-if bytes), so scan exits non-zero (partial_failure) BY DESIGN
+# — the dedicated `apply --force` step below does the real patching.
+# Exit code is logged for diagnostics, not gated; the gate is the exact
+# content-hash check at the end.
 socket-patch scan --json --sync --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems cargo 2>/tmp/sync.err
+  --ecosystems cargo > /tmp/sync.out 2>/tmp/sync.err
+SCAN_RC=$?
 cat /tmp/sync.err >&2
+echo "scan exit=$SCAN_RC" >&2
 
-socket-patch apply --json --force --offline --global --ecosystems cargo 2>/tmp/apply.err
+# scan must have written the manifest the offline apply reads; if it
+# didn't, the apply below would be a no-op and the hash check would not
+# catch a missing-manifest regression cleanly.
+[ -f /workspace/proj/.socket/manifest.json ] || {{ echo "FAIL: scan did not write .socket/manifest.json" >&2; exit 1; }}
+
+socket-patch apply --json --force --offline --global --ecosystems cargo > /tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
 cat /tmp/apply.err >&2
+echo "apply exit=$APPLY_RC" >&2
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply --force --offline exited $APPLY_RC" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+fi
 
+# The apply JSON must report exactly one file applied — not skipped,
+# not failed. This catches a regression where apply reports success
+# while silently no-op'ing (the failure mode the marker grep alone
+# would miss if the file were patched by some other path).
+grep -q '"applied": 1' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report applied:1" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+
+# Strong verification: the patched file must be byte-for-byte identical
+# to the fixture blob. A substring grep would tolerate corrupt/partial/
+# concatenated output that merely happens to contain the marker, so we
+# compare the full git-blob hash against the independently-computed
+# expected value.
+HASH_AFTER=$(git_sha256 "$LIB_RS")
+echo "hash_after=$HASH_AFTER expected=$EXPECTED_HASH" >&2
+if [ "$HASH_AFTER" != "$EXPECTED_HASH" ]; then
+  echo "FAIL: patched $LIB_RS content hash mismatch" >&2
+  echo "  expected=$EXPECTED_HASH" >&2
+  echo "  actual  =$HASH_AFTER" >&2
+  head -5 "$LIB_RS" >&2
+  exit 1
+fi
+
+# Belt-and-suspenders: the marker must also be literally present (guards
+# against an accidentally-matching hash from an empty/zeroed file).
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$LIB_RS"; then
   echo "FAIL: marker not in $LIB_RS" >&2
   head -3 "$LIB_RS" >&2
@@ -164,7 +239,8 @@ fi
 echo "===PATCH VERIFIED===" >&2
 echo "===E2E PASS==="
 exit 0
-"#
+"#,
+        git_sha256_fn = GIT_SHA256_FN,
     )
 }
 
@@ -213,7 +289,7 @@ async fn cargo_fetch_full_apply_chain() {
         "socket-patch-test-cargo:latest",
         "bash",
         "-c",
-        &local_script(&api_url),
+        &local_script(&api_url, &after_hash),
     ]);
     let out = cmd.output().expect("docker run");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -224,4 +300,23 @@ async fn cargo_fetch_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+
+    // The script gates on an exact git-blob-hash match; confirm the
+    // expected hash actually appears in the log so a future edit that
+    // accidentally drops the hash comparison (reverting to a substring
+    // grep) is caught here too.
+    assert!(
+        stderr.contains(&format!("hash_after={after_hash}")),
+        "expected post-apply hash to equal independently-computed fixture hash {after_hash};\nstderr=\n{stderr}"
+    );
+
+    // The scan must have actually called the patch API — proves the test
+    // exercised the real network/scan path, not a short-circuit.
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        received
+            .iter()
+            .any(|r| r.url.path().contains("/patches/batch")),
+        "scan should have called /patches/batch; received={received:#?}"
+    );
 }

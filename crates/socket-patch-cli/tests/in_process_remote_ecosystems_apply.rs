@@ -168,13 +168,18 @@ async fn golang_handcrafted_install_apply_patches_file() {
 
     let args = default_scan_args(tmp.path(), "golang", server.uri());
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    // A single free patch that downloads + applies cleanly must exit 0.
+    // `download_and_apply_patches` only returns 1 when a patch fails to
+    // download or apply, so 1 here means the apply path silently broke.
+    assert_eq!(code, 0, "scan --sync should fully apply the golang patch (exit 0)");
 
+    // Golden check: the file must equal the EXACT patched bytes the mock
+    // served, not merely contain the marker substring (a corrupting apply
+    // could append the marker while mangling the rest).
     let after = std::fs::read(&gin_file).expect("read after");
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", gin_file.display()
+    assert_eq!(
+        after, patched,
+        "patched {} bytes do not match the served blob exactly", gin_file.display()
     );
 
     std::env::remove_var("GOMODCACHE");
@@ -230,13 +235,12 @@ async fn maven_handcrafted_install_apply_patches_file() {
 
     let args = default_scan_args(tmp.path(), "maven", server.uri());
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(code, 0, "scan --sync should fully apply the maven patch (exit 0)");
 
     let after = std::fs::read(&payload_file).expect("read after");
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", payload_file.display()
+    assert_eq!(
+        after, patched,
+        "patched {} bytes do not match the served blob exactly", payload_file.display()
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
@@ -341,18 +345,23 @@ async fn maven_multi_classifier_patches_every_present_jar() {
 
     let args = default_scan_args(tmp.path(), "maven", server.uri());
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(
+        code, 0,
+        "scan --sync should fully apply BOTH classifier patches (exit 0)"
+    );
 
-    // BOTH coexisting classifier jars must be patched.
+    // BOTH coexisting classifier jars must be patched — and to the EXACT
+    // served bytes, so a selector that patches one jar with the other's
+    // blob (or only the first) is caught.
     let after_a = std::fs::read(version_dir.join(jar_a)).expect("read jar a");
     let after_b = std::fs::read(version_dir.join(jar_b)).expect("read jar b");
-    assert!(
-        after_a.windows(b"# MARKER-A\n".len()).any(|w| w == b"# MARKER-A\n"),
-        "linux-x86_64 classifier jar was not patched"
+    assert_eq!(
+        after_a, patched_a,
+        "linux-x86_64 classifier jar bytes do not match its served blob"
     );
-    assert!(
-        after_b.windows(b"# MARKER-B\n".len()).any(|w| w == b"# MARKER-B\n"),
-        "osx-x86_64 classifier jar was not patched (plural selector must keep both)"
+    assert_eq!(
+        after_b, patched_b,
+        "osx-x86_64 classifier jar bytes do not match its served blob (plural selector must keep both)"
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
@@ -414,13 +423,12 @@ async fn composer_handcrafted_install_apply_patches_file() {
     let mut args = default_scan_args(tmp.path(), "composer", server.uri());
     args.common.global = false;
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(code, 0, "scan --sync should fully apply the composer patch (exit 0)");
 
     let after = std::fs::read(&payload).expect("read after");
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", payload.display()
+    assert_eq!(
+        after, patched,
+        "patched {} bytes do not match the served blob exactly", payload.display()
     );
 }
 
@@ -472,13 +480,12 @@ async fn nuget_handcrafted_install_apply_patches_file() {
 
     let args = default_scan_args(tmp.path(), "nuget", server.uri());
     let code = scan_run(args).await;
-    assert!(code == 0 || code == 1, "scan --sync exit: {code}");
+    assert_eq!(code, 0, "scan --sync should fully apply the nuget patch (exit 0)");
 
     let after = std::fs::read(&payload).expect("read after");
-    assert!(
-        after.windows(b"SOCKET-PATCH-E2E-MARKER".len())
-            .any(|w| w == b"SOCKET-PATCH-E2E-MARKER"),
-        "marker not found in {}", payload.display()
+    assert_eq!(
+        after, patched,
+        "patched {} bytes do not match the served blob exactly", payload.display()
     );
 
     std::env::remove_var("NUGET_PACKAGES");

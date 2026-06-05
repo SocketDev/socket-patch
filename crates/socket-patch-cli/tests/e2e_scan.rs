@@ -72,6 +72,19 @@ fn has_command(cmd: &str) -> bool {
         .is_ok()
 }
 
+/// These e2e tests are `#[ignore]`d and only execute when explicitly
+/// requested (`--ignored`) — at which point npm is a hard prerequisite, not
+/// an optional one. A silent `return` on missing npm would let the entire
+/// e2e suite report green without exercising a single assertion, which is
+/// exactly the failure mode this audit guards against. Fail loudly instead.
+fn require_npm() {
+    assert!(
+        has_command("npm"),
+        "npm not found on PATH; the e2e_scan suite requires npm. \
+         Install npm before running with --ignored."
+    );
+}
+
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
     let mut hasher = Sha256::new();
@@ -187,10 +200,7 @@ fn write_seed_manifest(cwd: &Path, purl: &str, uuid: &str) {
 #[test]
 #[ignore]
 fn test_scan_apply_json_adds_new_patch() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
 
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
@@ -208,13 +218,28 @@ fn test_scan_apply_json_adds_new_patch() {
     let v = parse_scan_json(&stdout);
 
     assert_eq!(v["status"], "success");
+    // Guard against the "scan did nothing but still said success" failure
+    // mode (e.g. crawler found 0 packages, or every API batch errored and
+    // the command still reported success): a real apply must have scanned
+    // minimist and found at least one free patch for it.
+    assert!(
+        v["scannedPackages"].as_u64().unwrap_or(0) >= 1,
+        "scan must have crawled at least one package; got {}",
+        v["scannedPackages"]
+    );
+    assert!(
+        v["freePatches"].as_u64().unwrap_or(0) >= 1,
+        "API must have returned at least one free patch; got {}",
+        v["freePatches"]
+    );
     let patches = v["apply"]["patches"].as_array().expect("apply.patches array");
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
         .expect("apply.patches should include minimist");
     assert_eq!(minimist["action"], "added");
-    assert!(minimist["uuid"].is_string(), "uuid must be present");
+    let reported_uuid = minimist["uuid"].as_str().expect("uuid must be present");
+    assert!(!reported_uuid.is_empty(), "uuid must be non-empty");
 
     assert_ne!(
         git_sha256_file(&index_js),
@@ -226,6 +251,13 @@ fn test_scan_apply_json_adds_new_patch() {
         manifest["patches"][NPM_PURL].is_object(),
         "manifest must record an entry for {NPM_PURL}"
     );
+    // The persisted manifest must record the *same* UUID the apply output
+    // reported — not some other patch, and not a stale/empty value.
+    assert_eq!(
+        manifest["patches"][NPM_PURL]["uuid"].as_str(),
+        Some(reported_uuid),
+        "manifest uuid must match the uuid reported in apply.patches",
+    );
 }
 
 /// Re-running `scan --json --apply --yes` after the patch is already in
@@ -233,16 +265,24 @@ fn test_scan_apply_json_adds_new_patch() {
 #[test]
 #[ignore]
 fn test_scan_apply_json_skips_existing() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
+    let index_js = cwd.join("node_modules/minimist/index.js");
     assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "first run");
+    // Capture the exact patched bytes after the first run. A correct
+    // "skipped" re-run must leave the file *byte-for-byte identical*; merely
+    // checking `!= BEFORE_HASH` would also pass if the second run re-applied
+    // the patch or corrupted the file into some other non-pristine state.
+    let hash_after_first = git_sha256_file(&index_js);
+    assert_ne!(
+        hash_after_first, BEFORE_HASH,
+        "first run should have patched the file",
+    );
+
     let (stdout, _) = assert_run_ok(
         cwd,
         &["scan", "--json", "--apply", "--yes"],
@@ -256,12 +296,12 @@ fn test_scan_apply_json_skips_existing() {
         .find(|p| p["purl"] == NPM_PURL)
         .expect("apply.patches should include minimist on re-run");
     assert_eq!(minimist["action"], "skipped");
-    // The first run already patched the file — second run shouldn't
-    // touch it, so the hash should still differ from BEFORE_HASH.
-    assert_ne!(
-        git_sha256_file(&cwd.join("node_modules/minimist/index.js")),
-        BEFORE_HASH,
-        "file should still be patched after a no-op re-run",
+    // The re-run is a no-op: the file must be exactly what the first run
+    // produced.
+    assert_eq!(
+        git_sha256_file(&index_js),
+        hash_after_first,
+        "a skipped re-run must leave the patched file byte-for-byte identical",
     );
 }
 
@@ -271,10 +311,7 @@ fn test_scan_apply_json_skips_existing() {
 #[test]
 #[ignore]
 fn test_scan_apply_json_updates_existing() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -317,10 +354,7 @@ fn test_scan_apply_json_updates_existing() {
 #[test]
 #[ignore]
 fn test_scan_json_read_only_emits_updates_array() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -354,17 +388,42 @@ fn test_scan_json_read_only_emits_updates_array() {
 #[test]
 #[ignore]
 fn test_scan_json_read_only_no_mutation() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
     let index_js = cwd.join("node_modules/minimist/index.js");
-    let (_, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no manifest)");
+    assert_eq!(
+        git_sha256_file(&index_js),
+        BEFORE_HASH,
+        "precondition: file must be unpatched before read-only scan",
+    );
+    let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no manifest)");
+    let v = parse_scan_json(&stdout);
+
+    // Positive proof the read-only scan actually *did the read* — without
+    // this, a scan that crawled 0 packages or whose API batches all failed
+    // would still trivially satisfy the "no mutation" assertions below and
+    // falsely pass. A real read-only scan of an installed minimist must
+    // report it as scanned with a free patch available.
+    assert_eq!(v["status"], "success");
+    assert!(
+        v["scannedPackages"].as_u64().unwrap_or(0) >= 1,
+        "read-only scan must crawl at least one package; got {}",
+        v["scannedPackages"]
+    );
+    assert!(
+        v["freePatches"].as_u64().unwrap_or(0) >= 1,
+        "read-only scan must surface at least one free patch; got {}",
+        v["freePatches"]
+    );
+    let packages = v["packages"].as_array().expect("packages array");
+    assert!(
+        packages.iter().any(|p| p["purl"] == NPM_PURL),
+        "read-only scan must list minimist among discovered packages; got {packages:?}"
+    );
 
     assert!(
         !cwd.join(".socket/manifest.json").exists(),
@@ -384,10 +443,7 @@ fn test_scan_json_read_only_no_mutation() {
 #[test]
 #[ignore]
 fn test_scan_apply_prune_prunes_uninstalled_package() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -430,10 +486,7 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
 #[test]
 #[ignore]
 fn test_scan_apply_default_keeps_uninstalled_entries() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -469,10 +522,7 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
 #[test]
 #[ignore]
 fn test_scan_apply_prune_cleans_orphan_blobs() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -510,10 +560,7 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
 #[test]
 #[ignore]
 fn test_scan_dry_run_sync_previews_apply_and_gc() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -552,6 +599,13 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
         "preview should count at least 1 orphan blob"
     );
     assert_eq!(v["apply"]["dryRun"], true);
+    // The apply preview must still emit the stable `patches[]` shape even
+    // when nothing is selectable, so a bot can parse it unconditionally.
+    assert!(
+        v["apply"]["patches"].is_array(),
+        "dry-run apply must emit a patches array; got {}",
+        v["apply"]
+    );
 
     // Verify non-mutation.
     assert!(orphan.exists(), "dry-run must not delete orphan blob");
@@ -568,10 +622,7 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
 #[test]
 #[ignore]
 fn test_scan_json_no_gc_field_without_prune() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);
@@ -601,10 +652,7 @@ fn test_scan_json_no_gc_field_without_prune() {
 #[test]
 #[ignore]
 fn test_scan_sync_yes_full_lifecycle() {
-    if !has_command("npm") {
-        eprintln!("SKIP: npm not found on PATH");
-        return;
-    }
+    require_npm();
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     write_package_json(cwd);

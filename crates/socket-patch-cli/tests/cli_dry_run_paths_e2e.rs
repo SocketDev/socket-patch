@@ -39,6 +39,15 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
         .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
     assert_eq!(v["command"], "apply");
     assert_eq!(v["dryRun"], true);
+    // A dry-run must never mutate anything: every "did work" counter is 0.
+    let summary = &v["summary"];
+    assert!(summary.is_object(), "expected summary object; got {v}");
+    assert_eq!(summary["applied"], 0, "dry-run applied a patch: {v}");
+    assert_eq!(summary["updated"], 0, "dry-run updated a patch: {v}");
+    assert_eq!(summary["removed"], 0, "dry-run removed a patch: {v}");
+    assert_eq!(summary["downloaded"], 0, "dry-run downloaded a blob: {v}");
+    // Empty manifest → nothing to do; events stay empty.
+    assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
 
 /// `repair --dry-run --offline --json`: dry-run with no patches
@@ -58,6 +67,14 @@ fn repair_dry_run_offline_emits_dry_run_envelope() {
         .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
     assert_eq!(v["command"], "repair");
     assert_eq!(v["dryRun"], true);
+    // No patches + offline + dry-run is a clean no-op success.
+    assert_eq!(v["status"], "success", "expected success status: {v}");
+    let summary = &v["summary"];
+    assert!(summary.is_object(), "expected summary object; got {v}");
+    assert_eq!(summary["applied"], 0, "dry-run applied a patch: {v}");
+    assert_eq!(summary["updated"], 0, "dry-run updated a patch: {v}");
+    assert_eq!(summary["removed"], 0, "dry-run removed a patch: {v}");
+    assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
 
 /// Rollback with no patches in manifest + --json must not crash.
@@ -73,10 +90,16 @@ fn rollback_with_empty_manifest_emits_envelope() {
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Should produce SOME envelope JSON without panicking.
-    let _: serde_json::Value = serde_json::from_str(stdout.trim())
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout:\n{stdout}\nstderr:\n{}",
             String::from_utf8_lossy(&out.stderr)));
+    // Empty-but-valid manifest: rollback is a clean success that touches nothing.
+    assert_eq!(out.status.code(), Some(0), "rollback should exit 0: {v}");
+    assert_eq!(v["status"], "success", "expected success status: {v}");
+    assert_eq!(v["rolledBack"], 0, "nothing should roll back: {v}");
+    assert_eq!(v["alreadyOriginal"], 0, "no files to inspect: {v}");
+    assert_eq!(v["failed"], 0, "no rollback should fail: {v}");
+    assert_eq!(v["results"], serde_json::json!([]), "unexpected results: {v}");
 }
 
 /// `remove --json` with no manifest at all: the early-exit
@@ -101,15 +124,17 @@ fn remove_with_no_socket_dir_emits_manifest_not_found() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "remove");
-    let code = v["error"]["code"].as_str().unwrap_or("");
-    assert!(
-        code == "manifest_not_found" || code == "not_found",
-        "expected manifest_not_found error; got {v}"
+    assert_eq!(v["status"], "error", "missing manifest must be an error: {v}");
+    assert_eq!(out.status.code(), Some(1), "error must exit nonzero: {v}");
+    // Must be the *specific* missing-manifest code, not a generic not_found.
+    assert_eq!(
+        v["error"]["code"], "manifest_not_found",
+        "expected manifest_not_found error code; got {v}"
     );
 }
 
-/// `list --json` against an empty manifest emits an empty
-/// `patches` array and status=success. Covers the list-empty path.
+/// `list --json` against an empty manifest emits status=success with
+/// an all-zero summary and no events. Covers the list-empty path.
 #[test]
 fn list_with_empty_manifest_emits_empty_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -125,6 +150,12 @@ fn list_with_empty_manifest_emits_empty_envelope() {
         .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
     assert_eq!(v["command"], "list");
     assert_eq!(v["status"], "success");
+    assert_eq!(out.status.code(), Some(0), "list should exit 0: {v}");
+    // Empty manifest: nothing discovered, no events emitted.
+    let summary = &v["summary"];
+    assert!(summary.is_object(), "expected summary object; got {v}");
+    assert_eq!(summary["discovered"], 0, "empty manifest discovered patches: {v}");
+    assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
 
 /// `--silent` flag suppresses the friendly "no manifest" message

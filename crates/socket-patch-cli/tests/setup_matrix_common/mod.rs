@@ -357,14 +357,43 @@ fn run_cases(label: &str, cases: Vec<Case>) {
     let mut failures = Vec::new();
     for case in &cases {
         let res = run_case(case);
-        if res.actual_applied != case.expect_applied {
+
+        // The bash driver MUST emit exactly one parseable result line carrying
+        // a real boolean `actual_applied`. If it does not (binary crashed,
+        // docker error, script aborted before `emit_result`, malformed JSON),
+        // the case never actually exercised setup+install. Without this guard
+        // `run_case` falls back to `actual_applied = false`, which silently
+        // satisfies EVERY `expect_applied == false` case — and makes the
+        // round-trip `?` no-op — turning a broken harness fully green for the
+        // wrong reason. Treat a missing/garbled result as a hard failure
+        // regardless of the aspirational expectation (allowlist included).
+        let applied = match res
+            .parsed
+            .as_ref()
+            .and_then(|v| v.get("actual_applied"))
+            .and_then(|v| v.as_bool())
+        {
+            Some(b) => b,
+            None => {
+                failures.push(format!(
+                    "  - {}: driver emitted no parseable result line with a boolean \
+                     `actual_applied` — the case did not run to completion (this is a \
+                     harness/binary failure, NOT a baseline gap)\n{}",
+                    case.id,
+                    indent(&res.raw)
+                ));
+                continue;
+            }
+        };
+
+        if applied != case.expect_applied {
             if case.known_regression {
                 // On the temporary allowlist (matrix.json `known_regressions`):
                 // a tracked, non-blocking regression — report it but don't fail.
                 eprintln!(
                     "  - {}: expected applied={}, got {} [KNOWN REGRESSION (allowlisted in \
                      matrix.json; non-blocking — fix the hook + remove from the list)]",
-                    case.id, case.expect_applied, res.actual_applied
+                    case.id, case.expect_applied, applied
                 );
             } else {
                 let tag = if case.baseline_applied() {
@@ -377,7 +406,7 @@ fn run_cases(label: &str, cases: Vec<Case>) {
                 };
                 failures.push(format!(
                     "  - {}: expected applied={}, got {} [{}]\n{}",
-                    case.id, case.expect_applied, res.actual_applied, tag, indent(&res.raw)
+                    case.id, case.expect_applied, applied, tag, indent(&res.raw)
                 ));
             }
         }
@@ -417,37 +446,91 @@ fn run_cases(label: &str, cases: Vec<Case>) {
 ///
 /// Returns a failure message describing any violation, or `None` on success.
 fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
-    let parsed = res.parsed.as_ref()?;
+    // The main loop already turns a missing result line into a hard failure
+    // and `continue`s before reaching here, so this branch is defensive: never
+    // silently treat an absent result as a passing round-trip.
+    let parsed = match res.parsed.as_ref() {
+        Some(p) => p,
+        None => {
+            return Some(format!(
+                "  - {}: setup/install behavioral round-trip could not be evaluated \
+                 — driver produced no parseable result JSON\n{}",
+                case.id,
+                indent(&res.raw)
+            ))
+        }
+    };
     let int = |k: &str| parsed.get(k).and_then(|v| v.as_i64());
     let boolean = |k: &str| parsed.get(k).and_then(|v| v.as_bool());
 
     let mut problems = Vec::new();
 
-    // (2) patch application bookends — only ever true while the hook is wired.
-    if boolean("applied_before_setup") == Some(true) {
-        problems.push("patch applied BEFORE setup (no hook should be configured yet)".to_string());
+    // This branch runs ONLY for npm-family cases that ran setup, i.e. exactly
+    // the driver's full (install)·(setup)·(install)·(remove)·(install) path,
+    // which records every field below as a real value (never null). So every
+    // probe must be PRESENT with the right value; a missing/null field means
+    // the stage never ran and must be flagged, not tolerated.
+
+    // (2) patch-application bookends must be present AND false: the patch must
+    // NOT apply before any hook exists, and must NOT apply once it is removed.
+    let applied_before = boolean("applied_before_setup");
+    if applied_before != Some(false) {
+        problems.push(format!(
+            "applied_before_setup={applied_before:?} (want false: patch must NOT apply \
+             before a hook is configured)"
+        ));
     }
-    if boolean("applied_after_remove") == Some(true) {
-        problems.push("patch still applied AFTER remove (hook should be gone)".to_string());
+    let applied_after_remove = boolean("applied_after_remove");
+    if applied_after_remove != Some(false) {
+        problems.push(format!(
+            "applied_after_remove={applied_after_remove:?} (want false: patch must NOT \
+             apply once the hook is removed)"
+        ));
     }
 
-    // (1) `setup --check` tracks the configured state: false → true → false.
+    // The native install of the patched package must itself have succeeded,
+    // and the canonical after-setup verification must have found a real
+    // on-disk copy to inspect (`primary_marker_present` is null only when NO
+    // candidate file was found — which would make every "not applied" verdict
+    // vacuous). Both guard against a green round-trip that inspected nothing.
+    let install = int("install_exit");
+    if install != Some(0) {
+        problems.push(format!(
+            "install_exit={install:?} (want 0: the native install must succeed for the \
+             before/after probes to mean anything)"
+        ));
+    }
+    if boolean("primary_marker_present").is_none() {
+        problems.push(
+            "primary_marker_present null/missing: no installed file was found to verify \
+             (vacuous round-trip)"
+                .to_string(),
+        );
+    }
+
+    // (1) `setup --check` exit code must track the configured state:
+    // non-zero before setup → 0 after setup → non-zero after remove. Each
+    // must be present; a null exit means the check step never ran.
     let check_before = int("check_before_setup_exit");
     let check_setup = int("check_after_setup_exit");
     let remove = int("remove_exit");
     let check_remove = int("check_after_remove_exit");
 
-    if check_before == Some(0) {
-        problems.push("check-before-setup exit=0 (want non-zero; not configured yet)".to_string());
+    if !matches!(check_before, Some(n) if n != 0) {
+        problems.push(format!(
+            "check-before-setup exit={check_before:?} (want present & non-zero; not configured yet)"
+        ));
     }
     if check_setup != Some(0) {
-        problems.push(format!("check-after-setup exit={check_setup:?} (want 0)"));
+        problems.push(format!("check-after-setup exit={check_setup:?} (want 0; configured)"));
     }
     if remove != Some(0) {
-        problems.push(format!("remove exit={remove:?} (want 0)"));
+        problems.push(format!("remove exit={remove:?} (want 0; remove must succeed)"));
     }
-    if check_remove == Some(0) {
-        problems.push("check-after-remove exit=0 (want non-zero; hook still present)".to_string());
+    if !matches!(check_remove, Some(n) if n != 0) {
+        problems.push(format!(
+            "check-after-remove exit={check_remove:?} (want present & non-zero; hook still present)"
+        ));
     }
 
     if problems.is_empty() {

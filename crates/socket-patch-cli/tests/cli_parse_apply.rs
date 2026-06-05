@@ -44,12 +44,40 @@ fn defaults_match_contract() {
     assert!(!a.common.json);
     assert!(!a.common.verbose);
     assert_eq!(a.common.download_mode, "diff");
+
+    // The remaining global defaults from the contract table. These were
+    // previously unpinned, which let a dangerous default-value drift slip
+    // through silently — e.g. `--break-lock` defaulting to `true` would make
+    // `apply` steal a live lock, or the API/proxy URLs silently retargeting.
+    assert_eq!(a.common.api_url, "https://api.socket.dev");
+    assert_eq!(a.common.api_token, None);
+    assert_eq!(a.common.org, None);
+    assert_eq!(a.common.proxy_url, "https://patches-api.socket.dev");
+    assert!(!a.common.yes);
+    assert!(!a.common.debug);
+    assert!(!a.common.no_telemetry);
+    assert!(!a.common.break_lock);
+    assert_eq!(a.common.lock_timeout, None);
+
+    // `apply --check` is read-only audit mode. It MUST default off, otherwise
+    // a plain `apply` would silently stop mutating anything. Pinning this is
+    // the whole point of a "defaults" snapshot — leaving it out is exactly the
+    // loophole that would let that default flip to `true` unnoticed.
+    assert!(!a.check);
+
     // Embedded VEX is opt-in: off / unset by default.
     assert_eq!(a.vex.vex, None);
     assert_eq!(a.vex.vex_product, None);
     assert!(!a.vex.vex_no_verify);
     assert_eq!(a.vex.vex_doc_id, None);
     assert!(!a.vex.vex_compact);
+}
+
+/// `--check` (cargo redirect audit mode) must parse and flip the flag true.
+/// It uses a `BoolishValueParser`, so the bare flag form is the canonical use.
+#[test]
+fn check_long() {
+    assert!(parse_apply(&["--check"]).check);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +186,36 @@ fn json_long() {
     assert!(parse_apply(&["--json"]).common.json);
 }
 
+#[test]
+fn json_short() {
+    assert!(parse_apply(&["-j"]).common.json);
+}
+
+#[test]
+fn yes_long() {
+    assert!(parse_apply(&["--yes"]).common.yes);
+}
+
+#[test]
+fn yes_short() {
+    assert!(parse_apply(&["-y"]).common.yes);
+}
+
+#[test]
+fn debug_long() {
+    assert!(parse_apply(&["--debug"]).common.debug);
+}
+
+#[test]
+fn no_telemetry_long() {
+    assert!(parse_apply(&["--no-telemetry"]).common.no_telemetry);
+}
+
+#[test]
+fn break_lock_long() {
+    assert!(parse_apply(&["--break-lock"]).common.break_lock);
+}
+
 // ---------------------------------------------------------------------------
 // Value flags — long form, then short form (where applicable).
 // ---------------------------------------------------------------------------
@@ -180,6 +238,53 @@ fn global_prefix_long() {
     assert_eq!(
         parse_apply(&["--global-prefix", "/foo"]).common.global_prefix,
         Some(PathBuf::from("/foo"))
+    );
+}
+
+#[test]
+fn api_url_long() {
+    assert_eq!(
+        parse_apply(&["--api-url", "https://api.example.test"]).common.api_url,
+        "https://api.example.test"
+    );
+}
+
+#[test]
+fn api_token_long() {
+    assert_eq!(
+        parse_apply(&["--api-token", "tok-123"]).common.api_token.as_deref(),
+        Some("tok-123")
+    );
+}
+
+#[test]
+fn proxy_url_long() {
+    assert_eq!(
+        parse_apply(&["--proxy-url", "https://proxy.example.test"]).common.proxy_url,
+        "https://proxy.example.test"
+    );
+}
+
+#[test]
+fn org_long() {
+    assert_eq!(parse_apply(&["--org", "acme"]).common.org.as_deref(), Some("acme"));
+}
+
+#[test]
+fn org_short() {
+    assert_eq!(parse_apply(&["-o", "acme"]).common.org.as_deref(), Some("acme"));
+}
+
+#[test]
+fn lock_timeout_long() {
+    assert_eq!(parse_apply(&["--lock-timeout", "30"]).common.lock_timeout, Some(30));
+}
+
+#[test]
+fn ecosystems_short() {
+    assert_eq!(
+        parse_apply(&["-e", "npm,cargo"]).common.ecosystems,
+        Some(vec!["npm".to_string(), "cargo".to_string()])
     );
 }
 

@@ -769,9 +769,15 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
     );
     write_blob(&socket_dir, &after, PATCHED_LIB_RS.as_bytes());
 
-    let (_code, stdout, _stderr) = run(
+    let (code, stdout, stderr) = run(
         &consumer,
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+    );
+
+    // Success path: a clean prefix-normalized rewrite must exit 0.
+    assert_eq!(
+        code, 0,
+        "apply (prefix-normalized, no fixup error) must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     // Patch landed despite the prefixed key.
@@ -783,6 +789,14 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
     // `.cargo-checksum.json` was rewritten with the normalized key
     // `src/lib.rs` — NOT `package/src/lib.rs`. Cargo would reject
     // the latter at next build.
+    //
+    // NOTE: the fixture's *initial* checksum already carries a
+    // `src/lib.rs` key (sha256 of ORIGINAL). So `is_string()` alone is
+    // vacuous — it stays true even if the rewriter never touched the
+    // value, used the wrong framing, or wrote a stale/garbage hash.
+    // The only honest oracle is the independently-computed raw SHA256
+    // of the PATCHED bytes (cargo's directory source verifies exactly
+    // this). Compare against that, not just "a string exists".
     let checksum: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
             consumer.join("vendor/safety-fixture/.cargo-checksum.json"),
@@ -790,15 +804,33 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
         .unwrap(),
     )
     .unwrap();
-    assert!(
-        checksum["files"]["src/lib.rs"].is_string(),
-        "rewriter must use the normalized cargo-relative key; got {checksum}"
+    let expected_patched_hash = sha256_hex(PATCHED_LIB_RS.as_bytes());
+    // Sanity: the expected value must DIFFER from the original hash,
+    // otherwise this assertion couldn't distinguish "rewritten" from
+    // "left stale".
+    assert_ne!(
+        expected_patched_hash,
+        sha256_hex(ORIGINAL_LIB_RS.as_bytes()),
+        "test bug: patched and original hashes collide"
+    );
+    assert_eq!(
+        checksum["files"]["src/lib.rs"].as_str(),
+        Some(expected_patched_hash.as_str()),
+        "rewriter must normalize `package/src/lib.rs` -> `src/lib.rs` AND write \
+         the raw SHA256 of the patched bytes; got {checksum}"
     );
     assert!(
         checksum["files"]
             .get("package/src/lib.rs")
             .is_none(),
         "rewriter must NOT create a `package/`-prefixed key"
+    );
+    // The unpatched Cargo.toml entry must survive untouched — proves
+    // the rewriter only rehashed the patched file, not the whole map.
+    assert_eq!(
+        checksum["files"]["Cargo.toml"].as_str(),
+        Some(sha256_hex(FIXTURE_TOML.as_bytes()).as_str()),
+        "unpatched Cargo.toml entry must keep its original hash; got {checksum}"
     );
 
     // The envelope still reports the rewritten sidecar file by its

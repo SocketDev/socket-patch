@@ -273,3 +273,139 @@ pub fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
         .collect()
 }
+
+// ── Self-tests for the shared oracle ──────────────────────────────────
+//
+// This module is the trust anchor for every safety suite: consuming
+// tests call `git_sha256` BOTH to populate `after_hash` in their
+// synthetic manifests AND to verify the bytes apply leaves on disk.
+// That makes `git_sha256` a single point of failure — if it ever
+// drifted from the canonical Git-blob hash (drop the `\0`, drop the
+// length header, uppercase the hex, …), both sides of every consumer's
+// round-trip would drift together and the suites would stay green while
+// guarding nothing.
+//
+// These self-tests pin the oracle so it can never be silently weakened:
+//   * golden constants derived independently (Python `hashlib`), NOT by
+//     re-running the helper against itself, and
+//   * an equality check against the *production* hash
+//     (`compute_git_sha256_from_bytes`) that apply actually verifies
+//     against — so the harness and production can never disagree
+//     unnoticed.
+//
+// Integration-test crates do NOT have `cfg(test)` set (only a crate's own
+// unit tests do), so this module must NOT be gated behind `#[cfg(test)]` —
+// doing so silently excludes it from every consuming binary and the
+// self-tests never run. Left ungated, its `#[test]` fns are collected once
+// in every test binary that pulls in `common`.
+mod oracle_selftests {
+    use super::*;
+    use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    // Independently computed: sha256(b"blob <len>\0" + content).
+    const GIT_BLOB_EMPTY: &str =
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
+    const GIT_BLOB_HELLO: &str =
+        "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
+    // Independently computed: bare sha256(content), no Git framing.
+    const SHA256_EMPTY: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_HELLO: &str =
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[test]
+    fn git_sha256_matches_independent_golden() {
+        assert_eq!(
+            git_sha256(b""),
+            GIT_BLOB_EMPTY,
+            "git_sha256 oracle drifted from the canonical Git-blob hash of empty content"
+        );
+        assert_eq!(
+            git_sha256(b"hello"),
+            GIT_BLOB_HELLO,
+            "git_sha256 oracle drifted from the canonical Git-blob hash of b\"hello\""
+        );
+    }
+
+    #[test]
+    fn git_sha256_agrees_with_production_hash() {
+        // The harness oracle MUST equal the hash apply actually verifies
+        // against; otherwise the circular round-trip in every consumer
+        // can agree with a broken implementation. Cover empty, ASCII,
+        // multi-byte (so the length header is exercised in bytes not
+        // chars), and raw binary.
+        for content in [
+            &b""[..],
+            b"hello",
+            b"socket-patch test\n",
+            "é multibyte".as_bytes(),
+            &[0u8, 1, 2, 255, 254, 0, 42],
+        ] {
+            assert_eq!(
+                git_sha256(content),
+                compute_git_sha256_from_bytes(content),
+                "harness git_sha256 disagrees with production compute_git_sha256_from_bytes \
+                 for {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_framing_is_actually_applied() {
+        // Guard against the framing being silently stripped: the Git
+        // blob hash must differ from a bare sha256, must be lowercase
+        // hex, and must depend on content length (the `<len>` header),
+        // not just the bytes.
+        assert_ne!(
+            git_sha256(b"hello"),
+            sha256_hex(b"hello"),
+            "git_sha256 must include the `blob <len>\\0` framing, not bare sha256"
+        );
+        assert_ne!(
+            git_sha256(b"ab"),
+            git_sha256(b"a\0b"),
+            "git_sha256 must hash content length, not a fixed separator"
+        );
+        let h = git_sha256(b"hello");
+        assert_eq!(h.len(), 64, "hash must be 32 bytes of hex");
+        assert!(
+            h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "hash must be lowercase hex, got {h}"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_independent_golden() {
+        assert_eq!(sha256_hex(b""), SHA256_EMPTY);
+        assert_eq!(sha256_hex(b"hello"), SHA256_HELLO);
+        // Must be the un-framed digest, distinct from the Git-blob form.
+        assert_ne!(sha256_hex(b"hello"), git_sha256(b"hello"));
+    }
+
+    #[test]
+    fn git_sha256_file_hashes_real_bytes() {
+        // `git_sha256_file` must hash exactly what is on disk — read it
+        // back and confirm it equals hashing the same bytes in memory,
+        // and that distinct contents produce distinct hashes (i.e. it
+        // isn't returning a constant or hashing the path).
+        let dir = std::env::temp_dir();
+        let unique = format!("socket-patch-oracle-{}", std::process::id());
+        let p1 = dir.join(format!("{unique}-a.bin"));
+        let p2 = dir.join(format!("{unique}-b.bin"));
+        let content_a = b"alpha-content\n";
+        let content_b = b"beta-content\n";
+        std::fs::write(&p1, content_a).expect("write temp a");
+        std::fs::write(&p2, content_b).expect("write temp b");
+
+        assert_eq!(git_sha256_file(&p1), git_sha256(content_a));
+        assert_eq!(git_sha256_file(&p2), git_sha256(content_b));
+        assert_ne!(
+            git_sha256_file(&p1),
+            git_sha256_file(&p2),
+            "git_sha256_file must reflect file contents"
+        );
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+}

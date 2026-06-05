@@ -86,10 +86,22 @@ fn yarn_pnp_refuses_with_error_code() {
     // The error message must mention `yarn patch` so the user knows
     // the workaround. Contract: this is part of the public CLI
     // output — don't loosen the assertion without intent.
-    let error_msg = envelope_error_message(&env).unwrap_or("");
+    //
+    // Require the message field to actually be PRESENT (not just
+    // default to "" via `unwrap_or`, which would let a missing
+    // message slip through) AND to name both the workaround
+    // (`yarn patch`) and the specific layout (`Plug'n'Play`). The
+    // pair pins this as the yarn-pnp refusal, not some unrelated
+    // error that happens to contain the substring "yarn patch".
+    let error_msg = envelope_error_message(&env)
+        .unwrap_or_else(|| panic!("error.message missing from envelope: {env}"));
     assert!(
         error_msg.contains("yarn patch"),
         "error message should point at `yarn patch`, got: {error_msg}"
+    );
+    assert!(
+        error_msg.contains("Plug'n'Play"),
+        "error message should name the yarn-berry Plug'n'Play layout, got: {error_msg}"
     );
 }
 
@@ -102,8 +114,26 @@ fn yarn_pnp_refuses_in_human_mode() {
     make_yarn_berry_project(dir.path());
     write_synthetic_manifest(&dir.path().join(".socket"));
 
-    let (code, _stdout, stderr) = run(dir.path(), &["apply"]);
-    assert_eq!(code, 1);
+    let (code, stdout, stderr) = run(dir.path(), &["apply"]);
+    assert_eq!(
+        code, 1,
+        "expected exit 1.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Human mode must not leak a JSON envelope onto stdout — the
+    // refusal is a human-readable message on stderr. (Guards against
+    // a regression that always prints JSON regardless of `--json`.)
+    assert!(
+        !stdout.contains("\"status\"") && !stdout.contains("yarn_pnp_unsupported"),
+        "human mode must not emit a JSON envelope on stdout, got:\n{stdout}"
+    );
+    // The stderr message must be the yarn-pnp refusal specifically:
+    // name both the layout (`Plug'n'Play`) and the workaround
+    // (`yarn patch`). A bare `contains("yarn patch")` would accept an
+    // unrelated exit-1 failure that merely mentioned the command.
+    assert!(
+        stderr.contains("Plug'n'Play"),
+        "stderr should name the yarn-berry Plug'n'Play layout, got:\n{stderr}"
+    );
     assert!(
         stderr.contains("yarn patch"),
         "stderr should point at `yarn patch`, got:\n{stderr}"
@@ -128,16 +158,45 @@ fn npm_layout_does_not_trigger_yarn_pnp_refusal() {
     std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
     write_synthetic_manifest(&dir.path().join(".socket"));
 
-    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json"]);
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
 
-    // The output may or may not parse as a single JSON object
-    // depending on what apply printed (the synthetic manifest
-    // points at packages that don't exist on disk; apply may
-    // succeed-with-skipped or fail). All we assert here: the
-    // yarn-pnp error code MUST NOT appear in the output.
+    // `apply --json` ALWAYS emits exactly one JSON envelope on
+    // stdout — parse it. The previous "may or may not parse" wording
+    // was an escape hatch: it let an empty/garbled stdout pass
+    // vacuously, so a regression that crashed apply before detection
+    // (or printed nothing) would still be "green". Requiring a valid
+    // envelope proves apply actually ran the npm path.
+    let env = parse_json_envelope(&stdout);
+
+    // The decisive negative assertion: the yarn-pnp refusal must NOT
+    // fire for a plain npm layout. Check the structured field, not
+    // just a substring — this is what catches an always-on detector
+    // (which would make every positive test pass while silently
+    // breaking npm).
+    assert_ne!(
+        envelope_error_code(&env),
+        Some("yarn_pnp_unsupported"),
+        "npm layout must not trigger yarn-pnp refusal.\nenvelope: {env}"
+    );
+    // Belt-and-braces: the marker string must be absent from both
+    // streams entirely.
     assert!(
-        !stdout.contains("yarn_pnp_unsupported"),
-        "npm layout should not trigger yarn-pnp refusal.\nstdout:\n{stdout}"
+        !stdout.contains("yarn_pnp_unsupported") && !stderr.contains("yarn_pnp_unsupported"),
+        "npm layout should not mention yarn-pnp anywhere.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The synthetic manifest points at a package not on disk, so
+    // apply reaches the real apply path and discovers nothing — it
+    // does NOT bail on yarn-pnp detection. Pin that observed
+    // behavior so a future change that turns this into a yarn-pnp
+    // refusal (status=error) is caught.
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("partialFailure"),
+        "npm layout with no matching packages should report partialFailure.\nenvelope: {env}"
+    );
+    assert_eq!(
+        code, 1,
+        "expected exit 1 for the no-match npm case.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 
@@ -161,12 +220,30 @@ fn yarn_pnp_loader_mjs_also_refuses() {
     .unwrap();
     write_synthetic_manifest(&dir.path().join(".socket"));
 
-    let (code, stdout, _stderr) = run(dir.path(), &["apply", "--json"]);
-    assert_eq!(code, 1);
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
+    assert_eq!(
+        code, 1,
+        "expected exit 1.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_json_envelope(&stdout);
     assert_eq!(
         envelope_error_code(&env),
-        Some("yarn_pnp_unsupported")
+        Some("yarn_pnp_unsupported"),
+        "`.pnp.loader.mjs` should trigger the same refusal as `.pnp.cjs`.\nenvelope: {env}"
+    );
+    // Full parity with the `.cjs` headline test: status + message
+    // must match, so the ESM variant can't pass on the code alone
+    // while emitting a degraded envelope.
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("error"),
+        "expected status=error.\nenvelope: {env}"
+    );
+    let error_msg = envelope_error_message(&env)
+        .unwrap_or_else(|| panic!("error.message missing from envelope: {env}"));
+    assert!(
+        error_msg.contains("yarn patch") && error_msg.contains("Plug'n'Play"),
+        "error message should name `yarn patch` and the Plug'n'Play layout, got: {error_msg}"
     );
 }
 
@@ -191,8 +268,33 @@ fn synthetic_manifest_is_discovered_by_cli() {
     // detect package managers — it just reads the manifest. If
     // our synthetic manifest is well-formed, list prints it.
     let (stdout, _stderr) = assert_run_ok(dir.path(), &["list", "--json"], "list --json");
+    // Parse rather than substring-match: a bare `contains(purl)`
+    // would pass even if list emitted an *error* envelope that merely
+    // echoed the purl. We need to prove the manifest was genuinely
+    // discovered and read.
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("success"),
+        "list should succeed on a well-formed manifest.\nenvelope: {env}"
+    );
+    assert_eq!(
+        env.get("summary").and_then(|s| s.get("discovered")),
+        Some(&serde_json::json!(1)),
+        "list should discover exactly the one synthetic entry.\nenvelope: {env}"
+    );
+    // And the discovered entry must be ours — pin the purl + uuid in
+    // the structured event, not just anywhere in the text.
+    let events = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .unwrap_or_else(|| panic!("envelope missing events array: {env}"));
+    let found = events.iter().any(|ev| {
+        json_string(ev, "purl") == Some("pkg:npm/dummy@1.0.0")
+            && json_string(ev, "uuid") == Some("11111111-1111-4111-8111-111111111111")
+    });
     assert!(
-        stdout.contains("pkg:npm/dummy@1.0.0"),
-        "list should surface our synthetic manifest entry, got:\n{stdout}"
+        found,
+        "list should surface our synthetic manifest entry (purl + uuid).\nenvelope: {env}"
     );
 }

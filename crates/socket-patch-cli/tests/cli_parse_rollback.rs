@@ -40,6 +40,14 @@ fn defaults_no_positional() {
     assert_eq!(args.common.ecosystems, None);
     assert!(!args.common.json);
     assert!(!args.common.verbose);
+    // Remaining global defaults the contract pins but the original test omitted.
+    assert_eq!(args.common.proxy_url, "https://patches-api.socket.dev");
+    assert_eq!(args.common.download_mode, "diff");
+    assert!(!args.common.yes);
+    assert_eq!(args.common.lock_timeout, None);
+    assert!(!args.common.break_lock);
+    assert!(!args.common.debug);
+    assert!(!args.common.no_telemetry);
 }
 
 #[test]
@@ -168,6 +176,86 @@ fn positional_plus_flags() {
     assert_eq!(args.identifier, Some("pkg:npm/foo@1".to_string()));
     assert!(args.common.dry_run);
     assert!(args.common.json);
+}
+
+#[test]
+fn org_short() {
+    let args = parse_rollback(&["-o", "myorg"]);
+    assert_eq!(args.common.org, Some("myorg".to_string()));
+}
+
+#[test]
+fn ecosystems_short() {
+    let args = parse_rollback(&["-e", "npm,pypi"]);
+    assert_eq!(
+        args.common.ecosystems,
+        Some(vec!["npm".to_string(), "pypi".to_string()])
+    );
+}
+
+#[test]
+fn json_short() {
+    let args = parse_rollback(&["-j"]);
+    assert!(args.common.json);
+}
+
+#[test]
+fn yes_short() {
+    let args = parse_rollback(&["-y"]);
+    assert!(args.common.yes);
+}
+
+#[test]
+fn yes_long() {
+    let args = parse_rollback(&["--yes"]);
+    assert!(args.common.yes);
+}
+
+#[test]
+fn proxy_url_long() {
+    let args = parse_rollback(&["--proxy-url", "https://proxy.example"]);
+    assert_eq!(args.common.proxy_url, "https://proxy.example");
+}
+
+#[test]
+fn download_mode_long() {
+    let args = parse_rollback(&["--download-mode", "package"]);
+    assert_eq!(args.common.download_mode, "package");
+}
+
+#[test]
+fn lock_timeout_long() {
+    let args = parse_rollback(&["--lock-timeout", "30"]);
+    assert_eq!(args.common.lock_timeout, Some(30));
+}
+
+#[test]
+fn break_lock_long() {
+    let args = parse_rollback(&["--break-lock"]);
+    assert!(args.common.break_lock);
+}
+
+#[test]
+fn debug_long() {
+    let args = parse_rollback(&["--debug"]);
+    assert!(args.common.debug);
+}
+
+#[test]
+fn no_telemetry_long() {
+    let args = parse_rollback(&["--no-telemetry"]);
+    assert!(args.common.no_telemetry);
+}
+
+/// A second positional is rejected — `identifier` takes exactly one value, so
+/// a stray extra arg must not be silently swallowed.
+#[test]
+fn second_positional_fails() {
+    let err = match Cli::try_parse_from(["socket-patch", "rollback", "a", "b"]) {
+        Ok(_) => panic!("expected parse failure for extra positional"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]

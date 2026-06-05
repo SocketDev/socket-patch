@@ -26,8 +26,37 @@ fn run(args: &[&str], cwd: &std::path::Path, nuget_packages: &std::path::Path) -
         .args(args)
         .current_dir(cwd)
         .env("NUGET_PACKAGES", nuget_packages)
+        // The NuGet crawler is gated behind a runtime opt-in
+        // (`nuget_runtime_enabled()` → `SOCKET_EXPERIMENTAL_NUGET`). Without
+        // this, `scan` skips NuGet entirely and reports "No packages found.",
+        // which would silently defeat any discovery assertion. Enabling it here
+        // is what makes these tests actually exercise the NuGet code path.
+        .env("SOCKET_EXPERIMENTAL_NUGET", "1")
+        // Keep discovery deterministic: never reach a real ~/.nuget cache or a
+        // populated public-proxy token from the developer's environment.
+        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("Failed to run socket-patch binary")
+}
+
+/// Extract the integer N from a `Found N packages` line in scan's stderr.
+/// Panics if the line is absent — a missing "Found" line means scan reported
+/// "No packages found." (zero discovery), which is exactly the regression
+/// these tests must catch.
+fn parse_found_count(combined: &str) -> usize {
+    let line = combined
+        .lines()
+        .find(|l| l.contains("Found") && l.contains("packages"))
+        .unwrap_or_else(|| {
+            panic!("scan did not print a `Found N packages` line; output was:\n{combined}")
+        });
+    // Last "Found" segment, in case a progress carriage-return prefixes it.
+    let after = line.rsplit("Found").next().unwrap();
+    after
+        .split_whitespace()
+        .next()
+        .and_then(|tok| tok.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("could not parse package count from line: {line:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -73,8 +102,30 @@ fn scan_discovers_global_cache_packages() {
     let combined = format!("{stdout}{stderr}");
 
     assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover NuGet packages, got:\n{combined}"
+        output.status.success(),
+        "scan should exit 0 on a clean discovery, got {:?}:\n{combined}",
+        output.status.code()
+    );
+    // The crawler must NOT fall through to the empty-result message — that is
+    // the bug the old substring check ("packages" ⊂ "No packages found.")
+    // masked.
+    assert!(
+        !combined.contains("No packages found") && !combined.contains("No global packages found"),
+        "scan failed to discover the fake global cache:\n{combined}"
+    );
+    // Exactly the two packages we planted (Newtonsoft.Json, System.Text.Json)
+    // and nothing else — the temp project has no node_modules/site-packages,
+    // so every counted package must come from the fake NuGet cache.
+    assert_eq!(
+        parse_found_count(&combined),
+        2,
+        "expected exactly 2 discovered packages:\n{combined}"
+    );
+    // Prove they were attributed to the NuGet ecosystem, not discovered by some
+    // other crawler picking up stray files.
+    assert!(
+        combined.to_lowercase().contains("nuget"),
+        "expected discovered packages to be reported as NuGet:\n{combined}"
     );
 }
 
@@ -110,7 +161,22 @@ fn scan_discovers_legacy_packages() {
     let combined = format!("{stdout}{stderr}");
 
     assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover legacy NuGet packages, got:\n{combined}"
+        output.status.success(),
+        "scan should exit 0 on a clean discovery, got {:?}:\n{combined}",
+        output.status.code()
+    );
+    assert!(
+        !combined.contains("No packages found") && !combined.contains("No global packages found"),
+        "scan failed to discover the legacy packages/ layout:\n{combined}"
+    );
+    // Exactly the single legacy package we planted (Newtonsoft.Json.13.0.3).
+    assert_eq!(
+        parse_found_count(&combined),
+        1,
+        "expected exactly 1 discovered package:\n{combined}"
+    );
+    assert!(
+        combined.to_lowercase().contains("nuget"),
+        "expected discovered package to be reported as NuGet:\n{combined}"
     );
 }

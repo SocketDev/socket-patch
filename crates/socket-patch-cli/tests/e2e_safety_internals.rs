@@ -203,13 +203,16 @@ async fn cow_lstat_permission_denied_propagates_io_error() {
     let _ = std::fs::set_permissions(&locked, restore);
 
     let err = result.expect_err("expected I/O error from locked-dir lstat");
-    // Different OSes pick slightly different errno: Linux returns
-    // PermissionDenied, macOS may too. The contract is "not
-    // NotFound" — if it were, cow would have returned NoFile.
-    assert_ne!(
+    // EACCES from search-permission denial maps to PermissionDenied on
+    // every Unix (and decisively NOT NotFound — if it were, cow would
+    // have returned NoFile and the .expect_err above would have fired).
+    // Asserting the exact kind closes the loophole where a mis-mapped
+    // errno (Other/InvalidInput/wrapped) would slip past a bare
+    // `!= NotFound` check.
+    assert_eq!(
         err.kind(),
-        std::io::ErrorKind::NotFound,
-        "expected permission-denied class error; got {err:?}"
+        std::io::ErrorKind::PermissionDenied,
+        "lstat on a search-denied parent must surface as PermissionDenied; got {err:?}"
     );
 }
 
@@ -229,6 +232,14 @@ async fn cow_symlink_to_missing_target_propagates_read_error() {
         .await
         .expect_err("read through dangling symlink must propagate the error");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    // The dangling link itself must still exist — read-fail-fast must
+    // never enter the remove/rewrite dance that could destroy it.
+    let meta = std::fs::symlink_metadata(&link)
+        .expect("dangling symlink must survive a read-fail-fast");
+    assert!(
+        meta.file_type().is_symlink(),
+        "read-through failure must leave the symlink untouched, got {meta:?}"
+    );
 }
 
 /// Symlink branch rename-fails arm: when the symlink itself carries
@@ -281,7 +292,11 @@ async fn cow_symlink_unremovable_propagates_remove_error() {
     let _ = Command::new("chflags").arg("-h").arg("nouchg").arg(&link).status();
 
     let err = result.expect_err("rename over immutable symlink must propagate EPERM");
-    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "rename over an immutable (uchg) symlink must surface EPERM as PermissionDenied; got {err:?}"
+    );
 
     // Regression (atomicity): the failed break must NOT have destroyed
     // the original. The path still exists and is still the symlink.
@@ -290,6 +305,13 @@ async fn cow_symlink_unremovable_propagates_remove_error() {
     assert!(
         meta.file_type().is_symlink(),
         "original symlink must survive a failed break, got {meta:?}"
+    );
+    // And it must still resolve to the untouched target content — the
+    // break neither rewrote nor truncated the link's destination.
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        b"content",
+        "symlink must still resolve to its original target content"
     );
     // And no stage litter left behind.
     let leftover: Vec<_> = std::fs::read_dir(tmp.path())
@@ -342,7 +364,28 @@ async fn cow_hardlink_unreadable_propagates_read_error() {
     let _ = std::fs::set_permissions(&a, restore);
 
     let err = result.expect_err("read of unreadable hardlinked file must propagate");
-    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "read of a chmod-0000 hardlinked file must surface EACCES as PermissionDenied; got {err:?}"
+    );
+    // Atomicity: the failed read must not have replaced or destroyed
+    // either link — both still share the original inode (nlink == 2).
+    {
+        use std::os::unix::fs::MetadataExt;
+        let restored_meta = std::fs::metadata(&a).unwrap();
+        assert_eq!(
+            restored_meta.nlink(),
+            2,
+            "a failed CoW read must leave both hardlinks intact, got nlink {}",
+            restored_meta.nlink()
+        );
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            b"data",
+            "original content must be untouched after a failed CoW read"
+        );
+    }
 }
 
 /// `write_via_stage_rename` stage-write failure (cow.rs:111): the
@@ -395,7 +438,30 @@ async fn cow_stage_write_failure_propagates() {
     let _ = std::fs::set_permissions(&dir, restore);
 
     let err = result.expect_err("stage write into read-only parent must fail");
-    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "stage create in a no-write (0o500) parent must surface EACCES as PermissionDenied; got {err:?}"
+    );
+    // Atomicity: the failed stage write must not have disturbed the
+    // original — both hardlinks survive with their original content and
+    // no `.socket-cow-*` litter is left behind.
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&a).unwrap().nlink(),
+            2,
+            "failed stage write must leave both hardlinks intact"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), b"content");
+        assert_eq!(std::fs::read(&b).unwrap(), b"content");
+    }
+    let leftover: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
+        .collect();
+    assert!(leftover.is_empty(), "stage litter left behind: {leftover:?}");
 }
 
 /// Symlink-branch `write_via_stage_rename` stage-create failure arm:
@@ -462,7 +528,11 @@ async fn cow_symlink_stage_write_failure_propagates() {
         "with deny-add_file ACL, write_via_stage_rename's stage create must fail, \
          surfacing the stage-write `?` Err arm",
     );
-    assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "deny-add_file ACL must surface the stage create as PermissionDenied; got {err:?}"
+    );
 
     // Regression (atomicity / rollback): the old code unlinked the
     // symlink before this denied stage write, leaving the package file
@@ -556,10 +626,39 @@ async fn cow_rename_failure_runs_stage_cleanup() {
     // contract: when stage commit fails, the caller learns of the
     // failure rather than silently succeeding on a half-state.
     let err = cow_result.expect_err("immutable target must cause rename failure");
-    assert_ne!(
+    assert_eq!(
         err.kind(),
-        std::io::ErrorKind::NotFound,
-        "expected EPERM-class error, got {err:?}"
+        std::io::ErrorKind::PermissionDenied,
+        "rename over a uchg-immutable target must surface EPERM as PermissionDenied, got {err:?}"
+    );
+
+    // Atomicity / rollback (the contract this test exists to police):
+    // a failed stage->target rename must leave the ORIGINAL target
+    // completely intact — same inode (no replacement committed), same
+    // nlink (sibling hardlink still attached), same bytes. The old
+    // litter-only assertion below would stay green even if a regression
+    // truncated or replaced the original, so assert the survival
+    // explicitly here first.
+    let surv = std::fs::symlink_metadata(&target)
+        .expect("failed rename must leave the original target in place");
+    assert!(
+        surv.file_type().is_file(),
+        "original target must remain a regular file, got {surv:?}"
+    );
+    assert_eq!(
+        surv.nlink(),
+        2,
+        "no new inode may be committed on rename failure — both links must survive"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"original",
+        "failed CoW rename must leave the original target content byte-for-byte intact"
+    );
+    assert_eq!(
+        std::fs::read(&link).unwrap(),
+        b"original",
+        "the sibling hardlink must also be untouched after a failed CoW"
     );
 
     // The cleanup arm (cow.rs:117-119) ran: no `.socket-cow-…`

@@ -135,6 +135,25 @@ fn run_apply(cwd: &Path, extra: &[&str]) -> (i32, String) {
     )
 }
 
+/// Every counter in the envelope's `summary` block must be exactly 0.
+/// We enumerate the keys explicitly (rather than "applied == 0") so a
+/// regression that started reporting work on these no-op paths — e.g. a
+/// phantom `downloaded`, `verified`, or `skipped` — trips the test
+/// instead of slipping through an unchecked field.
+fn assert_summary_all_zero(summary: &serde_json::Value) {
+    let obj = summary
+        .as_object()
+        .unwrap_or_else(|| panic!("summary must be a JSON object, got {summary}"));
+    assert!(!obj.is_empty(), "summary object must not be empty");
+    for (key, val) in obj {
+        assert_eq!(
+            val.as_u64(),
+            Some(0),
+            "summary.{key} must be 0 on this no-op path, got {val}"
+        );
+    }
+}
+
 #[test]
 fn offline_with_missing_source_emits_partial_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -152,9 +171,26 @@ fn offline_with_missing_source_emits_partial_failure() {
         v["status"], "partialFailure",
         "expected status=partialFailure, got {v}"
     );
-    // No patches applied; the failed count comes from the summary block.
-    assert_eq!(v["summary"]["applied"], 0);
-    assert_eq!(v["summary"]["failed"], 0);
+    // `partialFailure` is distinct from a hard `error` envelope: the
+    // command ran to completion and decided nothing was applicable. A
+    // top-level `error` payload here would mean a different failure mode
+    // slipped through wearing the partialFailure label.
+    assert!(
+        v.get("error").is_none(),
+        "partialFailure must not carry a top-level error payload; got {v}"
+    );
+    // Nothing was applied, downloaded, skipped, or otherwise touched —
+    // the offline guard bails before any work. Every summary counter
+    // must be 0 (not just `applied`/`failed`), and no per-patch events
+    // should be emitted on this short-circuit path.
+    assert_summary_all_zero(&v["summary"]);
+    let events = v["events"]
+        .as_array()
+        .expect("envelope must carry an events array");
+    assert!(
+        events.is_empty(),
+        "offline bail emits no per-patch events; got {events:?}"
+    );
 }
 
 #[test]
@@ -164,14 +200,39 @@ fn apply_does_not_mutate_socket_dir_offline() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_project(tmp.path());
 
-    let before = dir_hash(&tmp.path().join(".socket"));
-    let (code, _stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
-    let after = dir_hash(&tmp.path().join(".socket"));
+    let socket = tmp.path().join(".socket");
+    let before = dir_hash(&socket);
+    let (code, stdout) = run_apply(tmp.path(), &["--offline", "--silent"]);
+    let after = dir_hash(&socket);
 
-    assert_eq!(code, 1, "offline+missing should exit 1");
+    // The run must have actually taken the failure path we care about —
+    // otherwise an apply that errored out *before* reaching any write
+    // would also leave `.socket/` pristine and the hash check would pass
+    // vacuously. Pin the exit code AND the envelope status so the
+    // no-mutation guarantee is anchored to the documented offline bail.
+    assert_eq!(code, 1, "offline+missing should exit 1; stdout=\n{stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    assert_eq!(
+        v["status"], "partialFailure",
+        "expected the offline partialFailure path, got {v}"
+    );
     assert_eq!(
         before, after,
         "apply --offline must not mutate .socket/; hash changed"
+    );
+    // Belt-and-suspenders against a dir_hash blind spot: read the two
+    // payload files back and confirm they are byte-identical to what
+    // `write_project` laid down.
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join("sentinel")).expect("sentinel survives"),
+        b"do not modify me",
+        "apply must not rewrite the blobs sentinel"
+    );
+    assert_eq!(
+        std::fs::read_to_string(socket.join("manifest.json")).expect("manifest survives"),
+        MANIFEST_JSON,
+        "apply must not rewrite manifest.json"
     );
 }
 
@@ -183,13 +244,39 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_project(tmp.path());
 
-    let before = dir_hash(&tmp.path().join(".socket"));
-    let _ = run_apply(tmp.path(), &["--silent"]);
-    let after = dir_hash(&tmp.path().join(".socket"));
+    let socket = tmp.path().join(".socket");
+    let before = dir_hash(&socket);
+    let (code, stdout) = run_apply(tmp.path(), &["--silent"]);
+    let after = dir_hash(&socket);
 
+    // Previously this test discarded the result entirely (`let _ = ...`),
+    // so a build that crashed, hung, exited 0, or wrote garbage to stdout
+    // would still "pass" as long as it happened not to touch `.socket/`.
+    // Pin the contract: the no-usable-source run reports partialFailure
+    // and exits non-zero, AND leaves `.socket/` untouched.
+    assert_eq!(
+        code, 1,
+        "no-match / unfetchable run must exit 1; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    assert_eq!(v["command"], "apply");
+    assert_eq!(
+        v["status"], "partialFailure",
+        "expected partialFailure on the no-match path, got {v}"
+    );
+    assert!(
+        v.get("error").is_none(),
+        "no-match path is a partialFailure, not a hard error; got {v}"
+    );
     assert_eq!(
         before, after,
         "apply must not mutate .socket/ on the no-match path; hash changed"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join("sentinel")).expect("sentinel survives"),
+        b"do not modify me",
+        "apply must not rewrite the blobs sentinel on the no-match path"
     );
 }
 
@@ -207,6 +294,21 @@ fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
         serde_json::from_str(&stdout).expect("envelope must be valid JSON");
     assert_eq!(v["command"], "apply");
     assert_eq!(v["status"], "noManifest");
+    // noManifest is a clean no-op, not a partial failure dressed up: no
+    // error payload, no events, and every summary counter at 0.
+    assert!(
+        v.get("error").is_none(),
+        "noManifest must not carry an error payload; got {v}"
+    );
+    assert!(
+        v["events"]
+            .as_array()
+            .expect("envelope must carry an events array")
+            .is_empty(),
+        "noManifest emits no events; got {}",
+        v["events"]
+    );
+    assert_summary_all_zero(&v["summary"]);
 }
 
 /// Non-JSON / silent flag: same no-manifest case but in human
@@ -224,4 +326,23 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.trim().is_empty(), "silent must produce no stdout; got {stdout:?}");
+
+    // Control run: the same no-manifest scenario WITHOUT `--silent` must
+    // print the friendly skip message to stdout. Without this control the
+    // test above would pass vacuously even if `--silent` did nothing and
+    // the message simply never existed — i.e. it would not actually prove
+    // the silent-mode short-circuit suppresses anything.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let loud = Command::new(binary())
+        .args(["apply"])
+        .current_dir(tmp2.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(loud.status.code(), Some(0));
+    let loud_stdout = String::from_utf8_lossy(&loud.stdout);
+    assert!(
+        loud_stdout.contains("No .socket folder found"),
+        "non-silent no-manifest run must print the skip message; got {loud_stdout:?}"
+    );
 }

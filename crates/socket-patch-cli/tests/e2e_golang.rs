@@ -26,8 +26,36 @@ fn run(args: &[&str], cwd: &std::path::Path, gomodcache: &std::path::Path) -> Ou
         .args(args)
         .current_dir(cwd)
         .env("GOMODCACHE", gomodcache)
+        // Pin the cache lookup to GOMODCACHE only: a stray GOPATH/HOME in the
+        // test environment must not let the crawler wander into a real module
+        // cache and inflate the discovered count.
+        .env_remove("GOPATH")
         .output()
         .expect("Failed to run socket-patch binary")
+}
+
+/// Run `socket-patch scan --json ...`, assert the process succeeded, and
+/// return the parsed JSON envelope from stdout.
+///
+/// Parsing (rather than substring matching) means a malformed or missing
+/// envelope fails the test loudly instead of slipping past a `.contains()`
+/// check. Doing this offline is safe: the package *count* is derived from the
+/// local crawl and is emitted regardless of whether the API query succeeds.
+fn scan_json(cwd: &std::path::Path, gomodcache: &std::path::Path) -> serde_json::Value {
+    let output = run(
+        &["scan", "--json", "--cwd", cwd.to_str().unwrap()],
+        cwd,
+        gomodcache,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "scan --json should exit 0, got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json must emit valid JSON ({e}), got:\n{stdout}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +96,25 @@ fn scan_discovers_go_modules() {
     )
     .unwrap();
 
+    // --- JSON path: assert the EXACT discovered count, not just "non-zero".
+    // The old test accepted `contains("Found") || contains("packages")`, which
+    // is satisfied even by the empty-scan envelope (`"scannedPackages": 0`) or
+    // the "No packages found" message — so a crawler that discovered nothing
+    // still passed. Pin the count to exactly the two modules planted above.
+    let json = scan_json(dir.path(), &cache_dir);
+    assert_eq!(
+        json["status"], "success",
+        "scan envelope must report success; got:\n{json:#}"
+    );
+    assert_eq!(
+        json["scannedPackages"], 2,
+        "scan must discover exactly the two Go modules (gin + text); got:\n{json:#}"
+    );
+
+    // --- Human path: the count must be attributed to the *go* ecosystem,
+    // proving the Go crawler (not an accidental npm/pypi pickup) found them.
+    // Also guards against the old loophole where "No packages found" still
+    // satisfied a `contains("packages")` check.
     let output = run(
         &["scan", "--cwd", dir.path().to_str().unwrap()],
         dir.path(),
@@ -76,14 +123,28 @@ fn scan_discovers_go_modules() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}{stderr}");
-
     assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover Go module packages, got:\n{combined}"
+        output.status.success(),
+        "human scan should exit 0, got {:?}\n{combined}",
+        output.status.code()
+    );
+    assert!(
+        combined.contains("Found 2 packages") && combined.contains("2 go"),
+        "Expected human scan to report 'Found 2 packages (2 go)', got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("No packages found"),
+        "scan reported no packages despite a populated module cache:\n{combined}"
     );
 }
 
 /// Verify that `socket-patch scan` discovers case-encoded Go modules.
+///
+/// Go's module cache stores uppercase letters as `!`+lowercase, so
+/// `github.com/Azure/...` lands on disk under `github.com/!azure/...`. The
+/// crawler must descend into the `!azure` directory and count the module; a
+/// crawler that skipped `!`-prefixed dirs (or failed the layout) would report
+/// zero.
 #[test]
 fn scan_discovers_case_encoded_modules() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,24 +158,49 @@ fn scan_discovers_case_encoded_modules() {
         .join("azure-sdk-for-go@v1.0.0");
     std::fs::create_dir_all(&azure_dir).unwrap();
 
-    // Create a go.mod in the project directory
+    // Create a go.mod in the project directory so local mode activates.
     std::fs::write(
         dir.path().join("go.mod"),
         "module example.com/myproject\n\ngo 1.21\n",
     )
     .unwrap();
 
+    // --- JSON path: exactly one case-encoded module must be discovered.
+    // The old assertion `contains("scannedPackages") || contains("Found")`
+    // was vacuous: the empty-scan envelope ALSO emits `"scannedPackages": 0`,
+    // so the test passed even when the `!azure` directory was never found.
+    // Pin the count to exactly 1.
+    let json = scan_json(dir.path(), &cache_dir);
+    assert_eq!(
+        json["status"], "success",
+        "scan envelope must report success; got:\n{json:#}"
+    );
+    assert_eq!(
+        json["scannedPackages"], 1,
+        "scan must discover exactly the one case-encoded module under !azure; got:\n{json:#}"
+    );
+
+    // --- Human path: the discovery must be attributed to the go ecosystem and
+    // must not fall through to "No packages found" (the old loophole).
     let output = run(
-        &["scan", "--json", "--cwd", dir.path().to_str().unwrap()],
+        &["scan", "--cwd", dir.path().to_str().unwrap()],
         dir.path(),
         &cache_dir,
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
-
     assert!(
-        combined.contains("scannedPackages") || combined.contains("Found"),
-        "Expected scan output, got:\n{combined}"
+        output.status.success(),
+        "human scan should exit 0, got {:?}\n{combined}",
+        output.status.code()
+    );
+    assert!(
+        combined.contains("Found 1 packages") && combined.contains("1 go"),
+        "Expected human scan to report 'Found 1 packages (1 go)', got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("No packages found"),
+        "scan reported no packages despite a populated module cache:\n{combined}"
     );
 }

@@ -3,8 +3,13 @@
 //! Installs `minimist@1.2.2` (a real, historically-vulnerable package) via
 //! `npm install` inside a Linux container, then drives the full
 //! `socket-patch scan` → `apply` → `rollback` chain against a wiremock-
-//! served patch fixture. Asserts the on-disk file is patched and
-//! restored.
+//! served patch fixture. Asserts scan discovers the patch, apply writes
+//! the patched bytes to disk, and rollback stays consistent (it may not
+//! claim success while leaving the patch on disk, nor destroy the file
+//! when it fails). NOTE: because the fixture uses a placeholder all-zero
+//! beforeHash and serves no before-blob, an --offline rollback cannot
+//! actually restore the original bytes here — that path is the offline
+//! guard, not a genuine restore. See the summary in the audit notes.
 //!
 //! Run modes:
 //!   - Default (Docker): requires Docker daemon. Pulls `socket-patch-test-
@@ -208,29 +213,56 @@ mkdir -p /workspace/proj && cd /workspace/proj
 echo '{{ "name": "e2e-proj", "version": "0.0.0" }}' > package.json
 npm install --silent --no-audit --no-fund minimist@1.2.2
 
-# 2. scan --json: should discover the patch.
+# 2. scan --json: must discover the patch via the real batch API. A
+#    clean exit alone proves nothing (a no-op scan also exits 0), so we
+#    gate on exit==0 AND on the installed PURL and the available patch
+#    UUID actually appearing in the JSON. If scan stops finding the
+#    package or the patch, this fails loud instead of sailing through.
 echo "===SCAN OUTPUT===" >&2
-socket-patch scan --json "${{COMMON_ARGS[@]}}" 2>/tmp/scan.err
+socket-patch scan --json "${{COMMON_ARGS[@]}}" >/tmp/scan.out 2>/tmp/scan.err
 SCAN_RC=$?
 echo "scan exit=$SCAN_RC" >&2
 cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
 
 # 3. scan --sync writes the manifest and applies the patch in one go.
 echo "===SCAN/SYNC OUTPUT===" >&2
-socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" 2>/tmp/sync.err
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
 SYNC_RC=$?
 echo "sync exit=$SYNC_RC" >&2
+cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
 
 # 4. scan --sync may end up with "no installed package" (unmatched)
 #    because the fixture's installed minimist has different bytes than
 #    our synthetic patch expects. Force-apply via the manifest written
-#    by scan above.
+#    by scan above. apply must report success (exit 0) — not merely
+#    leave a marker behind while reporting partial failure.
 echo "===APPLY OUTPUT===" >&2
-socket-patch apply --json --force --offline 2>/tmp/apply.err
+socket-patch apply --json --force --offline >/tmp/apply.out 2>/tmp/apply.err
 APPLY_RC=$?
 echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.out >&2 || true
 cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
 
 echo "===POST-APPLY STATE===" >&2
 echo "manifest:" >&2
@@ -247,13 +279,50 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' node_modules/minimist/index.js; then
 fi
 echo "===PATCH VERIFIED===" >&2
 
-# 6. rollback — the fixture doesn't serve beforeHash blobs, so this
-#    exercises the dispatch path but exits non-zero on the offline guard.
+# 6. rollback. The fixture's manifest records a placeholder all-zero
+#    beforeHash and serves no matching before-blob, so an --offline
+#    rollback cannot legitimately restore the file. Whatever it does,
+#    it MUST stay consistent: it may NOT report success while leaving
+#    the patched bytes on disk, and a failed rollback may NOT silently
+#    destroy/alter the file. This catches a "fake success" rollback that
+#    claims to restore without touching the file.
 echo "===ROLLBACK OUTPUT===" >&2
-socket-patch rollback --json --offline 2>/tmp/rb.err
+socket-patch rollback --json --offline >/tmp/rb.out 2>/tmp/rb.err
 RB_RC=$?
 echo "rollback exit=$RB_RC" >&2
+cat /tmp/rb.out >&2 || true
 cat /tmp/rb.err >&2 || true
+
+MARKER_PRESENT=0
+grep -q 'SOCKET-PATCH-E2E-MARKER' node_modules/minimist/index.js && MARKER_PRESENT=1
+
+if [ "$RB_RC" -eq 0 ]; then
+  # Rollback claims success → the patch marker MUST be gone (real restore).
+  if [ "$MARKER_PRESENT" -eq 1 ]; then
+    echo "FAIL: rollback reported success (exit 0) but the patch marker is still on disk — file NOT restored" >&2
+    exit 1
+  fi
+  if ! grep -q '"status": *"success"' /tmp/rb.out; then
+    echo "FAIL: rollback exit 0 but JSON status is not success" >&2
+    cat /tmp/rb.out >&2
+    exit 1
+  fi
+else
+  # Rollback failed (expected here: offline guard, before-blob missing).
+  # A failed rollback must be a no-op — the patched bytes stay intact —
+  # and it must surface a structured failure, not crash unannounced.
+  if [ "$MARKER_PRESENT" -eq 0 ]; then
+    echo "FAIL: rollback failed (exit $RB_RC) yet the patched bytes vanished — corrupting/partial rollback" >&2
+    head -3 node_modules/minimist/index.js >&2 || echo "no file" >&2
+    exit 1
+  fi
+  if ! grep -Eq '"status": *"(partial_failure|error)"' /tmp/rb.out; then
+    echo "FAIL: rollback exit $RB_RC but emitted no partial_failure/error JSON status" >&2
+    cat /tmp/rb.out >&2
+    exit 1
+  fi
+fi
+echo "===ROLLBACK CHECKED===" >&2
 
 echo "===E2E PASS==="
 exit 0
@@ -421,9 +490,7 @@ fn run_on_host(script: &str) -> std::process::Output {
     // Rewrite the script's `/workspace/proj` paths to a host-tmp dir so we
     // don't need root or write access to `/workspace`.
     let host_proj = tmp.path().join("proj");
-    let host_script = script
-        .replace("/workspace/proj", host_proj.to_str().unwrap())
-        .replace("node_modules/minimist/index.js", "node_modules/minimist/index.js");
+    let host_script = script.replace("/workspace/proj", host_proj.to_str().unwrap());
     Command::new("bash")
         .arg("-c")
         .arg(host_script)
@@ -477,9 +544,20 @@ async fn npm_install_scan_apply_rollback_cycle() {
         output.status.success(),
         "container script failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // Each stage marker is emitted only after that stage's in-script
+    // gate passed. Requiring all four proves the full chain ran and
+    // every gate held — not just that the script reached its tail.
+    assert!(
+        stderr.contains("===SCAN VERIFIED==="),
+        "scan did not discover the patch (===SCAN VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(
         stderr.contains("===PATCH VERIFIED==="),
         "expected post-apply marker grep to succeed (===PATCH VERIFIED=== in stderr).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===ROLLBACK CHECKED==="),
+        "rollback consistency check did not run/pass (===ROLLBACK CHECKED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
         stdout.contains("===E2E PASS==="),
@@ -490,15 +568,21 @@ async fn npm_install_scan_apply_rollback_cycle() {
     // resolve the in-tree binary. Without this clippy warns unused.
     let _ = workspace_root();
 
-    // Sanity: the mock got the requests we expect (this isn't strictly
-    // necessary since the script enforces correctness, but it's a
-    // cheap consistency check).
+    // The mock must have served BOTH the metadata discovery (batch) and
+    // an actual blob fetch (inline view or raw-blob fallback). Without
+    // the latter, the full download→apply pipeline never ran the
+    // content path even if a marker somehow appeared.
     let received = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<&str> = received.iter().map(|r| r.url.path()).collect();
     assert!(
-        received
+        paths.iter().any(|p| p.contains("/patches/batch")),
+        "scan should have called /patches/batch; received={paths:#?}"
+    );
+    assert!(
+        paths
             .iter()
-            .any(|r| r.url.path().contains("/patches/batch")),
-        "scan should have called /patches/batch; received={received:#?}"
+            .any(|p| p.contains("/patches/view/") || p.contains("/patches/blob/")),
+        "scan --sync should have fetched patch content via /patches/view/ or /patches/blob/; received={paths:#?}"
     );
 }
 

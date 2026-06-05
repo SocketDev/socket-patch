@@ -9,20 +9,23 @@
 //!     installed by Deno). Reuses the same wiremock fixture as
 //!     `docker_e2e_npm.rs`'s minimist test.
 //!
-//!   * `deno_jsr_install_scan_verifies_discovery` — uses
-//!     `deno install jsr:@luca/flag@1.0.0` to populate
-//!     `$DENO_DIR/npm/jsr.io/@luca/flag/1.0.0/`, then runs
+//!   * `deno_jsr_synthetic_layout_scan_verifies_discovery` — stages a
+//!     *synthetic* JSR cache layout under
+//!     `$DENO_DIR/npm/jsr.io/<scope>/<name>/<version>/` with `mkdir`
+//!     (real Deno 2.x caches JSR content-addressed, with no
+//!     scope/name/version tree for the crawler to walk — see the
+//!     `deno_jsr_script` comment), then runs
 //!     `socket-patch scan --json --ecosystems deno --global` against
-//!     the JSR cache. Asserts the DenoCrawler enumerated the package
-//!     end-to-end with a real binary, mirroring the
-//!     `pypi_uv_tool_install_full_apply_chain` pattern.
+//!     that root. Asserts the DenoCrawler enumerates *exactly* the two
+//!     staged packages (@luca/flag + @std/path) end-to-end through the
+//!     real CLI binary. The `deno` binary is exercised only to prove
+//!     the image is healthy; it does not produce the scanned layout.
 //!
 //! Run command:
 //!   `cargo test -p socket-patch-cli --features docker-e2e,deno --test docker_e2e_deno`
 
 #![cfg(all(feature = "docker-e2e", feature = "deno"))]
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use base64::Engine;
@@ -68,14 +71,6 @@ fn cov_docker_args() -> Vec<String> {
         "-e".into(),
         "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
     ]
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .to_path_buf()
 }
 
 /// Build the wiremock for the npm-via-deno-install variant. Same
@@ -171,7 +166,7 @@ fn api_url_for_container(server: &MockServer) -> String {
 /// 2.0 reads `package.json`, resolves dependencies through the npm
 /// registry, and populates `node_modules/` — at which point the
 /// existing NpmCrawler discovers the packages.
-fn deno_node_modules_script(api_url: &str) -> String {
+fn deno_node_modules_script(api_url: &str, expected_blob_b64: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -uo pipefail
@@ -210,22 +205,71 @@ if [ ! -f "$TARGET" ]; then
 fi
 echo "Installed minimist at: $TARGET" >&2
 
+# Snapshot the pre-apply content so we can prove apply actually
+# rewrote the file (not that the marker happened to be there already).
+PRE_APPLY_SHA=$(sha256sum "$TARGET" | cut -d' ' -f1)
+echo "pre-apply sha: $PRE_APPLY_SHA" >&2
+
 # 3. scan --sync — npm ecosystem, since the discovered package is
-#    a real npm package (pkg:npm/minimist@1.2.2).
+#    a real npm package (pkg:npm/minimist@1.2.2). The sync step may
+#    itself exit non-zero (it tries to apply, and the installed bytes
+#    don't match our synthetic patch's beforeHash) — that's expected
+#    and tolerated, exactly as in docker_e2e_npm.rs. What MUST happen,
+#    regardless of its exit code, is that scan writes the manifest that
+#    the offline apply below consumes. We assert on that side-effect.
 socket-patch scan --json --sync --yes --ecosystems npm "${{COMMON_ARGS[@]}}" \
-  2>/tmp/sync.err
+  >/tmp/sync.out 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.err >&2 || true
 
-# 4. apply --force --offline.
-socket-patch apply --json --force --offline --ecosystems npm 2>/tmp/apply.err
-echo "apply exit=$?" >&2
-cat /tmp/apply.err >&2 || true
+# The manifest is the real artifact that drives the offline apply. It
+# must exist and must record the minimist patch the mock served;
+# otherwise apply --offline has nothing to do and the marker check
+# below would be vacuous.
+MANIFEST=.socket/manifest.json
+if [ ! -f "$MANIFEST" ]; then
+  echo "FAIL: scan --sync did not write $MANIFEST" >&2
+  ls -la .socket/ 2>&1 >&2 || true
+  exit 1
+fi
+echo "--- manifest ---" >&2; cat "$MANIFEST" >&2
+python3 - "$MANIFEST" <<'PY' || exit 1
+import json, sys
+m = json.load(open(sys.argv[1]))
+blob = json.dumps(m)
+assert "{NPM_PURL}" in blob, "manifest missing purl {NPM_PURL}"
+assert "{NPM_UUID}" in blob, "manifest missing patch uuid {NPM_UUID}"
+print("manifest records minimist patch", file=sys.stderr)
+PY
 
-# 5. The on-disk file must contain the marker.
-if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
-  echo "FAIL: marker not in $TARGET after apply" >&2
-  head -3 "$TARGET" >&2
+# 4. apply --force --offline. MUST succeed (exit 0): the manifest and
+#    blob are present locally, so there is no excuse for a failure.
+socket-patch apply --json --force --offline --ecosystems npm \
+  >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0)" >&2
+  exit 1
+fi
+
+# 5. The on-disk file must now byte-for-byte equal the patched blob the
+#    mock served — not merely "contain a marker" (which a partial or
+#    corrupt write could still satisfy).
+EXPECTED=/tmp/expected-index.js
+echo '{expected_blob_b64}' | base64 -d > "$EXPECTED"
+if ! cmp -s "$EXPECTED" "$TARGET"; then
+  echo "FAIL: $TARGET does not byte-match the patched blob after apply" >&2
+  echo "--- expected ---" >&2; cat "$EXPECTED" >&2
+  echo "--- actual ---" >&2; cat "$TARGET" >&2
+  exit 1
+fi
+# And the content must actually have changed from the pre-apply state.
+POST_APPLY_SHA=$(sha256sum "$TARGET" | cut -d' ' -f1)
+echo "post-apply sha: $POST_APPLY_SHA" >&2
+if [ "$PRE_APPLY_SHA" = "$POST_APPLY_SHA" ]; then
+  echo "FAIL: $TARGET unchanged by apply ($POST_APPLY_SHA)" >&2
   exit 1
 fi
 
@@ -268,7 +312,16 @@ EOF
 
 # Confirm deno itself is runnable (proves the image is healthy even
 # though we don't drive a real deno install in this variant).
-deno --version >&2
+if ! deno --version >/tmp/deno-version.out 2>&1; then
+  echo "FAIL: deno --version did not run" >&2
+  cat /tmp/deno-version.out >&2 || true
+  exit 1
+fi
+cat /tmp/deno-version.out >&2
+grep -qi '^deno ' /tmp/deno-version.out || {
+  echo "FAIL: 'deno --version' output did not identify the deno binary" >&2
+  exit 1
+}
 
 mkdir -p /workspace/proj && cd /workspace/proj
 cat >deno.json <<'EOF'
@@ -285,11 +338,26 @@ SCAN_RC=$?
 echo "scan exit=$SCAN_RC" >&2
 cat /tmp/scan.err >&2 || true
 echo "$SCAN_OUT" | head -50 >&2
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  exit 1
+fi
 
-SCANNED=$(echo "$SCAN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('scannedPackages', 0))" 2>/dev/null || echo 0)
+# Parse scannedPackages. Do NOT swallow a parse failure with `|| echo 0`
+# — malformed JSON or a missing field is itself a regression and must
+# surface, not silently degrade to "found 0".
+SCANNED=$(echo "$SCAN_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['scannedPackages'])")
+PARSE_RC=$?
+if [ "$PARSE_RC" -ne 0 ]; then
+  echo "FAIL: could not parse scannedPackages from scan JSON (rc=$PARSE_RC)" >&2
+  echo "$SCAN_OUT" >&2
+  exit 1
+fi
 echo "scanned jsr packages: $SCANNED" >&2
-if [ "$SCANNED" -lt 2 ]; then
-  echo "FAIL: DenoCrawler found $SCANNED packages, expected 2 (@luca/flag + @std/path)" >&2
+# Exactly two packages were staged; the crawler must find neither fewer
+# (missed one) nor more (walked into the wrong directory level).
+if [ "$SCANNED" -ne 2 ]; then
+  echo "FAIL: DenoCrawler found $SCANNED packages, expected exactly 2 (@luca/flag + @std/path)" >&2
   find "$JSR" -maxdepth 4 2>&1 >&2 || true
   exit 1
 fi
@@ -337,17 +405,33 @@ async fn deno_install_node_modules_full_apply_chain() {
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&deno_node_modules_script(&api_url));
+    let blob_b64 = base64::engine::general_purpose::STANDARD.encode(PATCHED_BYTES);
+    let out = run_container(&deno_node_modules_script(&api_url, &blob_b64));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "deno install apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // The real `deno install` populated node_modules/.
+    assert!(
+        stderr.contains("Installed minimist at:"),
+        "deno install did not populate node_modules:\nstderr=\n{stderr}"
+    );
+    // scan --sync wrote a manifest recording the mocked minimist patch
+    // (its own exit code is allowed to be non-zero, like docker_e2e_npm).
+    assert!(
+        stderr.contains("manifest records minimist patch"),
+        "scan --sync did not write a manifest with the minimist patch:\nstderr=\n{stderr}"
+    );
+    // The offline apply itself must succeed cleanly.
+    assert!(
+        stderr.contains("apply exit=0"),
+        "apply did not exit 0:\nstderr=\n{stderr}"
+    );
+    // The byte-for-byte + sha-changed checks in the script gate this marker.
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
-
-    let _ = workspace_root();
 }
 
 #[tokio::test]
@@ -361,6 +445,11 @@ async fn deno_jsr_synthetic_layout_scan_verifies_discovery() {
     assert!(
         out.status.success(),
         "deno jsr scan failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    // Exactly the two staged packages were enumerated by the DenoCrawler.
+    assert!(
+        stderr.contains("scanned jsr packages: 2"),
+        "DenoCrawler did not enumerate exactly 2 packages:\nstderr=\n{stderr}"
     );
     assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");

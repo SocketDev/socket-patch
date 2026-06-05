@@ -223,6 +223,18 @@ fn test_pypi_full_lifecycle() {
     let files = files_value.as_object().expect("files should be an object");
     assert!(!files.is_empty(), "patch should modify at least one file");
 
+    // The patch must genuinely change content: at least one file's beforeHash
+    // must differ from its afterHash (a brand-new file with an empty beforeHash
+    // also counts). Without this, every "applied"/"restored"/"unchanged"
+    // assertion below is vacuous — a no-op implementation would stay green.
+    let nontrivial = files.iter().any(|(_, info)| {
+        info["beforeHash"].as_str().unwrap_or("") != info["afterHash"].as_str().unwrap_or("")
+    });
+    assert!(
+        nontrivial,
+        "patch must change at least one file (some beforeHash != afterHash)"
+    );
+
     // Verify every file's hash matches the afterHash from the manifest.
     for (rel_path, info) in files {
         let after_hash = info["afterHash"]
@@ -240,6 +252,18 @@ fn test_pypi_full_lifecycle() {
             "hash mismatch for {rel_path} after get"
         );
     }
+
+    // Independent oracle: at least one file recorded BEFORE any CLI ran must
+    // have actually changed on disk. This catches a `get` that writes nothing
+    // (or whose manifest afterHash was copied from the pristine file).
+    let disk_changed = original_hashes.iter().any(|(rel, orig)| {
+        let p = site_packages.join(rel);
+        !orig.is_empty() && p.exists() && git_sha256_file(&p) != *orig
+    });
+    assert!(
+        disk_changed,
+        "get should have modified at least one already-existing file on disk"
+    );
 
     // -- LIST: verify JSON output ------------------------------------------
     // v3.0 envelope: `list --json` emits {command,status,events,summary}
@@ -324,6 +348,26 @@ fn test_pypi_full_lifecycle() {
     // -- REMOVE: rollback + remove from manifest ---------------------------
     assert_run_ok(cwd, &["remove", PYPI_UUID], "remove");
 
+    // `remove` is rollback + manifest removal, so the files must be restored,
+    // not just the manifest cleared. Verify both against the manifest's
+    // beforeHash (new files removed, existing files reverted).
+    for (rel_path, info) in files {
+        let before_hash = info["beforeHash"].as_str().unwrap_or("");
+        let full_path = site_packages.join(rel_path);
+        if before_hash.is_empty() {
+            assert!(
+                !full_path.exists(),
+                "new file {rel_path} should be removed after remove"
+            );
+        } else {
+            assert_eq!(
+                git_sha256_file(&full_path),
+                before_hash,
+                "{rel_path} should be restored to beforeHash after remove"
+            );
+        }
+    }
+
     // Manifest should be empty.
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -364,28 +408,69 @@ fn test_pypi_dry_run() {
         "file should not change after get --no-apply"
     );
 
-    // Dry-run should leave file untouched.
-    assert_run_ok(cwd, &["apply", "--dry-run"], "apply --dry-run");
-    assert_eq!(
-        git_sha256_file(&messages_py),
-        original_hash,
-        "file should not change after apply --dry-run"
-    );
-
-    // Real apply should work.
-    assert_run_ok(cwd, &["apply"], "apply");
-
-    // Read afterHash from manifest to verify.
+    // Read the manifest and snapshot the pre-apply on-disk state of EVERY
+    // patched file, so we can prove dry-run touched none of them.
     let manifest_path = cwd.join(".socket/manifest.json");
     let (_, files_value) = read_patch_files(&manifest_path);
     let files = files_value.as_object().unwrap();
-    let after_hash = files["pydantic_ai/messages.py"]["afterHash"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        git_sha256_file(&messages_py),
-        after_hash,
-        "file should match afterHash after real apply"
+    assert!(!files.is_empty(), "manifest should record patched files");
+
+    // The patch must be non-trivial; otherwise "unchanged after dry-run" is
+    // vacuously true even for a completely broken apply.
+    let nontrivial = files.iter().any(|(_, info)| {
+        info["beforeHash"].as_str().unwrap_or("") != info["afterHash"].as_str().unwrap_or("")
+    });
+    assert!(nontrivial, "patch must change at least one file");
+
+    let pre_state: Vec<(String, Option<String>)> = files
+        .keys()
+        .map(|rel| {
+            let p = site_packages.join(rel);
+            let h = if p.exists() { Some(git_sha256_file(&p)) } else { None };
+            (rel.clone(), h)
+        })
+        .collect();
+
+    // Dry-run should leave EVERY patched file untouched (no edits, no new files).
+    assert_run_ok(cwd, &["apply", "--dry-run"], "apply --dry-run");
+    for (rel, before) in &pre_state {
+        let p = site_packages.join(rel);
+        match before {
+            Some(h) => assert_eq!(
+                &git_sha256_file(&p),
+                h,
+                "{rel} must be unchanged after apply --dry-run"
+            ),
+            None => assert!(
+                !p.exists(),
+                "{rel} must not be created by apply --dry-run"
+            ),
+        }
+    }
+
+    // Real apply should bring every file to afterHash, and must actually move
+    // at least one file off its pre-apply state.
+    assert_run_ok(cwd, &["apply"], "apply");
+    let mut any_changed = false;
+    for (rel, info) in files {
+        let after_hash = info["afterHash"].as_str().expect("afterHash");
+        let p = site_packages.join(rel);
+        assert_eq!(
+            git_sha256_file(&p),
+            after_hash,
+            "{rel} should match afterHash after real apply"
+        );
+        let pre = pre_state
+            .iter()
+            .find(|(r, _)| r == rel)
+            .and_then(|(_, h)| h.clone());
+        if pre.as_deref() != Some(after_hash) {
+            any_changed = true;
+        }
+    }
+    assert!(
+        any_changed,
+        "real apply must modify at least one file relative to its pre-apply state"
     );
 }
 
@@ -455,6 +540,14 @@ fn test_pypi_global_lifecycle() {
 
     let (_, files_value) = read_patch_files(&manifest_path);
     let files = files_value.as_object().expect("files object");
+    assert!(!files.is_empty(), "manifest should record patched files");
+
+    // Patch must be non-trivial, else the rollback/apply round-trip below is
+    // vacuous (rolling back to beforeHash == afterHash proves nothing).
+    let nontrivial = files.iter().any(|(_, info)| {
+        info["beforeHash"].as_str().unwrap_or("") != info["afterHash"].as_str().unwrap_or("")
+    });
+    assert!(nontrivial, "patch must change at least one file");
 
     // Verify every patched file matches afterHash.
     for (rel_path, info) in files {
@@ -516,6 +609,24 @@ fn test_pypi_global_lifecycle() {
         "remove -g",
     );
 
+    // Files must be restored by the global remove, not just the manifest cleared.
+    for (rel_path, info) in files {
+        let before_hash = info["beforeHash"].as_str().unwrap_or("");
+        let full_path = global_dir.path().join(rel_path);
+        if before_hash.is_empty() {
+            assert!(
+                !full_path.exists(),
+                "new file {rel_path} should be removed after global remove"
+            );
+        } else {
+            assert_eq!(
+                git_sha256_file(&full_path),
+                before_hash,
+                "{rel_path} should be restored to beforeHash after global remove"
+            );
+        }
+    }
+
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     assert!(
@@ -557,17 +668,50 @@ fn test_pypi_save_only() {
     let manifest_path = cwd.join(".socket/manifest.json");
     assert!(manifest_path.exists(), "manifest should exist after get --save-only");
 
-    let (purl, _) = read_patch_files(&manifest_path);
+    let (purl, files_value) = read_patch_files(&manifest_path);
     assert!(
         purl.starts_with(PYPI_PURL_PREFIX),
         "manifest should contain a pydantic-ai patch"
     );
 
-    // Real apply should work.
+    let files = files_value.as_object().unwrap();
+    assert!(!files.is_empty(), "manifest should record patched files");
+
+    // Patch must be non-trivial, else "unchanged after save-only" is vacuous.
+    let nontrivial = files.iter().any(|(_, info)| {
+        info["beforeHash"].as_str().unwrap_or("") != info["afterHash"].as_str().unwrap_or("")
+    });
+    assert!(nontrivial, "patch must change at least one file");
+
+    // --save-only must NOT apply the patch. For every file the patch genuinely
+    // modifies (beforeHash != afterHash), the on-disk content must therefore
+    // not match afterHash. (Note: an empty beforeHash does not imply the file
+    // is absent on disk — the package install may already ship it.)
+    let mut checked_modified = 0;
+    for (rel, info) in files {
+        let before_hash = info["beforeHash"].as_str().unwrap_or("");
+        let after_hash = info["afterHash"].as_str().expect("afterHash");
+        if before_hash == after_hash {
+            continue; // file not actually changed by the patch
+        }
+        let p = site_packages.join(rel);
+        if p.exists() {
+            assert_ne!(
+                git_sha256_file(&p),
+                after_hash,
+                "{rel} must NOT be at afterHash after get --save-only (apply must not have run)"
+            );
+        }
+        checked_modified += 1;
+    }
+    assert!(
+        checked_modified > 0,
+        "expected at least one patch-modified file to verify against save-only"
+    );
+
+    // Real apply should work, and bring every file to its afterHash.
     assert_run_ok(cwd, &["apply"], "apply");
 
-    let (_, files_value) = read_patch_files(&manifest_path);
-    let files = files_value.as_object().unwrap();
     let after_hash = files["pydantic_ai/messages.py"]["afterHash"]
         .as_str()
         .unwrap();
@@ -576,6 +720,14 @@ fn test_pypi_save_only() {
         after_hash,
         "file should match afterHash after apply"
     );
+    for (rel, info) in files {
+        let after = info["afterHash"].as_str().expect("afterHash");
+        assert_eq!(
+            git_sha256_file(&site_packages.join(rel)),
+            after,
+            "{rel} should match afterHash after apply"
+        );
+    }
 }
 
 /// macOS auto-discovery: `scan -g --json` without `--global-prefix` uses real path probing.
@@ -627,14 +779,31 @@ fn test_pypi_uuid_shortcut() {
     let site_packages = find_site_packages(cwd);
     assert!(site_packages.join("pydantic_ai").exists());
 
+    // Snapshot a known-patched file BEFORE the shortcut runs, so we have an
+    // oracle that is independent of the command under test.
+    let messages_py = site_packages.join("pydantic_ai/messages.py");
+    let messages_before = messages_py.exists().then(|| git_sha256_file(&messages_py));
+
     // Run with bare UUID (no "get" subcommand).
     assert_run_ok(cwd, &[PYPI_UUID], "uuid shortcut");
 
     let manifest_path = cwd.join(".socket/manifest.json");
     assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
 
-    let (_, files_value) = read_patch_files(&manifest_path);
+    let (purl, files_value) = read_patch_files(&manifest_path);
+    assert!(
+        purl.starts_with(PYPI_PURL_PREFIX),
+        "manifest should contain a pydantic-ai patch, got {purl}"
+    );
     let files = files_value.as_object().expect("files object");
+    assert!(!files.is_empty(), "manifest should record patched files");
+
+    // Patch must be non-trivial; combined with the afterHash checks below this
+    // proves the shortcut actually applied (not a no-op that happens to match).
+    let nontrivial = files.iter().any(|(_, info)| {
+        info["beforeHash"].as_str().unwrap_or("") != info["afterHash"].as_str().unwrap_or("")
+    });
+    assert!(nontrivial, "patch must change at least one file");
 
     for (rel_path, info) in files {
         let after_hash = info["afterHash"].as_str().expect("afterHash");
@@ -644,5 +813,18 @@ fn test_pypi_uuid_shortcut() {
             after_hash,
             "{rel_path} should match afterHash after UUID shortcut"
         );
+    }
+
+    // Independent oracle: the bare-UUID shortcut must behave like `get` and
+    // actually modify the file we snapshotted before it ran. If messages.py is
+    // part of this patch, its on-disk content must have moved off the original.
+    if let Some(before) = messages_before {
+        if files.contains_key("pydantic_ai/messages.py") {
+            assert_ne!(
+                git_sha256_file(&messages_py),
+                before,
+                "UUID shortcut should have modified messages.py (behave like `get`)"
+            );
+        }
     }
 }

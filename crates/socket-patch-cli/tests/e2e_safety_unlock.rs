@@ -48,6 +48,26 @@ fn unlock_reports_free_when_no_socket_dir() {
     let env = parse_json_envelope(&stdout);
     assert_eq!(json_string(&env, "status"), Some("free"));
     assert_eq!(json_string(&env, "command"), Some("unlock"));
+    // No `--release`, nothing existed: `released` must be present and false,
+    // not merely absent (an envelope that dropped the field entirely would
+    // otherwise read as a pass).
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(false),
+        "free probe without --release must report released=false: {stdout}"
+    );
+    // The reported lock path must be the real `.socket/apply.lock`, not some
+    // placeholder — this is the path the mutating subcommands actually flock.
+    let lock_field = json_string(&env, "lockFile").expect("lockFile field present");
+    assert!(
+        lock_field.ends_with("apply.lock"),
+        "lockFile should name the real apply.lock, got {lock_field}"
+    );
+    // A pure probe must not materialize project state out of thin air.
+    assert!(
+        !dir.path().join(".socket").exists(),
+        "probing a fresh repo must not create .socket/"
+    );
 }
 
 /// `unlock` while another process holds the lock reports `held`
@@ -65,11 +85,31 @@ fn unlock_reports_held_when_lock_actively_held() {
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let env = parse_json_envelope(&stdout);
     assert_eq!(json_string(&env, "status"), Some("error"));
+    // Must be tagged as an unlock failure, not some other subcommand's
+    // envelope leaking through.
+    assert_eq!(json_string(&env, "command"), Some("unlock"));
     let code_field = env
         .get("error")
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_str());
     assert_eq!(code_field, Some("lock_held"));
+    // The error must specifically be about a competing process — guards
+    // against a generic/empty error message masquerading as lock_held.
+    let msg = env
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    assert!(
+        msg.contains("another socket-patch process"),
+        "lock_held message should name the competing process, got: {msg}"
+    );
+    // Probing a held lock must NOT disturb the file the external holder
+    // owns — the probe is read-only.
+    assert!(
+        socket_dir.join("apply.lock").is_file(),
+        "held-probe must leave the externally-locked file intact"
+    );
 }
 
 /// `unlock --release` against a free lock with a leftover file
@@ -87,8 +127,13 @@ fn unlock_release_deletes_lock_file_when_free() {
     let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--release"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "command"), Some("unlock"));
     assert_eq!(json_string(&env, "status"), Some("free"));
-    assert_eq!(env.get("released").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(true),
+        "a pre-existing leftover file was removed, so released must be true: {stdout}"
+    );
     assert!(
         !lock_file.exists(),
         "--release should have deleted the lock file"
@@ -112,6 +157,7 @@ fn unlock_release_reports_not_released_when_no_lock_file() {
     let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--release"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "command"), Some("unlock"));
     assert_eq!(json_string(&env, "status"), Some("free"));
     assert_eq!(
         env.get("released").and_then(|v| v.as_bool()),
@@ -133,11 +179,18 @@ fn unlock_release_reports_not_released_when_no_socket_dir() {
     let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--release"]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "command"), Some("unlock"));
     assert_eq!(json_string(&env, "status"), Some("free"));
     assert_eq!(
         env.get("released").and_then(|v| v.as_bool()),
         Some(false),
         "no .socket/ existed, so released must be false: {stdout}"
+    );
+    // `--release` against a missing dir must stay a no-op: it must not
+    // create `.socket/` (and therefore no lock file) as a side-effect.
+    assert!(
+        !dir.path().join(".socket").exists(),
+        "--release on a fresh repo must not create .socket/"
     );
 }
 
@@ -151,11 +204,29 @@ fn unlock_release_refuses_when_held() {
     let socket_dir = dir.path().join(".socket");
     let _external = take_external_lock(&socket_dir);
 
-    let (code, _stdout, _stderr) = run(dir.path(), &["unlock", "--release"]);
-    assert_eq!(code, 1);
+    let (code, _stdout, stderr) = run(dir.path(), &["unlock", "--release"]);
+    assert_eq!(code, 1, "stderr={stderr}");
     assert!(
         socket_dir.join("apply.lock").is_file(),
         "lock file must survive a refused --release"
+    );
+    // Exit 1 + surviving file is not enough — a crash or an unrelated I/O
+    // error would also satisfy that. Confirm we hit the *held-refusal*
+    // branch specifically: the operator is told the release was refused and
+    // pointed at --break-lock. This is the distinctive `--release`+held
+    // message that no other failure path emits.
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("lock is held"),
+        "stderr should report the held lock, got:\n{stderr}"
+    );
+    assert!(
+        lower.contains("refusing to release"),
+        "stderr should explicitly refuse to release a held lock, got:\n{stderr}"
+    );
+    assert!(
+        lower.contains("break-lock"),
+        "stderr should point operator at --break-lock, got:\n{stderr}"
     );
 }
 
@@ -170,9 +241,21 @@ fn unlock_human_mode_hints_at_break_lock_when_held() {
     let _external = take_external_lock(&socket_dir);
 
     let (code, _stdout, stderr) = run(dir.path(), &["unlock"]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 1, "stderr={stderr}");
+    let lower = stderr.to_lowercase();
     assert!(
-        stderr.to_lowercase().contains("break-lock"),
+        lower.contains("lock is held"),
+        "stderr should report the held lock, got:\n{stderr}"
+    );
+    assert!(
+        lower.contains("break-lock"),
         "stderr should point operator at --break-lock, got:\n{stderr}"
+    );
+    // This is the *probe* (no --release) branch, distinct from the
+    // release-refusal branch — it must NOT claim it refused to release
+    // something the caller never asked to release.
+    assert!(
+        !lower.contains("refusing to release"),
+        "plain held probe must not emit the --release-refusal wording, got:\n{stderr}"
     );
 }

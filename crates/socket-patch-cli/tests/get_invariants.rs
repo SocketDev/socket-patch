@@ -124,10 +124,19 @@ async fn get_by_uuid_not_found_emits_envelope() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (_, stdout, _) = run_get(tmp.path(), &mock.uri(), UUID, &[]);
+    let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), UUID, &[]);
+    assert_eq!(code, 0, "not_found is a clean (non-error) outcome; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "not_found");
     assert_eq!(v["found"], 0);
+    assert_eq!(v["downloaded"], 0);
+    assert_eq!(v["applied"], 0);
+    assert_eq!(v["patches"].as_array().expect("patches array").len(), 0);
+    // A 404 must never leave a manifest behind.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "not_found must not write a manifest"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -172,9 +181,25 @@ async fn get_by_cve_returns_matching_patches() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
+    assert_manifest_has_patch(tmp.path(), purl, UUID);
+}
+
+/// Read `.socket/manifest.json` and assert it records the given PURL with
+/// the expected UUID. Merely checking the file exists would let a broken
+/// save path (empty/garbage manifest) pass.
+fn assert_manifest_has_patch(root: &Path, purl: &str, uuid: &str) {
+    let manifest_path = root.join(".socket/manifest.json");
+    assert!(manifest_path.exists(), "manifest must be written");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let patches = manifest["patches"].as_object().expect("patches object");
     assert!(
-        tmp.path().join(".socket/manifest.json").exists(),
-        "CVE-based get must write the manifest"
+        patches.contains_key(purl),
+        "manifest must contain PURL key {purl}; got {manifest}"
+    );
+    assert_eq!(
+        patches[purl]["uuid"], uuid,
+        "manifest PURL entry must record the resolved UUID; got {manifest}"
     );
 }
 
@@ -192,9 +217,15 @@ async fn get_by_cve_no_match_emits_not_found() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (_, stdout, _) = run_get(tmp.path(), &mock.uri(), cve, &[]);
+    let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), cve, &[]);
+    assert_eq!(code, 0, "empty CVE search is not an error; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "not_found");
+    assert_eq!(v["found"], 0);
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "empty CVE search must not write a manifest"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +265,7 @@ async fn get_by_ghsa_returns_matching_patches() {
     assert_eq!(code, 0, "get by GHSA must succeed; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
+    assert_manifest_has_patch(tmp.path(), purl, UUID);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +306,7 @@ async fn get_by_purl_returns_matching_patches() {
     assert_eq!(code, 0, "get by PURL must succeed; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
+    assert_manifest_has_patch(tmp.path(), purl, UUID);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,19 +350,40 @@ async fn get_multiple_patches_in_json_mode_returns_selection_required() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (code, stdout, _) = run_get(tmp.path(), &mock.uri(), purl, &[]);
+    let (code, stdout, stderr) = run_get(tmp.path(), &mock.uri(), purl, &[]);
     // With multiple free patches and --json, get must NOT prompt
-    // interactively — it must emit a selection_required envelope so
-    // the caller can pick one via --id.
-    assert!(
-        code == 0 || code == 1,
-        "should exit with a stable code; got {code}"
+    // interactively and must NOT silently auto-pick one (which would
+    // emit `success`). It must emit a `selection_required` envelope and
+    // exit 1 so the caller can pick one via --id.
+    assert_eq!(
+        code, 1,
+        "multi-patch JSON path must exit 1 (selection required); stdout={stdout}; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let status = v["status"].as_str().expect("status string");
+    assert_eq!(
+        v["status"], "selection_required",
+        "multi-patch JSON path must emit selection_required, never success/auto-pick; got {v}"
+    );
+    assert_eq!(v["purl"], purl, "envelope must echo the queried purl");
+    let options = v["options"].as_array().expect("options array");
+    assert_eq!(
+        options.len(),
+        2,
+        "both available patches must be offered as options; got {v}"
+    );
+    let offered: Vec<&str> = options
+        .iter()
+        .map(|o| o["uuid"].as_str().expect("option uuid"))
+        .collect();
     assert!(
-        status == "selection_required" || status == "success",
-        "expected selection_required or success in JSON multi-patch path; got {status}: {v}"
+        offered.contains(&uuid_a) && offered.contains(&uuid_b),
+        "options must list both patch UUIDs; got {offered:?}"
+    );
+    // No manifest may be written when selection is still required —
+    // nothing has been chosen or downloaded yet.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "selection_required must not write a manifest"
     );
 }
 
@@ -445,11 +499,25 @@ async fn get_paid_patch_via_public_proxy_returns_paid_required() {
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    // The exact status varies by code path (paid_required vs error),
-    // but it must NOT be `success` because no paid token was provided.
-    let status = v["status"].as_str().expect("status string");
-    assert_ne!(
-        status, "success",
-        "paid patch without token must not succeed; got: {v}"
+    // A single paid patch with no paid access must emit `paid_required`
+    // with zero downloads/applies and the patch echoed back as paid.
+    // Asserting merely `!= success` would let a generic error envelope
+    // (or any other status) pass and mask a broken paid-path branch.
+    assert_eq!(
+        v["status"], "paid_required",
+        "paid patch without token must emit paid_required; got: {v}"
+    );
+    assert_eq!(v["found"], 1, "the one paid patch must be counted as found; got {v}");
+    assert_eq!(v["downloaded"], 0, "paid patch must not be downloaded; got {v}");
+    assert_eq!(v["applied"], 0, "paid patch must not be applied; got {v}");
+    let patches = v["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "exactly the one paid patch must be reported; got {v}");
+    assert_eq!(patches[0]["purl"], purl);
+    assert_eq!(patches[0]["uuid"], UUID);
+    assert_eq!(patches[0]["tier"], "paid", "reported patch must be flagged paid; got {v}");
+    // Nothing was downloaded, so no manifest may be written.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "paid_required must not write a manifest"
     );
 }

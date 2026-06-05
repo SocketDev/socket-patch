@@ -209,7 +209,21 @@ fn assert_original_hashes(gem_dir: &Path, original_hashes: &HashMap<String, Stri
 // Scan tests (no network needed)
 // ---------------------------------------------------------------------------
 
+/// Parse `scan --json` stdout into a Value, with diagnostics on failure.
+fn parse_scan_json(stdout: &str, stderr: &str) -> serde_json::Value {
+    serde_json::from_str(stdout).unwrap_or_else(|e| {
+        panic!("scan --json must emit valid JSON ({e}).\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    })
+}
+
 /// Verify that `socket-patch scan` discovers gems in a vendor/bundle layout.
+///
+/// The crawl is offline (no real Ruby/network); only the JSON `scannedPackages`
+/// count is asserted, since the `packages` array requires an API match. In a
+/// pristine tempdir the Ruby crawler is the only one that can find anything, so
+/// the count must equal *exactly* the two gems we planted — a broken crawler
+/// that finds zero (or the wrong number) now fails loudly instead of being
+/// masked by a generic "packages" substring.
 #[test]
 fn scan_discovers_vendored_gems() {
     let dir = tempfile::tempdir().unwrap();
@@ -235,22 +249,34 @@ fn scan_discovers_vendored_gems() {
     let nokogiri_dir = gems_dir.join("nokogiri-1.15.4");
     std::fs::create_dir_all(nokogiri_dir.join("lib")).unwrap();
 
-    let output = Command::new(binary())
-        .args(["scan", "--cwd", project_dir.to_str().unwrap()])
-        .current_dir(&project_dir)
-        .output()
-        .expect("Failed to run socket-patch binary");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let combined = format!("{stdout}{stderr}");
-
-    assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover vendored gems, got:\n{combined}"
+    let (code, stdout, stderr) = run(
+        &project_dir,
+        &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
     );
+    assert_eq!(
+        code, 0,
+        "scan --json should exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let json = parse_scan_json(&stdout, &stderr);
+    assert_eq!(
+        json["status"], "success",
+        "scan status should be success.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Exactly the two vendored gems — not zero (crawler regression) and not a
+    // larger number (ambient discovery leaking in).
+    assert_eq!(
+        json["scannedPackages"].as_u64(),
+        Some(2),
+        "scan should discover exactly the two vendored gems (rails, nokogiri).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // Shape invariants the contract guarantees.
+    assert!(json["packages"].is_array(), "packages must be an array");
+    assert!(json["updates"].is_array(), "updates must be an array");
 }
 
-/// Verify that `socket-patch scan` discovers gems with gemspec markers.
+/// Verify that `socket-patch scan` discovers gems with gemspec markers
+/// (the `.gemspec`-without-`lib/` discovery path, distinct from the lib/ path).
 #[test]
 fn scan_discovers_gems_with_gemspec() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,18 +299,26 @@ fn scan_discovers_gems_with_gemspec() {
     std::fs::create_dir_all(&net_http_dir).unwrap();
     std::fs::write(net_http_dir.join("net-http.gemspec"), "# gemspec\n").unwrap();
 
-    let output = Command::new(binary())
-        .args(["scan", "--json", "--cwd", project_dir.to_str().unwrap()])
-        .current_dir(&project_dir)
-        .output()
-        .expect("Failed to run socket-patch binary");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
+    let (code, stdout, stderr) = run(
+        &project_dir,
+        &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
+    );
+    assert_eq!(
+        code, 0,
+        "scan --json should exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
-    assert!(
-        combined.contains("scannedPackages") || combined.contains("Found"),
-        "Expected scan output, got:\n{combined}"
+    let json = parse_scan_json(&stdout, &stderr);
+    assert_eq!(
+        json["status"], "success",
+        "scan status should be success.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The single gemspec-only gem must be discovered — exactly one, proving the
+    // .gemspec marker path works (a regression there would yield zero).
+    assert_eq!(
+        json["scannedPackages"].as_u64(),
+        Some(1),
+        "scan should discover exactly the one gemspec-marked gem (net-http).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

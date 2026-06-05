@@ -197,4 +197,92 @@ async fn run_missing_manifest_exits_one() {
     };
     let exit = run(args).await;
     assert_eq!(exit, 1, "missing manifest must exit 1");
+
+    // Side-effect guard: the missing-manifest path must NOT fabricate a
+    // manifest (or any `.socket/` state). An implementation that created
+    // an empty manifest and then "succeeded" would otherwise look fine to
+    // an exit-code-only assertion.
+    assert!(
+        !tempdir.path().join(".socket/manifest.json").exists(),
+        "run() must not create a manifest when none exists"
+    );
+}
+
+/// Contrast partner to `run_missing_manifest_exits_one`: drives the FULL
+/// `run()` removal path (not the early manifest-not-found short-circuit) and
+/// proves it (a) exits 0 and (b) actually mutates the manifest on disk —
+/// removing the targeted entry while leaving an unrelated one intact.
+///
+/// Without this, the only `run()` coverage is an error short-circuit, so a
+/// broken `run()` that *always* returned 1 — or that returned 0 without ever
+/// touching the manifest — would still pass the suite.
+#[tokio::test]
+async fn run_removes_matching_patch_and_exits_zero() {
+    use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+    use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+    use std::collections::HashMap;
+
+    fn record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "test".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = tempdir.path().join("manifest.json");
+
+    let mut patches = HashMap::new();
+    patches.insert(
+        "pkg:npm/foo@1".to_string(),
+        record("11111111-1111-1111-1111-111111111111"),
+    );
+    patches.insert(
+        "pkg:npm/bar@2".to_string(),
+        record("22222222-2222-2222-2222-222222222222"),
+    );
+    write_manifest(&manifest_path, &PatchManifest { patches })
+        .await
+        .expect("write manifest");
+
+    let args = RemoveArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tempdir.path().to_path_buf(),
+            // Relative to cwd → resolves to the manifest we just wrote; its
+            // parent (the tempdir) is the `.socket`-equivalent lock dir.
+            manifest_path: "manifest.json".to_string(),
+            yes: true,
+            json: true,
+            // Keep the test fully offline: no telemetry network call.
+            offline: true,
+            no_telemetry: true,
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        identifier: "pkg:npm/foo@1".to_string(),
+        // Skip rollback so we exercise the manifest-mutation path without
+        // needing installed packages on disk.
+        skip_rollback: true,
+    };
+    let exit = run(args).await;
+    assert_eq!(exit, 0, "removing an existing patch must exit 0");
+
+    // The on-disk manifest must reflect the removal: `foo` gone, `bar` kept.
+    let after = read_manifest(&manifest_path)
+        .await
+        .expect("read manifest")
+        .expect("manifest still present");
+    assert!(
+        !after.patches.contains_key("pkg:npm/foo@1"),
+        "removed patch must be gone from the manifest file"
+    );
+    assert!(
+        after.patches.contains_key("pkg:npm/bar@2"),
+        "unrelated patch must remain"
+    );
+    assert_eq!(after.patches.len(), 1, "exactly one patch should remain");
 }

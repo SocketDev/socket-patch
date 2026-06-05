@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use socket_patch_core::api::blob_fetcher::DownloadMode;
 use socket_patch_cli::commands::repair::RepairArgs;
 use socket_patch_cli::{Cli, Commands};
 
@@ -43,6 +44,15 @@ fn repair_defaults_match_contract() {
     // command (was "file" in v2.x). Users that need the legacy per-file
     // blob behavior opt in with `--download-mode file`.
     assert_eq!(args.common.download_mode, "diff");
+    // The clap layer stores a raw String with no value_parser, so the
+    // assertion above only proves the literal echoes. Bind it to the real
+    // runtime validator so a regression that changes what `"diff"` *means*
+    // (or stops recognizing it) fails here too.
+    assert_eq!(
+        DownloadMode::parse(&args.common.download_mode),
+        Ok(DownloadMode::Diff),
+        "default download_mode must be the real Diff variant"
+    );
 
     // Remaining defaults from CLI_CONTRACT.md repair table.
     assert_eq!(args.common.cwd, PathBuf::from("."));
@@ -93,18 +103,48 @@ fn repair_json_flag() {
 fn repair_download_mode_file() {
     let args = parse_repair(&["--download-mode", "file"]);
     assert_eq!(args.common.download_mode, "file");
+    // The legacy per-file blob opt-in this test exists to protect: assert
+    // `"file"` is a mode the engine actually recognizes, not just an echoed
+    // string. If `File` support is dropped, this fails loudly.
+    assert_eq!(
+        DownloadMode::parse(&args.common.download_mode),
+        Ok(DownloadMode::File)
+    );
 }
 
 #[test]
 fn repair_download_mode_diff() {
     let args = parse_repair(&["--download-mode", "diff"]);
     assert_eq!(args.common.download_mode, "diff");
+    assert_eq!(
+        DownloadMode::parse(&args.common.download_mode),
+        Ok(DownloadMode::Diff)
+    );
 }
 
 #[test]
 fn repair_download_mode_package() {
     let args = parse_repair(&["--download-mode", "package"]);
     assert_eq!(args.common.download_mode, "package");
+    assert_eq!(
+        DownloadMode::parse(&args.common.download_mode),
+        Ok(DownloadMode::Package)
+    );
+}
+
+#[test]
+fn repair_download_mode_rejects_unknown_at_runtime() {
+    // The clap surface accepts ANY string for --download-mode (no
+    // value_parser); validation is deferred to `DownloadMode::parse` in the
+    // run path. Pin that two-layer contract: a bogus mode parses at the clap
+    // layer but is rejected by the validator. Without this, a test asserting
+    // only the clap echo would pass even if every mode were silently valid.
+    let args = parse_repair(&["--download-mode", "bogus"]);
+    assert_eq!(args.common.download_mode, "bogus");
+    assert!(
+        DownloadMode::parse(&args.common.download_mode).is_err(),
+        "unknown download mode must be rejected by the runtime validator"
+    );
 }
 
 #[test]
@@ -114,6 +154,10 @@ fn repair_gc_alias_defaults_match_repair() {
 
     // The whole point of the alias: identical parsing.
     assert_eq!(via_gc.common.download_mode, "diff");
+    assert_eq!(
+        DownloadMode::parse(&via_gc.common.download_mode),
+        Ok(DownloadMode::Diff)
+    );
     assert_eq!(via_gc.common.download_mode, via_repair.common.download_mode);
     assert_eq!(via_gc.common.cwd, via_repair.common.cwd);
     assert_eq!(via_gc.common.manifest_path, via_repair.common.manifest_path);

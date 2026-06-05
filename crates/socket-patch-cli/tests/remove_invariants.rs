@@ -109,7 +109,18 @@ fn remove_with_invalid_manifest_emits_error() {
     let (code, stdout) = run_remove(tmp.path(), "pkg:npm/foo@1.0.0", &[]);
     assert_eq!(code, 1, "invalid manifest must exit 1; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "error");
+    // A parse failure must be distinguished from a missing manifest, otherwise
+    // a broken loader could silently treat corrupt JSON as "not found".
+    assert_eq!(v["error"]["code"], "manifest_unreadable");
+    let msg = v["error"]["message"].as_str().expect("error message string");
+    assert!(
+        msg.contains("parse") || msg.contains("JSON"),
+        "error message should explain the parse failure; got: {msg}"
+    );
+    // Nothing was removed on the error path.
+    assert_eq!(v["summary"]["removed"], 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,15 +172,34 @@ fn remove_by_uuid_drops_matching_entry() {
 #[test]
 fn remove_event_has_required_envelope_fields() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    make_socket_dir(tmp.path());
+    let socket = make_socket_dir(tmp.path());
 
-    let (_, stdout) = run_remove(tmp.path(), "pkg:npm/__remove_test_a__@1.0.0", &[]);
+    let (code, stdout) = run_remove(tmp.path(), "pkg:npm/__remove_test_a__@1.0.0", &[]);
+    assert_eq!(code, 0, "remove must succeed; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["removed"], 1);
-    // dryRun is part of the envelope contract — must always be present.
-    assert!(v["dryRun"].is_boolean());
+    // This is a real removal (no --dry-run), so dryRun must be exactly false —
+    // not merely "a boolean". A run that secretly short-circuits to dry-run
+    // would report removed:1 while never touching the manifest.
+    assert_eq!(v["dryRun"], serde_json::Value::Bool(false));
+
+    // The event stream must name the actually-removed patch.
+    let events = v["events"].as_array().expect("events array");
+    let removed_purls: Vec<&str> = events
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["purl"].is_string())
+        .map(|e| e["purl"].as_str().unwrap())
+        .collect();
+    assert_eq!(removed_purls, vec!["pkg:npm/__remove_test_a__@1.0.0"]);
+
+    // The reported removal must be durable: the manifest on disk must reflect it.
+    let manifest = read_manifest(&socket);
+    let patches = manifest["patches"].as_object().expect("patches object");
+    assert_eq!(patches.len(), 1);
+    assert!(!patches.contains_key("pkg:npm/__remove_test_a__@1.0.0"));
+    assert!(patches.contains_key("pkg:npm/__remove_test_b__@2.0.0"));
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +227,25 @@ fn remove_honors_manifest_path_override() {
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(out.status.code(), Some(0), "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["summary"]["removed"], 1);
 
+    // The override file — not the default location — must be the one mutated,
+    // and it must drop exactly the requested entry (A), keeping B.
     let body = std::fs::read_to_string(custom_dir.join("patches.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(manifest["patches"].as_object().unwrap().len(), 1);
+    let patches = manifest["patches"].as_object().unwrap();
+    assert_eq!(patches.len(), 1);
+    assert!(!patches.contains_key("pkg:npm/__remove_test_a__@1.0.0"));
+    assert!(patches.contains_key("pkg:npm/__remove_test_b__@2.0.0"));
+
+    // The override must be honored, not silently ignored in favor of a
+    // freshly-created default manifest.
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "remove must not create a default .socket manifest when --manifest-path is given"
+    );
 }

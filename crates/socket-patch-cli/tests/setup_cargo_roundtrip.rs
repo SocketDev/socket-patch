@@ -44,12 +44,73 @@ fn stage_workspace(root: &Path) {
     std::fs::write(root.join("crates/a/build.rs"), USER_BUILD_RS).unwrap();
 }
 
+// ── independent (dependency-free) TOML probes ─────────────────────────────
+//
+// These deliberately do NOT use the production `toml_edit`/`cargo_config`
+// parsers — those are the very code paths under test, so reusing them would
+// make the oracle circular. A minimal hand-rolled scan keeps the test honest:
+// it can disagree with a broken writer.
+
+/// Return the trimmed right-hand side of `key = <rhs>` inside the `[section]`
+/// table of `doc`, scanning only until the next table header. `None` if the
+/// section or key is absent. Top-level keys use `section = ""`.
+fn toml_value_in_section(doc: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{section}]");
+    // `section == ""` means top-level (before any header).
+    let mut in_section = section.is_empty();
+    for line in doc.lines() {
+        let t = line.trim();
+        if t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        if t.starts_with('[') {
+            in_section = t == header;
+            continue;
+        }
+        if in_section {
+            if let Some((k, v)) = t.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Assert the guard dep is a real `[dependencies].socket-patch-guard` entry
+/// carrying a plausible `"<major>.<minor>"` version string — not merely a
+/// substring lurking in a comment or the wrong table.
+fn assert_guard_dep_versioned(toml: &str, who: &str) {
+    let rhs = toml_value_in_section(toml, "dependencies", "socket-patch-guard")
+        .unwrap_or_else(|| panic!("no [dependencies].socket-patch-guard in {who}:\n{toml}"));
+    // A bare version string is double-quoted; reject table/path forms that
+    // would mean setup wrote something other than a published version pin.
+    let inner = rhs
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or_else(|| {
+            panic!("guard dep in {who} is not a quoted version string: {rhs}\n{toml}")
+        });
+    let parts: Vec<&str> = inner.split('.').collect();
+    assert!(
+        parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+        "guard dep version in {who} is not a numeric major.minor: {inner:?}\n{toml}"
+    );
+}
+
 #[test]
 fn setup_check_remove_check_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     stage_workspace(root);
     let root_s = root.to_str().unwrap();
+
+    // ── check (before setup) ────────────────────────────────────────
+    // A pristine workspace is unconfigured: `--check` must report that,
+    // proving the check reads real state rather than hardcoding 0.
+    let (code, _o, _e) = run(root, &["setup", "--check", "--cwd", root_s]);
+    assert_eq!(code, 1, "setup --check should fail before setup");
 
     // ── setup ───────────────────────────────────────────────────────
     let (code, stdout, stderr) = run(root, &["setup", "--cwd", root_s, "--yes"]);
@@ -60,19 +121,22 @@ fn setup_check_remove_check_roundtrip() {
 
     let a_toml = std::fs::read_to_string(root.join("crates/a/Cargo.toml")).unwrap();
     let b_toml = std::fs::read_to_string(root.join("crates/b/Cargo.toml")).unwrap();
-    assert!(
-        a_toml.contains("socket-patch-guard"),
-        "guard dep missing from a:\n{a_toml}"
-    );
-    assert!(
-        b_toml.contains("socket-patch-guard"),
-        "guard dep missing from b:\n{b_toml}"
-    );
+    // Guard must be a real, version-pinned [dependencies] entry in BOTH
+    // members (b started with no [dependencies] table at all, so this also
+    // proves setup created the table correctly).
+    assert_guard_dep_versioned(&a_toml, "crates/a/Cargo.toml");
+    assert_guard_dep_versioned(&b_toml, "crates/b/Cargo.toml");
 
     let config = std::fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
-    assert!(
-        config.contains("[env]") && config.contains("SOCKET_PATCH_ROOT"),
-        "[env] SOCKET_PATCH_ROOT missing:\n{config}"
+    // The [env] entry must carry the exact relative-root spec the build-time
+    // guard relies on (`{ value = ".", relative = true }`) — not just the key
+    // name with an arbitrary/empty/absolute value.
+    let env_rhs = toml_value_in_section(&config, "env", "SOCKET_PATCH_ROOT")
+        .unwrap_or_else(|| panic!("[env] SOCKET_PATCH_ROOT missing:\n{config}"));
+    let normalized: String = env_rhs.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalized, r#"{ value = ".", relative = true }"#,
+        "[env] SOCKET_PATCH_ROOT must be the relative project-root spec, got: {env_rhs}\n{config}"
     );
 
     // The user's build.rs is untouched, byte-for-byte.
@@ -92,21 +156,22 @@ fn setup_check_remove_check_roundtrip() {
         code, 0,
         "setup --remove failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    let a_toml = std::fs::read_to_string(root.join("crates/a/Cargo.toml")).unwrap();
+    let b_toml = std::fs::read_to_string(root.join("crates/b/Cargo.toml")).unwrap();
     assert!(
-        !std::fs::read_to_string(root.join("crates/a/Cargo.toml"))
-            .unwrap()
-            .contains("socket-patch-guard"),
-        "guard dep should be removed from a"
+        toml_value_in_section(&a_toml, "dependencies", "socket-patch-guard").is_none()
+            && !a_toml.contains("socket-patch-guard"),
+        "guard dep should be removed from a:\n{a_toml}"
     );
     assert!(
-        !std::fs::read_to_string(root.join("crates/b/Cargo.toml"))
-            .unwrap()
-            .contains("socket-patch-guard"),
-        "guard dep should be removed from b"
+        toml_value_in_section(&b_toml, "dependencies", "socket-patch-guard").is_none()
+            && !b_toml.contains("socket-patch-guard"),
+        "guard dep should be removed from b:\n{b_toml}"
     );
     let config = std::fs::read_to_string(root.join(".cargo/config.toml")).unwrap_or_default();
     assert!(
-        !config.contains("SOCKET_PATCH_ROOT"),
+        toml_value_in_section(&config, "env", "SOCKET_PATCH_ROOT").is_none()
+            && !config.contains("SOCKET_PATCH_ROOT"),
         "[env] root should be removed:\n{config}"
     );
 
@@ -114,6 +179,7 @@ fn setup_check_remove_check_roundtrip() {
     assert_eq!(
         std::fs::read_to_string(root.join("crates/a/build.rs")).unwrap(),
         USER_BUILD_RS,
+        "setup --remove must never modify a user's build.rs"
     );
 
     // ── check (needs configuration) ─────────────────────────────────

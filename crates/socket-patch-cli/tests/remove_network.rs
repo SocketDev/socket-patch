@@ -130,6 +130,23 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
         !manifest_has_entry(&socket),
         "online remove must drop the manifest entry; stdout=\n{stdout}"
     );
+
+    // The whole point of this test (and what gives the `--offline` test its
+    // teeth) is that the online path ACTUALLY downloads the missing blob.
+    // Verify the mock was hit for the exact beforeHash; a path that succeeds
+    // without ever fetching would otherwise leave this guarantee unproven.
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{before_hash}");
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    let fetched = reqs.iter().filter(|r| r.url.path() == blob_path).count();
+    assert!(
+        fetched >= 1,
+        "online remove must fetch the missing beforeHash blob ({blob_path}); \
+         observed request paths={:?}",
+        reqs.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
 }
 
 /// `--offline` must NOT contact the network: with the beforeHash blob
@@ -161,5 +178,23 @@ async fn remove_offline_does_not_fetch_and_keeps_entry() {
     assert!(
         manifest_has_entry(&socket),
         "remove --offline must NOT delete the entry when rollback can't run; stdout=\n{stdout}"
+    );
+
+    // The strict-airgap contract is "never contact the network on ANY
+    // command". Exit code + preserved entry alone don't prove that: a
+    // regressed binary could fetch the (armed) blob and still fail rollback
+    // downstream for some other reason. Assert the mock saw NO traffic at
+    // all — this is what actually makes the test name ("does_not_fetch")
+    // true and catches the original `offline = false` hardcode.
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    assert!(
+        reqs.is_empty(),
+        "remove --offline must not contact the network at all; observed requests={:?}",
+        reqs.iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_string()))
+            .collect::<Vec<_>>()
     );
 }

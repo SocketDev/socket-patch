@@ -38,6 +38,46 @@ async fn mock_batch_empty(server: &MockServer) {
         .await;
 }
 
+/// Collect the raw bodies of every POST to the batch search endpoint.
+///
+/// `scan` exits 0 even when it discovers nothing, so the exit code alone
+/// never proves the crawler found the planted package. The observable
+/// proof of discovery is the PURL the crawler ships to `/patches/batch`;
+/// these helpers assert on that instead of trusting the exit code.
+async fn batch_bodies(server: &MockServer) -> Vec<String> {
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request recording is enabled by default");
+    requests
+        .iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect()
+}
+
+/// Assert the crawler discovered `purl` and sent it to the batch endpoint.
+fn assert_discovered(bodies: &[String], purl: &str) {
+    assert!(
+        !bodies.is_empty(),
+        "crawler never queried the batch endpoint — nothing was discovered \
+         (expected PURL {purl})"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains(purl)),
+        "batch request did not include discovered PURL {purl}; bodies: {bodies:?}"
+    );
+}
+
+/// Assert `needle` was NOT shipped to the batch endpoint (nothing spurious
+/// discovered). `needle` may be a full PURL or a `pkg:pypi/` prefix.
+fn assert_not_discovered(bodies: &[String], needle: &str) {
+    assert!(
+        !bodies.iter().any(|b| b.contains(needle)),
+        "unexpectedly discovered {needle}; bodies: {bodies:?}"
+    );
+}
+
 fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -78,6 +118,7 @@ async fn pypi_venv_layout_discovered() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +136,10 @@ async fn pypi_venv_python312_layout_discovered() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_discovered(
+        &batch_bodies(&server).await,
+        "pkg:pypi/venv-pkg-312@1.0.0",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +157,10 @@ async fn pypi_venv_python313_layout_discovered() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_discovered(
+        &batch_bodies(&server).await,
+        "pkg:pypi/venv-pkg-313@1.0.0",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +170,19 @@ async fn pypi_venv_python313_layout_discovered() {
 #[tokio::test]
 #[serial]
 async fn pypi_alternate_venv_dir_names() {
-    for venv_name in &["env", "venv", ".env"] {
+    // Contract per the crawler's documented search list (VIRTUAL_ENV,
+    // `.venv`, `venv`): ONLY `venv` here is a recognized local venv dir
+    // name. `env` and `.env` are NOT scanned, so their packages must not
+    // be discovered. (The original test claimed all three were discovered
+    // but only asserted exit 0, which is always true regardless.)
+    //
+    // (venv dir name, PEP 503 canonical PURL, whether it should be found).
+    // `alt_env`/`alt_.env` both canonicalize to `alt-env`.
+    for (venv_name, expected_purl, should_find) in &[
+        ("env", "pkg:pypi/alt-env@1.0.0", false),
+        ("venv", "pkg:pypi/alt-venv@1.0.0", true),
+        (".env", "pkg:pypi/alt-env@1.0.0", false),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let site = tmp
             .path()
@@ -133,7 +194,14 @@ async fn pypi_alternate_venv_dir_names() {
         let server = MockServer::start().await;
         mock_batch_empty(&server).await;
         let res = scan_run(default_args(tmp.path(), server.uri())).await;
-        assert_eq!(res, 0, "venv name {venv_name} should be discovered");
+        assert_eq!(res, 0, "venv name {venv_name} should scan cleanly");
+
+        let bodies = batch_bodies(&server).await;
+        if *should_find {
+            assert_discovered(&bodies, expected_purl);
+        } else {
+            assert_not_discovered(&bodies, expected_purl);
+        }
     }
 }
 
@@ -157,6 +225,13 @@ async fn pypi_virtual_env_env_var_override() {
     let res = scan_run(default_args(tmp.path(), server.uri())).await;
     std::env::remove_var("VIRTUAL_ENV");
     assert_eq!(res, 0);
+    // `custom-venv` is not one of the standard scanned dir names, so the
+    // package can only be found by honoring $VIRTUAL_ENV. Discovery of its
+    // PURL is the proof that the override path actually ran.
+    assert_discovered(
+        &batch_bodies(&server).await,
+        "pkg:pypi/venv-override@1.0.0",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +256,9 @@ async fn pypi_dist_info_only_layout() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    // A package with no source dir is still a real install and must be
+    // discovered from its dist-info alone.
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/dist-only@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +283,11 @@ async fn pypi_canonical_name_normalization() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    let bodies = batch_bodies(&server).await;
+    // Must be canonicalized to lowercase before hitting the API...
+    assert_discovered(&bodies, "pkg:pypi/sqlalchemy@2.0.30");
+    // ...and the raw mixed-case form must NOT leak through.
+    assert_not_discovered(&bodies, "pkg:pypi/SQLAlchemy@2.0.30");
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +310,10 @@ async fn pypi_multiple_python_versions_in_venvs() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    // BOTH venvs must be scanned — discovering only one would still exit 0.
+    let bodies = batch_bodies(&server).await;
+    assert_discovered(&bodies, "pkg:pypi/pkg311@1.0.0");
+    assert_discovered(&bodies, "pkg:pypi/pkg312@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +331,9 @@ async fn pypi_empty_site_packages_safe() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    // Nothing on disk => nothing may be shipped to the API. Guards against
+    // a crawler that invents phantom packages from an empty site-packages.
+    assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/");
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +346,12 @@ async fn pypi_malformed_metadata_handled_gracefully() {
     let tmp = tempfile::tempdir().unwrap();
     let site = tmp.path().join(".venv/lib/python3.11/site-packages");
     std::fs::create_dir_all(&site).unwrap();
-    // dist-info with missing Name/Version fields — crawler should skip.
+    // dist-info with a METADATA file that has no Name/Version headers.
+    // The crawler does NOT skip it: by design it falls back to parsing the
+    // `<name>-<version>.dist-info` directory name so a corrupt/partial
+    // install stays visible to a tool whose job is to patch it. So
+    // `malformed-1.0.0.dist-info` is still discovered as
+    // `pkg:pypi/malformed@1.0.0`.
     let dist = site.join("malformed-1.0.0.dist-info");
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::write(dist.join("METADATA"), "Not a real METADATA file").unwrap();
@@ -264,6 +359,7 @@ async fn pypi_malformed_metadata_handled_gracefully() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/malformed@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +372,11 @@ async fn pypi_egg_info_layout_handled() {
     let tmp = tempfile::tempdir().unwrap();
     let site = tmp.path().join(".venv/lib/python3.11/site-packages");
     std::fs::create_dir_all(&site).unwrap();
-    // egg-info — older format. Crawler may or may not handle it; we
-    // just check it doesn't crash.
+    // egg-info — older format. The crawler only recognizes `.dist-info`
+    // dirs, so the egg-info package is NOT discovered. Pin that current
+    // contract: scan exits cleanly (like the empty-site-packages case) and
+    // ships no PURL for it. If egg-info support is added later this fails
+    // loudly and the assertion should be flipped to `assert_discovered`.
     let egg = site.join("legacy_pkg-1.0.0.egg-info");
     std::fs::create_dir_all(&egg).unwrap();
     std::fs::write(
@@ -289,5 +388,9 @@ async fn pypi_egg_info_layout_handled() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     let res = scan_run(default_args(tmp.path(), server.uri())).await;
-    assert!(res == 0 || res == 1, "egg-info layout must not crash");
+    assert_eq!(res, 0, "egg-info layout must scan cleanly without crashing");
+    // Not discovered today; neither the canonical nor raw name may appear.
+    let bodies = batch_bodies(&server).await;
+    assert_not_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
+    assert_not_discovered(&bodies, "pkg:pypi/legacy_pkg@1.0.0");
 }

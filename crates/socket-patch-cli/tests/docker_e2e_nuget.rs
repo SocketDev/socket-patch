@@ -64,6 +64,15 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Plain SHA-256 of the bytes (what `sha256sum` in the container
+/// reports). Used to verify the patched file's EXACT contents, not just
+/// that it contains the marker substring.
+fn plain_sha256(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
 async fn make_mock_server(after_hash: &str) -> MockServer {
     let listener =
         std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
@@ -127,10 +136,14 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     server
 }
 
-fn local_script(api_url: &str) -> String {
+fn local_script(api_url: &str, expected_sha: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
+# No `set -e`: we capture every stage's exit code and gate on it
+# explicitly so a crashing/no-op scan or apply fails loud instead of
+# being masked by the final marker grep.
 set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG} --ecosystems nuget)
 
 mkdir -p /workspace/proj && cd /workspace/proj
 dotnet new console --force --output . > /dev/null 2>&1
@@ -148,17 +161,71 @@ LICENSE_FILE="$NUGET_PACKAGES/newtonsoft.json/13.0.3/LICENSE.md"
 [ -f "$LICENSE_FILE" ] || {{ echo "FAIL: $LICENSE_FILE missing" >&2; ls "$NUGET_PACKAGES/newtonsoft.json/13.0.3/" >&2 || true; exit 1; }}
 echo "Installed to: $LICENSE_FILE" >&2
 
-socket-patch scan --json --sync --yes \
-  --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems nuget 2>/tmp/sync.err
-cat /tmp/sync.err >&2
+# The unpatched LICENSE must NOT already contain our synthetic marker —
+# otherwise the post-apply grep would be vacuously true.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
+  echo "FAIL: pristine LICENSE.md already contains the marker (fixture broken)" >&2
+  exit 1
+fi
 
-socket-patch apply --json --force --offline --ecosystems nuget 2>/tmp/apply.err
-cat /tmp/apply.err >&2
+# 1. Discovery scan (no --sync): a clean exit alone proves nothing (a
+#    no-op scan also exits 0), so gate on exit==0 AND the installed PURL
+#    AND the available patch UUID actually appearing in the JSON.
+socket-patch scan --json "${{COMMON_ARGS[@]}}" >/tmp/scan.out 2>/tmp/scan.err
+SCAN_RC=$?
+echo "scan exit=$SCAN_RC" >&2
+cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --json did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
 
+# 2. scan --sync writes the manifest and downloads the patch blob. It
+#    may exit non-zero here: the un-forced sync-apply hits a HashMismatch
+#    because the fixture's placeholder beforeHash doesn't match the real
+#    installed bytes. That's expected — the separate forced apply below
+#    is what actually writes the patch, so we only log sync's exit code.
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+echo "sync exit=$?" >&2
+cat /tmp/sync.out >&2 || true
+cat /tmp/sync.err >&2 || true
+
+# 3. apply must report success (exit 0) — not merely leave a marker
+#    behind while reporting partial failure.
+socket-patch apply --json --force --offline --ecosystems nuget >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.out >&2 || true
+cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
+
+# 4. The on-disk file must EXACTLY equal the served blob — not merely
+#    contain the marker substring (which a partial/corrupt write could).
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
   echo "FAIL: marker not in $LICENSE_FILE" >&2
   head -3 "$LICENSE_FILE" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$LICENSE_FILE" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
+  echo "FAIL: patched LICENSE.md bytes differ from served blob" >&2
+  echo "  expected={expected_sha}" >&2
+  echo "  actual  =$ACTUAL_SHA" >&2
   exit 1
 fi
 
@@ -169,10 +236,12 @@ exit 0
     )
 }
 
-fn global_script(api_url: &str) -> String {
+fn global_script(api_url: &str, expected_sha: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
+# No `set -e`: exit codes are gated explicitly (see local_script).
 set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG} --global --ecosystems nuget)
 
 # Default `dotnet add package` populates ~/.nuget/packages.
 mkdir -p /workspace/proj && cd /workspace/proj
@@ -185,21 +254,68 @@ LICENSE_FILE="$HOME/.nuget/packages/newtonsoft.json/13.0.3/LICENSE.md"
 [ -f "$LICENSE_FILE" ] || {{ echo "FAIL: $LICENSE_FILE missing" >&2; ls "$HOME/.nuget/packages/newtonsoft.json/13.0.3/" >&2 || true; exit 1; }}
 echo "Global-installed at: $LICENSE_FILE" >&2
 
+# Pristine LICENSE must not already carry the marker.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
+  echo "FAIL: pristine LICENSE.md already contains the marker (fixture broken)" >&2
+  exit 1
+fi
+
 # Empty cwd — --global tells socket-patch to scan the global cache,
 # ignoring cwd-relative discovery.
 mkdir -p /workspace/empty && cd /workspace/empty
 
-socket-patch scan --json --sync --yes --global \
-  --api-url '{api_url}' --api-token fake --org {ORG} \
-  --ecosystems nuget 2>/tmp/sync.err
-cat /tmp/sync.err >&2
+# 1. Discovery scan: gate exit==0 and PURL + UUID present in JSON.
+socket-patch scan --json "${{COMMON_ARGS[@]}}" >/tmp/scan.out 2>/tmp/scan.err
+SCAN_RC=$?
+echo "scan exit=$SCAN_RC" >&2
+cat /tmp/scan.err >&2 || true
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "FAIL: scan exited $SCAN_RC (expected 0)" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{PURL}' /tmp/scan.out; then
+  echo "FAIL: scan --json --global did not report the installed PURL {PURL}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+if ! grep -q '{UUID}' /tmp/scan.out; then
+  echo "FAIL: scan --json --global did not report available patch UUID {UUID}" >&2
+  cat /tmp/scan.out >&2
+  exit 1
+fi
+echo "===SCAN VERIFIED===" >&2
 
-socket-patch apply --json --force --offline --global --ecosystems nuget 2>/tmp/apply.err
-cat /tmp/apply.err >&2
+# 2. scan --sync. May exit non-zero (un-forced sync-apply HashMismatch
+#    against the fixture's placeholder beforeHash); the forced apply
+#    below is what writes the patch, so only log sync's exit code.
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+echo "sync exit=$?" >&2
+cat /tmp/sync.out >&2 || true
+cat /tmp/sync.err >&2 || true
 
+# 3. apply must exit 0.
+socket-patch apply --json --force --offline --global --ecosystems nuget >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.out >&2 || true
+cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
+
+# 4. Exact-bytes verification, not just substring.
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
   echo "FAIL: marker not in $LICENSE_FILE" >&2
   head -3 "$LICENSE_FILE" >&2
+  exit 1
+fi
+ACTUAL_SHA=$(sha256sum "$LICENSE_FILE" | cut -d' ' -f1)
+if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
+  echo "FAIL: patched LICENSE.md bytes differ from served blob" >&2
+  echo "  expected={expected_sha}" >&2
+  echo "  actual  =$ACTUAL_SHA" >&2
   exit 1
 fi
 
@@ -253,40 +369,70 @@ fn run_container(script: &str) -> std::process::Output {
     cmd.output().expect("docker run")
 }
 
+/// Assert the wiremock actually served BOTH the metadata discovery
+/// (batch) AND the patch-content fetch (view). Without the latter, the
+/// download→apply content path never ran even if a marker somehow
+/// appeared on disk, so this proves the real network code path executed.
+async fn assert_api_path_exercised(server: &MockServer) {
+    let received = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<String> = received.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("/patches/batch")),
+        "scan should have called /patches/batch; received={paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains("/patches/view/")),
+        "scan --sync should have fetched patch content via /patches/view/; received={paths:#?}"
+    );
+}
+
 #[tokio::test]
 async fn nuget_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_LICENSE);
+    let expected_sha = plain_sha256(PATCHED_LICENSE);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&local_script(&api_url));
+    let out = run_container(&local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "nuget local apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // Each marker is emitted only after its in-script gate passed.
+    assert!(
+        stderr.contains("===SCAN VERIFIED==="),
+        "scan did not discover the patch (===SCAN VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 #[tokio::test]
 async fn nuget_global_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_LICENSE);
+    let expected_sha = plain_sha256(PATCHED_LICENSE);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
     if skip_if_no_image() {
         return;
     }
-    let out = run_container(&global_script(&api_url));
+    let out = run_container(&global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
         "nuget global apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    assert!(
+        stderr.contains("===SCAN VERIFIED==="),
+        "scan did not discover the patch (===SCAN VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }

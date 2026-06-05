@@ -122,7 +122,7 @@ fn setup_interactive_y_proceeds_with_update() {
 
     // Without --yes, setup prompts "Proceed with these changes? (y/N): ".
     // Sending "y\n" should make it proceed with the update.
-    let (code, _output) = run_in_pty(
+    let (code, output) = run_in_pty(
         &["setup"],
         tmp.path(),
         "y\n",
@@ -130,11 +130,31 @@ fn setup_interactive_y_proceeds_with_update() {
     );
     assert_eq!(code, 0, "setup with 'y' must succeed");
 
-    // package.json should have been updated.
-    let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    // The interactive prompt MUST have actually run — otherwise this test
+    // would pass against a regression that drops the TTY gate and
+    // auto-proceeds, never exercising the path this file is named for.
     assert!(
-        pkg.contains("socket-patch"),
-        "setup must have written postinstall script; got: {pkg}"
+        output.contains("Proceed with these changes?"),
+        "setup must have shown the interactive confirm prompt; got: {output}"
+    );
+    // A regression that took the non-interactive auto-proceed branch would
+    // print this banner instead of prompting; it must NOT appear.
+    assert!(
+        !output.contains("Non-interactive mode detected"),
+        "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+
+    // package.json should have been updated with a real postinstall hook
+    // that invokes socket-patch (not merely mention the string somewhere).
+    let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&pkg)
+        .unwrap_or_else(|e| panic!("setup must leave valid JSON; err={e}; got: {pkg}"));
+    let postinstall = parsed["scripts"]["postinstall"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup must write scripts.postinstall; got: {pkg}"));
+    assert!(
+        postinstall.contains("socket-patch"),
+        "postinstall must invoke socket-patch; got: {postinstall}"
     );
 }
 
@@ -152,9 +172,23 @@ fn setup_interactive_n_aborts_without_update() {
         Duration::from_secs(15),
     );
     assert_eq!(code, 0, "setup with 'n' must exit cleanly");
+    // The interactive prompt MUST have run, then aborted.
     assert!(
-        output.contains("Aborted") || output.contains("aborted"),
+        output.contains("Proceed with these changes?"),
+        "setup must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode detected"),
+        "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Aborted"),
         "setup must print abort message; got: {output}"
+    );
+    // It must NOT have started applying changes.
+    assert!(
+        !output.contains("Applying changes..."),
+        "setup 'n' must abort before applying; got: {output}"
     );
 
     // package.json must be unchanged.
@@ -170,13 +204,32 @@ fn setup_interactive_default_no_aborts() {
 "#;
     std::fs::write(tmp.path().join("package.json"), original).unwrap();
 
-    let (code, _output) = run_in_pty(
+    let (code, output) = run_in_pty(
         &["setup"],
         tmp.path(),
         "\n",
         Duration::from_secs(15),
     );
     assert_eq!(code, 0);
+    // The prompt MUST have run; bare Enter must hit the default-N abort.
+    // Without these, the test passes vacuously if setup never prompts and
+    // simply no-ops, never proving the default is "No".
+    assert!(
+        output.contains("Proceed with these changes?"),
+        "setup must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode detected"),
+        "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Aborted"),
+        "bare-Enter must default to N and print abort; got: {output}"
+    );
+    assert!(
+        !output.contains("Applying changes..."),
+        "default-N must abort before applying; got: {output}"
+    );
     let pkg = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
     assert_eq!(pkg, original, "default-N must not modify package.json");
 }
@@ -210,23 +263,35 @@ fn remove_interactive_y_proceeds() {
     let tmp = tempfile::tempdir().unwrap();
     write_remove_manifest(tmp.path());
 
-    let (code, _output) = run_in_pty(
+    let (code, output) = run_in_pty(
         &["remove", "pkg:npm/__interactive_remove__@1.0.0", "--skip-rollback"],
         tmp.path(),
         "y\n",
         Duration::from_secs(15),
     );
     assert_eq!(code, 0);
-    // Manifest should be empty now.
+    // The interactive confirm MUST have run (printed to the tty via stderr),
+    // not the non-interactive auto-default branch.
+    assert!(
+        output.contains("Remove") && output.contains("patch(es)"),
+        "remove must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode"),
+        "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Removed"),
+        "remove 'y' must report what it removed; got: {output}"
+    );
+    // Manifest should be empty now: the `patches` object must exist and be
+    // empty (not merely "missing", which a corrupt rewrite could produce).
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        manifest["patches"]
-            .as_object()
-            .map(|p| p.is_empty())
-            .unwrap_or(false),
-        "remove 'y' must drop the entry; got: {body}"
-    );
+    let patches = manifest["patches"]
+        .as_object()
+        .unwrap_or_else(|| panic!("manifest must keep a 'patches' object; got: {body}"));
+    assert!(patches.is_empty(), "remove 'y' must drop the entry; got: {body}");
 }
 
 #[test]
@@ -234,22 +299,47 @@ fn remove_interactive_n_cancels() {
     let tmp = tempfile::tempdir().unwrap();
     write_remove_manifest(tmp.path());
 
-    let (code, _output) = run_in_pty(
+    let (code, output) = run_in_pty(
         &["remove", "pkg:npm/__interactive_remove__@1.0.0", "--skip-rollback"],
         tmp.path(),
         "n\n",
         Duration::from_secs(15),
     );
     assert_eq!(code, 0, "remove 'n' must exit cleanly");
-    // Manifest must still have the entry.
+    // The interactive confirm MUST have run and the cancellation path taken.
+    assert!(
+        output.contains("Remove") && output.contains("patch(es)"),
+        "remove must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode"),
+        "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Removal cancelled"),
+        "remove 'n' must report cancellation; got: {output}"
+    );
+    assert!(
+        !output.contains("Removed"),
+        "remove 'n' must not report any removal; got: {output}"
+    );
+    // Manifest must still have the SPECIFIC entry intact. The previous
+    // `.unwrap_or(true)` silently passed even if `patches` was wiped/missing,
+    // which is exactly the regression this test must catch.
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let patches = manifest["patches"]
+        .as_object()
+        .unwrap_or_else(|| panic!("remove 'n' must keep the 'patches' object; got: {body}"));
     assert!(
-        manifest["patches"]
-            .as_object()
-            .map(|p| !p.is_empty())
-            .unwrap_or(true),
-        "remove 'n' must leave manifest intact"
+        patches.contains_key("pkg:npm/__interactive_remove__@1.0.0"),
+        "remove 'n' must leave the exact entry intact; got: {body}"
+    );
+    // And the entry's contents must be preserved byte-for-byte.
+    let original: serde_json::Value = serde_json::from_str(REMOVE_MANIFEST).unwrap();
+    assert_eq!(
+        manifest, original,
+        "remove 'n' must not mutate the manifest at all"
     );
 }
 
@@ -268,8 +358,10 @@ fn apply_in_pty_with_no_manifest_prints_friendly_message() {
         Duration::from_secs(15),
     );
     assert_eq!(code, 0);
+    // Assert the full message, not either half of it. The `||` previously
+    // let a truncated/garbled message ("...skipping...") pass.
     assert!(
-        output.contains("No .socket folder") || output.contains("skipping"),
-        "PTY apply no-manifest must print friendly message; got: {output}"
+        output.contains("No .socket folder found, skipping patch application."),
+        "PTY apply no-manifest must print the friendly message; got: {output}"
     );
 }

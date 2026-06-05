@@ -283,10 +283,34 @@ fn rollback_restores_file_to_before_content() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["rolledBack"], 1);
+    assert_eq!(v["failed"], 0, "no file should fail to roll back; stdout={stdout}");
+    assert_eq!(v["alreadyOriginal"], 0, "file was patched, not original");
+    assert_eq!(v["dryRun"], false, "live rollback, not dry-run");
+    // The single result must name our package and actually list the restored file.
+    let results = v["results"].as_array().expect("results array");
+    let entry = results
+        .iter()
+        .find(|r| r["purl"] == "pkg:npm/rollback-target@1.0.0")
+        .unwrap_or_else(|| panic!("missing result entry; stdout={stdout}"));
+    assert_eq!(entry["success"], true);
+    let rolled = entry["filesRolledBack"]
+        .as_array()
+        .expect("filesRolledBack array");
+    assert!(
+        rolled.iter().any(|f| f == "package/index.js"),
+        "index.js must be listed as rolled back; stdout={stdout}"
+    );
 
-    // The file in node_modules should now contain the BEFORE bytes.
+    // The file in node_modules should now contain the BEFORE bytes...
     let restored = std::fs::read(pkg_dir.join("index.js")).unwrap();
     assert_eq!(restored, before, "rollback must restore BEFORE content");
+    // ...and its hash must match the manifest beforeHash (independent oracle,
+    // not just byte-equality to the fixture constant).
+    assert_eq!(
+        git_sha256(&restored),
+        before_hash,
+        "restored content must hash to the manifest beforeHash"
+    );
 }
 
 #[test]
@@ -415,7 +439,48 @@ fn rollback_dry_run_does_not_modify_file() {
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "dry-run must exit 0; stdout={stdout}; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Exit-0 + unchanged-file alone would also be satisfied by a dry-run that
+    // silently discovered nothing. Prove the rollback was actually *previewed*:
+    // the package must be discovered, flagged dryRun, and reported as a file
+    // that WOULD be rolled back (no actual rollback performed).
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "dry-run status; stdout={stdout}");
+    assert_eq!(v["dryRun"], true, "dry-run must set dryRun=true");
+    // Nothing is actually written in a dry run.
+    assert_eq!(v["rolledBack"], 0, "dry-run must not roll anything back");
+    assert_eq!(v["failed"], 0, "dry-run must not record failures");
+    let results = v["results"].as_array().expect("results array");
+    let entry = results
+        .iter()
+        .find(|r| r["purl"] == "pkg:npm/dry-target@1.0.0")
+        .unwrap_or_else(|| panic!("dry-run must discover the installed package; stdout={stdout}"));
+    assert_eq!(entry["success"], true, "discovered package entry must be success");
+    let verified = entry["filesVerified"]
+        .as_array()
+        .expect("filesVerified array");
+    let file = verified
+        .iter()
+        .find(|f| f["file"] == "package/index.js")
+        .expect("index.js must appear in filesVerified");
+    // "ready" means the engine confirmed it COULD restore this file (current
+    // hash matches the patched AFTER state, before blob available) — i.e. it
+    // genuinely walked the rollback path, just stopping short of writing.
+    assert_eq!(
+        file["status"], "ready",
+        "dry-run must report the file as ready-to-roll-back; stdout={stdout}"
+    );
+    assert_eq!(
+        file["targetHash"], before_hash,
+        "dry-run must target the BEFORE hash"
+    );
 
     // Dry-run must NOT modify the file.
     let content = std::fs::read(pkg_dir.join("index.js")).unwrap();
@@ -446,8 +511,21 @@ fn rollback_honors_manifest_path_override() {
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
-    assert_eq!(v["status"], "success");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "manifest-path override must load + succeed; stdout={stdout}; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // There is NO default `.socket/manifest.json` here, so a "success" status
+    // can only mean the override path was honored — had it been ignored, the
+    // command would have hit the no-manifest error path instead.
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert!(v["error"].is_null(), "no error expected; stdout={stdout}");
+    // No installed packages match, so the run is a clean zero-work success.
+    assert_eq!(v["rolledBack"], 0);
+    assert_eq!(v["failed"], 0);
+    assert_eq!(v["alreadyOriginal"], 0);
 }

@@ -145,6 +145,23 @@ where
     None
 }
 
+/// `(device, inode)` identity of the file at `path`, following
+/// symlinks (so a pnpm `node_modules/<pkg>` symlink resolves to the
+/// hardlinked store file it points at). Two paths sharing this pair
+/// are the *same physical bytes on disk* — the precondition that makes
+/// every "store/proj_b stayed unchanged" assertion in this suite
+/// meaningful. Without it, an install that silently produced
+/// independent COPIES (hardlink flag ignored, or a filesystem without
+/// hardlink support) would keep the store/proj_b unchanged *for free*,
+/// and a totally absent CoW defense would still pass green.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    (md.dev(), md.ino())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 /// Sanity: post-install, `node_modules/minimist` in proj_a is a
@@ -176,11 +193,36 @@ fn pnpm_install_produces_symlinked_layout() {
         "fresh pnpm install should give us the unpatched minimist"
     );
 
-    let original_bytes = std::fs::read(&index_a).unwrap();
-    assert!(
-        find_store_file_with_content(&fx.store_dir, &original_bytes).is_some(),
-        "store should contain a file matching proj_a's index.js"
+    let index_b = fx.index_js_in(&fx.proj_b);
+    assert_eq!(
+        git_sha256_file(&index_b),
+        BEFORE_HASH,
+        "fresh pnpm install should give proj_b the unpatched minimist too"
     );
+
+    let original_bytes = std::fs::read(&index_a).unwrap();
+    let store_copy = find_store_file_with_content(&fx.store_dir, &original_bytes)
+        .expect("store should contain a file matching proj_a's index.js");
+
+    // The fixture's whole point is a SHARED inode: the store file, and
+    // both projects' resolved index.js, must be the same physical bytes
+    // (hardlinks). If this fails, the install produced copies and every
+    // "unchanged after apply" assertion in this suite is vacuous.
+    #[cfg(unix)]
+    {
+        let store_id = file_identity(&store_copy);
+        assert_eq!(
+            file_identity(&index_a),
+            store_id,
+            "proj_a's index.js must be hardlinked to the store entry \
+             (got distinct inodes — pnpm produced copies, not hardlinks)"
+        );
+        assert_eq!(
+            file_identity(&index_b),
+            store_id,
+            "proj_b's index.js must be hardlinked to the same store entry"
+        );
+    }
 }
 
 /// **Headline test**: socket-patch apply in proj_a patches proj_a,
@@ -214,6 +256,27 @@ fn apply_in_a_does_not_mutate_b_or_store() {
     let store_hash_before = git_sha256_file(&store_copy);
     assert_eq!(store_hash_before, BEFORE_HASH);
 
+    // Precondition that gives the test its teeth: proj_a, proj_b and the
+    // store entry are all the SAME inode pre-apply. If they aren't, the
+    // install produced copies and the post-apply "unchanged" checks
+    // would pass even with no CoW defense at all.
+    #[cfg(unix)]
+    let store_id_before = {
+        let store_id = file_identity(&store_copy);
+        assert_eq!(
+            file_identity(&index_a),
+            store_id,
+            "pre-apply: proj_a's index.js must be hardlinked to the store entry \
+             (distinct inodes => copies, not hardlinks => test proves nothing)"
+        );
+        assert_eq!(
+            file_identity(&index_b),
+            store_id,
+            "pre-apply: proj_b's index.js must share the store entry's inode"
+        );
+        store_id
+    };
+
     // -- get + apply in proj_a only ----------------------------------
     assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
 
@@ -238,6 +301,34 @@ fn apply_in_a_does_not_mutate_b_or_store() {
         BEFORE_HASH,
         "pnpm store entry must stay unpatched. CoW failure?"
     );
+
+    // Inode-level proof that CoW actually fired rather than the bytes
+    // merely being independent: patching A must have given it a NEW
+    // inode (the hardlink was broken), while the store entry and proj_b
+    // keep the original shared inode. A regression that wrote through
+    // the shared inode in place would leave A's inode equal to the
+    // store's and trip the byte assertions above; a regression that
+    // somehow left A on the old inode but with new bytes would trip
+    // this one.
+    #[cfg(unix)]
+    {
+        let index_a_after = file_identity(&index_a);
+        assert_ne!(
+            index_a_after, store_id_before,
+            "post-apply: proj_a must have a NEW inode — CoW should have broken \
+             the hardlink, not mutated the shared store inode in place"
+        );
+        assert_eq!(
+            file_identity(&store_copy),
+            store_id_before,
+            "post-apply: the store inode must be untouched"
+        );
+        assert_eq!(
+            file_identity(&index_b),
+            store_id_before,
+            "post-apply: proj_b must still reference the original shared inode"
+        );
+    }
 }
 
 /// After `apply_in_a_does_not_mutate_b_or_store`, running
@@ -303,12 +394,19 @@ fn apply_in_pnpm_project_emits_layout_note() {
     let (_stdout, stderr) =
         assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
 
-    // The exact phrasing is a stable contract — assert on the
-    // distinctive substring "pnpm" appearing in the user-facing
-    // stderr message. (apply.rs emits "Note: pnpm layout detected.
-    // Copy-on-write will keep the global store untouched.")
+    // The exact phrasing is a stable contract. A bare `contains("pnpm")`
+    // is worthless here — every pnpm store path printed on stderr
+    // (`.pnpm-store`, `node_modules/.pnpm/...`) contains "pnpm", so that
+    // check would survive deleting the note entirely. Pin the
+    // distinctive note text apply.rs emits: "Note: pnpm layout detected.
+    // Copy-on-write will keep the global store untouched."
+    let lower = stderr.to_lowercase();
     assert!(
-        stderr.to_lowercase().contains("pnpm"),
-        "apply against a pnpm project should mention pnpm in stderr.\nstderr:\n{stderr}"
+        lower.contains("pnpm layout detected"),
+        "apply against a pnpm project should emit the pnpm-layout note.\nstderr:\n{stderr}"
+    );
+    assert!(
+        lower.contains("copy-on-write") && lower.contains("store"),
+        "the pnpm-layout note should explain the CoW/store guarantee.\nstderr:\n{stderr}"
     );
 }

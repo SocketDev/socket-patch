@@ -25,7 +25,18 @@ fn run(args: &[&str], cwd: &std::path::Path, m2_repo: &std::path::Path) -> Outpu
     Command::new(binary())
         .args(args)
         .current_dir(cwd)
+        // Point the crawler at the fake local repo.
         .env("MAVEN_REPO_LOCAL", m2_repo)
+        // The Maven crawler is gated behind a runtime opt-in
+        // (`maven_runtime_enabled` in ecosystem_dispatch.rs); without
+        // this the crawl short-circuits to zero packages and the scan
+        // prints "No packages found." These tests are named for Maven
+        // *discovery*, so they must enable the real crawl path — otherwise
+        // they only ever exercise the disabled stub and pass vacuously.
+        .env("SOCKET_EXPERIMENTAL_MAVEN", "1")
+        // Keep the run hermetic: no ambient token, no inherited repo path.
+        .env_remove("SOCKET_API_TOKEN")
+        .env_remove("M2_HOME")
         .output()
         .expect("Failed to run socket-patch binary")
 }
@@ -87,6 +98,13 @@ fn scan_discovers_maven_artifacts() {
     )
     .unwrap();
 
+    // --- Human-readable run: proves the count AND the ecosystem ----------
+    // The crawl summary line ("Found N packages (N maven)") is the
+    // strongest discovery oracle: it pins both how many artifacts were
+    // found and that they were attributed to the Maven ecosystem. We
+    // created exactly two artifacts (commons-lang3, guava), so the
+    // expected line is derived independently from the fixture, not copied
+    // from the implementation's output.
     let output = run(
         &["scan", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
@@ -97,8 +115,41 @@ fn scan_discovers_maven_artifacts() {
     let combined = format!("{stdout}{stderr}");
 
     assert!(
-        combined.contains("Found") || combined.contains("packages"),
-        "Expected scan to discover Maven artifacts, got:\n{combined}"
+        output.status.success(),
+        "scan should exit 0; got {:?}\n{combined}",
+        output.status.code()
+    );
+    // Must NOT have hit the empty-crawl path — that line *also* contains
+    // the word "packages", which is exactly what let the old assertion
+    // pass when discovery was disabled.
+    assert!(
+        !combined.contains("No packages found"),
+        "scan reported zero packages — Maven discovery did not run:\n{combined}"
+    );
+    assert!(
+        combined.contains("Found 2 packages"),
+        "expected exactly 2 discovered packages, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("2 maven"),
+        "expected the 2 artifacts to be attributed to the Maven ecosystem, got:\n{combined}"
+    );
+
+    // --- JSON run: locks the stable `scannedPackages` contract field -----
+    let json_out = run(
+        &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
+        &project_dir,
+        &m2_repo,
+    );
+    let json = String::from_utf8_lossy(&json_out.stdout);
+    assert!(json_out.status.success(), "scan --json should exit 0:\n{json}");
+    assert!(
+        json.contains("\"scannedPackages\": 2"),
+        "expected scannedPackages == 2 in JSON output, got:\n{json}"
+    );
+    assert!(
+        json.contains("\"status\": \"success\""),
+        "expected status == success in JSON output, got:\n{json}"
     );
 }
 
@@ -138,6 +189,11 @@ fn scan_discovers_gradle_project_artifacts() {
     )
     .unwrap();
 
+    // --- JSON run: the `scannedPackages` count is the contract field -----
+    // A single artifact lives in the repo. We assert the *value* (1), not
+    // merely the presence of the key — the old `contains("scannedPackages")`
+    // check passed even when the count was 0 (i.e. nothing discovered),
+    // since the field is always emitted.
     let output = run(
         &["scan", "--json", "--cwd", project_dir.to_str().unwrap()],
         &project_dir,
@@ -145,10 +201,40 @@ fn scan_discovers_gradle_project_artifacts() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
 
     assert!(
-        combined.contains("scannedPackages") || combined.contains("Found"),
-        "Expected scan output, got:\n{combined}"
+        output.status.success(),
+        "scan --json should exit 0; got {:?}\n{stdout}{stderr}"
+        , output.status.code()
+    );
+    assert!(
+        stdout.contains("\"scannedPackages\": 1"),
+        "expected exactly 1 artifact discovered via the build.gradle marker, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"scannedPackages\": 0"),
+        "scannedPackages was 0 — the Gradle project marker did not activate Maven discovery:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"status\": \"success\""),
+        "expected status == success, got:\n{stdout}"
+    );
+
+    // --- Human run: confirm the artifact is attributed to Maven ----------
+    // build.gradle (not pom.xml) is what must trigger local-mode Maven
+    // discovery here; the eco summary proves the single package is Maven.
+    let human = run(
+        &["scan", "--cwd", project_dir.to_str().unwrap()],
+        &project_dir,
+        &m2_repo,
+    );
+    let h_combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        h_combined.contains("Found 1 packages") && h_combined.contains("1 maven"),
+        "expected the Gradle project to discover 1 Maven artifact, got:\n{h_combined}"
     );
 }

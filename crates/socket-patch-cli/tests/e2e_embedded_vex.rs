@@ -114,6 +114,72 @@ fn seed_offline_apply(cwd: &Path) -> String {
     after_hash
 }
 
+/// Assert a VEX statement is the fully-formed `not_affected` attestation
+/// our builder is contracted to emit for an applied/trusted patch:
+/// correct vulnerability name + CVE aliases, the supplied product as the
+/// statement product, the patched package pinned as a subcomponent, and
+/// the spec-required `not_affected` + justification pairing. This is the
+/// substance of an embedded VEX doc — counting `statements.len() == 1`
+/// alone would stay green even if the status flipped to `affected`, the
+/// CVE alias vanished, or the subcomponent were dropped.
+fn assert_not_affected_statement(
+    stmt: &Value,
+    expect_vuln: &str,
+    expect_cve: &str,
+    expect_product: &str,
+    expect_subcomponent: &str,
+) {
+    assert_eq!(
+        stmt["vulnerability"]["name"], expect_vuln,
+        "statement vulnerability name"
+    );
+
+    let aliases = stmt["vulnerability"]["aliases"]
+        .as_array()
+        .expect("vulnerability.aliases is an array");
+    assert!(
+        aliases.iter().any(|a| a == expect_cve),
+        "CVE alias {expect_cve} must be present in {aliases:?}"
+    );
+
+    // VEX semantics: an applied/trusted patch is `not_affected` with the
+    // inline-mitigation justification. Anything else is a regression.
+    assert_eq!(
+        stmt["status"], "not_affected",
+        "applied patch must be attested not_affected, got {:?}",
+        stmt["status"]
+    );
+    assert_eq!(
+        stmt["justification"], "inline_mitigations_already_exist",
+        "not_affected requires the inline-mitigation justification"
+    );
+
+    let products = stmt["products"].as_array().expect("statement.products");
+    assert_eq!(products.len(), 1, "exactly one product per statement");
+    assert_eq!(
+        products[0]["@id"], expect_product,
+        "product comes from --vex-product"
+    );
+
+    let subs = products[0]["subcomponents"]
+        .as_array()
+        .expect("product.subcomponents is an array");
+    assert!(
+        subs.iter().any(|s| s["@id"] == expect_subcomponent),
+        "patched package {expect_subcomponent} must be pinned as a subcomponent, got {subs:?}"
+    );
+
+    // The impact statement ties the attestation back to a concrete patch.
+    assert!(
+        stmt["impact_statement"]
+            .as_str()
+            .map(|s| s.contains("Socket patch"))
+            .unwrap_or(false),
+        "impact_statement should reference the Socket patch, got {:?}",
+        stmt["impact_statement"]
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // apply --vex
 // ──────────────────────────────────────────────────────────────────────
@@ -152,12 +218,20 @@ fn apply_vex_writes_document_on_success() {
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
+    assert_eq!(doc["version"], 1, "OpenVEX revision counter starts at 1");
+    assert!(
+        doc["author"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "document must carry a non-empty author, got {:?}",
+        doc["author"]
+    );
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(stmts.len(), 1);
-    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-aaaa-bbbb-cccc");
-    assert_eq!(
-        stmts[0]["products"][0]["@id"], "pkg:npm/my-app@1.0.0",
-        "product comes from --vex-product"
+    assert_not_affected_statement(
+        &stmts[0],
+        "GHSA-aaaa-bbbb-cccc",
+        "CVE-2024-0001",
+        "pkg:npm/my-app@1.0.0",
+        "pkg:npm/vuln-pkg@1.0.0",
     );
 }
 
@@ -191,6 +265,25 @@ fn apply_json_envelope_carries_vex_summary() {
     assert_eq!(env["vex"]["format"], "openvex-0.2.0");
     assert_eq!(env["vex"]["path"], vex_path.to_str().unwrap());
     assert!(vex_path.exists());
+
+    // The envelope's reported count must match what actually landed on
+    // disk — otherwise a stub could report `statements: 1` while writing
+    // an empty (or absent) document.
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().expect("doc.statements array");
+    assert_eq!(
+        stmts.len(),
+        env["vex"]["statements"].as_u64().unwrap() as usize,
+        "envelope vex.statements must equal the written document's statement count"
+    );
+    assert_not_affected_statement(
+        &stmts[0],
+        "GHSA-aaaa-bbbb-cccc",
+        "CVE-2024-0001",
+        "pkg:npm/my-app@1.0.0",
+        "pkg:npm/vuln-pkg@1.0.0",
+    );
 }
 
 #[test]
@@ -284,7 +377,16 @@ fn scan_json_vex_no_verify_emits_summary() {
 
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
-    assert_eq!(doc["statements"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert_not_affected_statement(
+        &stmts[0],
+        "GHSA-aaaa-bbbb-cccc",
+        "CVE-2024-0001",
+        "pkg:npm/my-app@1.0.0",
+        "pkg:npm/vuln-pkg@1.0.0",
+    );
 }
 
 #[test]

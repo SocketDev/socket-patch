@@ -148,29 +148,71 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let status = v["status"].as_str().expect("status string");
-    // status is "success" or "partial_failure"; either is acceptable as
-    // long as the chain completed.
-    assert!(
-        status == "success" || status == "partial_failure",
-        "unexpected status: {status}; envelope={v}"
+    // A clean apply against a pristine fixture MUST fully succeed. Accepting
+    // "partial_failure" here would mask the apply step silently failing
+    // (`scan.rs` flips status to partial_failure exactly when apply_code != 0).
+    assert_eq!(
+        status, "success",
+        "scan --sync against a clean project must fully succeed; envelope={v}"
     );
 
-    // The manifest must exist now.
+    // The apply sub-object MUST be present and report exactly one patch
+    // discovered, downloaded, and applied with no failures. Guarding this
+    // behind `if let Some(..)` (as before) let a missing apply object pass.
+    let apply = v["apply"]
+        .as_object()
+        .unwrap_or_else(|| panic!("scan --sync must emit an apply sub-object; envelope={v}"));
+    assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
+    assert_eq!(apply["applied"], 1, "apply.applied; apply={apply:?}");
+    assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
+    let patches = apply["patches"].as_array().expect("apply.patches array");
+    assert_eq!(patches.len(), 1, "exactly one patch record; apply={apply:?}");
+    assert_eq!(patches[0]["purl"], purl);
+    assert_eq!(patches[0]["uuid"], UUID);
+    assert_eq!(
+        patches[0]["action"], "added",
+        "patch must be newly added; record={:?}",
+        patches[0]
+    );
+
+    // The manifest must exist AND record this exact patch/uuid.
     let manifest_path = tmp.path().join(".socket/manifest.json");
-    assert!(
-        manifest_path.exists(),
-        "scan --sync must write the manifest"
+    assert!(manifest_path.exists(), "scan --sync must write the manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+            .expect("valid manifest JSON");
+    assert_eq!(
+        manifest["patches"][purl]["uuid"], UUID,
+        "manifest must record the applied patch under its purl; manifest={manifest}"
     );
 
-    // Verify the apply sub-object is present (synchronous path emits it).
-    let apply_obj = v["apply"].as_object();
-    if let Some(apply) = apply_obj {
-        // We expect at least one patch action recorded.
-        assert!(
-            apply.contains_key("patches") || apply.contains_key("applied"),
-            "apply sub-object should have outcomes; got: {apply:?}"
-        );
-    }
+    // The whole point of `--sync`: the on-disk file is rewritten to the
+    // patched ("after") content and its hash matches the API's afterHash.
+    let patched = tmp
+        .path()
+        .join("node_modules")
+        .join("sync-target")
+        .join("index.js");
+    let on_disk = std::fs::read(&patched).expect("patched index.js must exist");
+    assert_eq!(
+        on_disk, after,
+        "index.js must contain the patched bytes after scan --sync"
+    );
+    assert_eq!(
+        git_sha256(&on_disk),
+        after_hash,
+        "on-disk content hash must equal the API's afterHash"
+    );
+
+    // Confirm the real pipeline ran end-to-end: batch discovery + the full
+    // patch view were both fetched from the mock (not short-circuited).
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    let hit = |needle: &str| reqs.iter().any(|r| r.url.path().contains(needle));
+    assert!(hit("/patches/batch"), "batch discovery must be called");
+    assert!(
+        hit(&format!("/patches/view/{UUID}")),
+        "full patch view must be fetched"
+    );
 }
 
 #[tokio::test]
@@ -291,7 +333,52 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 0, "scan --apply with cached UUID must succeed; stdout={stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        code, 0,
+        "scan --apply with cached UUID must succeed; stdout={stdout}; stderr={stderr}"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+
+    // The pre-staged manifest already carries this exact UUID, so the patch
+    // MUST be classified `skipped` (not re-applied / re-added). Nothing in
+    // the original test verified this — exit 0 alone would also hold if the
+    // patch were wrongly re-applied.
+    let apply = v["apply"]
+        .as_object()
+        .unwrap_or_else(|| panic!("scan --apply must emit an apply sub-object; envelope={v}"));
+    assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
+    assert_eq!(apply["skipped"], 1, "patch must be skipped; apply={apply:?}");
+    assert_eq!(apply["applied"], 0, "nothing applied on a skip; apply={apply:?}");
+    assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
+    let patches = apply["patches"].as_array().expect("apply.patches array");
+    assert_eq!(patches.len(), 1, "apply={apply:?}");
+    assert_eq!(patches[0]["uuid"], UUID);
+    assert_eq!(
+        patches[0]["action"], "skipped",
+        "cached/known UUID must yield action=skipped; record={:?}",
+        patches[0]
+    );
+
+    // A skip must NOT touch the file: index.js stays at its original
+    // ("before") content (the patch was never re-applied).
+    let on_disk = std::fs::read(
+        tmp.path()
+            .join("node_modules")
+            .join("cached-sync")
+            .join("index.js"),
+    )
+    .expect("index.js must exist");
+    assert_eq!(
+        on_disk, before,
+        "skipped patch must leave the file untouched"
+    );
+
+    // The pre-staged cached blob must still be present and unchanged.
+    let cached = std::fs::read(blobs.join(&after_hash)).expect("cached blob must remain");
+    assert_eq!(cached, after, "cached blob must be untouched");
 }
 
 #[tokio::test]
@@ -330,9 +417,27 @@ async fn scan_apply_with_no_patches_emits_empty_apply_object() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 0);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["status"], "success", "envelope={v}");
     let apply = v["apply"].as_object().unwrap();
-    assert_eq!(apply["found"], 0);
-    assert_eq!(apply["applied"], 0);
+    assert_eq!(apply["found"], 0, "apply={apply:?}");
+    assert_eq!(apply["applied"], 0, "apply={apply:?}");
+    assert_eq!(apply["skipped"], 0, "apply={apply:?}");
+    assert_eq!(apply["failed"], 0, "apply={apply:?}");
+    assert_eq!(apply["downloaded"], 0, "apply={apply:?}");
+    // No patches discovered => the patches list must be empty, not just absent.
+    assert_eq!(
+        apply["patches"].as_array().expect("patches array").len(),
+        0,
+        "apply.patches must be empty; apply={apply:?}"
+    );
+
+    // Discovery (batch) must have actually been queried.
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    assert!(
+        reqs.iter().any(|r| r.url.path().contains("/patches/batch")),
+        "batch discovery must be called"
+    );
 }
