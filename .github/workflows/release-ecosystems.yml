@@ -35,11 +35,17 @@ jobs:
     steps:
       - name: Resolve version + tag
         id: v
+        # Pass event/input data through env (never interpolate `${{ ... }}`
+        # directly into the shell) to avoid template-injection (zizmor).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
           else
-            TAG="v${{ inputs.version }}"
+            TAG="v${INPUT_VERSION}"
           fi
           VERSION="${TAG#v}"
           echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
@@ -61,19 +67,25 @@ jobs:
       # Ruby is pre-installed on ubuntu-latest; no setup action needed.
       - name: Lint + build the launcher gem
         working-directory: gem/socket-patch
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           ruby -c lib/socket_patch/launcher.rb
           ruby -c exe/socket-patch
           # The gemspec version is baked at the tag by scripts/version-sync.sh.
           gemver="$(ruby -e 'print Gem::Specification.load("socket-patch.gemspec").version')"
-          if [ "$gemver" != "${{ needs.resolve-version.outputs.version }}" ]; then
-            echo "::error::gemspec version $gemver != release ${{ needs.resolve-version.outputs.version }} (run scripts/version-sync.sh before tagging)"
+          if [ "$gemver" != "$EXPECTED_VERSION" ]; then
+            echo "::error::gemspec version $gemver != release $EXPECTED_VERSION (run scripts/version-sync.sh before tagging)"
             exit 1
           fi
           gem build socket-patch.gemspec
 
       - name: Publish socket-patch to RubyGems
         working-directory: gem/socket-patch
+        # zizmor: ignore[use-trusted-publishing]
+        # Uses an API key for now; RubyGems trusted publishing (OIDC) is the
+        # documented future hardening (see the header), mirroring the crates.io
+        # / PyPI jobs. Suppressed until that publisher is registered.
         env:
           GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
           VERSION: ${{ needs.resolve-version.outputs.version }}
