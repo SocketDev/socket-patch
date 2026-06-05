@@ -4,6 +4,8 @@ use socket_patch_core::cargo_setup::{
     add_guard_dep, discover_cargo_project, is_guard_dep_present, remove_guard_dep, CargoEditResult,
     CargoSetupStatus,
 };
+#[cfg(feature = "golang")]
+use socket_patch_core::go_setup::{self, GoSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
@@ -34,7 +36,13 @@ fn manager_name(pm: PackageManager) -> &'static str {
 
 /// Compose the `+`-joined telemetry manager tag across the ecosystems in scope
 /// (e.g. `npm+pypi+cargo`), or `none`.
-fn telemetry_manager_str(npm: bool, py: bool, cargo: bool, npm_pm: PackageManager) -> String {
+fn telemetry_manager_str(
+    npm: bool,
+    py: bool,
+    cargo: bool,
+    go: bool,
+    npm_pm: PackageManager,
+) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if npm {
         parts.push(manager_name(npm_pm));
@@ -44,6 +52,9 @@ fn telemetry_manager_str(npm: bool, py: bool, cargo: bool, npm_pm: PackageManage
     }
     if cargo {
         parts.push("cargo");
+    }
+    if go {
+        parts.push("golang");
     }
     if parts.is_empty() {
         "none".to_string()
@@ -280,7 +291,7 @@ fn update_status_str(s: &UpdateStatus) -> &'static str {
 /// the `cargo` feature is off), so the shared reporting code never has to name
 /// the cargo-only types.
 #[derive(Default)]
-struct CargoOutcome {
+struct SetupOutcome {
     /// A cargo project was discovered (gates the `no_files` decision).
     present: bool,
     /// Items changed (guard dep added/removed + `[env]` written/removed).
@@ -296,15 +307,15 @@ struct CargoOutcome {
 /// Build the cargo outcome for a setup (`remove=false`) or remove
 /// (`remove=true`) run at the given `dry_run` setting.
 #[cfg(feature = "cargo")]
-async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> CargoOutcome {
+async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     use socket_patch_core::patch::cargo_config;
 
     let project = match discover_cargo_project(&common.cwd).await {
         Some(p) => p,
-        None => return CargoOutcome::default(),
+        None => return SetupOutcome::default(),
     };
 
-    let mut out = CargoOutcome {
+    let mut out = SetupOutcome {
         present: true,
         ..Default::default()
     };
@@ -365,8 +376,141 @@ async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -
 }
 
 #[cfg(not(feature = "cargo"))]
-async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> CargoOutcome {
-    CargoOutcome::default()
+async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+    SetupOutcome::default()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Go (project-local go.mod `replace`-redirect guard) helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build the Go branch's contribution to a setup/remove run: write (or remove)
+/// the `internal/socketpatchguard` package + the per-`main` blank-import files.
+/// A no-op `Default` when the `golang` feature is off.
+#[cfg(feature = "golang")]
+async fn build_go_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+    let module = match go_setup::discover_go_module(&common.cwd).await {
+        Some(m) => m,
+        None => return SetupOutcome::default(),
+    };
+
+    let mut out = SetupOutcome {
+        present: true,
+        ..Default::default()
+    };
+
+    let mut results: Vec<go_setup::GoEditResult> = Vec::new();
+    if remove {
+        results.push(go_setup::remove_guard(&module.root, dry_run).await);
+        results.extend(go_setup::remove_main_imports(&module.root, dry_run).await);
+    } else {
+        results.push(go_setup::add_guard(&module.root, dry_run).await);
+        results.extend(
+            go_setup::add_main_imports(&module.root, &module.module_path, dry_run).await,
+        );
+    }
+
+    let mut added_paths: Vec<String> = Vec::new();
+    for r in &results {
+        match r.status {
+            GoSetupStatus::Updated => {
+                out.changed += 1;
+                added_paths.push(r.path.clone());
+            }
+            GoSetupStatus::AlreadyConfigured => out.already += 1,
+            GoSetupStatus::Error => out.errors += 1,
+        }
+        out.json_files.push(serde_json::json!({
+            "kind": r.kind,
+            "path": r.path,
+            "status": go_status_str(&r.status, remove),
+            "error": r.error,
+        }));
+    }
+
+    if !added_paths.is_empty() {
+        let header = if remove {
+            "Go: remove socket-patch guard wiring from:"
+        } else {
+            "Go: add socket-patch guard wiring to:"
+        };
+        out.preview.push(header.to_string());
+        for p in &added_paths {
+            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+        }
+    }
+
+    out
+}
+
+#[cfg(not(feature = "golang"))]
+async fn build_go_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+    SetupOutcome::default()
+}
+
+#[cfg(feature = "golang")]
+fn go_status_str(s: &GoSetupStatus, for_remove: bool) -> &'static str {
+    match (s, for_remove) {
+        (GoSetupStatus::Updated, false) => "updated",
+        (GoSetupStatus::Updated, true) => "removed",
+        (GoSetupStatus::AlreadyConfigured, false) => "already_configured",
+        (GoSetupStatus::AlreadyConfigured, true) => "not_configured",
+        (GoSetupStatus::Error, _) => "error",
+    }
+}
+
+/// Materialise the Go `replace` redirects right after wiring the guard (the
+/// "automatic" step) so the first `go test`/`go run` finds patches already in
+/// sync instead of self-healing on first run. Best-effort and offline: runs the
+/// same `apply` the guard would, capturing output so it never corrupts setup's
+/// (possibly JSON) stdout. A non-zero exit becomes a warning — the guard heals
+/// it on first run. No-op without the `golang` feature.
+#[cfg(feature = "golang")]
+async fn finalize_go(common: &GlobalArgs) -> Vec<String> {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return vec![format!(
+                "could not locate socket-patch to materialize go patches ({e}); \
+                 run `socket-patch apply --ecosystems golang`"
+            )]
+        }
+    };
+    let root = common.cwd.display().to_string();
+    match tokio::process::Command::new(&exe)
+        .args(["apply", "--offline", "--ecosystems", "golang", "--cwd", &root, "--silent"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => Vec::new(),
+        Ok(o) => vec![format!(
+            "materializing go patches exited with {}; the guard will heal on first `go test`/run",
+            o.status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
+        )],
+        Err(e) => vec![format!(
+            "could not run apply to materialize go patches ({e}); the guard will heal on first run"
+        )],
+    }
+}
+
+#[cfg(not(feature = "golang"))]
+async fn finalize_go(_common: &GlobalArgs) -> Vec<String> {
+    Vec::new()
+}
+
+/// Combine two ecosystem outcomes (cargo + go) into one for the shared
+/// preview/envelope printers, which take a single [`SetupOutcome`].
+fn merge_outcomes(mut a: SetupOutcome, b: SetupOutcome) -> SetupOutcome {
+    a.present |= b.present;
+    a.changed += b.changed;
+    a.already += b.already;
+    a.errors += b.errors;
+    a.json_files.extend(b.json_files);
+    a.preview.extend(b.preview);
+    a
 }
 
 /// The guard version string `setup` writes — major.minor of this CLI, so the
@@ -461,6 +605,49 @@ async fn append_cargo_check_entries(
     false
 }
 
+/// Append Go check entries (the guard package + one per `package main` blank
+/// import) to the shared `run_check` entries list. Returns whether a Go module
+/// was found. Checks the SETUP wiring only — redirect sync is `apply --check`.
+#[cfg(feature = "golang")]
+async fn append_go_check_entries(
+    common: &GlobalArgs,
+    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    let module = match go_setup::discover_go_module(&common.cwd).await {
+        Some(m) => m,
+        None => return false,
+    };
+    let guard_state = if go_setup::guard_files_present(&module.root).await {
+        CheckState::Configured
+    } else {
+        CheckState::NeedsConfiguration
+    };
+    entries.push((
+        "go_guard",
+        module.root.join(go_setup::GUARD_DIR).display().to_string(),
+        guard_state,
+        None,
+    ));
+    for dir in go_setup::find_main_package_dirs(&module.root).await {
+        let path = go_setup::import_file_path(&dir);
+        let state = if tokio::fs::metadata(&path).await.is_ok() {
+            CheckState::Configured
+        } else {
+            CheckState::NeedsConfiguration
+        };
+        entries.push(("go_import", path.display().to_string(), state, None));
+    }
+    true
+}
+
+#[cfg(not(feature = "golang"))]
+async fn append_go_check_entries(
+    _common: &GlobalArgs,
+    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    false
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // check
 // ─────────────────────────────────────────────────────────────────────────
@@ -478,7 +665,7 @@ enum CheckState {
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     if !args.common.json {
-        println!("Searching for package.json / Python / Cargo manifests...");
+        println!("Searching for package.json / Python / Cargo / Go manifests...");
     }
 
     let npm_files = discover(args).await;
@@ -526,6 +713,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
     }
 
     append_cargo_check_entries(&args.common, &mut entries).await;
+    append_go_check_entries(&args.common, &mut entries).await;
 
     if entries.is_empty() {
         return report_no_files(args, "no_files");
@@ -613,15 +801,19 @@ fn render_removed(new: &Option<String>) -> String {
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     if !common.json {
-        println!("Searching for package.json / Python / Cargo manifests...");
+        println!("Searching for package.json / Python / Cargo / Go manifests...");
     }
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
     let cargo_preview = build_cargo_outcome(common, true, true).await;
-    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present {
+    let go_preview = build_go_outcome(common, true, true).await;
+    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present && !go_preview.present {
         return report_no_files(args, "no_files");
     }
+    let cargo_present = cargo_preview.present;
+    let go_present = go_preview.present;
+    let cargo_preview = merge_outcomes(cargo_preview, go_preview);
 
     // Preview (dry_run=true never writes).
     let mut npm_preview = Vec::new();
@@ -703,8 +895,9 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, true, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo removal (guard dep + [env] root).
-    let cargo_results = build_cargo_outcome(common, true, false).await;
+    // Real cargo + go removal (guard dep/[env] root; go guard package + imports).
+    let cargo_results =
+        merge_outcomes(build_cargo_outcome(common, true, false).await, build_go_outcome(common, true, false).await);
 
     let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
         + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
@@ -733,10 +926,17 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         if py_plan.is_some() {
             println!("\nAlso run `pip uninstall socket-patch-hook` to remove the installed .pth.");
         }
-        if cargo_results.present {
+        if cargo_present {
             println!(
                 "\nNote: existing patched-crate copies under .socket/cargo-patches/ and any \
                  managed [patch.crates-io] entries are removed on `socket-patch rollback`."
+            );
+        }
+        if go_present {
+            println!(
+                "\nNote: the Go guard wiring was removed; existing patched-module copies under \
+                 .socket/go-patches/ and managed go.mod `replace` directives are removed on \
+                 `socket-patch rollback`."
             );
         }
     }
@@ -751,7 +951,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
 fn print_remove_preview(
     npm: &[RemoveResult],
     py: &[PthEditResult],
-    cargo: &CargoOutcome,
+    cargo: &SetupOutcome,
     common: &GlobalArgs,
 ) {
     let to_remove: Vec<_> = npm.iter().filter(|r| r.status == RemoveStatus::Removed).collect();
@@ -788,7 +988,7 @@ fn print_remove_envelope(
     status: &str,
     npm: &[RemoveResult],
     py: &[PthEditResult],
-    cargo: &CargoOutcome,
+    cargo: &SetupOutcome,
     warnings: &[String],
 ) {
     let removed = npm.iter().filter(|r| r.status == RemoveStatus::Removed).count()
@@ -861,10 +1061,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 
     let npm_files = discover(args).await;
     let py_plan = plan_python(common).await;
-    // Cargo preview (dry-run); `.present` also tells us a cargo project exists.
+    // Cargo + Go previews (dry-run); `.present` also tells us each project exists.
     let cargo_preview = build_cargo_outcome(common, false, true).await;
+    let go_preview = build_go_outcome(common, false, true).await;
 
-    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present {
+    if npm_files.is_empty() && py_plan.is_none() && !cargo_preview.present && !go_preview.present {
         if common.json {
             println!(
                 "{}",
@@ -878,17 +1079,22 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            println!("No package.json, Python, or Cargo project found");
+            println!("No package.json, Python, Cargo, or Go project found");
         }
         return 0;
     }
+
+    let cargo_present = cargo_preview.present;
+    let go_present = go_preview.present;
+    let cargo_preview = merge_outcomes(cargo_preview, go_preview);
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
     let telemetry_manager = telemetry_manager_str(
         !npm_files.is_empty(),
         py_plan.is_some(),
-        cargo_preview.present,
+        cargo_present,
+        go_present,
         npm_pm,
     );
     track_patch_setup(
@@ -986,8 +1192,16 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo edit (guard dep + [env] root).
-    let cargo_results = build_cargo_outcome(common, false, false).await;
+    // Real cargo + go edits (cargo guard dep/[env] root; go guard package +
+    // per-main blank imports).
+    let cargo_results =
+        merge_outcomes(build_cargo_outcome(common, false, false).await, build_go_outcome(common, false, false).await);
+
+    // Materialise the go.mod `replace` redirects now so the first `go test`/run
+    // is already in sync (the "automatic" step). Best-effort → warnings only.
+    if go_present {
+        warnings.extend(finalize_go(common).await);
+    }
 
     let errors = npm_results.iter().filter(|r| r.status == UpdateStatus::Error).count()
         + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
@@ -1022,10 +1236,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 plan.pm.as_str()
             );
         }
-        if cargo_results.present {
+        if cargo_present {
             println!(
                 "\nCommit Cargo.toml (socket-patch-guard), .cargo/config.toml, and your \
                  .socket/ patches so the guard re-applies cargo patches in CI."
+            );
+        }
+        if go_present {
+            println!(
+                "\nCommit go.mod (the `replace` directives), internal/socketpatchguard/, the \
+                 generated socket_patch_guard_import.go files, .socket/go-patches/, and your \
+                 .socket/ patches. Enforcement: `go test ./...` gates at CI time (the guard \
+                 reads the patch state in-process, so the test cache re-runs it on any drift), \
+                 and the init() guard gates every `go run`/binary launch."
             );
         }
     }
@@ -1040,7 +1263,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 fn print_setup_preview(
     npm: &[UpdateResult],
     py: &[PthEditResult],
-    cargo: &CargoOutcome,
+    cargo: &SetupOutcome,
     common: &GlobalArgs,
 ) {
     let npm_changes: Vec<_> = npm.iter().filter(|r| r.status == UpdateStatus::Updated).collect();
@@ -1098,7 +1321,7 @@ fn print_setup_envelope(
     status: &str,
     npm: &[UpdateResult],
     py: &[PthEditResult],
-    cargo: &CargoOutcome,
+    cargo: &SetupOutcome,
     npm_pm: PackageManager,
     py_plan: Option<&PythonPlan>,
     warnings: &[String],

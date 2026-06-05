@@ -24,6 +24,7 @@ use crate::patch::file_hash::compute_file_git_sha256;
 use crate::utils::purl::{build_cargo_purl, parse_cargo_purl};
 
 use super::cargo_config::{self, expected_patch_path, CARGO_PATCHES_DIR};
+use super::copy_tree::{fresh_copy, remove_tree};
 
 /// A discrepancy between the committed redirect artifacts and the manifest,
 /// reported by [`verify_cargo_redirect_state`].
@@ -208,7 +209,7 @@ pub async fn apply_cargo_redirect(
     }
 
     // Fresh copy pristine → copy_dir, excluding any `.cargo-checksum.json`.
-    if let Err(e) = fresh_copy_excluding_checksum(pristine_src, &copy_dir).await {
+    if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
         return synthesized_result(
             purl,
             &copy_dir,
@@ -520,83 +521,6 @@ fn purl_from_entry_path(path: Option<&str>) -> Option<String> {
 fn purl_from_dir_name(dir_name: &str) -> Option<String> {
     let (name, version) = crate::crawlers::CargoCrawler::parse_dir_name_version(dir_name)?;
     Some(build_cargo_purl(&name, &version))
-}
-
-fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
-/// Fresh-copy `src` → `dst`, removing `dst` first and excluding any
-/// `.cargo-checksum.json` at any level. Runs on the blocking pool (registry
-/// sources are bounded, <10 MB unpacked). Directories are created fresh
-/// (writable `0o755`) rather than mirroring the registry's read-only modes, so
-/// the copy can be patched and later removed without a chmod dance.
-async fn fresh_copy_excluding_checksum(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let src = src.to_path_buf();
-    let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        force_remove_dir_all(&dst)?;
-        std::fs::create_dir_all(&dst)?;
-        for entry in walkdir::WalkDir::new(&src).follow_links(false) {
-            let entry = entry.map_err(to_io)?;
-            let rel = entry.path().strip_prefix(&src).map_err(to_io)?;
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            if entry.file_name() == ".cargo-checksum.json" {
-                continue;
-            }
-            let target = dst.join(rel);
-            let ft = entry.file_type();
-            if ft.is_dir() {
-                std::fs::create_dir_all(&target)?;
-            } else if ft.is_file() {
-                if let Some(p) = target.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                std::fs::copy(entry.path(), &target)?;
-            }
-            // Symlinks / specials: crates.io registry sources contain none, so
-            // skip them rather than risk copying a dangling link.
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?
-}
-
-/// Recursively remove a tree, retrying once after relaxing perms (a previously
-/// patched copy may carry read-only file modes restored from the registry).
-fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
-                    let mode = if entry.file_type().is_dir() {
-                        0o755
-                    } else {
-                        0o644
-                    };
-                    let _ = std::fs::set_permissions(
-                        entry.path(),
-                        std::fs::Permissions::from_mode(mode),
-                    );
-                }
-            }
-            std::fs::remove_dir_all(dir)
-        }
-    }
-}
-
-async fn remove_tree(dir: &Path) -> std::io::Result<()> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || force_remove_dir_all(&dir))
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 #[cfg(test)]
