@@ -599,12 +599,13 @@ async fn apply_empty_manifest_is_noop() {
     write_manifest(&socket, r#"{ "patches": {} }"#);
 
     let code = apply_run(default_apply(tmp.path())).await;
-    // Empty manifest → no patches in scope → `apply_patches_inner`
-    // returns `success == false`, which maps to exit code 1. This must
-    // be asserted exactly: `code == 0 || code == 1` accepts every
-    // outcome the function can return and would stay green even if the
-    // empty-scope path regressed to a spurious success.
-    assert_eq!(code, 1, "empty manifest is out of scope → exit 1");
+    // Empty manifest → no patches in scope → there is genuinely nothing
+    // to do, so `apply` is a clean no-op SUCCESS (exit 0). This must be
+    // asserted exactly: `code == 0 || code == 1` accepts every outcome the
+    // function can return and would stay green even if the empty-scope path
+    // regressed back to the spurious `partialFailure`/exit-1 that broke the
+    // npm `postinstall` hook (which runs `apply` on every install).
+    assert_eq!(code, 0, "empty manifest has no work → clean no-op success");
     // A true no-op must not invent files. node_modules was never
     // created and the manifest must be untouched on disk.
     assert!(
