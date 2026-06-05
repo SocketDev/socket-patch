@@ -18,6 +18,12 @@ use socket_patch_core::patch::cargo_redirect::{
 };
 #[cfg(feature = "cargo")]
 use socket_patch_core::utils::purl::parse_cargo_purl;
+#[cfg(feature = "golang")]
+use socket_patch_core::patch::go_redirect::{
+    apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
+};
+#[cfg(feature = "golang")]
+use socket_patch_core::utils::purl::parse_golang_purl;
 
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
@@ -255,12 +261,112 @@ async fn reconcile_local_cargo(common: &GlobalArgs, target_manifest_purls: &Hash
 #[cfg(not(feature = "cargo"))]
 async fn reconcile_local_cargo(_common: &GlobalArgs, _target_manifest_purls: &HashSet<String>) {}
 
-/// Read-only verification of committed cargo redirects (CI / GitHub-App audit).
-/// Lock-free, crawl-free, offline-safe. Exits 0 when in sync, 1 on drift.
-#[cfg(feature = "cargo")]
-async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
-    use socket_patch_core::patch::cargo_redirect::Drift;
+// ── local-go redirect helpers ────────────────────────────────────────────────
+// The Go analog of the cargo helpers above: in local mode a `pkg:golang/…` PURL
+// redirects to a project-local patched copy under `.socket/go-patches/` wired via
+// a `go.mod` `replace` directive. Inert stubs without the `golang` feature.
 
+/// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
+#[cfg(feature = "golang")]
+fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
+    !common.global
+        && common.global_prefix.is_none()
+        && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
+}
+
+/// Whether local-go redirects are in scope (local mode + golang not filtered out
+/// by `--ecosystems`). Gates reconcile / `--check`.
+#[cfg(feature = "golang")]
+fn go_in_local_scope(common: &GlobalArgs) -> bool {
+    if common.global || common.global_prefix.is_some() {
+        return false;
+    }
+    match &common.ecosystems {
+        None => true,
+        Some(list) => list
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("golang") || e.eq_ignore_ascii_case("go")),
+    }
+}
+
+/// Materialise a local-go redirect for `purl`, or `None` if `purl` isn't a
+/// local-go target (the caller then falls back to in-place apply, i.e. the
+/// `--global` module-cache path).
+#[cfg(feature = "golang")]
+async fn try_local_go_apply(
+    purl: &str,
+    pkg_path: &Path,
+    patch: &PatchRecord,
+    sources: &PatchSources<'_>,
+    common: &GlobalArgs,
+    force: bool,
+) -> Option<ApplyResult> {
+    if !is_local_go(purl, common) {
+        return None;
+    }
+    // `pkg_path` is the pristine, case-encoded module-cache dir; `module`/
+    // `version` are the decoded PURL components keying the copy + `replace`.
+    let (module, version) = parse_golang_purl(purl)?;
+    Some(
+        apply_go_redirect(
+            purl,
+            module,
+            version,
+            pkg_path,
+            &common.cwd,
+            &patch.files,
+            sources,
+            Some(&patch.uuid),
+            common.dry_run,
+            force,
+        )
+        .await,
+    )
+}
+
+#[cfg(not(feature = "golang"))]
+async fn try_local_go_apply(
+    _purl: &str,
+    _pkg_path: &Path,
+    _patch: &PatchRecord,
+    _sources: &PatchSources<'_>,
+    _common: &GlobalArgs,
+    _force: bool,
+) -> Option<ApplyResult> {
+    None
+}
+
+/// After the apply loop: prune local-go redirects whose patches were dropped
+/// from the manifest. No-op unless local go is in scope.
+#[cfg(feature = "golang")]
+async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet<String>) {
+    if !go_in_local_scope(common) {
+        return;
+    }
+    let desired: HashSet<String> = target_manifest_purls
+        .iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
+        .cloned()
+        .collect();
+    let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await;
+    if !removed.is_empty() && !common.silent && !common.json {
+        let verb = if common.dry_run { "Would remove" } else { "Removed" };
+        println!("{verb} {} stale go patch redirect(s):", removed.len());
+        for purl in &removed {
+            println!("  {purl}");
+        }
+    }
+}
+
+#[cfg(not(feature = "golang"))]
+async fn reconcile_local_go(_common: &GlobalArgs, _target_manifest_purls: &HashSet<String>) {}
+
+/// Read-only verification of committed local redirects (cargo + go) for CI /
+/// GitHub-App auditing and the build-time guard probe. Lock-free, crawl-free,
+/// offline-safe. Exits 0 when in sync, 1 on drift. Verifies every redirect
+/// ecosystem that is both compiled in and in `--ecosystems` scope.
+#[cfg(any(feature = "cargo", feature = "golang"))]
+async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     let manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         // The caller already confirmed the manifest file exists. `Ok(None)` means
@@ -271,7 +377,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         Err(e) => {
             if !args.common.silent && !args.common.json {
                 eprintln!(
-                    "Cargo patch redirect check could not read the manifest ({e}); \
+                    "Patch redirect check could not read the manifest ({e}); \
                      treating as drift (fail-closed)."
                 );
             }
@@ -279,74 +385,108 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
     };
 
-    let desired: HashSet<String> = if cargo_in_local_scope(&args.common) {
-        manifest
-            .patches
-            .keys()
-            .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
-            .cloned()
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    // (purl_or_name, reason_code, detail) for each drift across ecosystems.
+    let mut drifts: Vec<(String, &'static str, String)> = Vec::new();
+    let mut checked: usize = 0;
 
-    match verify_cargo_redirect_state(&args.common.cwd, &manifest, &desired).await {
-        Ok(()) => {
-            if args.common.json {
-                println!("{}", Envelope::new(Command::Apply).to_pretty_json());
-            } else if !args.common.silent {
-                println!(
-                    "Cargo patch redirects are in sync ({} checked).",
-                    desired.len()
+    #[cfg(feature = "cargo")]
+    {
+        use socket_patch_core::patch::cargo_redirect::Drift as CargoDrift;
+        if cargo_in_local_scope(&args.common) {
+            let desired: HashSet<String> = manifest
+                .patches
+                .keys()
+                .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+                .cloned()
+                .collect();
+            checked += desired.len();
+            if let Err(ds) = verify_cargo_redirect_state(&args.common.cwd, &manifest, &desired).await
+            {
+                for d in &ds {
+                    let id = match d {
+                        CargoDrift::MissingCopy { purl }
+                        | CargoDrift::StaleCopy { purl, .. }
+                        | CargoDrift::MissingEntry { purl }
+                        | CargoDrift::WrongEntryPath { purl, .. }
+                        | CargoDrift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
+                        CargoDrift::OrphanEntry { name } => name.clone(),
+                    };
+                    drifts.push((id, "cargo_redirect_drift", d.to_string()));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "golang")]
+    {
+        use socket_patch_core::patch::go_redirect::Drift as GoDrift;
+        if go_in_local_scope(&args.common) {
+            let desired: HashSet<String> = manifest
+                .patches
+                .keys()
+                .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
+                .cloned()
+                .collect();
+            checked += desired.len();
+            if let Err(ds) = verify_go_redirect_state(&args.common.cwd, &manifest, &desired).await {
+                for d in &ds {
+                    let id = match d {
+                        GoDrift::MissingCopy { purl }
+                        | GoDrift::StaleCopy { purl, .. }
+                        | GoDrift::MissingReplace { purl }
+                        | GoDrift::WrongReplacePath { purl, .. }
+                        | GoDrift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
+                        GoDrift::OrphanReplace { module } => module.clone(),
+                    };
+                    drifts.push((id, "go_redirect_drift", d.to_string()));
+                }
+            }
+        }
+    }
+
+    if drifts.is_empty() {
+        if args.common.json {
+            println!("{}", Envelope::new(Command::Apply).to_pretty_json());
+        } else if !args.common.silent {
+            println!("Patch redirects are in sync ({checked} checked).");
+        }
+        0
+    } else {
+        if args.common.json {
+            let mut env = Envelope::new(Command::Apply);
+            for (id, code, detail) in &drifts {
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, id.clone())
+                        .with_reason(*code, detail.clone()),
                 );
             }
-            0
-        }
-        Err(drifts) => {
-            if args.common.json {
-                let mut env = Envelope::new(Command::Apply);
-                for d in &drifts {
-                    let purl = match d {
-                        Drift::MissingCopy { purl }
-                        | Drift::StaleCopy { purl, .. }
-                        | Drift::MissingEntry { purl }
-                        | Drift::WrongEntryPath { purl, .. }
-                        | Drift::ResolvedVersionMismatch { purl, .. } => purl.clone(),
-                        Drift::OrphanEntry { name } => name.clone(),
-                    };
-                    env.record(
-                        PatchEvent::new(PatchAction::Failed, purl)
-                            .with_reason("cargo_redirect_drift", d.to_string()),
-                    );
-                }
-                env.mark_partial_failure();
-                println!("{}", env.to_pretty_json());
-            } else if !args.common.silent {
-                eprintln!("Cargo patch redirects are OUT OF SYNC:");
-                for d in &drifts {
-                    eprintln!("  {d}");
-                }
-                eprintln!("Run `socket-patch apply` to regenerate them.");
+            env.mark_partial_failure();
+            println!("{}", env.to_pretty_json());
+        } else if !args.common.silent {
+            eprintln!("Patch redirects are OUT OF SYNC:");
+            for (_, _, detail) in &drifts {
+                eprintln!("  {detail}");
             }
-            1
+            eprintln!("Run `socket-patch apply` to regenerate them.");
         }
+        1
     }
 }
 
-#[cfg(not(feature = "cargo"))]
+#[cfg(not(any(feature = "cargo", feature = "golang")))]
 async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
-    // Fail-closed: `--check` is the cargo patch-redirect audit. A socket-patch
-    // built WITHOUT the `cargo` feature cannot verify those redirects, so it must
-    // NOT report "in sync" (exit 0). The build-time guard probes whatever
+    // Fail-closed: `--check` is the redirect audit. A socket-patch built WITHOUT
+    // any redirect ecosystem (cargo/golang) cannot verify those redirects, so it
+    // must NOT report "in sync" (exit 0). The build-time guard probes whatever
     // `socket-patch` is on the build machine's PATH; if a feature-off binary
     // answered 0 here, the guard would silently proceed against possibly
     // stale/unpatched copies — defeating its whole purpose. Exit non-zero with a
     // clear reason so the guard fails the build instead.
     if !args.common.silent && !args.common.json {
         eprintln!(
-            "socket-patch: this build has no cargo support, so it cannot verify cargo \
+            "socket-patch: this build has no cargo/golang support, so it cannot verify \
              patch redirects (`--check`). Install a socket-patch built with the `cargo` \
-             feature, or point SOCKET_PATCH_BIN at one."
+             and/or `golang` feature, or point SOCKET_PATCH_BIN at one."
         );
     }
     2
@@ -954,6 +1094,7 @@ async fn apply_patches_inner(
     // now lists zero in-scope cargo patches (the all-removed case). No-op
     // unless local cargo is in scope.
     reconcile_local_cargo(&args.common, &target_manifest_purls).await;
+    reconcile_local_go(&args.common, &target_manifest_purls).await;
 
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
@@ -1101,11 +1242,11 @@ async fn apply_patches_inner(
                 packages_path: Some(&packages_path),
                 diffs_path: Some(&diffs_path),
             };
-            // Local cargo redirects to a project-local patched copy
-            // (`apply_cargo_redirect`); everything else — npm/pypi, and cargo
-            // under --global/--global-prefix — patches in place via
-            // `apply_package_patch`. In a build without the `cargo` feature
-            // `try_local_cargo_apply` is an inert `None`.
+            // Local cargo/go redirect to a project-local patched copy
+            // (`apply_cargo_redirect` / `apply_go_redirect`); everything else —
+            // npm/pypi, and cargo/go under --global/--global-prefix — patches in
+            // place via `apply_package_patch`. Without the respective feature the
+            // `try_local_*_apply` helpers are inert `None`s.
             let result = match try_local_cargo_apply(
                 purl,
                 pkg_path,
@@ -1117,18 +1258,30 @@ async fn apply_patches_inner(
             .await
             {
                 Some(r) => r,
-                None => {
-                    apply_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &sources,
-                        Some(&patch.uuid),
-                        args.common.dry_run,
-                        args.force,
-                    )
-                    .await
-                }
+                None => match try_local_go_apply(
+                    purl,
+                    pkg_path,
+                    patch,
+                    &sources,
+                    &args.common,
+                    args.force,
+                )
+                .await
+                {
+                    Some(r) => r,
+                    None => {
+                        apply_package_patch(
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            Some(&patch.uuid),
+                            args.common.dry_run,
+                            args.force,
+                        )
+                        .await
+                    }
+                },
             };
 
             if !result.success {
