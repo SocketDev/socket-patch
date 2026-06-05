@@ -418,20 +418,22 @@ jobs:
           - os: ubuntu-latest
             suite: e2e_nuget
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
-          # e2e_scan) are intentionally NOT in the PR matrix — their
-          # `#[ignore]`-gated tests hit the real public proxy at
-          # patches-api.socket.dev, which intermittently returns
-          # 503 "Service temporarily over capacity" outside this
-          # repo's control. Run on demand:
-          #
-          #   cargo test -p socket-patch-cli --test e2e_npm  -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_pypi -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_gem  -- --ignored
-          #   cargo test -p socket-patch-cli --test e2e_scan -- --ignored
-          #
-          # PR-time coverage for the same code paths comes from the
-          # `e2e-docker` matrix below, which runs the same flow
-          # against a hermetic wiremock fixture.
+          # e2e_scan) run as blocking PR checks. Their `#[ignore]`-gated
+          # tests are selected here via `-- --ignored`. They hit the real
+          # public proxy at patches-api.socket.dev, which can intermittently
+          # return 503 "Service temporarily over capacity" outside this
+          # repo's control — so a red result here may reflect upstream
+          # flakiness rather than a code regression. The same code paths
+          # also have hermetic, always-on coverage in the `e2e-docker`
+          # matrix below (wiremock fixture, no real API).
+          - os: ubuntu-latest
+            suite: e2e_npm
+          - os: ubuntu-latest
+            suite: e2e_pypi
+          - os: ubuntu-latest
+            suite: e2e_gem
+          - os: ubuntu-latest
+            suite: e2e_scan
           # Safety-hardening e2e suites. The fast non-ignored ones
           # (e2e_safety_lock, e2e_safety_yarn_pnp) run via the
           # standard `test` job above on all three platforms, so no
@@ -527,8 +529,10 @@ jobs:
   # managers and run socket-patch against a wiremock-served fixture —
   # no real Socket API contact. Hermetic, reproducible.
   #
-  # Triggered on every PR. The existing `e2e` job above stays for
-  # `--ignored` real-API smoke runs (manual / scheduled).
+  # Triggered on every PR. The `e2e` job above now also runs the
+  # `--ignored` real-API smoke suites on PR (e2e_npm/pypi/gem/scan);
+  # this hermetic matrix is the always-green counterpart that does not
+  # depend on the public proxy.
   # ----------------------------------------------------------------------
   e2e-docker:
     runs-on: ubuntu-latest
@@ -579,7 +583,7 @@ jobs:
         run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}
 
   # ----------------------------------------------------------------------
-  # Experimental `setup`-flow matrix (NON-BLOCKING).
+  # `setup`-flow matrix (BLOCKING, except maven/nuget).
   #
   # For each ecosystem/package manager, drives the full intended flow —
   # prepare deps + a committed patch set, run `socket-patch setup`, run
@@ -587,19 +591,18 @@ jobs:
   # negative controls (no setup, empty/wrong/alt patch sets). See
   # tests/setup_matrix/ and scripts/setup-matrix.sh.
   #
-  # This is EXPERIMENTAL and intentionally not required to pass yet:
-  # `setup` only configures npm-family install hooks today, so most
-  # non-npm `baseline_with_setup` cases are EXPECTED to fail (a baseline
-  # of what `setup` must eventually support). `continue-on-error: true`
-  # means this job never blocks a PR — it must ALSO be left OUT of the
-  # repo's required status checks (configured in the branch-protection
-  # UI, not in this file). The orchestrator exits non-zero only on a
-  # *regression* vs the recorded baseline; the full per-case result set
-  # is uploaded as a JSON artifact for inspection.
+  # Every ecosystem except maven and nuget is now REQUIRED to support the
+  # `setup` flow: its targets are marked `baseline_supported: true` in
+  # matrix.json, so any case that fails the ideal classifies as a
+  # *regression* and the orchestrator exits non-zero — failing this job.
+  # maven and nuget stay experimental (`baseline_supported: false`), so
+  # their unmet cases remain non-blocking `known_gap`s. For a failure to
+  # also block merges, this job must be listed in the repo's required
+  # status checks (configured in the branch-protection UI, not here). The
+  # full per-case result set is uploaded as a JSON artifact for inspection.
   # ----------------------------------------------------------------------
   setup-matrix:
     runs-on: ubuntu-latest
-    continue-on-error: true
     permissions:
       contents: read
     strategy:

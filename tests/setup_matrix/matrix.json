@@ -5,11 +5,12 @@
     "crates/socket-patch-cli/tests/setup_matrix_<eco>.rs (serde_json).",
     "",
     "A 'case' is the cross-product (target x scenario). expect_applied comes from",
-    "the scenario (the ASPIRATIONAL ideal); baseline_supported on the target says",
-    "whether `setup` ACTUALLY wires a working install hook today. The classifier in",
+    "the scenario (the ASPIRATIONAL ideal); baseline_supported on the target marks",
+    "whether the ecosystem is REQUIRED to support the `setup` flow today (true for",
+    "every ecosystem except the still-experimental maven/nuget). The classifier in",
     "the orchestrator compares actual vs both: meeting the ideal => pass; failing the",
-    "ideal but matching the recorded baseline => known_gap (non-blocking); diverging",
-    "from the baseline in the wrong direction => regression (blocking the optional job).",
+    "ideal but matching the recorded baseline => known_gap (non-blocking, now used",
+    "only for maven/nuget); diverging from the baseline => regression (fails CI).",
     "",
     "Packages, PURLs, manifest keys and install layouts are reused verbatim from the",
     "existing tests/docker_e2e_<eco>.rs so the fixtures are known-valid.",
@@ -105,13 +106,13 @@
     },
     {
       "ecosystem": "pypi", "pm": "poetry", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
     {
       "ecosystem": "pypi", "pm": "pdm", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
@@ -124,21 +125,21 @@
 
     {
       "ecosystem": "cargo", "pm": "cargo", "image": "cargo", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "cfg-if", "version": "1.0.0", "purl": "pkg:cargo/cfg-if@1.0.0",
       "manifest_key": "package/src/lib.rs", "apply_ecosystems": "cargo"
     },
 
     {
       "ecosystem": "gem", "pm": "bundler", "image": "gem", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "colorize", "version": "1.1.0", "purl": "pkg:gem/colorize@1.1.0",
       "manifest_key": "package/lib/colorize.rb", "apply_ecosystems": "gem"
     },
 
     {
       "ecosystem": "golang", "pm": "go", "image": "golang", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "github.com/gin-gonic/gin", "version": "v1.9.1",
       "purl": "pkg:golang/github.com/gin-gonic/gin@v1.9.1",
       "manifest_key": "package/gin.go", "apply_ecosystems": "golang"
@@ -154,7 +155,7 @@
 
     {
       "ecosystem": "composer", "pm": "composer", "image": "composer", "hook_family": "composer-event",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "monolog/monolog", "version": "3.5.0", "purl": "pkg:composer/monolog/monolog@3.5.0",
       "manifest_key": "package/src/Monolog/Logger.php", "apply_ecosystems": "composer"
     },
@@ -168,7 +169,7 @@
 
     {
       "ecosystem": "deno", "pm": "deno", "image": "deno", "hook_family": "npm-via-deno",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "minimist", "version": "1.2.2", "purl": "pkg:npm/minimist@1.2.2",
       "manifest_key": "package/index.js", "apply_ecosystems": "npm"
     }
@@ -181,7 +182,8 @@
     "`setup`'s workspace handling — npm/yarn write the hook to every member,",
     "pnpm only to the root — plus the cross-workspace apply on the root",
     "install. npm/yarn/pnpm should apply (baseline_supported true); Python",
-    "workspaces (uv workspace, pip nested-requirements) are gaps."
+    "workspaces (uv workspace, pip nested-requirements) are now REQUIRED too",
+    "(baseline_supported true) and fail until `setup` supports them."
   ],
   "workspace_scenarios": [
     {
@@ -227,13 +229,13 @@
     },
     {
       "ecosystem": "pypi", "pm": "pip", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     },
     {
       "ecosystem": "pypi", "pm": "uv", "image": "pypi", "hook_family": "none",
-      "baseline_supported": false,
+      "baseline_supported": true,
       "package": "six", "version": "1.16.0", "purl": "pkg:pypi/six@1.16.0",
       "manifest_key": "six.py", "apply_ecosystems": "pypi"
     }
