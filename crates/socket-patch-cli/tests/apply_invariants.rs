@@ -269,6 +269,19 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
         v.get("error").is_none(),
         "no-match path is a partialFailure, not a hard error; got {v}"
     );
+    // Parity with the offline test: this bail path does no work either, so
+    // every summary counter must be 0 and no per-patch events should be
+    // emitted. Without these a regression that started reporting phantom
+    // work (a spurious `failed`/`discovered`/`downloaded`, or fabricated
+    // events) on the no-match branch would pass unnoticed.
+    assert_summary_all_zero(&v["summary"]);
+    let events = v["events"]
+        .as_array()
+        .expect("envelope must carry an events array");
+    assert!(
+        events.is_empty(),
+        "no-match bail emits no per-patch events; got {events:?}"
+    );
     assert_eq!(
         before, after,
         "apply must not mutate .socket/ on the no-match path; hash changed"
@@ -277,6 +290,14 @@ fn apply_does_not_mutate_socket_dir_when_no_packages_match() {
         std::fs::read(socket.join("blobs").join("sentinel")).expect("sentinel survives"),
         b"do not modify me",
         "apply must not rewrite the blobs sentinel on the no-match path"
+    );
+    // Belt-and-suspenders against a dir_hash blind spot (same as the
+    // offline test): the manifest must be byte-identical to what
+    // `write_project` laid down.
+    assert_eq!(
+        std::fs::read_to_string(socket.join("manifest.json")).expect("manifest survives"),
+        MANIFEST_JSON,
+        "apply must not rewrite manifest.json on the no-match path"
     );
 }
 

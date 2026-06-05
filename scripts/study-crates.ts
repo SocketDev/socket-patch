@@ -64,6 +64,10 @@ import { createInterface } from "node:readline";
 import {
   mkdirSync,
   writeFileSync,
+  appendFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
   createWriteStream,
   readdirSync,
   statSync,
@@ -152,6 +156,7 @@ interface Args {
   target: StudyTarget;
   concurrency: number;
   timeoutSec: number;
+  offset: number;
   dryRun: boolean;
   help: boolean;
 }
@@ -162,6 +167,7 @@ function parseArgs(argv: string[]): Args {
     target: "src",
     concurrency: 1,
     timeoutSec: 1800,
+    offset: 0,
     dryRun: false,
     help: false,
   };
@@ -210,6 +216,9 @@ function parseArgs(argv: string[]): Args {
       case "--timeout":
         a.timeoutSec = Math.max(1, parseInt(next(), 10) || 1800);
         break;
+      case "--offset":
+        a.offset = Math.max(0, parseInt(next(), 10) || 0);
+        break;
       case "--dry-run":
         a.dryRun = true;
         break;
@@ -249,6 +258,8 @@ Usage: npx tsx scripts/study-crates.ts [options]
   --tests                   Shorthand for --target tests.
   --concurrency <n>         Parallel sessions (default: 1).
   --timeout <sec>           Per-file timeout in seconds (default: 1800).
+  --offset <n>              Skip the first <n> files in the deterministic order
+                            (default: 0). Use to resume after a crash.
   --dry-run                 List files + rendered prompts; run nothing.
   -h, --help                Show this help.
 
@@ -320,6 +331,10 @@ function discoverFiles(args: Args): FileCtx[] {
       }
     }
   }
+  // Impose a single, stable total order over the full set so the global index
+  // (and therefore --offset) is deterministic across runs and independent of
+  // crate/root traversal nesting. Sort by repo-relative POSIX path.
+  files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
   return files;
 }
 
@@ -537,14 +552,73 @@ async function runPool<T, R>(
 }
 
 // ---------------------------------------------------------------------------
+// Result persistence (for crash-resume via --offset)
+// ---------------------------------------------------------------------------
+
+/**
+ * Path of the machine-readable result log. One JSON object per line, appended
+ * as each file completes, so a crashed sweep can be resumed with --offset
+ * without losing the work already done. `writeSummary` reads this back to
+ * build a SUMMARY.md spanning every pass, not just the current one.
+ */
+function resultsLogPath(outDir: string): string {
+  return join(outDir, "results.jsonl");
+}
+
+/** Append one completed file's result to the resume log (atomic per call). */
+function appendResult(outDir: string, r: FileResult): void {
+  try {
+    appendFileSync(resultsLogPath(outDir), JSON.stringify(r) + "\n");
+  } catch (err) {
+    // Persistence is best-effort: a failed append must not abort the sweep.
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`  ! could not persist result for ${r.ctx.file}: ${message}`);
+  }
+}
+
+/**
+ * Load all previously-logged results, de-duplicated by file (last write wins,
+ * so a re-run of the same file in a later pass supersedes the earlier one).
+ * Returns an empty array if the log is absent or unreadable.
+ */
+function loadPriorResults(outDir: string): FileResult[] {
+  const path = resultsLogPath(outDir);
+  if (!existsSync(path)) return [];
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  const byFile = new Map<string, FileResult>();
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const r = JSON.parse(trimmed) as FileResult;
+      if (r?.ctx?.file) byFile.set(r.ctx.file, r);
+    } catch {
+      // Skip a corrupt/truncated line (e.g. a crash mid-write) rather than fail.
+    }
+  }
+  return [...byFile.values()];
+}
+
+// ---------------------------------------------------------------------------
 // Aggregation
 // ---------------------------------------------------------------------------
 
 function writeSummary(
   outDir: string,
-  results: FileResult[],
+  unordered: FileResult[],
   args: Args,
 ): string {
+  // Results may arrive out of discovery order (concurrency) or merged from a
+  // resume log (Map iteration); impose the same stable path order used for
+  // discovery so the report is deterministic across runs.
+  const results = [...unordered].sort((a, b) =>
+    a.ctx.file < b.ctx.file ? -1 : a.ctx.file > b.ctx.file ? 1 : 0,
+  );
   const ok = results.filter((r) => r.ok);
   const failed = results.filter((r) => !r.ok);
   const totalCost = results.reduce((s, r) => s + r.costUsd, 0);
@@ -622,9 +696,23 @@ async function main(): Promise<void> {
     return;
   }
 
-  const files = discoverFiles(args);
-  if (files.length === 0) {
+  const allFiles = discoverFiles(args);
+  if (allFiles.length === 0) {
     fail("No matching source files found.");
+  }
+  if (args.offset >= allFiles.length) {
+    fail(
+      `--offset ${args.offset} skips all ${allFiles.length} discovered file(s); nothing to do.`,
+    );
+  }
+  // Resume support: skip the first `offset` files in the deterministic order.
+  const files =
+    args.offset > 0 ? allFiles.slice(args.offset) : allFiles;
+  if (args.offset > 0) {
+    console.log(
+      `Skipping first ${args.offset} of ${allFiles.length} file(s) (--offset); ` +
+        `${files.length} remaining.`,
+    );
   }
 
   const renderer = await loadRenderer(args);
@@ -637,12 +725,14 @@ async function main(): Promise<void> {
           ? "source + test"
           : "non-test source";
     console.log(`Discovered ${files.length} ${label} file(s):\n`);
-    for (const ctx of files) {
-      console.log(`• ${ctx.file}`);
+    files.forEach((ctx, i) => {
+      // Global index (incl. --offset) so the printed number is the value to
+      // pass as --offset to resume from this file.
+      console.log(`• [${args.offset + i}] ${ctx.file}`);
       const prompt = renderer(ctx);
       const preview = prompt.length > 240 ? prompt.slice(0, 237) + "..." : prompt;
       console.log(`    prompt: ${preview.replace(/\n/g, " ")}`);
-    }
+    });
     console.log(
       `\n(dry run — nothing executed; ${files.length} session(s) would run, ` +
         `concurrency ${args.concurrency})`,
@@ -653,6 +743,19 @@ async function main(): Promise<void> {
   const outDir = resolve(process.cwd(), args.out);
   const rawDir = join(outDir, "raw");
   mkdirSync(rawDir, { recursive: true });
+
+  // Resume support: a fresh run (offset 0) starts the result log clean so a
+  // prior sweep's entries don't leak into this report. A resume (offset > 0)
+  // keeps the log and appends to it, so SUMMARY.md spans every pass.
+  if (args.offset === 0) {
+    rmSync(resultsLogPath(outDir), { force: true });
+  } else {
+    const priorCount = loadPriorResults(outDir).length;
+    console.log(
+      `Resuming: ${priorCount} prior result(s) loaded from ` +
+        `${resultsLogPath(outDir)} will be merged into the report.`,
+    );
+  }
 
   console.log(
     `Studying ${files.length} file(s) with ${CLAUDE_BIN} ` +
@@ -665,8 +768,30 @@ async function main(): Promise<void> {
   const total = files.length;
 
   const results = await runPool(files, args.concurrency, async (ctx, i) => {
-    const prompt = renderer(ctx);
-    const r = await runOne(ctx, prompt, args, i, total, rawDir);
+    // Never let one file's failure abort the whole sweep: any unexpected throw
+    // (e.g. a renderer that blows up on this ctx) is recorded as a failed
+    // result and the pool moves on. runOne itself already resolves on
+    // spawn/timeout/non-zero errors rather than rejecting.
+    let r: FileResult;
+    try {
+      const prompt = renderer(ctx);
+      r = await runOne(ctx, prompt, args, i, total, rawDir);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(`  ✗ skipped ${ctx.file}: ${message}`);
+      r = {
+        ctx,
+        ok: false,
+        reason: `unhandled error: ${message}`,
+        summary: "",
+        costUsd: 0,
+        durationMs: 0,
+        numTurns: 0,
+      };
+    }
+    // Persist immediately so a later crash can resume via --offset without
+    // losing this file's work.
+    appendResult(outDir, r);
     done++;
     runningCost += r.costUsd;
     console.log(
@@ -675,17 +800,31 @@ async function main(): Promise<void> {
     return r;
   });
 
-  // Preserve discovery order in the report regardless of completion order.
-  const summaryPath = writeSummary(outDir, results, args);
+  // Merge this pass with any prior passes recorded in the resume log (last
+  // write per file wins, handled by loadPriorResults) so SUMMARY.md reflects
+  // every file studied across resumes, not just this invocation. writeSummary
+  // re-imposes the deterministic file order.
+  const merged = loadPriorResults(outDir);
+  const summaryPath = writeSummary(outDir, merged, args);
 
-  const ok = results.filter((r) => r.ok).length;
-  const failed = results.length - ok;
+  const thisOk = results.filter((r) => r.ok).length;
+  const thisFailed = results.length - thisOk;
+  const mergedOk = merged.filter((r) => r.ok).length;
+  const mergedFailed = merged.length - mergedOk;
   console.log("\n──────────────────────────────────────────");
-  console.log(`Done: ${ok} succeeded, ${failed} failed of ${total}.`);
-  console.log(`Total cost: $${runningCost.toFixed(4)}`);
+  console.log(
+    `This pass: ${thisOk} succeeded, ${thisFailed} failed of ${total}.`,
+  );
+  if (args.offset > 0 || merged.length !== results.length) {
+    console.log(
+      `Overall (incl. prior passes): ${mergedOk} succeeded, ` +
+        `${mergedFailed} failed of ${merged.length}.`,
+    );
+  }
+  console.log(`Total cost (this pass): $${runningCost.toFixed(4)}`);
   console.log(`Summary written to ${summaryPath}`);
   console.log(`Raw streams in ${rawDir}`);
-  if (failed > 0) process.exitCode = 1;
+  if (mergedFailed > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {

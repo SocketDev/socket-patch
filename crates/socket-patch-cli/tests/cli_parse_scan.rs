@@ -14,10 +14,75 @@ use clap::Parser;
 use socket_patch_cli::commands::scan::ScanArgs;
 use socket_patch_cli::{Cli, Commands};
 
+/// Every `ScanArgs`/`GlobalArgs`/`VexEmbedArgs` field that has an `env =
+/// "SOCKET_*"` binding. clap reads these at parse time whenever the matching
+/// flag is absent, so an ambient value silently overrides the code-level
+/// `default_value`. That defeats the entire purpose of these snapshot tests:
+/// a regression that flips a `default_value` (e.g. `--download-mode` →
+/// `"package"`, or `--batch-size` → `50`) would stay GREEN on any machine
+/// whose shell/CI happens to export the old value, and the "default" tests
+/// would be asserting the environment, not the parser. We therefore clear
+/// the whole set before every parse and restore it after, under `#[serial]`
+/// so the process-global mutation can't race a concurrent test.
+///
+/// Keep this list in sync with `env = "SOCKET_*"` attrs in
+/// `src/args.rs`, `src/commands/scan.rs`, and `src/commands/vex.rs`.
+const SCAN_ENV_VARS: &[&str] = &[
+    "SOCKET_ALL_RELEASES",
+    "SOCKET_API_TOKEN",
+    "SOCKET_API_URL",
+    "SOCKET_BATCH_SIZE",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_CWD",
+    "SOCKET_DEBUG",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_DRY_RUN",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_OFFLINE",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_SILENT",
+    "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_VERBOSE",
+    "SOCKET_VEX",
+    "SOCKET_VEX_COMPACT",
+    "SOCKET_VEX_DOC_ID",
+    "SOCKET_VEX_NO_VERIFY",
+    "SOCKET_VEX_OUTPUT",
+    "SOCKET_VEX_PRODUCT",
+    "SOCKET_YES",
+];
+
+/// Run `f` with every `SOCKET_*` var removed from the environment, then
+/// restore the originals. Must be called only from `#[serial]` tests —
+/// env state is process-global.
+fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
+    let saved: Vec<(&str, Option<String>)> = SCAN_ENV_VARS
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+    for k in SCAN_ENV_VARS {
+        std::env::remove_var(k);
+    }
+    let result = f();
+    for (k, orig) in saved {
+        match orig {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    result
+}
+
 fn parse_scan(extra: &[&str]) -> ScanArgs {
     let mut argv = vec!["socket-patch", "scan"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = with_clean_env(|| Cli::try_parse_from(&argv)).expect("parse");
     match cli.command {
         Commands::Scan(a) => a,
         _ => panic!("expected Scan"),
@@ -27,7 +92,7 @@ fn parse_scan(extra: &[&str]) -> ScanArgs {
 fn try_parse_scan(extra: &[&str]) -> Result<ScanArgs, clap::Error> {
     let mut argv = vec!["socket-patch", "scan"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv)?;
+    let cli = with_clean_env(|| Cli::try_parse_from(&argv))?;
     match cli.command {
         Commands::Scan(a) => Ok(a),
         _ => panic!("expected Scan"),
@@ -35,6 +100,7 @@ fn try_parse_scan(extra: &[&str]) -> Result<ScanArgs, clap::Error> {
 }
 
 #[test]
+#[serial_test::serial]
 fn defaults_match_contract() {
     let args = parse_scan(&[]);
 
@@ -72,6 +138,7 @@ fn defaults_match_contract() {
 }
 
 #[test]
+#[serial_test::serial]
 fn vex_path_sets_output() {
     assert_eq!(
         parse_scan(&["--vex", "out.vex.json"]).vex.vex,
@@ -80,6 +147,7 @@ fn vex_path_sets_output() {
 }
 
 #[test]
+#[serial_test::serial]
 fn vex_passthrough_flags() {
     let args = parse_scan(&[
         "--vex",
@@ -99,84 +167,98 @@ fn vex_passthrough_flags() {
 }
 
 #[test]
+#[serial_test::serial]
 fn all_releases_flag_long_form() {
     let args = parse_scan(&["--all-releases"]);
     assert!(args.all_releases);
 }
 
 #[test]
+#[serial_test::serial]
 fn yes_short_flag() {
     let args = parse_scan(&["-y"]);
     assert!(args.common.yes);
 }
 
 #[test]
+#[serial_test::serial]
 fn yes_long_flag() {
     let args = parse_scan(&["--yes"]);
     assert!(args.common.yes);
 }
 
 #[test]
+#[serial_test::serial]
 fn global_short_flag() {
     let args = parse_scan(&["-g"]);
     assert!(args.common.global);
 }
 
 #[test]
+#[serial_test::serial]
 fn global_long_flag() {
     let args = parse_scan(&["--global"]);
     assert!(args.common.global);
 }
 
 #[test]
+#[serial_test::serial]
 fn cwd_flag() {
     let args = parse_scan(&["--cwd", "/tmp/x"]);
     assert_eq!(args.common.cwd, std::path::PathBuf::from("/tmp/x"));
 }
 
 #[test]
+#[serial_test::serial]
 fn org_flag() {
     let args = parse_scan(&["--org", "myorg"]);
     assert_eq!(args.common.org.as_deref(), Some("myorg"));
 }
 
 #[test]
+#[serial_test::serial]
 fn json_flag() {
     let args = parse_scan(&["--json"]);
     assert!(args.common.json);
 }
 
 #[test]
+#[serial_test::serial]
 fn global_prefix_flag() {
     let args = parse_scan(&["--global-prefix", "/foo"]);
     assert_eq!(args.common.global_prefix, Some(std::path::PathBuf::from("/foo")));
 }
 
 #[test]
+#[serial_test::serial]
 fn api_url_flag() {
     let args = parse_scan(&["--api-url", "https://api"]);
     assert_eq!(args.common.api_url, "https://api");
 }
 
 #[test]
+#[serial_test::serial]
 fn api_token_flag() {
     let args = parse_scan(&["--api-token", "tok"]);
     assert_eq!(args.common.api_token.as_deref(), Some("tok"));
 }
 
 #[test]
+#[serial_test::serial]
 fn batch_size_500() {
     let args = parse_scan(&["--batch-size", "500"]);
     assert_eq!(args.batch_size, 500);
 }
 
 #[test]
+#[serial_test::serial]
 fn batch_size_1() {
     let args = parse_scan(&["--batch-size", "1"]);
     assert_eq!(args.batch_size, 1);
 }
 
 #[test]
+#[serial_test::serial]
 fn batch_size_0_parses() {
     // Clap accepts 0 as a valid usize. Whether 0 is a sensible batch size is
     // a command-level concern, not a parser concern. Lock in that the parser
@@ -186,6 +268,7 @@ fn batch_size_0_parses() {
 }
 
 #[test]
+#[serial_test::serial]
 fn batch_size_negative_fails() {
     // Use `--batch-size=-1` (rather than two separate tokens) so clap parses
     // `-1` as the value, not a stray short flag. The value must then fail
@@ -206,6 +289,7 @@ fn batch_size_negative_fails() {
 }
 
 #[test]
+#[serial_test::serial]
 fn ecosystems_csv_multi() {
     let args = parse_scan(&["--ecosystems", "npm,pypi,cargo,maven"]);
     assert_eq!(
@@ -220,30 +304,35 @@ fn ecosystems_csv_multi() {
 }
 
 #[test]
+#[serial_test::serial]
 fn ecosystems_csv_single() {
     let args = parse_scan(&["--ecosystems", "npm"]);
     assert_eq!(args.common.ecosystems, Some(vec!["npm".to_string()]));
 }
 
 #[test]
+#[serial_test::serial]
 fn download_mode_diff() {
     let args = parse_scan(&["--download-mode", "diff"]);
     assert_eq!(args.common.download_mode, "diff");
 }
 
 #[test]
+#[serial_test::serial]
 fn download_mode_package() {
     let args = parse_scan(&["--download-mode", "package"]);
     assert_eq!(args.common.download_mode, "package");
 }
 
 #[test]
+#[serial_test::serial]
 fn download_mode_file() {
     let args = parse_scan(&["--download-mode", "file"]);
     assert_eq!(args.common.download_mode, "file");
 }
 
 #[test]
+#[serial_test::serial]
 fn unknown_flag_fails() {
     let err = match try_parse_scan(&["--not-a-real-flag"]) {
         Ok(_) => panic!("unknown flag should fail to parse"),
@@ -260,12 +349,14 @@ fn unknown_flag_fails() {
 // on to summarize what would change.
 
 #[test]
+#[serial_test::serial]
 fn apply_flag_long_form() {
     let args = parse_scan(&["--apply"]);
     assert!(args.apply);
 }
 
 #[test]
+#[serial_test::serial]
 fn apply_flag_combines_with_json_and_yes() {
     let args = parse_scan(&["--apply", "--json", "--yes"]);
     assert!(args.apply);
@@ -279,12 +370,14 @@ fn apply_flag_combines_with_json_and_yes() {
 // `--dry-run` (`-d`) previews what those flags would do without mutating.
 
 #[test]
+#[serial_test::serial]
 fn prune_flag_long_form() {
     let args = parse_scan(&["--prune"]);
     assert!(args.prune);
 }
 
 #[test]
+#[serial_test::serial]
 fn prune_combines_with_apply_and_json() {
     let args = parse_scan(&["--apply", "--json", "--yes", "--prune"]);
     assert!(args.apply);
@@ -294,6 +387,7 @@ fn prune_combines_with_apply_and_json() {
 }
 
 #[test]
+#[serial_test::serial]
 fn sync_flag_long_form() {
     let args = parse_scan(&["--sync"]);
     assert!(args.sync);
@@ -304,6 +398,7 @@ fn sync_flag_long_form() {
 }
 
 #[test]
+#[serial_test::serial]
 fn sync_combines_with_json_and_yes() {
     let args = parse_scan(&["--json", "--sync", "--yes"]);
     assert!(args.common.json);
@@ -312,12 +407,14 @@ fn sync_combines_with_json_and_yes() {
 }
 
 #[test]
+#[serial_test::serial]
 fn dry_run_long_form() {
     let args = parse_scan(&["--dry-run"]);
     assert!(args.common.dry_run);
 }
 
 #[test]
+#[serial_test::serial]
 fn scan_json_empty_cwd_emits_updates_key() {
     // Spawn the compiled binary against an empty tempdir so no API call
     // happens (no packages found → early "no packages" JSON return).
@@ -335,13 +432,19 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // loudly. See the summary for the uncovered `detect_updates` gap.
     let bin = env!("CARGO_BIN_EXE_socket-patch");
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = std::process::Command::new(bin)
-        .args(["scan", "--json", "--cwd"])
-        .arg(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .env_remove("SOCKET_API_URL")
-        .output()
-        .expect("spawn socket-patch");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(["scan", "--json", "--cwd"]).arg(tmp.path());
+    // Strip *every* SOCKET_* override the child would otherwise inherit.
+    // It is not enough to drop the API creds: an ambient `SOCKET_VEX` would
+    // fold a `vex` object into the output, `SOCKET_OFFLINE`/`SOCKET_GLOBAL`
+    // would steer the crawl, and `SOCKET_JSON=false` would suppress JSON
+    // entirely — any of which would either spuriously fail the exact-shape
+    // lock or, worse, change the branch under test. Clear them all so the
+    // subprocess sees only the CLI args we pass.
+    for k in SCAN_ENV_VARS {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().expect("spawn socket-patch");
 
     assert_eq!(
         out.status.code(),

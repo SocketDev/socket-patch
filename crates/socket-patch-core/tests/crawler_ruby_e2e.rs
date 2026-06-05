@@ -46,6 +46,24 @@ async fn stage_gem(gem_path: &Path, name: &str, version: &str) -> std::path::Pat
     pkg_dir
 }
 
+/// Install a fake `gem` executable into `bin_dir` that answers
+/// `gem env gemdir` with `gemdir` and fails every other invocation.
+/// Lets the local-mode `gem env gemdir` fallback be exercised
+/// deterministically (asserting the resolved path) without a real Ruby
+/// toolchain on the host — instead of the previous swallowed-result
+/// "doesn't crash" smoke tests.
+#[cfg(unix)]
+fn install_fake_gem(bin_dir: &Path, gemdir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = env ] && [ \"$2\" = gemdir ]; then\n  printf '%s\\n' \"{}\"\n  exit 0\nfi\nexit 1\n",
+        gemdir.display()
+    );
+    let bin = bin_dir.join("gem");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 // ── find_by_purls ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -59,7 +77,12 @@ async fn find_by_purls_finds_gem_in_gem_path() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    assert_eq!(result.get(ORG_PURL).unwrap().path, pkg_dir);
+    let pkg = result.get(ORG_PURL).unwrap();
+    assert_eq!(pkg.path, pkg_dir);
+    assert_eq!(pkg.name, "rails");
+    assert_eq!(pkg.version, "7.1.0");
+    assert_eq!(pkg.purl, ORG_PURL);
+    assert_eq!(pkg.namespace, None);
 }
 
 #[tokio::test]
@@ -78,6 +101,10 @@ async fn find_by_purls_accepts_gem_with_gemspec_only() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
+    let pkg = result.get(ORG_PURL).unwrap();
+    assert_eq!(pkg.path, pkg_dir, "gemspec-only dir must be the resolved path");
+    assert_eq!(pkg.name, "rails");
+    assert_eq!(pkg.version, "7.1.0");
 }
 
 #[tokio::test]
@@ -109,12 +136,34 @@ async fn find_by_purls_no_match_returns_empty() {
 #[tokio::test]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
+    // Stage a gem dir that WOULD match `rails@7.1.0` on disk. The only
+    // reason the lookup must come back empty is that the non-gem PURL
+    // type fails `parse_gem_purl` and is skipped — not because there's
+    // nothing to find. Without the staged dir this test passes
+    // vacuously even if the ecosystem prefix were ignored.
+    stage_gem(tmp.path(), "rails", "7.1.0").await;
+
     let crawler = RubyCrawler;
+    let non_gem = "pkg:not-gem/rails@7.1.0".to_string();
     let result = crawler
-        .find_by_purls(tmp.path(), &["pkg:not-gem/rails@7.1.0".to_string()])
+        .find_by_purls(tmp.path(), &[non_gem.clone()])
         .await
         .unwrap();
-    assert!(result.is_empty());
+    assert!(
+        result.is_empty(),
+        "non-gem PURL must be skipped despite a matching rails-7.1.0 dir; got {result:?}"
+    );
+    assert!(!result.contains_key(&non_gem));
+
+    // Control: the SAME on-disk layout resolves when the PURL is a real
+    // gem PURL — proves the staged dir is genuinely discoverable, so the
+    // emptiness above is attributable to the bad ecosystem, not a missing
+    // fixture.
+    let gem_result = crawler
+        .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
+        .await
+        .unwrap();
+    assert_eq!(gem_result.len(), 1, "control gem PURL must resolve");
 }
 
 // ── crawl_all ─────────────────────────────────────────────────
@@ -134,6 +183,25 @@ async fn crawl_all_discovers_gems_in_path() {
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 2);
+
+    // len==2 alone would survive a regression that discovers two *wrong*
+    // gems. Pin the exact (purl, name, version) set discovered.
+    use std::collections::HashSet;
+    let purls: HashSet<&str> = result.iter().map(|p| p.purl.as_str()).collect();
+    assert!(
+        purls.contains("pkg:gem/rails@7.1.0"),
+        "rails must be discovered; got {purls:?}"
+    );
+    assert!(
+        purls.contains("pkg:gem/nokogiri@1.16.5"),
+        "nokogiri must be discovered; got {purls:?}"
+    );
+    let rails = result.iter().find(|p| p.name == "rails").unwrap();
+    assert_eq!(rails.version, "7.1.0");
+    assert_eq!(rails.path, tmp.path().join("rails-7.1.0"));
+    let noko = result.iter().find(|p| p.name == "nokogiri").unwrap();
+    assert_eq!(noko.version, "1.16.5");
+    assert_eq!(noko.path, tmp.path().join("nokogiri-1.16.5"));
 }
 
 // ── get_gem_paths ──────────────────────────────────────────────
@@ -166,9 +234,15 @@ async fn get_gem_paths_vendor_bundle_takes_precedence_over_global() {
         .get_gem_paths(&options_at(tmp.path()))
         .await
         .unwrap();
-    assert!(
-        paths.iter().any(|p| p == &gems),
-        "vendor/bundle gems dir must be discovered; got {paths:?}"
+    // `options_at` is local mode. Vendor discovery short-circuits and
+    // returns ONLY the vendor gems dir — it must NOT fall through to the
+    // `gem env`/global fallback (which is what "takes precedence" means).
+    // An `any(...)` check would tolerate global paths leaking in
+    // alongside vendor; require the exact singleton instead.
+    assert_eq!(
+        paths,
+        vec![gems.clone()],
+        "vendor/bundle gems dir must be the sole result (no global fallthrough); got {paths:?}"
     );
 }
 
@@ -184,38 +258,84 @@ async fn get_gem_paths_no_gemfile_returns_empty() {
     assert!(paths.is_empty(), "non-Ruby dir must return empty paths");
 }
 
+/// With a Gemfile present and no vendor/bundle, local mode falls back
+/// to `gem env gemdir` and returns `<gemdir>/gems`. Driven
+/// deterministically with a fake `gem` on PATH so the success arm is
+/// actually asserted (the old test swallowed the result with `let _`).
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn get_gem_paths_with_gemfile_no_vendor_returns_paths() {
+async fn get_gem_paths_with_gemfile_no_vendor_returns_gemdir() {
     let tmp = tempfile::tempdir().unwrap();
-    // Gemfile present, no vendor/bundle. Falls back to `gem env gemdir`.
-    // This either returns paths (if `gem` is on PATH and produces output)
-    // or empty (if `gem` is missing). Both are valid — the contract is
-    // "doesn't crash".
     tokio::fs::write(tmp.path().join("Gemfile"), b"source 'https://rubygems.org'")
         .await
         .unwrap();
 
+    // The dir the fake `gem env gemdir` reports; its `gems/` subdir is
+    // what the crawler must return (it checks is_dir on `<gemdir>/gems`).
+    let gemdir = tempfile::tempdir().unwrap();
+    let gems = gemdir.path().join("gems");
+    tokio::fs::create_dir_all(&gems).await.unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem(bin.path(), gemdir.path());
+
+    let prev = std::env::var("PATH").ok();
+    std::env::set_var("PATH", bin.path());
+
     let crawler = RubyCrawler;
-    let _ = crawler
-        .get_gem_paths(&options_at(tmp.path()))
-        .await
-        .unwrap();
-    // No assertion on contents — just contract that no panic occurs.
+    let result = crawler.get_gem_paths(&options_at(tmp.path())).await;
+
+    if let Some(v) = prev {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    let paths = result.unwrap();
+    assert_eq!(
+        paths,
+        vec![gems.clone()],
+        "Gemfile + `gem env gemdir` must yield exactly <gemdir>/gems; got {paths:?}"
+    );
 }
 
+/// Same as above but only a Gemfile.lock is present — proves the lock
+/// alone (not just a Gemfile) triggers the `gem env gemdir` fallback.
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn get_gem_paths_with_gemfile_lock_only_works_too() {
+async fn get_gem_paths_with_gemfile_lock_only_returns_gemdir() {
     let tmp = tempfile::tempdir().unwrap();
     tokio::fs::write(tmp.path().join("Gemfile.lock"), b"GEM\n")
         .await
         .unwrap();
+
+    let gemdir = tempfile::tempdir().unwrap();
+    let gems = gemdir.path().join("gems");
+    tokio::fs::create_dir_all(&gems).await.unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    install_fake_gem(bin.path(), gemdir.path());
+
+    let prev = std::env::var("PATH").ok();
+    std::env::set_var("PATH", bin.path());
+
     let crawler = RubyCrawler;
-    let _ = crawler
-        .get_gem_paths(&options_at(tmp.path()))
-        .await
-        .unwrap();
+    let result = crawler.get_gem_paths(&options_at(tmp.path())).await;
+
+    if let Some(v) = prev {
+        std::env::set_var("PATH", v);
+    } else {
+        std::env::remove_var("PATH");
+    }
+
+    let paths = result.unwrap();
+    assert_eq!(
+        paths,
+        vec![gems.clone()],
+        "Gemfile.lock alone must trigger `gem env gemdir`; got {paths:?}"
+    );
 }
 
 // ── global gem discovery ───────────────────────────────────────

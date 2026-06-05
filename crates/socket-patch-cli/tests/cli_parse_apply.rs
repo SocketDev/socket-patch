@@ -25,6 +25,46 @@ fn parse_apply(extra: &[&str]) -> ApplyArgs {
     }
 }
 
+/// Every boolean toggle on `apply`, as `(contract name, current value)`.
+/// Used to prove that a single flag flips *only* its own field — without
+/// this, each positive test ignores all other fields, so a parser bug that
+/// cross-wired `--yes` into `--force` (auto-approve → silently bypass the
+/// beforeHash check) or any flag into `--break-lock` / `--global` would still
+/// stay green. Keep this in sync with the boolean flags in the contract.
+fn bool_flags(a: &ApplyArgs) -> Vec<(&'static str, bool)> {
+    vec![
+        ("dry_run", a.common.dry_run),
+        ("silent", a.common.silent),
+        ("global", a.common.global),
+        ("offline", a.common.offline),
+        ("json", a.common.json),
+        ("verbose", a.common.verbose),
+        ("yes", a.common.yes),
+        ("debug", a.common.debug),
+        ("no_telemetry", a.common.no_telemetry),
+        ("break_lock", a.common.break_lock),
+        ("force", a.force),
+        ("check", a.check),
+        ("vex_no_verify", a.vex.vex_no_verify),
+        ("vex_compact", a.vex.vex_compact),
+    ]
+}
+
+/// Assert that exactly the flags named in `expected_true` are set, and every
+/// other boolean toggle stayed at its `false` default. Closes the
+/// cross-contamination loophole: a flag that silently flips an *extra* field
+/// now fails loudly instead of passing because nobody looked.
+fn assert_only_true(a: &ApplyArgs, expected_true: &[&str]) {
+    for (name, value) in bool_flags(a) {
+        let want = expected_true.contains(&name);
+        assert_eq!(
+            value, want,
+            "flag `{name}` = {value}, expected {want} (set flags: {expected_true:?}) \
+             — a single flag must not flip any other boolean"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Defaults — every default value from the contract table is pinned here.
 // ---------------------------------------------------------------------------
@@ -71,13 +111,18 @@ fn defaults_match_contract() {
     assert!(!a.vex.vex_no_verify);
     assert_eq!(a.vex.vex_doc_id, None);
     assert!(!a.vex.vex_compact);
+
+    // Belt-and-suspenders: with no args, NO boolean toggle may be on.
+    assert_only_true(&a, &[]);
 }
 
 /// `--check` (cargo redirect audit mode) must parse and flip the flag true.
 /// It uses a `BoolishValueParser`, so the bare flag form is the canonical use.
 #[test]
 fn check_long() {
-    assert!(parse_apply(&["--check"]).check);
+    let a = parse_apply(&["--check"]);
+    assert!(a.check);
+    assert_only_true(&a, &["check"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,10 +132,12 @@ fn check_long() {
 
 #[test]
 fn vex_path_sets_output() {
-    assert_eq!(
-        parse_apply(&["--vex", "out.vex.json"]).vex.vex,
-        Some(PathBuf::from("out.vex.json"))
-    );
+    let a = parse_apply(&["--vex", "out.vex.json"]);
+    assert_eq!(a.vex.vex, Some(PathBuf::from("out.vex.json")));
+    // The trigger flag alone must not flip any other vex knob or boolean.
+    assert_eq!(a.vex.vex_product, None);
+    assert_eq!(a.vex.vex_doc_id, None);
+    assert_only_true(&a, &[]);
 }
 
 #[test]
@@ -110,6 +157,9 @@ fn vex_passthrough_flags() {
     assert!(a.vex.vex_no_verify);
     assert_eq!(a.vex.vex_doc_id.as_deref(), Some("urn:uuid:fixed"));
     assert!(a.vex.vex_compact);
+    // Only the two vex booleans should be set; nothing else (e.g. --force) may
+    // ride along on the vex passthrough.
+    assert_only_true(&a, &["vex_no_verify", "vex_compact"]);
 }
 
 /// The `download_mode` default is pinned separately — it's the one
@@ -133,87 +183,194 @@ fn default_manifest_path_is_dot_socket_manifest_json() {
 
 #[test]
 fn dry_run_long() {
-    assert!(parse_apply(&["--dry-run"]).common.dry_run);
+    let a = parse_apply(&["--dry-run"]);
+    assert!(a.common.dry_run);
+    assert_only_true(&a, &["dry_run"]);
 }
 
 #[test]
 fn silent_long() {
-    assert!(parse_apply(&["--silent"]).common.silent);
+    let a = parse_apply(&["--silent"]);
+    assert!(a.common.silent);
+    assert_only_true(&a, &["silent"]);
 }
 
 #[test]
 fn silent_short() {
-    assert!(parse_apply(&["-s"]).common.silent);
+    let a = parse_apply(&["-s"]);
+    assert!(a.common.silent);
+    assert_only_true(&a, &["silent"]);
 }
 
 #[test]
 fn global_long() {
-    assert!(parse_apply(&["--global"]).common.global);
+    let a = parse_apply(&["--global"]);
+    assert!(a.common.global);
+    assert_only_true(&a, &["global"]);
 }
 
 #[test]
 fn global_short() {
-    assert!(parse_apply(&["-g"]).common.global);
+    let a = parse_apply(&["-g"]);
+    assert!(a.common.global);
+    assert_only_true(&a, &["global"]);
 }
 
 #[test]
 fn force_long() {
-    assert!(parse_apply(&["--force"]).force);
+    let a = parse_apply(&["--force"]);
+    assert!(a.force);
+    assert_only_true(&a, &["force"]);
 }
 
 #[test]
 fn force_short() {
-    assert!(parse_apply(&["-f"]).force);
+    let a = parse_apply(&["-f"]);
+    assert!(a.force);
+    assert_only_true(&a, &["force"]);
 }
 
 #[test]
 fn verbose_long() {
-    assert!(parse_apply(&["--verbose"]).common.verbose);
+    let a = parse_apply(&["--verbose"]);
+    assert!(a.common.verbose);
+    assert_only_true(&a, &["verbose"]);
 }
 
 #[test]
 fn verbose_short() {
-    assert!(parse_apply(&["-v"]).common.verbose);
+    let a = parse_apply(&["-v"]);
+    assert!(a.common.verbose);
+    assert_only_true(&a, &["verbose"]);
 }
 
 #[test]
 fn offline_long() {
-    assert!(parse_apply(&["--offline"]).common.offline);
+    let a = parse_apply(&["--offline"]);
+    assert!(a.common.offline);
+    assert_only_true(&a, &["offline"]);
 }
 
 #[test]
 fn json_long() {
-    assert!(parse_apply(&["--json"]).common.json);
+    let a = parse_apply(&["--json"]);
+    assert!(a.common.json);
+    assert_only_true(&a, &["json"]);
 }
 
 #[test]
 fn json_short() {
-    assert!(parse_apply(&["-j"]).common.json);
+    let a = parse_apply(&["-j"]);
+    assert!(a.common.json);
+    assert_only_true(&a, &["json"]);
 }
 
 #[test]
 fn yes_long() {
-    assert!(parse_apply(&["--yes"]).common.yes);
+    let a = parse_apply(&["--yes"]);
+    assert!(a.common.yes);
+    // `--yes` must NOT imply `--force`: auto-approving prompts is not the same
+    // as bypassing the beforeHash safety check.
+    assert_only_true(&a, &["yes"]);
 }
 
 #[test]
 fn yes_short() {
-    assert!(parse_apply(&["-y"]).common.yes);
+    let a = parse_apply(&["-y"]);
+    assert!(a.common.yes);
+    assert_only_true(&a, &["yes"]);
 }
 
 #[test]
 fn debug_long() {
-    assert!(parse_apply(&["--debug"]).common.debug);
+    let a = parse_apply(&["--debug"]);
+    assert!(a.common.debug);
+    assert_only_true(&a, &["debug"]);
 }
 
 #[test]
 fn no_telemetry_long() {
-    assert!(parse_apply(&["--no-telemetry"]).common.no_telemetry);
+    let a = parse_apply(&["--no-telemetry"]);
+    assert!(a.common.no_telemetry);
+    assert_only_true(&a, &["no_telemetry"]);
 }
 
 #[test]
 fn break_lock_long() {
-    assert!(parse_apply(&["--break-lock"]).common.break_lock);
+    let a = parse_apply(&["--break-lock"]);
+    assert!(a.common.break_lock);
+    assert_only_true(&a, &["break_lock"]);
+}
+
+/// Bare boolean flags are `SetTrue` (num_args = 0): they must NOT swallow the
+/// following token as a value. If `--force` silently became value-taking, a
+/// wrapper invoking `apply --force <something>` would change meaning. Assert
+/// the trailing token is rejected as an unknown argument.
+#[test]
+fn bare_bool_does_not_consume_next_token() {
+    match Cli::try_parse_from(["socket-patch", "apply", "--force", "stray"]) {
+        Ok(_) => panic!("`--force stray` must reject the stray positional"),
+        Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
+    }
+}
+
+/// All boolean toggles set at once: each must independently be true. Catches a
+/// regression where two flags share storage (only the last would win) or a
+/// flag is dropped entirely.
+#[test]
+fn all_bools_settable_together() {
+    let a = parse_apply(&[
+        "--dry-run",
+        "--silent",
+        "--global",
+        "--offline",
+        "--json",
+        "--verbose",
+        "--yes",
+        "--debug",
+        "--no-telemetry",
+        "--break-lock",
+        "--force",
+        "--check",
+    ]);
+    assert_only_true(
+        &a,
+        &[
+            "dry_run",
+            "silent",
+            "global",
+            "offline",
+            "json",
+            "verbose",
+            "yes",
+            "debug",
+            "no_telemetry",
+            "break_lock",
+            "force",
+            "check",
+        ],
+    );
+}
+
+/// All short flags bundled together must each map to their own distinct field.
+/// Decisively catches short-flag cross-wiring (e.g. `-g` and `-j` writing the
+/// same field).
+#[test]
+fn all_short_flags_map_to_distinct_fields() {
+    let a = parse_apply(&["-sgjvyf", "-o", "acme", "-e", "npm,cargo"]);
+    assert!(a.common.silent, "-s");
+    assert!(a.common.global, "-g");
+    assert!(a.common.json, "-j");
+    assert!(a.common.verbose, "-v");
+    assert!(a.common.yes, "-y");
+    assert!(a.force, "-f");
+    assert_eq!(a.common.org.as_deref(), Some("acme"), "-o");
+    assert_eq!(
+        a.common.ecosystems,
+        Some(vec!["npm".to_string(), "cargo".to_string()]),
+        "-e"
+    );
+    assert_only_true(&a, &["silent", "global", "json", "verbose", "yes", "force"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +486,50 @@ fn download_mode_package() {
 #[test]
 fn download_mode_file() {
     assert_eq!(parse_apply(&["--download-mode", "file"]).common.download_mode, "file");
+}
+
+/// Values pass through verbatim — no lowercasing, trimming, or aliasing at the
+/// parse layer. `package` must not silently normalize to `diff`, etc. This
+/// guards against a parser that quietly coerces input to a default.
+#[test]
+fn download_mode_values_are_not_normalized() {
+    // Case is preserved verbatim (parse does not canonicalize).
+    assert_eq!(
+        parse_apply(&["--download-mode", "DIFF"]).common.download_mode,
+        "DIFF"
+    );
+    // The three valid tokens are distinct and round-trip exactly.
+    for token in ["diff", "package", "file"] {
+        let got = parse_apply(&["--download-mode", token]).common.download_mode;
+        assert_eq!(got, token, "download-mode `{token}` must round-trip exactly");
+    }
+}
+
+/// CONTRACT GAP (documented, not a hardening of a passing behavior): the
+/// contract types `--download-mode` as `enum: diff | package | file`, but the
+/// arg is a plain `String` with no `value_parser`, so clap accepts ANY value
+/// at parse time. Invalid values are only rejected later by
+/// `DownloadMode::parse` at runtime (see `commands/apply.rs`). This test pins
+/// the *current* parse-layer behavior so a future move to a real
+/// `value_parser`/enum (which WOULD reject here) is a deliberate, visible
+/// change rather than a silent one. If the enum is enforced at parse, flip the
+/// expectation to assert an `InvalidValue` error.
+#[test]
+fn download_mode_invalid_value_is_only_caught_at_runtime() {
+    match Cli::try_parse_from(["socket-patch", "apply", "--download-mode", "totally-bogus"]) {
+        Ok(cli) => match cli.command {
+            Commands::Apply(a) => assert_eq!(
+                a.common.download_mode, "totally-bogus",
+                "parse layer currently passes unknown download modes through verbatim"
+            ),
+            _ => panic!("expected Apply"),
+        },
+        Err(err) => panic!(
+            "parse layer unexpectedly rejected an unknown download-mode (kind={:?}); \
+             if the enum is now enforced at parse, update this test to assert InvalidValue",
+            err.kind()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

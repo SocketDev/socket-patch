@@ -283,6 +283,113 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
     std::env::remove_var("CARGO_HOME");
 }
 
+/// Safety gate: when the patch's advertised `beforeHash` does NOT match the
+/// on-disk file, apply must REFUSE to write (it cannot trust that the blob is
+/// a valid successor of whatever is actually on disk). The positive test
+/// above only ever feeds a correct `beforeHash`, so a regression that made
+/// apply blindly clobber the file regardless of its current content would
+/// sail through it. This test pins the refusal: the file must be left
+/// byte-for-byte untouched and the run must NOT report success.
+#[tokio::test]
+#[serial]
+async fn cargo_apply_refuses_on_before_hash_mismatch() {
+    if !has_cargo() {
+        println!("SKIP: cargo not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (lib_file, cargo_home) = fetch_cfg_if(tmp.path());
+    let original = std::fs::read(&lib_file).expect("read lib.rs");
+
+    // Advertise a `beforeHash` that deliberately does NOT match the on-disk
+    // file. The real file hashes to `git_sha256(&original)`; we lie and claim
+    // it should hash to the digest of unrelated bytes.
+    let bogus_before_hash = git_sha256(b"this is not what is on disk");
+    assert_ne!(
+        bogus_before_hash,
+        git_sha256(&original),
+        "test bug: bogus beforeHash accidentally matches the real file"
+    );
+
+    // The "patched" content the mock would write IF apply ignored the gate.
+    let mut patched = original.clone();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN\n");
+    let after_hash = git_sha256(&patched);
+
+    let server = MockServer::start().await;
+    setup_cargo_apply_mock(&server, &bogus_before_hash, &after_hash, &patched).await;
+
+    make_writable(&lib_file);
+
+    let args = ScanArgs {
+        common: socket_patch_cli::args::GlobalArgs {
+            cwd: tmp.path().join("proj"),
+            org: Some(ORG.to_string()),
+            json: true,
+            yes: true,
+            global: true,
+            global_prefix: None,
+            api_url: server.uri(),
+            api_token: Some("fake".to_string()),
+            ecosystems: Some(vec!["cargo".to_string()]),
+            download_mode: "diff".to_string(),
+            dry_run: false,
+            // force MUST stay false: with --force, a hash mismatch is
+            // deliberately downgraded to "ready" and the file WOULD be
+            // overwritten. We are asserting the safe default refuses.
+            ..socket_patch_cli::args::GlobalArgs::default()
+        },
+        batch_size: 100,
+        apply: false,
+        prune: false,
+        sync: true,
+        all_releases: false,
+        vex: Default::default(),
+    };
+    std::env::set_var("CARGO_HOME", &cargo_home);
+
+    let code = scan_run(args).await;
+
+    // Confirm the real apply path actually ran (it discovered the crate and
+    // fetched the blob) — otherwise the "file untouched" assertion below
+    // would be vacuously satisfied by a scan that simply did nothing.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
+    let purl = format!("pkg:cargo/{CRATE_NAME}@{CRATE_VERSION}");
+    let hit_batch = requests.iter().any(|r| {
+        r.url.path().ends_with("/patches/batch")
+            && String::from_utf8_lossy(&r.body).contains(&purl)
+    });
+    assert!(hit_batch, "crawler never sent cfg-if to the batch endpoint");
+
+    // THE safety guarantee: the on-disk file must be byte-for-byte unchanged.
+    // If apply ignored the beforeHash gate and wrote the blob, this fails.
+    let after = std::fs::read(&lib_file).expect("read after");
+    assert_eq!(
+        after, original,
+        "apply clobbered a file whose content did NOT match the advertised \
+         beforeHash — the hash-verification safety gate has regressed"
+    );
+    assert!(
+        !after
+            .windows(b"SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN".len())
+            .any(|w| w == b"SOCKET-PATCH-SHOULD-NOT-BE-WRITTEN"),
+        "the should-not-be-written marker leaked onto disk"
+    );
+
+    // A run that refused to apply its only patch must NOT report success.
+    assert_ne!(
+        code, 0,
+        "scan --sync reported success (exit 0) even though its only patch was \
+         rejected for a beforeHash mismatch and nothing was applied"
+    );
+
+    std::env::remove_var("CARGO_HOME");
+}
+
 #[tokio::test]
 #[serial]
 async fn cargo_crawler_finds_real_fetched_crate() {

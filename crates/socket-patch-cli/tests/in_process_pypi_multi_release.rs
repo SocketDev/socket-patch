@@ -150,16 +150,22 @@ async fn setup_multi_release_mock(server: &MockServer, installed_before_hash: &s
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "packages": [{
                 "purl": base,
+                // Ordering is deliberate: the INSTALLED variant is listed
+                // LAST, never first. Selection must be driven by an on-disk
+                // `beforeHash` match (`select_installed_variants`), not by
+                // "keep/apply the first variant in the list". If a regression
+                // ever falls back to positional selection it would pick
+                // other-wheel here and the byte/marker asserts below fail.
                 "patches": [
-                    { "uuid": UUID_INSTALLED, "purl": qualified(ARTIFACT_INSTALLED),
-                      "tier": "free", "cveIds": [], "ghsaIds": [],
-                      "severity": "high", "title": "installed wheel" },
                     { "uuid": UUID_OTHER_WHEEL, "purl": qualified(ARTIFACT_OTHER_WHEEL),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "other wheel" },
                     { "uuid": UUID_SDIST, "purl": qualified(ARTIFACT_SDIST),
                       "tier": "free", "cveIds": [], "ghsaIds": [],
                       "severity": "high", "title": "sdist" },
+                    { "uuid": UUID_INSTALLED, "purl": qualified(ARTIFACT_INSTALLED),
+                      "tier": "free", "cveIds": [], "ghsaIds": [],
+                      "severity": "high", "title": "installed wheel" },
                 ]
             }],
             "canAccessPaidPatches": false,
@@ -171,15 +177,16 @@ async fn setup_multi_release_mock(server: &MockServer, installed_before_hash: &s
     Mock::given(method("GET"))
         .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            // Same deliberate ordering: installed variant LAST (see batch).
             "patches": [
-                { "uuid": UUID_INSTALLED, "purl": qualified(ARTIFACT_INSTALLED),
-                  "publishedAt": "2024-01-01T00:00:00Z", "description": "installed wheel",
-                  "license": "MIT", "tier": "free", "vulnerabilities": {} },
                 { "uuid": UUID_OTHER_WHEEL, "purl": qualified(ARTIFACT_OTHER_WHEEL),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "other wheel",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
                 { "uuid": UUID_SDIST, "purl": qualified(ARTIFACT_SDIST),
                   "publishedAt": "2024-01-01T00:00:00Z", "description": "sdist",
+                  "license": "MIT", "tier": "free", "vulnerabilities": {} },
+                { "uuid": UUID_INSTALLED, "purl": qualified(ARTIFACT_INSTALLED),
+                  "publishedAt": "2024-01-01T00:00:00Z", "description": "installed wheel",
                   "license": "MIT", "tier": "free", "vulnerabilities": {} },
             ],
             "canAccessPaidPatches": false,

@@ -24,6 +24,32 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
 }
 
+/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
+/// scrubbed from the child process.
+///
+/// Every embedded-VEX flag has an env fallback (`--vex`/`SOCKET_VEX`,
+/// `--vex-product`/`SOCKET_VEX_PRODUCT`, `--vex-no-verify`/
+/// `SOCKET_VEX_NO_VERIFY`, `--vex-doc-id`, `--vex-compact`), as do the
+/// `GlobalArgs` (`SOCKET_OFFLINE`, `SOCKET_FORCE`, `SOCKET_API_TOKEN`,
+/// `SOCKET_ORG`, …). If the ambient environment leaks any of these into
+/// the child, a test silently stops exercising the path it names —
+/// `apply_vex_failure_flips_exit_code` would no longer hit
+/// product-detection failure if `SOCKET_VEX_PRODUCT` were exported, and the
+/// verify/no-verify split between the two `scan` tests would collapse under
+/// an exported `SOCKET_VEX_NO_VERIFY`. Removing the whole prefix from the
+/// child (the parent env is never mutated, so tests stay independent and
+/// need no serialization) makes the explicit CLI flags the sole source of
+/// truth.
+fn cli() -> Command {
+    let mut cmd = Command::new(binary());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
@@ -191,7 +217,7 @@ fn apply_vex_writes_document_on_success() {
     let after_hash = seed_offline_apply(cwd);
     let vex_path = cwd.join("apply.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "apply",
             "--cwd",
@@ -242,7 +268,7 @@ fn apply_json_envelope_carries_vex_summary() {
     seed_offline_apply(cwd);
     let vex_path = cwd.join("apply.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "apply",
             "--cwd",
@@ -296,7 +322,7 @@ fn apply_vex_failure_flips_exit_code() {
     seed_offline_apply(cwd);
     let vex_path = cwd.join("apply.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "apply",
             "--cwd",
@@ -350,7 +376,7 @@ fn scan_json_vex_no_verify_emits_summary() {
     write_manifest(cwd, &manifest);
     let vex_path = cwd.join("scan.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "scan",
             "--cwd",
@@ -371,15 +397,30 @@ fn scan_json_vex_no_verify_emits_summary() {
     );
 
     let result: Value = serde_json::from_slice(&out.stdout).expect("scan JSON");
+    assert_eq!(result["status"], "success");
     assert_eq!(result["scannedPackages"], 0);
     assert_eq!(result["vex"]["statements"], 1);
+    assert_eq!(result["vex"]["format"], "openvex-0.2.0");
     assert_eq!(result["vex"]["path"], vex_path.to_str().unwrap());
 
     let doc: Value =
         serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
+    assert_eq!(doc["version"], 1, "OpenVEX revision counter starts at 1");
+    assert!(
+        doc["author"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        "document must carry a non-empty author, got {:?}",
+        doc["author"]
+    );
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(stmts.len(), 1);
+    // The envelope's reported count must equal what landed on disk — a stub
+    // could otherwise report `statements: 1` while writing an empty doc.
+    assert_eq!(
+        stmts.len(),
+        result["vex"]["statements"].as_u64().unwrap() as usize,
+        "envelope vex.statements must equal the written document's count"
+    );
     assert_not_affected_statement(
         &stmts[0],
         "GHSA-aaaa-bbbb-cccc",
@@ -411,7 +452,7 @@ fn scan_json_vex_verify_failure_is_error() {
     write_manifest(cwd, &manifest);
     let vex_path = cwd.join("scan.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "scan",
             "--cwd",

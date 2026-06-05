@@ -33,6 +33,10 @@ const OTHER_VARS: &[&str] = &["SOCKET_API_TOKEN", "SOCKET_API_URL", "SOCKET_ORG_
 struct Output {
     stdout: String,
     stderr: String,
+    /// Process exit code. `None` only if the child was killed by a signal —
+    /// which we treat as a hard failure (a crash that happened to print the
+    /// warning before dying must not count as a pass).
+    code: Option<i32>,
 }
 
 /// Count non-overlapping occurrences of `needle` in `haystack`.
@@ -64,6 +68,7 @@ fn run_with_legacy_env(legacy: &str, value: &str, extra_args: &[&str]) -> Output
     Output {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code(),
     }
 }
 
@@ -104,6 +109,29 @@ fn assert_deprecation_warning(stderr: &str, legacy: &str, new: &str) {
         1,
         "legacy var name should appear exactly once in the warning; stderr was:\n{stderr}"
     );
+    // Strongest guard, and the one that defeats reward-hacking: the warning
+    // line must match the full documented contract *verbatim*, not merely
+    // contain a scatter of the right substrings. The expected text is spelled
+    // out here independently of the implementation (it is not read back from
+    // the binary), so a regression that mangles the `[socket-patch] warning:`
+    // prefix, drops the "removed in a future major release" notice, reorders
+    // clauses, or alters punctuation will fail this test rather than slip past
+    // the looser `contains` checks above.
+    let expected_line = format!(
+        "[socket-patch] warning: env var `{legacy}` is deprecated; \
+         use `{new}` instead. The legacy name will be removed in a \
+         future major release."
+    );
+    assert!(
+        stderr.contains(&expected_line),
+        "stderr must contain the exact deprecation line:\n  {expected_line}\nstderr was:\n{stderr}"
+    );
+    // And it must appear as a standalone line on stderr (not embedded in some
+    // other message), terminated by a newline — i.e. emitted via `eprintln!`.
+    assert!(
+        stderr.lines().any(|l| l == expected_line),
+        "the deprecation warning must be its own stderr line; stderr was:\n{stderr}"
+    );
 }
 
 #[test]
@@ -116,6 +144,16 @@ fn legacy_proxy_url_warns() {
         "deprecation warning must not leak onto stdout; stdout was:\n{}",
         out.stdout
     );
+    // The warning must fire on the *real* code path: `list` against an empty
+    // tempdir runs to its normal "manifest not found" error (exit 1). Pinning
+    // this rejects a child that crashed (signal → `None`) after emitting the
+    // line, and proves the shim ran inside an actual command invocation.
+    assert_eq!(
+        out.code,
+        Some(1),
+        "expected the manifest-not-found error exit; stderr was:\n{}",
+        out.stderr
+    );
 }
 
 #[test]
@@ -126,6 +164,12 @@ fn legacy_debug_warns() {
         !out.stdout.to_lowercase().contains("deprecated"),
         "deprecation warning must not leak onto stdout; stdout was:\n{}",
         out.stdout
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "expected the manifest-not-found error exit; stderr was:\n{}",
+        out.stderr
     );
 }
 
@@ -142,6 +186,12 @@ fn legacy_telemetry_disabled_warns() {
         "deprecation warning must not leak onto stdout; stdout was:\n{}",
         out.stdout
     );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "expected the manifest-not-found error exit; stderr was:\n{}",
+        out.stderr
+    );
 }
 
 /// `--silent` suppresses informational output but the deprecation warning
@@ -150,13 +200,24 @@ fn legacy_telemetry_disabled_warns() {
 #[test]
 fn legacy_warning_fires_under_silent() {
     let out = run_with_legacy_env("SOCKET_PATCH_PROXY_URL", "https://legacy.example", &["--silent"]);
+    // The exact-line check inside this helper is the real guard: passing
+    // `--silent` must not degrade, truncate, or suppress the warning — under
+    // `--silent` it must be byte-for-byte the same line emitted without it.
     assert_deprecation_warning(&out.stderr, "SOCKET_PATCH_PROXY_URL", "SOCKET_PROXY_URL");
-    // `--silent` must genuinely silence stdout, proving the warning survived a
-    // flag that suppresses everything else (rather than the warning simply
-    // riding along on output that was never silenced).
+    // `--silent` is parsed and accepted (no clap usage error, which would be
+    // exit 2); the command still runs to its normal manifest-not-found error.
+    assert_eq!(
+        out.code,
+        Some(1),
+        "--silent should be accepted and the command reach its normal error exit; stderr was:\n{}",
+        out.stderr
+    );
+    // The warning is diagnostic output: it must stay on stderr and never bleed
+    // onto stdout, regardless of verbosity flags.
     assert!(
-        out.stdout.is_empty(),
-        "--silent should produce no stdout; stdout was:\n{}",
+        !out.stdout.to_lowercase().contains("deprecated")
+            && !out.stdout.contains("SOCKET_PATCH_PROXY_URL"),
+        "deprecation warning must not leak onto stdout under --silent; stdout was:\n{}",
         out.stdout
     );
 }
@@ -184,10 +245,26 @@ fn legacy_warning_fires_under_json() {
     );
     let parsed: serde_json::Value =
         serde_json::from_str(trimmed).unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}); stdout was:\n{}", out.stdout));
-    assert!(
-        parsed.get("command").is_some(),
-        "JSON payload should be the structured command result; got:\n{}",
+    assert_eq!(
+        parsed.get("command").and_then(|v| v.as_str()),
+        Some("list"),
+        "JSON payload should be the structured `list` command result; got:\n{}",
         out.stdout
+    );
+    // The run errors (no manifest in the fresh tempdir), so the structured
+    // result must say so — and exit non-zero — proving the JSON path itself
+    // ran rather than some short-circuited stub.
+    assert_eq!(
+        parsed.get("status").and_then(|v| v.as_str()),
+        Some("error"),
+        "JSON payload should report the manifest-not-found error; got:\n{}",
+        out.stdout
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "expected the manifest-not-found error exit under --json; stderr was:\n{}",
+        out.stderr
     );
 }
 
@@ -203,6 +280,15 @@ fn new_var_takes_precedence_and_silences_warning() {
     cmd.env("SOCKET_PATCH_PROXY_URL", "https://legacy.example");
     let out = cmd.output().expect("run socket-patch list");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Guard against a vacuous pass: if the binary never launched (or crashed
+    // before promoting env vars) stderr would also lack "deprecated". Require
+    // the real manifest-not-found error exit so "no warning" means the shim
+    // ran and chose to stay quiet — not that nothing ran at all.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected the binary to run to its manifest-not-found error; stderr was:\n{stderr}"
+    );
     assert!(
         !stderr.to_lowercase().contains("deprecated"),
         "no deprecation warning expected when new var is set; stderr was:\n{stderr}"
@@ -223,8 +309,23 @@ fn no_warning_when_no_legacy_var_set() {
     let mut cmd = base_cmd(tmp.path(), &[]);
     let out = cmd.output().expect("run socket-patch list");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // As above: require the real error exit so a "clean" stderr can't be the
+    // result of the binary failing to start.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected the binary to run to its manifest-not-found error; stderr was:\n{stderr}"
+    );
     assert!(
         !stderr.to_lowercase().contains("deprecated"),
         "no deprecation warning expected with no legacy var set; stderr was:\n{stderr}"
     );
+    // Cross-check the positive tests are not rubber-stamping ambient output:
+    // with no legacy var set, none of the legacy names may appear on stderr.
+    for legacy in ALL_RENAME_VARS {
+        assert!(
+            !stderr.contains(legacy),
+            "no legacy var name should appear with none set; saw `{legacy}` in stderr:\n{stderr}"
+        );
+    }
 }

@@ -7,6 +7,29 @@
 //!
 //! Exercises `find_packages_for_rollback` for every ecosystem — a
 //! distinct code path from `find_packages_for_purls`.
+//!
+//! That distinction is only *observable* for the release-variant
+//! ecosystems (PyPI / RubyGems / Maven): there the rollback resolver
+//! uses `merge_qualified` while the apply/get resolver uses
+//! `merge_first_wins`, and the two diverge ONLY when the manifest key is
+//! a *qualified* PURL (`?artifact_id=` / `?platform=` / `?classifier=`).
+//! The crawler is queried with the deduped base PURL and returns a
+//! base-keyed result; `merge_qualified` fans that path back out to every
+//! qualified manifest key, whereas `merge_first_wins` would leave only
+//! the base key — so the subsequent `manifest.patches.get(<qualified>)`
+//! returns `None`, the package is skipped, and nothing is restored.
+//!
+//! For those three ecosystems we therefore deliberately use a QUALIFIED
+//! manifest PURL: a regression that swapped the rollback resolver back to
+//! `find_packages_for_purls` would silently leave the file patched and
+//! the byte-restore assertion below would fail. With a bare PURL both
+//! merge functions behave identically, so the test would prove nothing —
+//! that is the loophole this file used to have.
+//!
+//! npm / cargo / golang / composer / nuget are NOT release-variant
+//! ecosystems (they use `merge_first_wins` in both resolvers), so a
+//! qualified PURL there is genuinely unsupported and those fixtures keep
+//! bare PURLs.
 
 use std::path::Path;
 
@@ -183,9 +206,15 @@ async fn rollback_pypi_restores_original_content() {
     std::fs::write(pkg_dir.join("__init__.py"), patched).unwrap();
 
     let socket = tmp.path().join(".socket");
+    // QUALIFIED PURL on purpose — see module header. The crawler emits the
+    // base `pkg:pypi/rbpypi@1.0.0`; only `merge_qualified` (used by
+    // `find_packages_for_rollback`) fans it back out to this `?artifact_id=`
+    // key so the manifest lookup hits. `find_packages_for_purls`
+    // (`merge_first_wins`) would key it under the bare base, the patch
+    // lookup would miss, and the file below would stay patched.
     write_manifest_with_patch(
         &socket,
-        "pkg:pypi/rbpypi@1.0.0",
+        "pkg:pypi/rbpypi@1.0.0?artifact_id=sdist",
         "33333333-3333-4333-8333-333333333333",
         "rbpypi/__init__.py",
         &before_hash,
@@ -233,9 +262,14 @@ async fn rollback_gem_restores_original_content() {
     std::fs::write(gem_root.join("lib/rbgem.rb"), patched).unwrap();
 
     let socket = tmp.path().join(".socket");
+    // QUALIFIED PURL on purpose — RubyGems is a release-variant ecosystem
+    // (`?platform=`). Only `find_packages_for_rollback`'s `merge_qualified`
+    // remaps the crawler's base PURL onto this qualified manifest key; the
+    // `merge_first_wins` resolver would skip the package and leave the file
+    // patched. See module header.
     write_manifest_with_patch(
         &socket,
-        "pkg:gem/rbgem@1.0.0",
+        "pkg:gem/rbgem@1.0.0?platform=ruby",
         "44444444-4444-4444-8444-444444444444",
         "package/lib/rbgem.rb",
         &before_hash,
@@ -391,9 +425,14 @@ async fn rollback_maven_restores_original_content() {
     std::fs::write(version_dir.join("LICENSE.txt"), patched).unwrap();
 
     let socket = tmp.path().join(".socket");
+    // QUALIFIED PURL on purpose — Maven is a release-variant ecosystem
+    // (`?classifier=&type=`). Only `find_packages_for_rollback`'s
+    // `merge_qualified` remaps the crawler's base PURL onto this qualified
+    // manifest key; `merge_first_wins` would skip the package and leave the
+    // file patched. See module header.
     write_manifest_with_patch(
         &socket,
-        "pkg:maven/org.example/rbmvn@1.0.0",
+        "pkg:maven/org.example/rbmvn@1.0.0?classifier=sources&type=jar",
         "77777777-7777-4777-8777-777777777777",
         "package/LICENSE.txt",
         &before_hash,

@@ -14,15 +14,64 @@
 //!
 //! Network: no. Toolchain: no. NOT `#[ignore]` — runs on every PR.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::{
-    assert_run_ok, envelope_error_code, envelope_error_message, json_string,
-    parse_json_envelope, run, write_minimal_manifest, PatchEntry,
+    assert_run_ok, envelope_error_code, envelope_error_message, git_sha256, json_string,
+    parse_json_envelope, run, write_blob, write_minimal_manifest, PatchEntry,
 };
+
+const PURL: &str = "pkg:npm/dummy@1.0.0";
+const UUID: &str = "11111111-1111-4111-8111-111111111111";
+const ORIGINAL_BYTES: &[u8] = b"module.exports = function() { return 'before'; };\n";
+const PATCHED_BYTES: &[u8] = b"module.exports = function() { return 'after'; };\n";
+
+/// Stage a *fully patchable, offline-ready* npm package under `cwd`:
+///   * `node_modules/dummy/{package.json,index.js}` matching [`PURL`],
+///   * `.socket/manifest.json` recording the real before/after Git
+///     hashes of [`ORIGINAL_BYTES`] → [`PATCHED_BYTES`], and
+///   * the after-hash blob staged under `.socket/blobs/` so `apply`
+///     can run to completion with no network.
+///
+/// This is the load-bearing part of the refusal tests: because the
+/// package is genuinely applicable, a `socket-patch apply` that did
+/// NOT refuse on the yarn-PnP layout would actually rewrite
+/// `index.js`. The refusal tests therefore assert the file stays
+/// byte-identical — proving the refusal short-circuits *before* the
+/// patch engine touches anything, not merely that apply found nothing
+/// to do.
+///
+/// Returns the absolute path to the patchable `index.js`.
+fn stage_applicable_package(cwd: &Path) -> PathBuf {
+    let pkg = cwd.join("node_modules").join("dummy");
+    std::fs::create_dir_all(&pkg).expect("create node_modules/dummy");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"dummy","version":"1.0.0"}"#,
+    )
+    .expect("write dummy package.json");
+    let index = pkg.join("index.js");
+    std::fs::write(&index, ORIGINAL_BYTES).expect("write index.js");
+
+    let socket = cwd.join(".socket");
+    let before_hash = git_sha256(ORIGINAL_BYTES);
+    let after_hash = git_sha256(PATCHED_BYTES);
+    write_minimal_manifest(
+        &socket,
+        PURL,
+        UUID,
+        &[PatchEntry {
+            file_name: "package/index.js",
+            before_hash: &before_hash,
+            after_hash: &after_hash,
+        }],
+    );
+    write_blob(&socket, &after_hash, PATCHED_BYTES);
+    index
+}
 
 /// Stage the minimum filesystem layout the detector classifies as
 /// yarn-berry PnP: a `.pnp.cjs` file at the project root plus a
@@ -41,20 +90,77 @@ fn make_yarn_berry_project(cwd: &Path) {
         .expect("create .yarn/cache");
 }
 
-/// Manifest with a single trivial patch entry. The actual hashes
-/// don't matter — apply refuses on layout detection before any
-/// hash check.
+/// Manifest-only helper for the `list`-discovery guard test. The
+/// hashes are irrelevant there — `list` never resolves them — so use
+/// fixed sentinels rather than the real round-trip hashes.
 fn write_synthetic_manifest(socket_dir: &Path) {
     write_minimal_manifest(
         socket_dir,
-        "pkg:npm/dummy@1.0.0",
-        "11111111-1111-4111-8111-111111111111",
+        PURL,
+        UUID,
         &[PatchEntry {
             file_name: "package/index.js",
             before_hash: "a".repeat(64).as_str(),
             after_hash: "b".repeat(64).as_str(),
         }],
     );
+}
+
+/// Assert the refusal envelope did NO patch work: every summary
+/// counter is zero and no patch events were recorded. This is what
+/// catches a regression where the yarn-PnP guard moves *after* the
+/// crawl/apply step (so apply would discover/patch the staged package
+/// first and only then report the error).
+fn assert_no_work_done(env: &serde_json::Value) {
+    let summary = env
+        .get("summary")
+        .unwrap_or_else(|| panic!("envelope missing summary: {env}"));
+    for k in [
+        "discovered",
+        "downloaded",
+        "applied",
+        "updated",
+        "skipped",
+        "failed",
+        "removed",
+        "verified",
+    ] {
+        assert_eq!(
+            summary.get(k).and_then(|v| v.as_u64()),
+            Some(0),
+            "yarn-PnP refusal must short-circuit before any work; summary.{k} != 0.\nenvelope: {env}"
+        );
+    }
+    let events = env
+        .get("events")
+        .and_then(|e| e.as_array())
+        .unwrap_or_else(|| panic!("envelope missing events array: {env}"));
+    assert!(
+        events.is_empty(),
+        "yarn-PnP refusal must record no patch events.\nenvelope: {env}"
+    );
+}
+
+/// Assert apply left no stage/CoW temp files behind in `pkg_dir`, and
+/// that the package's own files are still present (so we know we
+/// scanned the right, non-empty directory).
+fn assert_pristine_package_dir(pkg_dir: &Path) {
+    let names: Vec<String> = std::fs::read_dir(pkg_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", pkg_dir.display()))
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "package.json") && names.iter().any(|n| n == "index.js"),
+        "package dir {} missing expected files, got: {names:?}",
+        pkg_dir.display()
+    );
+    for name in &names {
+        assert!(
+            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
+            "yarn-PnP refusal must not leave stage/CoW litter in {}: {name}",
+            pkg_dir.display()
+        );
+    }
 }
 
 /// The headline test: yarn-berry PnP project + apply = exit 1 with
@@ -64,7 +170,9 @@ fn write_synthetic_manifest(socket_dir: &Path) {
 fn yarn_pnp_refuses_with_error_code() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_project(dir.path());
-    write_synthetic_manifest(&dir.path().join(".socket"));
+    // Stage a genuinely-applicable package: if the refusal regressed,
+    // apply WOULD rewrite this file. We assert below that it doesn't.
+    let index = stage_applicable_package(dir.path());
 
     let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
     assert_eq!(
@@ -73,6 +181,11 @@ fn yarn_pnp_refuses_with_error_code() {
     );
 
     let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "command"),
+        Some("apply"),
+        "envelope must be the apply command's.\nenvelope: {env}"
+    );
     assert_eq!(
         envelope_error_code(&env),
         Some("yarn_pnp_unsupported"),
@@ -83,6 +196,15 @@ fn yarn_pnp_refuses_with_error_code() {
         Some("error"),
         "expected status=error.\nenvelope: {env}"
     );
+    // The refusal must be a clean pre-apply bail: no work counters,
+    // no events, and the on-disk package left byte-identical.
+    assert_no_work_done(&env);
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "yarn-PnP refusal must NOT patch the on-disk file; apply ran the patch engine anyway"
+    );
+    assert_pristine_package_dir(index.parent().unwrap());
     // The error message must mention `yarn patch` so the user knows
     // the workaround. Contract: this is part of the public CLI
     // output — don't loosen the assertion without intent.
@@ -112,7 +234,7 @@ fn yarn_pnp_refuses_with_error_code() {
 fn yarn_pnp_refuses_in_human_mode() {
     let dir = tempfile::tempdir().unwrap();
     make_yarn_berry_project(dir.path());
-    write_synthetic_manifest(&dir.path().join(".socket"));
+    let index = stage_applicable_package(dir.path());
 
     let (code, stdout, stderr) = run(dir.path(), &["apply"]);
     assert_eq!(
@@ -138,6 +260,14 @@ fn yarn_pnp_refuses_in_human_mode() {
         stderr.contains("yarn patch"),
         "stderr should point at `yarn patch`, got:\n{stderr}"
     );
+    // Same pre-apply-bail guarantee as the JSON path: the genuinely
+    // patchable file must be left byte-identical, with no temp litter.
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "yarn-PnP refusal (human mode) must NOT patch the on-disk file"
+    );
+    assert_pristine_package_dir(index.parent().unwrap());
 }
 
 /// Negative control: a plain npm layout (no `.pnp.cjs`) must NOT
@@ -148,24 +278,22 @@ fn yarn_pnp_refuses_in_human_mode() {
 #[test]
 fn npm_layout_does_not_trigger_yarn_pnp_refusal() {
     let dir = tempfile::tempdir().unwrap();
-    // Plain npm: package.json + an empty node_modules/ — no
-    // .pnp.cjs, no .yarn/cache/.
+    // Plain npm: package.json + a real, fully-staged patchable
+    // package under node_modules/ — no .pnp.cjs, no .yarn/cache/.
     std::fs::write(
         dir.path().join("package.json"),
         r#"{"name":"npm-fixture","version":"0.0.0","private":true}"#,
     )
     .unwrap();
-    std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
-    write_synthetic_manifest(&dir.path().join(".socket"));
+    let index = stage_applicable_package(dir.path());
 
     let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
 
     // `apply --json` ALWAYS emits exactly one JSON envelope on
-    // stdout — parse it. The previous "may or may not parse" wording
-    // was an escape hatch: it let an empty/garbled stdout pass
-    // vacuously, so a regression that crashed apply before detection
-    // (or printed nothing) would still be "green". Requiring a valid
-    // envelope proves apply actually ran the npm path.
+    // stdout — parse it. A "may or may not parse" escape hatch would
+    // let an empty/garbled stdout pass vacuously, so a regression that
+    // crashed apply before detection (or printed nothing) would still
+    // be "green". Requiring a valid envelope proves apply ran.
     let env = parse_json_envelope(&stdout);
 
     // The decisive negative assertion: the yarn-pnp refusal must NOT
@@ -184,19 +312,32 @@ fn npm_layout_does_not_trigger_yarn_pnp_refusal() {
         !stdout.contains("yarn_pnp_unsupported") && !stderr.contains("yarn_pnp_unsupported"),
         "npm layout should not mention yarn-pnp anywhere.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // The synthetic manifest points at a package not on disk, so
-    // apply reaches the real apply path and discovers nothing — it
-    // does NOT bail on yarn-pnp detection. Pin that observed
-    // behavior so a future change that turns this into a yarn-pnp
-    // refusal (status=error) is caught.
+    // Far stronger than pinning a no-match `partialFailure`: with a
+    // genuinely-applicable package on disk, the npm path must run to
+    // COMPLETION and patch the file. This proves both that yarn-pnp
+    // did not fire AND that the npm apply path itself still works (an
+    // always-on detector that silently broke npm would fail here, not
+    // pass vacuously on "nothing to do").
     assert_eq!(
-        json_string(&env, "status"),
-        Some("partialFailure"),
-        "npm layout with no matching packages should report partialFailure.\nenvelope: {env}"
+        code, 0,
+        "npm layout with a staged applicable package must apply cleanly (exit 0).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(
-        code, 1,
-        "expected exit 1 for the no-match npm case.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        json_string(&env, "status"),
+        Some("success"),
+        "npm layout apply should report success.\nenvelope: {env}"
+    );
+    assert_eq!(
+        env.get("summary").and_then(|s| s.get("applied")).and_then(|v| v.as_u64()),
+        Some(1),
+        "npm layout apply should patch exactly the one staged file.\nenvelope: {env}"
+    );
+    // And the file on disk must actually carry the patched bytes — the
+    // ultimate proof the npm path executed end to end.
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        PATCHED_BYTES,
+        "npm layout apply must rewrite index.js to the patched bytes"
     );
 }
 
@@ -218,7 +359,7 @@ fn yarn_pnp_loader_mjs_also_refuses() {
         b"// stub PnP ESM loader\n",
     )
     .unwrap();
-    write_synthetic_manifest(&dir.path().join(".socket"));
+    let index = stage_applicable_package(dir.path());
 
     let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
     assert_eq!(
@@ -245,6 +386,14 @@ fn yarn_pnp_loader_mjs_also_refuses() {
         error_msg.contains("yarn patch") && error_msg.contains("Plug'n'Play"),
         "error message should name `yarn patch` and the Plug'n'Play layout, got: {error_msg}"
     );
+    // Pre-apply-bail parity too: no work done, staged file untouched.
+    assert_no_work_done(&env);
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        ORIGINAL_BYTES,
+        "`.pnp.loader.mjs` refusal must NOT patch the on-disk file"
+    );
+    assert_pristine_package_dir(index.parent().unwrap());
 }
 
 /// A guard test asserting the helper itself produced a manifest

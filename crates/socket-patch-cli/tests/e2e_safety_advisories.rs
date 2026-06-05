@@ -35,6 +35,11 @@ use common::{
     git_sha256, parse_json_envelope, run_with_env, write_blob, write_minimal_manifest,
     PatchEntry,
 };
+// Only the cargo sidecar test needs the bare (un-framed) digest used in
+// `.cargo-checksum.json`; gate the import so a `--no-default-features`
+// (no `cargo`) build doesn't trip the unused-import lint under `-D warnings`.
+#[cfg(feature = "cargo")]
+use common::sha256_hex;
 
 /// Helper: stage a package layout + manifest + blob, run apply, and
 /// return the parsed JSON envelope.
@@ -251,12 +256,14 @@ fn pypi_apply_emits_pypi_record_stale_advisory() {
         advisory["severity"], "warning",
         "severity contract: pypi advisory is severity=warning"
     );
+    // The advisory message is the operator-facing remediation guidance —
+    // a bare non-empty check would accept any garbage string. Pin the
+    // stable, load-bearing tokens the production constant carries: the
+    // `pip check` instruction and the `.dist-info/RECORD` it points at.
+    let msg = advisory["message"].as_str().unwrap_or("");
     assert!(
-        advisory["message"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        "advisory.message must be non-empty"
+        msg.contains("pip check") && msg.contains("RECORD"),
+        "pypi advisory.message must guide the operator to `pip check` the .dist-info/RECORD; got {msg:?}"
     );
 }
 
@@ -317,12 +324,12 @@ fn gem_apply_emits_gem_bundle_install_reverts_advisory() {
         "code contract: gem must emit gem_bundle_install_reverts"
     );
     assert_eq!(advisory["severity"], "warning");
+    // Pin the stable operator-guidance token rather than just non-empty:
+    // the gem advisory tells the operator that `bundle install` reverts.
+    let msg = advisory["message"].as_str().unwrap_or("");
     assert!(
-        advisory["message"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        "advisory.message must be non-empty.\nrecord: {record}"
+        msg.contains("bundle install"),
+        "gem advisory.message must warn that `bundle install` reverts the patch; got {msg:?}"
     );
 }
 
@@ -396,12 +403,12 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
         "code contract: golang must emit go_mod_verify_fails"
     );
     assert_eq!(advisory["severity"], "warning");
+    // Pin the stable operator-guidance token rather than just non-empty:
+    // the Go advisory points at `go mod verify`.
+    let msg = advisory["message"].as_str().unwrap_or("");
     assert!(
-        advisory["message"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        "advisory.message must be non-empty.\nrecord: {record}"
+        msg.contains("go mod verify"),
+        "golang advisory.message must point the operator at `go mod verify`; got {msg:?}"
     );
 }
 
@@ -538,6 +545,14 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
         eprintln!("SKIP: filesystem rejects non-UTF8 filenames");
         return;
     }
+    // Precondition must be genuinely established — otherwise the rest of
+    // this test would pass as a plain `.nupkg.metadata` deletion without
+    // ever exercising the non-UTF8 `to_str() == None` skip arm it exists
+    // to lock. A silent no-op here would mean the test guards nothing.
+    assert!(
+        bad_path.exists(),
+        "non-UTF8 fixture file must exist so has_signed_marker's None arm is reached"
+    );
 
     let target = pkg_dir.join("payload.txt");
     let original = b"hello\n";
@@ -573,6 +588,13 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
     // is what we're locking in).
     assert_eq!(std::fs::read(&target).unwrap(), patched);
     assert!(!pkg_dir.join(".nupkg.metadata").exists());
+    // The non-UTF8 file must be untouched — the fixup skips it (it is not
+    // a `.nupkg.sha512` marker) rather than deleting or mangling it. Proves
+    // the skip arm ran and left the directory otherwise intact.
+    assert!(
+        bad_path.exists(),
+        "non-UTF8 file must survive the fixup (skipped, not deleted)"
+    );
 
     let record = find_sidecar_record(&env, "nuget");
     assert_sidecar_joins_applied_event(&env, record);
@@ -659,6 +681,13 @@ fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
     assert!(
         msg.contains(".nupkg.metadata"),
         "advisory message must reference the metadata path; got {msg:?}"
+    );
+    // The boundary wraps the SidecarError with a stable, recognizable
+    // prefix consumers key on; a bare "contains the path" check would
+    // pass on an unrelated message that merely mentions the file.
+    assert!(
+        msg.contains("sidecar fixup failed"),
+        "fixup-failed advisory must carry the stable `sidecar fixup failed` prefix; got {msg:?}"
     );
     // Boundary contract: failure path emits NO files[] entries.
     let files = record["files"].as_array().expect("files array");
@@ -757,8 +786,139 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
         "code contract: signed-package case emits nuget_signed_package_tampered"
     );
     assert_eq!(advisory["severity"], "warning");
-    assert!(advisory["message"]
-        .as_str()
-        .map(|s| !s.is_empty())
-        .unwrap_or(false));
+    // Pin the stable token: the signed-package advisory names the
+    // `.nupkg.sha512` signature sidecar it cannot honestly recompute.
+    let msg = advisory["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(".nupkg.sha512"),
+        "signed-package advisory.message must reference the .nupkg.sha512 signature sidecar; got {msg:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Cargo — file rewrite (no advisory), code path proves
+// `.cargo-checksum.json` is rewritten to the on-disk hash and recorded
+// as `Rewritten`. This is the DEFAULT-feature sidecar and the only one
+// in the shipped binary that *rewrites* a file, so it must have an
+// end-to-end guard that runs under `--features cargo` (the recommended
+// command) — not just core-crate unit tests on `cargo::fixup`.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Cargo: patching a file inside a `<name>-<version>/` registry-cache
+/// crate rewrites `<crate>/.cargo-checksum.json` so the patched file's
+/// entry reflects its new on-disk SHA-256, records the rewrite under
+/// `envelope.sidecars[].files[]` with action `rewritten`, and emits NO
+/// advisory (the rewrite keeps `cargo build` happy — there is nothing
+/// to warn the operator about).
+///
+/// Independently derives the expected post-patch digest with the bare
+/// (un-Git-framed) `sha256_hex` cargo uses, then reads the rewritten
+/// checksum file back off disk and pins it — so a regression that
+/// stops rewriting, rewrites the wrong value, clobbers the untouched
+/// sibling / `package` tarball hash, or mislabels the action fires loudly.
+#[cfg(feature = "cargo")]
+#[test]
+fn cargo_apply_rewrites_checksum_and_records_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let registry = cwd.join("registry-src");
+    // Registry layout: <name>-<version>/ with a Cargo.toml the crawler
+    // verifies against the PURL (name=mycrate, version=1.0.0).
+    let crate_dir = registry.join("mycrate-1.0.0");
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        "[package]\nname = \"mycrate\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+
+    let target = crate_dir.join("src").join("lib.rs");
+    let original = b"// original lib\n";
+    std::fs::write(&target, original).unwrap();
+    let patched = b"// patched lib\n";
+    let before = git_sha256(original);
+    let after = git_sha256(patched);
+
+    // Pre-existing `.cargo-checksum.json` with a STALE hash for the file
+    // we patch, an UNTOUCHED sibling entry, and the `package` tarball
+    // hash. The fixup must rewrite ONLY the patched entry and preserve
+    // the rest verbatim.
+    let stale_lib = "00".repeat(32);
+    let untouched_sibling = "11".repeat(32);
+    let package_hash = "deadbeefpackagehash";
+    let checksum_path = crate_dir.join(".cargo-checksum.json");
+    std::fs::write(
+        &checksum_path,
+        format!(
+            r#"{{"files":{{"src/lib.rs":"{stale_lib}","Cargo.toml":"{untouched_sibling}"}},"package":"{package_hash}"}}"#
+        ),
+    )
+    .unwrap();
+
+    let socket_dir = cwd.join(".socket");
+    write_minimal_manifest(
+        &socket_dir,
+        "pkg:cargo/mycrate@1.0.0",
+        "20000008-0000-4008-8008-000000000008",
+        &[PatchEntry {
+            file_name: "package/src/lib.rs",
+            before_hash: &before,
+            after_hash: &after,
+        }],
+    );
+    write_blob(&socket_dir, &after, patched);
+
+    let env = apply_and_parse(cwd, &registry, &[]);
+
+    // Patch landed on disk before the sidecar fired.
+    assert_eq!(std::fs::read(&target).unwrap(), patched);
+
+    // The checksum file was rewritten on disk: the patched entry now
+    // carries the REAL post-patch bare-sha256 (derived independently here,
+    // NOT read back from the same value we'd be checking), the stale value
+    // is gone, and the untouched sibling + `package` tarball hash survive.
+    let post: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&checksum_path).unwrap())
+            .expect(".cargo-checksum.json must stay valid JSON after rewrite");
+    let expected = sha256_hex(patched);
+    assert_eq!(
+        post["files"]["src/lib.rs"].as_str(),
+        Some(expected.as_str()),
+        "patched-file checksum must be rewritten to the on-disk sha256; got {post}"
+    );
+    assert_ne!(
+        post["files"]["src/lib.rs"].as_str(),
+        Some(stale_lib.as_str()),
+        "stale pre-patch checksum must NOT survive the rewrite; got {post}"
+    );
+    assert_eq!(
+        post["files"]["Cargo.toml"].as_str(),
+        Some(untouched_sibling.as_str()),
+        "an unpatched sibling's checksum must be preserved verbatim; got {post}"
+    );
+    assert_eq!(
+        post["package"].as_str(),
+        Some(package_hash),
+        "the `package` tarball hash must be preserved verbatim; got {post}"
+    );
+
+    let record = find_sidecar_record(&env, "cargo");
+    assert_sidecar_joins_applied_event(&env, record);
+    assert_eq!(record["purl"], "pkg:cargo/mycrate@1.0.0");
+    let files = record["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        1,
+        "cargo fixup rewrites exactly one file (.cargo-checksum.json); got {record}"
+    );
+    assert_eq!(files[0]["path"], ".cargo-checksum.json");
+    assert_eq!(
+        files[0]["action"], "rewritten",
+        "action contract: .cargo-checksum.json is `rewritten`, not `deleted`"
+    );
+    // The success path emits files only — no advisory rides along.
+    assert!(
+        record.get("advisory").is_none() || record["advisory"].is_null(),
+        "cargo checksum rewrite must not emit an advisory; got {record}"
+    );
 }

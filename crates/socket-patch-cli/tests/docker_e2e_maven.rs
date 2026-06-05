@@ -215,8 +215,32 @@ fi
 # not failed. This catches a regression where apply reports success
 # while silently no-op'ing (the failure mode the marker grep alone
 # would miss if the file were patched by some other path).
-grep -q '"applied": 1' /tmp/apply.out || {{
+#
+# Anchor on the trailing comma (the summary is pretty-printed and
+# `applied` is followed by `updated`, so it is never the last field):
+# a bare `"applied": 1` substring would also match `"applied": 10`,
+# `"applied": 11`, etc. and let a multi-apply regression slip through.
+grep -q '"applied": 1,' /tmp/apply.out || {{
   echo "FAIL: apply JSON did not report applied:1" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+
+# A clean apply must report zero failures/skips and an overall success
+# status. Without these, apply could report `applied: 1` while ALSO
+# failing or skipping other files and still look green to the grep above.
+grep -q '"failed": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report failed:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"skipped": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"status": "success"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON status was not success" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}
@@ -323,12 +347,55 @@ async fn maven_install_full_apply_chain() {
     );
 
     // The scan must have actually called the patch API — proves the test
-    // exercised the real network/scan path, not a short-circuit.
-    let received = server.received_requests().await.unwrap_or_default();
+    // exercised the real network/scan path, not a short-circuit. Use
+    // `.expect` (not `unwrap_or_default`) so a recording failure surfaces
+    // loudly instead of silently degrading to "no requests seen".
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock should have recorded requests");
+
+    // 1. The batch search POST must have fired AND carried the maven PURL
+    //    in its body. A path-only check would pass even if the maven
+    //    crawler discovered nothing and sent an empty component list, so
+    //    we assert the discovered purl actually made it onto the wire.
+    //
+    //    The m2 cache holds hundreds of artifacts, so the crawler splits
+    //    discovery across several `/patches/batch` POSTs. Checking only the
+    //    first batch would miss commons-lang3 (it lands in a later batch),
+    //    so we scan every batch body and require at least one to carry the
+    //    target purl — proving the specific patched artifact was discovered,
+    //    not merely that *some* component list was sent.
+    let batch_posts: Vec<_> = received
+        .iter()
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().contains("/patches/batch"))
+        .collect();
+    assert!(
+        !batch_posts.is_empty(),
+        "scan should have POSTed /patches/batch; received={received:#?}"
+    );
+    assert!(
+        batch_posts
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains(PURL)),
+        "some batch POST body should reference the discovered maven purl {PURL}; bodies={:#?}",
+        batch_posts
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // 2. The blob-download endpoint (`patches/view/<uuid>`) must have been
+    //    hit during scan --sync. The offline apply reads the blob from the
+    //    local store rather than the network, so a green offline apply is
+    //    only possible if scan really downloaded and persisted the blob via
+    //    this endpoint — asserting it pins the full download→offline-apply
+    //    chain rather than just the manifest write.
     assert!(
         received
             .iter()
-            .any(|r| r.url.path().contains("/patches/batch")),
-        "scan should have called /patches/batch; received={received:#?}"
+            .any(|r| format!("{}", r.method) == "GET"
+                && r.url.path() == format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
+        "scan should have downloaded the patch blob via /patches/view/{UUID}; received={received:#?}"
     );
 }

@@ -122,6 +122,49 @@ fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) 
     );
 }
 
+/// Assert no patch-time temp files leaked into `pkg_dir`.
+///
+/// Two distinct stagers write into the package directory:
+///   * the atomic writer (`apply::write_atomic`) stages `.socket-stage-*`,
+///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
+///     branches) stages `.socket-cow-*`.
+/// Both must be renamed-over on success or unlinked on failure, so a
+/// completed apply — success OR clean failure — must leave neither prefix
+/// behind.
+///
+/// Crucially, this is the assertion that actually polices CoW's stage
+/// cleanup: only the hardlink/symlink/multi-file scenarios drive
+/// `write_via_stage_rename` and thus ever create a `.socket-cow-*` file.
+/// The regular-file scenario takes the `AlreadyPrivate` fast path, which
+/// never stages a CoW copy — so a CoW stage-file leak is invisible there
+/// and only catchable from the link scenarios.
+fn assert_no_patch_litter(pkg_dir: &Path) {
+    let names: Vec<String> = std::fs::read_dir(pkg_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", pkg_dir.display()))
+        .map(|e| {
+            e.unwrap_or_else(|e| panic!("dir entry error in {}: {e}", pkg_dir.display()))
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    // Sanity: the package's own files are present, so we know we scanned
+    // the right (non-empty) directory rather than passing vacuously over
+    // an empty/wrong path.
+    assert!(
+        names.iter().any(|n| n == "package.json") && names.iter().any(|n| n == "index.js"),
+        "package dir {} listing missing expected files, got: {names:?}",
+        pkg_dir.display()
+    );
+    for name in &names {
+        assert!(
+            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
+            "stage / cow temp file leaked into package directory {}: {name}",
+            pkg_dir.display()
+        );
+    }
+}
+
 const TEST_PURL: &str = "pkg:npm/cow-fixture@1.0.0";
 const TEST_UUID: &str = "33333333-3333-4333-8333-333333333333";
 
@@ -233,6 +276,11 @@ fn apply_breaks_hardlink_before_patching() {
         1,
         "after CoW, the outside file should be a single-link inode"
     );
+    // CoW broke the link via a `.socket-cow-*` stage + rename; that
+    // stage file (and the atomic-writer's `.socket-stage-*`) must be
+    // gone. This is the only scenario class that exercises the CoW
+    // stager, so this is where a stage-cleanup regression would show.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// `node_modules/<pkg>/index.js` is a symlink to an outside file —
@@ -276,6 +324,9 @@ fn apply_replaces_symlink_with_private_file() {
         git_sha256(ORIGINAL_BYTES),
         "the symlink target must NOT have been mutated; CoW must replace the link with a private file"
     );
+    // The symlink branch of CoW also stages a `.socket-cow-*` private
+    // copy and renames it over the link; no litter may remain.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// A package with TWO patched files, each hardlinked to a separate
@@ -295,6 +346,17 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     std::fs::write(&outside_b, b"BBB original\n").unwrap();
     std::fs::hard_link(&outside_a, pkg.join("index.js")).unwrap();
     std::fs::hard_link(&outside_b, pkg.join("lib/helper.js")).unwrap();
+
+    // Sanity: both fixtures are genuinely hardlinked (nlink==2) before
+    // apply, so the post-apply nlink==1 checks below prove a real break
+    // rather than a fixture that was never linked.
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().nlink(), 2);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().nlink(), 2);
+    let (ino_a_pre, ino_b_pre) = (
+        std::fs::metadata(&outside_a).unwrap().ino(),
+        std::fs::metadata(&outside_b).unwrap().ino(),
+    );
 
     let before_a = git_sha256(b"AAA original\n");
     let after_a = git_sha256(b"AAA patched!\n");
@@ -338,6 +400,45 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     // for every patched file, not just the first.
     assert_eq!(std::fs::read(&outside_a).unwrap(), b"AAA original\n");
     assert_eq!(std::fs::read(&outside_b).unwrap(), b"BBB original\n");
+
+    // Each link was broken: both outside siblings are now single-link
+    // inodes and retain their original inode (the inside copy moved to a
+    // fresh inode, not the sibling). This pins per-file CoW for the
+    // second file too — a loop that broke only the first link would
+    // leave outside_b at nlink==2.
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().nlink(), 1);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().nlink(), 1);
+    assert_eq!(std::fs::metadata(&outside_a).unwrap().ino(), ino_a_pre);
+    assert_eq!(std::fs::metadata(&outside_b).unwrap().ino(), ino_b_pre);
+    assert_ne!(
+        std::fs::metadata(pkg.join("index.js")).unwrap().ino(),
+        ino_a_pre,
+        "patched index.js must live in a new private inode"
+    );
+    assert_ne!(
+        std::fs::metadata(pkg.join("lib/helper.js")).unwrap().ino(),
+        ino_b_pre,
+        "patched lib/helper.js must live in a new private inode"
+    );
+
+    // No CoW/stage litter in EITHER directory the per-file stagers
+    // touched: index.js stages in `pkg/`, lib/helper.js stages in
+    // `pkg/lib/`.
+    assert_no_patch_litter(&pkg);
+    let lib_litter: Vec<String> = std::fs::read_dir(pkg.join("lib"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        lib_litter.iter().any(|n| n == "helper.js"),
+        "lib/ listing missing helper.js, got: {lib_litter:?}"
+    );
+    for name in &lib_litter {
+        assert!(
+            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
+            "stage / cow temp file leaked into lib/: {name}"
+        );
+    }
 }
 
 /// Regular files (no hardlink, no symlink) are the common case.
@@ -358,28 +459,11 @@ fn apply_against_regular_file_leaves_no_cow_litter() {
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(PATCHED_BYTES));
 
     // No `.socket-cow-*` or `.socket-stage-*` litter in the package
-    // directory after a successful apply. Stage files are unlinked
-    // after rename; CoW files are unlinked after CoW completes. Iterate
-    // with explicit unwrap so a read_dir error can't silently truncate
-    // the scan and let litter slip through.
-    let pkg_dir = fx.root().join("node_modules/cow-fixture");
-    let names: Vec<String> = std::fs::read_dir(&pkg_dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
-    // Sanity: the directory listing is non-empty (package.json +
-    // index.js at minimum), so we know we actually inspected entries
-    // rather than scanning an empty/wrong directory.
-    assert!(
-        names.iter().any(|n| n == "index.js") && names.iter().any(|n| n == "package.json"),
-        "package dir listing missing expected files, got: {names:?}"
-    );
-    for name in &names {
-        assert!(
-            !name.starts_with(".socket-cow-") && !name.starts_with(".socket-stage-"),
-            "stage / cow temp file leaked into package directory: {name}"
-        );
-    }
+    // directory after a successful apply. (For a regular file the
+    // `AlreadyPrivate` path never stages a `.socket-cow-*` copy, so this
+    // mainly guards the atomic writer's `.socket-stage-*` cleanup here;
+    // the hardlink/symlink tests are what cover the CoW stager.)
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }
 
 /// CoW happens before the atomic write — so on a hash-mismatch
@@ -482,4 +566,9 @@ fn apply_failure_does_not_cow_or_modify() {
         "failed apply must not break the hardlink"
     );
     assert_eq!(pre_inode, std::fs::metadata(&outside).unwrap().ino());
+
+    // A failed apply must also leave no half-written stage/cow litter
+    // behind: the hash gate fires before any stager runs, so the package
+    // directory must be exactly as clean as on success.
+    assert_no_patch_litter(&fx.root().join("node_modules/cow-fixture"));
 }

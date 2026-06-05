@@ -28,18 +28,35 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 /// against callers that forget to check `files_patched.is_empty()`
 /// (apply.rs does, but the guard belongs on the engine side too).
 /// Covers `sidecars/mod.rs:110`.
+///
+/// The PURL MUST name an ecosystem whose non-short-circuited path
+/// returns `Some` — otherwise the test is vacuous. A `pkg:cargo/...`
+/// PURL against an empty dir would return `None` from `cargo::fixup`
+/// too (no `.cargo-checksum.json`), so deleting the `patched.is_empty()`
+/// early-return would NOT change the result and the regression would
+/// stay green. We use `pkg:pypi/...` because the pypi arm
+/// *unconditionally* emits an advisory (`Some`) whenever it is reached
+/// — and it is compiled in every feature configuration. So observing
+/// `None` here can ONLY mean the empty-patched short-circuit fired
+/// before PURL classification. (This mirrors the in-tree lib test
+/// `empty_patched_short_circuits_before_advisory`, which the original
+/// integration test failed to copy.)
 #[tokio::test]
 async fn dispatch_fixup_empty_patched_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let out = dispatch_fixup(
-        "pkg:cargo/anything@1.0.0",
+        "pkg:pypi/requests@2.28.0",
         tmp.path(),
         &[],
         &HashMap::new(),
     )
     .await
     .unwrap();
-    assert!(out.is_none(), "empty patched must short-circuit to None");
+    assert!(
+        out.is_none(),
+        "empty patched must short-circuit to None *before* the pypi advisory arm; \
+         a Some here means the patched.is_empty() guard was bypassed"
+    );
 }
 
 /// Unknown PURL ecosystem (no recognized scheme prefix) also
@@ -98,10 +115,21 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
 
     let err = result.expect_err("missing file in patched list must surface as Err");
     match err {
-        SidecarError::Io { path, .. } => {
+        SidecarError::Io { path, source } => {
             assert!(
                 path.contains("missing-on-disk.txt"),
                 "Io error path must reference the missing file; got {path:?}"
+            );
+            // The premise of this test is that the file is *absent* and
+            // the `read()` in `sha256_file` fails with NotFound. Assert
+            // that exact errno so a regression that surfaced some other
+            // Io failure (EACCES, EISDIR, a wrapped/mislabeled error)
+            // here — i.e. NOT the missing-file arm we claim to cover —
+            // cannot masquerade as this test passing.
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::NotFound,
+                "sha256_file on an absent path must surface NotFound, got {source:?}"
             );
         }
         other => panic!("expected SidecarError::Io, got {other:?}"),

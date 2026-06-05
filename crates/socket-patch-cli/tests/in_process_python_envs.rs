@@ -191,12 +191,26 @@ async fn pypi_alternate_venv_dir_names() {
         std::fs::create_dir_all(&site).unwrap();
         write_dist_info(&site, &format!("alt_{venv_name}"), "1.0.0");
 
+        // Positive control: a package in a recognized `.venv` dir in the
+        // SAME project. The crawler must always discover this. Without it,
+        // the `should_find == false` branch below is vacuous — it passes
+        // even if the crawler silently stopped probing site-packages, or
+        // (worse) fell through to a non-deterministic host-wide scan that
+        // happens to miss the planted package. With the control present,
+        // `.venv` is found, the early-return short-circuits any host scan,
+        // and a clean negative for `env`/`.env` proves they were genuinely
+        // skipped rather than never reached.
+        let control_site = tmp.path().join(".venv/lib/python3.11/site-packages");
+        std::fs::create_dir_all(&control_site).unwrap();
+        write_dist_info(&control_site, "alt_control", "9.9.9");
+
         let server = MockServer::start().await;
         mock_batch_empty(&server).await;
         let res = scan_run(default_args(tmp.path(), server.uri())).await;
         assert_eq!(res, 0, "venv name {venv_name} should scan cleanly");
 
         let bodies = batch_bodies(&server).await;
+        assert_discovered(&bodies, "pkg:pypi/alt-control@9.9.9");
         if *should_find {
             assert_discovered(&bodies, expected_purl);
         } else {
@@ -324,16 +338,36 @@ async fn pypi_multiple_python_versions_in_venvs() {
 #[serial]
 async fn pypi_empty_site_packages_safe() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
-    std::fs::create_dir_all(&site).unwrap();
-    // No dist-info entries.
+    // Empty `.venv` site-packages — no dist-info entries.
+    let empty_site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    std::fs::create_dir_all(&empty_site).unwrap();
+    // A second recognized venv (`venv/`) holds exactly one real package.
+    // It serves as a positive control: the crawler scans both `.venv` and
+    // `venv`, so its discovery proves scanning actually ran. The empty
+    // `.venv` must contribute NOTHING on top of it.
+    let control_site = tmp.path().join("venv/lib/python3.11/site-packages");
+    std::fs::create_dir_all(&control_site).unwrap();
+    write_dist_info(&control_site, "only_real", "3.2.1");
 
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
-    // Nothing on disk => nothing may be shipped to the API. Guards against
-    // a crawler that invents phantom packages from an empty site-packages.
-    assert_not_discovered(&batch_bodies(&server).await, "pkg:pypi/");
+
+    let bodies = batch_bodies(&server).await;
+    // The one real package must be discovered (proves the crawl happened).
+    assert_discovered(&bodies, "pkg:pypi/only-real@3.2.1");
+    // ...and it must be the ONLY pypi PURL shipped. An empty site-packages
+    // must invent no phantom packages; the exact-count check fails if the
+    // crawler conjures anything from the empty `.venv`.
+    let total_pypi_purls: usize = bodies
+        .iter()
+        .map(|b| b.matches("pkg:pypi/").count())
+        .sum();
+    assert_eq!(
+        total_pypi_purls, 1,
+        "exactly one pypi PURL (the control) expected; empty site-packages \
+         must not produce phantom packages. bodies: {bodies:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -385,12 +419,23 @@ async fn pypi_egg_info_layout_handled() {
     )
     .unwrap();
 
+    // Positive control in the SAME site-packages: a real `.dist-info`
+    // package the crawler must discover. Without it, the negative
+    // assertions below are vacuous — they pass even if the crawler never
+    // walked this directory at all (e.g. a regression that stops probing
+    // `.venv`). The control proves the dir WAS walked, so a missing
+    // `legacy_pkg` means egg-info was specifically not recognized, not that
+    // scanning silently no-op'd.
+    write_dist_info(&site, "modern_sibling", "2.0.0");
+
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     let res = scan_run(default_args(tmp.path(), server.uri())).await;
     assert_eq!(res, 0, "egg-info layout must scan cleanly without crashing");
-    // Not discovered today; neither the canonical nor raw name may appear.
     let bodies = batch_bodies(&server).await;
+    // Control: proves the crawler genuinely walked this site-packages dir.
+    assert_discovered(&bodies, "pkg:pypi/modern-sibling@2.0.0");
+    // Not discovered today; neither the canonical nor raw name may appear.
     assert_not_discovered(&bodies, "pkg:pypi/legacy-pkg@1.0.0");
     assert_not_discovered(&bodies, "pkg:pypi/legacy_pkg@1.0.0");
 }

@@ -280,6 +280,26 @@ fn run_container(script: &str) -> std::process::Output {
     cmd.output().expect("docker run")
 }
 
+/// Assert the wiremock actually served BOTH the metadata discovery
+/// (batch) AND the patch-content fetch (view). The in-container `echo`
+/// markers alone can't prove the real network path ran — a build that
+/// short-circuits the API (cached layer, stubbed fetch, or a marker
+/// written by some unrelated mechanism) could still emit them. Requiring
+/// the server to have observed the batch POST and the per-UUID blob GET
+/// proves the genuine scan→download→apply code path executed end to end.
+async fn assert_api_path_exercised(server: &MockServer) {
+    let received = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<String> = received.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("/patches/batch")),
+        "scan should have called /patches/batch; received={paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains(&format!("/patches/view/{UUID}"))),
+        "scan --sync should have fetched patch content via /patches/view/{UUID}; received={paths:#?}"
+    );
+}
+
 #[tokio::test]
 async fn gem_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_RB);
@@ -298,6 +318,7 @@ async fn gem_local_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }
 
 #[tokio::test]
@@ -318,4 +339,5 @@ async fn gem_global_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_api_path_exercised(&server).await;
 }

@@ -191,8 +191,30 @@ fi
 # failed. This catches a regression where apply reports success while
 # silently no-op'ing (the failure mode the marker grep alone would miss
 # if the file were patched by some other path).
-grep -q '"applied": 1' /tmp/apply.out || {{
-  echo "FAIL: apply JSON did not report applied:1" >&2
+#
+# Use anchored regexes against the pretty-printed envelope (serde
+# to_string_pretty → `  "applied": 1,`). A bare `"applied": 1` substring
+# would also match `"applied": 10`/`100`, so require the trailing comma.
+# We additionally pin the top-level status and the *other* summary counts:
+# a regression that patches our file but corrupts/fails a second one would
+# report applied:1 alongside failed:1, and the old check would miss it.
+grep -qE '^[[:space:]]*"applied": 1,[[:space:]]*$' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report exactly applied:1" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -qE '^[[:space:]]*"failed": 0,[[:space:]]*$' /tmp/apply.out || {{
+  echo "FAIL: apply JSON reported a non-zero failed count" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -qE '^[[:space:]]*"skipped": 0,[[:space:]]*$' /tmp/apply.out || {{
+  echo "FAIL: apply JSON reported a non-zero skipped count" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -qE '"status": "success"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON status was not success" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}
@@ -292,11 +314,42 @@ async fn golang_download_full_apply_chain() {
 
     // The scan must have actually called the patch API — proves the test
     // exercised the real network/scan path, not a short-circuit.
-    let received = server.received_requests().await.unwrap_or_default();
+    let received = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
     assert!(
-        received
-            .iter()
-            .any(|r| r.url.path().contains("/patches/batch")),
-        "scan should have called /patches/batch; received={received:#?}"
+        !received.is_empty(),
+        "scan should have made at least one API request; received nothing"
+    );
+
+    // The batch call alone isn't enough: an empty/broken go crawler would
+    // still POST /patches/batch with an empty component list and the old
+    // `.any(path contains batch)` check would stay green. Require that the
+    // batch request *body* carried the gin PURL — i.e. the golang crawler
+    // actually discovered the package in $GOMODCACHE (the real code path
+    // this test is named after). The body is
+    // `{"components":[{"purl":"pkg:golang/.../gin@v1.9.1"}]}`.
+    let batch_with_purl = received.iter().any(|r| {
+        r.url.path().contains("/patches/batch")
+            && String::from_utf8_lossy(&r.body).contains(PURL)
+    });
+    assert!(
+        batch_with_purl,
+        "scan should have POSTed /patches/batch containing {PURL} \
+         (proves the go crawler discovered the package); received={received:#?}"
+    );
+
+    // scan --sync must download the patch blob so the offline apply can use
+    // it. The blob is served from /patches/view/{UUID}; if scan skipped it,
+    // apply --offline would have had no bytes and the hash check would be
+    // testing a pre-seeded file instead of a freshly-fetched one.
+    let fetched_blob = received
+        .iter()
+        .any(|r| r.url.path().contains(&format!("/patches/view/{UUID}")));
+    assert!(
+        fetched_blob,
+        "scan --sync should have fetched the patch blob via /patches/view/{UUID}; \
+         received={received:#?}"
     );
 }

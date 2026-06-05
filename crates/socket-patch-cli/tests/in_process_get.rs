@@ -108,7 +108,11 @@ async fn start_wiremock() -> (MockServer, String) {
 /// of its `blobContent` (`base64("patched\n")`). Derived here independently
 /// of the production decode path so a regression that mangles the blob shows.
 const AFTER_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const BEFORE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const BLOB_BYTES: &[u8] = b"patched\n";
+/// The single patched file path declared by `make_view_mock`. The saved
+/// manifest record must map exactly this path to the before/after hashes.
+const FILE_PATH: &str = "package/index.js";
 
 /// Assert that a successful `get` persisted the patch for `purl`/`uuid`:
 /// the manifest records the exact uuid, and the after-hash blob holds the
@@ -126,6 +130,23 @@ fn assert_patch_saved(cwd: &Path, purl: &str, uuid: &str) {
     assert_eq!(
         m["patches"][purl]["uuid"], uuid,
         "manifest uuid must match the fetched patch"
+    );
+    // The record must also carry the patched-file map keyed by the exact
+    // file path, with the before/after hashes from the view response. A
+    // no-op that wrote a bare {uuid} record (no files) would pass the uuid
+    // check above but fail here, and apply would have nothing to do.
+    let file_entry = &m["patches"][purl]["files"][FILE_PATH];
+    assert!(
+        file_entry.is_object(),
+        "manifest record must map {FILE_PATH}, got: {body}"
+    );
+    assert_eq!(
+        file_entry["afterHash"], AFTER_HASH,
+        "manifest file entry must record the view's afterHash"
+    );
+    assert_eq!(
+        file_entry["beforeHash"], BEFORE_HASH,
+        "manifest file entry must record the view's beforeHash"
     );
 
     let blob_path = cwd.join(".socket/blobs").join(AFTER_HASH);
@@ -406,17 +427,27 @@ async fn get_with_explicit_ghsa_flag() {
     assert_patch_saved(tmp.path(), PURL, UUID);
 }
 
+/// Write a minimal installed npm package under `<cwd>/node_modules/<name>`
+/// so `crawl_all_ecosystems` discovers it as `pkg:npm/<name>@<version>`.
+fn install_npm_fixture(cwd: &Path, name: &str, version: &str) {
+    let pkg_dir = cwd.join("node_modules").join(name);
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({ "name": name, "version": version }).to_string(),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 #[serial]
-async fn get_with_explicit_package_flag() {
-    // NOTE: `--package` does NOT hit the `by-package/<name>` endpoint with
-    // the raw identifier. It routes through `crawl_all_ecosystems` over the
-    // cwd, fuzzy-matches the discovered packages, then searches by the best
-    // match's PURL. In this empty tempdir there are no installed packages,
-    // so the run short-circuits on `no_packages` and exits 0 WITHOUT ever
-    // contacting the mounted mock. We assert that contract precisely: exit 0
-    // and no manifest. (A previous version asserted only `== 0`, which hid
-    // the fact that the mock is never exercised.)
+async fn get_with_explicit_package_no_install_short_circuits() {
+    // `--package` routes through `crawl_all_ecosystems` over the cwd. With
+    // NO installed packages the run short-circuits on `no_packages` and must
+    // exit 0 WITHOUT ever contacting the API. We assert the full contract:
+    // exit 0, no manifest, AND that the mounted mock saw zero requests — so a
+    // regression that started issuing a raw `by-package/<name>` lookup (or
+    // any network call) on an empty tree would be caught.
     let (server, url) = start_wiremock().await;
     let name = "some-package";
     make_search_mock_one(&server, "by-package", name, UUID, PURL, "free").await;
@@ -430,6 +461,57 @@ async fn get_with_explicit_package_flag() {
     let code = run(args).await;
     assert_eq!(code, 0, "no installed packages → no_packages, exit 0");
     assert_no_manifest(tmp.path());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "no_packages short-circuit must make zero API calls, saw: {:?}",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn get_with_explicit_package_flag_resolves_installed_and_saves() {
+    // Drive the REAL `--package` path end to end: an installed npm package is
+    // discovered by the crawler, fuzzy-matched against the identifier, then
+    // searched by its resolved PURL and saved. (The previous sole test for
+    // this flag ran against an empty tempdir, short-circuited on `no_packages`
+    // and never exercised resolution, search, view, or save at all.)
+    let (server, url) = start_wiremock().await;
+    // The crawler discovers `node_modules/in-process-test` as exactly PURL,
+    // and the package search is keyed on the urlencoded PURL.
+    let encoded = "pkg%3Anpm%2Fin-process-test%401.0.0";
+    make_search_mock_one(&server, "by-package", encoded, UUID, PURL, "free").await;
+    make_view_mock(&server, UUID, PURL, "free").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    install_npm_fixture(tmp.path(), "in-process-test", "1.0.0");
+
+    // Identifier is the installed package name; --package forces the package
+    // resolution path rather than treating it as a PURL/UUID.
+    let mut args = default_args("in-process-test", tmp.path());
+    args.common.api_url = url;
+    args.package = true;
+
+    let code = run(args).await;
+    assert_eq!(code, 0, "resolved + saved package must exit 0");
+    assert_patch_saved(tmp.path(), PURL, UUID);
+
+    // Prove the real network path ran: the package search endpoint (keyed on
+    // the resolved PURL) AND the view endpoint were both hit. Without this a
+    // short-circuit that skipped the API but happened to leave a stray
+    // manifest would slip through.
+    let requests = server.received_requests().await.unwrap();
+    let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/by-package/{encoded}")),
+        "must search by the resolved PURL, saw: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
+        "must fetch the selected patch's view, saw: {paths:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

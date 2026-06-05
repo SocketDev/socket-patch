@@ -46,8 +46,16 @@ fn scan_json(cwd: &std::path::Path) -> serde_json::Value {
         "scan --json should exit 0, got {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("scan --json must emit valid JSON ({e}), got:\n{stdout}"))
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan --json must emit valid JSON ({e}), got:\n{stdout}"));
+    // The discovery contract is "success" — guard the envelope shape so a
+    // regression that swaps the status (or drops the field, yielding Null)
+    // is caught here rather than slipping past the count assertion below.
+    assert_eq!(
+        value["status"], "success",
+        "scan --json envelope must report status=success; got:\n{value:#}"
+    );
+    value
 }
 
 // ---------------------------------------------------------------------------
@@ -115,9 +123,16 @@ fn scan_discovers_fake_registry_crates() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}{stderr}");
+    // Match the exact ecosystem summary, not two loose substrings. The old
+    // `contains("Found 2 packages") && contains("cargo")` was satisfied by an
+    // incidental "cargo" anywhere (the proxy banner, the
+    // "npm/yarn/pnpm/pip/cargo" install hint, a PURL) and would NOT have
+    // caught a stray non-cargo pickup, e.g. `Found 2 packages (1 cargo, 1
+    // npm)`. Requiring `(2 cargo)` proves all of the count is attributed to
+    // the registry crawler.
     assert!(
-        combined.contains("Found 2 packages") && combined.contains("cargo"),
-        "Expected human scan to report 'Found 2 packages (2 cargo)', got:\n{combined}"
+        combined.contains("Found 2 packages (2 cargo)"),
+        "Expected human scan to report exactly 'Found 2 packages (2 cargo)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),
@@ -155,9 +170,12 @@ fn scan_discovers_vendor_crates() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
+    // Exact ecosystem summary — see the registry test for why the two-loose-
+    // substring form was a loophole. `(1 cargo)` proves the single discovered
+    // package is the vendored crate and not an accidental npm/pypi pickup.
     assert!(
-        combined.contains("Found 1 packages") && combined.contains("cargo"),
-        "Expected human scan to report 'Found 1 packages (1 cargo)', got:\n{combined}"
+        combined.contains("Found 1 packages (1 cargo)"),
+        "Expected human scan to report exactly 'Found 1 packages (1 cargo)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),

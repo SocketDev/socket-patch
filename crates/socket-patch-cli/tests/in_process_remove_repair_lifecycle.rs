@@ -236,7 +236,8 @@ async fn remove_invalid_manifest_emits_error() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
+    let original = "{ not json";
+    std::fs::write(socket.join("manifest.json"), original).unwrap();
 
     let args = RemoveArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -252,6 +253,13 @@ async fn remove_invalid_manifest_emits_error() {
         skip_rollback: true,
     };
     assert_eq!(remove_run(args).await, 1);
+    // A manifest it could not parse must be left byte-for-byte intact — remove
+    // must never silently overwrite/truncate it into a valid empty manifest.
+    assert_eq!(
+        std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+        original,
+        "unparseable manifest must not be clobbered on error"
+    );
 }
 
 #[tokio::test]
@@ -272,6 +280,11 @@ async fn remove_no_manifest_emits_not_found() {
         skip_rollback: true,
     };
     assert_eq!(remove_run(args).await, 1);
+    // Removing from a non-existent manifest must not conjure one into being.
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "remove against a missing manifest must not create one"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -509,33 +522,78 @@ async fn repair_file_mode_downloads_individual_blobs() {
 #[serial]
 async fn repair_dry_run_does_not_download() {
     let tmp = tempfile::tempdir().unwrap();
+
+    // Critically: run dry-run while ONLINE (offline = false) and with a mock
+    // server that WOULD happily serve the missing blob. The only thing that
+    // can stop the download is the dry_run flag being honoured. The previous
+    // version of this test also set offline = true and had no server, so a
+    // `dry_run` that was silently ignored would still pass vacuously (network
+    // blocked by airgap, not by dry-run logic).
+    let blob_content = b"would-be-downloaded blob\n";
+    let after_hash = git_sha256(blob_content);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/blob/{after_hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob_content.to_vec()))
+        .mount(&server)
+        .await;
+
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(
         socket.join("manifest.json"),
-        r#"{ "patches": {
-            "pkg:npm/dryrun@1.0.0": {
+        format!(
+            r#"{{ "patches": {{
+            "pkg:npm/dryrun@1.0.0": {{
                 "uuid": "15151515-1515-4151-8151-151515151515",
                 "exportedAt": "2024-01-01T00:00:00Z",
-                "files": { "package/x.js": {
+                "files": {{ "package/x.js": {{
                     "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-                    "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
-                }},
-                "vulnerabilities": {}, "description": "x",
+                    "afterHash":  "{after_hash}"
+                }}}},
+                "vulnerabilities": {{}}, "description": "x",
                 "license": "MIT", "tier": "free"
-            }
-        }}"#,
+            }}
+        }}}}"#
+        ),
     )
     .unwrap();
 
     let mut args = make_repair_args(tmp.path(), "file");
     args.common.dry_run = true;
-    args.common.offline = true;
-    assert_eq!(repair_run(args).await, 0);
-    // Nothing should be downloaded.
+    args.common.offline = false;
+
+    std::env::set_var("SOCKET_API_URL", server.uri());
+    std::env::set_var("SOCKET_API_TOKEN", "fake");
+    std::env::set_var("SOCKET_ORG_SLUG", ORG);
+    let code = repair_run(args).await;
+    std::env::remove_var("SOCKET_API_URL");
+    std::env::remove_var("SOCKET_API_TOKEN");
+    std::env::remove_var("SOCKET_ORG_SLUG");
+    assert_eq!(code, 0, "dry-run repair must succeed");
+
+    // The blob the server offered must NOT be on disk.
+    assert!(
+        !socket.join("blobs").join(&after_hash).exists(),
+        "dry-run must not write the missing blob to disk"
+    );
     assert!(
         !socket.join("blobs").exists() || socket.join("blobs").read_dir().unwrap().count() == 0,
         "dry-run must not download blobs"
+    );
+    // The decisive check: the blob endpoint must never have been requested.
+    // If dry_run were ignored, fetch_missing_sources would have hit it.
+    let hits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with(&format!("/v0/orgs/{ORG}/patches/")))
+        .count();
+    assert_eq!(
+        hits, 0,
+        "dry-run must not issue any patch-artifact download requests"
     );
 }
 

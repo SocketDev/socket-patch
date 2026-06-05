@@ -99,24 +99,41 @@ fn scan_discovers_composer2_packages() {
     std::fs::create_dir_all(vendor_dir.join("monolog").join("monolog")).unwrap();
     std::fs::create_dir_all(vendor_dir.join("symfony").join("console")).unwrap();
 
+    // Decoy: a populated vendor directory that is NOT listed in
+    // installed.json. Discovery is installed.json-driven (the crawler
+    // iterates the manifest entries and confirms each one on disk), so this
+    // package must NOT be counted. If it ever is, the crawler has regressed
+    // to blindly walking vendor/ subdirectories — which the exact-count
+    // assertions below would then catch (3 != 2).
+    std::fs::create_dir_all(vendor_dir.join("decoy").join("unlisted")).unwrap();
+
     // --- JSON path: assert the EXACT discovered count, not just "non-zero" and
     // not merely the presence of a `scannedPackages` key (which the envelope
     // always carries, even when zero packages are found). The Composer 2
     // `{"packages": [...]}` parser must surface both packages.
     let json = scan_json(&project_dir);
     assert_eq!(
+        json["status"], "success",
+        "scan envelope must report success; got:\n{json:#}"
+    );
+    assert_eq!(
         json["scannedPackages"], 2,
         "scan must discover exactly the two Composer 2 packages \
          (monolog/monolog + symfony/console); got:\n{json:#}"
     );
 
-    // --- Human path: the count must be attributed to the *php* ecosystem,
-    // proving the Composer crawler (not an accidental npm/pypi pickup) found
-    // them, and the run must NOT report "No packages found".
+    // --- Human path: the count must be attributed *entirely* to the php
+    // ecosystem. Assert the contiguous `Found 2 packages (2 php)` string
+    // rather than two independent substrings (`"Found 2 packages"` AND
+    // `"php"`): the latter would also accept a regression that splits the
+    // count across ecosystems (e.g. `Found 2 packages (1 php, 1 npm)`) or
+    // attributes it to the wrong crawler entirely while "php" leaks in from
+    // an unrelated line. The closing paren after `php` pins the breakdown to
+    // php-only.
     let combined = scan_human(&project_dir);
     assert!(
-        combined.contains("Found 2 packages") && combined.contains("php"),
-        "Expected human scan to report 'Found 2 packages (2 php)', got:\n{combined}"
+        combined.contains("Found 2 packages (2 php)"),
+        "Expected human scan to report exactly 'Found 2 packages (2 php)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),
@@ -156,17 +173,23 @@ fn scan_discovers_composer1_packages() {
     // (which would silently yield 0 here while the envelope still validates).
     let json = scan_json(&project_dir);
     assert_eq!(
+        json["status"], "success",
+        "scan envelope must report success; got:\n{json:#}"
+    );
+    assert_eq!(
         json["scannedPackages"], 1,
         "scan must discover exactly the one Composer 1 package \
          (guzzlehttp/guzzle) from the flat-array installed.json; got:\n{json:#}"
     );
 
-    // --- Human path: discovery must be attributed to the php ecosystem and
-    // must NOT report "No packages found".
+    // --- Human path: the single package must be attributed *entirely* to the
+    // php ecosystem. Assert the contiguous `Found 1 packages (1 php)` string
+    // (see the Composer 2 test for why two independent substrings are too
+    // weak).
     let combined = scan_human(&project_dir);
     assert!(
-        combined.contains("Found 1 packages") && combined.contains("php"),
-        "Expected human scan to report 'Found 1 packages (1 php)', got:\n{combined}"
+        combined.contains("Found 1 packages (1 php)"),
+        "Expected human scan to report exactly 'Found 1 packages (1 php)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),

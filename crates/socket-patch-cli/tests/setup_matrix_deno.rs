@@ -71,18 +71,58 @@ mod host_guard {
     const DENO_JSON: &str =
         "{ \"name\": \"sm-proj\", \"version\": \"0.0.0\", \"nodeModulesDir\": \"auto\" }\n";
 
+    /// Every `SOCKET_*` env var clap consults for the `setup` surface this
+    /// test drives. The round-trip's whole signal is the contrast between
+    /// flag-present and flag-absent runs (`--check`, `--yes`, `--cwd`,
+    /// `--remove`); an ambient `SOCKET_CWD` / `SOCKET_YES` / `SOCKET_OFFLINE`
+    /// / `SOCKET_MANIFEST_PATH` etc. in the shell or CI could stand in for a
+    /// flag and mask a flag-handling regression (e.g. `--cwd` being ignored,
+    /// or `--check` silently succeeding). Strip the full surface so behaviour
+    /// reflects the explicit flags alone. Mirrors `setup_matrix_cargo.rs`.
+    const SOCKET_ENV_VARS: &[&str] = &[
+        "SOCKET_CWD",
+        "SOCKET_MANIFEST_PATH",
+        "SOCKET_API_URL",
+        "SOCKET_API_TOKEN",
+        "SOCKET_ORG_SLUG",
+        "SOCKET_PROXY_URL",
+        "SOCKET_ECOSYSTEMS",
+        "SOCKET_DOWNLOAD_MODE",
+        "SOCKET_OFFLINE",
+        "SOCKET_GLOBAL",
+        "SOCKET_GLOBAL_PREFIX",
+        "SOCKET_JSON",
+        "SOCKET_VERBOSE",
+        "SOCKET_SILENT",
+        "SOCKET_DRY_RUN",
+        "SOCKET_YES",
+        "SOCKET_LOCK_TIMEOUT",
+        "SOCKET_BREAK_LOCK",
+        "SOCKET_DEBUG",
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_SAVE_ONLY",
+        "SOCKET_ONE_OFF",
+        "SOCKET_ALL_RELEASES",
+        "SOCKET_PATCH_ROOT",
+        "SOCKET_PATCH_GUARD",
+    ];
+
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
     fn binary() -> std::path::PathBuf {
         env!("CARGO_BIN_EXE_socket-patch").into()
     }
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// `SOCKET_API_TOKEN` is stripped so nothing reaches authed endpoints.
+    /// The entire `SOCKET_*` surface is stripped so behaviour reflects the
+    /// explicit flags alone (see [`SOCKET_ENV_VARS`]) — nothing reaches authed
+    /// endpoints and no ambient var can stand in for a flag.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(binary())
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("SOCKET_API_TOKEN")
+        let mut cmd = Command::new(binary());
+        cmd.args(args).current_dir(cwd);
+        for var in SOCKET_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd
             .output()
             .expect("failed to execute socket-patch binary");
         (
@@ -218,10 +258,21 @@ mod host_guard {
             code, 0,
             "setup --check must PASS (exit 0) after setup configured the deno project.\nstdout:\n{out}\nstderr:\n{err}"
         );
+        let v = parse_json(&out, "check (configured)");
         assert_eq!(
-            json_str_field(&parse_json(&out, "check (configured)"), "status", "check (configured)"),
+            json_str_field(&v, "status", "check (configured)"),
             "configured",
             "check must report the deno package.json as configured after setup.\nstderr:\n{err}"
+        );
+        assert_eq!(
+            v.get("configured").and_then(|n| n.as_i64()),
+            Some(1),
+            "exactly one manifest (the package.json) must be reported configured.\n{out}"
+        );
+        assert_eq!(
+            v.get("needsConfiguration").and_then(|n| n.as_i64()),
+            Some(0),
+            "no manifest may still need configuration after a successful setup.\n{out}"
         );
 
         // ── remove: must delete the hook and succeed ────────────────────────
@@ -251,10 +302,21 @@ mod host_guard {
             code, 1,
             "setup --check must FAIL (exit 1) again after remove.\nstdout:\n{out}\nstderr:\n{err}"
         );
+        let v = parse_json(&out, "check (post-remove)");
         assert_eq!(
-            json_str_field(&parse_json(&out, "check (post-remove)"), "status", "check (post-remove)"),
+            json_str_field(&v, "status", "check (post-remove)"),
             "needs_configuration",
             "check must report needs_configuration again after the hook is removed.\nstderr:\n{err}"
+        );
+        assert_eq!(
+            v.get("needsConfiguration").and_then(|n| n.as_i64()),
+            Some(1),
+            "the package.json must count as needing configuration again after remove.\n{out}"
+        );
+        assert_eq!(
+            v.get("configured").and_then(|n| n.as_i64()),
+            Some(0),
+            "no manifest may report configured after the hook is removed.\n{out}"
         );
     }
 }

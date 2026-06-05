@@ -383,7 +383,12 @@ fn rollback_removes_redirect_offline_without_registry() {
             .exists(),
         "copy dir should be removed on rollback"
     );
-    let cfg = std::fs::read_to_string(config_toml(&project)).unwrap_or_default();
+    // Read WITHOUT a default fallback: a wrongly-deleted config.toml must fail
+    // loudly here, not collapse to "" and let the `!contains(CRATE)` check pass
+    // vacuously (the SOCKET_PATCH_ROOT survival assert below is the only thing
+    // that would otherwise catch a deletion — make the failure mode explicit).
+    let cfg = std::fs::read_to_string(config_toml(&project))
+        .expect("config.toml must survive rollback (it holds [env] setup state)");
     assert!(
         !cfg.contains(CRATE),
         "managed [patch] entry should be gone:\n{cfg}"
@@ -420,15 +425,33 @@ fn reconcile_prunes_dropped_patch() {
         serde_json::to_string_pretty(&empty).unwrap(),
     )
     .unwrap();
-    // Exit code may be non-zero (an empty manifest = "nothing to apply"), but
-    // reconcile runs before that early return and prunes the orphan. We don't
-    // assert the exact code (it's the early-return path, not the contract under
-    // test) but we DO keep the output for diagnostics and assert the binary ran
-    // rather than crashing (a panic would surface as code -1 / signal).
-    let (rc_code, _rc_out, _rc_err) = apply(&project, &cargo_home);
+    // The empty manifest takes the "nothing to apply" early-return path (today:
+    // exit 1 / status=partialFailure; a future no-op-success fix would make it
+    // exit 0), but reconcile runs BEFORE that return and prunes the orphan. We
+    // deliberately don't pin the exact status (it's the early-return path, not
+    // the contract under test) — but `rc_code >= 0` was vacuous: every normal
+    // exit, INCLUDING a Rust panic (code 101), satisfies it, so it could not
+    // actually catch the binary crashing before reconcile. Instead require the
+    // apply pipeline to have RUN TO COMPLETION: a normal exit in {0,1} (rejects
+    // panic=101 and signal=-1) AND a well-formed JSON envelope that applied
+    // nothing. A panic/abort before reconcile yields no envelope (parse panics)
+    // or a signal exit; a runaway re-apply would report applied>=1 — both fail
+    // loudly here rather than silently passing the FS checks below.
+    let (rc_code, rc_out, rc_err) = apply(&project, &cargo_home);
     assert!(
-        rc_code >= 0,
-        "apply process crashed/aborted (code {rc_code}) instead of running reconcile"
+        rc_code == 0 || rc_code == 1,
+        "empty-manifest apply must exit 0/1 (not crash), got {rc_code}.\nstdout:\n{rc_out}\nstderr:\n{rc_err}"
+    );
+    let rc_env = parse_json_envelope(&rc_out);
+    assert!(
+        matches!(json_string(&rc_env, "status"), Some("partialFailure") | Some("success")),
+        "empty-manifest apply must reach a clean terminal status, got {:?}:\n{rc_out}",
+        json_string(&rc_env, "status")
+    );
+    assert_eq!(
+        rc_env["summary"]["applied"].as_u64().unwrap_or(u64::MAX),
+        0,
+        "reconcile/empty-manifest apply must apply nothing:\n{rc_out}"
     );
 
     assert!(

@@ -352,10 +352,36 @@ fn test_npm_global_lifecycle() {
         "scan -g --json",
     );
     let scan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        scan["status"], "success",
+        "scan envelope should report success, got: {scan:#?}"
+    );
     let scanned = scan["scannedPackages"]
         .as_u64()
         .expect("scannedPackages should be a number");
     assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+
+    // A bare count is a loophole: scan could enumerate *some* package while
+    // failing to discover minimist or match its patch, and `scanned >= 1`
+    // would still pass. Require that the scan actually surfaced our exact
+    // PURL *with* the expected patch UUID in `packages`.
+    let packages = scan["packages"].as_array().expect("scan packages array");
+    let minimist = packages
+        .iter()
+        .find(|p| p["purl"].as_str() == Some(NPM_PURL))
+        .unwrap_or_else(|| panic!("scan should discover {NPM_PURL}, got packages: {packages:#?}"));
+    let patches = minimist["patches"]
+        .as_array()
+        .expect("discovered package should carry a patches array");
+    assert!(
+        patches.iter().any(|p| p["uuid"].as_str() == Some(NPM_UUID)),
+        "scan should match patch {NPM_UUID} for minimist, got patches: {patches:#?}"
+    );
+    assert!(
+        scan["packagesWithPatches"].as_u64().unwrap_or(0) >= 1,
+        "packagesWithPatches should be >= 1, got: {}",
+        scan["packagesWithPatches"]
+    );
 
     // -- GET: download + apply patch globally --------------------------------
     assert_run_ok(
@@ -383,6 +409,7 @@ fn test_npm_global_lifecycle() {
         .collect();
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"].as_str().unwrap(), NPM_UUID);
+    assert_eq!(patches[0]["purl"].as_str().unwrap(), NPM_PURL);
 
     // -- ROLLBACK: restore original file globally ----------------------------
     assert_run_ok(
@@ -566,13 +593,38 @@ fn test_npm_macos_global_auto_discovery() {
         "scan -g --json failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // Output should be valid JSON with scannedPackages field
+    // Output should be a well-formed success envelope. We cannot assert a
+    // package count (the host's global prefix is uncontrolled and may be
+    // empty), but checking only `is_u64()` is a loophole: a regression that
+    // emits a malformed/error envelope while still printing *some* number
+    // would slip through. Pin the full envelope shape and its internal
+    // invariant instead.
     let scan: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("invalid JSON from scan -g: {e}\nstdout:\n{stdout}"));
+    assert_eq!(
+        scan["status"], "success",
+        "scan -g envelope should report success, got: {scan:#?}"
+    );
+    let scanned = scan["scannedPackages"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("scannedPackages should be a number, got: {}", scan["scannedPackages"]));
+    let with_patches = scan["packagesWithPatches"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("packagesWithPatches should be a number, got: {}", scan["packagesWithPatches"]));
+    let packages = scan["packages"]
+        .as_array()
+        .expect("scan -g should emit a packages array");
+    // Discovery invariant: every package-with-a-patch was a scanned package,
+    // and the `packages` list (packages carrying patches) cannot exceed the
+    // total scanned count.
     assert!(
-        scan["scannedPackages"].is_u64(),
-        "scannedPackages should be a number, got: {}",
-        scan["scannedPackages"]
+        with_patches <= scanned,
+        "packagesWithPatches ({with_patches}) must not exceed scannedPackages ({scanned})"
+    );
+    assert_eq!(
+        packages.len() as u64,
+        with_patches,
+        "packages array length should equal packagesWithPatches"
     );
 }
 

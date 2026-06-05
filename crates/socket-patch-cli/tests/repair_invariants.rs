@@ -16,8 +16,58 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG_SLUG: &str = "test-org";
 
+/// Every `SOCKET_*` env var that maps onto a `GlobalArgs`/`RepairArgs` field.
+/// The child binary must NOT inherit any of these from the ambient
+/// environment, or the assertions stop testing what they claim:
+///   * an ambient `SOCKET_OFFLINE` would make every `--offline` test pass even
+///     if the `--offline` *flag* path regressed (the binary would be offline
+///     for the wrong reason);
+///   * `SOCKET_MANIFEST_PATH` / `SOCKET_CWD` could point the binary at a
+///     different manifest than the fixture each test writes, so the
+///     manifest-not-found / override assertions would be meaningless;
+///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DOWNLOAD_MODE` / `SOCKET_DRY_RUN`
+///     could flip the cleanup-vs-download branch out from under the test.
+/// We scrub the whole set and then re-set only the handful a given test
+/// deliberately controls.
+const SOCKET_ENV_VARS: &[&str] = &[
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_FORCE",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+];
+
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+/// A `socket-patch` command rooted at `cwd` with the full `SOCKET_*` env
+/// scrubbed, so every assertion exercises the flag/argv path and nothing the
+/// ambient environment happened to leak in.
+fn socket_cmd(cwd: &Path) -> Command {
+    let mut cmd = Command::new(binary());
+    cmd.current_dir(cwd);
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
 }
 
 /// Git-SHA256: SHA256("blob <len>\0" ++ content).
@@ -69,10 +119,8 @@ fn write_blob(socket: &Path, hash: &str, content: &[u8]) {
 fn run_repair(cwd: &Path, extra: &[&str]) -> (i32, String) {
     let mut args = vec!["repair", "--json", "--offline"];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
+    let out = socket_cmd(cwd)
         .args(&args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     (
@@ -138,10 +186,8 @@ fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
 #[test]
 fn repair_offline_and_download_only_are_mutually_exclusive() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args(["repair", "--json", "--offline", "--download-only"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(
@@ -168,10 +214,8 @@ fn repair_offline_and_download_only_are_mutually_exclusive() {
 #[test]
 fn repair_offline_and_download_only_human_mode_errors_to_stderr() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args(["repair", "--offline", "--download-only"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(out.status.code(), Some(2));
@@ -320,10 +364,8 @@ fn repair_download_only_skips_cleanup() {
     let orphan_hash = "feedface".repeat(8);
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args(["repair", "--json", "--download-only", "--download-mode", "file"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -369,10 +411,8 @@ fn gc_alias_behaves_identically_to_repair() {
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
     // Run via `gc` instead of `repair`.
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args(["gc", "--json", "--offline"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(out.status.code(), Some(0));
@@ -380,8 +420,19 @@ fn gc_alias_behaves_identically_to_repair() {
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     // The envelope's `command` field reports the canonical name, not the alias.
     assert_eq!(v["command"], "repair");
+    assert_eq!(v["status"], "success");
+    // Full parity with `repair_offline_removes_orphan_blob`: the orphan is
+    // swept, the referenced blob survives, and nothing is downloaded offline.
     assert_eq!(v["summary"]["removed"], 1);
-    assert!(!socket.join("blobs").join(&orphan_hash).exists());
+    assert_eq!(v["summary"]["downloaded"], 0);
+    assert!(
+        !socket.join("blobs").join(&orphan_hash).exists(),
+        "gc must remove the orphan just like repair"
+    );
+    assert!(
+        socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "gc must keep the referenced blob just like repair"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -401,9 +452,11 @@ async fn repair_online_downloads_missing_blob() {
     let after_hash = git_sha256(content);
 
     let mock = MockServer::start().await;
+    let blob_endpoint = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}")))
+        .and(path(blob_endpoint.clone()))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .expect(1)
         .mount(&mock)
         .await;
 
@@ -432,7 +485,7 @@ async fn repair_online_downloads_missing_blob() {
     );
     std::fs::write(socket.join("manifest.json"), manifest).unwrap();
 
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args([
             "repair",
             "--json",
@@ -440,7 +493,6 @@ async fn repair_online_downloads_missing_blob() {
             "file",
             "--download-only",
         ])
-        .current_dir(tmp.path())
         .env("SOCKET_API_URL", &mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
@@ -462,6 +514,27 @@ async fn repair_online_downloads_missing_blob() {
     assert!(blob_path.exists(), "fetched blob must be persisted");
     let body = std::fs::read(&blob_path).unwrap();
     assert_eq!(body, content);
+
+    // Prove the network path was actually exercised against the mock — that
+    // the `downloaded: 1` count and the on-disk blob came from a real GET to
+    // the blob endpoint, not from some cache/short-circuit that fabricated
+    // the count. wiremock records every request it received.
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock should be recording requests");
+    let blob_hits: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == blob_endpoint)
+        .collect();
+    assert_eq!(
+        blob_hits.len(),
+        1,
+        "repair must issue exactly one GET to {blob_endpoint}; saw {} request(s): {:?}",
+        requests.len(),
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>(),
+    );
+    assert_eq!(format!("{}", blob_hits[0].method), "GET");
 }
 
 #[test]
@@ -487,7 +560,7 @@ fn repair_honors_manifest_path_override() {
         serde_json::from_str(&ctrl_stdout).expect("control envelope JSON");
     assert_eq!(cv["error"]["code"], "manifest_not_found");
 
-    let out = Command::new(binary())
+    let out = socket_cmd(tmp.path())
         .args([
             "repair",
             "--json",
@@ -495,8 +568,6 @@ fn repair_honors_manifest_path_override() {
             "--manifest-path",
             "custom/patches.json",
         ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
     assert_eq!(

@@ -67,8 +67,8 @@ fn plain_sha256(content: &[u8]) -> String {
 }
 
 /// Shared verification block for both scripts. Expects `PHP_FILE`,
-/// `EXPECTED_SHA`, and `APPLY_EXIT` to be set, plus the JSON captured in
-/// `/tmp/scan.json` and `/tmp/apply.json`.
+/// `EXPECTED_SHA`, `PRE_SHA`, and `APPLY_EXIT` to be set, plus the JSON
+/// captured in `/tmp/scan.json` and `/tmp/apply.json`.
 ///
 /// This asserts on the *real structured output* of the run, not just a
 /// substring marker:
@@ -80,10 +80,15 @@ fn plain_sha256(content: &[u8]) -> String {
 ///     genuinely-working pipeline.
 ///   - apply exited 0 and its JSON reports the patch was actually
 ///     `"applied"`, hash-`"verified": true`, with `summary.applied == 1`
+///     (matched with a word boundary so `"applied": 10` can't sneak past)
 ///     — this rejects a no-op "success" that patches nothing.
 ///   - the installed file contains the marker AND is byte-for-byte
 ///     identical to the patch blob the API served (exact sha256), so
 ///     truncated/garbled/appended writes can't slip through.
+///   - the file's sha actually CHANGED from its freshly-installed state
+///     (`PRE_SHA`), so a fixture that was pre-patched (marker already
+///     present before apply ran) can't make the post-checks pass
+///     vacuously.
 fn verify_snippet() -> &'static str {
     r#"
 # --- scan: must have discovered and synced the monolog patch ---
@@ -96,10 +101,13 @@ grep -qF '"action": "added"' /tmp/scan.json || {
 if [ "${APPLY_EXIT:-1}" != "0" ]; then
   echo "FAIL: apply exited non-zero (${APPLY_EXIT:-unset})" >&2; cat /tmp/apply.json >&2; exit 1
 fi
-for needle in '"status": "success"' '"action": "applied"' '"verified": true' '"applied": 1' 'pkg:composer/monolog/monolog@3.5.0'; do
+for needle in '"status": "success"' '"action": "applied"' '"verified": true' 'pkg:composer/monolog/monolog@3.5.0'; do
   grep -qF "$needle" /tmp/apply.json || {
     echo "FAIL: apply json missing [$needle]" >&2; cat /tmp/apply.json >&2; exit 1; }
 done
+# exactly one applied patch — word-boundary match so "applied": 10/15/... can't pass.
+grep -qE '"applied": 1([^0-9]|$)' /tmp/apply.json || {
+  echo "FAIL: apply json does not report summary.applied == 1" >&2; cat /tmp/apply.json >&2; exit 1; }
 
 # --- installed file: marker present AND byte-identical to the patch blob ---
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
@@ -112,6 +120,11 @@ if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
   echo "FAIL: $PHP_FILE content sha256 ($ACTUAL_SHA) != expected ($EXPECTED_SHA)" >&2
   echo "---- actual file ----" >&2
   cat "$PHP_FILE" >&2
+  exit 1
+fi
+# apply must have actually MUTATED the file from its installed state.
+if [ "$ACTUAL_SHA" = "${PRE_SHA:-}" ]; then
+  echo "FAIL: $PHP_FILE unchanged by apply (sha still ${PRE_SHA:-unset}); patch was a no-op" >&2
   exit 1
 fi
 
@@ -203,6 +216,13 @@ PHP_FILE="vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls vendor/monolog/monolog/src/Monolog/ >&2 || true; exit 1; }}
 echo "Installed to: $PHP_FILE" >&2
 
+# pristine pre-check: the freshly-installed upstream file must NOT already
+# carry our marker, else a no-op apply would satisfy the post-checks vacuously.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
+  echo "FAIL: marker present in $PHP_FILE before apply (fixture not pristine)" >&2; exit 1
+fi
+PRE_SHA=$(sha256sum "$PHP_FILE" | cut -d' ' -f1)
+
 # scan exit code is intentionally not gated (see verify_snippet); capture JSON.
 socket-patch scan --json --sync --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
@@ -232,6 +252,13 @@ COMPOSER_DIR=$(composer config --global home)
 PHP_FILE="$COMPOSER_DIR/vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls "$COMPOSER_DIR/vendor/monolog/monolog/src/Monolog/" >&2 || true; exit 1; }}
 echo "Global-installed at: $PHP_FILE" >&2
+
+# pristine pre-check: the freshly-installed upstream file must NOT already
+# carry our marker, else a no-op apply would satisfy the post-checks vacuously.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
+  echo "FAIL: marker present in $PHP_FILE before apply (fixture not pristine)" >&2; exit 1
+fi
+PRE_SHA=$(sha256sum "$PHP_FILE" | cut -d' ' -f1)
 
 mkdir -p /workspace/proj && cd /workspace/proj
 
@@ -282,6 +309,29 @@ fn run_container(script: &str) -> std::process::Output {
     cmd.output().expect("docker run")
 }
 
+/// Independent (Rust-side) proof that the container exercised the real
+/// scan→sync network path against our mock — not a pre-baked/cached patch
+/// store. `scan --sync` must POST batch discovery and GET the full patch
+/// blob via `/patches/view/<uuid>`. If neither fired, the in-container
+/// marker/sha checks would be meaningless, so this rejects a
+/// short-circuited run even if the file somehow ended up patched.
+async fn assert_real_pipeline_hit_the_api(server: &MockServer) {
+    let reqs = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    let hit = |needle: &str| reqs.iter().any(|r| r.url.path().contains(needle));
+    let paths: Vec<String> = reqs.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        hit("/patches/batch"),
+        "scan never POSTed batch discovery to the mock; recorded paths={paths:?}"
+    );
+    assert!(
+        hit(&format!("/patches/view/{UUID}")),
+        "sync never fetched the patch blob via /patches/view/{UUID}; recorded paths={paths:?}"
+    );
+}
+
 #[tokio::test]
 async fn composer_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PHP);
@@ -300,6 +350,7 @@ async fn composer_local_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_real_pipeline_hit_the_api(&server).await;
 }
 
 #[tokio::test]

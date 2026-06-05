@@ -289,6 +289,90 @@ fn subprocess_configures_real_package_json() {
 }
 
 // ---------------------------------------------------------------------------
+// Subprocess: --dry-run must PREVIEW only — report what it would do but leave
+// the package.json byte-for-byte unchanged. `dry_run_long_form` only proves the
+// flag parses; nothing here proved it is actually honoured at runtime. An impl
+// that ignored --dry-run and wrote the hook anyway would still emit a
+// "dry_run" envelope (that string comes from a separate branch) and pass every
+// other test — so the decisive guard is reading the file back and asserting it
+// did NOT gain the postinstall hook.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subprocess_dry_run_previews_without_writing() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let pkg_path = tempdir.path().join("package.json");
+    let original = r#"{"name":"demo","version":"1.0.0"}"#;
+    std::fs::write(&pkg_path, original).expect("write package.json");
+
+    let exe = env!("CARGO_BIN_EXE_socket-patch");
+    let output = Command::new(exe)
+        .arg("setup")
+        .arg("--cwd")
+        .arg(tempdir.path())
+        .arg("--dry-run")
+        .arg("--json")
+        .arg("--yes")
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("spawn socket-patch");
+
+    assert!(
+        output.status.success(),
+        "dry-run setup must exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON, got {stdout:?}: {e}"));
+
+    // The envelope must announce a preview of a real change — not no_files,
+    // not already_configured, not success.
+    assert_eq!(
+        v["status"], "dry_run",
+        "dry-run on a configurable package.json must report status 'dry_run'; payload: {v}"
+    );
+    assert_eq!(v["dryRun"], true, "dryRun flag must be set; payload: {v}");
+    assert_eq!(
+        v["wouldUpdate"], 1,
+        "dry-run must report exactly one would-be update; payload: {v}"
+    );
+    assert_eq!(
+        v["updated"], 1,
+        "the preview counts the manifest it would touch; payload: {v}"
+    );
+    assert_eq!(v["errors"], 0, "payload: {v}");
+    let files = v["files"].as_array().expect("'files' must be an array");
+    let pkg_entries: Vec<&serde_json::Value> = files
+        .iter()
+        .filter(|f| f["kind"] == "package_json")
+        .collect();
+    assert_eq!(
+        pkg_entries.len(),
+        1,
+        "exactly one package_json preview entry expected; payload: {v}"
+    );
+    assert_eq!(
+        pkg_entries[0]["status"], "updated",
+        "the previewed entry must report it would be 'updated'; payload: {v}"
+    );
+
+    // The decisive check: dry-run must NOT have touched the file on disk.
+    let after = std::fs::read_to_string(&pkg_path).expect("read package.json back");
+    assert_eq!(
+        after, original,
+        "--dry-run must leave package.json byte-for-byte unchanged (no write)"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&after).expect("package.json must stay valid JSON");
+    assert!(
+        parsed["scripts"]["postinstall"].is_null(),
+        "--dry-run must NOT add the postinstall hook to disk; file: {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Subprocess: idempotency — running setup against an already-configured
 // project must report `already_configured` (updated 0), not re-write or claim
 // a fresh success. Guards against an impl that can't tell configured from not.

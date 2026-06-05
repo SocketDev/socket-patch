@@ -263,6 +263,14 @@ if [ "$APPLY_RC" -ne 0 ]; then
   echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
   exit 1
 fi
+# Exit 0 is necessary but not sufficient: a regression could exit 0 while
+# emitting status="partial_failure"/"error" in the JSON. The guarantee is a
+# clean success, so gate on the structured status too.
+if ! grep -q '"status": *"success"' /tmp/apply.out; then
+  echo "FAIL: apply exit 0 but JSON status is not success (partial_failure/error masked behind a clean exit?)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+fi
 
 echo "===POST-APPLY STATE===" >&2
 echo "manifest:" >&2
@@ -354,11 +362,28 @@ echo "Global-installed at: $GLOBAL_FILE" >&2
 mkdir -p /workspace/proj && cd /workspace/proj
 
 socket-patch scan --json --sync --yes --global "${{COMMON_ARGS[@]}}" \
-  --ecosystems npm 2>/tmp/sync.err
+  --ecosystems npm >/tmp/sync.out 2>/tmp/sync.err
+echo "scan --sync exit=$?" >&2
 cat /tmp/sync.err >&2
 
-socket-patch apply --json --force --offline --global --ecosystems npm 2>/tmp/apply.err
+# Force-apply must succeed cleanly: a non-zero exit, or exit 0 with a
+# partial_failure/error status, means the apply pipeline regressed. The
+# marker grep alone is not enough — apply could write the bytes yet report
+# failure, and we must reject that.
+socket-patch apply --json --force --offline --global --ecosystems npm >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.out >&2 || true
 cat /tmp/apply.err >&2
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: global apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
+if ! grep -q '"status": *"success"' /tmp/apply.out; then
+  echo "FAIL: global apply exit 0 but JSON status is not success" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+fi
 
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GLOBAL_FILE"; then
   echo "FAIL: marker not in $GLOBAL_FILE" >&2
@@ -409,15 +434,25 @@ TARGET_INODE_BEFORE=$(stat -c %i "$TARGET")
 TARGET_NLINK_BEFORE=$(stat -c %h "$TARGET")
 echo "bun target inode_before=$TARGET_INODE_BEFORE nlink_before=$TARGET_NLINK_BEFORE" >&2
 
-# Locate the cache twin via inode if nlink > 1.
+# Locate the cache copy of minimist by NAME (independent of whether bun
+# hard-linked or copied). prewarm guarantees it exists, so a missing cache
+# copy is itself a failure — and locating it by name means the cache
+# integrity assertion below can never silently no-op just because bun chose
+# to copy rather than hard-link in this environment.
+CACHE_FILE=$(find /root/.bun/install/cache -type f -path '*minimist*' -name 'index.js' 2>/dev/null | head -1 || true)
+if [ -z "$CACHE_FILE" ] || [ ! -f "$CACHE_FILE" ]; then
+  echo "FAIL: bun cache copy of minimist/index.js not found under ~/.bun/install/cache (prewarm should have populated it)" >&2
+  find /root/.bun/install/cache -maxdepth 4 -type d 2>/dev/null >&2 || true
+  exit 1
+fi
+CACHE_FILE_HASH_BEFORE=$(sha256sum "$CACHE_FILE" | cut -d' ' -f1)
+echo "bun cache file: $CACHE_FILE hash=$CACHE_FILE_HASH_BEFORE" >&2
+
+# Also record the inode twin when hard-linked, for the extra nlink signal.
 CACHE_TWIN=""
-CACHE_HASH_BEFORE=""
 if [ "$TARGET_NLINK_BEFORE" -gt 1 ]; then
   CACHE_TWIN=$(find /root/.bun/install/cache -inum "$TARGET_INODE_BEFORE" 2>/dev/null | head -1 || true)
-  if [ -n "$CACHE_TWIN" ] && [ -f "$CACHE_TWIN" ]; then
-    CACHE_HASH_BEFORE=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
-    echo "bun cache twin: $CACHE_TWIN hash=$CACHE_HASH_BEFORE" >&2
-  fi
+  echo "bun cache twin (by inode): $CACHE_TWIN" >&2
 fi
 
 # 4. scan --sync.
@@ -425,10 +460,22 @@ socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.err >&2 || true
 
-# 5. apply --force --offline.
-socket-patch apply --json --force --offline 2>/tmp/apply.err
-echo "apply exit=$?" >&2
+# 5. apply --force --offline. Must succeed cleanly — reject a non-zero exit
+#    or a partial_failure/error status hidden behind exit 0.
+socket-patch apply --json --force --offline >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2
+cat /tmp/apply.out >&2 || true
 cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then
+  echo "FAIL: bun apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
+  exit 1
+fi
+if ! grep -q '"status": *"success"' /tmp/apply.out; then
+  echo "FAIL: bun apply exit 0 but JSON status is not success" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+fi
 
 # 6. Marker must be in the on-disk file.
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
@@ -437,26 +484,34 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
   exit 1
 fi
 
-# 7. If the install hard-linked from cache, the apply must have
-#    isolated the venv copy via CoW. The cache twin's bytes must be
-#    unchanged.
-if [ "$TARGET_NLINK_BEFORE" -gt 1 ] && [ -n "$CACHE_TWIN" ] && [ -f "$CACHE_TWIN" ]; then
-  CACHE_HASH_AFTER=$(sha256sum "$CACHE_TWIN" | cut -d' ' -f1)
-  if [ "$CACHE_HASH_AFTER" != "$CACHE_HASH_BEFORE" ]; then
-    echo "FAIL: bun cache content CORRUPTED — CoW didn't isolate the venv copy!" >&2
-    echo "  before=$CACHE_HASH_BEFORE" >&2
-    echo "  after =$CACHE_HASH_AFTER" >&2
-    echo "  path  =$CACHE_TWIN" >&2
-    head -3 "$CACHE_TWIN" >&2
+# 7. CoW isolation — UNCONDITIONAL. Whether bun hard-linked or copied, the
+#    apply must never mutate the shared cache copy: its bytes must be
+#    byte-for-byte unchanged and it must never gain the patch marker. This
+#    runs regardless of nlink so it can't silently no-op.
+CACHE_FILE_HASH_AFTER=$(sha256sum "$CACHE_FILE" | cut -d' ' -f1)
+if [ "$CACHE_FILE_HASH_AFTER" != "$CACHE_FILE_HASH_BEFORE" ]; then
+  echo "FAIL: bun cache content CORRUPTED by apply — CoW/isolation failed!" >&2
+  echo "  before=$CACHE_FILE_HASH_BEFORE" >&2
+  echo "  after =$CACHE_FILE_HASH_AFTER" >&2
+  echo "  path  =$CACHE_FILE" >&2
+  head -3 "$CACHE_FILE" >&2
+  exit 1
+fi
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$CACHE_FILE"; then
+  echo "FAIL: bun cache copy contains the marker — patch leaked into ~/.bun/install/cache/" >&2
+  exit 1
+fi
+echo "bun cache integrity PRESERVED: $CACHE_FILE unchanged" >&2
+
+# Extra assurance when bun hard-linked: the apply must have BROKEN the link
+# so the target no longer shares the cache twin's inode.
+if [ "$TARGET_NLINK_BEFORE" -gt 1 ]; then
+  TARGET_INODE_AFTER=$(stat -c %i "$TARGET")
+  echo "bun target inode_after=$TARGET_INODE_AFTER (was $TARGET_INODE_BEFORE)" >&2
+  if [ "$TARGET_INODE_AFTER" = "$TARGET_INODE_BEFORE" ]; then
+    echo "FAIL: target still shares the cache inode after apply — hard link was NOT broken (CoW skipped)" >&2
     exit 1
   fi
-  if grep -q 'SOCKET-PATCH-E2E-MARKER' "$CACHE_TWIN"; then
-    echo "FAIL: bun cache twin contains the marker — patch leaked into ~/.bun/install/cache/" >&2
-    exit 1
-  fi
-  echo "bun cache integrity PRESERVED: $CACHE_TWIN unchanged" >&2
-else
-  echo "(bun did not hard-link in this environment; CoW path was a no-op)" >&2
 fi
 
 echo "===PATCH VERIFIED===" >&2
@@ -572,18 +627,7 @@ async fn npm_install_scan_apply_rollback_cycle() {
     // an actual blob fetch (inline view or raw-blob fallback). Without
     // the latter, the full download→apply pipeline never ran the
     // content path even if a marker somehow appeared.
-    let received = server.received_requests().await.unwrap_or_default();
-    let paths: Vec<&str> = received.iter().map(|r| r.url.path()).collect();
-    assert!(
-        paths.iter().any(|p| p.contains("/patches/batch")),
-        "scan should have called /patches/batch; received={paths:#?}"
-    );
-    assert!(
-        paths
-            .iter()
-            .any(|p| p.contains("/patches/view/") || p.contains("/patches/blob/")),
-        "scan --sync should have fetched patch content via /patches/view/ or /patches/blob/; received={paths:#?}"
-    );
+    assert_real_api_pipeline_ran(&server).await;
 }
 
 #[tokio::test]
@@ -611,6 +655,26 @@ async fn npm_global_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_real_api_pipeline_ran(&server).await;
+}
+
+/// Shared check: the mock must have served BOTH the metadata discovery
+/// (batch) and an actual blob fetch (inline view or raw-blob fallback).
+/// Without the latter the full download→apply pipeline never ran the
+/// content path even if a marker somehow appeared on disk.
+async fn assert_real_api_pipeline_ran(server: &MockServer) {
+    let received = server.received_requests().await.unwrap_or_default();
+    let paths: Vec<&str> = received.iter().map(|r| r.url.path()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("/patches/batch")),
+        "scan should have called /patches/batch; received={paths:#?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.contains("/patches/view/") || p.contains("/patches/blob/")),
+        "scan --sync should have fetched patch content via /patches/view/ or /patches/blob/; received={paths:#?}"
+    );
 }
 
 /// Bun-managed install + apply, with CoW-isolation assertion. See
@@ -638,6 +702,7 @@ async fn npm_bun_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_real_api_pipeline_ran(&server).await;
 }
 
 /// Smoke test: verify the test infrastructure starts up correctly. This

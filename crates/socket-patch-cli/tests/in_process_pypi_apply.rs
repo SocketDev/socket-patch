@@ -427,6 +427,34 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         before_hash,
         "dry-run changed the file hash"
     );
+
+    // "File unchanged" alone is a vacuous oracle: it is satisfied just as
+    // well by a crawler that discovered nothing or a scan that no-op'd
+    // before ever reaching the apply path. To prove the dry-run path
+    // actually had real work to *decline*, assert the crawler discovered
+    // six and queried the batch endpoint with its PURL — the same
+    // observable proof of discovery used by the crawler sanity test.
+    let purl = format!("pkg:pypi/{PYPI_PACKAGE}@{PYPI_VERSION}");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recording enabled");
+    let batch_bodies: Vec<String> = requests
+        .iter()
+        .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(
+        !batch_bodies.is_empty(),
+        "dry-run never queried the batch endpoint — discovery did not run, \
+         so the file being unmodified proves nothing about dry-run apply"
+    );
+    assert!(
+        batch_bodies.iter().any(|b| b.contains(&purl)),
+        "dry-run batch request did not include the discovered six PURL {purl}; \
+         the unchanged file does not prove dry-run suppressed a real patch; \
+         bodies: {batch_bodies:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -496,6 +496,13 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
 
 /// `uv.lock` alone is also a valid Python-project marker — a fresh
 /// clone of a uv-managed repo shouldn't need a venv to be scannable.
+///
+/// Previously this test only asserted the call returned `Ok` without
+/// staging anything discoverable, so a regression that dropped
+/// `uv.lock` from the marker list (returning an empty Vec via the
+/// no-marker early-out) stayed green. We now stage a real global
+/// layout under the stubbed HOME and assert it surfaces — which can
+/// ONLY happen if the `uv.lock` marker triggered the global fallback.
 #[tokio::test]
 #[serial]
 async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
@@ -505,6 +512,38 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
         .await
         .unwrap();
 
+    // Stage a uv-tools layout under the stubbed HOME so global
+    // discovery has something concrete to find.
+    #[cfg(target_os = "macos")]
+    let staged = home
+        .path()
+        .join("Library")
+        .join("Application Support")
+        .join("uv")
+        .join("tools")
+        .join("black")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    let staged = home
+        .path()
+        .join(".local")
+        .join("share")
+        .join("uv")
+        .join("tools")
+        .join("black")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    #[cfg(windows)]
+    let staged = home.path().join("uv-fake-staged");
+    tokio::fs::create_dir_all(&staged).await.unwrap();
+
+    // Ensure an ambient VIRTUAL_ENV can't satisfy discovery via a
+    // different (venv) arm — the fallback must be the marker path.
+    let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
+    std::env::remove_var("VIRTUAL_ENV");
     let prev_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", home.path());
     let crawler = PythonCrawler;
@@ -514,15 +553,24 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
         global_prefix: None,
         batch_size: 100,
     };
-    // The result vec may be empty (no global Python layouts staged
-    // under the home tempdir), but the call must succeed — the gate
-    // engaged. We assert get_site_packages_paths returned Ok rather
-    // than panicking, which would only happen if the marker path
-    // was wrong.
-    let _ = crawler.get_site_packages_paths(&opts).await.unwrap();
+    let result = crawler.get_site_packages_paths(&opts).await.unwrap();
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
     }
+    if let Some(v) = prev_virtual_env {
+        std::env::set_var("VIRTUAL_ENV", v);
+    }
+
+    #[cfg(not(windows))]
+    assert!(
+        result.iter().any(|p| p == &staged),
+        "uv.lock marker must trigger global fallback; got {result:?}"
+    );
+    // On Windows the staged layout doesn't match the global crawler's
+    // search paths (different env var), so the marker-fallback path is
+    // covered by the pyproject test on Unix only.
+    #[cfg(windows)]
+    let _ = (result, staged);
 }
 
 /// Without any Python-project marker AND without a venv, local-mode
@@ -687,6 +735,17 @@ async fn find_by_purls_matches_canonicalized_name() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "canonical lookup must hit");
+    // The map is keyed by the queried PURL and the payload must carry the
+    // PEP-503-canonicalized name, exact version, correct PURL, and the
+    // site-packages path we searched — not just "some" entry.
+    let pkg = result
+        .get("pkg:pypi/requests@2.28.0")
+        .expect("result must be keyed by the queried PURL");
+    assert_eq!(pkg.name, "requests", "name must be canonicalized to lowercase");
+    assert_eq!(pkg.version, "2.28.0");
+    assert_eq!(pkg.purl, "pkg:pypi/requests@2.28.0");
+    assert_eq!(pkg.namespace, None);
+    assert_eq!(pkg.path, tmp.path());
 }
 
 #[tokio::test]
@@ -703,6 +762,15 @@ async fn find_by_purls_strips_qualifiers() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1, "qualifiers must be stripped before lookup");
+    // The map key preserves the ORIGINAL (qualified) PURL the caller passed,
+    // while name/version come from the matched dist-info.
+    let pkg = result
+        .get("pkg:pypi/requests@2.28.0?extension=tar.gz")
+        .expect("result must be keyed by the original qualified PURL");
+    assert_eq!(pkg.name, "requests");
+    assert_eq!(pkg.version, "2.28.0");
+    assert_eq!(pkg.purl, "pkg:pypi/requests@2.28.0?extension=tar.gz");
+    assert_eq!(pkg.path, tmp.path());
 }
 
 #[tokio::test]
@@ -774,10 +842,26 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"requests"));
-    assert!(names.contains(&"urllib3"));
-    assert_eq!(result.len(), 2);
+    assert_eq!(result.len(), 2, "exactly the two dist-info dirs; got {result:?}");
+
+    // Verify the full identity of each package, not just the name — a
+    // regression that mangled the version or PURL (or canonicalization)
+    // would otherwise stay green.
+    let requests = result
+        .iter()
+        .find(|p| p.name == "requests")
+        .expect("requests must be discovered (canonicalized from \"Requests\")");
+    assert_eq!(requests.version, "2.28.0");
+    assert_eq!(requests.purl, "pkg:pypi/requests@2.28.0");
+    assert_eq!(requests.namespace, None);
+    assert_eq!(requests.path, tmp.path());
+
+    let urllib3 = result
+        .iter()
+        .find(|p| p.name == "urllib3")
+        .expect("urllib3 must be discovered");
+    assert_eq!(urllib3.version, "2.0.0");
+    assert_eq!(urllib3.purl, "pkg:pypi/urllib3@2.0.0");
 }
 
 #[tokio::test]

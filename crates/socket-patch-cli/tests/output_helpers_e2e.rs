@@ -70,6 +70,31 @@ fn color_with_use_color_true_wraps_with_code() {
 }
 
 #[test]
+fn color_threads_code_parameter_verbatim() {
+    // A single-code ("31") test can't tell a correct impl apart from one that
+    // hardcodes `\x1b[31m...` and ignores its `code` argument. Drive several
+    // distinct codes (including multi-part SGR sequences) and require the exact
+    // code to appear in the envelope; also assert distinct codes diverge.
+    assert_eq!(color("text", "91", true), "\x1b[91mtext\x1b[0m");
+    assert_eq!(color("text", "1;32", true), "\x1b[1;32mtext\x1b[0m");
+    assert_eq!(color("text", "0", true), "\x1b[0mtext\x1b[0m");
+    assert_ne!(
+        color("text", "31", true),
+        color("text", "91", true),
+        "distinct codes must produce distinct output"
+    );
+}
+
+#[test]
+fn color_with_use_color_false_ignores_code() {
+    // The disabled path must return the input verbatim for ANY code and must
+    // never emit an ANSI escape, regardless of the code argument.
+    assert_eq!(color("text", "1;32", false), "text");
+    assert_eq!(color("", "91", false), "");
+    assert!(!color("text", "91", false).contains('\x1b'));
+}
+
+#[test]
 fn color_with_empty_text_still_wraps() {
     // Edge case: empty input still gets the ANSI envelope when
     // colour is enabled.

@@ -161,6 +161,14 @@ fn apply_verbose_prints_per_file_details() {
         stdout.contains(&git_sha256(after)),
         "--verbose apply must print the per-file target hash; got: {stdout}"
     );
+    // The verbose block must describe real work: confirm the file was
+    // actually rewritten, so a no-op apply that merely prints the block fails.
+    let patched =
+        std::fs::read(tmp.path().join("node_modules/verbose-target/index.js")).unwrap();
+    assert_eq!(
+        patched, after,
+        "--verbose apply must still rewrite the target file"
+    );
 }
 
 #[test]
@@ -366,6 +374,16 @@ fn scan_non_json_no_packages_prints_friendly_message() {
 fn repair_non_json_no_orphans_prints_summary() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), "pkg:npm/repair-target@1.0.0", b"a", b"b");
+    // `write_manifest` writes BOTH the beforeHash and afterHash blobs, but
+    // repair treats `beforeHash` blobs as unused-by-design (they are fetched
+    // on demand during rollback). To exercise the genuine "all in use" path
+    // implied by this test's name, drop the beforeHash blob so the only
+    // remaining blob is the in-use afterHash one.
+    let blobs = tmp.path().join(".socket/blobs");
+    let before_blob = blobs.join(git_sha256(b"a"));
+    let after_blob = blobs.join(git_sha256(b"b"));
+    std::fs::remove_file(&before_blob).unwrap();
+    assert!(after_blob.exists(), "fixture precondition: afterHash blob present");
 
     let out = Command::new(binary())
         .args(["repair", "--offline"])
@@ -375,9 +393,24 @@ fn repair_non_json_no_orphans_prints_summary() {
         .expect("run");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // With exactly one in-use blob and no orphans, repair must report the
+    // all-in-use status (not a removal) and finish. The old check accepted
+    // any output containing "Repair complete.", so a repair that wrongly
+    // deleted the in-use blob — or skipped the cleanup scan entirely — still
+    // passed.
+    assert!(
+        stdout.contains("Checked 1 blob(s), all are in use."),
+        "no-orphan repair must report the single blob as in-use; got: {stdout}"
+    );
     assert!(
         stdout.contains("Repair complete."),
         "non-JSON repair should print the completion summary; got: {stdout}"
+    );
+    // Critically: the in-use afterHash blob (the patched file content that
+    // `apply` needs) must NOT be deleted by repair.
+    assert!(
+        after_blob.exists(),
+        "repair must preserve the in-use afterHash blob"
     );
 }
 
@@ -389,6 +422,9 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
     let blobs = tmp.path().join(".socket/blobs");
     let orphan = blobs.join("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
     std::fs::write(&orphan, b"orphan").unwrap();
+    // The in-use blob that MUST survive the cleanup: the afterHash content.
+    let after_blob = blobs.join(git_sha256(b"b"));
+    assert!(after_blob.exists(), "fixture precondition: afterHash blob present");
 
     let out = Command::new(binary())
         .args(["repair", "--offline"])
@@ -399,16 +435,24 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The test name promises a *cleanup* summary, so assert the cleanup
-    // actually happened — both in the printed summary and on disk. The
-    // old `!stdout.is_empty()` check would pass even if no blob was ever
-    // removed.
+    // actually happened — both in the printed summary and on disk. Pin the
+    // exact count (the orphan blob + the by-design-unused beforeHash blob =
+    // 2) so a repair that removes too few OR too many blobs fails here; the
+    // old `contains("Removed")` accepted any nonzero count.
     assert!(
-        stdout.contains("Removed") && stdout.contains("unused blob"),
-        "repair with orphans must report removed unused blobs; got: {stdout}"
+        stdout.contains("Removed 2 unused blob(s)"),
+        "repair with orphans must report exactly 2 removed unused blobs; got: {stdout}"
     );
     assert!(
         !orphan.exists(),
         "repair must actually delete the orphan blob from disk"
+    );
+    // ...but it must NOT delete the in-use afterHash blob. A repair that
+    // nuked every blob would still satisfy the "Removed/orphan-gone" checks;
+    // this assertion is what makes that bug visible.
+    assert!(
+        after_blob.exists(),
+        "repair must preserve the in-use afterHash blob while removing orphans"
     );
     assert!(
         stdout.contains("Repair complete."),
@@ -506,6 +550,15 @@ fn rollback_verbose_prints_per_file_details() {
     assert!(
         stdout.contains("Detailed verification:") && stdout.contains("package/index.js"),
         "verbose rollback must print the per-file detail block; got: {stdout}"
+    );
+    // The detail block must reflect real work: the file must actually be
+    // restored to its pre-patch ("before") content, so a no-op rollback that
+    // only prints the block fails here.
+    let restored =
+        std::fs::read(tmp.path().join("node_modules/rb-verbose/index.js")).unwrap();
+    assert_eq!(
+        restored, before,
+        "verbose rollback must restore the file to its pre-patch content"
     );
 }
 

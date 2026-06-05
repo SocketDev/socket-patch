@@ -97,6 +97,50 @@ fn assert_apply_not_installed(stdout: &str, purl: &str) {
     }
 }
 
+/// Parse `stdout` as the `apply` JSON envelope and assert the exact
+/// "package WAS found and patched" outcome for `purl`: a `success`
+/// envelope whose single event is an `applied` action and whose summary
+/// counts everything at zero except `applied == 1`.
+///
+/// This is the *positive control* that distinguishes "the global tree was
+/// actually discovered and crawled" from "the `--global` / `--global-prefix`
+/// resolution was silently ignored". The package name used in the fixtures
+/// (`__*__@1.0.0`) cannot exist in any real npm/yarn/pnpm global tree, so an
+/// `applied` outcome can only come from the path the test explicitly seeded.
+fn assert_apply_applied(stdout: &str, purl: &str) {
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("apply --global must emit valid JSON");
+    assert_eq!(v["command"], "apply", "envelope={v}");
+    assert_eq!(
+        v["status"], "success",
+        "a matching global pkg must be applied successfully; envelope={v}"
+    );
+    assert_eq!(v["dryRun"], false, "envelope={v}");
+
+    let events = v["events"].as_array().expect("events must be an array");
+    assert_eq!(events.len(), 1, "exactly one event expected; envelope={v}");
+    let event = &events[0];
+    assert_eq!(event["action"], "applied", "envelope={v}");
+    assert_eq!(
+        event["purl"], purl,
+        "applied event must name the seeded PURL; envelope={v}"
+    );
+
+    let summary = &v["summary"];
+    assert_eq!(summary["applied"], 1, "envelope={v}");
+    for key in [
+        "discovered",
+        "downloaded",
+        "updated",
+        "skipped",
+        "failed",
+        "removed",
+        "verified",
+    ] {
+        assert_eq!(summary[key], 0, "summary.{key} must be 0; envelope={v}");
+    }
+}
+
 /// Parse `stdout` as the `rollback` JSON envelope and assert the exact
 /// "nothing to roll back" success outcome (no patches were applied, so
 /// none can be reverted, but the run is clean — not a failure).
@@ -169,58 +213,130 @@ fn rollback_global_resolves_real_npm_prefix() {
 // --global-prefix explicit path — bypasses npm/yarn/pnpm resolution
 // ---------------------------------------------------------------------------
 
+/// `--global-prefix <dir>` must drive package discovery from `<dir>` itself
+/// (the npm crawler treats the prefix as the `node_modules` root). We prove
+/// the flag is *honoured* — not silently ignored in favour of the real npm
+/// global tree — with two contrasting runs that share one manifest PURL:
+///
+///   * an empty prefix yields `package_not_installed`, and
+///   * the *same* prefix with the matching package planted in it yields
+///     `applied`.
+///
+/// If `--global-prefix` were ignored, the second run could never flip to
+/// `applied` (the seeded name cannot exist in any real global tree), so the
+/// positive control is what closes the "did the flag do anything?" loophole.
+const PREFIX_PURL: &str = "pkg:npm/__explicit_prefix__@1.0.0";
+
 #[test]
 fn apply_global_prefix_uses_explicit_path() {
     let tmp = tempfile::tempdir().unwrap();
     let global_dir = tmp.path().join("global");
-    std::fs::create_dir_all(global_dir.join("node_modules")).unwrap();
-    write_manifest(tmp.path(), "pkg:npm/__explicit_prefix__@1.0.0");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    write_manifest(tmp.path(), PREFIX_PURL);
 
-    let out = Command::new(binary())
-        .args([
-            "apply",
-            "--global",
-            "--global-prefix",
-            global_dir.to_str().unwrap(),
-            "--offline",
-            "--json",
-            "--silent",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let run = |cwd: &Path| {
+        let out = Command::new(binary())
+            .args([
+                "apply",
+                "--global",
+                "--global-prefix",
+                global_dir.to_str().unwrap(),
+                "--offline",
+                "--json",
+                "--silent",
+            ])
+            .current_dir(cwd)
+            .env_remove("SOCKET_API_TOKEN")
+            .output()
+            .expect("run socket-patch");
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // Negative: empty prefix → nothing to patch.
+    let (code, stdout) = run(tmp.path());
     assert_eq!(code, 1, "explicit empty prefix → exit 1; stdout={stdout}");
-    assert_apply_not_installed(&stdout, "pkg:npm/__explicit_prefix__@1.0.0");
+    assert_apply_not_installed(&stdout, PREFIX_PURL);
+
+    // Positive control: plant the matching package directly under the
+    // prefix (the crawler uses the prefix as the node_modules root) and the
+    // outcome must flip to `applied`, proving the prefix path was crawled.
+    let pkg_dir = global_dir.join("__explicit_prefix__");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"__explicit_prefix__","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let (code, stdout) = run(tmp.path());
+    assert_eq!(code, 0, "seeded prefix → exit 0; stdout={stdout}");
+    assert_apply_applied(&stdout, PREFIX_PURL);
 }
 
 #[test]
 fn rollback_global_prefix_uses_explicit_path() {
     let tmp = tempfile::tempdir().unwrap();
     let global_dir = tmp.path().join("global");
-    std::fs::create_dir_all(global_dir.join("node_modules")).unwrap();
-    write_manifest(tmp.path(), "pkg:npm/__explicit_prefix__@1.0.0");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    write_manifest(tmp.path(), PREFIX_PURL);
 
-    let out = Command::new(binary())
-        .args([
-            "rollback",
-            "--global",
-            "--global-prefix",
-            global_dir.to_str().unwrap(),
-            "--offline",
-            "--json",
-            "--silent",
-        ])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
-        .output()
-        .expect("run socket-patch");
-    let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let run = || {
+        let out = Command::new(binary())
+            .args([
+                "rollback",
+                "--global",
+                "--global-prefix",
+                global_dir.to_str().unwrap(),
+                "--offline",
+                "--json",
+                "--silent",
+            ])
+            .current_dir(tmp.path())
+            .env_remove("SOCKET_API_TOKEN")
+            .output()
+            .expect("run socket-patch");
+        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // Negative: empty prefix → no package, empty results.
+    let (code, stdout) = run();
     assert_eq!(code, 0, "empty rollback → exit 0; stdout={stdout}");
     assert_rollback_noop(&stdout);
+
+    // Positive control: plant the matching package under the prefix. The
+    // rollback must now report a per-package result whose `path` lives
+    // inside the explicit prefix — proving the prefix (not the real npm
+    // global tree) drove discovery. `rolledBack` stays 0 because the patch
+    // has no files, but the presence of the result entry is the signal.
+    let pkg_dir = global_dir.join("__explicit_prefix__");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"__explicit_prefix__","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let (code, stdout) = run();
+    assert_eq!(code, 0, "seeded rollback → exit 0; stdout={stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("rollback must emit valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["failed"], 0, "envelope={v}");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert_eq!(
+        results.len(),
+        1,
+        "the seeded package must surface exactly one result; envelope={v}"
+    );
+    let r = &results[0];
+    assert_eq!(r["purl"], PREFIX_PURL, "envelope={v}");
+    assert_eq!(r["success"], true, "envelope={v}");
+    let path = r["path"].as_str().expect("result must carry a path");
+    assert!(
+        Path::new(path).starts_with(&global_dir),
+        "result path must live inside the explicit prefix {}; got {path}; envelope={v}",
+        global_dir.display(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -287,15 +403,17 @@ fn write_stub(dir: &Path, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A controlled `npm root -g` stub that prints a non-empty path.
+/// A controlled `npm root -g` stub that resolves to a tree containing the
+/// matching package.
 ///
-/// The stub also `touch`es a marker file when invoked with `root -g`, and
-/// the test asserts that marker exists afterward — proving the real
-/// `get_npm_global_prefix` code path actually shelled out to npm (rather
-/// than a regression short-circuiting it). The marker is essential here
-/// because the *envelope* is identical whether or not npm is consulted
-/// (the resolved tree contains no matching package either way), so without
-/// it the test could not distinguish the real path from a stubbed-out one.
+/// This proves the *whole* global-resolution chain end-to-end, not just that
+/// npm was spawned: (1) the stub records its invocation via a marker file, so
+/// a regression that short-circuits `get_npm_global_prefix` fails the marker
+/// assert; and (2) the path the stub prints is seeded with the manifest
+/// package, so the run must flip to `applied` — which can only happen if the
+/// path npm returned was actually crawled. A regression that resolves npm but
+/// then discards its output would still spawn npm (marker present) yet never
+/// find the package (no `applied`), and this test would catch it.
 #[cfg(unix)]
 #[test]
 fn apply_global_with_stub_npm_root_resolves_path() {
@@ -303,7 +421,15 @@ fn apply_global_with_stub_npm_root_resolves_path() {
     let stub_dir = tmp.path().join("bin");
     std::fs::create_dir_all(&stub_dir).unwrap();
     let fake_global = tmp.path().join("fake-global/node_modules");
-    std::fs::create_dir_all(&fake_global).unwrap();
+    // Seed the resolved tree with the manifest package so a successful
+    // resolution-then-crawl is observable as `applied`.
+    let pkg_dir = fake_global.join("__stubbed_npm__");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"__stubbed_npm__","version":"1.0.0"}"#,
+    )
+    .unwrap();
     let marker = tmp.path().join("npm-root-g-invoked");
     // Record invocation via shell redirection (a builtin) rather than
     // `touch` so the marker is written even under restrictive sandboxes
@@ -326,8 +452,8 @@ fn apply_global_with_stub_npm_root_resolves_path() {
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 1, "stubbed npm root → exit 1; stdout={stdout}");
-    assert_apply_not_installed(&stdout, "pkg:npm/__stubbed_npm__@1.0.0");
+    assert_eq!(code, 0, "stubbed npm root resolves seeded pkg → exit 0; stdout={stdout}");
+    assert_apply_applied(&stdout, "pkg:npm/__stubbed_npm__@1.0.0");
     assert!(
         marker.exists(),
         "`npm root -g` must have been invoked — the global resolution path \

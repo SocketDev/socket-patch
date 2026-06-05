@@ -27,6 +27,33 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
 }
 
+/// Build a `Command` for the CLI with the entire `SOCKET_*` environment
+/// scrubbed from the child process.
+///
+/// Every flag these tests rely on has an env fallback: `--product`/
+/// `SOCKET_VEX_PRODUCT`, `--no-verify`/`SOCKET_VEX_NO_VERIFY`, `--doc-id`/
+/// `SOCKET_VEX_DOC_ID`, `--output`/`SOCKET_VEX_OUTPUT`, `--compact`/
+/// `SOCKET_VEX_COMPACT`, plus the `GlobalArgs` set (`SOCKET_JSON`,
+/// `SOCKET_OFFLINE`, `SOCKET_ECOSYSTEMS`, `SOCKET_GLOBAL_PREFIX`,
+/// `SOCKET_CWD`, `SOCKET_MANIFEST_PATH`, `SOCKET_API_TOKEN`, …). If the
+/// ambient environment leaks any of these into the child, a test silently
+/// stops exercising the path it names — an exported `SOCKET_VEX_NO_VERIFY`
+/// would route the verify-mode tests through the no-verify path (so the
+/// on-disk hash check is never run), and an exported `SOCKET_VEX_PRODUCT`
+/// would defeat both auto-detect tests by supplying the product the test
+/// claims the binary inferred. Removing the whole prefix from the child
+/// (the parent env is never mutated, so tests stay independent and need no
+/// serialization) makes the explicit CLI flags the sole source of truth.
+fn cli() -> Command {
+    let mut cmd = Command::new(binary());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 /// Write `manifest` to `<cwd>/.socket/manifest.json`.
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
@@ -111,7 +138,7 @@ fn no_verify_emits_valid_openvex() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -196,7 +223,7 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -226,7 +253,7 @@ fn empty_manifest_exits_non_zero_with_no_doc() {
     let cwd = tmp.path();
     write_manifest(cwd, &PatchManifest::new());
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -262,7 +289,7 @@ fn empty_manifest_exits_non_zero_with_no_doc() {
 #[test]
 fn missing_manifest_exits_non_zero() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -291,7 +318,7 @@ fn json_envelope_requires_output() {
     let tmp = tempfile::tempdir().unwrap();
     write_manifest(tmp.path(), &PatchManifest::new());
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -330,7 +357,7 @@ fn json_envelope_with_output_emits_both() {
     write_manifest(cwd, &manifest);
     let vex_path = cwd.join("out.vex.json");
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -394,7 +421,7 @@ fn auto_detect_prefers_git_remote_over_package_json() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
         .output()
         .expect("invoke vex");
@@ -434,7 +461,7 @@ fn auto_detect_uses_package_json() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -542,7 +569,7 @@ fn verify_mode_includes_applied_omits_unapplied() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -625,7 +652,7 @@ fn verify_mode_all_failed_exits_non_zero() {
 
     // No node_modules, no package directory — ecosystem dispatch returns
     // empty map, every patch lands in `failed` → no statements → exit 1.
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",
@@ -701,7 +728,7 @@ fn verify_mode_resolves_qualified_pypi_purl() {
     );
     write_manifest(cwd, &manifest);
 
-    let out = Command::new(binary())
+    let out = cli()
         .args([
             "vex",
             "--cwd",

@@ -104,13 +104,122 @@ fn parse_get(extra: &[&str]) -> GetArgs {
     }
 }
 
-/// The default `GetArgs` produced by the bare `get <id>` invocation, used as
-/// an independent oracle: flag tests assert that flipping one flag changes
-/// *only* that field and leaves every other field at its default. This keeps
-/// a regression that flips an unrelated flag as a side effect from sneaking
-/// past a single-field assertion.
-fn baseline() -> GetArgs {
-    parse_get(&["some-id"])
+/// Owned, comparable snapshot of *every* parsed field in `GetArgs` — its own
+/// flags plus every field of the flattened `GlobalArgs`. `GetArgs` itself does
+/// not derive `PartialEq` (it's production code we may not touch), so this
+/// mirror exists purely so a single `assert_eq!` can police the entire parsed
+/// surface at once.
+///
+/// This is what makes the per-flag tests honest. A field-at-a-time assertion
+/// (`assert!(a.package)`) only proves the flag set *its* field; it says nothing
+/// about whether the same flag also flipped an unrelated one. A clap-derive
+/// copy/paste regression (e.g. `--package` accidentally wired to `one_off`)
+/// would set both and still pass a single-field check. Comparing the whole
+/// snapshot against the independently-declared defaults — with only the field
+/// under test mutated — fails loudly the instant any other field moves.
+#[derive(Debug, Clone, PartialEq)]
+struct Snap {
+    identifier: String,
+    cwd: PathBuf,
+    manifest_path: String,
+    api_url: String,
+    api_token: Option<String>,
+    org: Option<String>,
+    proxy_url: String,
+    ecosystems: Option<Vec<String>>,
+    download_mode: String,
+    offline: bool,
+    global: bool,
+    global_prefix: Option<PathBuf>,
+    json: bool,
+    verbose: bool,
+    silent: bool,
+    dry_run: bool,
+    yes: bool,
+    lock_timeout: Option<u64>,
+    break_lock: bool,
+    debug: bool,
+    no_telemetry: bool,
+    id: bool,
+    cve: bool,
+    ghsa: bool,
+    package: bool,
+    save_only: bool,
+    one_off: bool,
+    all_releases: bool,
+}
+
+fn snapshot(a: &GetArgs) -> Snap {
+    Snap {
+        identifier: a.identifier.clone(),
+        cwd: a.common.cwd.clone(),
+        manifest_path: a.common.manifest_path.clone(),
+        api_url: a.common.api_url.clone(),
+        api_token: a.common.api_token.clone(),
+        org: a.common.org.clone(),
+        proxy_url: a.common.proxy_url.clone(),
+        ecosystems: a.common.ecosystems.clone(),
+        download_mode: a.common.download_mode.clone(),
+        offline: a.common.offline,
+        global: a.common.global,
+        global_prefix: a.common.global_prefix.clone(),
+        json: a.common.json,
+        verbose: a.common.verbose,
+        silent: a.common.silent,
+        dry_run: a.common.dry_run,
+        yes: a.common.yes,
+        lock_timeout: a.common.lock_timeout,
+        break_lock: a.common.break_lock,
+        debug: a.common.debug,
+        no_telemetry: a.common.no_telemetry,
+        id: a.id,
+        cve: a.cve,
+        ghsa: a.ghsa,
+        package: a.package,
+        save_only: a.save_only,
+        one_off: a.one_off,
+        all_releases: a.all_releases,
+    }
+}
+
+/// Independent oracle: the snapshot a correct parse of `get <identifier>` (with
+/// no other flags) must produce. The values are transcribed by hand from the
+/// `default_value`/`default_value_t` declarations on `GetArgs`/`GlobalArgs` and
+/// the `DEFAULT_*` constants in `socket-patch-core` — NOT read back from a live
+/// parse — so this can actually disagree with the implementation if a default
+/// regresses. Every per-flag test starts from this and mutates exactly the one
+/// field the flag is supposed to touch.
+fn expected_defaults(identifier: &str) -> Snap {
+    Snap {
+        identifier: identifier.to_string(),
+        cwd: PathBuf::from("."),
+        manifest_path: ".socket/manifest.json".to_string(),
+        api_url: "https://api.socket.dev".to_string(),
+        api_token: None,
+        org: None,
+        proxy_url: "https://patches-api.socket.dev".to_string(),
+        ecosystems: None,
+        download_mode: "diff".to_string(),
+        offline: false,
+        global: false,
+        global_prefix: None,
+        json: false,
+        verbose: false,
+        silent: false,
+        dry_run: false,
+        yes: false,
+        lock_timeout: None,
+        break_lock: false,
+        debug: false,
+        no_telemetry: false,
+        id: false,
+        cve: false,
+        ghsa: false,
+        package: false,
+        save_only: false,
+        one_off: false,
+        all_releases: false,
+    }
 }
 
 // --- Defaults ----------------------------------------------------------------
@@ -119,43 +228,30 @@ fn baseline() -> GetArgs {
 #[serial_test::serial]
 fn defaults_with_only_required_identifier() {
     let a = parse_get(&["some-id"]);
-    assert_eq!(a.identifier, "some-id");
-    assert_eq!(a.common.org, None);
-    assert_eq!(a.common.cwd, PathBuf::from("."));
-    assert!(!a.id);
-    assert!(!a.cve);
-    assert!(!a.ghsa);
-    assert!(!a.package);
-    assert!(!a.common.yes);
-    assert_eq!(a.common.api_url, "https://api.socket.dev");
-    assert_eq!(a.common.api_token, None);
-    assert!(!a.save_only);
-    assert!(!a.common.global);
-    assert_eq!(a.common.global_prefix, None);
-    assert!(!a.one_off);
-    assert!(!a.common.json);
-    assert_eq!(a.common.download_mode, "diff");
-    assert!(
-        !a.all_releases,
-        "--all-releases default is false (narrow — installed-dist variant only)"
-    );
+    // Pin the *entire* default surface in one shot against the independent
+    // oracle. This covers fields the old test silently skipped (manifest_path,
+    // proxy_url, offline, verbose, silent, dry_run, lock_timeout, break_lock,
+    // debug, no_telemetry, ecosystems) — any of which could regress to a
+    // non-default and go unnoticed under a field-cherry-picked assertion.
+    assert_eq!(snapshot(&a), expected_defaults("some-id"));
 }
 
 #[test]
 #[serial_test::serial]
 fn all_releases_flag_sets_all_releases() {
     let a = parse_get(&["some-id", "--all-releases"]);
-    assert!(a.all_releases);
-    // Guard against the env masking the flag: a bare baseline must be false,
-    // so the `true` above is attributable to the flag, not ambient state.
-    assert!(!baseline().all_releases);
+    let mut want = expected_defaults("some-id");
+    want.all_releases = true;
+    // Full-snapshot equality: proves the flag set `all_releases` AND left every
+    // other field at its default (env scrubbed, so the `true` is the flag's).
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn default_download_mode_is_diff() {
     let a = parse_get(&["some-id"]);
-    assert_eq!(a.common.download_mode, "diff");
+    assert_eq!(snapshot(&a), expected_defaults("some-id"));
 }
 
 // --- Positional --------------------------------------------------------------
@@ -164,7 +260,8 @@ fn default_download_mode_is_diff() {
 #[serial_test::serial]
 fn positional_identifier_stored() {
     let a = parse_get(&["pkg:npm/foo@1.0"]);
-    assert_eq!(a.identifier, "pkg:npm/foo@1.0");
+    // The positional lands in `identifier` and nothing else shifts.
+    assert_eq!(snapshot(&a), expected_defaults("pkg:npm/foo@1.0"));
 }
 
 // --- Short flags -------------------------------------------------------------
@@ -173,47 +270,54 @@ fn positional_identifier_stored() {
 #[serial_test::serial]
 fn short_p_sets_package() {
     let a = parse_get(&["some-id", "-p"]);
-    assert!(a.package);
-    // `package` has no env source, but assert the default is false so the
-    // short flag is the only thing that could have set it.
-    assert!(!baseline().package);
+    let mut want = expected_defaults("some-id");
+    want.package = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn long_package_sets_package() {
     let a = parse_get(&["some-id", "--package"]);
-    assert!(a.package);
+    let mut want = expected_defaults("some-id");
+    want.package = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn short_y_sets_yes() {
     let a = parse_get(&["some-id", "-y"]);
-    assert!(a.common.yes);
-    assert!(!baseline().common.yes);
+    let mut want = expected_defaults("some-id");
+    want.yes = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn long_yes_sets_yes() {
     let a = parse_get(&["some-id", "--yes"]);
-    assert!(a.common.yes);
+    let mut want = expected_defaults("some-id");
+    want.yes = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn short_g_sets_global() {
     let a = parse_get(&["some-id", "-g"]);
-    assert!(a.common.global);
-    assert!(!baseline().common.global);
+    let mut want = expected_defaults("some-id");
+    want.global = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn long_global_sets_global() {
     let a = parse_get(&["some-id", "--global"]);
-    assert!(a.common.global);
+    let mut want = expected_defaults("some-id");
+    want.global = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 // --- Long-only flags ---------------------------------------------------------
@@ -222,84 +326,94 @@ fn long_global_sets_global() {
 #[serial_test::serial]
 fn cwd_flag_sets_cwd() {
     let a = parse_get(&["some-id", "--cwd", "/tmp/project"]);
-    assert_eq!(a.common.cwd, PathBuf::from("/tmp/project"));
-    // The default differs from the value under test, so a parse that ignored
-    // the flag would leave `.` and fail here.
-    assert_eq!(baseline().common.cwd, PathBuf::from("."));
+    let mut want = expected_defaults("some-id");
+    want.cwd = PathBuf::from("/tmp/project");
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn org_flag_sets_org() {
     let a = parse_get(&["some-id", "--org", "acme"]);
-    assert_eq!(a.common.org.as_deref(), Some("acme"));
-    assert_eq!(baseline().common.org, None);
+    let mut want = expected_defaults("some-id");
+    want.org = Some("acme".to_string());
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn id_flag_sets_id() {
     let a = parse_get(&["some-id", "--id"]);
-    assert!(a.id);
-    assert!(!baseline().id);
+    let mut want = expected_defaults("some-id");
+    want.id = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn cve_flag_sets_cve() {
     let a = parse_get(&["some-id", "--cve"]);
-    assert!(a.cve);
-    assert!(!baseline().cve);
+    let mut want = expected_defaults("some-id");
+    want.cve = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn ghsa_flag_sets_ghsa() {
     let a = parse_get(&["some-id", "--ghsa"]);
-    assert!(a.ghsa);
-    assert!(!baseline().ghsa);
+    let mut want = expected_defaults("some-id");
+    want.ghsa = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn api_url_flag_sets_api_url() {
     let a = parse_get(&["some-id", "--api-url", "https://api.example.com"]);
-    assert_eq!(a.common.api_url, "https://api.example.com");
-    // Default is the production URL — distinct from the value under test, so
-    // an ignored flag would fail rather than coincidentally match.
-    assert_eq!(baseline().common.api_url, "https://api.socket.dev");
+    let mut want = expected_defaults("some-id");
+    want.api_url = "https://api.example.com".to_string();
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn api_token_flag_sets_api_token() {
     let a = parse_get(&["some-id", "--api-token", "sktsec_abc"]);
-    assert_eq!(a.common.api_token.as_deref(), Some("sktsec_abc"));
-    assert_eq!(baseline().common.api_token, None);
+    let mut want = expected_defaults("some-id");
+    want.api_token = Some("sktsec_abc".to_string());
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn global_prefix_flag_sets_global_prefix() {
     let a = parse_get(&["some-id", "--global-prefix", "/usr/local/lib"]);
-    assert_eq!(a.common.global_prefix, Some(PathBuf::from("/usr/local/lib")));
-    assert_eq!(baseline().common.global_prefix, None);
+    let mut want = expected_defaults("some-id");
+    want.global_prefix = Some(PathBuf::from("/usr/local/lib"));
+    // `--global-prefix` must NOT imply `--global`; full-snapshot equality keeps
+    // `global` pinned at its default.
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn one_off_flag_sets_one_off() {
     let a = parse_get(&["some-id", "--one-off"]);
-    assert!(a.one_off);
-    assert!(!baseline().one_off);
+    let mut want = expected_defaults("some-id");
+    want.one_off = true;
+    // `--one-off` and `--save-only` are semantic opposites; this guards that
+    // setting one does not also flip the other.
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn json_flag_sets_json() {
     let a = parse_get(&["some-id", "--json"]);
-    assert!(a.common.json);
-    assert!(!baseline().common.json);
+    let mut want = expected_defaults("some-id");
+    want.json = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 // --- save-only / --no-apply alias -------------------------------------------
@@ -308,9 +422,9 @@ fn json_flag_sets_json() {
 #[serial_test::serial]
 fn save_only_flag_sets_save_only() {
     let a = parse_get(&["some-id", "--save-only"]);
-    assert!(a.save_only);
-    // Default is false (env scrubbed), so `--save-only` is what set it.
-    assert!(!baseline().save_only);
+    let mut want = expected_defaults("some-id");
+    want.save_only = true;
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
@@ -321,12 +435,14 @@ fn no_apply_hidden_alias_sets_save_only() {
     // CLI contract. With the env scrubbed, this can only pass if the alias is
     // actually wired to `save_only` (not because SOCKET_SAVE_ONLY was set).
     let a = parse_get(&["some-id", "--no-apply"]);
-    assert!(a.save_only);
-    // The alias must be exactly equivalent to `--save-only`: it sets
-    // save_only and nothing else relative to the baseline.
+    let mut want = expected_defaults("some-id");
+    want.save_only = true;
+    // The alias must set `save_only` and nothing else.
+    assert_eq!(snapshot(&a), want);
+    // ...and must be byte-for-byte equivalent to the canonical `--save-only`
+    // across the *entire* parsed surface, not just the `save_only` field.
     let direct = parse_get(&["some-id", "--save-only"]);
-    assert_eq!(a.save_only, direct.save_only);
-    assert!(!a.one_off, "--no-apply must not also flip --one-off");
+    assert_eq!(snapshot(&a), snapshot(&direct));
 }
 
 // --- download-mode -----------------------------------------------------------
@@ -335,21 +451,26 @@ fn no_apply_hidden_alias_sets_save_only() {
 #[serial_test::serial]
 fn download_mode_package() {
     let a = parse_get(&["some-id", "--download-mode", "package"]);
-    assert_eq!(a.common.download_mode, "package");
+    let mut want = expected_defaults("some-id");
+    want.download_mode = "package".to_string();
+    assert_eq!(snapshot(&a), want);
 }
 
 #[test]
 #[serial_test::serial]
 fn download_mode_diff() {
     let a = parse_get(&["some-id", "--download-mode", "diff"]);
-    assert_eq!(a.common.download_mode, "diff");
+    // Explicitly passing the default value must still parse to exactly defaults.
+    assert_eq!(snapshot(&a), expected_defaults("some-id"));
 }
 
 #[test]
 #[serial_test::serial]
 fn download_mode_file() {
     let a = parse_get(&["some-id", "--download-mode", "file"]);
-    assert_eq!(a.common.download_mode, "file");
+    let mut want = expected_defaults("some-id");
+    want.download_mode = "file".to_string();
+    assert_eq!(snapshot(&a), want);
 }
 
 // --- `download` visible alias for `get` -------------------------------------
@@ -361,14 +482,10 @@ fn download_visible_alias_routes_to_get() {
     let cli = Cli::try_parse_from(["socket-patch", "download", "some-id"]).expect("parse");
     match cli.command {
         Commands::Get(a) => {
-            assert_eq!(a.identifier, "some-id");
-            // The alias must produce the same defaults as `get`, not some
+            // The alias must produce a `GetArgs` identical, across the entire
+            // parsed surface, to what bare `get some-id` produces — not some
             // divergently-parsed command that merely happens to be `Get`.
-            assert!(!a.save_only);
-            assert!(!a.one_off);
-            assert!(!a.all_releases);
-            assert_eq!(a.common.download_mode, "diff");
-            assert_eq!(a.common.cwd, PathBuf::from("."));
+            assert_eq!(snapshot(&a), expected_defaults("some-id"));
         }
         _ => panic!("expected Get from `download` alias"),
     }

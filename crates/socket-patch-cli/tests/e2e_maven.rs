@@ -130,9 +130,12 @@ fn scan_discovers_maven_artifacts() {
         combined.contains("Found 2 packages"),
         "expected exactly 2 discovered packages, got:\n{combined}"
     );
+    // Anchor the full parenthesized breakdown: `(2 maven)` forces Maven to
+    // be the *sole* ecosystem with exactly 2 artifacts. A loose `2 maven`
+    // substring would also match `12 maven` or `(2 maven, 1 npm)`.
     assert!(
-        combined.contains("2 maven"),
-        "expected the 2 artifacts to be attributed to the Maven ecosystem, got:\n{combined}"
+        combined.contains("(2 maven)"),
+        "expected all 2 artifacts attributed solely to the Maven ecosystem, got:\n{combined}"
     );
 
     // --- JSON run: locks the stable `scannedPackages` contract field -----
@@ -143,9 +146,13 @@ fn scan_discovers_maven_artifacts() {
     );
     let json = String::from_utf8_lossy(&json_out.stdout);
     assert!(json_out.status.success(), "scan --json should exit 0:\n{json}");
+    // Anchor on the trailing comma so this matches *exactly* 2, not any
+    // number that merely starts with "2" (20, 25, 200, ...). Without the
+    // comma, `contains("scannedPackages\": 2")` is satisfied by an
+    // over-counting crawler reporting e.g. 25, masking a discovery bug.
     assert!(
-        json.contains("\"scannedPackages\": 2"),
-        "expected scannedPackages == 2 in JSON output, got:\n{json}"
+        json.contains("\"scannedPackages\": 2,"),
+        "expected scannedPackages == exactly 2 in JSON output, got:\n{json}"
     );
     assert!(
         json.contains("\"status\": \"success\""),
@@ -207,12 +214,15 @@ fn scan_discovers_gradle_project_artifacts() {
         "scan --json should exit 0; got {:?}\n{stdout}{stderr}"
         , output.status.code()
     );
+    // Anchor on the trailing comma: a bare `contains("scannedPackages\": 1")`
+    // is also satisfied by 10..=19, 100, etc., so an over-counting crawler
+    // would pass while claiming to find "1". The comma pins it to exactly 1.
     assert!(
-        stdout.contains("\"scannedPackages\": 1"),
+        stdout.contains("\"scannedPackages\": 1,"),
         "expected exactly 1 artifact discovered via the build.gradle marker, got:\n{stdout}"
     );
     assert!(
-        !stdout.contains("\"scannedPackages\": 0"),
+        !stdout.contains("\"scannedPackages\": 0,"),
         "scannedPackages was 0 — the Gradle project marker did not activate Maven discovery:\n{stdout}"
     );
     assert!(
@@ -234,7 +244,7 @@ fn scan_discovers_gradle_project_artifacts() {
         String::from_utf8_lossy(&human.stderr)
     );
     assert!(
-        h_combined.contains("Found 1 packages") && h_combined.contains("1 maven"),
-        "expected the Gradle project to discover 1 Maven artifact, got:\n{h_combined}"
+        h_combined.contains("Found 1 packages") && h_combined.contains("(1 maven)"),
+        "expected the Gradle project to discover exactly 1 Maven artifact, got:\n{h_combined}"
     );
 }

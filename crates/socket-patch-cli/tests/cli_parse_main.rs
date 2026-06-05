@@ -8,11 +8,18 @@
 //! Each subcommand name and alias here is part of the CLI contract
 //! defined in `crates/socket-patch-cli/CLI_CONTRACT.md`.
 
-use clap::Parser;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::{parse_with_uuid_fallback, Cli, Commands};
 
+/// Parse through the **production** entry point. `main.rs` does not call
+/// `Cli::try_parse_from` directly — it calls `parse_with_uuid_fallback`, which
+/// wraps clap with the bare-`<UUID>` → `get <UUID>` rewrite. Driving these
+/// tests through the raw clap parser would leave that wrapper entirely
+/// uncovered: a regression that swallows clap errors, mis-routes argv, or
+/// drops the rewrite would keep every test in this file green while breaking
+/// the real CLI. Routing through the wrapper means each name/alias/error-kind
+/// assertion below also exercises the code path users actually hit.
 fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
-    Cli::try_parse_from(argv)
+    parse_with_uuid_fallback(argv.iter().map(|s| s.to_string()).collect())
 }
 
 /// Pull the error out of a parse result. `Cli` doesn't derive `Debug`,
@@ -63,6 +70,36 @@ fn version_flag_triggers_display_version() {
 fn help_flag_triggers_display_help() {
     let err = expect_err(parse(&["socket-patch", "--help"]));
     assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+
+    // The kind alone is vacuous — a help screen that silently dropped whole
+    // commands would still be `DisplayHelp`. Every contract subcommand must be
+    // listed in the rendered help.
+    let help = err.to_string();
+    for name in [
+        "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair", "unlock", "vex",
+    ] {
+        assert!(
+            help.contains(name),
+            "--help must list the `{name}` subcommand; got:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn bare_uuid_is_rewritten_to_get_by_production_wrapper() {
+    // Locks the production wrapper into this file's parse path: `parse()` only
+    // exercises the real entry point if the bare-`<UUID>` → `get <UUID>`
+    // rewrite actually runs. If the wrapper ever regressed to a plain
+    // `Cli::try_parse_from` pass-through, a bare UUID would be rejected as an
+    // unknown subcommand and this would fail — turning every other test here
+    // back into a raw-clap test silently. (The shape predicate itself is
+    // covered exhaustively in `src/lib.rs::tests`.)
+    let uuid = "80630680-4da6-45f9-bba8-b888e0ffd58c";
+    let cli = parse(&["socket-patch", uuid]).expect("bare UUID must rewrite to `get`");
+    match cli.command {
+        Commands::Get(args) => assert_eq!(args.identifier, uuid),
+        _ => panic!("expected Commands::Get via bare-UUID fallback"),
+    }
 }
 
 #[test]

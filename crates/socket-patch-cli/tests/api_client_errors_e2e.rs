@@ -73,6 +73,26 @@ fn assert_error_envelope(v: &serde_json::Value, needle: &str) {
     );
 }
 
+/// Assert the mock actually received a request whose path contains `needle`.
+/// This proves the CLI exercised the *real* network path under test rather
+/// than short-circuiting (e.g. erroring out before the HTTP call, or hitting
+/// a different/cached code path) and incidentally producing the right
+/// envelope. Without this, an error/not_found envelope alone cannot
+/// distinguish "the API was called and failed as mocked" from "the call
+/// never happened".
+async fn assert_path_hit(mock: &MockServer, needle: &str) {
+    let reqs = mock
+        .received_requests()
+        .await
+        .expect("wiremock must record received requests");
+    let paths: Vec<String> = reqs.iter().map(|r| r.url.path().to_string()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains(needle)),
+        "expected the real endpoint containing {needle:?} to be queried; \
+         recorded request paths = {paths:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 401 / 403 / 404 / 5xx error handling — every command that hits the API
 // ---------------------------------------------------------------------------
@@ -129,6 +149,38 @@ async fn get_uuid_with_401_falls_back_to_proxy() {
         stderr.contains("falling back to public patch API proxy"),
         "401 must trigger the documented proxy fallback; stderr={stderr}"
     );
+    // ...but the stderr log line is only an *incidental* signal: a regression
+    // could emit it without actually querying the proxy, or query the proxy
+    // without logging. Pin the behavior at the network layer — the auth
+    // endpoint must have been tried (and returned 401) AND the proxy endpoint
+    // must have actually been queried as a consequence.
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")).await;
+    assert_path_hit(&mock, &format!("/patch/view/{UUID}")).await;
+    // ...and crucially the proxy must be queried *after* the authenticated
+    // endpoint returned 401 — that ordering is what makes this a fallback and
+    // not two independent requests. A regression that queries the proxy
+    // unconditionally (without first trying — and failing — auth) would pass
+    // the two membership checks above but violate this ordering.
+    {
+        let reqs = mock
+            .received_requests()
+            .await
+            .expect("wiremock must record received requests");
+        let paths: Vec<String> = reqs.iter().map(|r| r.url.path().to_string()).collect();
+        let auth_idx = paths
+            .iter()
+            .position(|p| p.contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")))
+            .expect("auth endpoint must have been queried");
+        let proxy_idx = paths
+            .iter()
+            .position(|p| p.contains(&format!("/patch/view/{UUID}")))
+            .expect("proxy endpoint must have been queried");
+        assert!(
+            auth_idx < proxy_idx,
+            "the proxy must be queried only after the auth 401; \
+             recorded request paths = {paths:?}"
+        );
+    }
     // Proxy returned 404 → graceful "not found", exit 0.
     assert_eq!(code, 0, "graceful fallback must exit 0; stderr={stderr}");
     let v = json_stdout(&out);
@@ -169,6 +221,7 @@ async fn get_uuid_with_500_reports_error() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")).await;
     assert_eq!(code, 1, "500 must surface as a non-zero failure");
     let v = json_stdout(&out);
     assert_error_envelope(&v, "500");
@@ -208,6 +261,7 @@ async fn get_uuid_with_malformed_json_reports_parse_error() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID}")).await;
     assert_eq!(code, 1, "malformed JSON must surface as a non-zero failure");
     let v = json_stdout(&out);
     assert_error_envelope(&v, "parse");
@@ -246,6 +300,10 @@ async fn scan_with_400_bad_request_reports_failure() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
+    // Prove the batch endpoint was genuinely reached and returned the 400 —
+    // otherwise a regression that simply discovers zero packages (and never
+    // calls the API) could also avoid "success" for the wrong reason.
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/batch")).await;
     let v = json_stdout(&out);
     // KNOWN PRODUCTION BUG (left red intentionally — see file summary):
     // `scan` currently emits `status:"success"`/exit 0 even when every
@@ -364,6 +422,7 @@ async fn get_by_cve_with_500_reports_error() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/by-cve/{cve}")).await;
     assert_eq!(code, 1, "CVE 500 must surface as non-zero");
     let v = json_stdout(&out);
     assert_error_envelope(&v, "500");
@@ -400,6 +459,7 @@ async fn get_by_ghsa_with_404_reports_not_found() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/by-ghsa/{ghsa}")).await;
     assert_eq!(code, 0, "GHSA 404 is a graceful not-found, exit 0");
     let v = json_stdout(&out);
     assert_eq!(
@@ -467,6 +527,10 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // Prove the blob download was actually attempted against the mock (and
+    // returned 404) — the failure must come from the real fetch path, not
+    // from repair bailing out before it ever tried to download.
+    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}")).await;
     assert_eq!(
         code, 1,
         "repair must exit non-zero when an artifact download fails so CI guarding on \
@@ -483,6 +547,20 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
         summary_failed,
         Some(1),
         "repair summary must record exactly the one failed download; got: {v}"
+    );
+    // The 404'd blob must NOT also be counted as a success anywhere in the
+    // summary. A regression that records the artifact as both `failed` and
+    // `downloaded`/`applied` would still satisfy the `failed==1` check above,
+    // so pin the success counters to zero to catch double-counting.
+    assert_eq!(
+        v["summary"]["downloaded"].as_u64(),
+        Some(0),
+        "a 404'd blob must not be counted as downloaded; got: {v}"
+    );
+    assert_eq!(
+        v["summary"]["applied"].as_u64(),
+        Some(0),
+        "a failed download must not be counted as applied; got: {v}"
     );
     let has_failed_event = v
         .get("events")

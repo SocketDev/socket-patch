@@ -209,13 +209,23 @@ async fn gem_install_scan_sync_patches_real_file() {
     let code = scan_run(args).await;
     assert_eq!(code, 0, "scan --sync should succeed when the patch applies cleanly");
 
-    // The apply must have driven the REAL code path: the patch blob is only
-    // available from the view endpoint, so it must have been fetched. This
-    // guards against a short-circuit that "passes" without touching the file.
+    // The apply must have driven the REAL code path end to end:
+    //   crawler discovers the gem -> POSTs its purl to /batch -> fetches the
+    //   blob from /view/{UUID} -> writes it. Assert every link so the apply
+    //   cannot "pass" via an incidental fetch or a short-circuit.
     let requests = server
         .received_requests()
         .await
         .expect("mock server recorded requests");
+    let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
+    let batch_path = format!("/v0/orgs/{ORG}/patches/batch");
+    let discovered = requests.iter().any(|r| {
+        r.url.path() == batch_path && String::from_utf8_lossy(&r.body).contains(purl.as_str())
+    });
+    assert!(
+        discovered,
+        "crawler did not discover the installed gem: no batch request carried {purl}"
+    );
     let view_path = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
     let view_hits = requests
         .iter()
@@ -252,7 +262,10 @@ async fn gem_crawler_finds_real_installed_gem() {
         return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _ = install_colorize(tmp.path());
+    let lib_file = install_colorize(tmp.path());
+    // A scan WITHOUT --sync is read-only; capture the installed file so we can
+    // prove it is left byte-for-byte untouched after discovery.
+    let before_scan = std::fs::read(&lib_file).expect("read colorize.rb before scan");
 
     let server = MockServer::start().await;
     let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
@@ -312,5 +325,15 @@ async fn gem_crawler_finds_real_installed_gem() {
     assert!(
         discovered,
         "crawler did not discover the installed gem: no batch request carried {purl}"
+    );
+
+    // A discovery-only scan (no --sync, no --apply) must not mutate any
+    // installed file. This catches a regression where scan silently writes
+    // patches behind the user's back during a read-only pass.
+    let after_scan = std::fs::read(&lib_file).expect("read colorize.rb after scan");
+    assert_eq!(
+        after_scan, before_scan,
+        "read-only scan mutated the installed gem file at {}",
+        lib_file.display()
     );
 }

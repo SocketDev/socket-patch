@@ -62,18 +62,58 @@ mod host_guard {
 
     const USER_BUILD_RS: &str = "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n";
 
+    /// Every `SOCKET_*` env var clap consults for the surface this test drives.
+    /// They are stripped from the child so the run reflects ONLY the explicit
+    /// flags (`--cwd`, `--yes`, `--check`, `--remove`). Without this, an ambient
+    /// `SOCKET_CWD` / `SOCKET_YES` / `SOCKET_OFFLINE` in the shell or CI could
+    /// satisfy an assertion via the environment rather than the flag under test
+    /// — masking a regression in flag wiring. (Mirrors the scrub used by the
+    /// `cli_parse_*` suites.)
+    const SOCKET_ENV_VARS: &[&str] = &[
+        "SOCKET_CWD",
+        "SOCKET_MANIFEST_PATH",
+        "SOCKET_API_URL",
+        "SOCKET_API_TOKEN",
+        "SOCKET_ORG_SLUG",
+        "SOCKET_PROXY_URL",
+        "SOCKET_ECOSYSTEMS",
+        "SOCKET_DOWNLOAD_MODE",
+        "SOCKET_OFFLINE",
+        "SOCKET_GLOBAL",
+        "SOCKET_GLOBAL_PREFIX",
+        "SOCKET_JSON",
+        "SOCKET_VERBOSE",
+        "SOCKET_SILENT",
+        "SOCKET_DRY_RUN",
+        "SOCKET_YES",
+        "SOCKET_LOCK_TIMEOUT",
+        "SOCKET_BREAK_LOCK",
+        "SOCKET_DEBUG",
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_SAVE_ONLY",
+        "SOCKET_ONE_OFF",
+        "SOCKET_ALL_RELEASES",
+        // cargo redirect-backend specific knobs.
+        "SOCKET_PATCH_ROOT",
+        "SOCKET_PATCH_GUARD",
+    ];
+
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
     fn binary() -> std::path::PathBuf {
         env!("CARGO_BIN_EXE_socket-patch").into()
     }
 
     /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
-    /// `SOCKET_API_TOKEN` is stripped so nothing reaches authed endpoints.
+    /// The entire `SOCKET_*` surface is stripped so behaviour reflects the
+    /// explicit flags alone (see [`SOCKET_ENV_VARS`]) — nothing reaches authed
+    /// endpoints and no ambient var can stand in for a flag.
     fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(binary())
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("SOCKET_API_TOKEN")
+        let mut cmd = Command::new(binary());
+        cmd.args(args).current_dir(cwd);
+        for var in SOCKET_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd
             .output()
             .expect("failed to execute socket-patch binary");
         (
@@ -159,6 +199,21 @@ mod host_guard {
         let root = tmp.path();
         stage_single_crate(root);
         let root_s = root.to_str().unwrap();
+
+        // ── pristine precondition ──────────────────────────────────────────
+        // Pin the BEFORE state so the post-setup assertions genuinely prove
+        // that `setup` *created* the redirect config — not that a leftover
+        // fixture happened to already contain it.
+        let pristine_toml = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            toml_value_in_section(&pristine_toml, "dependencies", "socket-patch-guard").is_none()
+                && !pristine_toml.contains("socket-patch-guard"),
+            "fixture must start WITHOUT the guard dep:\n{pristine_toml}"
+        );
+        assert!(
+            !root.join(".cargo/config.toml").exists(),
+            ".cargo/config.toml must not exist before setup"
+        );
 
         // ── check (before setup): unconfigured → must report non-zero ──────
         // Proves `--check` reads real state instead of hardcoding success.

@@ -21,6 +21,29 @@ fn options_at(root: &Path) -> CrawlerOptions {
     }
 }
 
+/// Save/restore an env var around a test body, restoring even if the
+/// body panics mid-assert (important: these tests are `#[serial]`, so a
+/// leaked `DENO_DIR` would poison sibling tests' default-resolution).
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// Stage a JSR package: `<root>/<scope>/<name>/<version>/mod.ts`.
 async fn stage_jsr_pkg(root: &Path, scope: &str, name: &str, version: &str) -> std::path::PathBuf {
     let pkg = root.join(scope).join(name).join(version);
@@ -46,33 +69,53 @@ async fn find_by_purls_finds_jsr_package() {
     assert_eq!(result.len(), 1);
     let entry = result.get(ORG_PURL).unwrap();
     assert_eq!(entry.path, pkg);
+    // The resolved path must actually point at the staged dir on disk,
+    // not just be string-equal to an arbitrary join.
+    assert!(entry.path.is_dir(), "resolved path must be a real dir");
+    assert!(entry.path.join("mod.ts").is_file());
     assert_eq!(entry.name, "path");
     assert_eq!(entry.namespace.as_deref(), Some("@std"));
     assert_eq!(entry.version, "0.220.0");
+    assert_eq!(entry.purl, ORG_PURL);
 }
 
 #[tokio::test]
 async fn find_by_purls_no_match_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
+    // Cache is NOT empty: a *different* package is present. This proves
+    // the empty result is selectivity (no match for the queried PURL),
+    // not a "return-everything" / "return-nothing" implementation that
+    // would also pass against a bare directory.
+    stage_jsr_pkg(tmp.path(), "@std", "fs", "9.9.9").await;
+
     let crawler = DenoCrawler;
     let result = crawler
         .find_by_purls(tmp.path(), &[ORG_PURL.to_string()])
         .await
         .unwrap();
-    assert!(result.is_empty());
+    assert!(
+        result.is_empty(),
+        "querying an absent PURL must not return the unrelated staged package"
+    );
 }
 
 #[tokio::test]
 async fn find_by_purls_non_jsr_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
+    // Stage a tree that an *ecosystem-blind* parser (one that ignored
+    // the `pkg:jsr/` prefix and just split scope/name/version) would
+    // happily resolve from the npm PURL below. A correct crawler skips
+    // the PURL on the `jsr` gate and never looks here.
+    stage_jsr_pkg(tmp.path(), "@types", "node", "1.0.0").await;
+
     let crawler = DenoCrawler;
     let result = crawler
-        .find_by_purls(tmp.path(), &["pkg:npm/lodash@4.17.21".to_string()])
+        .find_by_purls(tmp.path(), &["pkg:npm/@types/node@1.0.0".to_string()])
         .await
         .unwrap();
     assert!(
         result.is_empty(),
-        "non-jsr PURLs must be ignored by DenoCrawler"
+        "non-jsr PURLs must be ignored by DenoCrawler even when a matching tree exists"
     );
 }
 
@@ -81,7 +124,7 @@ async fn find_by_purls_non_jsr_purl_skipped() {
 #[tokio::test]
 async fn crawl_all_enumerates_jsr_packages() {
     let tmp = tempfile::tempdir().unwrap();
-    stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
+    let std_path = stage_jsr_pkg(tmp.path(), "@std", "path", "0.220.0").await;
     stage_jsr_pkg(tmp.path(), "@std", "fs", "0.220.0").await;
     stage_jsr_pkg(tmp.path(), "@luca", "flag", "1.0.0").await;
 
@@ -98,6 +141,17 @@ async fn crawl_all_enumerates_jsr_packages() {
     assert!(purls.contains(&"pkg:jsr/@std/fs@0.220.0"));
     assert!(purls.contains(&"pkg:jsr/@luca/flag@1.0.0"));
     assert_eq!(result.len(), 3);
+
+    // The fully-decoded record for one package must be exact — guards a
+    // regression that strips/mangles the scope or mis-maps the path.
+    let entry = result
+        .iter()
+        .find(|p| p.purl == "pkg:jsr/@std/path@0.220.0")
+        .expect("std/path must be enumerated");
+    assert_eq!(entry.name, "path");
+    assert_eq!(entry.namespace.as_deref(), Some("@std"));
+    assert_eq!(entry.version, "0.220.0");
+    assert_eq!(entry.path, std_path);
 }
 
 #[tokio::test]
@@ -118,8 +172,18 @@ async fn crawl_all_skips_dirs_not_starting_with_at() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
+    // Exactly the one legitimate package — not the bogus `notascope/foo`.
+    assert_eq!(
+        result.len(),
+        1,
+        "only the @-prefixed scope should survive, got {:?}",
+        result.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>()
+    );
+    let only = &result[0];
+    assert_eq!(only.purl, "pkg:jsr/@std/path@0.220.0");
+    assert_eq!(only.name, "path");
+    assert_eq!(only.namespace.as_deref(), Some("@std"));
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert!(names.contains(&"path"));
     assert!(
         !names.contains(&"foo"),
         "non-`@`-prefixed dir must be skipped"
@@ -149,8 +213,7 @@ async fn get_jsr_cache_paths_global_via_deno_dir_env() {
     let jsr = tmp.path().join("npm").join("jsr.io");
     tokio::fs::create_dir_all(&jsr).await.unwrap();
 
-    let prev = std::env::var("DENO_DIR").ok();
-    std::env::set_var("DENO_DIR", tmp.path());
+    let _g = EnvGuard::set("DENO_DIR", tmp.path());
 
     let crawler = DenoCrawler;
     let opts = CrawlerOptions {
@@ -161,26 +224,56 @@ async fn get_jsr_cache_paths_global_via_deno_dir_env() {
     };
     let paths = crawler.get_jsr_cache_paths(&opts).await.unwrap();
 
-    if let Some(v) = prev {
-        std::env::set_var("DENO_DIR", v);
-    } else {
-        std::env::remove_var("DENO_DIR");
-    }
-
     assert_eq!(paths, vec![jsr]);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_jsr_cache_paths_global_deno_dir_missing_cache_returns_empty() {
+    // Global mode + DENO_DIR set, but the `npm/jsr.io` cache dir does
+    // NOT exist. The `is_dir` gate must filter it out — a regression
+    // that returns the path unconditionally would surface here.
+    let tmp = tempfile::tempdir().unwrap();
+    let _g = EnvGuard::set("DENO_DIR", tmp.path());
+
+    let crawler = DenoCrawler;
+    let opts = CrawlerOptions {
+        cwd: tmp.path().to_path_buf(),
+        global: true,
+        global_prefix: None,
+        batch_size: 100,
+    };
+    let paths = crawler.get_jsr_cache_paths(&opts).await.unwrap();
+    assert!(
+        paths.is_empty(),
+        "missing jsr.io cache dir must yield no paths, got {paths:?}"
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn get_jsr_cache_paths_local_no_marker_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
+    let deno_home = tempfile::tempdir().unwrap();
+    // Point DENO_DIR at a REAL, populated jsr cache so the only thing
+    // standing between the crawler and a non-empty result is the
+    // project-marker gate. Without this, a regression that drops the
+    // `is_deno_project` check would still return empty (because the
+    // ambient cache doesn't exist) and the test would pass vacuously.
+    let jsr = deno_home.path().join("npm").join("jsr.io");
+    tokio::fs::create_dir_all(&jsr).await.unwrap();
+    let _g = EnvGuard::set("DENO_DIR", deno_home.path());
+
     // No deno.json / .jsonc / .lock — not a Deno project.
     let crawler = DenoCrawler;
     let paths = crawler
         .get_jsr_cache_paths(&options_at(tmp.path()))
         .await
         .unwrap();
-    assert!(paths.is_empty());
+    assert!(
+        paths.is_empty(),
+        "local mode without a Deno project marker must return no paths even when the cache exists, got {paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -194,20 +287,13 @@ async fn get_jsr_cache_paths_local_with_deno_json_falls_back_to_cache() {
     let jsr = deno_home.path().join("npm").join("jsr.io");
     tokio::fs::create_dir_all(&jsr).await.unwrap();
 
-    let prev = std::env::var("DENO_DIR").ok();
-    std::env::set_var("DENO_DIR", deno_home.path());
+    let _g = EnvGuard::set("DENO_DIR", deno_home.path());
 
     let crawler = DenoCrawler;
     let paths = crawler
         .get_jsr_cache_paths(&options_at(project.path()))
         .await
         .unwrap();
-
-    if let Some(v) = prev {
-        std::env::set_var("DENO_DIR", v);
-    } else {
-        std::env::remove_var("DENO_DIR");
-    }
 
     assert_eq!(paths, vec![jsr]);
 }

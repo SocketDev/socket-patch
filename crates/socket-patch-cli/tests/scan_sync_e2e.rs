@@ -165,6 +165,13 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
     assert_eq!(apply["applied"], 1, "apply.applied; apply={apply:?}");
     assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
+    // A fresh add against an empty manifest MUST download the blob exactly once
+    // and classify it as new (not skipped/updated). Without these a regression
+    // that double-counts, re-uses a stale cache, or mislabels the action stays
+    // green on `applied == 1` alone.
+    assert_eq!(apply["downloaded"], 1, "the new patch must be downloaded; apply={apply:?}");
+    assert_eq!(apply["skipped"], 0, "nothing to skip on a fresh add; apply={apply:?}");
+    assert_eq!(apply["updated"], 0, "no manifest entry existed to update; apply={apply:?}");
     let patches = apply["patches"].as_array().expect("apply.patches array");
     assert_eq!(patches.len(), 1, "exactly one patch record; apply={apply:?}");
     assert_eq!(patches[0]["purl"], purl);
@@ -184,6 +191,18 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     assert_eq!(
         manifest["patches"][purl]["uuid"], UUID,
         "manifest must record the applied patch under its purl; manifest={manifest}"
+    );
+    // The manifest must record the independently-computed before/after hashes,
+    // not just the UUID — otherwise a manifest that drops or corrupts the file
+    // records would pass on the UUID check alone.
+    let file_entry = &manifest["patches"][purl]["files"]["package/index.js"];
+    assert_eq!(
+        file_entry["beforeHash"], before_hash,
+        "manifest must record the original-content hash; manifest={manifest}"
+    );
+    assert_eq!(
+        file_entry["afterHash"], after_hash,
+        "manifest must record the patched-content hash; manifest={manifest}"
     );
 
     // The whole point of `--sync`: the on-disk file is rewritten to the
@@ -212,6 +231,10 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     assert!(
         hit(&format!("/patches/view/{UUID}")),
         "full patch view must be fetched"
+    );
+    assert!(
+        hit(&format!("/patches/by-package/{encoded}")),
+        "per-package patch search must be queried during scan --sync"
     );
 }
 
@@ -353,6 +376,13 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     assert_eq!(apply["skipped"], 1, "patch must be skipped; apply={apply:?}");
     assert_eq!(apply["applied"], 0, "nothing applied on a skip; apply={apply:?}");
     assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
+    // The defining claim of this test ("skip the blob download / use the cached
+    // one"): a known UUID with a cached blob must NOT trigger a blob download
+    // and must NOT update the manifest. The original test asserted neither, so
+    // a regression that re-downloads/re-writes on every run stayed green on
+    // `skipped == 1` alone.
+    assert_eq!(apply["downloaded"], 0, "a cached/known patch must not be downloaded; apply={apply:?}");
+    assert_eq!(apply["updated"], 0, "a skipped patch must not update the manifest; apply={apply:?}");
     let patches = apply["patches"].as_array().expect("apply.patches array");
     assert_eq!(patches.len(), 1, "apply={apply:?}");
     assert_eq!(patches[0]["uuid"], UUID);
@@ -379,6 +409,22 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     // The pre-staged cached blob must still be present and unchanged.
     let cached = std::fs::read(blobs.join(&after_hash)).expect("cached blob must remain");
     assert_eq!(cached, after, "cached blob must be untouched");
+
+    // A skip must leave the manifest byte-identical: exactly the one pre-staged
+    // entry under its purl with the same UUID — not duplicated, replaced, or
+    // augmented with a second record.
+    let manifest_after: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
+    )
+    .expect("valid manifest JSON after skip");
+    let entries = manifest_after["patches"]
+        .as_object()
+        .expect("manifest patches object");
+    assert_eq!(entries.len(), 1, "skip must not add/duplicate manifest entries; manifest={manifest_after}");
+    assert_eq!(
+        manifest_after["patches"][purl]["uuid"], UUID,
+        "skip must preserve the original manifest UUID; manifest={manifest_after}"
+    );
 }
 
 #[tokio::test]

@@ -20,6 +20,52 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Identity fingerprint of a file that survives a byte-identical rewrite check.
+///
+/// A genuine short-circuit (`already_patched` / `already_original`) leaves the
+/// file completely untouched. The atomic-write path used by every real
+/// apply/rollback stages a temp file and `rename`s it over the target, which
+/// allocates a NEW inode. So comparing the inode before/after is a
+/// filesystem-observable proof that the short-circuit fired and the file was
+/// not silently re-written with the same bytes (a regression that exit-code +
+/// byte-equality checks alone cannot distinguish, because the staged blob
+/// equals the on-disk content in these tests).
+#[cfg(unix)]
+fn file_identity(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// Assert that no apply/rollback staging litter (`.socket-cow-*`, temp
+/// `.tmp`/`~`-style files) was left behind in a directory tree.
+fn assert_no_staging_litter(dir: &Path) {
+    for entry in walk(dir) {
+        let name = entry.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with(".socket-cow-")
+                && !name.starts_with(".socket-stage-")
+                && !name.ends_with(".socket-tmp"),
+            "unexpected staging litter left on disk: {}",
+            entry.display()
+        );
+    }
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 fn write_npm_pkg(root: &Path, name: &str, version: &str, files: &[(&str, &[u8])]) {
     let pkg = root.join("node_modules").join(name);
     std::fs::create_dir_all(&pkg).unwrap();
@@ -355,15 +401,30 @@ async fn apply_twice_second_run_is_idempotent() {
     std::fs::create_dir_all(&blobs).unwrap();
     std::fs::write(blobs.join(&after_hash), patched).unwrap();
 
+    let target = tmp.path().join("node_modules/idempotent/index.js");
     assert_eq!(apply_run(default_apply(tmp.path())).await, 0);
-    let mid = std::fs::read(tmp.path().join("node_modules/idempotent/index.js")).unwrap();
+    let mid = std::fs::read(&target).unwrap();
     assert_eq!(mid, patched);
+    #[cfg(unix)]
+    let ino_after_first = file_identity(&target);
 
     // Second run finds the file already at afterHash → marks as
-    // already_patched → exits 0 without modifying further.
+    // already_patched → exits 0 WITHOUT touching the file. Because the
+    // staged blob bytes equal the on-disk bytes, exit-0 + byte-equality
+    // cannot tell a real short-circuit apart from a regression that blindly
+    // re-writes the afterHash blob. The inode-stability check below is the
+    // discriminator: a re-write goes through the atomic rename path and
+    // allocates a fresh inode, so a lost short-circuit fails loudly here.
     assert_eq!(apply_run(default_apply(tmp.path())).await, 0);
-    let after = std::fs::read(tmp.path().join("node_modules/idempotent/index.js")).unwrap();
+    let after = std::fs::read(&target).unwrap();
     assert_eq!(after, patched, "idempotent re-apply preserves patched content");
+    #[cfg(unix)]
+    assert_eq!(
+        file_identity(&target),
+        ino_after_first,
+        "idempotent re-apply must short-circuit (already_patched), not re-write the file"
+    );
+    assert_no_staging_litter(&tmp.path().join("node_modules/idempotent"));
 }
 
 // ---------------------------------------------------------------------------
@@ -501,12 +562,24 @@ async fn rollback_already_original_short_circuits() {
         identifier: None,
         one_off: false,
     };
+    let target = tmp.path().join("node_modules/already-orig/index.js");
+    #[cfg(unix)]
+    let ino_before = file_identity(&target);
     assert_eq!(rollback_run(args).await, 0);
-    // File unchanged.
+    // File unchanged in content...
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+    // ...AND not re-written. The staged beforeHash blob is byte-identical to
+    // the on-disk content, so a regression that loses the `already_original`
+    // short-circuit and instead re-writes the blob would still leave the file
+    // == original and exit 0 — invisible to content/exit checks alone. Inode
+    // stability proves the file was genuinely left untouched.
+    #[cfg(unix)]
     assert_eq!(
-        std::fs::read(tmp.path().join("node_modules/already-orig/index.js")).unwrap(),
-        original
+        file_identity(&target),
+        ino_before,
+        "already-original rollback must short-circuit, not re-write the file"
     );
+    assert_no_staging_litter(&tmp.path().join("node_modules/already-orig"));
 }
 
 // ---------------------------------------------------------------------------

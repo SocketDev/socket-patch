@@ -11,7 +11,11 @@
 //! a `HEALED_MARKER`). No real `socket-patch` / network. The guard is a zero-dep
 //! path dependency, so `cargo build --offline` needs no downloads.
 //!
-//! `#[ignore]`d (shells out to `cargo`); `#[cfg(unix)]` for the shell stub.
+//! These shell out to a real `cargo build`, but — like the crate's other cargo
+//! shell-out tests (`e2e_cargo.rs`, `docker_e2e_cargo.rs`, `setup_matrix_cargo.rs`)
+//! — they run as part of the normal suite and self-skip via `has_command("cargo")`
+//! when the toolchain is absent, rather than being `#[ignore]`d (an `#[ignore]`d
+//! guard test protects nothing in CI). `#[cfg(unix)]` for the shell stub.
 
 #![cfg(unix)]
 
@@ -101,10 +105,17 @@ fn assert_full_args(line: &str, root: &str, check: bool) {
 }
 
 fn build(consumer: &Path, cargo_home: &Path, stub: &Path, extra_env: &[(&str, &str)]) -> Output {
+    // Neutralize the stub's control vars FIRST so an ambient `INITIAL_CHECK` /
+    // `HEAL_FAILS` in the runner's environment can't silently flip a test's
+    // expected drift/heal outcome. `cargo_run` applies vars in order and
+    // later-wins (`Command::env`), so a test's `extra_env` still overrides these
+    // safe defaults — but a leaked ambient value can no longer reach the stub.
     let mut env: Vec<(&str, &str)> = vec![
         ("CARGO_HOME", cargo_home.to_str().unwrap()),
         ("SOCKET_PATCH_ROOT", consumer.to_str().unwrap()),
         ("SOCKET_PATCH_BIN", stub.to_str().unwrap()),
+        ("INITIAL_CHECK", "0"),
+        ("HEAL_FAILS", ""),
     ];
     env.extend_from_slice(extra_env);
     cargo_run(consumer, &["build", "--offline"], &env)
@@ -113,7 +124,6 @@ fn build(consumer: &Path, cargo_home: &Path, stub: &Path, extra_env: &[(&str, &s
 /// In sync (`apply --check` exits 0) → build succeeds; the guard probed via
 /// `apply --check` and did NOT run a heal `apply`.
 #[test]
-#[ignore]
 fn guard_in_sync_proceeds_without_heal() {
     if !has_command("cargo") {
         eprintln!("SKIP: cargo not on PATH");
@@ -121,11 +131,20 @@ fn guard_in_sync_proceeds_without_heal() {
     }
     let (tmp, consumer, cargo_home, stub, sentinel, _healed) = scaffold();
     let out = build(&consumer, &cargo_home, &stub, &[("INITIAL_CHECK", "0")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "in-sync build must succeed.\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "in-sync build must succeed.\nstderr:\n{stderr}"
     );
+    // An in-sync build must emit NONE of the fail-closed diagnostics: a guard
+    // that healed/failed-then-somehow-recovered (or printed a drift warning on a
+    // clean tree) would be wrong even though the build happened to succeed.
+    for forbidden in ["regenerated", "could NOT be reconciled", "could not run `apply --check`"] {
+        assert!(
+            !stderr.contains(forbidden),
+            "in-sync build must not emit the `{forbidden}` diagnostic.\nstderr:\n{stderr}"
+        );
+    }
     // Exactly one invocation — the read-only probe — and nothing else: an
     // in-sync build must probe once and must NOT heal. Counting (not just
     // "any heal line") closes the loophole of a duplicate/extra probe slipping
@@ -146,7 +165,6 @@ fn guard_in_sync_proceeds_without_heal() {
 /// the re-check passes → the build FAILS with the "regenerated / re-run" message
 /// (the heal happened; the retry is clean). Proves fail-closed + auto-heal.
 #[test]
-#[ignore]
 fn guard_recoverable_drift_heals_then_fails_with_rebuild_message() {
     if !has_command("cargo") {
         eprintln!("SKIP: cargo not on PATH");
@@ -187,7 +205,6 @@ fn guard_recoverable_drift_heals_then_fails_with_rebuild_message() {
 /// Unrecoverable drift: the heal can't reconcile (re-check still fails) → the
 /// build FAILS with the "could NOT be reconciled" message.
 #[test]
-#[ignore]
 fn guard_unrecoverable_drift_fails_closed() {
     if !has_command("cargo") {
         eprintln!("SKIP: cargo not on PATH");
@@ -233,7 +250,6 @@ fn guard_unrecoverable_drift_fails_closed() {
 
 /// Missing CLI → the probe can't run → fail-closed (no escape hatch).
 #[test]
-#[ignore]
 fn guard_missing_cli_fails_closed() {
     if !has_command("cargo") {
         eprintln!("SKIP: cargo not on PATH");

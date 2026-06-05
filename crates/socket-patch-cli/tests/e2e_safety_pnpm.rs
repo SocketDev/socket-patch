@@ -345,8 +345,44 @@ fn pnpm_install_in_b_does_not_revert_a() {
     }
     let root = tempfile::tempdir().unwrap();
     let fx = setup_two_pnpm_projects(root.path());
-    assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
     let index_a = fx.index_js_in(&fx.proj_a);
+    let index_b = fx.index_js_in(&fx.proj_b);
+
+    // Both projects start from the same unpatched minimist.
+    assert_eq!(git_sha256_file(&index_a), BEFORE_HASH);
+    assert_eq!(git_sha256_file(&index_b), BEFORE_HASH);
+
+    // Locate the store entry and pin its pre-apply hash.
+    let original_bytes = std::fs::read(&index_a).unwrap();
+    let store_copy = find_store_file_with_content(&fx.store_dir, &original_bytes)
+        .expect("store should contain the original minimist bytes pre-apply");
+    assert_eq!(git_sha256_file(&store_copy), BEFORE_HASH);
+
+    // Precondition that gives this test its teeth (the same guard tests
+    // 1 & 2 carry, which this test originally lacked): proj_a, proj_b
+    // and the store entry must be the SAME inode pre-apply. If pnpm
+    // produced independent COPIES instead of hardlinks (flag ignored, or
+    // a filesystem without hardlink support), then "A's patch survives
+    // B's install" and "B stays unpatched" are vacuously true even with
+    // NO CoW defense at all — the whole point of this scenario evaporates.
+    #[cfg(unix)]
+    let store_id_before = {
+        let store_id = file_identity(&store_copy);
+        assert_eq!(
+            file_identity(&index_a),
+            store_id,
+            "pre-apply: proj_a's index.js must be hardlinked to the store entry \
+             (distinct inodes => copies, not hardlinks => test proves nothing)"
+        );
+        assert_eq!(
+            file_identity(&index_b),
+            store_id,
+            "pre-apply: proj_b's index.js must share the store entry's inode"
+        );
+        store_id
+    };
+
+    assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
     assert_eq!(git_sha256_file(&index_a), AFTER_HASH);
 
     // Re-run pnpm install in proj_b with frozen lockfile — this
@@ -372,10 +408,43 @@ fn pnpm_install_in_b_does_not_revert_a() {
         "proj_a's patch must survive `pnpm install --frozen-lockfile` in proj_b"
     );
     assert_eq!(
-        git_sha256_file(&fx.index_js_in(&fx.proj_b)),
+        git_sha256_file(&index_b),
         BEFORE_HASH,
         "proj_b should still see the original minimist after frozen install"
     );
+    // The shared store entry must still hold the original bytes: if apply
+    // had mutated the store inode in place (no CoW), B's frozen reinstall
+    // would re-materialise the patched bytes — or the store itself would
+    // already read AFTER_HASH here.
+    assert_eq!(
+        git_sha256_file(&store_copy),
+        BEFORE_HASH,
+        "pnpm store entry must stay unpatched after apply + B's frozen install. CoW failure?"
+    );
+
+    // Inode-level proof: apply broke A's hardlink (A is on a NEW inode),
+    // while the store entry and proj_b still reference the original shared
+    // inode. This is what distinguishes a real CoW break from B merely
+    // having been an independent copy all along.
+    #[cfg(unix)]
+    {
+        assert_ne!(
+            file_identity(&index_a),
+            store_id_before,
+            "post-apply: proj_a must have a NEW inode — CoW should have broken \
+             the hardlink, not mutated the shared store inode in place"
+        );
+        assert_eq!(
+            file_identity(&store_copy),
+            store_id_before,
+            "post-apply: the store inode must be untouched"
+        );
+        assert_eq!(
+            file_identity(&index_b),
+            store_id_before,
+            "post-apply: proj_b must still reference the original shared inode"
+        );
+    }
 }
 
 /// The pnpm layout produces an informational note on stderr (the

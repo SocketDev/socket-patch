@@ -337,6 +337,18 @@ pub fn run_monorepo() {
 /// unavailable (container mode) — matching the `docker_e2e_*` convention
 /// where Rust integration tests have no native "skipped".
 fn run_cases(label: &str, cases: Vec<Case>) {
+    // A section with zero cases would make the final `failures.is_empty()`
+    // assertion pass having exercised nothing ("0 of 0 cases") — a vacuous
+    // green if matrix.json's scenarios/targets list is ever emptied or a key
+    // is renamed. `load_section` emits one case per scenario, so an empty
+    // vector here means the spec degenerated; fail loudly. Checked before the
+    // docker/image soft-skip because the spec is read regardless of runner.
+    assert!(
+        !cases.is_empty(),
+        "{label}: no setup-matrix cases were loaded from matrix.json — the \
+         scenario/target list is empty (would make this suite pass vacuously)"
+    );
+
     if !host_mode() && !docker_on_path() {
         eprintln!("skip {label}: docker not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on host)");
         return;

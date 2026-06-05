@@ -16,10 +16,13 @@
 //!     scope/name/version tree for the crawler to walk — see the
 //!     `deno_jsr_script` comment), then runs
 //!     `socket-patch scan --json --ecosystems deno --global` against
-//!     that root. Asserts the DenoCrawler enumerates *exactly* the two
-//!     staged packages (@luca/flag + @std/path) end-to-end through the
-//!     real CLI binary. The `deno` binary is exercised only to prove
-//!     the image is healthy; it does not produce the scanned layout.
+//!     that root. The fixture stages four packages whose scope/name/
+//!     version cardinalities all differ (2 scopes, 3 names, 4 versions)
+//!     plus decoys, then asserts the DenoCrawler count matches a
+//!     filesystem-derived oracle *exactly* — so a crawler that counts
+//!     the wrong tree level cannot pass. End-to-end through the real CLI
+//!     binary. The `deno` binary is exercised only to prove the image is
+//!     healthy; it does not produce the scanned layout.
 //!
 //! Run command:
 //!   `cargo test -p socket-patch-cli --features docker-e2e,deno --test docker_e2e_deno`
@@ -298,17 +301,47 @@ set -uo pipefail
 
 # Stage a synthetic JSR cache layout under a project-local DENO_DIR.
 # Layout: <DENO_DIR>/npm/jsr.io/<scope>/<name>/<version>/<file>.
-# Two packages so the scan count is non-trivial.
+#
+# CRITICAL: the staged tree deliberately makes the scope / name / version
+# cardinalities all DIFFERENT, so a correct per-(scope,name,version)
+# enumeration is the ONLY thing that yields the expected count. With the
+# old "one package per scope" fixture, a crawler that mistakenly counted
+# scopes (or names, or versions) would produce the same number as a
+# correct one and pass — masking a real enumeration bug.
+#
+#   scope:           @std, @luca                         -> 2 distinct
+#   scope/name:      @std/path, @std/fs, @luca/flag      -> 3 distinct
+#   scope/name/ver:  +0.220.0 +0.225.0 +1.0.0 +1.0.0     -> 4 packages
+#
+# Only the correct crawler reports 4. A scope-counter reports 2, a
+# name-counter 3 — both now fail.
 export DENO_DIR=/workspace/deno-cache
 JSR=$DENO_DIR/npm/jsr.io
-mkdir -p "$JSR/@luca/flag/1.0.0"
 mkdir -p "$JSR/@std/path/0.220.0"
-cat >"$JSR/@luca/flag/1.0.0/mod.ts" <<'EOF'
-export default true;
-EOF
+mkdir -p "$JSR/@std/path/0.225.0"   # 2nd version of @std/path -> exercises the version layer
+mkdir -p "$JSR/@std/fs/1.0.0"       # 2nd name under @std      -> exercises the name layer
+mkdir -p "$JSR/@luca/flag/1.0.0"    # 2nd scope                -> exercises the scope layer
 cat >"$JSR/@std/path/0.220.0/mod.ts" <<'EOF'
 export const sep = "/";
 EOF
+cat >"$JSR/@std/path/0.225.0/mod.ts" <<'EOF'
+export const sep = "/";
+EOF
+cat >"$JSR/@std/fs/1.0.0/mod.ts" <<'EOF'
+export const exists = true;
+EOF
+cat >"$JSR/@luca/flag/1.0.0/mod.ts" <<'EOF'
+export default true;
+EOF
+
+# Noise that the crawler MUST ignore, so over-counting is caught too:
+#  - a non-`@`-prefixed top-level dir (not a JSR scope)
+#  - a stray file where a version dir would sit (not a directory)
+mkdir -p "$JSR/noscope/pkg/9.9.9"
+cat >"$JSR/noscope/pkg/9.9.9/mod.ts" <<'EOF'
+export const ignore = true;
+EOF
+echo "not a version dir" >"$JSR/@std/path/README.txt"
 
 # Confirm deno itself is runnable (proves the image is healthy even
 # though we don't drive a real deno install in this variant).
@@ -354,34 +387,72 @@ if [ "$PARSE_RC" -ne 0 ]; then
   exit 1
 fi
 echo "scanned jsr packages: $SCANNED" >&2
-# Exactly two packages were staged; the crawler must find neither fewer
-# (missed one) nor more (walked into the wrong directory level).
-if [ "$SCANNED" -ne 2 ]; then
-  echo "FAIL: DenoCrawler found $SCANNED packages, expected exactly 2 (@luca/flag + @std/path)" >&2
+
+# Independent oracle: count the real leaf (scope,name,version) dirs on
+# disk WITHOUT going through the crawler. JSR packages live at depth 3
+# under $JSR (@scope/name/version) and the scope segment must start with
+# `@` — this excludes the `noscope/...` decoy. Deriving the expected
+# value from the filesystem (not a copied-from-output constant) means the
+# test disagrees with the implementation whenever the crawler miscounts.
+EXPECTED=$(find "$JSR" -mindepth 3 -maxdepth 3 -type d -path "$JSR/@*/*/*" | wc -l | tr -d ' ')
+echo "expected (find-derived) jsr packages: $EXPECTED" >&2
+# Sanity-check the fixture itself staged the disambiguating layout, so a
+# botched edit to the staging block can't quietly collapse the oracle.
+if [ "$EXPECTED" -ne 4 ]; then
+  echo "FAIL: fixture staging is wrong; find counted $EXPECTED leaf dirs, expected 4" >&2
+  find "$JSR" -maxdepth 4 2>&1 >&2 || true
+  exit 1
+fi
+# The crawler must agree with the filesystem oracle exactly: neither fewer
+# (missed a package / stopped at the wrong level) nor more (walked the
+# `@*` decoy, counted the README file, or double-counted a level).
+if [ "$SCANNED" -ne "$EXPECTED" ]; then
+  echo "FAIL: DenoCrawler found $SCANNED packages, filesystem has $EXPECTED (@std/path@0.220.0, @std/path@0.225.0, @std/fs@1.0.0, @luca/flag@1.0.0)" >&2
   find "$JSR" -maxdepth 4 2>&1 >&2 || true
   exit 1
 fi
 
+echo "scanned jsr packages count matches oracle: $SCANNED" >&2
 echo "===SCAN VERIFIED===" >&2
 echo "===E2E PASS==="
 exit 0
 "#.to_string()
 }
 
+/// Returns `true` when the test must skip because the docker image is
+/// absent. Rust integration tests have no native "skipped" outcome, so a
+/// missing image silently makes the whole test vacuous — that is itself a
+/// loophole. To make the skip auditable, set `SOCKET_PATCH_REQUIRE_DOCKER=1`
+/// (CI does this): the helper then PANICS instead of skipping, so a green
+/// run proves the assertions actually executed rather than no-op'd.
 #[must_use]
 fn skip_if_no_image() -> bool {
-    let Ok(out) = Command::new("docker")
+    let require = std::env::var("SOCKET_PATCH_REQUIRE_DOCKER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let out = Command::new("docker")
         .args(["image", "inspect", "socket-patch-test-deno:latest"])
-        .output()
-    else {
-        eprintln!("skipping: `docker` not on PATH");
-        return true;
-    };
-    if !out.status.success() {
-        eprintln!("skipping: docker image `socket-patch-test-deno:latest` not present");
-        return true;
+        .output();
+    match out {
+        Ok(o) if o.status.success() => false,
+        Ok(_) => {
+            assert!(
+                !require,
+                "SOCKET_PATCH_REQUIRE_DOCKER=1 but image \
+                 `socket-patch-test-deno:latest` is not present"
+            );
+            eprintln!("skipping: docker image `socket-patch-test-deno:latest` not present");
+            true
+        }
+        Err(_) => {
+            assert!(
+                !require,
+                "SOCKET_PATCH_REQUIRE_DOCKER=1 but `docker` is not on PATH"
+            );
+            eprintln!("skipping: `docker` not on PATH");
+            true
+        }
     }
-    false
 }
 
 fn run_container(script: &str) -> std::process::Output {
@@ -446,10 +517,16 @@ async fn deno_jsr_synthetic_layout_scan_verifies_discovery() {
         out.status.success(),
         "deno jsr scan failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    // Exactly the two staged packages were enumerated by the DenoCrawler.
+    // The DenoCrawler enumerated exactly the 4 staged (scope,name,version)
+    // packages — verified in-script against a filesystem-derived oracle, so
+    // a crawler that counts the wrong tree level (scopes=2, names=3) fails.
     assert!(
-        stderr.contains("scanned jsr packages: 2"),
-        "DenoCrawler did not enumerate exactly 2 packages:\nstderr=\n{stderr}"
+        stderr.contains("scanned jsr packages: 4"),
+        "DenoCrawler did not enumerate exactly 4 packages:\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("scanned jsr packages count matches oracle: 4"),
+        "DenoCrawler count did not match the filesystem oracle:\nstderr=\n{stderr}"
     );
     assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");

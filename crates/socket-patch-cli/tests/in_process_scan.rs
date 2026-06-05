@@ -366,6 +366,11 @@ async fn scan_prune_only_wet_removes_orphans() {
     write_npm_package(tmp.path(), "still-installed", "1.0.0");
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
+    // Two manifest entries: one orphan (not installed) and one for the
+    // package that IS installed. Prune must remove ONLY the orphan and leave
+    // the live entry untouched. With a single orphan-only manifest, a buggy
+    // prune that wipes EVERYTHING would also pass `len == 0`; the live entry
+    // is what makes this test discriminate orphan-prune from manifest-wipe.
     std::fs::write(
         socket.join("manifest.json"),
         r#"{ "patches": {
@@ -374,6 +379,12 @@ async fn scan_prune_only_wet_removes_orphans() {
                 "exportedAt": "2024-01-01T00:00:00Z",
                 "files": {}, "vulnerabilities": {},
                 "description": "orphan", "license": "MIT", "tier": "free"
+            },
+            "pkg:npm/still-installed@1.0.0": {
+                "uuid": "44444444-4444-4444-8444-444444444444",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {}, "vulnerabilities": {},
+                "description": "live", "license": "MIT", "tier": "free"
             }
         }}"#,
     )
@@ -386,7 +397,20 @@ async fn scan_prune_only_wet_removes_orphans() {
     assert_eq!(run(args).await, 0);
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let m: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(m["patches"].as_object().unwrap().len(), 0, "orphan must be pruned");
+    let patches = m["patches"].as_object().unwrap();
+    assert_eq!(
+        patches.len(),
+        1,
+        "prune must remove exactly the orphan and keep the live entry; got {m}"
+    );
+    assert!(
+        !patches.contains_key("pkg:npm/orphan@1.0.0"),
+        "orphan (not installed) must be pruned; got {m}"
+    );
+    assert!(
+        patches.contains_key("pkg:npm/still-installed@1.0.0"),
+        "live entry (installed) must NOT be pruned; got {m}"
+    );
 }
 
 // ---------------------------------------------------------------------------

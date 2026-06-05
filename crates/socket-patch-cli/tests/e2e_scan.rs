@@ -503,6 +503,22 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
     );
     let v = parse_scan_json(&stdout);
 
+    // Positive proof the scan actually executed an apply pass — otherwise a
+    // scan that crawled 0 packages (or whose API batches all failed) would
+    // emit no `gc` field and leave the manifest untouched, trivially passing
+    // the negative assertions below for entirely the wrong reason.
+    assert_eq!(v["status"], "success");
+    assert!(
+        v["scannedPackages"].as_u64().unwrap_or(0) >= 1,
+        "scan must have crawled at least one (installed) package; got {}",
+        v["scannedPackages"]
+    );
+    assert!(
+        v["apply"]["patches"].is_array(),
+        "an apply run must emit the apply.patches array; got {}",
+        v["apply"]
+    );
+
     assert!(
         v.get("gc").is_none() || v["gc"].is_null(),
         "gc field must be omitted when --prune is not set; got {}",
@@ -529,10 +545,26 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
     assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
 
+    let index_js = cwd.join("node_modules/minimist/index.js");
+    let patched_hash = git_sha256_file(&index_js);
+    assert_ne!(
+        patched_hash, BEFORE_HASH,
+        "precondition: initial apply must have patched the file",
+    );
+
     // Plant an orphan blob. Not referenced by any manifest entry, so the
     // GC pass must reap it.
     let blobs_dir = cwd.join(".socket/blobs");
     std::fs::create_dir_all(&blobs_dir).expect("create blobs dir");
+    // Snapshot the legitimate (manifest-referenced) blobs that exist *before*
+    // we plant the orphan. A correct GC reaps ONLY the orphan; a buggy GC
+    // that nukes the whole blob store would also satisfy `removedBlobs >= 1`
+    // and `!orphan.exists()`, so we assert every pre-existing blob survives.
+    let legit_blobs_before: Vec<std::ffi::OsString> = std::fs::read_dir(&blobs_dir)
+        .expect("read blobs dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
     let orphan = blobs_dir.join(FAKE_ORPHAN_HASH);
     std::fs::write(&orphan, b"junk").expect("plant orphan");
     assert!(orphan.exists());
@@ -543,6 +575,7 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
         "scan --prune with orphan blob present",
     );
     let v = parse_scan_json(&stdout);
+    assert_eq!(v["status"], "success");
 
     let removed = v["gc"]["removedBlobs"]
         .as_u64()
@@ -552,6 +585,28 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
         "gc should report at least 1 removed blob, got {removed}"
     );
     assert!(!orphan.exists(), "orphan blob should be deleted");
+
+    // The orphan was the only unreferenced blob: GC must not have touched any
+    // legitimate, manifest-referenced blob.
+    for name in &legit_blobs_before {
+        assert!(
+            blobs_dir.join(name).exists(),
+            "GC must not delete the referenced blob {name:?}; over-broad cleanup detected",
+        );
+    }
+
+    // minimist is still installed, so its manifest entry must survive the
+    // prune, and the patched file on disk must not have been reverted.
+    let manifest = read_manifest_file(cwd);
+    assert!(
+        manifest["patches"][NPM_PURL].is_object(),
+        "still-installed minimist must NOT be pruned by GC"
+    );
+    assert_eq!(
+        git_sha256_file(&index_js),
+        patched_hash,
+        "GC must not revert the patched file of a still-installed package",
+    );
 }
 
 /// `scan --json --dry-run --sync --yes` previews the full sync action:
@@ -639,6 +694,17 @@ fn test_scan_json_no_gc_field_without_prune() {
     let (stdout, _) = assert_run_ok(cwd, &["scan", "--json"], "scan --json (no prune)");
     let v = parse_scan_json(&stdout);
 
+    // Positive proof the read-only scan actually ran a discovery pass — a
+    // scan that crawled nothing would emit no gc field and pass the negative
+    // assertion below for the wrong reason. left-pad is the installed package
+    // here (minimist was uninstalled), so at minimum one package is scanned.
+    assert_eq!(v["status"], "success");
+    assert!(
+        v["scannedPackages"].as_u64().unwrap_or(0) >= 1,
+        "read-only scan must crawl at least one package; got {}",
+        v["scannedPackages"]
+    );
+
     assert!(
         v.get("gc").is_none() || v["gc"].is_null(),
         "scan --json must NOT emit gc when --prune is not set; got {}",
@@ -672,8 +738,24 @@ fn test_scan_sync_yes_full_lifecycle() {
         patches.iter().any(|p| p["purl"] == NPM_PURL && p["action"] == "added"),
         "first sync should add the minimist patch"
     );
-    // gc field should be present (--sync implies --prune) but empty.
-    assert!(v1["gc"].is_object(), "gc must be emitted under --sync");
+    assert_eq!(v1["status"], "success");
+    // gc field should be present (--sync implies --prune). It must be a real GC
+    // result, not the `{"skipped": true}` short-circuit (which `is_object()`
+    // would also accept), and on this first run there is nothing installed-then-
+    // uninstalled, so it must prune nothing.
+    let gc1 = v1["gc"].as_object().expect("gc must be emitted under --sync");
+    assert!(
+        gc1.get("skipped") != Some(&serde_json::Value::Bool(true)),
+        "GC must not be skipped on a --sync run that scanned packages; got {:?}",
+        gc1
+    );
+    let pruned1 = gc1["prunedManifestEntries"]
+        .as_array()
+        .expect("first-run gc must report prunedManifestEntries");
+    assert!(
+        pruned1.is_empty(),
+        "first --sync run must prune nothing (minimist is still installed); got {pruned1:?}"
+    );
 
     // Uninstall + plant orphan, then run --sync again.
     npm_run(cwd, &["uninstall", "minimist"]);

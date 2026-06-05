@@ -24,6 +24,40 @@ const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const UUID_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
+/// Every `SOCKET_*` env var that `get`/`GlobalArgs` reads as an `#[arg(env=…)]`
+/// fallback. These subprocess tests assert an EXACT envelope, so any one of
+/// these leaking in from the ambient shell (CI, a dev's `.envrc`, etc.) could
+/// silently redirect the command to a different path (offline mode, a real
+/// api-url, download-only, …) and make a broken impl look green. We scrub the
+/// whole surface so behavior is fully determined by the explicit CLI flags.
+const SOCKET_ENV_VARS: &[&str] = &[
+    "SOCKET_API_TOKEN",
+    "SOCKET_API_URL",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_SAVE_ONLY",
+    "SOCKET_YES",
+    "SOCKET_JSON",
+    "SOCKET_OFFLINE",
+    "SOCKET_FORCE",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_ALL_RELEASES",
+    "SOCKET_BATCH_SIZE",
+    "SOCKET_CWD",
+    "SOCKET_DEBUG",
+    "SOCKET_DRY_RUN",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_ONE_OFF",
+    "SOCKET_PROXY_URL",
+    "SOCKET_SILENT",
+    "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_VERBOSE",
+    "SOCKET_VEX",
+];
+
 /// Run `socket-patch get <identifier>` with `--json --save-only --yes`
 /// against `api_url` (authenticated mode). Returns (code, stdout, stderr).
 fn run_get_auth(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
@@ -41,10 +75,12 @@ fn run_get_auth(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> 
         ORG_SLUG,
     ];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
+    let mut cmd = Command::new(binary());
+    cmd.args(&args).current_dir(cwd);
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .output()
         .expect("run socket-patch");
     (
@@ -123,6 +159,28 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
         "options must list both candidate UUIDs; got {uuids:?}"
     );
 
+    // Each option must carry the full disambiguation payload — tier, the
+    // human description, and the publish timestamp — so a degenerate
+    // "just the uuid" shape (which would make the prompt useless) fails.
+    let descriptions: HashSet<&str> =
+        opts.iter().filter_map(|o| o["description"].as_str()).collect();
+    assert!(
+        descriptions.contains("Patch A") && descriptions.contains("Patch B"),
+        "options must echo each patch description; got {descriptions:?}"
+    );
+    for o in opts {
+        assert_eq!(
+            o["tier"], "free",
+            "each listed candidate must be the free patch we mocked; got {}",
+            o["tier"]
+        );
+        assert!(
+            o["published_at"].as_str().is_some_and(|s| !s.is_empty()),
+            "each option must carry a non-empty published_at; got {}",
+            o["published_at"]
+        );
+    }
+
     // The error text must instruct the user how to disambiguate.
     let err = v["error"].as_str().unwrap_or("");
     assert!(
@@ -159,9 +217,29 @@ async fn get_id_flag_does_not_accept_a_value() {
         stdout.trim().is_empty(),
         "a usage error must not emit a JSON envelope; stdout={stdout}"
     );
+    // Strict: the clap error must both name the stray value AND flag it as
+    // unexpected. An OR here would accept any old usage error (e.g. a missing
+    // required arg) and stop policing that it's specifically `--id` refusing
+    // a value.
     assert!(
-        stderr.contains(UUID_B) || stderr.to_lowercase().contains("unexpected"),
-        "stderr must report the unexpected argument; stderr={stderr}"
+        stderr.contains(UUID_B),
+        "stderr must name the stray value; stderr={stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("unexpected"),
+        "stderr must report it as an unexpected argument; stderr={stderr}"
+    );
+
+    // A usage error is detected during arg parsing, before any API call: the
+    // command must never have reached the server.
+    let received = mock
+        .received_requests()
+        .await
+        .expect("wiremock request recording must be enabled");
+    assert!(
+        received.is_empty(),
+        "a CLI usage error must short-circuit before any HTTP request; got {} request(s)",
+        received.len()
     );
 }
 
@@ -274,10 +352,13 @@ async fn get_by_cve_with_no_patches_emits_no_match() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         v["status"], "not_found",
-        "empty CVE search must emit not_found; got {}",
+        "empty CVE search must emit not_found (NOT no_match, which is the \
+         fuzzy package-name path); got {}",
         v["status"]
     );
     assert_eq!(v["found"], 0);
+    assert_eq!(v["downloaded"], 0, "no patches downloaded on empty search");
+    assert_eq!(v["applied"], 0, "no patches applied on empty search");
     assert!(v["patches"].as_array().expect("patches array").is_empty());
 }
 
@@ -304,9 +385,12 @@ async fn get_by_ghsa_with_no_patches_emits_no_match() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         v["status"], "not_found",
-        "empty GHSA search must emit not_found; got {}",
+        "empty GHSA search must emit not_found (NOT no_match, which is the \
+         fuzzy package-name path); got {}",
         v["status"]
     );
     assert_eq!(v["found"], 0);
+    assert_eq!(v["downloaded"], 0, "no patches downloaded on empty search");
+    assert_eq!(v["applied"], 0, "no patches applied on empty search");
     assert!(v["patches"].as_array().expect("patches array").is_empty());
 }

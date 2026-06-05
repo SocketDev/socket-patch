@@ -59,6 +59,63 @@ fn parse_found_count(combined: &str) -> usize {
         .unwrap_or_else(|| panic!("could not parse package count from line: {line:?}"))
 }
 
+/// Assert scan reported EXACTLY `n` packages and that ALL of them were
+/// attributed to the NuGet ecosystem, via the contiguous breakdown line
+/// `Found <n> packages (<n> nuget)`.
+///
+/// This is deliberately stricter than checking the count and the substring
+/// "nuget" independently: a split-ecosystem regression that mis-attributed a
+/// planted package (e.g. `Found 2 packages (1 nuget, 1 npm)`) would satisfy
+/// both a `count == n` check and a loose `contains("nuget")` check, yet is
+/// exactly the kind of breakage we must catch. Requiring the whole
+/// `(<n> nuget)` breakdown segment to match the total proves every counted
+/// package is NuGet and nothing leaked in from another crawler.
+fn assert_all_nuget(combined: &str, n: usize) {
+    // Cross-check the bare count first for a clear error on mismatch.
+    let found = parse_found_count(combined);
+    assert_eq!(
+        found, n,
+        "expected exactly {n} discovered packages, got {found}:\n{combined}"
+    );
+    let needle = format!("Found {n} packages ({n} nuget)");
+    assert!(
+        combined.contains(&needle),
+        "expected the contiguous breakdown line {needle:?} \
+         (all {n} packages attributed to NuGet); output was:\n{combined}"
+    );
+}
+
+/// Run `scan --json` and assert the machine-readable envelope independently
+/// agrees that exactly `n` packages were scanned with overall success. This is
+/// a separate output formatter from the human-readable `Found N packages` line,
+/// so it guards against the human line and the JSON envelope drifting apart.
+fn assert_json_scanned(
+    cwd: &std::path::Path,
+    nuget_packages: &std::path::Path,
+    project_dir: &std::path::Path,
+    n: usize,
+) {
+    let output = run(
+        &["scan", "--cwd", project_dir.to_str().unwrap(), "--json"],
+        cwd,
+        nuget_packages,
+    );
+    assert!(
+        output.status.success(),
+        "scan --json should exit 0 on clean discovery, got {:?}",
+        output.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("\"scannedPackages\": {n}")),
+        "scan --json envelope should report scannedPackages={n}:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"status\": \"success\""),
+        "scan --json envelope should report status=success:\n{stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -113,20 +170,15 @@ fn scan_discovers_global_cache_packages() {
         !combined.contains("No packages found") && !combined.contains("No global packages found"),
         "scan failed to discover the fake global cache:\n{combined}"
     );
-    // Exactly the two packages we planted (Newtonsoft.Json, System.Text.Json)
-    // and nothing else — the temp project has no node_modules/site-packages,
-    // so every counted package must come from the fake NuGet cache.
-    assert_eq!(
-        parse_found_count(&combined),
-        2,
-        "expected exactly 2 discovered packages:\n{combined}"
-    );
-    // Prove they were attributed to the NuGet ecosystem, not discovered by some
-    // other crawler picking up stray files.
-    assert!(
-        combined.to_lowercase().contains("nuget"),
-        "expected discovered packages to be reported as NuGet:\n{combined}"
-    );
+    // Exactly the two packages we planted (Newtonsoft.Json, System.Text.Json),
+    // ALL attributed to NuGet and nothing else — the temp project has no
+    // node_modules/site-packages, so every counted package must come from the
+    // fake NuGet cache. The contiguous `(2 nuget)` breakdown also rejects a
+    // split-ecosystem regression that a separate count + loose substring check
+    // would let through.
+    assert_all_nuget(&combined, 2);
+    // Independently confirm via the JSON envelope (a different output path).
+    assert_json_scanned(&project_dir, &nuget_cache, &project_dir, 2);
 }
 
 /// Verify that `socket-patch scan` discovers packages in a fake legacy packages/ layout.
@@ -169,14 +221,9 @@ fn scan_discovers_legacy_packages() {
         !combined.contains("No packages found") && !combined.contains("No global packages found"),
         "scan failed to discover the legacy packages/ layout:\n{combined}"
     );
-    // Exactly the single legacy package we planted (Newtonsoft.Json.13.0.3).
-    assert_eq!(
-        parse_found_count(&combined),
-        1,
-        "expected exactly 1 discovered package:\n{combined}"
-    );
-    assert!(
-        combined.to_lowercase().contains("nuget"),
-        "expected discovered package to be reported as NuGet:\n{combined}"
-    );
+    // Exactly the single legacy package we planted (Newtonsoft.Json.13.0.3),
+    // attributed to NuGet via the contiguous `(1 nuget)` breakdown.
+    assert_all_nuget(&combined, 1);
+    // Independently confirm via the JSON envelope (a different output path).
+    assert_json_scanned(&project_dir, &packages_dir, &project_dir, 1);
 }

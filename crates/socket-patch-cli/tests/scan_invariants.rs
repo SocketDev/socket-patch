@@ -65,6 +65,60 @@ fn run_scan(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) 
 }
 
 // ---------------------------------------------------------------------------
+// Request-inspection helpers.
+//
+// The mocks above match on METHOD + PATH only — they ignore the request
+// body. Without inspecting what the binary actually *sent*, a regression
+// that crawled the wrong package, encoded PURLs incorrectly, or skipped
+// the network call entirely would still see the canned (path-keyed)
+// response and stay green. These helpers let each test pin the real
+// network code path the module doc claims to exercise: URL construction
+// and the PURLs carried in the batch request body.
+// ---------------------------------------------------------------------------
+
+async fn recorded(mock: &MockServer) -> Vec<wiremock::Request> {
+    mock.received_requests()
+        .await
+        .expect("wiremock records requests by default")
+}
+
+fn batch_posts(reqs: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+    reqs.iter()
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/batch"))
+        .collect()
+}
+
+fn by_package_gets(reqs: &[wiremock::Request]) -> usize {
+    reqs.iter()
+        .filter(|r| {
+            format!("{}", r.method) == "GET" && r.url.path().contains("/patches/by-package/")
+        })
+        .count()
+}
+
+fn body_text(req: &wiremock::Request) -> String {
+    String::from_utf8_lossy(&req.body).into_owned()
+}
+
+/// Assert that exactly one batch POST was sent and its body mentions the
+/// given PURL verbatim. This is what proves scan constructed the request
+/// from the *crawled* package rather than fabricating the response.
+fn assert_single_batch_carries_purl(reqs: &[wiremock::Request], purl: &str) {
+    let posts = batch_posts(reqs);
+    assert_eq!(
+        posts.len(),
+        1,
+        "expected exactly one batch POST; saw {}",
+        posts.len()
+    );
+    let body = body_text(posts[0]);
+    assert!(
+        body.contains(purl),
+        "batch request body must carry the crawled purl {purl}; body was: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Discovery — no installed packages, no API calls expected
 // ---------------------------------------------------------------------------
 
@@ -96,6 +150,18 @@ async fn scan_with_no_installed_packages_reports_zero() {
     assert_eq!(v["scannedPackages"], 0);
     assert_eq!(v["packagesWithPatches"], 0);
     assert_eq!(v["totalPatches"], 0);
+
+    // A project with no installed dependencies crawls zero packages, so
+    // scan must never query the batch API. The zeroed counters above are
+    // *also* what a regression that silently swallowed an API failure
+    // would emit — pinning "0 batch POSTs" distinguishes "nothing to
+    // scan" from "scanned but lost the results".
+    let reqs = recorded(&mock).await;
+    assert!(
+        batch_posts(&reqs).is_empty(),
+        "empty project must not query the batch API; saw {} POST(s)",
+        batch_posts(&reqs).len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +216,13 @@ async fn scan_reports_available_patch_for_installed_package() {
     assert_eq!(patches.len(), 1);
     assert_eq!(patches[0]["uuid"], "11111111-1111-4111-8111-111111111111");
     assert_eq!(patches[0]["severity"], "high");
+
+    // The mock answers minimist patches on ANY batch POST, so the
+    // counters above prove only that correlation worked — not that scan
+    // *sent* the crawled PURL. Pin the request body so a PURL-encoding
+    // regression (wrong purl / empty body / no call) fails loudly.
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +292,9 @@ async fn scan_emits_updates_entry_when_newer_uuid_available() {
     assert_eq!(updates[0]["purl"], purl);
     assert_eq!(updates[0]["oldUuid"], old_uuid);
     assert_eq!(updates[0]["newUuid"], new_uuid);
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +343,9 @@ async fn scan_with_no_manifest_emits_empty_updates() {
         "updates should be empty when no manifest exists; got: {v}"
     );
     assert_eq!(v["packagesWithPatches"], 1);
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +464,18 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
         !tmp.path().join(".socket/manifest.json").exists(),
         "scan --apply --dry-run must not write .socket/manifest.json"
     );
+
+    // --apply mode must query BOTH endpoints: the batch search (carrying
+    // the crawled PURL) and the per-package detail fetch. The "added"
+    // action above is only trustworthy if it was synthesized from a real
+    // detail fetch, not fabricated.
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
+    assert!(
+        by_package_gets(&reqs) >= 1,
+        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        by_package_gets(&reqs)
+    );
 }
 
 #[tokio::test]
@@ -470,6 +561,14 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     assert_eq!(apply["updated"], 0);
     let patches = apply["patches"].as_array().unwrap();
     assert_eq!(patches[0]["action"], "skipped");
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
+    assert!(
+        by_package_gets(&reqs) >= 1,
+        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        by_package_gets(&reqs)
+    );
 }
 
 #[tokio::test]
@@ -557,6 +656,14 @@ async fn scan_apply_dry_run_with_different_uuid_emits_updated_action() {
     assert_eq!(patches[0]["action"], "updated");
     assert_eq!(patches[0]["oldUuid"], old_uuid);
     assert_eq!(patches[0]["uuid"], new_uuid);
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
+    assert!(
+        by_package_gets(&reqs) >= 1,
+        "scan --apply must fetch per-package patch details; saw {} by-package GET(s)",
+        by_package_gets(&reqs)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +731,16 @@ async fn scan_prune_dry_run_reports_prunable_manifest_entries() {
     let body = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(manifest["patches"].as_object().unwrap().len(), 1);
+
+    // The prune decision must be grounded in a real crawl: the batch
+    // query carries the *installed* package (fresh-pkg), and "uninstalled"
+    // is prunable precisely because it was NOT among the crawled packages.
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, "pkg:npm/fresh-pkg@1.0.0");
+    assert!(
+        !body_text(batch_posts(&reqs)[0]).contains("pkg:npm/uninstalled@1.0.0"),
+        "the uninstalled (prunable) PURL must not appear in the crawl-driven batch query"
+    );
 }
 
 #[tokio::test]
@@ -679,6 +796,9 @@ async fn scan_prune_removes_stale_manifest_entries() {
         0,
         "stale entry must be pruned from manifest"
     );
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, "pkg:npm/fresh-pkg@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +912,13 @@ async fn scan_prune_keeps_entry_when_package_installed_but_api_silent() {
             .is_some(),
         "the original PURL/UUID record must remain intact"
     );
+
+    // The survival is only meaningful if the package was actually crawled
+    // and queried this run — otherwise the entry would survive trivially
+    // because prune never ran. Pin that the installed PURL was in the
+    // batch query.
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, "pkg:npm/still-installed@1.0.0");
 }
 
 /// Withdrawn-patch lifecycle: a patch present in the manifest for a
@@ -858,6 +985,9 @@ async fn scan_prune_removes_withdrawn_patch_entry() {
         0,
         "withdrawn entry must be removed"
     );
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, "pkg:npm/unrelated@1.0.0");
 }
 
 /// Update detection: when the API returns a different UUID for the
@@ -946,4 +1076,7 @@ async fn scan_detects_update_without_touching_existing_blobs() {
         b"original contents",
         "scan without --apply must not touch existing blobs"
     );
+
+    let reqs = recorded(&mock).await;
+    assert_single_batch_carries_purl(&reqs, purl);
 }

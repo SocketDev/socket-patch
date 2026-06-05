@@ -346,14 +346,28 @@ fn break_lock_removes_stale_file_and_records_warning() {
     // we additionally get the audit event.
     std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
 
-    let (_code, stdout, _stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--json", "--break-lock"]);
     let env = parse_json_envelope(&stdout);
     // --break-lock breaks the stale file and then acquires cleanly, so
-    // the run must NOT itself be a lock_held failure.
+    // the run must NOT itself be a lock_held failure. Prove the binary
+    // genuinely re-acquired the lock and drove the real apply pipeline
+    // to completion (partialFailure against the absent synthetic
+    // package, no top-level error) — not merely that the errorCode
+    // happened to differ from "lock_held". Without this, a regression
+    // that emitted the audit event but then bailed before acquiring
+    // (or with some other non-lock error) would slip through the
+    // `assert_ne!` + event-presence checks below.
+    assert_lock_acquired(&env);
     assert_ne!(
         envelope_error_code(&env),
         Some("lock_held"),
         "--break-lock should acquire, not report lock_held.\nenvelope: {env}"
+    );
+    // Same exit contract as every other acquired-then-pipeline run in
+    // this file: partialFailure against an absent package exits 1.
+    assert_eq!(
+        code, 1,
+        "break-lock apply that ran the pipeline to partialFailure must exit 1.\nstderr:\n{stderr}"
     );
     let events = env["events"].as_array().expect("events array");
     // Exactly one lock_broken audit event, carrying the audit reason

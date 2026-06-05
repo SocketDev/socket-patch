@@ -12,13 +12,96 @@
 //!   * `setup --check` then exits non-zero.
 
 use std::path::Path;
+use std::process::Command;
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::run;
-
 const USER_BUILD_RS: &str = "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n";
+
+/// Run the CLI binary with `args` in `cwd`, scrubbing **all** ambient
+/// `SOCKET_*` env vars from the child. The shared `common::run` only strips
+/// `SOCKET_API_TOKEN`; setup/check resolve discovery roots and offline gates
+/// from the environment, so an ambient `SOCKET_*` could otherwise satisfy a
+/// flag-driven assertion via the environment and mask a regression. This keeps
+/// the round-trip flag-driven and parallel-safe.
+fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(common::binary());
+    cmd.args(args).current_dir(cwd);
+    for (k, _) in std::env::vars() {
+        if k.starts_with("SOCKET_") {
+            cmd.env_remove(k);
+        }
+    }
+    let out = cmd.output().expect("failed to execute socket-patch binary");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    (code, stdout, stderr)
+}
+
+/// Run `setup --check --json` and return `(exit_code, parsed_envelope)`.
+/// Asserting on the JSON (not just the exit code) closes two holes in an
+/// exit-code-only check:
+///   * exit 0 is ALSO returned by `report_no_files` when discovery finds
+///     nothing — so a broken cargo discovery would make "--check passes after
+///     setup" pass vacuously;
+///   * exit 1 conflates `needs_configuration` with `error` (a parse failure),
+///     so a check that errored instead of reporting "needs setup" would still
+///     look like the expected before/after-remove state.
+fn check_json(cwd: &Path, root_s: &str) -> (i32, serde_json::Value) {
+    let (code, stdout, stderr) = run(cwd, &["setup", "--check", "--json", "--cwd", root_s]);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("setup --check --json did not emit parseable JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+/// Extract the per-member cargo check states and the `[env]` state from a
+/// `setup --check --json` envelope, asserting the workspace shape we staged
+/// (exactly two `cargo` member entries + one `cargo_env` entry, and NOTHING
+/// else — no stray npm/pth entries leaking in). Returns
+/// `(member_statuses, env_status)`.
+fn cargo_check_states(env: &serde_json::Value) -> (Vec<String>, String) {
+    let files = env
+        .get("files")
+        .and_then(|f| f.as_array())
+        .unwrap_or_else(|| panic!("check envelope has no `files` array:\n{env}"));
+    let mut members = Vec::new();
+    let mut env_status: Option<String> = None;
+    for f in files {
+        let kind = f
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or_else(|| panic!("check entry missing string `kind`:\n{f}"));
+        let status = f
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or_else(|| panic!("check entry missing string `status`:\n{f}"))
+            .to_string();
+        match kind {
+            "cargo" => members.push(status),
+            "cargo_env" => {
+                assert!(
+                    env_status.replace(status).is_none(),
+                    "more than one cargo_env entry in check envelope:\n{env}"
+                );
+            }
+            other => panic!(
+                "unexpected check entry kind {other:?} (only cargo/cargo_env expected for a \
+                 pure-cargo workspace):\n{env}"
+            ),
+        }
+    }
+    assert_eq!(
+        members.len(),
+        2,
+        "expected exactly two cargo member check entries (crates/a, crates/b):\n{env}"
+    );
+    let env_status =
+        env_status.unwrap_or_else(|| panic!("no cargo_env check entry:\n{env}"));
+    (members, env_status)
+}
 
 fn stage_workspace(root: &Path) {
     std::fs::create_dir_all(root.join("crates/a/src")).unwrap();
@@ -108,9 +191,30 @@ fn setup_check_remove_check_roundtrip() {
 
     // ── check (before setup) ────────────────────────────────────────
     // A pristine workspace is unconfigured: `--check` must report that,
-    // proving the check reads real state rather than hardcoding 0.
-    let (code, _o, _e) = run(root, &["setup", "--check", "--cwd", root_s]);
+    // proving the check reads real state rather than hardcoding 0. We assert
+    // on the JSON so exit 1 can't be satisfied by an *error* (parse failure)
+    // or by "no files found" instead of the genuine "needs configuration".
+    let (code, env) = check_json(root, root_s);
     assert_eq!(code, 1, "setup --check should fail before setup");
+    assert_eq!(
+        env.get("status").and_then(|s| s.as_str()),
+        Some("needs_configuration"),
+        "pristine workspace must report needs_configuration, not error/no_files:\n{env}"
+    );
+    assert_eq!(
+        env.get("errors").and_then(|e| e.as_u64()),
+        Some(0),
+        "pristine check must have zero parse errors:\n{env}"
+    );
+    let (members, env_state) = cargo_check_states(&env);
+    assert!(
+        members.iter().all(|s| s == "needs_configuration"),
+        "both members must report needs_configuration before setup, got {members:?}\n{env}"
+    );
+    assert_eq!(
+        env_state, "needs_configuration",
+        "[env] must report needs_configuration before setup:\n{env}"
+    );
 
     // ── setup ───────────────────────────────────────────────────────
     let (code, stdout, stderr) = run(root, &["setup", "--cwd", root_s, "--yes"]);
@@ -147,8 +251,40 @@ fn setup_check_remove_check_roundtrip() {
     );
 
     // ── check (configured) ──────────────────────────────────────────
-    let (code, _o, _e) = run(root, &["setup", "--check", "--cwd", root_s]);
+    // Exit 0 alone is ambiguous (`report_no_files` also returns 0); assert the
+    // envelope proves every cargo entry — both members AND the [env] — is
+    // independently reported `configured`, with no errors.
+    let (code, env) = check_json(root, root_s);
     assert_eq!(code, 0, "setup --check should pass after setup");
+    assert_eq!(
+        env.get("status").and_then(|s| s.as_str()),
+        Some("configured"),
+        "configured workspace must report status=configured (not no_files):\n{env}"
+    );
+    assert_eq!(
+        env.get("needsConfiguration").and_then(|n| n.as_u64()),
+        Some(0),
+        "no entry should still need configuration after setup:\n{env}"
+    );
+    assert_eq!(
+        env.get("errors").and_then(|e| e.as_u64()),
+        Some(0),
+        "configured check must have zero errors:\n{env}"
+    );
+    assert_eq!(
+        env.get("configured").and_then(|c| c.as_u64()),
+        Some(3),
+        "all three cargo entries (2 members + [env]) must be configured:\n{env}"
+    );
+    let (members, env_state) = cargo_check_states(&env);
+    assert!(
+        members.iter().all(|s| s == "configured"),
+        "both members must report configured after setup, got {members:?}\n{env}"
+    );
+    assert_eq!(
+        env_state, "configured",
+        "[env] must report configured after setup:\n{env}"
+    );
 
     // ── remove ──────────────────────────────────────────────────────
     let (code, stdout, stderr) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes"]);
@@ -183,6 +319,27 @@ fn setup_check_remove_check_roundtrip() {
     );
 
     // ── check (needs configuration) ─────────────────────────────────
-    let (code, _o, _e) = run(root, &["setup", "--check", "--cwd", root_s]);
+    // After remove we must be back to the genuine needs_configuration state —
+    // not an error, and not no_files (which would also exit non-1 / 0).
+    let (code, env) = check_json(root, root_s);
     assert_eq!(code, 1, "setup --check should fail after remove");
+    assert_eq!(
+        env.get("status").and_then(|s| s.as_str()),
+        Some("needs_configuration"),
+        "after remove the workspace must report needs_configuration again:\n{env}"
+    );
+    assert_eq!(
+        env.get("errors").and_then(|e| e.as_u64()),
+        Some(0),
+        "post-remove check must have zero parse errors:\n{env}"
+    );
+    let (members, env_state) = cargo_check_states(&env);
+    assert!(
+        members.iter().all(|s| s == "needs_configuration"),
+        "both members must report needs_configuration after remove, got {members:?}\n{env}"
+    );
+    assert_eq!(
+        env_state, "needs_configuration",
+        "[env] must report needs_configuration after remove:\n{env}"
+    );
 }

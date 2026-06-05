@@ -53,3 +53,221 @@ fn pnpm_workspace() {
 fn yarn_workspace() {
     smc::run_workspace_pm("npm", "yarn");
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Real, non-skippable regression guard for npm `setup`.
+//
+// IMPORTANT — why this file needs an assertion of its own:
+// every `smc::run_pm` / `smc::run_workspace_pm` call above routes through the
+// shared Docker matrix harness, which *soft-skips and silently passes* whenever
+// Docker or the `npm` image is absent (the common case locally and in this
+// eval). So for the one ecosystem `setup` genuinely supports today, the matrix
+// calls can be entirely green having exercised NOTHING — a broken
+// package.json-hook writer would never turn this file red.
+//
+// To close that loophole WITHOUT touching the shared harness, the module below
+// adds a self-contained, host-only (no Docker, no network, no real npm
+// toolchain) exercise of the actual `socket-patch` binary against a real
+// package.json. It runs unconditionally and fails loudly if npm
+// `setup` / `setup --check` / `setup --remove` regress. State is verified with
+// an *independent* JSON read + raw substring probes (NOT the production
+// `is_setup_configured` / `update_package_json` detectors), so the oracle can
+// disagree with a broken writer.
+// ─────────────────────────────────────────────────────────────────────────
+mod host_guard {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// The apply command `setup` is supposed to inject into the npm lifecycle
+    /// scripts. Hardcoded HERE (not imported from production) so a regression
+    /// that drops/garbles the command is caught by an independent oracle. The
+    /// detector accepts several variants; we pin the canonical npm one the
+    /// writer emits for a lockfile-less project.
+    const NPM_APPLY_CMD: &str = "@socketsecurity/socket-patch apply";
+    const NPM_ECOSYSTEM_FLAG: &str = "--ecosystems npm";
+    /// A pre-existing, user-authored postinstall step `setup` must PRESERVE
+    /// (prepend the patch command before it, never clobber it).
+    const USER_POSTINSTALL: &str = "echo user-build-step";
+
+    /// Every `SOCKET_*` env var clap consults for the surface this test drives,
+    /// stripped from the child so behaviour reflects ONLY the explicit flags
+    /// (`--cwd`, `--yes`, `--check`, `--remove`). Without this, an ambient
+    /// `SOCKET_CWD` / `SOCKET_YES` in the shell or CI could satisfy an assertion
+    /// via the environment rather than the flag under test. (Mirrors the scrub
+    /// used by the `cli_parse_*` and cargo host-guard suites.)
+    const SOCKET_ENV_VARS: &[&str] = &[
+        "SOCKET_CWD",
+        "SOCKET_MANIFEST_PATH",
+        "SOCKET_API_URL",
+        "SOCKET_API_TOKEN",
+        "SOCKET_ORG_SLUG",
+        "SOCKET_PROXY_URL",
+        "SOCKET_ECOSYSTEMS",
+        "SOCKET_DOWNLOAD_MODE",
+        "SOCKET_OFFLINE",
+        "SOCKET_GLOBAL",
+        "SOCKET_GLOBAL_PREFIX",
+        "SOCKET_JSON",
+        "SOCKET_VERBOSE",
+        "SOCKET_SILENT",
+        "SOCKET_DRY_RUN",
+        "SOCKET_YES",
+        "SOCKET_LOCK_TIMEOUT",
+        "SOCKET_BREAK_LOCK",
+        "SOCKET_DEBUG",
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_SAVE_ONLY",
+        "SOCKET_ONE_OFF",
+        "SOCKET_ALL_RELEASES",
+    ];
+
+    fn binary() -> std::path::PathBuf {
+        env!("CARGO_BIN_EXE_socket-patch").into()
+    }
+
+    /// Run the CLI with `args` in `cwd`; returns `(exit_code, stdout, stderr)`.
+    /// The whole `SOCKET_*` surface is stripped so behaviour reflects the
+    /// explicit flags alone — no ambient var can stand in for a flag.
+    fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+        let mut cmd = Command::new(binary());
+        cmd.args(args).current_dir(cwd);
+        for var in SOCKET_ENV_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd.output().expect("failed to execute socket-patch binary");
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// Independent oracle: parse package.json with serde_json (a plain JSON
+    /// read, NOT the production setup detector) and return a named lifecycle
+    /// script, if present and a string.
+    fn lifecycle_script(root: &Path, key: &str) -> Option<String> {
+        let text = std::fs::read_to_string(root.join("package.json")).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("package.json is not valid JSON after CLI ran: {e}\n{text}"));
+        val.get("scripts")
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    fn stage_project(root: &Path) {
+        // A package.json with a pre-existing postinstall step. No lockfile, so
+        // the npm-family detector resolves to plain npm. No Cargo.toml /
+        // pyproject, so only the npm branch of `setup` fires.
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{
+  "name": "sm-npm-host-guard",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {{
+    "postinstall": "{USER_POSTINSTALL}"
+  }},
+  "dependencies": {{}}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// setup → check → remove → check, asserting REAL on-disk package.json
+    /// state at every stage. This is the assertion the soft-skipping Docker
+    /// matrix can never make.
+    #[test]
+    fn npm_setup_roundtrip_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_project(root);
+        let root_s = root.to_str().unwrap();
+
+        // ── pristine precondition ──────────────────────────────────────────
+        // Pin the BEFORE state so post-setup assertions prove `setup` CREATED
+        // the hook, not that a leftover fixture already contained it.
+        let pristine = std::fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(
+            !pristine.contains(NPM_APPLY_CMD),
+            "fixture must start WITHOUT the socket-patch hook:\n{pristine}"
+        );
+        assert_eq!(
+            lifecycle_script(root, "postinstall").as_deref(),
+            Some(USER_POSTINSTALL),
+            "fixture must start with only the user's postinstall step"
+        );
+
+        // ── check (before setup): unconfigured → must report non-zero ──────
+        // Proves `--check` reads real state instead of hardcoding success.
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s]);
+        assert_eq!(
+            code, 1,
+            "setup --check must FAIL (exit 1) on an unconfigured project.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+
+        // ── setup ──────────────────────────────────────────────────────────
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes"]);
+        assert_eq!(code, 0, "setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+
+        // The postinstall hook must now carry the apply command AND the npm
+        // ecosystem filter, run FIRST, and PRESERVE the user's original step.
+        let post = lifecycle_script(root, "postinstall")
+            .unwrap_or_else(|| panic!("postinstall script missing after setup"));
+        assert!(
+            post.contains(NPM_APPLY_CMD) && post.contains(NPM_ECOSYSTEM_FLAG),
+            "postinstall must contain the npm apply command after setup, got: {post:?}"
+        );
+        assert!(
+            post.contains(USER_POSTINSTALL),
+            "setup must PRESERVE the user's existing postinstall step, got: {post:?}"
+        );
+        assert!(
+            post.trim_start().starts_with("npx ")
+                && post.find(NPM_APPLY_CMD) < post.find(USER_POSTINSTALL),
+            "the patch apply command must be prepended to run BEFORE the user's step, got: {post:?}"
+        );
+        // setup also wires the `dependencies` lifecycle script (created fresh,
+        // since the fixture had none).
+        let deps = lifecycle_script(root, "dependencies")
+            .unwrap_or_else(|| panic!("dependencies script missing after setup"));
+        assert!(
+            deps.contains(NPM_APPLY_CMD) && deps.contains(NPM_ECOSYSTEM_FLAG),
+            "the `dependencies` lifecycle script must also be configured, got: {deps:?}"
+        );
+
+        // ── check (configured): must report zero ───────────────────────────
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s]);
+        assert_eq!(
+            code, 0,
+            "setup --check must PASS (exit 0) after setup.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+
+        // ── remove ──────────────────────────────────────────────────────────
+        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes"]);
+        assert_eq!(code, 0, "setup --remove must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+
+        // The apply command must be gone everywhere, and the user's original
+        // postinstall step restored intact (not left mangled by the removal).
+        let after = std::fs::read_to_string(root.join("package.json")).unwrap();
+        assert!(
+            !after.contains(NPM_APPLY_CMD),
+            "the socket-patch apply command must be removed from package.json:\n{after}"
+        );
+        assert_eq!(
+            lifecycle_script(root, "postinstall").as_deref(),
+            Some(USER_POSTINSTALL),
+            "remove must restore the user's original postinstall step verbatim:\n{after}"
+        );
+
+        // ── check (after remove): back to needs-configuration ───────────────
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s]);
+        assert_eq!(
+            code, 1,
+            "setup --check must FAIL (exit 1) again after remove.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+    }
+}

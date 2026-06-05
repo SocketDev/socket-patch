@@ -202,6 +202,17 @@ echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
 
+# 2b. sync must NOT have written the patch to the package file (its
+#     un-forced apply hits a HashMismatch). If it had, the marker on disk
+#     would be attributable to sync rather than the forced apply below,
+#     and a totally no-op `apply` would pass the marker grep vacuously.
+#     Pinning the file pristine here makes step 3's `apply` the sole
+#     writer, so a broken apply can't ride on sync's coattails.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
+  echo "FAIL: scan --sync already wrote the marker; apply is no longer the verified writer" >&2
+  exit 1
+fi
+
 # 3. apply must report success (exit 0) — not merely leave a marker
 #    behind while reporting partial failure.
 socket-patch apply --json --force --offline --ecosystems nuget >/tmp/apply.out 2>/tmp/apply.err
@@ -213,6 +224,31 @@ if [ "$APPLY_RC" -ne 0 ]; then
   echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
   exit 1
 fi
+
+# 3b. exit 0 alone does not prove anything was applied: a no-op apply
+#     (applied:0) also exits 0. The apply JSON must report exactly one
+#     file applied, zero skipped, zero failed, status success. The
+#     trailing comma anchors `"applied": 1` so it can't match `10`/`11`.
+grep -q '"applied": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report applied:1 (no-op apply?)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"failed": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report failed:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"skipped": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"status": "success"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON status was not success" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
 
 # 4. The on-disk file must EXACTLY equal the served blob — not merely
 #    contain the marker substring (which a partial/corrupt write could).
@@ -294,6 +330,14 @@ echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
 
+# 2b. sync must NOT have written the patch (HashMismatch on un-forced
+#     apply). Pinning the file pristine here makes step 3's forced apply
+#     the sole writer, so a no-op apply can't pass on sync's coattails.
+if grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then
+  echo "FAIL: scan --sync already wrote the marker; apply is no longer the verified writer" >&2
+  exit 1
+fi
+
 # 3. apply must exit 0.
 socket-patch apply --json --force --offline --global --ecosystems nuget >/tmp/apply.out 2>/tmp/apply.err
 APPLY_RC=$?
@@ -304,6 +348,29 @@ if [ "$APPLY_RC" -ne 0 ]; then
   echo "FAIL: apply exited $APPLY_RC (expected 0 on a forced apply)" >&2
   exit 1
 fi
+
+# 3b. exit 0 does not prove a write happened. The apply JSON must report
+#     exactly one file applied, zero skipped, zero failed, status success.
+grep -q '"applied": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report applied:1 (no-op apply?)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"failed": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report failed:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"skipped": 0,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:0" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"status": "success"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON status was not success" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
 
 # 4. Exact-bytes verification, not just substring.
 if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$LICENSE_FILE"; then

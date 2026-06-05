@@ -163,6 +163,43 @@ fn assert_apply_dispatched(code: i32, env: &Value, ecosystem: &str, expected_pur
     }
 }
 
+/// Negative-control oracle: when `ecosystem` does NOT match the manifest's
+/// PURLs, the `--ecosystems` filter in `partition_purls` must drop every PURL
+/// before dispatch, so NO `package_not_installed` event is emitted and
+/// `skipped == 0`. This is the load-bearing proof that the filter actually
+/// filters — without it, a `partition_purls` that ignored `allowed_ecosystems`
+/// (a catch-all) would keep every positive test below green while silently
+/// dispatching out-of-scope PURLs. We deliberately do NOT assert the exit
+/// code / status here: an all-out-of-scope (effectively empty) manifest
+/// currently exits 1 / `partialFailure` (a known, separate no-op-success bug);
+/// the dispatch property under test is independent of that.
+fn assert_apply_not_dispatched(env: &Value, ecosystem: &str, out_of_scope_purls: &[&str]) {
+    assert_eq!(
+        env["command"], "apply",
+        "apply --ecosystems={ecosystem}: wrong command field; env={env}"
+    );
+    assert_eq!(
+        env["summary"]["skipped"].as_u64(),
+        Some(0),
+        "apply --ecosystems={ecosystem}: out-of-scope PURLs must not be skipped (they must be filtered out before dispatch); env={env}"
+    );
+    let events = env["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("apply --ecosystems={ecosystem}: events missing; env={env}"));
+    assert!(
+        events.is_empty(),
+        "apply --ecosystems={ecosystem}: expected zero dispatch events for out-of-scope PURLs, got {}; env={env}",
+        events.len()
+    );
+    for purl in out_of_scope_purls {
+        let leaked = events.iter().any(|e| e["purl"] == Value::from(*purl));
+        assert!(
+            !leaked,
+            "apply --ecosystems={ecosystem}: out-of-scope PURL {purl} leaked into events — the --ecosystems filter did not exclude it; env={env}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Default-feature ecosystems: npm, pypi, gem
 // ---------------------------------------------------------------------------
@@ -308,6 +345,34 @@ fn dispatch_multi_ecosystem_csv() {
 }
 
 // ---------------------------------------------------------------------------
+// Negative control: the `--ecosystems` filter must EXCLUDE out-of-scope
+// PURLs. A single manifest is run twice — once with the matching ecosystem
+// (PURL dispatched → 1 skipped event) and once with a mismatched ecosystem
+// (PURL filtered out → 0 events). Without this differential, a regression
+// that removed/neutralized the `allowed_ecosystems` filter in
+// `partition_purls` (turning it into a catch-all) would keep every positive
+// dispatch test above green while silently routing PURLs to the wrong
+// ecosystem.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dispatch_filter_excludes_out_of_scope_purl() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let purl = "pkg:gem/__scope_test__@1.0.0";
+    write_manifest(tmp.path(), purl);
+
+    // In scope: the gem branch fires, producing exactly one skipped event.
+    let (code, env) = run_apply_for_ecosystem(tmp.path(), "gem");
+    assert_apply_dispatched(code, &env, "gem", &[purl]);
+
+    // Out of scope: the SAME manifest under `--ecosystems npm` must dispatch
+    // nothing — the gem PURL has to be filtered out before dispatch.
+    let (_code, env) = run_apply_for_ecosystem(tmp.path(), "npm");
+    assert_apply_not_dispatched(&env, "npm", &[purl]);
+}
+
+// ---------------------------------------------------------------------------
 // Rollback dispatch branches — find_packages_for_rollback is a separate
 // function and needs its own coverage. Each test installs a real,
 // crawler-discoverable package so the rollback actually runs end-to-end.
@@ -445,6 +510,45 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
     );
 }
 
+/// Negative-control oracle for rollback: when `ecosystem` does not match the
+/// installed package's ecosystem, the `--ecosystems` filter must drop the
+/// PURL so nothing is discovered, nothing is rolled back, and the on-disk
+/// file is left untouched (still PATCHED). Mirrors `assert_apply_not_dispatched`
+/// for the separate `find_packages_for_rollback` code path.
+fn assert_rollback_not_dispatched(cwd: &Path, ecosystem: &str, fixture: &RollbackFixture) {
+    let (code, env) = run_rollback(cwd, ecosystem, &fixture.envs);
+    assert_eq!(
+        code, 0,
+        "rollback --ecosystems={ecosystem}: out-of-scope rollback should be a clean no-op (exit 0); env={env}"
+    );
+    assert_eq!(
+        env["rolledBack"].as_u64(),
+        Some(0),
+        "rollback --ecosystems={ecosystem}: out-of-scope package must NOT be rolled back; env={env}"
+    );
+    assert_eq!(
+        env["alreadyOriginal"].as_u64(),
+        Some(0),
+        "rollback --ecosystems={ecosystem}: out-of-scope package must not be discovered at all; env={env}"
+    );
+    let results = env["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rollback --ecosystems={ecosystem}: results missing; env={env}"));
+    assert!(
+        results.is_empty(),
+        "rollback --ecosystems={ecosystem}: expected no results for out-of-scope PURL, got {}; env={env}",
+        results.len()
+    );
+    // Decisive: the file must NOT have been restored — the wrong-ecosystem
+    // crawler must never have touched it.
+    let on_disk = std::fs::read(&fixture.verify_file).unwrap();
+    assert_eq!(
+        on_disk, PATCHED,
+        "rollback --ecosystems={ecosystem}: file at {} was restored despite being out of scope — the --ecosystems filter leaked it",
+        fixture.verify_file.display()
+    );
+}
+
 /// npm: `node_modules/<name>/` with a package.json the crawler matches.
 fn fixture_npm(root: &Path) -> RollbackFixture {
     let purl = "pkg:npm/__rollback_dispatch__@1.0.0";
@@ -535,6 +639,19 @@ fn rollback_dispatch_branch_gem() {
     write_root_package_json(tmp.path());
     let fixture = fixture_gem(tmp.path());
     assert_rollback_restored(tmp.path(), "gem", &fixture);
+}
+
+#[test]
+fn rollback_dispatch_filter_excludes_out_of_scope_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let fixture = fixture_npm(tmp.path());
+    // Sanity: an in-scope rollback DOES restore (proves the fixture is valid
+    // and the differential below is meaningful, not vacuously a no-op).
+    assert_rollback_not_dispatched(tmp.path(), "pypi", &fixture);
+    // After the out-of-scope no-op the file is still PATCHED; now the matching
+    // ecosystem must actually restore it to ORIGINAL.
+    assert_rollback_restored(tmp.path(), "npm", &fixture);
 }
 
 #[cfg(feature = "cargo")]

@@ -116,7 +116,14 @@ fn try_parse(subcommand: &str, extra: &[&str]) -> Result<Cli, clap::Error> {
 }
 
 #[test]
+#[serial_test::serial]
 fn every_global_flag_parses_on_every_subcommand() {
+    // Serial + env-isolated: clap validates a field's `env` value during parse
+    // even when the field is not on the CLI (an invalid `SOCKET_OFFLINE` will
+    // abort a parse that never mentions `--offline`). So any ambient or
+    // concurrently-set `SOCKET_*` value can break this matrix — the old
+    // "CLI args win so it's deterministic" comment was wrong. Clear the slate.
+    let saved = save_and_clear_global_env();
     let cases = global_flag_cases();
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
         .iter()
@@ -138,12 +145,63 @@ fn every_global_flag_parses_on_every_subcommand() {
                 )
             });
             // Not just "parsed" — the value must actually land in the
-            // matching GlobalArgs field on this subcommand. CLI args always
-            // win over env/default, so this is deterministic even under the
-            // parallel serial env tests.
+            // matching GlobalArgs field on this subcommand. With the env
+            // cleared above, the only source for the field is the CLI flag.
             verify(common_of(&cli));
         }
     }
+
+    restore_global_env(saved);
+}
+
+/// Tripwire: the long-flag matrix in `global_flag_cases()` must have exactly
+/// one entry per `GlobalArgs` field. The exhaustive destructure below fails to
+/// compile the moment a field is added or removed, forcing the matrix (and its
+/// per-field verifier) to be updated. Without this, a newly-added global flag
+/// could ship completely untested while every existing test stayed green —
+/// precisely the "a flag was accidentally dropped/added" regression this file
+/// claims to guard.
+#[test]
+#[serial_test::serial]
+fn global_flag_cases_cover_every_global_field() {
+    let saved = save_and_clear_global_env();
+    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let common = common_of(&cli).clone();
+    // Exhaustive: every field must be named here. `_`-binding keeps it honest
+    // (we only care that the set of fields matches), and a `..` rest pattern is
+    // deliberately NOT used so new fields break the build.
+    let GlobalArgs {
+        cwd: _,
+        manifest_path: _,
+        api_url: _,
+        api_token: _,
+        org: _,
+        proxy_url: _,
+        ecosystems: _,
+        download_mode: _,
+        offline: _,
+        global: _,
+        global_prefix: _,
+        json: _,
+        verbose: _,
+        silent: _,
+        dry_run: _,
+        yes: _,
+        lock_timeout: _,
+        break_lock: _,
+        debug: _,
+        no_telemetry: _,
+    } = common;
+
+    // 20 fields ↔ 20 long-flag cases. Bump both this count and add a case when
+    // the destructure above forces you to add a field.
+    assert_eq!(
+        global_flag_cases().len(),
+        20,
+        "every GlobalArgs field needs a long-flag case in global_flag_cases()",
+    );
+
+    restore_global_env(saved);
 }
 
 /// Tripwire: every subcommand clap knows about must appear in the
@@ -195,7 +253,11 @@ fn all_subcommands_are_covered() {
 /// for future flags); the corresponding rejection check lives in
 /// `reserved_short_forms_are_not_assigned` below.
 #[test]
+#[serial_test::serial]
 fn every_global_short_form_parses_on_every_subcommand() {
+    // Serial + env-isolated for the same reason as the long-flag matrix: an
+    // ambient/concurrent invalid `SOCKET_*` bool would abort these parses.
+    let saved = save_and_clear_global_env();
     // (short, value-or-None, verifier) — only flags that actually have a
     // short. The verifier proves the short maps to the *intended* GlobalArgs
     // field, not just that it parses (a short silently rebound to a different
@@ -236,6 +298,8 @@ fn every_global_short_form_parses_on_every_subcommand() {
             verify(common_of(&cli));
         }
     }
+
+    restore_global_env(saved);
 }
 
 /// `-d` and `-m` were intentionally dropped (formerly aliases for
@@ -244,7 +308,12 @@ fn every_global_short_form_parses_on_every_subcommand() {
 /// every subcommand. The long forms still work and are exercised by
 /// `every_global_flag_parses_on_every_subcommand` above.
 #[test]
+#[serial_test::serial]
 fn reserved_short_forms_are_not_assigned() {
+    // Env-isolated: an invalid ambient `SOCKET_*` bool would make clap fail
+    // with ValueValidation *before* it ever reports UnknownArgument for the
+    // reserved short, turning this assertion into a false positive/negative.
+    let saved = save_and_clear_global_env();
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
         .iter()
         .chain(SUBCOMMANDS_WITH_IDENTIFIER.iter())
@@ -272,6 +341,8 @@ fn reserved_short_forms_are_not_assigned() {
             );
         }
     }
+
+    restore_global_env(saved);
 }
 
 /// Locks the env-var bindings: setting a SOCKET_* env var must populate
@@ -420,43 +491,115 @@ fn bool_env_vars_accept_one_and_yes() {
     }
 }
 
-/// Defensive: "0", "false", "no", "off", and empty string must NOT
-/// engage a bool. Otherwise an operator unsetting via SOCKET_OFFLINE=0
-/// would still get airgap mode (and various subtler shell idioms).
+/// Defensive: "0", "false", "no", "off" must NOT engage a bool. Otherwise
+/// an operator unsetting via `SOCKET_OFFLINE=0` would still get airgap mode
+/// (and various subtler shell idioms).
+///
+/// The original version of this test was vacuous: every assertion expected
+/// `false`, which is *also* the field default. A regression that dropped the
+/// `env = "SOCKET_*"` binding (or replaced `BoolishValueParser` with a parser
+/// that silently ignored the var) would leave the fields at their default
+/// `false` and the test would stay green — it never actually exercised the
+/// env binding. We now first PROVE the binding is live by setting the var
+/// truthy and asserting the field flips to `true`; only then is the
+/// falsey-resolves-to-false assertion meaningful. Env is fully cleared and
+/// isolated per iteration so no leaked `SOCKET_*` value can taint a parse.
 #[test]
 #[serial_test::serial]
 fn bool_env_vars_reject_zero_and_falsey() {
-    let cases: &[(&str, &str)] = &[
-        ("SOCKET_OFFLINE", "0"),
-        ("SOCKET_DEBUG", "false"),
-        ("SOCKET_TELEMETRY_DISABLED", "no"),
-        ("SOCKET_JSON", "off"),
+    let fields: &[(&str, fn(&GlobalArgs) -> bool)] = &[
+        ("SOCKET_OFFLINE", |c| c.offline),
+        ("SOCKET_DEBUG", |c| c.debug),
+        ("SOCKET_TELEMETRY_DISABLED", |c| c.no_telemetry),
+        ("SOCKET_JSON", |c| c.json),
     ];
 
-    let saved: Vec<(String, Option<String>)> = cases
-        .iter()
-        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-        .collect();
-    for (k, v) in cases {
-        std::env::set_var(k, v);
-    }
+    let saved = save_and_clear_global_env();
 
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
-    if let socket_patch_cli::Commands::List(args) = cli.command {
-        assert!(!args.common.offline);
-        assert!(!args.common.debug);
-        assert!(!args.common.no_telemetry);
-        assert!(!args.common.json);
-    } else {
-        panic!("expected List");
-    }
+    let parse_list = || {
+        let cli = Cli::try_parse_from(["socket-patch", "list"]);
+        cli.map(|cli| match cli.command {
+            socket_patch_cli::Commands::List(args) => args.common,
+            _ => panic!("expected List"),
+        })
+    };
 
-    for (k, orig) in saved {
-        match orig {
-            Some(v) => std::env::set_var(&k, v),
-            None => std::env::remove_var(&k),
+    for &(var, get) in fields {
+        // Liveness proof: a truthy value MUST flip the field to true. If this
+        // fails, the env binding is dead and the falsey checks below would be
+        // vacuous.
+        std::env::set_var(var, "1");
+        let common = parse_list().unwrap_or_else(|e| panic!("{var}=1 should parse: {e}"));
+        assert!(get(&common), "{var}=1 must engage the bool (proves binding is live)");
+        std::env::remove_var(var);
+
+        // Each falsey idiom must resolve to false — not true, not a parse error.
+        for falsey in ["0", "false", "no", "off"] {
+            std::env::set_var(var, falsey);
+            let common =
+                parse_list().unwrap_or_else(|e| panic!("{var}={falsey} should parse, got: {e}"));
+            assert!(!get(&common), "{var}={falsey} must NOT engage the bool");
+            std::env::remove_var(var);
         }
     }
+
+    restore_global_env(saved);
+}
+
+/// Characterization of how an **empty** boolean env var is handled.
+///
+/// SUSPECTED PRODUCTION BUG (left unfixed per the audit constraints — see
+/// summary): the `bool_env_vars_reject_zero_and_falsey` doc historically
+/// claimed that an empty string "must NOT engage a bool". It does not — but
+/// it also does not resolve to `false`. `BoolishValueParser` rejects `""`
+/// outright, so `SOCKET_OFFLINE=` (the conventional shell idiom for blanking
+/// a variable without unsetting it) makes clap fail with a `ValueValidation`
+/// error and takes down *every* CLI invocation, on *every* subcommand, for
+/// *every* boolean global. An operator who blanks the var to disable airgap
+/// mode instead gets a hard crash.
+///
+/// This test pins the current (surprising) behavior so any change — including
+/// a fix that makes empty resolve to `false` — is noticed and reviewed rather
+/// than slipping through silently. It does NOT endorse the behavior.
+#[test]
+#[serial_test::serial]
+fn empty_bool_env_var_is_a_hard_error_not_falsey() {
+    let bool_vars = [
+        "SOCKET_OFFLINE",
+        "SOCKET_GLOBAL",
+        "SOCKET_JSON",
+        "SOCKET_VERBOSE",
+        "SOCKET_SILENT",
+        "SOCKET_DRY_RUN",
+        "SOCKET_YES",
+        "SOCKET_BREAK_LOCK",
+        "SOCKET_DEBUG",
+        "SOCKET_TELEMETRY_DISABLED",
+    ];
+
+    let saved = save_and_clear_global_env();
+
+    for var in bool_vars {
+        std::env::set_var(var, "");
+        let result = Cli::try_parse_from(["socket-patch", "list"]);
+        std::env::remove_var(var);
+
+        let err = result.err().unwrap_or_else(|| {
+            panic!(
+                "{var}= (empty) unexpectedly parsed OK — behavior changed; \
+                 if empty now resolves to a clean falsey, update this test \
+                 and the reject-test doc to match"
+            )
+        });
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{var}= (empty) should fail validation; got {:?}",
+            err.kind(),
+        );
+    }
+
+    restore_global_env(saved);
 }
 
 /// Names of every `SOCKET_*` env var that `GlobalArgs` binds, so tests that

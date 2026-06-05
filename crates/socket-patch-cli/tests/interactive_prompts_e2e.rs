@@ -271,10 +271,15 @@ fn remove_interactive_y_proceeds() {
     );
     assert_eq!(code, 0);
     // The interactive confirm MUST have run (printed to the tty via stderr),
-    // not the non-interactive auto-default branch.
+    // not the non-interactive auto-default branch. Match the DISTINCTIVE
+    // prompt text ("...and rollback files?") rather than the loose pair
+    // `contains("Remove") && contains("patch(es)")` — the latter is also
+    // satisfied by the SUCCESS line "Removed 1 patch(es) from manifest:",
+    // so it would stay green even if the confirm prompt were dropped and the
+    // command auto-removed. The exact count ("1") pins single-entry preview.
     assert!(
-        output.contains("Remove") && output.contains("patch(es)"),
-        "remove must have shown the interactive confirm prompt; got: {output}"
+        output.contains("Remove 1 patch(es) and rollback files?"),
+        "remove must have shown the interactive confirm prompt verbatim; got: {output}"
     );
     assert!(
         !output.contains("Non-interactive mode"),
@@ -307,9 +312,12 @@ fn remove_interactive_n_cancels() {
     );
     assert_eq!(code, 0, "remove 'n' must exit cleanly");
     // The interactive confirm MUST have run and the cancellation path taken.
+    // Match the verbatim prompt (see remove_interactive_y_proceeds): the loose
+    // `contains("Remove") && contains("patch(es)")` pair could also be matched
+    // by the preview banner, masking a dropped confirm prompt.
     assert!(
-        output.contains("Remove") && output.contains("patch(es)"),
-        "remove must have shown the interactive confirm prompt; got: {output}"
+        output.contains("Remove 1 patch(es) and rollback files?"),
+        "remove must have shown the interactive confirm prompt verbatim; got: {output}"
     );
     assert!(
         !output.contains("Non-interactive mode"),

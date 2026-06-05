@@ -85,21 +85,56 @@ mod host_guard {
         )
     }
 
-    /// Parse the CLI's `--json` stdout and return the top-level `status`
-    /// field. Panics (loudly) if stdout is not the single JSON object the
-    /// command promises — a non-JSON / multi-line dump means the command
-    /// did not run the path we think it did.
-    fn json_status(stdout: &str, who: &str) -> String {
-        let v: serde_json::Value = serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}"));
-        v.get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or_else(|| panic!("{who}: JSON has no string `status` field:\n{stdout}"))
-            .to_string()
+    /// Parse the CLI's `--json` stdout into the single top-level object the
+    /// command promises. Panics (loudly) if stdout is not exactly that — a
+    /// non-JSON / multi-line dump means the command did not run the path we
+    /// think it did.
+    fn parse_obj(stdout: &str, who: &str) -> serde_json::Value {
+        serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}"))
     }
 
-    /// Assert composer.json is byte-for-byte what we wrote, and that no
-    /// foreign npm `package.json` hook was created beside it.
+    /// Assert the parsed result is a genuine clean no-op for an unsupported
+    /// ecosystem: `status == "no_files"` AND an *empty* `files` array. The
+    /// `files` check is not redundant — a regression that mis-detected the
+    /// composer manifest could keep `status: "no_files"` while listing files
+    /// it touched, or vice versa; both must agree that nothing was done.
+    fn assert_no_files_status(stdout: &str, who: &str) {
+        let v = parse_obj(stdout, who);
+        assert_eq!(
+            v.get("status").and_then(|s| s.as_str()),
+            Some("no_files"),
+            "{who}: must report status=no_files for a composer-only project; \
+             any other status (esp. \"configured\") would falsely claim composer is supported.\n{stdout}"
+        );
+        let files = v
+            .get("files")
+            .and_then(|f| f.as_array())
+            .unwrap_or_else(|| panic!("{who}: JSON has no `files` array:\n{stdout}"));
+        assert!(
+            files.is_empty(),
+            "{who}: a no_files result must carry an EMPTY files array; \
+             a non-empty list means setup acted on something it claims not to have.\n{stdout}"
+        );
+    }
+
+    /// Immediate entry names under `root`, sorted — for proving the directory
+    /// was not littered with foreign artifacts.
+    fn dir_entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap_or_else(|e| panic!("read_dir({}): {e}", root.display()))
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Assert composer.json is byte-for-byte what we wrote, AND that the
+    /// project directory still contains *only* composer.json. The directory
+    /// check is the real teeth: a clean no-op for an unsupported ecosystem
+    /// must create NOTHING — not an npm `package.json` hook, not a `.socket/`
+    /// dir, not a lockfile, not a `.pth`, nothing. Probing for one specific
+    /// filename (`package.json`) would let any other foreign artifact through.
     fn assert_manifest_pristine(root: &Path, who: &str) {
         assert_eq!(
             std::fs::read_to_string(root.join("composer.json")).unwrap(),
@@ -109,6 +144,12 @@ mod host_guard {
         assert!(
             !root.join("package.json").exists(),
             "{who}: setup must NOT inject an npm package.json hook into a composer-only project"
+        );
+        assert_eq!(
+            dir_entries(root),
+            vec!["composer.json".to_string()],
+            "{who}: a clean no-op must leave the project dir containing ONLY composer.json; \
+             any extra entry means setup wrote a foreign artifact into a composer-only project"
         );
     }
 
@@ -129,12 +170,7 @@ mod host_guard {
             code, 0,
             "setup --check on a composer-only project must exit 0.\nstdout:\n{out}\nstderr:\n{err}"
         );
-        assert_eq!(
-            json_status(&out, "check (pristine)"),
-            "no_files",
-            "setup --check must report no recognised manifests for a composer-only project; \
-             any other status (esp. \"configured\") would falsely claim composer is supported.\nstderr:\n{err}"
-        );
+        assert_no_files_status(&out, "check (pristine)");
         assert_manifest_pristine(root, "after check (pristine)");
 
         // ── setup ────────────────────────────────────────────────────────────
@@ -143,13 +179,8 @@ mod host_guard {
             code, 0,
             "setup on a composer-only project must exit 0 (clean no-op).\nstdout:\n{out}\nstderr:\n{err}"
         );
-        let v: serde_json::Value = serde_json::from_str(out.trim())
-            .unwrap_or_else(|e| panic!("setup: stdout was not a single JSON object ({e}):\n{out}"));
-        assert_eq!(
-            v.get("status").and_then(|s| s.as_str()),
-            Some("no_files"),
-            "setup must report status=no_files for a composer-only project.\nstderr:\n{err}"
-        );
+        assert_no_files_status(&out, "setup");
+        let v = parse_obj(&out, "setup");
         // It must claim to have changed nothing — not silently report work.
         assert_eq!(
             v.get("updated").and_then(|n| n.as_i64()),
@@ -161,6 +192,13 @@ mod host_guard {
             Some(0),
             "setup must report errors=0 for a composer-only project.\n{out}"
         );
+        // ...and must NOT falsely claim the project was already configured —
+        // that would mask a regression that mis-classifies composer as set up.
+        assert_eq!(
+            v.get("alreadyConfigured").and_then(|n| n.as_i64()),
+            Some(0),
+            "setup must report alreadyConfigured=0 for an unsupported composer-only project.\n{out}"
+        );
         assert_manifest_pristine(root, "after setup");
 
         // ── check (after setup): the no-op must not have configured anything ──
@@ -169,11 +207,7 @@ mod host_guard {
             code, 0,
             "setup --check (post-setup) must still exit 0.\nstdout:\n{out}\nstderr:\n{err}"
         );
-        assert_eq!(
-            json_status(&out, "check (post-setup)"),
-            "no_files",
-            "setup must not have configured a composer-only project; check must still be no_files.\nstderr:\n{err}"
-        );
+        assert_no_files_status(&out, "check (post-setup)");
         assert_manifest_pristine(root, "after check (post-setup)");
 
         // ── remove: also a clean no-op, manifest still pristine ───────────────
@@ -182,11 +216,7 @@ mod host_guard {
             code, 0,
             "setup --remove on a composer-only project must exit 0.\nstdout:\n{out}\nstderr:\n{err}"
         );
-        assert_eq!(
-            json_status(&out, "remove"),
-            "no_files",
-            "setup --remove must report no_files for a composer-only project.\nstderr:\n{err}"
-        );
+        assert_no_files_status(&out, "remove");
         assert_manifest_pristine(root, "after remove");
     }
 }

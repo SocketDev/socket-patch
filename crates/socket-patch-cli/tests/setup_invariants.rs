@@ -9,13 +9,61 @@ fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
 
+/// Every `SOCKET_*` env var that `setup` (via `GlobalArgs`) honours as a
+/// fallback for a CLI flag. These tests drive `setup` purely through flags and
+/// on-disk fixtures, so ANY of these leaking in from the developer's shell or
+/// CI would let an assertion pass for the wrong reason — e.g. an ambient
+/// `SOCKET_DRY_RUN=true` would keep a regressed `--check`/`--yes` path from
+/// writing (satisfying the "must not modify" checks vacuously), and an ambient
+/// `SOCKET_ECOSYSTEMS`/`SOCKET_YES`/`SOCKET_CWD` would silently change which
+/// manifest is touched and how the script is rendered. Scrub the whole set
+/// from every child so behaviour is decided by flags alone. Mirrors the
+/// hardened helpers in remove_network.rs / repair_invariants.rs.
+const SOCKET_ENV_VARS: &[&str] = &[
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_FORCE",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+    // Legacy / cargo-backend knobs that also steer setup behaviour.
+    "SOCKET_PATCH_ROOT",
+    "SOCKET_PATCH_BIN",
+    "SOCKET_PATCH_DEBUG",
+    "SOCKET_PATCH_PROXY_URL",
+    "SOCKET_PATCH_TELEMETRY_DISABLED",
+];
+
+/// Build a `setup` invocation with the full `SOCKET_*` environment scrubbed.
+fn setup_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn run_setup(cwd: &Path, extra: &[&str]) -> (i32, String) {
     let mut args = vec!["setup", "--json"];
     args.extend_from_slice(extra);
-    let out = Command::new(binary())
-        .args(&args)
-        .current_dir(cwd)
-        .env_remove("SOCKET_API_TOKEN")
+    let out = setup_command(cwd, &args)
         .output()
         .expect("run socket-patch");
     (
@@ -335,10 +383,7 @@ fn setup_malformed_does_not_claim_already_configured_in_human_mode() {
 
     // Human (non-JSON) mode: the misleading "All package.json files are
     // already configured" line must not appear when a file errored.
-    let out = Command::new(binary())
-        .args(["setup", "--yes"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
+    let out = setup_command(tmp.path(), &["setup", "--yes"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -548,10 +593,7 @@ fn setup_check_and_remove_are_mutually_exclusive() {
     write(&tmp.path().join("package.json"), r#"{ "name": "x" }"#);
 
     // clap conflict → usage error (exit 2), not a normal run.
-    let out = Command::new(binary())
-        .args(["setup", "--check", "--remove"])
-        .current_dir(tmp.path())
-        .env_remove("SOCKET_API_TOKEN")
+    let out = setup_command(tmp.path(), &["setup", "--check", "--remove"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);

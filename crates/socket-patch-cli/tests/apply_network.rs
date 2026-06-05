@@ -153,6 +153,24 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
         code, 0,
         "apply must succeed; stdout={stdout}; stderr={stderr}"
     );
+
+    // The whole point of this test is the ONLINE fetch path: the blob was
+    // neither pre-staged in `.socket/blobs/` nor present anywhere on disk,
+    // so the only way the file can end up with after-content is by the
+    // binary actually GETting it from the blob endpoint. Assert the mock
+    // recorded that request — otherwise a future regression that resolved
+    // the content some other way (or short-circuited) would stay green.
+    let requests = mock
+        .received_requests()
+        .await
+        .expect("wiremock records requests");
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == blob_path),
+        "apply must fetch the missing blob from the API; \
+         got requests={:?}",
+        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+    );
     // The fetch path must have actually applied the patch (not silently
     // no-op'd to a green exit). Assert the JSON summary, not just exit code.
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -160,6 +178,10 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
     assert_eq!(
         v["summary"]["applied"], 1,
         "online fetch must apply exactly one patch; stdout={stdout}"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "online fetch must not record any failures; stdout={stdout}"
     );
     let events = v["events"].as_array().expect("events array");
     assert!(
@@ -217,16 +239,25 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
         &mock.uri(),
         &["--ecosystems", "pypi"],
     );
-    // Exit code is 1 today (apply reports "nothing in scope" as a
-    // partial-failure / not-success state); both 0 and 1 are acceptable
-    // — what matters is that the file is NOT touched.
-    assert!(
-        code == 0 || code == 1,
-        "expected 0 or 1; got {code}; stdout={stdout}; stderr={stderr}"
+    // Filtering out npm leaves nothing in scope: apply reports this as a
+    // partial-failure (exit 1, status "partialFailure", all-zero summary).
+    // Pin the exact contract — a disjoint `0 || 1` accept would let a
+    // regression that flipped the exit code (or started "succeeding" while
+    // silently doing nothing) slip through.
+    assert_eq!(
+        code, 1,
+        "ecosystem filter with nothing in scope must exit 1; stdout={stdout}; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "apply");
+    assert_eq!(v["status"], "partialFailure");
     assert_eq!(v["summary"]["applied"], 0);
+    // Nothing in the npm ecosystem may even be discovered/downloaded once
+    // it's filtered out — guards against the filter being applied only at
+    // the write step while still crawling/fetching the excluded packages.
+    assert_eq!(v["summary"]["discovered"], 0, "filtered npm must not be discovered");
+    assert_eq!(v["summary"]["downloaded"], 0, "filtered npm must not be downloaded");
+    assert_eq!(v["summary"]["failed"], 0, "skipping out-of-scope is not a failure");
     // The excluded npm patch must not appear as an applied/patched event —
     // an empty `events` array or one without our purl is fine, but a
     // "patched" event for the skipped purl would mean the filter leaked.
@@ -291,14 +322,24 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
     assert_eq!(code, 0, "dry-run must succeed; stdout={stdout}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["dryRun"], true);
+    // Dry-run must report it would patch but never actually applies.
+    assert_eq!(
+        v["summary"]["applied"], 0,
+        "dry-run must not count any applied patch; stdout={stdout}"
+    );
     let events = v["events"].as_array().expect("events array");
-    let actions: Vec<&str> = events
-        .iter()
-        .map(|e| e["action"].as_str().unwrap())
-        .collect();
+    // The verified event must be for OUR purl, not some unrelated event;
+    // and dry-run must NOT emit a real "patched"/"applied" action.
     assert!(
-        actions.contains(&"verified"),
-        "dry-run must emit verified event; got actions={actions:?}"
+        events.iter().any(|e| e["purl"] == "pkg:npm/dryrun-target@1.0.0"
+            && e["action"] == "verified"),
+        "dry-run must emit a verified event for the target purl; events={events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["action"] != "patched" && e["action"] != "applied"),
+        "dry-run must not emit a patched/applied action; events={events:?}"
     );
 
     // File content must be UNCHANGED.

@@ -443,6 +443,227 @@ fn empty_manifest_json_has_no_events_via_binary() {
     assert_eq!(v["events"].as_array().expect("events array").len(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-record subprocess tests — the single-record fixtures above cannot tell
+// "lists every patch, counts them, and sorts them" apart from "renders only the
+// first entry / hardcodes the count / leaks HashMap order". These build a
+// manifest with several patches (each with multiple out-of-order vulns/files)
+// and assert the count header, full completeness, and the stable sort order on
+// the *human-readable* path of run() — which is reachable only via the binary.
+// ---------------------------------------------------------------------------
+
+/// Three patches inserted in non-alphabetical PURL order, each carrying
+/// multiple vulnerabilities and files (also out of order), so the test can pin
+/// the count, completeness, and the by-PURL / by-id / by-path sort contract.
+fn multi_manifest() -> PatchManifest {
+    fn record(uuid: &str, vulns: &[(&str, &str)], files: &[&str]) -> PatchRecord {
+        let mut file_map = HashMap::new();
+        for fp in files {
+            file_map.insert(
+                fp.to_string(),
+                PatchFileInfo {
+                    before_hash: "a".repeat(64),
+                    after_hash: "b".repeat(64),
+                },
+            );
+        }
+        let mut vuln_map = HashMap::new();
+        for (id, cve) in vulns {
+            vuln_map.insert(
+                id.to_string(),
+                VulnerabilityInfo {
+                    cves: vec![cve.to_string()],
+                    summary: format!("summary for {id}"),
+                    severity: "high".to_string(),
+                    description: "desc".to_string(),
+                },
+            );
+        }
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: file_map,
+            vulnerabilities: vuln_map,
+            description: format!("description for {uuid}"),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        }
+    }
+
+    let mut patches = HashMap::new();
+    // Insert deliberately out of sorted order: zzz, aaa, mmm.
+    patches.insert(
+        "pkg:npm/zzz-pkg@3.0.0".to_string(),
+        record(
+            "33333333-3333-4333-8333-333333333333",
+            &[
+                ("GHSA-zzzz-0000-0003", "CVE-2024-3003"),
+                ("GHSA-aaaa-0000-0003", "CVE-2024-3001"),
+            ],
+            &["zzz/z.js", "zzz/a.js"],
+        ),
+    );
+    patches.insert(
+        "pkg:npm/aaa-pkg@1.0.0".to_string(),
+        record(
+            "11111111-1111-4111-8111-111111111111",
+            &[("GHSA-mmmm-0000-0001", "CVE-2024-1001")],
+            &["aaa/only.js"],
+        ),
+    );
+    patches.insert(
+        "pkg:npm/mmm-pkg@2.0.0".to_string(),
+        record(
+            "22222222-2222-4222-8222-222222222222",
+            &[("GHSA-cccc-0000-0002", "CVE-2024-2002")],
+            &["mmm/only.js"],
+        ),
+    );
+    PatchManifest { patches }
+}
+
+/// Byte offset of `needle` in `haystack`; panics with context if absent.
+fn pos_of(haystack: &str, needle: &str) -> usize {
+    haystack
+        .find(needle)
+        .unwrap_or_else(|| panic!("expected to find {needle:?} in:\n{haystack}"))
+}
+
+#[test]
+fn multi_manifest_plain_lists_all_records_sorted_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &multi_manifest());
+
+    let out = run_list_binary(tmp.path(), &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "multi list must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Count header must reflect the real number of patches, not a hardcode.
+    assert!(
+        stdout.contains("Found 3 patch(es):"),
+        "count header must say 3, got: {stdout}"
+    );
+
+    // Every package must be listed (catches "only renders the first entry").
+    let p_aaa = pos_of(&stdout, "Package: pkg:npm/aaa-pkg@1.0.0");
+    let p_mmm = pos_of(&stdout, "Package: pkg:npm/mmm-pkg@2.0.0");
+    let p_zzz = pos_of(&stdout, "Package: pkg:npm/zzz-pkg@3.0.0");
+    // ...and in stable, PURL-sorted order despite reversed insertion order.
+    assert!(
+        p_aaa < p_mmm && p_mmm < p_zzz,
+        "packages must be sorted by PURL (aaa<mmm<zzz), got offsets aaa={p_aaa} mmm={p_mmm} zzz={p_zzz}:\n{stdout}"
+    );
+
+    // Per-record completeness: every uuid, vuln id, cve and file must appear.
+    for needle in [
+        "UUID: 11111111-1111-4111-8111-111111111111",
+        "UUID: 22222222-2222-4222-8222-222222222222",
+        "UUID: 33333333-3333-4333-8333-333333333333",
+        "GHSA-mmmm-0000-0001",
+        "GHSA-cccc-0000-0002",
+        "GHSA-zzzz-0000-0003",
+        "GHSA-aaaa-0000-0003",
+        "CVE-2024-1001",
+        "CVE-2024-2002",
+        "CVE-2024-3001",
+        "CVE-2024-3003",
+        "aaa/only.js",
+        "mmm/only.js",
+        "zzz/a.js",
+        "zzz/z.js",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?} in:\n{stdout}");
+    }
+
+    // The zzz record's vulns must be sorted by advisory id (aaaa before zzzz)
+    // and its files by path (a.js before z.js) within that record's block.
+    assert!(
+        pos_of(&stdout, "GHSA-aaaa-0000-0003") < pos_of(&stdout, "GHSA-zzzz-0000-0003"),
+        "vulnerabilities must be sorted by id within a record:\n{stdout}"
+    );
+    assert!(
+        pos_of(&stdout, "zzz/a.js") < pos_of(&stdout, "zzz/z.js"),
+        "patched files must be sorted by path within a record:\n{stdout}"
+    );
+
+    // The two-vuln record must announce its count.
+    assert!(
+        stdout.contains("Vulnerabilities (2):"),
+        "zzz record must report 2 vulnerabilities, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Files patched (2):"),
+        "zzz record must report 2 patched files, got: {stdout}"
+    );
+}
+
+#[test]
+fn multi_manifest_json_lists_all_records_sorted_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &multi_manifest());
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "multi list --json must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("stdout must be valid JSON");
+    assert_eq!(v["status"], "success");
+    assert_eq!(v["summary"]["discovered"], 3, "discovered count must be 3");
+
+    let events = v["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 3, "exactly three discovered events expected");
+
+    // Events must be emitted in stable PURL-sorted order, not HashMap order.
+    let purls: Vec<&str> = events
+        .iter()
+        .map(|e| e["purl"].as_str().expect("purl"))
+        .collect();
+    assert_eq!(
+        purls,
+        vec![
+            "pkg:npm/aaa-pkg@1.0.0",
+            "pkg:npm/mmm-pkg@2.0.0",
+            "pkg:npm/zzz-pkg@3.0.0",
+        ],
+        "events must be sorted by PURL"
+    );
+
+    // The zzz event's two vulns must be sorted by id.
+    let zeta = events
+        .iter()
+        .find(|e| e["purl"] == "pkg:npm/zzz-pkg@3.0.0")
+        .expect("zzz event");
+    let ids: Vec<&str> = zeta["details"]["vulnerabilities"]
+        .as_array()
+        .expect("vulnerabilities array")
+        .iter()
+        .map(|x| x["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["GHSA-aaaa-0000-0003", "GHSA-zzzz-0000-0003"],
+        "vulnerabilities must be sorted by id"
+    );
+    let paths: Vec<&str> = zeta["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|f| f["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(paths, vec!["zzz/a.js", "zzz/z.js"], "files must be sorted by path");
+}
+
 #[test]
 fn absolute_manifest_path_content_wins_over_cwd_via_binary() {
     // Decoy manifest in cwd/.socket and a *different* manifest at an absolute

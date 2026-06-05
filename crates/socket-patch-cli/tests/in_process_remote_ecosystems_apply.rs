@@ -39,6 +39,44 @@ fn git_sha256(content: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+// --- Request introspection helpers -----------------------------------------
+// The discovery-only tests below previously asserted *only* `scan_run == 0`.
+// Exit 0 is also what a crawler that discovered nothing (or short-circuited
+// the API entirely) returns, so the old assertion was vacuous. These helpers
+// let us assert on the real code path: that the batch endpoint was actually
+// hit and that it carried the PURL the crawler was supposed to discover.
+async fn recorded(server: &MockServer) -> Vec<wiremock::Request> {
+    server.received_requests().await.unwrap_or_default()
+}
+
+fn batch_posts(reqs: &[wiremock::Request]) -> Vec<&wiremock::Request> {
+    reqs.iter()
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/batch"))
+        .collect()
+}
+
+fn req_body(req: &wiremock::Request) -> String {
+    String::from_utf8_lossy(&req.body).into_owned()
+}
+
+/// Assert the scan crawled the package and sent exactly that PURL to the
+/// batch endpoint — proving discovery actually ran rather than no-opping.
+async fn assert_discovered_purl(server: &MockServer, expected_purl: &str) {
+    let reqs = recorded(server).await;
+    let posts = batch_posts(&reqs);
+    assert_eq!(
+        posts.len(),
+        1,
+        "exactly one batch query expected (a crawler that found nothing sends none); got {}",
+        posts.len()
+    );
+    let body = req_body(posts[0]);
+    assert!(
+        body.contains(expected_purl),
+        "batch request must carry the discovered purl {expected_purl}; body was: {body}"
+    );
+}
+
 fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
     ScanArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -524,6 +562,9 @@ async fn golang_handcrafted_discovery() {
     let mut args = default_scan_args(tmp.path(), "golang", server.uri());
     args.sync = false;
     assert_eq!(scan_run(args).await, 0);
+    // Exit 0 alone is vacuous (an empty crawler also exits 0). Prove the
+    // handcrafted GOMODCACHE layout was actually crawled and its PURL sent.
+    assert_discovered_purl(&server, "pkg:golang/github.com/gin-gonic/gin@v1.9.1").await;
     std::env::remove_var("GOMODCACHE");
 }
 
@@ -551,6 +592,9 @@ async fn maven_handcrafted_discovery() {
     let mut args = default_scan_args(tmp.path(), "maven", server.uri());
     args.sync = false;
     assert_eq!(scan_run(args).await, 0);
+    // Prove the m2 layout (version dir gated on a .pom) was crawled and its
+    // PURL queried — not that the crawler silently found nothing.
+    assert_discovered_purl(&server, "pkg:maven/org.example/foo@1.0.0").await;
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
@@ -579,6 +623,9 @@ async fn nuget_handcrafted_discovery() {
     let mut args = default_scan_args(tmp.path(), "nuget", server.uri());
     args.sync = false;
     assert_eq!(scan_run(args).await, 0);
+    // Prove the nuget packages layout (gated on a .nuspec) was crawled and
+    // its PURL queried — exit 0 alone would also pass an empty crawl.
+    assert_discovered_purl(&server, "pkg:nuget/foo@1.0.0").await;
     std::env::remove_var("NUGET_PACKAGES");
     std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }

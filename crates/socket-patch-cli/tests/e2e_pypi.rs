@@ -752,13 +752,62 @@ fn test_pypi_macos_global_auto_discovery() {
         "scan -g --json failed (exit {code}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // Output should be valid JSON with scannedPackages field
+    // Output should be valid JSON with the full scan envelope.
     let scan: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("invalid JSON from scan -g: {e}\nstdout:\n{stdout}"));
+
+    // The scan must report success, not just exit 0 with an error payload.
+    assert_eq!(
+        scan["status"].as_str(),
+        Some("success"),
+        "scan -g envelope should report status=success, got: {}",
+        scan["status"]
+    );
+
+    let scanned = scan["scannedPackages"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("scannedPackages should be a number, got: {}", scan["scannedPackages"]));
+
+    // The whole point of this test is that auto-discovery (no --global-prefix)
+    // actually probes the real macOS framework/global site-packages. A working
+    // python3 host (required above) always ships a populated site-packages
+    // (pip/setuptools at minimum), so a correct probe finds >= 1 package. A
+    // broken probe that locates nothing would report 0 — assert against it so
+    // the "real path probing" claim cannot silently regress to a no-op.
     assert!(
-        scan["scannedPackages"].is_u64(),
-        "scannedPackages should be a number, got: {}",
-        scan["scannedPackages"]
+        scanned >= 1,
+        "auto-discovery should crawl the real global site-packages and find \
+         at least 1 package, got {scanned}.\nstdout:\n{stdout}"
+    );
+
+    // Structural envelope invariants: every count field must be present and
+    // numeric, the packages array must be well-formed, and the patched-subset
+    // count cannot exceed the total scanned. These hold regardless of host and
+    // reject a malformed/partial envelope that happens to carry a number.
+    for field in [
+        "packagesWithPatches",
+        "totalPatches",
+        "freePatches",
+        "paidPatches",
+    ] {
+        assert!(
+            scan[field].is_u64(),
+            "{field} should be a number, got: {}",
+            scan[field]
+        );
+    }
+    let packages = scan["packages"]
+        .as_array()
+        .expect("packages should be an array");
+    let with_patches = scan["packagesWithPatches"].as_u64().unwrap();
+    assert_eq!(
+        packages.len() as u64,
+        with_patches,
+        "packages array length must equal packagesWithPatches"
+    );
+    assert!(
+        with_patches <= scanned,
+        "packagesWithPatches ({with_patches}) cannot exceed scannedPackages ({scanned})"
     );
 }
 

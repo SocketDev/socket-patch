@@ -10,13 +10,69 @@
 
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::process::Command;
 
 use fs2::FileExt;
 
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{json_string, parse_json_envelope, run};
+use common::{json_string, parse_json_envelope};
+
+/// Every SOCKET_* env var that the global args / the `unlock`
+/// subcommand consult. These have clap `env =` fallbacks, so an
+/// ambient value silently overrides the flags the tests *don't* pass
+/// — most dangerously `SOCKET_UNLOCK_RELEASE` (turns every plain
+/// probe into a `--release`, subverting the no-release tests),
+/// `SOCKET_CWD` (redirects the probe to a different tree, making the
+/// staged `.socket/` irrelevant), and `SOCKET_JSON` / `SOCKET_SILENT`
+/// (which would respectively force JSON on the human-mode tests or
+/// blank out the stderr the human-mode tests assert on). The shared
+/// `common::run` only scrubs `SOCKET_API_TOKEN`, so this suite owns a
+/// fully-scrubbed runner of its own.
+const SOCKET_ENV_VARS: &[&str] = &[
+    "SOCKET_UNLOCK_RELEASE",
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+];
+
+/// Run the CLI with `args` in `cwd`, with the entire SOCKET_* env
+/// surface scrubbed so the behavior under test is determined solely by
+/// the CLI flags — not by whatever the developer/CI happens to export.
+/// Returns `(exit_code, stdout, stderr)`. Local shadow of
+/// `common::run`, which only removes `SOCKET_API_TOKEN`.
+fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(common::binary());
+    cmd.args(args).current_dir(cwd);
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .output()
+        .expect("failed to execute socket-patch binary");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    (code, stdout, stderr)
+}
 
 /// Take an exclusive flock on `.socket/apply.lock`. Returns the
 /// open file whose Drop releases the lock — keep it bound for the
@@ -58,10 +114,15 @@ fn unlock_reports_free_when_no_socket_dir() {
     );
     // The reported lock path must be the real `.socket/apply.lock`, not some
     // placeholder — this is the path the mutating subcommands actually flock.
+    // `ends_with("apply.lock")` was too loose: any `foo/apply.lock` would pass,
+    // including one outside `.socket/`. Pin the full `.socket/apply.lock`
+    // suffix (built via Path so the separator is correct on every platform).
     let lock_field = json_string(&env, "lockFile").expect("lockFile field present");
+    let expected_suffix = Path::new(".socket").join("apply.lock");
+    let expected_suffix = expected_suffix.to_str().unwrap();
     assert!(
-        lock_field.ends_with("apply.lock"),
-        "lockFile should name the real apply.lock, got {lock_field}"
+        lock_field.ends_with(expected_suffix),
+        "lockFile should name the real .socket/apply.lock, got {lock_field}"
     );
     // A pure probe must not materialize project state out of thin air.
     assert!(
@@ -79,7 +140,7 @@ fn unlock_reports_free_when_no_socket_dir() {
 fn unlock_reports_held_when_lock_actively_held() {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
-    let _external = take_external_lock(&socket_dir);
+    let external = take_external_lock(&socket_dir);
 
     let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json"]);
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
@@ -93,8 +154,10 @@ fn unlock_reports_held_when_lock_actively_held() {
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_str());
     assert_eq!(code_field, Some("lock_held"));
-    // The error must specifically be about a competing process — guards
-    // against a generic/empty error message masquerading as lock_held.
+    // The error must specifically be about a competing process AND name the
+    // `.socket` location it observed — guards against a generic/empty error
+    // message (or a hard-coded string with no real path context) masquerading
+    // as lock_held.
     let msg = env
         .get("error")
         .and_then(|e| e.get("message"))
@@ -104,12 +167,38 @@ fn unlock_reports_held_when_lock_actively_held() {
         msg.contains("another socket-patch process"),
         "lock_held message should name the competing process, got: {msg}"
     );
+    assert!(
+        msg.contains(".socket"),
+        "lock_held message should name the .socket location it probed, got: {msg}"
+    );
     // Probing a held lock must NOT disturb the file the external holder
     // owns — the probe is read-only.
     assert!(
         socket_dir.join("apply.lock").is_file(),
         "held-probe must leave the externally-locked file intact"
     );
+
+    // Positive control: the only thing that distinguishes "held" from "free"
+    // must be the live OS lock, NOT the mere existence of the lock file. Drop
+    // the external lock (the file stays on disk, byte-for-byte identical) and
+    // re-probe: the verdict has to flip to `free`. If production reported
+    // `held` just because `apply.lock` exists, this second probe would still
+    // report held and the assertion below would fail — closing the
+    // file-existence-masquerading-as-a-lock loophole.
+    fs2::FileExt::unlock(&external).expect("release external lock");
+    assert!(
+        socket_dir.join("apply.lock").is_file(),
+        "control precondition: the lock file must persist across the release"
+    );
+    let (code2, stdout2, stderr2) = run(dir.path(), &["unlock", "--json"]);
+    assert_eq!(code2, 0, "free after release: stdout={stdout2}\nstderr={stderr2}");
+    let env2 = parse_json_envelope(&stdout2);
+    assert_eq!(
+        json_string(&env2, "status"),
+        Some("free"),
+        "the same lock file with no live OS lock must read as free: {stdout2}"
+    );
+    drop(external);
 }
 
 /// `unlock --release` against a free lock with a leftover file
