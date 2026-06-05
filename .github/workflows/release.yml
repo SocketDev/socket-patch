@@ -471,6 +471,9 @@ jobs:
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Scope the publish secret to a deployment environment (zizmor
+    # secrets-outside-env); auto-created with no protection until configured.
+    environment: rubygems
     permissions:
       contents: read
     steps:

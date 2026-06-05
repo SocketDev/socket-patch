@@ -55,6 +55,10 @@ jobs:
   rubygems-cli:
     needs: resolve-version
     runs-on: ubuntu-latest
+    # Scope the publish secret to a deployment environment (zizmor
+    # secrets-outside-env); also lets a maintainer gate publishing with required
+    # reviewers. Auto-created with no protection rules until configured.
+    environment: rubygems
     permissions:
       contents: read
     steps:
@@ -106,6 +110,9 @@ jobs:
   packagist-cli:
     needs: resolve-version
     runs-on: ubuntu-latest
+    # Scope the Packagist secrets to a deployment environment (zizmor
+    # secrets-outside-env); auto-created with no protection until configured.
+    environment: packagist
     permissions:
       contents: read
     steps:
