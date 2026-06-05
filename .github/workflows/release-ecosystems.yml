@@ -1,0 +1,127 @@
+name: Release (composer + RubyGems CLI)
+
+# Separate release for distributing the `socket-patch` CLI on the composer and
+# RubyGems ecosystems. Decoupled from the main `release.yml`: these are thin
+# launcher packages that download the prebuilt binary from the GitHub release at
+# their own version, so they only need that release (and its `SHA256SUMS`) to
+# already exist. Runs automatically once the main release publishes, or manually
+# for a given version.
+#
+# Required secrets (each publish step skips gracefully when its secret is
+# absent, so this workflow is safe to land before credentials are wired):
+#   - RUBYGEMS_API_KEY   — a RubyGems API key with push scope for `socket-patch`
+#   - PACKAGIST_USERNAME / PACKAGIST_TOKEN — Packagist API credentials
+# Preferred hardening: RubyGems / Packagist trusted publishing (OIDC) instead of
+# long-lived keys, mirroring the crates.io / PyPI jobs in release.yml.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (no leading v), e.g. 3.3.0'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.VERSION }}
+      tag: ${{ steps.v.outputs.TAG }}
+    steps:
+      - name: Resolve version + tag
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="v${{ inputs.version }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing CLI launcher packages for $TAG"
+
+  rubygems-cli:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (at the release tag)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+          persist-credentials: false
+
+      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
+      - name: Lint + build the launcher gem
+        working-directory: gem/socket-patch
+        run: |
+          ruby -c lib/socket_patch/launcher.rb
+          ruby -c exe/socket-patch
+          # The gemspec version is baked at the tag by scripts/version-sync.sh.
+          gemver="$(ruby -e 'print Gem::Specification.load("socket-patch.gemspec").version')"
+          if [ "$gemver" != "${{ needs.resolve-version.outputs.version }}" ]; then
+            echo "::error::gemspec version $gemver != release ${{ needs.resolve-version.outputs.version }} (run scripts/version-sync.sh before tagging)"
+            exit 1
+          fi
+          gem build socket-patch.gemspec
+
+      - name: Publish socket-patch to RubyGems
+        working-directory: gem/socket-patch
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          if [ -z "${GEM_HOST_API_KEY}" ]; then
+            echo "::notice title=RubyGems publish skipped::RUBYGEMS_API_KEY not set; built the gem but did not push."
+            exit 0
+          fi
+          # `gem list -r -e -a` prints `socket-patch (3.3.0, 3.2.0, ...)`; match
+          # this version as a precise list element (preceded by `(`/space,
+          # followed by `,`/`)`).
+          if gem list --remote --exact --all socket-patch 2>/dev/null | grep -qE "[ (]${VERSION}[,)]"; then
+            echo "socket-patch ${VERSION} already on RubyGems; skipping."
+            exit 0
+          fi
+          gem push "socket-patch-${VERSION}.gem"
+
+  packagist-cli:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (at the release tag)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+          persist-credentials: false
+
+      # PHP + composer are pre-installed on ubuntu-latest.
+      - name: Lint launcher + validate composer.json
+        working-directory: composer/socket-patch
+        run: |
+          php -l bin/socket-patch
+          composer validate --no-check-publish
+
+      # Packagist is git-tag-driven: it ingests the tagged composer.json on its
+      # own (typically via a repo webhook). This step nudges its update API so
+      # the new tag is picked up promptly; without credentials it is a no-op.
+      - name: Notify Packagist of the new tag
+        env:
+          PACKAGIST_USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+        run: |
+          if [ -z "${PACKAGIST_USERNAME}" ] || [ -z "${PACKAGIST_TOKEN}" ]; then
+            echo "::notice title=Packagist sync skipped::PACKAGIST_USERNAME/PACKAGIST_TOKEN not set; Packagist will sync via its repo webhook."
+            exit 0
+          fi
+          curl -fsSL -XPOST -H 'content-type:application/json' \
+            "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+            -d '{"repository":{"url":"https://github.com/SocketDev/socket-patch"}}'

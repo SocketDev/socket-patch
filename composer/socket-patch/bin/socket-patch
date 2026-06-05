@@ -1,0 +1,230 @@
+#!/usr/bin/env php
+<?php
+// socket-patch CLI launcher (Composer distribution).
+//
+// `composer require socketsecurity/socket-patch` puts `socket-patch` on
+// `vendor/bin` — useful in PHP/Composer environments where the composer setup
+// hook needs the CLI present. On first run this downloads the prebuilt binary
+// for the host platform from the matching GitHub release (`v<version>`),
+// verifies it against the release's SHA256SUMS, caches it, and execs it. Set
+// SOCKET_PATCH_BIN to an existing executable to bypass the download (airgap).
+//
+// SP_VERSION is kept in sync with the workspace by scripts/version-sync.sh.
+
+const SP_VERSION = '3.3.0';
+const SP_REPO = 'SocketDev/socket-patch';
+const SP_BINARY = 'socket-patch';
+
+function sp_fail($msg)
+{
+    fwrite(STDERR, "socket-patch: $msg\n");
+    exit(1);
+}
+
+/** @return array{0:string,1:string} [target-triple, archive-extension] */
+function sp_detect_target()
+{
+    $family = PHP_OS_FAMILY; // 'Darwin' | 'Linux' | 'Windows' | 'BSD' | ...
+    $machine = strtolower(php_uname('m'));
+
+    if (preg_match('/x86_64|amd64|x64/', $machine)) {
+        $arch = 'x86_64';
+    } elseif (preg_match('/aarch64|arm64/', $machine)) {
+        $arch = 'aarch64';
+    } elseif (preg_match('/i[3-6]86|x86/', $machine)) {
+        $arch = 'i686';
+    } elseif (preg_match('/armv7|armhf|arm/', $machine)) {
+        $arch = 'arm';
+    } else {
+        sp_fail("unsupported CPU architecture: $machine");
+    }
+
+    if ($family === 'Darwin') {
+        if (!in_array($arch, ['x86_64', 'aarch64'], true)) {
+            sp_fail("unsupported macOS arch: $arch");
+        }
+        return ["$arch-apple-darwin", 'tar.gz'];
+    }
+    if ($family === 'Windows') {
+        $map = [
+            'x86_64' => 'x86_64-pc-windows-msvc',
+            'aarch64' => 'aarch64-pc-windows-msvc',
+            'i686' => 'i686-pc-windows-msvc',
+        ];
+        if (!isset($map[$arch])) {
+            sp_fail("unsupported Windows arch: $arch");
+        }
+        return [$map[$arch], 'zip'];
+    }
+    if ($family === 'Linux') {
+        $libc = sp_is_musl() ? 'musl' : 'gnu';
+        $suffix = $arch === 'arm' ? 'eabihf' : '';
+        return ["$arch-unknown-linux-$libc$suffix", 'tar.gz'];
+    }
+    sp_fail("unsupported OS: $family");
+}
+
+function sp_is_musl()
+{
+    $out = @shell_exec('ldd --version 2>&1');
+    if ($out && stripos($out, 'musl') !== false) {
+        return true;
+    }
+    return count(glob('/lib/ld-musl-*.so.1') ?: []) > 0;
+}
+
+function sp_cache_dir()
+{
+    if (PHP_OS_FAMILY === 'Windows') {
+        $base = getenv('LOCALAPPDATA') ?: (getenv('USERPROFILE') . '\\AppData\\Local');
+    } else {
+        $base = getenv('XDG_CACHE_HOME') ?: (getenv('HOME') . '/.cache');
+    }
+    return $base . DIRECTORY_SEPARATOR . 'socket-patch' . DIRECTORY_SEPARATOR . 'bin';
+}
+
+/** Download `$url`; write to `$dest` if given, else return the body. */
+function sp_http_get($url, $dest = null)
+{
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FAILONERROR => true,
+            CURLOPT_USERAGENT => 'socket-patch-composer',
+        ]);
+        $data = curl_exec($ch);
+        if ($data === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            sp_fail("download failed for $url: $err");
+        }
+        curl_close($ch);
+    } else {
+        $ctx = stream_context_create(['http' => [
+            'follow_location' => 1,
+            'max_redirects' => 10,
+            'user_agent' => 'socket-patch-composer',
+        ]]);
+        $data = @file_get_contents($url, false, $ctx);
+        if ($data === false) {
+            sp_fail("download failed for $url");
+        }
+    }
+    if ($dest !== null) {
+        file_put_contents($dest, $data);
+        return $dest;
+    }
+    return $data;
+}
+
+/** SHA256SUMS lines are "<hex>  <filename>" (filename may be `*`-prefixed). */
+function sp_verify_sha256($path, $archive, $sums)
+{
+    $expected = null;
+    foreach (preg_split('/\r?\n/', $sums) as $line) {
+        $parts = preg_split('/\s+/', trim($line), 2);
+        if (count($parts) < 2) {
+            continue;
+        }
+        $name = ltrim($parts[1], '*');
+        if ($name === $archive) {
+            $expected = $parts[0];
+            break;
+        }
+    }
+    if ($expected === null) {
+        sp_fail("no SHA256SUMS entry for $archive");
+    }
+    $actual = hash_file('sha256', $path);
+    if (strcasecmp($actual, $expected) !== 0) {
+        sp_fail("checksum mismatch for $archive (expected $expected, got $actual)");
+    }
+}
+
+function sp_extract($archivePath, $ext, $dir)
+{
+    // Prefer `tar` (handles tar.gz everywhere; zip via bsdtar on modern
+    // Windows); fall back to PharData (tar.gz) / ZipArchive (zip).
+    $cmd = $ext === 'zip'
+        ? sprintf('tar -xf %s -C %s', escapeshellarg($archivePath), escapeshellarg($dir))
+        : sprintf('tar xzf %s -C %s', escapeshellarg($archivePath), escapeshellarg($dir));
+    @exec($cmd . ' 2>&1', $out, $code);
+    if ($code === 0) {
+        return;
+    }
+    if ($ext === 'zip' && class_exists('ZipArchive')) {
+        $zip = new ZipArchive();
+        if ($zip->open($archivePath) === true) {
+            $zip->extractTo($dir);
+            $zip->close();
+            return;
+        }
+    } elseif (class_exists('PharData')) {
+        try {
+            (new PharData($archivePath))->extractTo($dir, null, true);
+            return;
+        } catch (Exception $e) {
+            // fall through
+        }
+    }
+    sp_fail('failed to extract ' . basename($archivePath));
+}
+
+function sp_resolve_binary()
+{
+    $env = getenv('SOCKET_PATCH_BIN');
+    if ($env && is_executable($env)) {
+        return $env;
+    }
+
+    list($target, $ext) = sp_detect_target();
+    $exe = SP_BINARY . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
+    $cached = sp_cache_dir() . DIRECTORY_SEPARATOR . SP_VERSION
+        . DIRECTORY_SEPARATOR . $target . DIRECTORY_SEPARATOR . $exe;
+    if (is_executable($cached)) {
+        return $cached;
+    }
+
+    $archive = SP_BINARY . "-$target.$ext";
+    $base = 'https://github.com/' . SP_REPO . '/releases/download/v' . SP_VERSION;
+    $tmp = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'socket-patch-' . getmypid();
+    @mkdir($tmp, 0777, true);
+
+    $archivePath = $tmp . DIRECTORY_SEPARATOR . $archive;
+    sp_http_get("$base/$archive", $archivePath);
+    $sums = sp_http_get("$base/SHA256SUMS");
+    sp_verify_sha256($archivePath, $archive, $sums);
+    sp_extract($archivePath, $ext, $tmp);
+
+    $extracted = $tmp . DIRECTORY_SEPARATOR . $exe;
+    if (!is_file($extracted)) {
+        sp_fail("release archive $archive did not contain $exe");
+    }
+    @mkdir(dirname($cached), 0777, true);
+    if (!@copy($extracted, $cached)) {
+        sp_fail("could not cache binary at $cached");
+    }
+    if (PHP_OS_FAMILY !== 'Windows') {
+        @chmod($cached, 0755);
+    }
+    return $cached;
+}
+
+$bin = sp_resolve_binary();
+$args = array_slice($argv, 1);
+
+if (function_exists('pcntl_exec')) {
+    pcntl_exec($bin, $args);
+    sp_fail("failed to exec $bin"); // reached only if exec fails
+}
+
+$cmd = escapeshellarg($bin);
+foreach ($args as $arg) {
+    $cmd .= ' ' . escapeshellarg($arg);
+}
+$code = 0;
+passthru($cmd, $code);
+exit($code);

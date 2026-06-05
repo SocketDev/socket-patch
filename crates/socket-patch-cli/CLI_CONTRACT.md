@@ -596,7 +596,14 @@ This syncs the workspace package version into:
 
 - `npm/socket-patch/package.json` (and its `optionalDependencies`)
 - every per-platform `npm/socket-patch-*/package.json`
-- `pypi/socket-patch/pyproject.toml`
+- `pypi/socket-patch/pyproject.toml` and `pypi/socket-patch-hook/pyproject.toml`
+- `gem/socket-patch-bundler/socket-patch-bundler.gemspec` (the Bundler plugin gem)
+- `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
+- the Composer CLI launcher's `SP_VERSION` (`composer/socket-patch/bin/socket-patch`)
+
+The RubyGems + Composer CLI launchers (`socket-patch` gem, `socketsecurity/socket-patch`
+on Packagist) are published by the separate **`.github/workflows/release-ecosystems.yml`**,
+which runs after the main release publishes and only needs the GitHub release binaries to exist.
 
 ## How the contract is enforced
 

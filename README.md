@@ -70,6 +70,26 @@ ecosystems:
 cargo install socket-patch-cli --features golang,maven,composer,nuget,deno
 ```
 
+### RubyGems
+
+```bash
+gem install socket-patch
+```
+
+A thin launcher gem: on first run it downloads the prebuilt binary for your
+platform from the matching GitHub release, verifies its SHA-256, caches it, and
+execs it. Set `SOCKET_PATCH_BIN` to an existing binary to skip the download.
+
+### Composer
+
+```bash
+composer require socketsecurity/socket-patch
+vendor/bin/socket-patch --help
+```
+
+Same launcher model as the RubyGems package (download-on-first-run, cached,
+`SOCKET_PATCH_BIN` to bypass).
+
 ## Quick Start
 
 You can pass a patch UUID directly to `socket-patch` as a shortcut:

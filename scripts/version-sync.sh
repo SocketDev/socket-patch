@@ -70,4 +70,26 @@ if [ -f "$gemspec" ]; then
   rm -f "$gemspec.bak"
 fi
 
+# Update the RubyGems CLI launcher gem (gemspec version + the VERSION constant
+# the launcher uses to pick the matching GitHub release binary).
+ruby_cli_gemspec="$REPO_ROOT/gem/socket-patch/socket-patch.gemspec"
+if [ -f "$ruby_cli_gemspec" ]; then
+  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$ruby_cli_gemspec"
+  rm -f "$ruby_cli_gemspec.bak"
+fi
+ruby_cli_launcher="$REPO_ROOT/gem/socket-patch/lib/socket_patch/launcher.rb"
+if [ -f "$ruby_cli_launcher" ]; then
+  sed -i.bak "s/VERSION = \".*\"/VERSION = \"$VERSION\"/" "$ruby_cli_launcher"
+  rm -f "$ruby_cli_launcher.bak"
+fi
+
+# Update the Composer CLI launcher's baked-in version (the release it fetches).
+# Packagist derives the package version from the git tag, so composer.json has
+# no version field — only the launcher constant needs syncing.
+composer_cli_bin="$REPO_ROOT/composer/socket-patch/bin/socket-patch"
+if [ -f "$composer_cli_bin" ]; then
+  sed -i.bak "s/const SP_VERSION = '.*';/const SP_VERSION = '$VERSION';/" "$composer_cli_bin"
+  rm -f "$composer_cli_bin.bak"
+fi
+
 echo "Synced version to $VERSION"
