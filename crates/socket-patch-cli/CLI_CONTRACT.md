@@ -158,14 +158,14 @@ in particular, are behavior changes that gate a version bump when implemented).
    yarn / pnpm / bun workspace members and cargo workspace members are all discovered and configured
    (pnpm is root-package-only by design, because workspace-member `postinstall` scripts fail under
    pnpm's strict module isolation). Selected paths may be **excluded**, and the exclusion is **persisted
-   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Single-level
-   workspace discovery implemented; the `--exclude` flag + manifest exclude sub-property are
-   **follow-up work** — pending test marked `#[ignore]`.)*
-   - **Nested workspaces (intended; gap).** A workspace member that is itself a workspace root — or, for
-     cargo, members matched by a recursive `members = ["crates/**"]` glob — *should* be recursed into and
-     have its own members configured. Today expansion is **one level only** (`find_package_json_files`
-     never reads a discovered member's own `workspaces` field; `discover_cargo_project` expands
-     `crates/*` but not `crates/**`). Guarded by the `#[ignore]`d gap pins
+   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Nested-workspace
+   discovery implemented; the `--exclude` flag + manifest exclude sub-property are **follow-up work** —
+   pending test marked `#[ignore]`.)*
+   - **Nested workspaces (implemented).** A workspace member that is itself a workspace root — or, for
+     cargo, members matched by a recursive `members = ["crates/**"]` glob — is recursed into and has its
+     own members configured. `find_workspace_packages` re-reads each discovered member's own
+     `workspaces` field (bounded depth), and `discover_cargo_project`'s `expand_member` expands the
+     recursive `crates/**` glob (`glob_dir_recursive`, skipping `target/` + hidden dirs). Guarded by
      `setup_recurses_into_nested_npm_workspace` / `setup_expands_recursive_cargo_member_glob` in
      `tests/setup_monorepo_invariants.rs`.
 

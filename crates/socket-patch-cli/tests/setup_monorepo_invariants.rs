@@ -174,13 +174,12 @@ fn setup_check_and_remove_handle_all_three_ecosystems() {
 // GAP — nested npm workspace recursion (property 9). A workspace member that is
 // itself a workspace root should have ITS members configured too.
 //
-// CURRENTLY IGNORED: `find_package_json_files` expands the root's workspace
-// patterns ONE level only; it never reads a discovered member's own
-// `workspaces` field, so `packages/inner/sub/leaf` is not configured.
+// SHIPPED: `find_workspace_packages` now recurses into a member that declares
+// its own `workspaces`, so `packages/inner/sub/leaf` is configured. This pin is
+// now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-#[ignore = "gap: setup expands workspaces one level only (no nested-workspace recursion); see CLI_CONTRACT 'Setup command contract' property 9"]
 fn setup_recurses_into_nested_npm_workspace() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -213,12 +212,12 @@ fn setup_recurses_into_nested_npm_workspace() {
 // workspaces), but `discover_cargo_project` only expands a single-level
 // `crates/*`, so a member at `crates/group/leaf` is never configured.
 //
-// CURRENTLY IGNORED: `expand_member` does not handle `**`. See
-// CLI_CONTRACT 'Setup command contract' property 9.
+// SHIPPED: `expand_member` now expands the recursive `crates/**` glob
+// (`glob_dir_recursive`), so a member at `crates/group/leaf` is configured.
+// This pin is now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-#[ignore = "gap: cargo member discovery does not expand the recursive `crates/**` glob; see CLI_CONTRACT 'Setup command contract' property 9"]
 fn setup_expands_recursive_cargo_member_glob() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

@@ -107,11 +107,18 @@ async fn find_workspace_root(start_manifest: &Path) -> Option<PathBuf> {
 }
 
 /// Expand one `[workspace] members` pattern (relative to `root`) into member
-/// `Cargo.toml` paths. Supports a bare path (`crate-a`), a single trailing
-/// glob (`crates/*`), and `*`. Deeper globs (`crates/**`) are not expanded.
+/// `Cargo.toml` paths. Supports a bare path (`crate-a`), a single-level glob
+/// (`crates/*` / `*`), and the recursive glob (`crates/**` / `**`), which Cargo
+/// accepts and which `setup` must honor so a deeply-nested member is configured
+/// (property 9). `/**` is checked before `/*` (a `crates/**` pattern ends in
+/// `**`, not `/*`, but the explicit order keeps intent clear).
 async fn expand_member(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let pattern = pattern.replace('\\', "/");
-    if let Some(prefix) = pattern.strip_suffix("/*") {
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        glob_dir_recursive(&root.join(prefix)).await
+    } else if pattern == "**" {
+        glob_dir_recursive(root).await
+    } else if let Some(prefix) = pattern.strip_suffix("/*") {
         glob_dir(&root.join(prefix)).await
     } else if pattern == "*" {
         glob_dir(root).await
@@ -146,6 +153,42 @@ async fn glob_dir(base: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Recursive-glob (`**`) expansion: every subdirectory of `base`, at any depth,
+/// that contains a `Cargo.toml`. Skips hidden dirs and `target/` so a build
+/// tree is never walked. Bounded depth as a loop backstop.
+async fn glob_dir_recursive(base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_manifests_recursive(base, 0, &mut out).await;
+    out
+}
+
+async fn collect_manifests_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 20 {
+        return;
+    }
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        // Stat (not `file_type`) so symlinked dirs are followed, mirroring `glob_dir`.
+        if !fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        let manifest = path.join("Cargo.toml");
+        if fs::metadata(&manifest).await.is_ok() {
+            out.push(manifest);
+        }
+        Box::pin(collect_manifests_recursive(&path, depth + 1, out)).await;
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +248,51 @@ mod tests {
         assert!(proj.members.contains(&root.join("crates/a/Cargo.toml")));
         assert!(proj.members.contains(&root.join("crates/b/Cargo.toml")));
         assert_eq!(proj.members.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_workspace_recursive_double_glob() {
+        // Property 9: `members = ["crates/**"]` must reach a member nested
+        // several directories deep (`crates/group/leaf`), which the single-level
+        // `crates/*` expansion would miss.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/**\"]\n",
+        )
+        .await;
+        write(
+            &root.join("crates/group/leaf/Cargo.toml"),
+            "[package]\nname=\"leaf\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // A sibling at a different depth is also matched by `**`.
+        write(
+            &root.join("crates/top/Cargo.toml"),
+            "[package]\nname=\"top\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // A `target/` build dir must NOT be walked even if it holds a Cargo.toml.
+        write(
+            &root.join("crates/group/target/junk/Cargo.toml"),
+            "[package]\nname=\"junk\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(
+            proj.members.contains(&root.join("crates/group/leaf/Cargo.toml")),
+            "deeply-nested member must be discovered via `crates/**`, got {:?}",
+            proj.members
+        );
+        assert!(proj.members.contains(&root.join("crates/top/Cargo.toml")));
+        assert!(
+            !proj.members.iter().any(|m| m.to_string_lossy().contains("target")),
+            "target/ build dir must not be walked, got {:?}",
+            proj.members
+        );
+        assert_eq!(proj.members.len(), 2, "exactly leaf + top: {:?}", proj.members);
     }
 
     #[tokio::test]
