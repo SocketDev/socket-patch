@@ -28,12 +28,14 @@ regex = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-# Shipped defaults: npm + PyPI are always compiled in (no feature gate); `cargo`
-# is on by default so released binaries and `cargo install socket-patch-cli`
-# patch Rust deps and run the build-time guard out of the box. The remaining
-# ecosystems stay opt-in. Build `--no-default-features` for a minimal
-# (npm + PyPI only) binary — its `apply --check` then fails closed.
-default = ["cargo"]
+# Shipped defaults: npm + PyPI + Ruby gems are always compiled in (no feature
+# gate); `cargo` and `golang` are on by default so released binaries and
+# `cargo install socket-patch-cli` patch Rust and Go deps (and run the
+# build-time cargo guard) out of the box. The still-unsupported ecosystems
+# (maven, nuget, composer, deno) stay opt-in. Build `--no-default-features`
+# for a minimal (npm + PyPI + Ruby gems only) binary — its `apply --check`
+# then fails closed.
+default = ["cargo", "golang"]
 cargo = ["socket-patch-core/cargo"]
 golang = ["socket-patch-core/golang"]
 maven = ["socket-patch-core/maven"]

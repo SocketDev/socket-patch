@@ -21,6 +21,33 @@ use socket_patch_core::api::client::ApiClientEnvOverrides;
 use socket_patch_core::constants::{
     DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_SOCKET_API_URL,
 };
+use socket_patch_core::crawlers::Ecosystem;
+
+/// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
+///
+/// Rejects any name this build does not support — both typos and
+/// ecosystems whose Cargo feature is not compiled in (e.g. `maven` /
+/// `nuget` on a default build, which ships npm + PyPI + Ruby gems + Go +
+/// Cargo). `Ecosystem::all()` is itself `#[cfg]`-gated, so the accepted
+/// set tracks the compiled feature set exactly.
+///
+/// Without this, an unsupported name parsed fine and was then silently
+/// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
+/// "0 patches" result with no hint that the ecosystem name was the cause.
+fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
+    if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
+        Ok(s.to_string())
+    } else {
+        let supported = Ecosystem::all()
+            .iter()
+            .map(|e| e.cli_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "unsupported ecosystem `{s}` in this build (supported: {supported})"
+        ))
+    }
+}
 
 /// Arguments inherited by every subcommand via `#[command(flatten)]`.
 ///
@@ -65,12 +92,14 @@ pub struct GlobalArgs {
     )]
     pub proxy_url: String,
 
-    /// Restrict to these ecosystems (comma-separated).
+    /// Restrict to these ecosystems (comma-separated). Names not supported
+    /// by this build (e.g. `maven`/`nuget` unless compiled in) are rejected.
     #[arg(
         long = "ecosystems",
         short = 'e',
         env = "SOCKET_ECOSYSTEMS",
         value_delimiter = ',',
+        value_parser = parse_supported_ecosystem,
     )]
     pub ecosystems: Option<Vec<String>>,
 

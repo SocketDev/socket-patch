@@ -586,7 +586,19 @@ jobs:
           load: true
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test
-        run: cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_${{ matrix.ecosystem }}
+        # The optional ecosystems gate their docker_e2e file behind their
+        # own feature (`#![cfg(all(feature = "docker-e2e", feature =
+        # "<eco>"))]`), so the harness must be built with that feature too —
+        # otherwise the test binary compiles to zero tests and passes
+        # vacuously. npm/pypi/gem are unconditional and have no such feature.
+        # (The socket-patch binary inside the image is always --all-features.)
+        run: |
+          eco='${{ matrix.ecosystem }}'
+          case "$eco" in
+            npm|pypi|gem) features=docker-e2e ;;
+            *) features="docker-e2e,$eco" ;;
+          esac
+          cargo test -p socket-patch-cli --features "$features" --test "docker_e2e_$eco"
 
   # ----------------------------------------------------------------------
   # Experimental `setup`-flow matrix (NON-BLOCKING).

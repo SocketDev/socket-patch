@@ -34,7 +34,7 @@
 //! configurable, or mutating the project on disk.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_maven`
-#![cfg(feature = "setup-e2e")]
+#![cfg(all(feature = "setup-e2e", feature = "maven"))]
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;

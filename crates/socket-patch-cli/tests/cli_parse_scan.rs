@@ -291,15 +291,61 @@ fn batch_size_negative_fails() {
 #[test]
 #[serial_test::serial]
 fn ecosystems_csv_multi() {
-    let args = parse_scan(&["--ecosystems", "npm,pypi,cargo,maven"]);
+    // Use only the unconditional ecosystems (npm/pypi/gem are always
+    // compiled in) so this CSV-splitting assertion is independent of which
+    // optional ecosystem features the test crate was built with.
+    let args = parse_scan(&["--ecosystems", "npm,pypi,gem"]);
     assert_eq!(
         args.common.ecosystems,
         Some(vec![
             "npm".to_string(),
             "pypi".to_string(),
-            "cargo".to_string(),
-            "maven".to_string(),
+            "gem".to_string(),
         ])
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn ecosystems_unsupported_name_rejected() {
+    // The `--ecosystems` value-parser rejects names this build does not
+    // support — both typos and ecosystems whose feature is not compiled
+    // in. `definitely-not-an-ecosystem` is never a valid name in any
+    // feature configuration, so this assertion holds regardless of the
+    // build's feature set.
+    let err = match try_parse_scan(&["--ecosystems", "definitely-not-an-ecosystem"]) {
+        Ok(_) => panic!("unsupported ecosystem name should fail to parse"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+        ),
+        "expected ValueValidation or InvalidValue, got {:?}",
+        err.kind()
+    );
+}
+
+/// maven is not in the default feature set, so a default build must reject
+/// `--ecosystems maven` (the whole point of marking it unsupported). When
+/// the `maven` feature *is* compiled in, the name is legitimately accepted,
+/// so this assertion is itself feature-gated to match.
+#[cfg(not(feature = "maven"))]
+#[test]
+#[serial_test::serial]
+fn ecosystems_maven_rejected_without_feature() {
+    let err = match try_parse_scan(&["--ecosystems", "maven"]) {
+        Ok(_) => panic!("`maven` must be rejected when the maven feature is off"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+        ),
+        "expected ValueValidation or InvalidValue, got {:?}",
+        err.kind()
     );
 }
 

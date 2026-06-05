@@ -13,7 +13,7 @@
 //! Both tests overwrite the package's `LICENSE.md` file with synthetic
 //! bytes containing the marker.
 
-#![cfg(feature = "docker-e2e")]
+#![cfg(all(feature = "docker-e2e", feature = "nuget"))]
 
 use std::process::Command;
 

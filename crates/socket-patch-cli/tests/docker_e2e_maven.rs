@@ -9,7 +9,7 @@
 //! containing the marker. The .pom is just metadata — apply replaces
 //! it byte-for-byte and the grep verifies on disk.
 
-#![cfg(feature = "docker-e2e")]
+#![cfg(all(feature = "docker-e2e", feature = "maven"))]
 
 use std::process::Command;
 

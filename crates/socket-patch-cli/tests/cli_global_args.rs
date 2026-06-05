@@ -360,7 +360,10 @@ fn env_vars_populate_global_args() {
         ("SOCKET_API_TOKEN", "env-token"),
         ("SOCKET_ORG_SLUG", "env-org"),
         ("SOCKET_PROXY_URL", "https://env-proxy.example.com"),
-        ("SOCKET_ECOSYSTEMS", "npm,maven"),
+        // npm + gem are unconditional ecosystems, so this env-binding
+        // assertion holds regardless of which optional features are
+        // compiled in (maven is not in the default build).
+        ("SOCKET_ECOSYSTEMS", "npm,gem"),
         ("SOCKET_DOWNLOAD_MODE", "package"),
         ("SOCKET_OFFLINE", "true"),
         ("SOCKET_GLOBAL", "true"),
@@ -397,7 +400,7 @@ fn env_vars_populate_global_args() {
         assert_eq!(args.common.proxy_url, "https://env-proxy.example.com");
         assert_eq!(
             args.common.ecosystems.as_deref(),
-            Some(&["npm".to_string(), "maven".to_string()][..])
+            Some(&["npm".to_string(), "gem".to_string()][..])
         );
         assert_eq!(args.common.download_mode, "package");
         assert!(args.common.offline);
