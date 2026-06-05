@@ -117,14 +117,27 @@ function sp_cache_dir()
     return $base . DIRECTORY_SEPARATOR . 'socket-patch' . DIRECTORY_SEPARATOR . 'bin';
 }
 
-/** Download `$url`; write to `$dest` if given, else return the body. */
+/**
+ * Download `$url`; write to `$dest` if given, else return the body. HTTPS is
+ * enforced including across redirects: GitHub release downloads redirect to a
+ * CDN (still HTTPS), but a redirect to http:// would let a network attacker
+ * serve a malicious binary AND a matching SHA256SUMS (both attacker-controlled),
+ * defeating the checksum check — so a non-HTTPS URL (initial or redirect target)
+ * is refused.
+ */
 function sp_http_get($url, $dest = null)
 {
+    if (stripos($url, 'https://') !== 0) {
+        sp_fail("refusing non-HTTPS URL: $url");
+    }
     if (function_exists('curl_init')) {
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS => 10,
+            // Only fetch/redirect over HTTPS — curl refuses an http:// redirect.
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FAILONERROR => true,
             CURLOPT_USERAGENT => 'socket-patch-composer',
@@ -137,19 +150,52 @@ function sp_http_get($url, $dest = null)
         }
         curl_close($ch);
     } else {
-        $ctx = stream_context_create(['http' => [
-            'follow_location' => 1,
-            'max_redirects' => 10,
-            'user_agent' => 'socket-patch-composer',
-        ]]);
-        $data = @file_get_contents($url, false, $ctx);
-        if ($data === false) {
-            sp_fail("download failed for $url");
-        }
+        // No curl: follow redirects manually so each hop's scheme can be checked
+        // (PHP streams can't whitelist redirect protocols). TLS verification is
+        // on by default; assert it explicitly.
+        $data = sp_stream_get($url, 10);
     }
     if ($dest !== null) {
         file_put_contents($dest, $data);
         return $dest;
+    }
+    return $data;
+}
+
+/** Manual, HTTPS-only redirect-following GET for the no-curl fallback. */
+function sp_stream_get($url, $redirects)
+{
+    if ($redirects < 0) {
+        sp_fail("too many redirects for $url");
+    }
+    if (stripos($url, 'https://') !== 0) {
+        sp_fail("refusing non-HTTPS URL: $url");
+    }
+    $ctx = stream_context_create([
+        'http' => [
+            'follow_location' => 0, // we follow manually to vet each hop
+            'ignore_errors' => true,
+            'user_agent' => 'socket-patch-composer',
+        ],
+        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+    ]);
+    $http_response_header = [];
+    $data = @file_get_contents($url, false, $ctx);
+    $status = 0;
+    $location = null;
+    foreach ($http_response_header as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d+)#', $h, $m)) {
+            $status = (int) $m[1];
+        } elseif (stripos($h, 'Location:') === 0) {
+            $location = trim(substr($h, strlen('Location:')));
+        }
+    }
+    if ($status >= 300 && $status < 400 && $location !== null) {
+        // GitHub uses absolute HTTPS redirect targets; reject anything else.
+        return sp_stream_get($location, $redirects - 1);
+    }
+    if ($data === false || $status >= 400) {
+        sp_fail("download failed ($status) for $url");
     }
     return $data;
 }
@@ -219,6 +265,10 @@ function sp_resolve_binary()
     $exe = SP_BINARY . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
     $cached = sp_cache_dir() . DIRECTORY_SEPARATOR . $ver
         . DIRECTORY_SEPARATOR . $target . DIRECTORY_SEPARATOR . $exe;
+    // Cache hit: verified when first downloaded, under the user's own cache dir.
+    // Trusted without re-verification (re-verifying needs a network fetch each
+    // run), matching npx / pip / rustup; an attacker able to write here can
+    // already replace the installed package or the binary itself.
     if (is_executable($cached)) {
         return $cached;
     }

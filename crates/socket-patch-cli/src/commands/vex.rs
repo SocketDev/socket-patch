@@ -262,6 +262,15 @@ fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
         "golang" | "go" => Some(Ecosystem::Golang),
         #[cfg(feature = "composer")]
         "composer" | "php" => Some(Ecosystem::Composer),
+        // The apply-only ecosystems are the primary use of `manual` (hand-applied
+        // patches with no auto-install hook); they must map too, feature-gated to
+        // match the compiled-in `Ecosystem` variants `from_purl` can return.
+        #[cfg(feature = "maven")]
+        "maven" | "java" => Some(Ecosystem::Maven),
+        #[cfg(feature = "nuget")]
+        "nuget" | "dotnet" => Some(Ecosystem::Nuget),
+        #[cfg(feature = "deno")]
+        "deno" | "jsr" => Some(Ecosystem::Deno),
         _ => None,
     }
 }
@@ -567,6 +576,30 @@ mod tests {
     //! lives in `tests/e2e_vex*.rs`.
     use super::*;
     use clap::Parser;
+
+    // Property 7: every ecosystem the build can classify a PURL for must also be
+    // declarable `manual`. Apply-only maven/nuget/deno are the *primary* use of
+    // `manual`; they were missing originally, silently dropping their patches.
+    #[test]
+    fn ecosystem_from_manual_name_maps_compiled_in_ecosystems() {
+        assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
+        assert_eq!(ecosystem_from_manual_name("PyPI"), Some(Ecosystem::Pypi)); // case-insensitive
+        assert_eq!(ecosystem_from_manual_name("python"), Some(Ecosystem::Pypi));
+        assert_eq!(ecosystem_from_manual_name("ruby"), Some(Ecosystem::Gem));
+        assert_eq!(ecosystem_from_manual_name("nonsense"), None);
+        #[cfg(feature = "cargo")]
+        assert_eq!(ecosystem_from_manual_name("cargo"), Some(Ecosystem::Cargo));
+        #[cfg(feature = "golang")]
+        assert_eq!(ecosystem_from_manual_name("go"), Some(Ecosystem::Golang));
+        #[cfg(feature = "composer")]
+        assert_eq!(ecosystem_from_manual_name("composer"), Some(Ecosystem::Composer));
+        #[cfg(feature = "maven")]
+        assert_eq!(ecosystem_from_manual_name("maven"), Some(Ecosystem::Maven));
+        #[cfg(feature = "nuget")]
+        assert_eq!(ecosystem_from_manual_name("nuget"), Some(Ecosystem::Nuget));
+        #[cfg(feature = "deno")]
+        assert_eq!(ecosystem_from_manual_name("deno"), Some(Ecosystem::Deno));
+    }
 
     #[derive(Parser)]
     struct Wrap {

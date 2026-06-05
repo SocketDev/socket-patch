@@ -22,13 +22,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serial_test::serial;
 use sha2::{Digest, Sha256};
-use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
 
 const PYPI_PACKAGE: &str = "six";
 const PYPI_VERSION: &str = "1.16.0";
 const UUID: &str = "12121212-1212-4121-8121-121212121212";
+
+fn binary() -> PathBuf {
+    env!("CARGO_BIN_EXE_socket-patch").into()
+}
 
 fn git_sha256(content: &[u8]) -> String {
     let header = format!("blob {}\0", content.len());
@@ -108,9 +110,8 @@ fn install_six(tmp: &Path) -> PathBuf {
 /// blob does not hash to its declared `afterHash` (so apply fails) must
 /// produce exactly one `failed` event and NO `package_not_installed`
 /// `skipped` event for the same PURL.
-#[tokio::test]
-#[serial]
-async fn failed_installed_variant_is_not_also_reported_not_installed() {
+#[test]
+fn failed_installed_variant_is_not_also_reported_not_installed() {
     if find_python().is_none() {
         println!("SKIP: python3 not on PATH");
         return;
@@ -140,9 +141,12 @@ async fn failed_installed_variant_is_not_also_reported_not_installed() {
         .expect("write decoy blob");
 
     let purl = format!("pkg:pypi/{PYPI_PACKAGE}@{PYPI_VERSION}");
+    // `serde_json::json!` consumes the key expression, so clone for the key and
+    // keep `purl` itself for the assertions further down.
+    let manifest_key = purl.clone();
     let manifest = serde_json::json!({
         "patches": {
-            purl: {
+            manifest_key: {
                 "uuid": UUID,
                 "exportedAt": "2024-01-01T00:00:00Z",
                 "files": {
@@ -161,37 +165,33 @@ async fn failed_installed_variant_is_not_also_reported_not_installed() {
     )
     .expect("write manifest");
 
-    // Capture stdout (the JSON envelope) from the in-process run.
-    let apply_args = ApplyArgs {
-        common: socket_patch_cli::args::GlobalArgs {
-            cwd: tmp.path().to_path_buf(),
-            dry_run: false,
-            silent: false,
-            manifest_path: ".socket/manifest.json".to_string(),
-            offline: true,
-            global: false,
-            global_prefix: None,
-            ecosystems: Some(vec!["pypi".to_string()]),
-            json: true,
-            verbose: false,
-            download_mode: "diff".to_string(),
-            ..socket_patch_cli::args::GlobalArgs::default()
-        },
-        // NOT forced: exercises the variant-matches-installed path, which
-        // is exactly where the misreport happened.
-        force: false,
-        check: false,
-        vex: Default::default(),
-    };
-
-    let buf = gag::BufferRedirect::stdout().expect("redirect stdout");
-    let code = apply_run(apply_args).await;
-    let mut out = String::new();
-    {
-        use std::io::Read;
-        let mut buf = buf;
-        buf.read_to_string(&mut out).expect("read captured stdout");
-    }
+    // Run the real binary as a subprocess and capture its JSON envelope from the
+    // child's stdout. This is reliable under cargo's test-output capture, unlike
+    // an in-process `gag`-based stdout redirect (which races libtest's own
+    // capture). NOT `--force`: exercises the variant-matches-installed path,
+    // exactly where the misreport happened. SOCKET_* are scrubbed so the flags
+    // decide behaviour.
+    let output = Command::new(binary())
+        .args([
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "pypi",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+        ])
+        .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_OFFLINE")
+        .env_remove("SOCKET_ECOSYSTEMS")
+        .env_remove("SOCKET_JSON")
+        .env_remove("SOCKET_FORCE")
+        .env_remove("SOCKET_CWD")
+        .env_remove("SOCKET_MANIFEST_PATH")
+        .output()
+        .expect("run socket-patch apply");
+    let code = output.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
 
     // The apply failed, so the command exits non-zero (partial failure).
     assert_eq!(code, 1, "a failed apply must exit 1; stdout: {out}");

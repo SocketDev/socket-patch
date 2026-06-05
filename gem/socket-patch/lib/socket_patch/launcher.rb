@@ -53,6 +53,11 @@ module SocketPatch
       target, ext = detect_target
       exe = BINARY + (Gem.win_platform? ? ".exe" : "")
       cached = File.join(cache_dir, ver, target, exe)
+      # Cache hit: the cached binary was SHA-256-verified when first downloaded
+      # and lives under the user's own cache dir. We trust it without
+      # re-verifying (re-verification would require re-fetching SHA256SUMS every
+      # run), matching npx / pip / rustup; an attacker able to write here can
+      # already replace the installed gem or the binary itself.
       return cached if File.executable?(cached)
 
       download_binary(ver, target, ext, cached)
@@ -153,16 +158,30 @@ module SocketPatch
       end
     end
 
+    # Require HTTPS for every request — including after a redirect. GitHub
+    # release downloads redirect to a CDN (still HTTPS); a redirect to http://
+    # would let a network attacker serve a malicious binary AND a matching
+    # SHA256SUMS (both attacker-controlled), defeating the checksum check. So a
+    # non-HTTPS URL — initial or redirect target — is refused.
+    def https_uri(url)
+      uri = URI(url)
+      unless uri.is_a?(URI::HTTPS)
+        raise LauncherError, "refusing non-HTTPS URL: #{url}"
+      end
+      uri
+    end
+
     # Follow redirects (GitHub release downloads redirect to a CDN) and stream
-    # the body to `dest`.
+    # the body to `dest`. Relative redirects are resolved against the current
+    # URL; the result must still be HTTPS (see `https_uri`).
     def fetch(url, dest, redirects = 10)
       raise LauncherError, "too many redirects fetching #{url}" if redirects.zero?
-      uri = URI(url)
-      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
+      uri = https_uri(url)
+      Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
         http.request(Net::HTTP::Get.new(uri)) do |res|
           case res
           when Net::HTTPRedirection
-            return fetch(res["location"], dest, redirects - 1)
+            return fetch(URI.join(url, res["location"]).to_s, dest, redirects - 1)
           when Net::HTTPSuccess
             File.open(dest, "wb") { |f| res.read_body { |chunk| f.write(chunk) } }
           else
@@ -174,12 +193,12 @@ module SocketPatch
 
     def fetch_string(url, redirects = 10)
       raise LauncherError, "too many redirects fetching #{url}" if redirects.zero?
-      uri = URI(url)
-      res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
+      uri = https_uri(url)
+      res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) do |http|
         http.request(Net::HTTP::Get.new(uri))
       end
       case res
-      when Net::HTTPRedirection then fetch_string(res["location"], redirects - 1)
+      when Net::HTTPRedirection then fetch_string(URI.join(url, res["location"]).to_s, redirects - 1)
       when Net::HTTPSuccess then res.body
       else raise LauncherError, "download failed (#{res.code}) for #{url}"
       end

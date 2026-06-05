@@ -318,9 +318,13 @@ pub(crate) async fn configured_ecosystems(
     }
 
     // pypi: a chosen python manifest carries the `socket-patch[hook]` dep.
-    if let Some(plan) = plan_python(common).await {
-        for (path, _) in &plan.manifests {
-            if let Ok(content) = tokio::fs::read_to_string(path).await {
+    // Detect on-disk state DIRECTLY — not via `plan_python`, which applies the
+    // `--ecosystems` filter; this probe must report real state regardless of it
+    // (e.g. `vex --ecosystems cargo` must still see a set-up python project).
+    if is_python_project(&common.cwd).await {
+        let pm = detect_python_pm(&common.cwd).await;
+        for (path, _) in choose_python_manifests(&common.cwd, pm).await {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
                 if deps_contain_hook(&content) {
                     set.insert(Ecosystem::Pypi);
                     break;
