@@ -58,7 +58,7 @@ fn manifest_with_after_hashes(after: &[&str]) -> PatchManifest {
             tier: "free".to_string(),
         },
     );
-    PatchManifest { patches }
+    PatchManifest { patches, setup: None }
 }
 
 /// Count the directory entries under `dir` (used to prove a short-circuit

@@ -240,7 +240,7 @@ mod tests {
             },
         );
 
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     /// A manifest with several patches, each carrying multiple
@@ -295,7 +295,7 @@ mod tests {
             "pkg:npm/mid@1.0.0".to_string(),
             record("uuid-m", &["GHSA-cccc-2222-3333"], &["m/x.js"]),
         );
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[test]

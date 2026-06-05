@@ -63,7 +63,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `rollback` | optional positional `identifier`; `--one-off` | `SOCKET_ONE_OFF` | Rollback target |
 | `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
 | `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`) |
-| `setup` | `--check`, `--remove` (mutually exclusive); honors global `--ecosystems` | `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. See [Setup command contract](#setup-command-contract) |
+| `setup` | `--check`, `--remove` (mutually exclusive); `--exclude` (CSV member paths); honors global `--ecosystems` | `SOCKET_SETUP_EXCLUDE`, `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. `--exclude` skips + persists workspace members (property 9). See [Setup command contract](#setup-command-contract) |
 
 `scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
 
@@ -158,9 +158,11 @@ in particular, are behavior changes that gate a version bump when implemented).
    yarn / pnpm / bun workspace members and cargo workspace members are all discovered and configured
    (pnpm is root-package-only by design, because workspace-member `postinstall` scripts fail under
    pnpm's strict module isolation). Selected paths may be **excluded**, and the exclusion is **persisted
-   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Nested-workspace
-   discovery implemented; the `--exclude` flag + manifest exclude sub-property are **follow-up work** —
-   pending test marked `#[ignore]`.)*
+   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Implemented —
+   nested-workspace discovery plus the `--exclude` flag, persisted as the `setup.exclude` array in
+   `.socket/manifest.json` and honored by discovery + `check` (a fresh clone inherits it without
+   re-passing the flag). Excludes apply to npm + cargo workspace members; the repo root is never
+   excludable.)*
    - **Nested workspaces (implemented).** A workspace member that is itself a workspace root — or, for
      cargo, members matched by a recursive `members = ["crates/**"]` glob — is recursed into and has its
      own members configured. `find_workspace_packages` re-reads each discovered member's own
@@ -312,6 +314,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
+| `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
 | `SOCKET_VEX` | `apply --vex` / `scan --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on `apply`/`scan` they bind to `--vex-product` etc. |
 
 ### Deprecated env vars

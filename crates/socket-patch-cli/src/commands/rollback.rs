@@ -63,6 +63,7 @@ fn exclude_local_cargo(manifest: &PatchManifest, common: &GlobalArgs) -> PatchMa
             .filter(|(purl, _)| !is_local_cargo(purl, common))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        setup: manifest.setup.clone(),
     }
 }
 
@@ -489,12 +490,14 @@ async fn rollback_patches_inner(
         return Ok((true, Vec::new()));
     }
 
-    // Create filtered manifest
+    // Create filtered manifest (a synthetic rollback-target subset, never
+    // written to disk, so it carries no persisted setup state).
     let filtered_manifest = PatchManifest {
         patches: patches_to_rollback
             .iter()
             .map(|p| (p.purl.clone(), p.patch.clone()))
             .collect(),
+        setup: None,
     };
 
     // Check for missing beforeHash blobs. Local-cargo PURLs are excluded:
@@ -713,7 +716,7 @@ mod tests {
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
         patches.insert("pkg:npm/bar@2.0".to_string(), make_record("uuid-bar"));
         patches.insert("pkg:pypi/baz@3.0".to_string(), make_record("uuid-baz"));
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[test]
@@ -774,7 +777,7 @@ mod tests {
             make_record("uuid-sdist"),
         );
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[test]
@@ -969,7 +972,7 @@ mod tests {
             "pkg:npm/foo@1.0.0".to_string(),
             record_with_file("uuid-npm", "index.js", "npm_before"),
         );
-        let manifest = PatchManifest { patches };
+        let manifest = PatchManifest { patches, setup: None };
 
         // Local mode (no --global / --global-prefix).
         let common = crate::args::GlobalArgs::default();

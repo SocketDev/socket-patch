@@ -605,7 +605,7 @@ mod tests {
             },
         );
 
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[tokio::test]
@@ -831,7 +831,7 @@ mod tests {
                 },
             );
         }
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_JSON",
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
+    "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VEX_NO_VERIFY",
     "SOCKET_VEX_PRODUCT",
     "SOCKET_DEBUG",
@@ -292,19 +293,83 @@ fn setup_remove_cleans_up_cargo_config_it_created() {
 }
 
 // ===========================================================================
-// Property 9 (exclude) — follow-up work. The `--exclude` flag and its persisted
-// home (a sub-property of `.socket/manifest.json`) are not implemented yet, so
-// this placeholder is `#[ignore]`d: it documents the intended behavior without
-// failing the default suite. Un-ignore it when the exclude mechanism lands.
+// Property 9 (exclude) — SHIPPED. `setup --exclude <member>` skips that member
+// and PERSISTS the exclusion under `.socket/manifest.json`'s `setup.exclude`, so
+// a later `--check` (and a fresh clone) honor it without re-passing the flag.
+// This pin is now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-#[ignore = "exclude mechanism is follow-up; see CLI_CONTRACT 'Setup command contract' property 9"]
 fn setup_honors_exclude_for_a_workspace_member() {
-    // Intended behavior once implemented:
-    //   - root package.json + packages/a configured,
-    //   - packages/b skipped because it was excluded,
-    //   - the exclusion persisted in .socket/manifest.json so `--check`, `apply`,
-    //     and a fresh clone all honor it (no re-passing of --exclude).
-    panic!("pending: --exclude flag + .socket/manifest.json exclude sub-property");
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    // npm workspace: root + two members.
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/a/package.json"),
+        r#"{ "name": "a", "version": "1.0.0" }"#,
+    );
+    write(
+        &proj.path().join("packages/b/package.json"),
+        r#"{ "name": "b", "version": "1.0.0" }"#,
+    );
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    // Setup, excluding packages/b.
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--json", "--yes", "--exclude", "packages/b"],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Root + packages/a configured; packages/b left untouched.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable)"
+    );
+    assert!(
+        read(proj.path().join("packages/a/package.json")).contains("socket-patch"),
+        "the included member packages/a must be configured"
+    );
+    assert!(
+        !read(proj.path().join("packages/b/package.json")).contains("socket-patch"),
+        "the EXCLUDED member packages/b must NOT be configured"
+    );
+
+    // The exclusion is persisted under `setup.exclude` in the manifest.
+    let manifest = read(proj.path().join(".socket/manifest.json"));
+    let mv: serde_json::Value = serde_json::from_str(&manifest).expect("manifest is JSON");
+    let excl = mv["setup"]["exclude"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest must carry setup.exclude:\n{manifest}"));
+    assert!(
+        excl.iter().any(|v| v == "packages/b"),
+        "the exclusion must persist in the manifest:\n{manifest}"
+    );
+
+    // A fresh `--check` WITHOUT re-passing --exclude honors the persisted set:
+    // the excluded member must not count as needing configuration → `configured`.
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    assert_eq!(
+        code, 0,
+        "check must pass — the excluded member must not be flagged as needing setup:\n{stdout}"
+    );
+    let cv: serde_json::Value = serde_json::from_str(&stdout).expect("check JSON");
+    assert_eq!(
+        cv["status"], "configured",
+        "check must report `configured`, honoring the persisted exclude:\n{stdout}"
+    );
+    assert!(
+        !cv["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"].as_str().is_some_and(|p| p.contains("packages/b"))),
+        "the excluded member must not appear among the checked files:\n{stdout}"
+    );
 }

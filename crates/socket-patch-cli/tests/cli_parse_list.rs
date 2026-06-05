@@ -117,7 +117,7 @@ fn populated_manifest() -> PatchManifest {
         },
     );
 
-    PatchManifest { patches }
+    PatchManifest { patches, setup: None }
 }
 
 #[tokio::test]
@@ -585,7 +585,7 @@ fn multi_manifest() -> PatchManifest {
             &["mmm/only.js"],
         ),
     );
-    PatchManifest { patches }
+    PatchManifest { patches, setup: None }
 }
 
 /// Byte offset of `needle` in `haystack`; panics with context if absent.

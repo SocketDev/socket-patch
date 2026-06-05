@@ -23,7 +23,8 @@ use socket_patch_core::pth_hook::{
     PthEditResult, PthStatus, PythonPackageManager,
 };
 use socket_patch_core::crawlers::CrawlerOptions;
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::utils::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches;
 use std::io::{self, Write};
@@ -102,6 +103,17 @@ pub struct SetupArgs {
     )]
     pub remove: bool,
 
+    /// Workspace-member path(s) to exclude from setup (comma-separated, relative
+    /// to the repo root). The exclusion is persisted in `.socket/manifest.json`
+    /// so `setup --check` and a fresh clone honor it without re-passing the flag
+    /// (CLI_CONTRACT property 9).
+    #[arg(
+        long = "exclude",
+        env = "SOCKET_SETUP_EXCLUDE",
+        value_delimiter = ',',
+    )]
+    pub exclude: Vec<String>,
+
     #[command(flatten)]
     pub common: GlobalArgs,
 }
@@ -119,7 +131,7 @@ pub async fn run(args: SetupArgs) -> i32 {
 /// Discover the package.json files `setup`/`check`/`remove` should act on,
 /// applying the pnpm "root-only" filtering. Returns an empty vec when none are
 /// found (callers also consider Python before reporting `no_files`).
-async fn discover(args: &SetupArgs) -> Vec<PackageJsonLocation> {
+async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
     if !eco_in_scope(&args.common, ECO_NPM) {
         return Vec::new();
     }
@@ -128,14 +140,20 @@ async fn discover(args: &SetupArgs) -> Vec<PackageJsonLocation> {
     // For pnpm monorepos, only update root package.json. pnpm runs root
     // postinstall on `pnpm install`, so workspace-level postinstall scripts are
     // unnecessary and would fail under pnpm's strict module isolation.
-    match find_result.workspace_type {
+    let files: Vec<PackageJsonLocation> = match find_result.workspace_type {
         WorkspaceType::Pnpm => find_result
             .files
             .into_iter()
             .filter(|loc| loc.is_root)
             .collect(),
         _ => find_result.files,
-    }
+    };
+
+    // Property 9: drop excluded workspace members (the root is never excludable).
+    files
+        .into_iter()
+        .filter(|loc| loc.is_root || !is_member_excluded(&loc.path, &args.common.cwd, excludes))
+        .collect()
 }
 
 /// Emit the shared "nothing found" result and exit code.
@@ -177,6 +195,95 @@ fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
             .iter()
             .any(|e| names.iter().any(|n| e.eq_ignore_ascii_case(n))),
     }
+}
+
+/// Normalize a workspace-member / exclude path for comparison: forward slashes,
+/// no leading `./`, no trailing slash.
+fn normalize_rel_path(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let p = p.strip_prefix("./").unwrap_or(&p);
+    p.trim_end_matches('/').to_string()
+}
+
+/// Whether a discovered member manifest (`package.json` / `Cargo.toml`) lies in
+/// an excluded workspace-member directory (relative to `cwd`). The repo root
+/// (relative path `""`) is never excludable — `--exclude` targets members.
+/// (CLI_CONTRACT property 9.)
+fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let dir = match manifest_path.parent() {
+        Some(d) => d,
+        None => return false,
+    };
+    let rel = match dir.strip_prefix(cwd) {
+        Ok(r) => normalize_rel_path(&r.to_string_lossy()),
+        Err(_) => return false, // outside cwd → not an excludable member
+    };
+    if rel.is_empty() {
+        return false;
+    }
+    excludes.iter().any(|e| normalize_rel_path(e) == rel)
+}
+
+/// The persisted `setup.exclude` list from `.socket/manifest.json` (empty if no
+/// manifest / no setup state). Read-only.
+async fn read_setup_excludes(common: &GlobalArgs) -> Vec<String> {
+    match read_manifest(&common.resolved_manifest_path()).await {
+        Ok(Some(m)) => m
+            .setup
+            .map(|s| s.exclude)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| normalize_rel_path(e))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The exclude set in effect for this run: the persisted `setup.exclude` union
+/// the `--exclude` flag values (all normalized). This is what a clone inherits
+/// — a clone with no flag still reads the persisted set.
+async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String> {
+    let mut set = read_setup_excludes(common).await;
+    for e in flag {
+        let n = normalize_rel_path(e);
+        if !n.is_empty() && !set.contains(&n) {
+            set.push(n);
+        }
+    }
+    set
+}
+
+/// Persist the effective exclude set into `.socket/manifest.json` (creating a
+/// minimal manifest if none exists) so `--check` and a fresh clone honor it
+/// without re-passing `--exclude`. No-op when the set is empty or already
+/// exactly persisted (keeps the manifest byte-stable). Never called under
+/// `--dry-run`.
+async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
+    if excludes.is_empty() {
+        return;
+    }
+    let path = common.resolved_manifest_path();
+    let existing = read_manifest(&path).await.ok().flatten();
+    let mut merged: Vec<String> = excludes.to_vec();
+    merged.sort();
+    merged.dedup();
+    if existing
+        .as_ref()
+        .and_then(|m| m.setup.as_ref())
+        .map(|s| &s.exclude)
+        == Some(&merged)
+    {
+        return; // already persisted exactly — don't rewrite
+    }
+    let mut manifest = existing.unwrap_or_else(PatchManifest::new);
+    manifest.setup = Some(SetupConfig { exclude: merged });
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = write_manifest(&path, &manifest).await;
 }
 
 // Canonical `--ecosystems` token sets per setup branch (see `eco_in_scope`).
@@ -357,7 +464,12 @@ struct SetupOutcome {
 /// Build the cargo outcome for a setup (`remove=false`) or remove
 /// (`remove=true`) run at the given `dry_run` setting.
 #[cfg(feature = "cargo")]
-async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+async fn build_cargo_outcome(
+    common: &GlobalArgs,
+    remove: bool,
+    dry_run: bool,
+    excludes: &[String],
+) -> SetupOutcome {
     use socket_patch_core::patch::cargo_config;
 
     if !eco_in_scope(common, ECO_CARGO) {
@@ -373,10 +485,14 @@ async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -
         ..Default::default()
     };
 
-    // Per-member guard dependency edits.
+    // Per-member guard dependency edits, skipping excluded members (property 9).
     let version = guard_version();
     let mut results: Vec<(String, CargoEditResult)> = Vec::new();
-    for member in &project.members {
+    for member in project
+        .members
+        .iter()
+        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
+    {
         let res = if remove {
             remove_guard_dep(member, dry_run).await
         } else {
@@ -429,7 +545,12 @@ async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -
 }
 
 #[cfg(not(feature = "cargo"))]
-async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+async fn build_cargo_outcome(
+    _common: &GlobalArgs,
+    _remove: bool,
+    _dry_run: bool,
+    _excludes: &[String],
+) -> SetupOutcome {
     SetupOutcome::default()
 }
 
@@ -935,6 +1056,7 @@ fn env_result(config_path: &Path, change: Result<bool, String>) -> CargoEditResu
 async fn append_cargo_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+    excludes: &[String],
 ) -> bool {
     use socket_patch_core::patch::cargo_config;
 
@@ -945,7 +1067,11 @@ async fn append_cargo_check_entries(
         Some(p) => p,
         None => return false,
     };
-    for member in &project.members {
+    for member in project
+        .members
+        .iter()
+        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
+    {
         let (state, err) = match tokio::fs::read_to_string(member).await {
             Ok(content) => {
                 if is_guard_dep_present(&content) {
@@ -976,6 +1102,7 @@ async fn append_cargo_check_entries(
 async fn append_cargo_check_entries(
     _common: &GlobalArgs,
     _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+    _excludes: &[String],
 ) -> bool {
     false
 }
@@ -1046,7 +1173,11 @@ async fn run_check(args: &SetupArgs) -> i32 {
         println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
     }
 
-    let npm_files = discover(args).await;
+    // Excluded members (persisted in the manifest + any passed via `--exclude`)
+    // are skipped by both discovery and the cargo check. Read-only: `--check`
+    // never persists.
+    let excludes = effective_excludes(&args.common, &args.exclude).await;
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(&args.common).await;
 
     // (kind, path, state, error)
@@ -1090,7 +1221,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
         }
     }
 
-    append_cargo_check_entries(&args.common, &mut entries).await;
+    append_cargo_check_entries(&args.common, &mut entries, &excludes).await;
     append_go_check_entries(&args.common, &mut entries).await;
     append_gem_check_entries(&args.common, &mut entries).await;
     append_composer_check_entries(&args.common, &mut entries).await;
@@ -1189,9 +1320,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
     }
 
-    let npm_files = discover(args).await;
+    // Honor the persisted/`--exclude` member set so we never touch a member that
+    // was deliberately excluded from setup. Remove does not change the set.
+    let excludes = effective_excludes(common, &args.exclude).await;
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    let cargo_preview = build_cargo_outcome(common, true, true).await;
+    let cargo_preview = build_cargo_outcome(common, true, true, &excludes).await;
     let go_preview = build_go_outcome(common, true, true).await;
     let gem_preview = build_gem_outcome(common, true, true).await;
     let composer_preview = build_composer_outcome(common, true, true).await;
@@ -1298,7 +1432,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     let cargo_results = merge_outcomes(
         merge_outcomes(
             merge_outcomes(
-                build_cargo_outcome(common, true, false).await,
+                build_cargo_outcome(common, true, false, &excludes).await,
                 build_go_outcome(common, true, false).await,
             ),
             build_gem_outcome(common, true, false).await,
@@ -1506,10 +1640,18 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         println!("Configuring socket-patch install hooks...");
     }
 
-    let npm_files = discover(args).await;
+    // Resolve the effective exclude set (persisted + `--exclude`) and, on a real
+    // run, persist it so `--check` and a fresh clone honor it without the flag.
+    // Dry-run never writes the manifest. Excluded members are then skipped by
+    // discovery and the cargo branch.
+    let excludes = effective_excludes(common, &args.exclude).await;
+    if !common.dry_run {
+        persist_setup_excludes(common, &excludes).await;
+    }
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
     // Cargo + Go + Gem + Composer previews (dry-run); `.present` also tells us each project exists.
-    let cargo_preview = build_cargo_outcome(common, false, true).await;
+    let cargo_preview = build_cargo_outcome(common, false, true, &excludes).await;
     let go_preview = build_go_outcome(common, false, true).await;
     let gem_preview = build_gem_outcome(common, false, true).await;
     let composer_preview = build_composer_outcome(common, false, true).await;
@@ -1660,7 +1802,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let cargo_results = merge_outcomes(
         merge_outcomes(
             merge_outcomes(
-                build_cargo_outcome(common, false, false).await,
+                build_cargo_outcome(common, false, false, &excludes).await,
                 build_go_outcome(common, false, false).await,
             ),
             build_gem_outcome(common, false, false).await,

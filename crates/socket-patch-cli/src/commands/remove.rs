@@ -395,7 +395,7 @@ mod tests {
             make_record("uuid-cp312"),
         );
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
-        let manifest = PatchManifest { patches };
+        let manifest = PatchManifest { patches, setup: None };
         write_manifest(&dir.join("manifest.json"), &manifest)
             .await
             .expect("write manifest");
@@ -465,7 +465,7 @@ mod tests {
         let mut patches = HashMap::new();
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
         patches.insert("pkg:npm/foobar@1.0".to_string(), make_record("uuid-foobar"));
-        let manifest = PatchManifest { patches };
+        let manifest = PatchManifest { patches, setup: None };
         let manifest_path = tmp.path().join("manifest.json");
         write_manifest(&manifest_path, &manifest)
             .await
@@ -520,7 +520,7 @@ mod tests {
             "pkg:pypi/six@1.17.0?artifact_id=sdist".to_string(),
             make_record("uuid-17-sdist"),
         );
-        let manifest = PatchManifest { patches };
+        let manifest = PatchManifest { patches, setup: None };
         let manifest_path = tmp.path().join("manifest.json");
         write_manifest(&manifest_path, &manifest)
             .await
