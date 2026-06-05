@@ -18,6 +18,9 @@ module SocketPatch
   #      GitHub release, verify its SHA-256 against the release's SHA256SUMS,
   #      extract the binary, cache it, and run it.
   module Launcher
+    # Fallback version, used ONLY when the installed gem's version can't be read
+    # (e.g. running this file from a checkout). In a real `gem install` the
+    # download uses the installed gem's own version — see `version`.
     VERSION = "3.3.0"
     REPO = "SocketDev/socket-patch"
     BINARY = "socket-patch"
@@ -46,13 +49,28 @@ module SocketPatch
       env = ENV["SOCKET_PATCH_BIN"]
       return env if env && !env.empty? && File.executable?(env)
 
+      ver = version
       target, ext = detect_target
       exe = BINARY + (Gem.win_platform? ? ".exe" : "")
-      cached = File.join(cache_dir, VERSION, target, exe)
+      cached = File.join(cache_dir, ver, target, exe)
       return cached if File.executable?(cached)
 
-      download_binary(target, ext, cached)
+      download_binary(ver, target, ext, cached)
       cached
+    end
+
+    # The version to fetch — the binary MUST match the CLI package the user
+    # actually installed, so derive it from the installed gem's own spec rather
+    # than trusting the `VERSION` constant (which `version-sync.sh` keeps current
+    # but which could drift). Falls back to the constant when the gem isn't
+    # activated (e.g. running this file directly from a checkout).
+    def version
+      if (spec = Gem.loaded_specs["socket-patch"])
+        return spec.version.to_s
+      end
+      Gem::Specification.find_by_name("socket-patch").version.to_s
+    rescue StandardError
+      VERSION
     end
 
     # Map the host to a release target triple + archive extension. Mirrors
@@ -111,9 +129,9 @@ module SocketPatch
 
     # ── download + verify + extract ───────────────────────────────────────────
 
-    def download_binary(target, ext, dest)
+    def download_binary(ver, target, ext, dest)
       archive = "#{BINARY}-#{target}.#{ext}"
-      base = "https://github.com/#{REPO}/releases/download/v#{VERSION}"
+      base = "https://github.com/#{REPO}/releases/download/v#{ver}"
 
       Dir.mktmpdir("socket-patch") do |tmp|
         archive_path = File.join(tmp, archive)

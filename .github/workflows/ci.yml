@@ -37,6 +37,45 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
 
+  # Lint the out-of-workspace packaging artifacts for the ecosystems whose setup
+  # / CLI-distribution we added: the RubyGems CLI launcher gem + the Bundler
+  # plugin gem (Ruby), the Composer CLI launcher (PHP), and the generated Go
+  # setup-guard templates. Ruby, PHP, Composer, and Go are all pre-installed on
+  # the ubuntu-latest runner.
+  lint-ecosystems:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Ruby — syntax-check + build the launcher gem and Bundler plugin
+        run: |
+          ( cd gem/socket-patch && ruby -c lib/socket_patch/launcher.rb && ruby -c exe/socket-patch && gem build socket-patch.gemspec )
+          ( cd gem/socket-patch-bundler && ruby -c plugins.rb && gem build socket-patch-bundler.gemspec )
+          # The generated-plugin templates are pure Ruby — keep them parseable.
+          ruby -c crates/socket-patch-core/src/gem_setup/templates/plugins.rb.tmpl
+          ruby -c crates/socket-patch-core/src/gem_setup/templates/gemspec.tmpl
+
+      - name: PHP — lint the Composer launcher + validate composer.json
+        run: |
+          php -l composer/socket-patch/bin/socket-patch
+          ( cd composer/socket-patch && composer validate --no-check-publish )
+
+      - name: Go — gofmt + vet the setup-guard templates
+        run: |
+          tmp="$(mktemp -d)"
+          cp crates/socket-patch-core/src/go_setup/templates/guard.go.tmpl "$tmp/guard.go"
+          cp crates/socket-patch-core/src/go_setup/templates/guard_test.go.tmpl "$tmp/guard_test.go"
+          unformatted="$(gofmt -l "$tmp")"
+          if [ -n "$unformatted" ]; then
+            echo "::error::Go setup-guard templates are not gofmt-clean:"
+            gofmt -d "$tmp"
+            exit 1
+          fi
+          ( cd "$tmp" && go mod init socketpatchguardlint >/dev/null && go vet ./... )
+
   test:
     strategy:
       fail-fast: false

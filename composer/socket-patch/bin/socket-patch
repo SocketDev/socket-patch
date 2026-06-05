@@ -9,16 +9,50 @@
 // verifies it against the release's SHA256SUMS, caches it, and execs it. Set
 // SOCKET_PATCH_BIN to an existing executable to bypass the download (airgap).
 //
-// SP_VERSION is kept in sync with the workspace by scripts/version-sync.sh.
+// SP_VERSION is a fallback used ONLY when Composer's recorded version for this
+// package can't be read (see sp_version); a normal install downloads the binary
+// matching the installed package version. Kept in sync by version-sync.sh.
 
 const SP_VERSION = '3.3.0';
 const SP_REPO = 'SocketDev/socket-patch';
 const SP_BINARY = 'socket-patch';
 
+// Load Composer's autoloader (the bin proxy exposes its path) so we can read the
+// version Composer recorded for THIS package — the binary we download must match
+// the package the user actually installed, not a constant that could drift.
+$sp_autoload = $GLOBALS['_composer_autoload_path'] ?? null;
+if (is_string($sp_autoload) && is_file($sp_autoload)) {
+    require_once $sp_autoload;
+}
+
 function sp_fail($msg)
 {
     fwrite(STDERR, "socket-patch: $msg\n");
     exit(1);
+}
+
+/**
+ * The version to fetch. Prefer the version Composer recorded for this package
+ * (matches what the user installed); fall back to the baked SP_VERSION constant
+ * (`version-sync.sh` keeps it current) when InstalledVersions is unavailable or
+ * reports a non-release (dev/branch) version with no matching release binary.
+ */
+function sp_version()
+{
+    if (class_exists('\\Composer\\InstalledVersions')) {
+        try {
+            $v = \Composer\InstalledVersions::getPrettyVersion('socketsecurity/socket-patch');
+            if ($v !== null) {
+                $v = ltrim($v, 'v');
+                if (preg_match('/^\d+\.\d+\.\d+/', $v)) {
+                    return $v;
+                }
+            }
+        } catch (\Throwable $e) {
+            // fall through to the constant
+        }
+    }
+    return SP_VERSION;
 }
 
 /** @return array{0:string,1:string} [target-triple, archive-extension] */
@@ -180,16 +214,17 @@ function sp_resolve_binary()
         return $env;
     }
 
+    $ver = sp_version();
     list($target, $ext) = sp_detect_target();
     $exe = SP_BINARY . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
-    $cached = sp_cache_dir() . DIRECTORY_SEPARATOR . SP_VERSION
+    $cached = sp_cache_dir() . DIRECTORY_SEPARATOR . $ver
         . DIRECTORY_SEPARATOR . $target . DIRECTORY_SEPARATOR . $exe;
     if (is_executable($cached)) {
         return $cached;
     }
 
     $archive = SP_BINARY . "-$target.$ext";
-    $base = 'https://github.com/' . SP_REPO . '/releases/download/v' . SP_VERSION;
+    $base = 'https://github.com/' . SP_REPO . '/releases/download/v' . $ver;
     $tmp = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'socket-patch-' . getmypid();
     @mkdir($tmp, 0777, true);
 

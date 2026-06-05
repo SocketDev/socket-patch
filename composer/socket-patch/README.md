@@ -9,13 +9,15 @@ vendor/bin/socket-patch --help
 ```
 
 This is a thin **launcher** package. On first run `vendor/bin/socket-patch`
-downloads the prebuilt binary for your platform from the matching GitHub release
-(`v<version>`), verifies it against the release's `SHA256SUMS`, caches it under
-your user cache (`~/.cache/socket-patch/bin/` or `%LOCALAPPDATA%\socket-patch\bin\`
-on Windows), and execs it. Subsequent runs use the cached binary.
+downloads the prebuilt binary for your platform from the GitHub release
+**matching the installed package's own version** (read from Composer's
+`InstalledVersions`), verifies it against the release's `SHA256SUMS`, caches it
+under your user cache (`~/.cache/socket-patch/bin/` or
+`%LOCALAPPDATA%\socket-patch\bin\` on Windows), and execs it. Subsequent runs use
+the cached binary.
 
-The package version maps to the release it fetches: installing the package at
-tag `vX.Y.Z` downloads the `vX.Y.Z` binary.
+So `composer require socketsecurity/socket-patch:3.2.0` downloads the `v3.2.0`
+binary — the binary version always tracks the installed package version.
 
 ## Airgapped / offline use
 
