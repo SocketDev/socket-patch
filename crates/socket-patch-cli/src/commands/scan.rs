@@ -608,6 +608,30 @@ pub async fn run(args: ScanArgs) -> i32 {
             telemetry_org.as_deref(),
         )
         .await;
+
+        // A scan in which *every* batch failed produced no trustworthy
+        // patch data. Surfacing `status: "success"` / exit 0 here would be
+        // indistinguishable from a genuine "no patches" result and would
+        // mask a total API outage. Report the failure explicitly and bail
+        // before writing any manifest or attempting apply/prune.
+        if args.common.json {
+            let result = serde_json::json!({
+                "status": "error",
+                "error": err,
+                "scannedPackages": package_count,
+                "packagesWithPatches": 0,
+                "totalPatches": 0,
+                "freePatches": 0,
+                "paidPatches": 0,
+                "canAccessPaidPatches": false,
+                "packages": [],
+                "updates": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        } else {
+            eprintln!("Error: all {total_batches} API batch queries failed: {err}");
+        }
+        return 1;
     }
 
     let total_patches_found: usize = all_packages_with_patches
