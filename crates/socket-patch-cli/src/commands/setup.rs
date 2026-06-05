@@ -1246,10 +1246,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             println!(
                 "\nCommit go.mod (the `replace` directives), internal/socketpatchguard/, the \
                  generated socket_patch_guard_import.go files, .socket/go-patches/, and your \
-                 .socket/ patches. The init() guard enforces patches on every `go run`/binary \
-                 launch. For a reliable CI merge gate add a step running:\n\
-                 \x20   socket-patch apply --check --ecosystems golang\n\
-                 (`go test ./...` also gates, but only on a cold cache — see internal/socketpatchguard)."
+                 .socket/ patches. Enforcement: `go test ./...` gates at CI time (the guard \
+                 reads the patch state in-process, so the test cache re-runs it on any drift), \
+                 and the init() guard gates every `go run`/binary launch."
             );
         }
     }

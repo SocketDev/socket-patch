@@ -179,6 +179,26 @@ fn go_build_links_patch_and_guard_enforces_drift() {
         String::from_utf8_lossy(&t.stderr)
     );
 
+    // ── warm-cache drift: `go test` (NO -count=1) must NOT serve a stale PASS ──
+    // Prime the cache with a passing run, then corrupt the copy and run again
+    // WITHOUT -count=1. The guard reads the patch state in-process, so the test
+    // cache must re-run the gate and FAIL (this is the test-cache-masking fix).
+    let warm = consumer.join(".socket/go-patches/example.com").join(format!("upstream@{UVER}")).join("lib.go");
+    let _ = go(&consumer, &["test", "./internal/socketpatchguard/"], &test_env); // prime cache (no -count=1)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&warm, std::fs::Permissions::from_mode(0o644));
+    }
+    std::fs::write(&warm, "package upstream\n\nfunc Greeting() string { return \"WARM-DRIFT\" }\n").unwrap();
+    let warm_test = go(&consumer, &["test", "./internal/socketpatchguard/"], &test_env); // NO -count=1
+    assert!(
+        !warm_test.status.success(),
+        "WARM-CACHE go test must catch drift (not serve a cached PASS):\n{}\n{}",
+        String::from_utf8_lossy(&warm_test.stdout),
+        String::from_utf8_lossy(&warm_test.stderr)
+    );
+    // (heal happened during that run; restore is verified by the -count=1 block below)
+
     // ── drift: corrupt the committed copy → guard test fails closed ──
     let copy_file = consumer
         .join(".socket/go-patches/example.com")

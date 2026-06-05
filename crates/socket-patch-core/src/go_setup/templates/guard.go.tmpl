@@ -58,6 +58,14 @@ func check() (string, bool) {
 	if _, err := os.Stat(filepath.Join(root, ".socket", "manifest.json")); err != nil {
 		return "", false // project does not use socket-patch
 	}
+	// Register the drift-relevant files as test inputs. `go test` caches a
+	// result keyed on the files the test reads IN-PROCESS (the testlog
+	// mechanism), but NOT on files a subprocess reads — so without this the
+	// `apply --check` verdict below would be served from a stale cache after
+	// drift (a dependency bump, an un-re-applied patch, a tampered copy). These
+	// reads make the cache re-run the gate whenever go.mod / the manifest / a
+	// committed copy changes.
+	registerCacheInputs(root)
 	bin := binPath()
 
 	switch probe(bin, root) {
@@ -92,6 +100,22 @@ func binPath() string {
 		return b
 	}
 	return "socket-patch"
+}
+
+// registerCacheInputs reads the files whose drift this guard detects, purely so
+// the `go test` result cache treats them as inputs (see check). The bytes are
+// discarded — the authoritative verdict comes from `apply --check`; this only
+// ensures `go test` doesn't serve a stale PASS on a warm cache after drift.
+func registerCacheInputs(root string) {
+	_, _ = os.ReadFile(filepath.Join(root, "go.mod"))
+	_, _ = os.ReadFile(filepath.Join(root, ".socket", "manifest.json"))
+	patches := filepath.Join(root, ".socket", "go-patches")
+	_ = filepath.WalkDir(patches, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			_, _ = os.ReadFile(p)
+		}
+		return nil
+	})
 }
 
 // probe runs the read-only `apply --check`. Exit 0 → inSync; a non-zero exit →
