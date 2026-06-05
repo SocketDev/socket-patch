@@ -608,19 +608,6 @@ mod tests {
             .await
             .expect("repair_inner");
 
-        eprintln!("DBG cleaned={} bytes={}", counts.cleaned, counts.bytes_freed);
-        eprintln!(
-            "DBG diff_orphan_exists={} pkg_orphan_exists={}",
-            socket
-                .join("diffs")
-                .join("99999999-9999-4999-8999-999999999999.tar.gz")
-                .exists(),
-            socket
-                .join("packages")
-                .join("88888888-8888-4888-8888-888888888888.tar.gz")
-                .exists(),
-        );
-        eprintln!("DBG events={:?}", env.events);
         // Two orphans removed (one diff, one package); the referenced ones stay.
         assert_eq!(counts.cleaned, 2, "both orphan archives should be swept");
         assert_eq!(
@@ -628,7 +615,25 @@ mod tests {
             (orphan_diff.len() + orphan_pkg.len()) as u64,
             "bytes_freed must aggregate diff + package reclaim"
         );
-        assert_eq!(env.summary.removed, 2);
+        // Cleanup is reported as a SINGLE batched `removed` artifact event whose
+        // `details.count` carries the tally — so the event-count summary is 1
+        // (`Summary::bump` increments once per event), and the 2-artifact count
+        // is asserted via `counts.cleaned` above and the event details here.
+        assert_eq!(env.summary.removed, 1, "one batched removal event");
+        let removed = env
+            .events
+            .iter()
+            .find(|e| matches!(e.action, PatchAction::Removed))
+            .expect("a Removed artifact event");
+        assert_eq!(
+            removed
+                .details
+                .as_ref()
+                .and_then(|d| d.get("count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "the batched removal event must report 2 swept artifacts"
+        );
 
         assert!(socket
             .join("diffs")
