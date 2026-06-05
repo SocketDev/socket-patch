@@ -1,6 +1,9 @@
-//! setup-matrix: gem ecosystem (bundler). No native post-install hook
-//! and `setup` is a no-op, so the with-setup cases are an EXPECTED
-//! BASELINE GAP.
+//! setup-matrix: gem ecosystem (bundler). `setup` now has REAL bundler support
+//! — it appends a managed `plugin "socket-patch"` block to the Gemfile and
+//! generates a committed in-tree Bundler plugin under `.socket/bundler-plugin/`
+//! whose `plugins.rb` re-runs `socket-patch apply --ecosystems gem` on every
+//! `bundle install` (load-time digest gate + `after-install-all` hook). So the
+//! with-setup cases are no longer a baseline gap.
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("gem", "bundler")` routes gem through the shared Docker
@@ -19,22 +22,14 @@
 //! To close that loophole WITHOUT touching the shared harness or the bash
 //! driver, [`host_guard::gem_setup_roundtrip_host`] runs unconditionally
 //! (no Docker, no network, no ruby/bundler toolchain) and pins gem
-//! `setup`'s *actual current contract*: a bundler project has only a
-//! `Gemfile` — a manifest `setup` does NOT support — so every `setup`
-//! subcommand must report `no_files` (exit 0 for setup/remove; exit 0 for
-//! `--check`, since "nothing to configure" is success not failure) and
-//! must leave the `Gemfile` byte-for-byte untouched. It reads on-disk
-//! state with an *independent* probe (a hand-pinned constant, not a copy
-//! of any writer output) so the oracle can disagree with a broken
-//! implementation. It fails loudly if gem `setup` ever starts mutating a
-//! Gemfile, crashes on a bundler project, mis-classifies the Gemfile as a
-//! configurable manifest, or returns the wrong exit code / status.
-//!
-//! If `setup` ever GROWS real bundler support, this guard's expectations
-//! become wrong-by-design and must be upgraded to the deno-style positive
-//! round-trip (check fails → setup configures → check passes → remove).
-//! That is the intended signal: the test going red here means the baseline
-//! gap closed, not that something broke.
+//! `setup`'s contract with a full POSITIVE round-trip: `--check` fails on a
+//! pristine Gemfile → `setup` wires the plugin → `--check` passes → `--remove`
+//! restores the Gemfile *byte-for-byte* and deletes the generated plugin dir →
+//! `--check` fails again. It reads on-disk state with *independent* probes
+//! (hand-pinned constants + a marker scan, not a copy of any writer output) so
+//! the oracle can disagree with a broken implementation. It fails loudly if
+//! gem `setup` stops wiring the plugin, corrupts the Gemfile, mis-reports a
+//! status / exit code, or leaves residue after `--remove`.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_gem`
 #![cfg(feature = "setup-e2e")]
@@ -55,10 +50,10 @@ fn bundler() {
 // ─────────────────────────────────────────────────────────────────────────
 // Real, non-skippable regression guard for gem `setup`.
 //
-// A bundler project carries only a Gemfile (no package.json / Python /
-// Cargo manifest), which `setup` does not support. The guard pins that
-// no-op contract precisely so a regression (Gemfile mutation, crash,
-// mis-detection, wrong exit code) turns this suite red even with no Docker.
+// A bundler project carries a Gemfile; `setup` wires a committed Bundler
+// plugin into it. The guard pins that round-trip precisely so a regression
+// (plugin no longer wired, Gemfile corrupted on add/remove, wrong exit code,
+// residue after remove) turns this suite red even with no Docker / ruby.
 // ─────────────────────────────────────────────────────────────────────────
 mod host_guard {
     use std::path::Path;
@@ -68,6 +63,13 @@ mod host_guard {
     /// `bundler` branch in `tests/setup_matrix/run-case.sh` and the gem
     /// target's package/version in matrix.json (`colorize` @ `1.1.0`).
     const GEMFILE: &str = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n";
+
+    /// The relative path of the generated in-tree plugin (independent of any
+    /// production constant — a hand-pinned oracle).
+    const PLUGIN_DIR: &str = ".socket/bundler-plugin";
+    /// The managed-block marker `setup` appends to the Gemfile. Pinned here so
+    /// the test disagrees with a renamed/removed marker rather than copying it.
+    const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
 
     /// Every `SOCKET_*` env var clap consults for the surface this test
     /// drives. Stripped from the child so the run reflects ONLY the explicit
@@ -102,6 +104,7 @@ mod host_guard {
         "SOCKET_ALL_RELEASES",
         "SOCKET_PATCH_ROOT",
         "SOCKET_PATCH_GUARD",
+        "SOCKET_PATCH_BIN",
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
@@ -143,43 +146,14 @@ mod host_guard {
             .to_string()
     }
 
-    /// The Gemfile must be byte-for-byte what we wrote — `setup` (in any
-    /// mode) operates on package.json / Python / Cargo manifests and must
-    /// NEVER touch a bundler Gemfile.
-    fn assert_gemfile_pristine(root: &Path, who: &str) {
-        assert_eq!(
-            std::fs::read_to_string(root.join("Gemfile")).unwrap(),
-            GEMFILE,
-            "{who}: Gemfile must be left byte-for-byte unchanged by setup"
-        );
+    fn json_i64(v: &serde_json::Value, key: &str, who: &str) -> i64 {
+        v.get(key)
+            .and_then(|n| n.as_i64())
+            .unwrap_or_else(|| panic!("{who}: JSON has no integer `{key}` field:\n{v}"))
     }
 
-    /// `setup`'s contract on a manifest it does not support is `no_files`
-    /// with a clean exit (0) and zero side effects. This single helper pins
-    /// every subcommand to that contract: a real boolean `no_files` status,
-    /// exit 0, the `files` list empty, and the Gemfile untouched.
-    fn assert_no_files(root: &Path, args: &[&str], who: &str) -> serde_json::Value {
-        let (code, out, err) = run(root, args);
-        assert_eq!(
-            code, 0,
-            "{who}: must exit 0 on an unsupported (Gemfile-only) project.\nstdout:\n{out}\nstderr:\n{err}"
-        );
-        let v = parse_json(&out, who);
-        assert_eq!(
-            json_str(&v, "status", who),
-            "no_files",
-            "{who}: a bundler project must report status=no_files (Gemfile is not a configurable manifest).\nstderr:\n{err}"
-        );
-        let files = v
-            .get("files")
-            .and_then(|f| f.as_array())
-            .unwrap_or_else(|| panic!("{who}: JSON has no `files` array:\n{v}"));
-        assert!(
-            files.is_empty(),
-            "{who}: no_files result must carry an EMPTY files list (the Gemfile must not be picked up as a manifest):\n{v}"
-        );
-        assert_gemfile_pristine(root, who);
-        v
+    fn gemfile_body(root: &Path) -> String {
+        std::fs::read_to_string(root.join("Gemfile")).unwrap()
     }
 
     /// setup / setup --check / setup --remove against a real bundler project,
@@ -191,51 +165,108 @@ mod host_guard {
         let root = tmp.path();
         std::fs::write(root.join("Gemfile"), GEMFILE).unwrap();
         let root_s = root.to_str().unwrap();
+        let plugins_rb = root.join(PLUGIN_DIR).join("plugins.rb");
+        let gemspec = root.join(PLUGIN_DIR).join("socket-patch.gemspec");
 
         // ── pristine precondition ──────────────────────────────────────────
-        // Pin the BEFORE state so the assertions prove the *binary* left the
-        // Gemfile alone, not that the fixture happened to match afterwards.
-        assert_gemfile_pristine(root, "fixture");
+        assert_eq!(gemfile_body(root), GEMFILE, "fixture Gemfile");
+        assert!(
+            !root.join(PLUGIN_DIR).exists(),
+            "fixture must not already contain the generated plugin dir"
+        );
         assert!(
             !root.join("package.json").exists(),
             "fixture must not contain a package.json (would change the path under test)"
         );
 
-        // ── check (before): no supported manifest → no_files, exit 0 ────────
-        // `--check` returning exit 1 here would be wrong (there is nothing to
-        // configure); returning `needs_configuration`/`configured` would mean
-        // the Gemfile was mis-detected as an npm/python/cargo manifest.
-        assert_no_files(root, &["setup", "--check", "--cwd", root_s, "--json"], "check (pristine)");
-
-        // ── setup: must be a true no-op (no Gemfile mutation, nothing wired) ─
-        let v = assert_no_files(root, &["setup", "--cwd", root_s, "--yes", "--json"], "setup");
-        assert_eq!(
-            v.get("updated").and_then(|n| n.as_i64()),
-            Some(0),
-            "setup on a bundler project must update zero manifests:\n{v}"
-        );
-        assert_eq!(
-            v.get("errors").and_then(|n| n.as_i64()),
-            Some(0),
-            "setup on a bundler project must report zero errors:\n{v}"
-        );
-        // Defensively confirm setup created no stray hook artifacts.
+        // ── check (pristine): plugin not wired → needs_configuration, exit 1 ─
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 1, "check on an unconfigured bundler project must exit 1.\n{out}\n{err}");
+        let v = parse_json(&out, "check (pristine)");
+        assert_eq!(json_str(&v, "status", "check (pristine)"), "needs_configuration");
+        // The Gemfile must be among the manifests reported as needing setup.
+        let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
         assert!(
-            !root.join("package.json").exists(),
-            "setup must NOT synthesize a package.json for a bundler project"
+            files.iter().any(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile")
+                && f.get("status").and_then(|s| s.as_str()) == Some("needs_configuration")),
+            "check must report the Gemfile as needs_configuration:\n{v}"
         );
 
-        // ── check (after setup): still nothing to configure → no_files ──────
-        // Proves `setup` did not silently configure something a later check
-        // would then report as `configured` (which would flip exit to 0 for a
-        // different, wrong reason).
-        assert_no_files(
-            root,
-            &["setup", "--check", "--cwd", root_s, "--json"],
-            "check (after setup)",
+        // ── setup: wire the plugin (Gemfile block + generated dir) ──────────
+        let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "setup must exit 0.\n{out}\n{err}");
+        let v = parse_json(&out, "setup");
+        assert_eq!(json_str(&v, "status", "setup"), "success");
+        assert!(json_i64(&v, "updated", "setup") >= 2, "Gemfile + plugin dir updated:\n{v}");
+        assert_eq!(json_i64(&v, "errors", "setup"), 0, "setup errors:\n{v}");
+
+        // On-disk, via independent probes (NOT a copy of the writer output):
+        // the managed block is appended (original bytes preserved as a prefix),
+        let body = gemfile_body(root);
+        assert!(body.starts_with(GEMFILE), "setup must only APPEND to the Gemfile:\n{body}");
+        assert!(body.contains(MANAGED_MARKER), "managed block marker missing:\n{body}");
+        assert!(
+            body.contains("plugin 'socket-patch'"),
+            "Gemfile must reference the socket-patch plugin:\n{body}"
+        );
+        // and the generated plugin carries the two triggers + fail-loud applier.
+        assert!(plugins_rb.exists(), "plugins.rb must be generated");
+        assert!(gemspec.exists(), "the plugin gemspec must be generated");
+        let rb = std::fs::read_to_string(&plugins_rb).unwrap();
+        assert!(
+            rb.contains("Bundler::Plugin.add_hook(\"after-install-all\")"),
+            "plugins.rb must register the after-install-all hook (fresh-install trigger):\n{rb}"
+        );
+        assert!(
+            rb.contains("SocketPatch.apply!"),
+            "plugins.rb must call the applier at load time (cached/no-op-install trigger):\n{rb}"
+        );
+        assert!(
+            rb.contains("\"--ecosystems\", \"gem\", \"--offline\""),
+            "plugins.rb must shell the gem-scoped offline apply:\n{rb}"
+        );
+        assert!(
+            rb.contains("BundlerError"),
+            "plugins.rb must fail loud (raise Bundler::BundlerError) on a patch failure:\n{rb}"
         );
 
-        // ── remove: also a no-op on an unsupported project ──────────────────
-        assert_no_files(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"], "remove");
+        // ── check (after setup): configured, exit 0 ─────────────────────────
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 0, "check on a configured project must exit 0.\n{out}\n{err}");
+        assert_eq!(
+            json_str(&parse_json(&out, "check (configured)"), "status", "check (configured)"),
+            "configured"
+        );
+
+        // ── idempotent re-setup: nothing changes ────────────────────────────
+        let (code, out, _) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "idempotent re-setup must exit 0");
+        let v = parse_json(&out, "re-setup");
+        assert_eq!(json_str(&v, "status", "re-setup"), "already_configured");
+        assert_eq!(json_i64(&v, "updated", "re-setup"), 0, "re-setup must update nothing:\n{v}");
+
+        // ── remove: byte-for-byte restore + plugin dir gone ─────────────────
+        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
+        assert_eq!(code, 0, "remove must exit 0.\n{out}\n{err}");
+        let v = parse_json(&out, "remove");
+        assert_eq!(json_str(&v, "status", "remove"), "success");
+        assert!(json_i64(&v, "removed", "remove") >= 2, "Gemfile + plugin dir removed:\n{v}");
+        assert_eq!(
+            gemfile_body(root),
+            GEMFILE,
+            "remove must restore the Gemfile byte-for-byte to its pre-setup state"
+        );
+        assert!(
+            !root.join(PLUGIN_DIR).exists(),
+            "remove must delete the generated plugin dir"
+        );
+
+        // ── check (after remove): needs_configuration again, exit 1 ─────────
+        let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(code, 1, "check after remove must exit 1 again");
+        assert_eq!(
+            json_str(&parse_json(&out, "check (removed)"), "status", "check (removed)"),
+            "needs_configuration"
+        );
     }
 }

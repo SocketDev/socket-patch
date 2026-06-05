@@ -114,9 +114,10 @@ in particular, are behavior changes that gate a version bump when implemented).
 3. **Consistency after install.** Once an ecosystem is set up, its locally-installed dependencies are
    re-patched to match the manifest after **any** of: a dependency added, updated, or removed; **or** a
    new patch added to the manifest. The re-patch is carried by the ecosystem's install/build hook (npm
-   `postinstall`/`dependencies`, the Python `.pth` startup hook, the cargo guard build script) which
-   runs `socket-patch apply` after the ecosystem's installer finishes, so patch state always reconverges
-   with the manifest. *(Implemented for npm/pypi/cargo via the support matrix.)*
+   `postinstall`/`dependencies`, the Python `.pth` startup hook, the cargo guard build script, the gem
+   Bundler plugin) which runs `socket-patch apply` after the ecosystem's installer finishes, so patch
+   state always reconverges with the manifest. *(Implemented for npm/pypi/cargo/gem via the support
+   matrix.)*
 
 4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
    in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
@@ -125,9 +126,11 @@ in particular, are behavior changes that gate a version bump when implemented).
    on-disk patch consistency. RED-guarded.)*
 
 5. **In-repo and committable.** `setup` writes only inside the working tree: `package.json`,
-   `pyproject.toml`/`requirements.txt`, member `Cargo.toml`s, and `.cargo/config.toml`. Every artifact
-   is git-committable. It never writes outside `--cwd` — no `$HOME`, no global `site-packages` (the
-   Python `.pth` wheel is installed later by the user's package manager, not by `setup`). *(Implemented.)*
+   `pyproject.toml`/`requirements.txt`, member `Cargo.toml`s, `.cargo/config.toml`, the `Gemfile` +
+   generated `.socket/bundler-plugin/`. Every artifact is git-committable. It never writes outside
+   `--cwd` — no `$HOME`, no global `site-packages` (the Python `.pth` wheel is installed later by the
+   user's package manager, not by `setup`; the gem patch stamp is written under `Bundler.bundle_path`
+   by the plugin at `bundle install` time, not by `setup`). *(Implemented.)*
 
 6. **Clone-portable.** Because all setup state is committed files, a fresh checkout on another host —
    CI, a deploy, a teammate's machine — inherits the setup state unchanged; `setup --check` passes on
@@ -172,13 +175,14 @@ patches still show up in VEX).
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
 | cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]` |
-| gem · nuget · maven · golang · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+| gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
+| nuget · maven · golang · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
 
 ### JSON output shapes (`setup`, `setup --check`, `setup --remove`)
 
 `setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
 consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `cargo`, `cargo_env`.
+`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`.
 
 **`setup`:**
 

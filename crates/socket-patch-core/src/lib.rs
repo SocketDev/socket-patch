@@ -3,6 +3,7 @@ pub mod api;
 pub mod cargo_setup;
 pub mod constants;
 pub mod crawlers;
+pub mod gem_setup;
 #[cfg(feature = "golang")]
 pub mod go_setup;
 pub mod hash;

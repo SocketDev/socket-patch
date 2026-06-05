@@ -776,3 +776,72 @@ fn setup_configures_npm_workspace_members() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gem (Bundler) — wires a committed plugin into the Gemfile (property 3).
+// The full check/remove round-trip + plugins.rb content lives in
+// setup_matrix_gem.rs; these pin the dry-run no-op and the mixed-ecosystem
+// dispatch alongside npm.
+// ---------------------------------------------------------------------------
+
+const GEMFILE_FIXTURE: &str = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n";
+
+#[test]
+fn setup_gem_dry_run_does_not_modify_gemfile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let gemfile = tmp.path().join("Gemfile");
+    write(&gemfile, GEMFILE_FIXTURE);
+
+    let (code, stdout) = run_setup(tmp.path(), &["--dry-run"]);
+    assert_eq!(code, 0, "dry-run should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "dry_run");
+    assert_eq!(v["dryRun"], true);
+
+    // The Gemfile must be byte-identical and no plugin dir created.
+    assert_eq!(
+        std::fs::read_to_string(&gemfile).unwrap(),
+        GEMFILE_FIXTURE,
+        "dry-run must not modify the Gemfile"
+    );
+    assert!(
+        !tmp.path().join(".socket/bundler-plugin").exists(),
+        "dry-run must not generate the plugin dir"
+    );
+}
+
+#[test]
+fn setup_configures_gem_alongside_npm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(&tmp.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "mixed", "version": "1.0.0" }
+"#,
+    );
+
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 0, "mixed setup should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+
+    // The envelope must carry both an npm package_json entry and the gem
+    // entries (gemfile + gem_plugin) — proof gem dispatch runs next to npm.
+    let kinds: BTreeSet<&str> = v["files"]
+        .as_array()
+        .expect("files[]")
+        .iter()
+        .filter_map(|f| f["kind"].as_str())
+        .collect();
+    assert!(kinds.contains("package_json"), "npm entry missing; kinds={kinds:?}");
+    assert!(kinds.contains("gemfile"), "gem Gemfile entry missing; kinds={kinds:?}");
+    assert!(kinds.contains("gem_plugin"), "gem plugin entry missing; kinds={kinds:?}");
+
+    // On disk: both manifests are wired.
+    assert!(std::fs::read_to_string(tmp.path().join("Gemfile"))
+        .unwrap()
+        .contains("plugin 'socket-patch'"));
+    assert!(std::fs::read_to_string(tmp.path().join("package.json"))
+        .unwrap()
+        .contains("socket-patch"));
+}
