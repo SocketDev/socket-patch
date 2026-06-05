@@ -158,9 +158,16 @@ in particular, are behavior changes that gate a version bump when implemented).
    yarn / pnpm / bun workspace members and cargo workspace members are all discovered and configured
    (pnpm is root-package-only by design, because workspace-member `postinstall` scripts fail under
    pnpm's strict module isolation). Selected paths may be **excluded**, and the exclusion is **persisted
-   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Workspace discovery
-   implemented; the `--exclude` flag + manifest exclude sub-property are **follow-up work** — pending
-   test marked `#[ignore]`.)*
+   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Single-level
+   workspace discovery implemented; the `--exclude` flag + manifest exclude sub-property are
+   **follow-up work** — pending test marked `#[ignore]`.)*
+   - **Nested workspaces (intended; gap).** A workspace member that is itself a workspace root — or, for
+     cargo, members matched by a recursive `members = ["crates/**"]` glob — *should* be recursed into and
+     have its own members configured. Today expansion is **one level only** (`find_package_json_files`
+     never reads a discovered member's own `workspaces` field; `discover_cargo_project` expands
+     `crates/*` but not `crates/**`). Guarded by the `#[ignore]`d gap pins
+     `setup_recurses_into_nested_npm_workspace` / `setup_expands_recursive_cargo_member_glob` in
+     `tests/setup_monorepo_invariants.rs`.
 
 ### Per-ecosystem setup support
 
@@ -177,6 +184,35 @@ patches still show up in VEX).
 | cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]` |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
 | nuget · maven · golang · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+
+### Monorepo / multi-project discovery model
+
+How `setup` (and the underlying `scan`/`apply` crawlers) find subprojects differs by ecosystem, and
+the model is **not uniform** today:
+
+- **Workspace-aware (walk members):** npm / yarn / pnpm / bun (`workspaces` / `pnpm-workspace.yaml`)
+  and cargo (`[workspace] members`). One repo-root invocation discovers and configures every member.
+  *Single level only* — see property 9's nested-workspace gap.
+- **cwd-only (single project):** gem, pypi, golang, composer. The crawler inspects only the project
+  rooted at `--cwd` (e.g. gem looks at `<cwd>/vendor/bundle/...`; pypi at `<cwd>/.venv`); it does **not**
+  descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories
+  (`backend/Gemfile.lock` + `frontend/Gemfile.lock`, multiple `.venv`, multiple `go.mod` /
+  `composer.json`) is handled by invoking the tool **once per subproject** (`--cwd` each), as a
+  per-directory install hook would.
+
+**Intended (gap):** the cwd-only ecosystems *should* also auto-discover per-subproject lockfiles when
+run from the repo root, matching the npm/cargo workspace model. The npm-vs-others asymmetry is a known
+defect, guarded by the `#[ignore]`d gap pin
+`gem_crawl_from_repo_root_discovers_all_subproject_lockfiles` in
+`crates/socket-patch-core/tests/crawler_monorepo_gaps.rs` (gem is the representative; python/go/composer
+share the limitation).
+
+**Deeply nested transitive dependencies are fully supported.** The npm crawler recurses `node_modules`
+at unbounded depth, and `apply` is path-agnostic — it patches a package by PURL against the manifest
+regardless of how deep in the dependency tree it was installed, so a deeply-nested transitive dependency
+is patched identically to a direct one. Pinned by
+`crawl_all_discovers_deeply_nested_transitive_deps` in
+`crates/socket-patch-core/tests/crawler_npm_e2e.rs`.
 
 ### JSON output shapes (`setup`, `setup --check`, `setup --remove`)
 

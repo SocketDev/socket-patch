@@ -75,7 +75,16 @@ fn files_under(dir: &Path) -> BTreeSet<String> {
                 if p.is_dir() {
                     walk(base, &p, out);
                 } else {
-                    out.insert(p.strip_prefix(base).unwrap().to_string_lossy().to_string());
+                    // Normalize to forward slashes so relative-path keys are
+                    // platform-stable: on Windows `strip_prefix` yields
+                    // `.cargo\config.toml`, but the assertions compare against
+                    // forward-slash literals like `.cargo/config.toml`.
+                    out.insert(
+                        p.strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/"),
+                    );
                 }
             }
         }

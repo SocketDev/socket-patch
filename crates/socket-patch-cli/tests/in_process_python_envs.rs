@@ -28,6 +28,25 @@ fn write_dist_info(site_packages: &Path, name: &str, version: &str) {
     std::fs::write(pkg.join("__init__.py"), "VERSION = '0'\n").unwrap();
 }
 
+/// Build the `site-packages` path the production crawler actually probes on
+/// this platform: `<venv_root>/Lib/site-packages` on Windows,
+/// `<venv_root>/lib/<py_ver>/site-packages` on Unix (see
+/// `find_site_packages_under` in `python_crawler.rs`). The `py_ver` segment is
+/// Unix-only — Windows venvs have no per-version directory — but it is kept as
+/// a parameter so the python3.12 / python3.13 layout tests still stage (and so
+/// document) the version their names claim on Unix.
+fn venv_site_packages(venv_root: &Path, py_ver: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = py_ver;
+        venv_root.join("Lib").join("site-packages")
+    }
+    #[cfg(not(windows))]
+    {
+        venv_root.join("lib").join(py_ver).join("site-packages")
+    }
+}
+
 async fn mock_batch_empty(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
@@ -111,7 +130,7 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
 #[serial]
 async fn pypi_venv_layout_discovered() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     write_dist_info(&site, "venv_pkg", "1.0.0");
 
@@ -129,7 +148,7 @@ async fn pypi_venv_layout_discovered() {
 #[serial]
 async fn pypi_venv_python312_layout_discovered() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.12/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.12");
     std::fs::create_dir_all(&site).unwrap();
     write_dist_info(&site, "venv_pkg_312", "1.0.0");
 
@@ -150,7 +169,7 @@ async fn pypi_venv_python312_layout_discovered() {
 #[serial]
 async fn pypi_venv_python313_layout_discovered() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.13/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.13");
     std::fs::create_dir_all(&site).unwrap();
     write_dist_info(&site, "venv_pkg_313", "1.0.0");
 
@@ -184,10 +203,7 @@ async fn pypi_alternate_venv_dir_names() {
         (".env", "pkg:pypi/alt-env@1.0.0", false),
     ] {
         let tmp = tempfile::tempdir().unwrap();
-        let site = tmp
-            .path()
-            .join(venv_name)
-            .join("lib/python3.11/site-packages");
+        let site = venv_site_packages(&tmp.path().join(venv_name), "python3.11");
         std::fs::create_dir_all(&site).unwrap();
         write_dist_info(&site, &format!("alt_{venv_name}"), "1.0.0");
 
@@ -200,7 +216,7 @@ async fn pypi_alternate_venv_dir_names() {
         // `.venv` is found, the early-return short-circuits any host scan,
         // and a clean negative for `env`/`.env` proves they were genuinely
         // skipped rather than never reached.
-        let control_site = tmp.path().join(".venv/lib/python3.11/site-packages");
+        let control_site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
         std::fs::create_dir_all(&control_site).unwrap();
         write_dist_info(&control_site, "alt_control", "9.9.9");
 
@@ -228,7 +244,7 @@ async fn pypi_alternate_venv_dir_names() {
 async fn pypi_virtual_env_env_var_override() {
     let tmp = tempfile::tempdir().unwrap();
     let custom_venv = tmp.path().join("custom-venv");
-    let site = custom_venv.join("lib/python3.11/site-packages");
+    let site = venv_site_packages(&custom_venv, "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     write_dist_info(&site, "venv_override", "1.0.0");
 
@@ -256,7 +272,7 @@ async fn pypi_virtual_env_env_var_override() {
 #[serial]
 async fn pypi_dist_info_only_layout() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     // dist-info dir without a corresponding package source dir.
     let dist = site.join("dist_only-1.0.0.dist-info");
@@ -283,7 +299,7 @@ async fn pypi_dist_info_only_layout() {
 #[serial]
 async fn pypi_canonical_name_normalization() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     // pypi canonicalization: SQLAlchemy → sqlalchemy (lowercase, _ -> -)
     let dist = site.join("SQLAlchemy-2.0.30.dist-info");
@@ -313,11 +329,11 @@ async fn pypi_canonical_name_normalization() {
 async fn pypi_multiple_python_versions_in_venvs() {
     let tmp = tempfile::tempdir().unwrap();
     // .venv with one package
-    let site311 = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site311 = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site311).unwrap();
     write_dist_info(&site311, "pkg311", "1.0.0");
     // venv/ with another (the crawler scans both)
-    let site312 = tmp.path().join("venv/lib/python3.12/site-packages");
+    let site312 = venv_site_packages(&tmp.path().join("venv"), "python3.12");
     std::fs::create_dir_all(&site312).unwrap();
     write_dist_info(&site312, "pkg312", "1.0.0");
 
@@ -339,13 +355,13 @@ async fn pypi_multiple_python_versions_in_venvs() {
 async fn pypi_empty_site_packages_safe() {
     let tmp = tempfile::tempdir().unwrap();
     // Empty `.venv` site-packages — no dist-info entries.
-    let empty_site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let empty_site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&empty_site).unwrap();
     // A second recognized venv (`venv/`) holds exactly one real package.
     // It serves as a positive control: the crawler scans both `.venv` and
     // `venv`, so its discovery proves scanning actually ran. The empty
     // `.venv` must contribute NOTHING on top of it.
-    let control_site = tmp.path().join("venv/lib/python3.11/site-packages");
+    let control_site = venv_site_packages(&tmp.path().join("venv"), "python3.11");
     std::fs::create_dir_all(&control_site).unwrap();
     write_dist_info(&control_site, "only_real", "3.2.1");
 
@@ -378,7 +394,7 @@ async fn pypi_empty_site_packages_safe() {
 #[serial]
 async fn pypi_malformed_metadata_handled_gracefully() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     // dist-info with a METADATA file that has no Name/Version headers.
     // The crawler does NOT skip it: by design it falls back to parsing the
@@ -404,7 +420,7 @@ async fn pypi_malformed_metadata_handled_gracefully() {
 #[serial]
 async fn pypi_egg_info_layout_handled() {
     let tmp = tempfile::tempdir().unwrap();
-    let site = tmp.path().join(".venv/lib/python3.11/site-packages");
+    let site = venv_site_packages(&tmp.path().join(".venv"), "python3.11");
     std::fs::create_dir_all(&site).unwrap();
     // egg-info — older format. The crawler only recognizes `.dist-info`
     // dirs, so the egg-info package is NOT discovered. Pin that current

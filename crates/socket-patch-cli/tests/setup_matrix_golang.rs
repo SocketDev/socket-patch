@@ -1,6 +1,9 @@
-//! setup-matrix: golang ecosystem (go modules). No native post-install
-//! hook and `setup` is a no-op, so the with-setup cases are an EXPECTED
-//! BASELINE GAP.
+//! setup-matrix: golang ecosystem (go modules). `setup` wires a project-local
+//! fail-closed guard (`internal/socketpatchguard` + a blank import in each
+//! `package main` dir) via the go.mod-redirect backend (#104). The Docker
+//! matrix `go()` case is still an EXPECTED BASELINE GAP (its image carries an
+//! older binary and `matrix.json` marks go `baseline_supported=false`); the
+//! real configure→check→remove contract is pinned by the host guard below.
 //!
 //! IMPORTANT — why this file carries a real assertion of its own:
 //! `smc::run_pm("golang", "go")` routes go through the shared Docker matrix
@@ -16,17 +19,17 @@
 //! own it protects nothing.
 //!
 //! To close that loophole WITHOUT touching the shared harness or the bash
-//! driver, [`host_guard::go_setup_is_a_noop_host`] runs unconditionally (no
-//! Docker, no network, no go toolchain) and pins go `setup`'s *actual current
-//! contract*: go has no configurable manifest surface (no package.json, no
-//! Python manifest, no Cargo.toml), so every sub-command must report
-//! `no_files` with exit 0 and must NOT crash, NOT claim success/configured,
-//! and — critically — must NEVER litter a go project with a hook file
-//! (package.json / .cargo/config.toml / *.pth). It verifies on-disk state with
-//! an *independent* recursive directory snapshot (not any production helper) so
-//! the oracle can disagree with a broken implementation. It fails loudly if go
-//! `setup` ever starts treating go as a configurable surface, writes files into
-//! a go project, mis-reports state, or aborts.
+//! driver, [`host_guard::go_setup_configures_and_removes_guard_host`] runs
+//! unconditionally (no Docker, no network, no go toolchain) and pins go
+//! `setup`'s *actual current contract*: `--check` on an un-wired project
+//! reports `needs_configuration` (exit 1); `setup` wires the guard package +
+//! blank import (status `success`, `updated=2`) without mutating the go
+//! sources; `--check` then reports `configured` (exit 0); and `--remove` tears
+//! it back out, restoring the byte-for-byte original tree. It verifies on-disk
+//! state with an *independent* recursive directory snapshot (not any production
+//! helper) so the oracle can disagree with a broken implementation. It fails
+//! loudly if go `setup` regresses to a no-op, mis-reports state, leaks files,
+//! or aborts.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_golang`
 #![cfg(feature = "setup-e2e")]
@@ -47,11 +50,12 @@ fn go() {
 // ─────────────────────────────────────────────────────────────────────────
 // Real, non-skippable regression guard for go `setup`.
 //
-// go modules have no native post-install hook, so `setup` is a no-op on a go
-// project: nothing to configure, nothing to write, nothing to remove. This
-// guard pins that exact contract — the assertion the Docker matrix can never
-// make for go — and would fail loudly if a regression made `setup` either
-// crash on, or silently litter, a go project.
+// Since #104's go.mod-redirect backend, `setup` wires a project-local
+// fail-closed guard (`internal/socketpatchguard` + a blank import per
+// `package main` dir) and `--remove` tears it back out. This guard pins that
+// configure→check→remove round-trip — the assertion the Docker matrix can
+// never make for go — and would fail loudly if a regression dropped the
+// wiring, mis-reported state, leaked files, or aborted.
 // ─────────────────────────────────────────────────────────────────────────
 mod host_guard {
     use std::collections::BTreeMap;
@@ -191,7 +195,7 @@ mod host_guard {
     }
 
     #[test]
-    fn go_setup_is_a_noop_host() {
+    fn go_setup_configures_and_removes_guard_host() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("go.mod"), GO_MOD).unwrap();
@@ -202,74 +206,102 @@ mod host_guard {
         // Pin the BEFORE state: exactly the three go files, no hook artifacts.
         assert_pristine_go_tree(root, "fixture (pristine)");
 
-        // ── check: go has no configurable manifest → no_files, exit 0 ────────
-        // A status other than `no_files` (e.g. `configured`/`needs_configuration`)
-        // would mean go started being treated as a hook surface; a non-zero exit
-        // would mean `--check` flags a go project as broken/unconfigured.
+        // The fail-closed guard surfaces setup wires into a `package main` dir:
+        // a guard package under `internal/socketpatchguard/` and a blank import
+        // beside the `package main` file (here, the repo root).
+        let guard_dir = root.join("internal").join("socketpatchguard");
+        let guard_go = guard_dir.join("guard.go");
+        let guard_test = guard_dir.join("guard_test.go");
+        let import_go = root.join("socket_patch_guard_import.go");
+
+        // ── check (pristine): since #104's go.mod-redirect guard backend, go IS
+        // a configurable surface — an un-wired project reports
+        // `needs_configuration` and exits 1 (NOT `no_files`/exit 0). ──────────
         let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(
-            code, 0,
-            "setup --check on a go-only project must exit 0 (no configurable surface).\nstdout:\n{out}\nstderr:\n{err}"
+            code, 1,
+            "setup --check on an un-wired go project must exit 1 (guard not configured).\nstdout:\n{out}\nstderr:\n{err}"
         );
-        let v = parse_json(&out, "check");
+        let v = parse_json(&out, "check (pristine)");
         assert_eq!(
-            json_str_field(&v, "status", "check"),
-            "no_files",
-            "go has no package.json / Python / Cargo manifest — check must report no_files, \
-             not configured/needs_configuration.\nstderr:\n{err}"
+            json_str_field(&v, "status", "check (pristine)"),
+            "needs_configuration",
+            "an un-wired go project must report needs_configuration.\nstderr:\n{err}"
         );
-        assert_eq!(
-            v.get("files").and_then(|f| f.as_array()).map(|a| a.len()),
-            Some(0),
-            "check must report zero configurable files for a go project.\n{out}"
+        let kinds: Vec<&str> = v["files"]
+            .as_array()
+            .expect("check must report a files array")
+            .iter()
+            .filter_map(|f| f["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"go_guard") && kinds.contains(&"go_import"),
+            "check must surface the go_guard + go_import targets; got kinds={kinds:?}\n{out}"
         );
+        // --check must not write anything.
         assert_pristine_go_tree(root, "after check");
 
-        // ── setup: must be a genuine no-op (no_files, nothing written) ───────
+        // ── setup: wires the guard package + the blank import. ───────────────
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
         assert_eq!(
             code, 0,
-            "setup on a go-only project must exit 0 (no-op).\nstdout:\n{out}\nstderr:\n{err}"
+            "setup on a go project must exit 0.\nstdout:\n{out}\nstderr:\n{err}"
         );
         let v = parse_json(&out, "setup");
         assert_eq!(
             json_str_field(&v, "status", "setup"),
-            "no_files",
-            "setup on a go project must report no_files, NOT success/updated.\nstderr:\n{err}"
+            "success",
+            "setup must report success now that go is a configurable surface.\nstderr:\n{err}"
         );
-        assert_eq!(json_i64_field(&v, "updated", "setup"), 0, "setup must update nothing.\n{out}");
         assert_eq!(
-            json_i64_field(&v, "alreadyConfigured", "setup"),
-            0,
-            "setup must report nothing already configured.\n{out}"
+            json_i64_field(&v, "updated", "setup"),
+            2,
+            "setup wires exactly the guard package + the blank import.\n{out}"
         );
         assert_eq!(json_i64_field(&v, "errors", "setup"), 0, "setup must report zero errors.\n{out}");
-        // The decisive anti-leak check: setup must not have written a hook file.
-        assert_pristine_go_tree(root, "after setup");
+        // Independent on-disk oracle: the guard package + blank import now exist,
+        // and the original go sources are byte-for-byte untouched. (Use path
+        // joins, not snapshot string keys, so this is separator-correct on
+        // Windows.)
+        assert!(guard_go.exists(), "setup must write internal/socketpatchguard/guard.go");
+        assert!(guard_test.exists(), "setup must write internal/socketpatchguard/guard_test.go");
+        assert!(import_go.exists(), "setup must write the blank socket_patch_guard_import.go");
+        assert_eq!(std::fs::read(root.join("go.mod")).unwrap(), GO_MOD.as_bytes(), "go.mod must be unchanged");
+        assert_eq!(std::fs::read(root.join("main.go")).unwrap(), MAIN_GO.as_bytes(), "main.go must be unchanged");
 
-        // ── check again: still a no-op surface ───────────────────────────────
+        // ── check (post-setup): now configured, exit 0. ──────────────────────
         let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(
             code, 0,
-            "setup --check must still exit 0 after a no-op setup.\nstdout:\n{out}\nstderr:\n{err}"
+            "setup --check must exit 0 once the guard is wired.\nstdout:\n{out}\nstderr:\n{err}"
         );
         assert_eq!(
             json_str_field(&parse_json(&out, "check (post-setup)"), "status", "check (post-setup)"),
-            "no_files",
-            "go must remain a no_files surface after setup ran.\nstderr:\n{err}"
+            "configured",
+            "go must report configured after setup wired the guard.\nstderr:\n{err}"
         );
 
-        // ── remove: nothing to remove → no_files, exit 0, tree untouched ─────
+        // ── remove: tears down the guard + import (pruning internal/) and
+        // restores the exact pre-setup tree. ────────────────────────────────
         let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
         assert_eq!(
             code, 0,
-            "setup --remove on a go-only project must exit 0 (nothing to remove).\nstdout:\n{out}\nstderr:\n{err}"
+            "setup --remove on a configured go project must exit 0.\nstdout:\n{out}\nstderr:\n{err}"
         );
         assert_eq!(
             json_str_field(&parse_json(&out, "remove"), "status", "remove"),
-            "no_files",
-            "setup --remove on a go project must report no_files.\nstderr:\n{err}"
+            "success",
+            "remove must report success when it tears the guard back out.\nstderr:\n{err}"
         );
+        // Decisive anti-leak check: the tree is byte-for-byte the original three
+        // files — the guard package + blank import are gone and internal/ pruned.
         assert_pristine_go_tree(root, "after remove");
+
+        // ── check (post-remove): back to needs_configuration, exit 1. ────────
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(
+            code, 1,
+            "setup --check must exit 1 again once the guard is removed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
     }
 }

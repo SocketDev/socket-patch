@@ -475,14 +475,19 @@ async fn apply_pypi_package_uses_python_crawler() {
     write_root_package_json(tmp.path());
 
     // Pypi crawler discovers a project-local venv via filesystem probing
-    // (`find_local_venv_site_packages` → `.venv/lib/python3.*/site-packages`),
-    // so this is fully deterministic and does NOT depend on a real Python on
-    // PATH. The crawler returns the *site-packages* dir as the package path,
-    // and apply joins it with the patch file key after stripping the
-    // `package/` prefix — so the patch key `package/index.js` resolves to
-    // `<site-packages>/index.js`. Write the source there so apply can
-    // actually patch it.
-    let site_packages = tmp.path().join(".venv/lib/python3.12/site-packages");
+    // (`find_local_venv_site_packages` → `find_site_packages_under`), so this is
+    // fully deterministic and does NOT depend on a real Python on PATH. The
+    // probed layout is platform-specific: `.venv/Lib/site-packages` on Windows,
+    // `.venv/lib/python3.*/site-packages` on Unix — stage whichever this runner
+    // will actually look in. The crawler returns the *site-packages* dir as the
+    // package path, and apply joins it with the patch file key after stripping
+    // the `package/` prefix — so the patch key `package/index.js` resolves to
+    // `<site-packages>/index.js`. Write the source there so apply can patch it.
+    let site_packages = if cfg!(windows) {
+        tmp.path().join(".venv").join("Lib").join("site-packages")
+    } else {
+        tmp.path().join(".venv").join("lib").join("python3.12").join("site-packages")
+    };
     std::fs::create_dir_all(&site_packages).expect("create site-packages");
     std::fs::write(site_packages.join("index.js"), before).expect("write source");
     let dist_info = site_packages.join("pypi_target-1.0.0.dist-info");

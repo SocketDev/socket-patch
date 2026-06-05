@@ -578,14 +578,18 @@ fn fixture_npm(root: &Path) -> RollbackFixture {
     }
 }
 
-/// pypi: `.venv/lib/python3.11/site-packages/` with a matching dist-info.
+/// pypi: a project-local venv `site-packages/` with a matching dist-info.
+/// The crawler probes a platform-specific layout (`find_site_packages_under`):
+/// `.venv/Lib/site-packages` on Windows, `.venv/lib/python3.*/site-packages` on
+/// Unix — stage whichever this runner will actually look in.
 fn fixture_pypi(root: &Path) -> RollbackFixture {
     let purl = "pkg:pypi/__rollback_dispatch__@1.0.0";
-    let sp = root
-        .join(".venv")
-        .join("lib")
-        .join("python3.11")
-        .join("site-packages");
+    let venv = root.join(".venv");
+    let sp = if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.11").join("site-packages")
+    };
     std::fs::create_dir_all(sp.join("__rollback_dispatch__-1.0.0.dist-info")).unwrap();
     std::fs::write(
         sp.join("__rollback_dispatch__-1.0.0.dist-info").join("METADATA"),

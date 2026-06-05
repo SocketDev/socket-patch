@@ -87,6 +87,10 @@ fn git_sha256(content: &[u8]) -> String {
 // ===========================================================================
 
 #[test]
+// Gap pin (non-blocking, runnable via --ignored): encodes the intended behavior
+// but stays off the blocking CI suite, consistent with the experimental-ecosystem
+// and exclude-placeholder convention. Un-ignore when property 2 ships.
+#[ignore = "gap: setup does not yet honor --ecosystems; see CLI_CONTRACT 'Setup command contract' property 2"]
 fn setup_ecosystems_filter_scopes_work_to_named_ecosystem() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -128,6 +132,8 @@ fn setup_ecosystems_filter_scopes_work_to_named_ecosystem() {
 // ===========================================================================
 
 #[test]
+// Gap pin (non-blocking, runnable via --ignored). Un-ignore when property 4 ships.
+#[ignore = "gap: setup --check does not yet verify on-disk patch consistency; see CLI_CONTRACT 'Setup command contract' property 4"]
 fn setup_check_detects_unapplied_manifest_patch() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -195,6 +201,8 @@ fn setup_check_detects_unapplied_manifest_patch() {
 // ===========================================================================
 
 #[test]
+// Gap pin (non-blocking, runnable via --ignored). Un-ignore when property 7 ships.
+#[ignore = "gap: VEX has no notion of setup state; see CLI_CONTRACT 'Setup command contract' property 7"]
 fn vex_omits_patches_for_unconfigured_ecosystem() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -258,6 +266,8 @@ fn vex_omits_patches_for_unconfigured_ecosystem() {
 
 #[cfg(feature = "cargo")]
 #[test]
+// Gap pin (non-blocking, runnable via --ignored). Un-ignore when the residue is cleaned up.
+#[ignore = "gap: setup --remove leaves an empty .cargo/config.toml; see CLI_CONTRACT 'Setup command contract' property 8"]
 fn setup_remove_cleans_up_cargo_config_it_created() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

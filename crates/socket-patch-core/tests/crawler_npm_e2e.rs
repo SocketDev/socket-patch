@@ -851,6 +851,45 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
 }
 
 #[tokio::test]
+async fn crawl_all_discovers_deeply_nested_transitive_deps() {
+    // The npm crawler recurses `node_modules` at UNBOUNDED depth, so a patch
+    // targeting a deeply-nested *transitive* dependency is discovered — and thus
+    // patchable — exactly like a direct dependency (apply is path-agnostic). The
+    // other nested tests stage only 2 levels; this pins 4, so a regression that
+    // capped recursion depth (or stopped descending after the first nested
+    // node_modules) would surface here. See CLI_CONTRACT "Setup command contract"
+    // → "Monorepo / multi-project discovery model".
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+
+    // a → b → c → d, each staged in the previous package's own node_modules.
+    let a_nm = nm.join("a").join("node_modules");
+    let b_nm = a_nm.join("b").join("node_modules");
+    let c_nm = b_nm.join("c").join("node_modules");
+    stage_npm_pkg(&nm, "a", "1.0.0").await;
+    stage_npm_pkg(&a_nm, "b", "2.0.0").await;
+    stage_npm_pkg(&b_nm, "c", "3.0.0").await;
+    stage_npm_pkg(&c_nm, "d", "4.0.0").await;
+
+    let crawler = NpmCrawler;
+    let result = crawler.crawl_all(&options_at(tmp.path())).await;
+
+    let ver = |n: &str| -> Option<&str> {
+        result.iter().find(|p| p.name == n).map(|p| p.version.as_str())
+    };
+    assert_eq!(ver("a"), Some("1.0.0"), "direct dep at depth 1");
+    assert_eq!(ver("b"), Some("2.0.0"), "transitive at depth 2");
+    assert_eq!(ver("c"), Some("3.0.0"), "transitive at depth 3");
+    assert_eq!(
+        ver("d"),
+        Some("4.0.0"),
+        "the depth-4 transitive dep must still be discovered (unbounded recursion)"
+    );
+    let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(result.len(), 4, "exactly the four chained packages; got {names:?}");
+}
+
+#[tokio::test]
 async fn crawl_all_skips_dirs_with_corrupt_package_json() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
