@@ -138,13 +138,15 @@ in particular, are behavior changes that gate a version bump when implemented).
 
 7. **Reflected in VEX.** A patch contributes a `not_affected` statement to the repo's OpenVEX document
    only for ecosystems that are **actually set up** — or explicitly declared **manual** (below). Patches
-   for an ecosystem that is neither set up nor declared manual produce no VEX statement. *(Intended;
-   **not yet implemented** — VEX currently filters by `--ecosystems` and on-disk verification but has no
-   notion of setup state. RED-guarded.)*
-   - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) can declare
-     an ecosystem or individual hook as `manual`, so VEX still attests its patches even though the
-     auto-install hook is intentionally not wired. Intended home: a sub-property of
-     `.socket/manifest.json`. *(Follow-up work.)*
+   for an ecosystem that is neither set up nor declared manual produce no VEX statement. *(Implemented —
+   `generate_vex` filters `applied` to ecosystems returned by `commands/setup::configured_ecosystems`
+   (on-disk hook presence) ∪ the manifest's `setup.manual`, in addition to the existing `--ecosystems`
+   filter and on-disk verification. Applies in both verify and `--no-verify` modes.)*
+   - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) declare an
+     ecosystem as `manual` so VEX still attests its patches even though the auto-install hook is
+     intentionally not wired. Home: the `setup.manual` array (a list of ecosystem `cli_name`s — `pypi`,
+     `cargo`, …) in `.socket/manifest.json`. *(Implemented for the read/attest path; a `setup` flag to
+     populate it is a future nicety — today it's hand-authored in the manifest.)*
 
 8. **Graceful, exact remove.** `setup --remove` (optionally per-ecosystem via `--ecosystems`) restores
    the repo to its exact pre-setup state: manifests byte-for-byte, sibling scripts/dependencies

@@ -278,12 +278,95 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
     {
         return; // already persisted exactly — don't rewrite
     }
+    // Preserve any existing `manual` declarations (property 7) when rewriting.
+    let manual = existing
+        .as_ref()
+        .and_then(|m| m.setup.as_ref())
+        .map(|s| s.manual.clone())
+        .unwrap_or_default();
     let mut manifest = existing.unwrap_or_else(PatchManifest::new);
-    manifest.setup = Some(SetupConfig { exclude: merged });
+    manifest.setup = Some(SetupConfig {
+        exclude: merged,
+        manual,
+    });
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
     let _ = write_manifest(&path, &manifest).await;
+}
+
+/// Which ecosystems are **actually set up** at `cwd` — i.e. their auto-repatch
+/// hook is present on disk (the same presence checks `setup --check` runs). VEX
+/// uses this (∪ the manifest's `manual` declarations) to attest patches only for
+/// set-up-or-manual ecosystems (CLI_CONTRACT property 7). Read-only; ignores the
+/// `--ecosystems` filter (it reports real on-disk state).
+pub(crate) async fn configured_ecosystems(
+    common: &GlobalArgs,
+) -> std::collections::HashSet<socket_patch_core::crawlers::Ecosystem> {
+    use socket_patch_core::crawlers::Ecosystem;
+    let mut set = std::collections::HashSet::new();
+
+    // npm: any discovered package.json whose hook scripts are present.
+    let npm = find_package_json_files(&common.cwd).await;
+    for loc in &npm.files {
+        if let Ok(content) = tokio::fs::read_to_string(&loc.path).await {
+            if !is_setup_configured_str(&content).needs_update {
+                set.insert(Ecosystem::Npm);
+                break;
+            }
+        }
+    }
+
+    // pypi: a chosen python manifest carries the `socket-patch[hook]` dep.
+    if let Some(plan) = plan_python(common).await {
+        for (path, _) in &plan.manifests {
+            if let Ok(content) = tokio::fs::read_to_string(path).await {
+                if deps_contain_hook(&content) {
+                    set.insert(Ecosystem::Pypi);
+                    break;
+                }
+            }
+        }
+    }
+
+    // gem: the managed plugin directive is present in the Gemfile.
+    if let Some(project) = gem_setup::discover_bundler_project(&common.cwd).await {
+        if let Ok(content) = tokio::fs::read_to_string(&project.gemfile).await {
+            if gem_setup::is_plugin_directive_present(&content) {
+                set.insert(Ecosystem::Gem);
+            }
+        }
+    }
+
+    #[cfg(feature = "cargo")]
+    if let Some(project) = discover_cargo_project(&common.cwd).await {
+        for member in &project.members {
+            if let Ok(content) = tokio::fs::read_to_string(member).await {
+                if is_guard_dep_present(&content) {
+                    set.insert(Ecosystem::Cargo);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "golang")]
+    if let Some(module) = go_setup::discover_go_module(&common.cwd).await {
+        if go_setup::guard_files_present(&module.root).await {
+            set.insert(Ecosystem::Golang);
+        }
+    }
+
+    #[cfg(feature = "composer")]
+    if let Some(project) = composer_setup::discover_composer_project(&common.cwd).await {
+        if let Ok(content) = tokio::fs::read_to_string(&project.composer_json).await {
+            if composer_setup::is_hook_present(&content) {
+                set.insert(Ecosystem::Composer);
+            }
+        }
+    }
+
+    set
 }
 
 // Canonical `--ecosystems` token sets per setup branch (see `eco_in_scope`).

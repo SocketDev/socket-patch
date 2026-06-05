@@ -188,17 +188,17 @@ fn setup_check_detects_unapplied_manifest_patch() {
 // has a pypi patch but pypi is NOT set up (no requirements.txt / pyproject hook),
 // so the document must contain zero statements (exit 1, no applicable patches).
 //
-// CURRENTLY RED: VEX has no notion of setup state. With `--no-verify` it trusts
-// the manifest wholesale and emits the statement regardless of whether pypi was
-// ever set up — so it writes a 1-statement document and exits 0.
+// SHIPPED: VEX now filters by setup state — `generate_vex` drops patches whose
+// ecosystem is neither set up (`commands/setup::configured_ecosystems`) nor
+// declared `manual` in the manifest's `setup.manual`. With pypi un-set-up and
+// not manual, the only patch is dropped → no applicable patches → exit 1. This
+// pin is now an active (non-ignored) regression guard.
 //
-// (The converse — declaring pypi `manual` to re-include it — is follow-up work;
-// see the `#[ignore]`d placeholder below.)
+// (The converse — declaring pypi `manual` to re-include it — is exercised by the
+// `manual` escape hatch the e2e_vex / e2e_embedded_vex fixtures rely on.)
 // ===========================================================================
 
 #[test]
-// Gap pin (non-blocking, runnable via --ignored). Un-ignore when property 7 ships.
-#[ignore = "gap: VEX has no notion of setup state; see CLI_CONTRACT 'Setup command contract' property 7"]
 fn vex_omits_patches_for_unconfigured_ecosystem() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

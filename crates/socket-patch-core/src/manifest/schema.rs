@@ -44,12 +44,17 @@ pub struct SetupConfig {
     /// needing configuration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+    /// Ecosystems (by `Ecosystem::cli_name`, e.g. `"pypi"`) the user runs
+    /// `socket-patch apply` for by hand, so their patches are still attested in
+    /// VEX even though no auto-install hook is wired (CLI_CONTRACT property 7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual: Vec<String>,
 }
 
 impl SetupConfig {
     /// Whether this carries no setup state (so the manifest can omit the key).
     pub fn is_empty(&self) -> bool {
-        self.exclude.is_empty()
+        self.exclude.is_empty() && self.manual.is_empty()
     }
 }
 

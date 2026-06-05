@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use socket_patch_core::crawlers::CrawlerOptions;
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
@@ -246,6 +246,26 @@ pub async fn run(args: VexArgs) -> i32 {
 /// telemetry. Returns a [`VexWriteSummary`] on success or a structured
 /// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
 /// telemetry is fired here so every caller reports consistently.
+/// Map a `setup.manual` entry to an `Ecosystem`. Accepts the canonical
+/// `cli_name` plus the friendly aliases `setup --exclude`/`--ecosystems` accept
+/// (`go`/`golang`, `python`/`pypi`, `ruby`/`gem`, `php`/`composer`). Names for
+/// ecosystems not compiled into this build (or unrecognized) yield `None` and
+/// are ignored.
+fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
+    match name.to_ascii_lowercase().as_str() {
+        "npm" | "yarn" | "pnpm" | "bun" => Some(Ecosystem::Npm),
+        "pypi" | "python" => Some(Ecosystem::Pypi),
+        "gem" | "ruby" => Some(Ecosystem::Gem),
+        #[cfg(feature = "cargo")]
+        "cargo" | "rust" => Some(Ecosystem::Cargo),
+        #[cfg(feature = "golang")]
+        "golang" | "go" => Some(Ecosystem::Golang),
+        #[cfg(feature = "composer")]
+        "composer" | "php" => Some(Ecosystem::Composer),
+        _ => None,
+    }
+}
+
 pub(crate) async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
@@ -258,7 +278,7 @@ pub(crate) async fn generate_vex(
     };
 
     // Partition manifest into applied / failed.
-    let outcome = if params.no_verify {
+    let mut outcome = if params.no_verify {
         VerifyOutcome {
             applied: manifest.patches.keys().cloned().collect(),
             failed: Vec::new(),
@@ -267,6 +287,31 @@ pub(crate) async fn generate_vex(
         let package_paths = resolve_package_paths(common, manifest).await;
         socket_patch_core::vex::applied_patches(manifest, &package_paths).await
     };
+
+    // Property 7: attest a patch only for an ecosystem that is actually set up —
+    // or explicitly declared `manual` in the manifest. Patches for an ecosystem
+    // that is neither are dropped regardless of verification mode (so even
+    // `--no-verify` won't attest an un-set-up ecosystem's patches).
+    let mut allowed = crate::commands::setup::configured_ecosystems(common).await;
+    if let Some(s) = &manifest.setup {
+        for name in &s.manual {
+            if let Some(e) = ecosystem_from_manual_name(name) {
+                allowed.insert(e);
+            }
+        }
+    }
+    let before = outcome.applied.len();
+    outcome.applied.retain(|purl| {
+        Ecosystem::from_purl(purl)
+            .map(|e| allowed.contains(&e))
+            .unwrap_or(false)
+    });
+    if outcome.applied.len() != before && !common.silent && !common.json {
+        eprintln!(
+            "Note: omitting patches for ecosystems that are not set up (and not declared `manual` \
+             in .socket/manifest.json's `setup.manual`) from VEX."
+        );
+    }
 
     if !outcome.failed.is_empty() && !common.silent && !common.json {
         for f in &outcome.failed {
