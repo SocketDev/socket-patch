@@ -486,6 +486,10 @@ jobs:
           gem build socket-patch-bundler.gemspec
 
       - name: Publish socket-patch-bundler to RubyGems
+        # zizmor: ignore[use-trusted-publishing]
+        # Uses an API key for now; RubyGems trusted publishing (OIDC) is the
+        # documented future hardening (see the job comment), matching the
+        # crates.io / PyPI jobs. Suppressed until that publisher is registered.
         env:
           GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
         run: |
