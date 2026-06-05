@@ -89,6 +89,32 @@ fn remove_long_form() {
 }
 
 #[test]
+fn ecosystems_flag_parses_on_setup() {
+    // Setup command contract, property 2 ("ecosystem-scoped"): `setup` accepts
+    // the global `--ecosystems` filter (long form + the `-e` short form, CSV
+    // split). This pins the *parse* surface only; whether `setup` actually
+    // restricts its work to the named ecosystems at runtime is a separate
+    // (currently unimplemented) guarantee, RED-guarded in setup_contract_gaps.rs.
+    let long = parse_setup(&["--ecosystems", "npm,cargo"]);
+    assert_eq!(
+        long.common.ecosystems.as_deref(),
+        Some(&["npm".to_string(), "cargo".to_string()][..]),
+        "setup must parse the CSV --ecosystems filter (long form)"
+    );
+    let short = parse_setup(&["-e", "pypi"]);
+    assert_eq!(
+        short.common.ecosystems.as_deref(),
+        Some(&["pypi".to_string()][..]),
+        "setup must accept the -e short form"
+    );
+    // Default: no filter ⇒ act on every detected ecosystem.
+    assert!(
+        parse_setup(&[]).common.ecosystems.is_none(),
+        "no --ecosystems ⇒ None"
+    );
+}
+
+#[test]
 fn check_and_remove_conflict() {
     let result = Cli::try_parse_from(["socket-patch", "setup", "--check", "--remove"]);
     let err = match result {

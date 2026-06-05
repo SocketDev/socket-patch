@@ -2,11 +2,46 @@
 //! fixtures. `setup` operates entirely on disk (lockfile detection +
 //! package.json mutation) so every path is runnable without network.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
+}
+
+/// Recursively collect every regular-file path under `dir`, relative to `dir`.
+/// Used to prove `setup` writes nothing outside the repo (property 5) and to
+/// snapshot a "clone" (property 6).
+fn files_under(dir: &Path) -> BTreeSet<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.insert(p.strip_prefix(base).unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Copy every file under `src` into `dst` (recreating directories). Simulates a
+/// fresh `git clone` of the committed tree onto another host.
+fn copy_tree(src: &Path, dst: &Path) {
+    for rel in files_under(src) {
+        let from = src.join(&rel);
+        let to = dst.join(&rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::copy(&from, &to).expect("copy file");
+    }
 }
 
 /// Every `SOCKET_*` env var that `setup` (via `GlobalArgs`) honours as a
@@ -615,4 +650,129 @@ fn setup_check_and_remove_are_mutually_exclusive() {
         stdout.trim().is_empty(),
         "rejected invocation must not emit a normal result envelope; stdout=\n{stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Property 5 — in-repo and committable. `setup` writes only inside the working
+// tree, never to `$HOME` or any global location.
+// (CLI_CONTRACT.md → "Setup command contract", property 5.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_writes_only_inside_repo() {
+    let proj = tempfile::tempdir().expect("proj");
+    let home = tempfile::tempdir().expect("home");
+    let pkg = proj.path().join("package.json");
+    write(&pkg, r#"{ "name": "x", "version": "1.0.0" }"#);
+
+    // Sentinel HOME starts empty; setup must leave it empty.
+    assert!(files_under(home.path()).is_empty(), "sentinel HOME must start empty");
+
+    let mut cmd = Command::new(binary());
+    cmd.args(["setup", "--json", "--yes"]).current_dir(proj.path());
+    for var in SOCKET_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    // Redirect HOME at the sentinel and disable telemetry so the only writes we
+    // could observe are setup's own manifest edits.
+    cmd.env("HOME", home.path());
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "setup should succeed; stderr=\n{stderr}");
+
+    // Nothing was written outside the repo.
+    assert!(
+        files_under(home.path()).is_empty(),
+        "setup must not write outside --cwd; HOME gained: {:?}",
+        files_under(home.path())
+    );
+    // The only file in the project is the package.json it edited — no marker or
+    // auxiliary files conjured beside it.
+    assert_eq!(
+        files_under(proj.path()),
+        BTreeSet::from(["package.json".to_string()]),
+        "setup must touch only in-repo manifests"
+    );
+    // Not vacuous: it really did wire the hook into that in-repo file.
+    assert!(
+        std::fs::read_to_string(&pkg).unwrap().contains("socket-patch"),
+        "setup must have edited the in-repo package.json"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 6 — clone-portable. Setup state is committed files only, so a fresh
+// checkout on another host inherits it; `--check` passes on the clone with no
+// re-run and no writes. (CLI_CONTRACT.md → "Setup command contract", property 6.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_state_is_clone_portable() {
+    let a = tempfile::tempdir().expect("a");
+    write(&a.path().join("package.json"), r#"{ "name": "x", "version": "1.0.0" }"#);
+    let (c, _) = run_setup(a.path(), &["--yes"]);
+    assert_eq!(c, 0, "initial setup must succeed");
+
+    // "Clone": copy the committed tree into a brand-new directory on a notional
+    // other host. (node_modules isn't committed, so only manifests travel.)
+    let b = tempfile::tempdir().expect("b");
+    copy_tree(a.path(), b.path());
+
+    let before = std::fs::read_to_string(b.path().join("package.json")).unwrap();
+    let (code, stdout) = run_setup(b.path(), &["--check"]);
+    assert_eq!(code, 0, "the clone must already be configured; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "configured");
+    assert_eq!(v["needsConfiguration"], 0);
+    // `--check` on the clone is read-only.
+    assert_eq!(
+        std::fs::read_to_string(b.path().join("package.json")).unwrap(),
+        before,
+        "--check must not modify the clone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 9 (base case) — nested workspaces. For a non-pnpm npm workspace, the
+// root AND every member package.json are configured. (The pnpm root-only carve-
+// out is covered by `setup_pnpm_monorepo_only_updates_root`.)
+// (CLI_CONTRACT.md → "Setup command contract", property 9.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_configures_npm_workspace_members() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(
+        &tmp.path().join("packages/a/package.json"),
+        r#"{ "name": "a", "version": "1.0.0" }"#,
+    );
+    write(
+        &tmp.path().join("packages/b/package.json"),
+        r#"{ "name": "b", "version": "1.0.0" }"#,
+    );
+
+    let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(code, 0, "workspace setup should succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+    assert_eq!(
+        v["updated"], 3,
+        "root + both members must each be configured; stdout=\n{stdout}"
+    );
+    for member in [
+        "package.json",
+        "packages/a/package.json",
+        "packages/b/package.json",
+    ] {
+        let content = std::fs::read_to_string(tmp.path().join(member)).unwrap();
+        assert!(
+            content.contains("socket-patch"),
+            "workspace member {member} must gain the hook; got:\n{content}"
+        );
+    }
 }

@@ -45,6 +45,39 @@ fn dir_entries(dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// Every regular-file path under `dir`, relative to `dir` (recursive). Proves
+/// `setup` writes nothing outside the repo (property 5) and snapshots a
+/// "clone" (property 6).
+fn files_under(dir: &Path) -> BTreeSet<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.insert(p.strip_prefix(base).unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Copy every file under `src` into `dst`. Simulates a fresh checkout of the
+/// committed tree on another host.
+fn copy_tree(src: &Path, dst: &Path) {
+    for rel in files_under(src) {
+        let to = dst.join(&rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::copy(src.join(&rel), &to).expect("copy file");
+    }
+}
+
 /// Return the single `files[]` entry whose `kind == kind`, panicking if there
 /// is not exactly one. Stops a regression from hiding a wrong/extra entry
 /// behind a positional `files[0]`.
@@ -325,5 +358,84 @@ fn pure_python_with_no_manifest_files_is_no_op() {
         dir_entries(tmp.path()).is_empty(),
         "no files may be created on a no_files run; found: {:?}",
         dir_entries(tmp.path())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 5 — the Python branch writes only inside the repo. The `.pth` wheel
+// is installed later by the user's package manager into site-packages; `setup`
+// itself only edits the committed requirements.txt / pyproject.toml and must
+// never write to `$HOME` or global site-packages.
+// (CLI_CONTRACT.md → "Setup command contract", property 5.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_python_writes_only_inside_repo() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write(&proj.path().join("requirements.txt"), "requests\n");
+    assert!(files_under(home.path()).is_empty(), "sentinel HOME must start empty");
+
+    let out = Command::new(binary())
+        .args(["setup", "--json", "--yes"])
+        .current_dir(proj.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_ECOSYSTEMS")
+        .env_remove("SOCKET_CWD")
+        .env("HOME", home.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "setup should succeed; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        files_under(home.path()).is_empty(),
+        "Python setup must not write outside --cwd; HOME gained: {:?}",
+        files_under(home.path())
+    );
+    // Only the committed manifest was touched — no site-packages, no .pth, no
+    // marker file beside it.
+    assert_eq!(
+        files_under(proj.path()),
+        BTreeSet::from(["requirements.txt".to_string()]),
+        "setup must touch only the in-repo requirements.txt"
+    );
+    assert_eq!(
+        read(&proj.path().join("requirements.txt")),
+        "requests\nsocket-patch[hook]\n",
+        "the in-repo manifest must have gained exactly the hook line"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property 6 — Python setup state is clone-portable: the committed dependency
+// line is the whole story, so `--check` passes on a copied tree.
+// (CLI_CONTRACT.md → "Setup command contract", property 6.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_python_state_is_clone_portable() {
+    let a = tempfile::tempdir().unwrap();
+    write(&a.path().join("requirements.txt"), "requests\n");
+    let (c, v) = run_setup(a.path(), &[]);
+    assert_eq!(c, 0, "initial setup must succeed: {v}");
+    assert_eq!(v["status"], "success");
+
+    let b = tempfile::tempdir().unwrap();
+    copy_tree(a.path(), b.path());
+
+    let before = read(&b.path().join("requirements.txt"));
+    let (code, v) = run_setup(b.path(), &["--check"]);
+    assert_eq!(code, 0, "clone must already be configured: {v}");
+    assert_eq!(v["status"], "configured");
+    assert_eq!(
+        read(&b.path().join("requirements.txt")),
+        before,
+        "--check must not modify the clone"
     );
 }
