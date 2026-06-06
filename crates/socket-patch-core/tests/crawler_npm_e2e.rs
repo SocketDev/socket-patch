@@ -479,30 +479,34 @@ async fn find_by_purls_version_mismatch_returns_empty() {
     assert!(result.is_empty(), "version mismatch must skip");
 }
 
-/// `parse_purl_components` strips trailing qualifiers (`?...`).
-/// Covers `parse_purl_components` line 702.
+/// A qualified PURL (`pkg:npm/lodash@4.17.21?extension=tgz`) must resolve:
+/// `parse_purl_components` strips the `?...` qualifier to locate the package
+/// dir, and the entry is keyed by the *verbatim* input PURL (qualifier
+/// included). The dispatcher looks results back up under the PURL it handed
+/// in, so keying by a stripped/reconstructed PURL would silently drop every
+/// qualified PURL.
 #[tokio::test]
-async fn find_by_purls_strips_qualifiers() {
+async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "lodash", "4.17.21").await;
 
     let crawler = NpmCrawler;
+    let qualified = "pkg:npm/lodash@4.17.21?extension=tgz".to_string();
     let result = crawler
-        .find_by_purls(&nm, &["pkg:npm/lodash@4.17.21?extension=tgz".to_string()])
+        .find_by_purls(&nm, &[qualified.clone()])
         .await
         .unwrap();
-    // Note: result key uses the original purl, but lookup back uses
-    // the stripped form internally; the purl set check ensures the
-    // entry is only inserted if the synthesized purl matches one of
-    // the requested purls. With qualifier present, synthesis returns
-    // `pkg:npm/lodash@4.17.21` which doesn't match the qualified
-    // input — so the result is empty. The important coverage is that
-    // parse_purl_components successfully strips the qualifier.
-    assert!(
-        result.is_empty(),
-        "qualifier strip + synth mismatch must yield empty"
-    );
+
+    // Resolved, keyed by the verbatim qualified input, and the stored
+    // package carries that same verbatim PURL.
+    assert_eq!(result.len(), 1, "qualified PURL must resolve");
+    let pkg = result
+        .get(&qualified)
+        .expect("result must be keyed by the verbatim input PURL");
+    assert_eq!(pkg.name, "lodash");
+    assert_eq!(pkg.version, "4.17.21");
+    assert_eq!(pkg.purl, qualified);
 }
 
 /// PURL with no `@` (no version separator) must be rejected via the

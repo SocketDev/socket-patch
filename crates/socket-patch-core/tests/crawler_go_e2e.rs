@@ -271,12 +271,13 @@ fn parse_go_mod_module_quoted_path() {
     );
 }
 
-/// `!` at the end of an encoded path with no following character — the
-/// trailing-`!` arm of decode_module_path silently drops the bang
-/// (line 38 inner `if let Some(next) = chars.next()` false arm).
+/// `!` at the end of an encoded path with no following character. Go's
+/// encoder never emits a lone trailing `!`, so it is not a valid escape;
+/// `decode_module_path` preserves it rather than silently dropping a byte,
+/// so decoding an unexpected/corrupt directory name never loses path data.
 #[test]
-fn decode_module_path_trailing_bang_is_dropped() {
-    assert_eq!(decode_module_path("github.com/foo!"), "github.com/foo");
+fn decode_module_path_trailing_bang_is_preserved() {
+    assert_eq!(decode_module_path("github.com/foo!"), "github.com/foo!");
 }
 
 /// `find_by_purls` with a directory matching the module name but the
