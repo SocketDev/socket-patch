@@ -1,0 +1,19 @@
+{
+  "name": "socketsecurity/socket-patch",
+  "description": "CLI tool for applying security patches to dependencies. Launcher that downloads the prebuilt socket-patch binary for the host platform.",
+  "type": "library",
+  "keywords": ["security", "patch", "cli", "dependencies"],
+  "homepage": "https://github.com/SocketDev/socket-patch",
+  "license": "MIT",
+  "authors": [
+    { "name": "Socket Security" }
+  ],
+  "require": {
+    "php": ">=7.4"
+  },
+  "bin": ["bin/socket-patch"],
+  "support": {
+    "issues": "https://github.com/SocketDev/socket-patch/issues",
+    "source": "https://github.com/SocketDev/socket-patch"
+  }
+}

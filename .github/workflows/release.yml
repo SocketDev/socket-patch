@@ -247,6 +247,17 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
+      # socket-patch-guard is a standalone crate (no dependency on core/cli) that
+      # `socket-patch setup` adds to a user's Cargo.toml as
+      # `socket-patch-guard = "<major.minor>"`. It MUST be published on every
+      # release or cargo setup writes an unresolvable dependency and the user's
+      # `cargo build` fails. Its build.rs is a no-op when SOCKET_PATCH_ROOT is
+      # unset (the case during publish verification), so this builds cleanly.
+      - name: Publish socket-patch-guard
+        run: cargo publish -p socket-patch-guard
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
       - name: Wait for crates.io index update
         run: sleep 30
 
@@ -445,3 +456,51 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
         with:
           packages-dir: dist-hook/
+
+  # Phase 2 scaffolding (CLI_CONTRACT "gem" support matrix): publish the
+  # `socket-patch-bundler` gem — the published form of the Bundler plugin that
+  # `socket-patch setup` currently wires via an in-tree `git:` reference. This
+  # gem is NOT yet the active mechanism (gem_setup still emits the in-tree
+  # plugin), so the job is **non-blocking** (`continue-on-error`) and skips the
+  # push when no credential is configured. A follow-up switches the generated
+  # Gemfile directive to `plugin "socket-patch-bundler"` and drops continue-on-
+  # error. Preferred hardening: RubyGems trusted publishing (OIDC), mirroring
+  # the crates.io / PyPI jobs above, in place of a long-lived API key.
+  gem-publish:
+    needs: [version, build, tag]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Scope the publish secret to a deployment environment (zizmor
+    # secrets-outside-env); auto-created with no protection until configured.
+    environment: rubygems
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Ruby is pre-installed on ubuntu-latest; no setup action needed.
+      - name: Build socket-patch-bundler gem
+        run: |
+          cd gem/socket-patch-bundler
+          gem build socket-patch-bundler.gemspec
+
+      - name: Publish socket-patch-bundler to RubyGems
+        # zizmor: ignore[use-trusted-publishing]
+        # Uses an API key for now; RubyGems trusted publishing (OIDC) is the
+        # documented future hardening (see the job comment), matching the
+        # crates.io / PyPI jobs. Suppressed until that publisher is registered.
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          cd gem/socket-patch-bundler
+          if [ -z "${GEM_HOST_API_KEY}" ]; then
+            echo "::notice title=gem publish skipped::RUBYGEMS_API_KEY not set; built socket-patch-bundler but did not push (Phase 2 scaffolding)."
+            exit 0
+          fi
+          # A re-push of an already-published version errors; the job is
+          # continue-on-error so that is non-fatal to the release.
+          gem push socket-patch-bundler-*.gem

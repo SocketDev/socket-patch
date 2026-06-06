@@ -14,7 +14,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `scan` | — | Crawl installed packages for available patches |
 | `list` | — | Print patches in the local manifest |
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
-| `setup` | — | Configure package.json postinstall scripts |
+| `setup` | — | Wire automatic-patching install hooks (npm/pypi/cargo/gem/golang) |
 | `repair` | `gc` | Download missing blobs + clean up unused ones |
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
@@ -63,7 +63,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `rollback` | optional positional `identifier`; `--one-off` | `SOCKET_ONE_OFF` | Rollback target |
 | `vex` | `--output` / `-O`, `--product`, `--no-verify`, `--doc-id`, `--compact` | `SOCKET_VEX_OUTPUT`, `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | OpenVEX 0.2.0 document generation; see "vex output channels" below |
 | `repair` | `--download-only` | `SOCKET_DOWNLOAD_ONLY` | Repair-specific cleanup mode (mutually exclusive with `--offline`) |
-| `setup` | `--check`, `--remove` (mutually exclusive); honors global `--ecosystems` | `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. See [Setup command contract](#setup-command-contract) |
+| `setup` | `--check`, `--remove` (mutually exclusive); `--exclude` (CSV member paths); honors global `--ecosystems` | `SOCKET_SETUP_EXCLUDE`, `SOCKET_ECOSYSTEMS` | Wire / verify / revert the automatic-patching install hooks. `--exclude` skips + persists workspace members (property 9). See [Setup command contract](#setup-command-contract) |
 
 `scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
 
@@ -109,15 +109,15 @@ in particular, are behavior changes that gate a version bump when implemented).
 2. **Ecosystem-scoped.** `setup`, `setup --check`, and `setup --remove` honor the global
    `--ecosystems` filter and act on only the named ecosystems; with no filter they act on every
    detected ecosystem. *(Intended; **not yet implemented** — `setup` currently ignores `--ecosystems`
-   and always processes npm + python + cargo. RED-guarded.)*
+   and always processes every detected ecosystem (npm + python + cargo + golang + gem). RED-guarded.)*
 
 3. **Consistency after install.** Once an ecosystem is set up, its locally-installed dependencies are
    re-patched to match the manifest after **any** of: a dependency added, updated, or removed; **or** a
    new patch added to the manifest. The re-patch is carried by the ecosystem's install/build hook (npm
    `postinstall`/`dependencies`, the Python `.pth` startup hook, the cargo guard build script, the gem
-   Bundler plugin) which runs `socket-patch apply` after the ecosystem's installer finishes, so patch
-   state always reconverges with the manifest. *(Implemented for npm/pypi/cargo/gem via the support
-   matrix.)*
+   Bundler plugin, the golang guard package) which runs `socket-patch apply` after the ecosystem's
+   installer finishes, so patch state always reconverges with the manifest. *(Implemented for
+   npm/pypi/cargo/gem/golang via the support matrix.)*
 
 4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
    in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
@@ -138,13 +138,15 @@ in particular, are behavior changes that gate a version bump when implemented).
 
 7. **Reflected in VEX.** A patch contributes a `not_affected` statement to the repo's OpenVEX document
    only for ecosystems that are **actually set up** — or explicitly declared **manual** (below). Patches
-   for an ecosystem that is neither set up nor declared manual produce no VEX statement. *(Intended;
-   **not yet implemented** — VEX currently filters by `--ecosystems` and on-disk verification but has no
-   notion of setup state. RED-guarded.)*
-   - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) can declare
-     an ecosystem or individual hook as `manual`, so VEX still attests its patches even though the
-     auto-install hook is intentionally not wired. Intended home: a sub-property of
-     `.socket/manifest.json`. *(Follow-up work.)*
+   for an ecosystem that is neither set up nor declared manual produce no VEX statement. *(Implemented —
+   `generate_vex` filters `applied` to ecosystems returned by `commands/setup::configured_ecosystems`
+   (on-disk hook presence) ∪ the manifest's `setup.manual`, in addition to the existing `--ecosystems`
+   filter and on-disk verification. Applies in both verify and `--no-verify` modes.)*
+   - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) declare an
+     ecosystem as `manual` so VEX still attests its patches even though the auto-install hook is
+     intentionally not wired. Home: the `setup.manual` array (a list of ecosystem `cli_name`s — `pypi`,
+     `cargo`, …) in `.socket/manifest.json`. *(Implemented for the read/attest path; a `setup` flag to
+     populate it is a future nicety — today it's hand-authored in the manifest.)*
 
 8. **Graceful, exact remove.** `setup --remove` (optionally per-ecosystem via `--ecosystems`) restores
    the repo to its exact pre-setup state: manifests byte-for-byte, sibling scripts/dependencies
@@ -158,32 +160,37 @@ in particular, are behavior changes that gate a version bump when implemented).
    yarn / pnpm / bun workspace members and cargo workspace members are all discovered and configured
    (pnpm is root-package-only by design, because workspace-member `postinstall` scripts fail under
    pnpm's strict module isolation). Selected paths may be **excluded**, and the exclusion is **persisted
-   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Single-level
-   workspace discovery implemented; the `--exclude` flag + manifest exclude sub-property are
-   **follow-up work** — pending test marked `#[ignore]`.)*
-   - **Nested workspaces (intended; gap).** A workspace member that is itself a workspace root — or, for
-     cargo, members matched by a recursive `members = ["crates/**"]` glob — *should* be recursed into and
-     have its own members configured. Today expansion is **one level only** (`find_package_json_files`
-     never reads a discovered member's own `workspaces` field; `discover_cargo_project` expands
-     `crates/*` but not `crates/**`). Guarded by the `#[ignore]`d gap pins
+   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Implemented —
+   nested-workspace discovery plus the `--exclude` flag, persisted as the `setup.exclude` array in
+   `.socket/manifest.json` and honored by discovery + `check` (a fresh clone inherits it without
+   re-passing the flag). Excludes apply to npm + cargo workspace members; the repo root is never
+   excludable.)*
+   - **Nested workspaces (implemented).** A workspace member that is itself a workspace root — or, for
+     cargo, members matched by a recursive `members = ["crates/**"]` glob — is recursed into and has its
+     own members configured. `find_workspace_packages` re-reads each discovered member's own
+     `workspaces` field (bounded depth), and `discover_cargo_project`'s `expand_member` expands the
+     recursive `crates/**` glob (`glob_dir_recursive`, skipping `target/` + hidden dirs). Guarded by
      `setup_recurses_into_nested_npm_workspace` / `setup_expands_recursive_cargo_member_glob` in
      `tests/setup_monorepo_invariants.rs`.
 
 ### Per-ecosystem setup support
 
-`setup` only installs an automatic-repatch hook for the three ecosystems with a native post-install /
-build hook. The remaining ecosystems are **apply-only**: `socket-patch apply` patches them on demand,
-but there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them. These are
-exactly the ecosystems for which property 7's **manual** declaration is intended (so their hand-applied
-patches still show up in VEX).
+`setup` installs an automatic-repatch hook for the five ecosystems with a usable post-install / build /
+startup hook (npm, pypi, cargo, gem, golang) — plus **composer** when the binary is built with the
+opt-in `composer` feature. The remaining ecosystems are **apply-only**: `socket-patch apply` patches
+them on demand, but there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them.
+These are exactly the ecosystems for which property 7's **manual** declaration is intended (so their
+hand-applied patches still show up in VEX).
 
 | Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
 |---|---|---|---|
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
-| cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]` |
+| cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]`; the guard crate is published to crates.io each release |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
-| nuget · maven · golang · composer · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+| golang | generated `internal/socketpatchguard/` guard package (`guard.go` + `guard_test.go`) + a blank import in each `main` package | every `go test ./...` (CI gate) **and** every `go run` / binary launch (`init()` guard) — fail-closed | self-contained: committed Go source, no published artifact; CLI must be on `PATH` |
+| composer *(opt-in `composer` feature)* | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH`; only compiled in with `--features composer` (apply support is likewise feature-gated). Without the feature, composer is a `no_files` no-op |
+| nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
 
 ### Monorepo / multi-project discovery model
 
@@ -218,7 +225,8 @@ is patched identically to a direct one. Pinned by
 
 `setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
 consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`.
+`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`,
+`composer`.
 
 **`setup`:**
 
@@ -308,6 +316,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
+| `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
 | `SOCKET_VEX` | `apply --vex` / `scan --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on `apply`/`scan` they bind to `--vex-product` etc. |
 
 ### Deprecated env vars
@@ -587,7 +596,14 @@ This syncs the workspace package version into:
 
 - `npm/socket-patch/package.json` (and its `optionalDependencies`)
 - every per-platform `npm/socket-patch-*/package.json`
-- `pypi/socket-patch/pyproject.toml`
+- `pypi/socket-patch/pyproject.toml` and `pypi/socket-patch-hook/pyproject.toml`
+- `gem/socket-patch-bundler/socket-patch-bundler.gemspec` (the Bundler plugin gem)
+- `gem/socket-patch/socket-patch.gemspec` + its launcher `VERSION` (the RubyGems CLI launcher)
+- the Composer CLI launcher's `SP_VERSION` (`composer/socket-patch/bin/socket-patch`)
+
+The RubyGems + Composer CLI launchers (`socket-patch` gem, `socketsecurity/socket-patch`
+on Packagist) are published by the separate **`.github/workflows/release-ecosystems.yml`**,
+which runs after the main release publishes and only needs the GitHub release binaries to exist.
 
 ## How the contract is enforced
 

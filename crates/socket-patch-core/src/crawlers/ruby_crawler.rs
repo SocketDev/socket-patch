@@ -150,14 +150,13 @@ impl RubyCrawler {
             }
         }
 
-        // gem env gempath (colon-separated)
+        // gem env gempath lists several gem homes separated by the OS path
+        // separator (`:` on Unix, `;` on Windows). Splitting on a hardcoded
+        // `:` shreds Windows drive-letter paths (`C:\Ruby\...;D:\...`) into
+        // `["C", "\Ruby\...;D", "\..."]`, so defer to `split_paths`, which
+        // honors the platform separator — same as the Go crawler's GOPATH.
         if let Some(gempath) = Self::run_gem_env("gempath").await {
-            for segment in gempath.split(':') {
-                let segment = segment.trim();
-                if segment.is_empty() {
-                    continue;
-                }
-                let gems_path = PathBuf::from(segment).join("gems");
+            for gems_path in gem_homes_to_gems_dirs(&gempath) {
                 if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
                     paths.push(gems_path);
                 }
@@ -380,6 +379,18 @@ pub fn parse_gem_env_output(stdout: &str) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Split a `gem env gempath` value into the `<home>/gems` directories it
+/// names. Each entry is one gem home; the installed gems live under its
+/// `gems/` subdirectory. Splitting uses [`std::env::split_paths`] so the
+/// OS path separator (`:` on Unix, `;` on Windows) is honored — a hardcoded
+/// `:` would mangle Windows drive-letter paths. Empty segments are dropped.
+fn gem_homes_to_gems_dirs(gempath: &str) -> Vec<PathBuf> {
+    std::env::split_paths(gempath)
+        .filter(|segment| !segment.as_os_str().is_empty())
+        .map(|segment| segment.join("gems"))
+        .collect()
 }
 
 /// Check whether a path is a directory.
@@ -652,5 +663,109 @@ mod tests {
         let purls = vec!["pkg:gem/rails@7.1.0".to_string()];
         let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
         assert_eq!(result.get("pkg:gem/rails@7.1.0").unwrap().path, exact);
+    }
+
+    // ── gem env gempath splitting (OS path separator) ─────────────
+
+    /// `gem env gempath` lists several gem homes joined by the OS path
+    /// separator. The splitter must use the platform separator, not a
+    /// hardcoded `:` — otherwise Windows drive-letter paths (`C:\…;D:\…`)
+    /// are shredded. Building the input with `std::env::join_paths` makes
+    /// this assertion exercise the real platform separator: a regression
+    /// to `split(':')` fails on Windows (join uses `;`) while staying
+    /// correct on Unix.
+    #[test]
+    fn gem_homes_split_honors_os_separator() {
+        let home_a = PathBuf::from(if cfg!(windows) { r"C:\rubies\3.2.0" } else { "/opt/rubies/3.2.0" });
+        let home_b = PathBuf::from(if cfg!(windows) { r"D:\gems\global" } else { "/home/dev/.gem/ruby/3.2.0" });
+        let joined = std::env::join_paths([&home_a, &home_b]).unwrap();
+        let joined = joined.to_str().unwrap();
+
+        let dirs = gem_homes_to_gems_dirs(joined);
+        assert_eq!(
+            dirs,
+            vec![home_a.join("gems"), home_b.join("gems")],
+            "gempath {joined:?} must split on the OS separator into per-home gems/ dirs"
+        );
+    }
+
+    /// Empty segments (leading/trailing/double separators) are dropped so
+    /// we never probe a bare `gems/` relative to the cwd.
+    #[test]
+    fn gem_homes_split_drops_empty_segments() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let only = if cfg!(windows) { r"C:\rubies\3.2.0" } else { "/opt/rubies/3.2.0" };
+        let input = format!("{sep}{only}{sep}{sep}");
+        let dirs = gem_homes_to_gems_dirs(&input);
+        assert_eq!(dirs, vec![PathBuf::from(only).join("gems")]);
+        assert!(gem_homes_to_gems_dirs("").is_empty());
+    }
+
+    // ── crawl/parse robustness regressions ────────────────────────
+
+    /// A base PURL must not resolve to a *plain* dir whose version merely
+    /// shares the requested version as a dotted prefix (`1.0` vs `1.0.0`).
+    /// Complements the platform-suffixed collision test.
+    #[tokio::test]
+    async fn find_by_purls_rejects_plain_version_prefix_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("foo-1.0.0").join("lib"))
+            .await
+            .unwrap();
+        let crawler = RubyCrawler::new();
+        let result = crawler
+            .find_by_purls(dir.path(), &["pkg:gem/foo@1.0".to_string()])
+            .await
+            .unwrap();
+        assert!(result.is_empty(), "1.0 wrongly matched plain foo-1.0.0: {result:?}");
+    }
+
+    /// `crawl_all` must skip dirs that parse as `<name>-<version>` but are
+    /// not gems (no `lib/`, no `.gemspec`) and must ignore `.gem` cache
+    /// files that string-match the `<name>-<version>` pattern.
+    #[tokio::test]
+    async fn crawl_all_skips_non_gem_dirs_and_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("rails-7.1.0").join("lib"))
+            .await
+            .unwrap();
+        // Parses as a gem name but has no lib/ or gemspec — not a gem.
+        tokio::fs::create_dir_all(dir.path().join("junk-1.0.0"))
+            .await
+            .unwrap();
+        // A cached `.gem` archive (a file, not a dir) that matches the pattern.
+        tokio::fs::write(dir.path().join("rails-7.1.0.gem"), b"x")
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(purls, HashSet::from(["pkg:gem/rails@7.1.0"]));
+    }
+
+    /// Gem names with embedded underscores/digits and multi-dash names
+    /// must keep their full name; the version starts at the first
+    /// dash-then-digit boundary.
+    #[test]
+    fn parse_dir_name_version_name_shapes() {
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("ruby2_keywords-0.0.5"),
+            Some(("ruby2_keywords".to_string(), "0.0.5".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("aws-sdk-s3-1.143.0"),
+            Some(("aws-sdk-s3".to_string(), "1.143.0".to_string()))
+        );
+        assert_eq!(
+            RubyCrawler::parse_dir_name_version("concurrent-ruby-1.2.3"),
+            Some(("concurrent-ruby".to_string(), "1.2.3".to_string()))
+        );
     }
 }

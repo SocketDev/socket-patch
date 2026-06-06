@@ -212,26 +212,60 @@ fn parse_yaml_list_value(raw: &str) -> String {
     value.trim().to_string()
 }
 
-/// Find workspace packages based on workspace patterns.
+/// Find workspace packages based on workspace patterns, recursing into any
+/// member that is **itself** a workspace root (property 9's nested-workspace
+/// rule). A member's own `workspaces` patterns are resolved relative to that
+/// member's directory.
 async fn find_workspace_packages(
     root_path: &Path,
     config: &WorkspaceConfig,
 ) -> Vec<PackageJsonLocation> {
     let mut results = Vec::new();
+    collect_workspace_members(root_path, config, 0, &mut results).await;
+    results
+}
 
+/// Bounded-depth recursion limit for nested workspaces — deep enough for any
+/// real monorepo, a hard stop against a pattern that loops back on itself.
+const MAX_WORKSPACE_DEPTH: usize = 10;
+
+async fn collect_workspace_members(
+    root_path: &Path,
+    config: &WorkspaceConfig,
+    depth: usize,
+    results: &mut Vec<PackageJsonLocation>,
+) {
+    if depth > MAX_WORKSPACE_DEPTH {
+        return;
+    }
     for pattern in &config.patterns {
         let packages = find_packages_matching_pattern(root_path, pattern).await;
         for p in packages {
+            let member_dir = p.parent().map(Path::to_path_buf);
             results.push(PackageJsonLocation {
                 path: p,
                 is_root: false,
                 is_workspace: true,
                 workspace_pattern: Some(pattern.clone()),
             });
+            // If this member declares its own workspaces, configure ITS members
+            // too (one repo-root `setup` covers the whole nested tree). The
+            // final de-dup in `find_package_json_files` collapses any overlap.
+            if let Some(dir) = member_dir {
+                let member_pkg = dir.join("package.json");
+                let member_config = detect_workspaces(&member_pkg).await;
+                if !matches!(member_config.ws_type, WorkspaceType::None) {
+                    Box::pin(collect_workspace_members(
+                        &dir,
+                        &member_config,
+                        depth + 1,
+                        results,
+                    ))
+                    .await;
+                }
+            }
         }
     }
-
-    results
 }
 
 /// Find packages matching a workspace pattern.
@@ -690,6 +724,49 @@ mod tests {
         let result = find_package_json_files(dir.path()).await;
         // root + recursively found workspace member
         assert!(result.files.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_recurses_into_nested_workspace() {
+        // Property 9: a workspace member that is itself a workspace root has ITS
+        // members discovered too. root → packages/inner → sub/leaf.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let inner = dir.path().join("packages").join("inner");
+        fs::create_dir_all(&inner).await.unwrap();
+        fs::write(
+            inner.join("package.json"),
+            r#"{"name":"inner","workspaces":["sub/*"]}"#,
+        )
+        .await
+        .unwrap();
+        let leaf = inner.join("sub").join("leaf");
+        fs::create_dir_all(&leaf).await.unwrap();
+        fs::write(leaf.join("package.json"), r#"{"name":"leaf"}"#)
+            .await
+            .unwrap();
+
+        let result = find_package_json_files(dir.path()).await;
+        let paths: Vec<String> = result
+            .files
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("packages/inner/package.json")),
+            "first-level member must be found: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("packages/inner/sub/leaf/package.json")),
+            "nested-workspace leaf must be found via recursion: {paths:?}"
+        );
+        // root + inner + leaf, no duplicates.
+        assert_eq!(result.files.len(), 3, "exactly root + inner + leaf: {paths:?}");
     }
 
     #[tokio::test]

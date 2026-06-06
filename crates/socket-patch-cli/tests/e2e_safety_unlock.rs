@@ -319,6 +319,96 @@ fn unlock_release_refuses_when_held() {
     );
 }
 
+/// Human-mode (`unlock` without `--json`) plain probe of a free lock
+/// prints the "Lock is free." line on stdout and exits 0. The JSON
+/// suite covers the machine surface; this pins the human surface so a
+/// regression in `emit_free`'s non-JSON branch (e.g. printing nothing,
+/// or routing to stderr) is caught.
+#[test]
+fn unlock_human_mode_reports_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("Lock is free."),
+        "human-mode free probe should print the free line, got stdout:\n{stdout}"
+    );
+    // A plain free probe must NOT claim it removed anything.
+    assert!(
+        !stdout.to_lowercase().contains("removed"),
+        "free probe without --release must not mention removal, got:\n{stdout}"
+    );
+}
+
+/// Human-mode `--release` against a free lock with a pre-existing
+/// leftover file prints the "Removed …" confirmation naming the real
+/// lock path. Regression guard for unlock.rs:186 — if the
+/// `removed`/`release` message branches were swapped, a genuine removal
+/// would silently report "no lock file to remove".
+#[test]
+fn unlock_human_mode_release_reports_removed_when_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    std::fs::write(&lock_file, b"").unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--release"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let lower = stdout.to_lowercase();
+    assert!(
+        lower.contains("removed"),
+        "human-mode --release of a leftover should confirm removal, got:\n{stdout}"
+    );
+    // Names the actual file it removed, not a placeholder.
+    assert!(
+        stdout.contains("apply.lock"),
+        "removal message should name the lock file, got:\n{stdout}"
+    );
+    // ...and it must not contradict itself by also saying there was
+    // nothing to remove.
+    assert!(
+        !lower.contains("no lock file to remove"),
+        "a real removal must not emit the no-op wording, got:\n{stdout}"
+    );
+    assert!(!lock_file.exists(), "--release should have deleted the file");
+}
+
+/// Human-mode `--release` against a clean `.socket/` (no pre-existing
+/// lock file) prints the "no lock file to remove" no-op wording — the
+/// probe-created file doesn't count as a released leftover. Companion
+/// to the "Removed" test: together they pin both arms of the
+/// `release && removed` branch so neither can be silently swapped.
+#[test]
+fn unlock_human_mode_release_reports_noop_when_no_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    assert!(!lock_file.exists(), "pre-stage: no lock file expected");
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--release"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let lower = stdout.to_lowercase();
+    assert!(
+        lower.contains("no lock file to remove"),
+        "human-mode --release with nothing to remove should say so, got:\n{stdout}"
+    );
+    // Must NOT falsely claim a removal happened.
+    assert!(
+        !lower.contains("removed"),
+        "no-leftover --release must not claim a removal, got:\n{stdout}"
+    );
+    // The probe-created file must not survive (clean slate).
+    assert!(
+        !lock_file.exists(),
+        "--release must not leave a probe-created lock file behind"
+    );
+}
+
 /// Human-mode (`unlock` without `--json`) emits a stderr hint
 /// pointing the user at `--break-lock` when the lock is held.
 /// Pinned at the substring level so the helpful guidance survives

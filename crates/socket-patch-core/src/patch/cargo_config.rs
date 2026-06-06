@@ -161,14 +161,35 @@ async fn edit_config(
         None => Ok(false),
         Some(new) => {
             if !dry_run {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)
+                if new.trim().is_empty() {
+                    // The edit emptied the file (all socket-owned content removed
+                    // and no user content — comments / other tables — remained).
+                    // Delete it, and prune the now-empty `.cargo/` dir, so
+                    // `setup --remove` restores the exact pre-setup tree rather
+                    // than leaving an empty `.cargo/config.toml` behind
+                    // (CLI_CONTRACT.md → "Setup command contract", property 8).
+                    // A file with surviving user content never trims to empty, so
+                    // this only fires for a config that was entirely socket's.
+                    match fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(format!("remove {}: {e}", path.display())),
+                    }
+                    if let Some(parent) = path.parent() {
+                        // Best-effort: `remove_dir` only succeeds when the dir is
+                        // empty, so a `.cargo/` holding other files is left intact.
+                        let _ = fs::remove_dir(parent).await;
+                    }
+                } else {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)
+                            .await
+                            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                    }
+                    fs::write(&path, new)
                         .await
-                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
+                        .map_err(|e| format!("write {}: {e}", path.display()))?;
                 }
-                fs::write(&path, new)
-                    .await
-                    .map_err(|e| format!("write {}: {e}", path.display()))?;
             }
             Ok(true)
         }
@@ -577,5 +598,67 @@ mod tests {
         let body = fs::read_to_string(cargo_dir.join("config")).await.unwrap();
         assert!(body.contains("cfg-if"));
         assert!(body.contains("jobs = 2"));
+    }
+
+    // ── exact-restore: emptied socket-created config is deleted (property 8) ──
+    #[tokio::test]
+    async fn test_drop_env_root_deletes_socket_created_config_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.cargo/` before setup.
+        assert!(!dir.path().join(".cargo").exists());
+        // setup creates `.cargo/config.toml` holding only [env] SOCKET_PATCH_ROOT.
+        assert!(ensure_env_root(dir.path(), false).await.unwrap());
+        assert!(dir.path().join(".cargo/config.toml").exists());
+        // remove empties it → both the file and the now-empty `.cargo/` are gone.
+        assert!(drop_env_root(dir.path(), false).await.unwrap());
+        assert!(
+            !dir.path().join(".cargo/config.toml").exists(),
+            "an emptied socket-created config must be deleted, not left empty"
+        );
+        assert!(
+            !dir.path().join(".cargo").exists(),
+            "the now-empty .cargo/ dir must be pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_env_root_keeps_config_with_user_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        // A user config carrying a [build] table alongside our env entry.
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\njobs = 4\n\n[env]\nSOCKET_PATCH_ROOT = { value = \".\", relative = true }\n",
+        )
+        .await
+        .unwrap();
+        assert!(drop_env_root(dir.path(), false).await.unwrap());
+        // The file survives (user content remains); only our key is gone.
+        let body = fs::read_to_string(cargo_dir.join("config.toml")).await.unwrap();
+        assert!(body.contains("jobs = 4"), "user [build] table must be preserved");
+        assert!(!body.contains("SOCKET_PATCH_ROOT"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_env_root_keeps_nonempty_cargo_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        // A sibling file (e.g. credentials) means `.cargo/` must survive even
+        // though our config is emptied + deleted.
+        fs::write(cargo_dir.join("credentials.toml"), "[registry]\ntoken = \"x\"\n")
+            .await
+            .unwrap();
+        assert!(ensure_env_root(dir.path(), false).await.unwrap());
+        assert!(drop_env_root(dir.path(), false).await.unwrap());
+        assert!(
+            !cargo_dir.join("config.toml").exists(),
+            "emptied config is deleted"
+        );
+        assert!(
+            cargo_dir.exists() && cargo_dir.join("credentials.toml").exists(),
+            ".cargo/ is kept because it still holds the user's credentials file"
+        );
     }
 }

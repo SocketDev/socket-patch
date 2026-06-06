@@ -1,0 +1,9 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Executable shim for the `socket-patch` launcher gem. Resolves the platform
+# binary (download-on-first-run, cached) and execs it, replacing this process so
+# exit codes / signals pass through unchanged.
+require "socket_patch/launcher"
+
+SocketPatch::Launcher.run(ARGV)

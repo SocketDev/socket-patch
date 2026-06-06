@@ -48,3 +48,4 @@ deno = []
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 serial_test = { workspace = true }
+wiremock = { workspace = true }

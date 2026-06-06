@@ -74,11 +74,17 @@ pub fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_json: bool
 /// Prompt the user to select one option from a list using dialoguer.
 ///
 /// - `is_json`: return `Err(SelectError::JsonModeNeedsExplicit)`.
+/// - Empty `options`: return `Err(SelectError::Cancelled)` — there is no
+///   option to select, so neither auto-select nor an interactive menu is
+///   meaningful (returning `Ok(0)` would hand callers an out-of-bounds index).
 /// - Non-TTY: auto-select first option with stderr warning.
 /// - Interactive: use `dialoguer::Select` on stderr.
 pub fn select_one(prompt: &str, options: &[String], is_json: bool) -> Result<usize, SelectError> {
     if is_json {
         return Err(SelectError::JsonModeNeedsExplicit);
+    }
+    if options.is_empty() {
+        return Err(SelectError::Cancelled);
     }
     if !stdin_is_tty() {
         eprintln!("Non-interactive mode: auto-selecting first option.");
@@ -278,6 +284,33 @@ mod tests {
         // Even with a single option, JSON mode must defer to an explicit
         // `--id` rather than silently picking it.
         let opts = vec!["only".to_string()];
+        assert!(matches!(
+            select_one("pick", &opts, true),
+            Err(SelectError::JsonModeNeedsExplicit)
+        ));
+    }
+
+    #[test]
+    fn select_one_empty_options_is_cancelled_not_index_zero() {
+        // Regression: with no options there is no "first" to auto-select.
+        // Returning `Ok(0)` here would hand the caller an out-of-bounds index
+        // (every caller does `group[idx]`). This guard runs before any stdin
+        // read, so it is deterministic under TTY and non-TTY alike.
+        let opts: Vec<String> = Vec::new();
+        match select_one("pick", &opts, false) {
+            Err(SelectError::Cancelled) => {}
+            Ok(idx) => panic!("empty options must not yield an index (got {idx})"),
+            Err(SelectError::JsonModeNeedsExplicit) => {
+                panic!("non-JSON empty options must report Cancelled, not JSON mode")
+            }
+        }
+    }
+
+    #[test]
+    fn select_one_json_mode_takes_precedence_over_empty_options() {
+        // JSON mode is decided first: even an empty list must surface the
+        // explicit-selection contract so the caller can emit `selection_required`.
+        let opts: Vec<String> = Vec::new();
         assert!(matches!(
             select_one("pick", &opts, true),
             Err(SelectError::JsonModeNeedsExplicit)

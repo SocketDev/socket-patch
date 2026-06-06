@@ -48,6 +48,22 @@ pub(crate) enum PatchAction {
     Skipped,
 }
 
+/// Compute the `(status, exit_code)` pair for a download+apply run.
+///
+/// A non-zero exit code must ALWAYS pair with a non-`success` status:
+/// both are derived from the same predicate here so a JSON consumer
+/// reading `status` and a shell reading `$?` can never disagree. The
+/// historical bug was a `status` of `success` (keyed only on download
+/// failures) sitting next to an exit code of `1` produced by a failed
+/// *apply* step.
+pub(crate) fn run_outcome(patches_failed: bool, apply_failed: bool) -> (&'static str, i32) {
+    if patches_failed || apply_failed {
+        ("partial_failure", 1)
+    } else {
+        ("success", 0)
+    }
+}
+
 /// Classify what `download_and_apply_patches` will do to a given PURL based on
 /// the manifest state *before* any insert. Pure / no I/O so it's unit-testable.
 pub(crate) fn decide_patch_action(
@@ -771,27 +787,10 @@ pub async fn download_and_apply_patches(
     let mut patches_added = 0;
     let mut patches_skipped = 0;
     let mut patches_failed = 0;
+    let mut patches_updated = 0;
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
-    let mut updates: Vec<String> = Vec::new();
 
     for search_result in selected {
-        // Check for updates: existing patch with different UUID
-        if let Some(existing) = manifest.patches.get(&search_result.purl) {
-            if existing.uuid != search_result.uuid {
-                updates.push(search_result.purl.clone());
-                if !params.json && !params.silent {
-                    eprintln!(
-                        "  [update] {} (replacing {})",
-                        search_result.purl,
-                        // Defensive: a malformed/short UUID in the manifest
-                        // must not panic the download loop. `&uuid[..8]`
-                        // would; fall back to the whole string.
-                        short_uuid(&existing.uuid)
-                    );
-                }
-            }
-        }
-
         match api_client
             .fetch_patch(effective_org, &search_result.uuid)
             .await
@@ -850,8 +849,16 @@ pub async fn download_and_apply_patches(
 
                 let mut action_record = match &action {
                     PatchAction::Updated { old_uuid } => {
+                        patches_updated += 1;
                         if !params.json && !params.silent {
-                            eprintln!("  [update] {}", patch.purl);
+                            // Defensive: a malformed/short UUID in the manifest
+                            // must not panic the download loop. `&uuid[..8]`
+                            // would; `short_uuid` falls back to the whole string.
+                            eprintln!(
+                                "  [update] {} (replacing {})",
+                                patch.purl,
+                                short_uuid(old_uuid)
+                            );
                         }
                         serde_json::json!({
                             "purl": patch.purl,
@@ -927,8 +934,8 @@ pub async fn download_and_apply_patches(
         if patches_failed > 0 {
             eprintln!("  Failed: {patches_failed}");
         }
-        if !updates.is_empty() {
-            eprintln!("  Updated: {}", updates.len());
+        if patches_updated > 0 {
+            eprintln!("  Updated: {patches_updated}");
         }
     }
 
@@ -962,14 +969,22 @@ pub async fn download_and_apply_patches(
         }
     }
 
+    // An apply step that ran (patches were added, not --save-only) but
+    // failed is a partial failure too — not just download failures. The
+    // `status` field must agree with `exit_code`; reporting `success`
+    // alongside a non-zero exit code misleads JSON consumers (the scan
+    // wrapper recomputes status from the exit code for exactly this
+    // reason, but `get` surfaces this envelope directly).
+    let apply_failed = !apply_succeeded && patches_added > 0 && !params.save_only;
+    let (status, exit_code) = run_outcome(patches_failed > 0, apply_failed);
     let mut result_json = serde_json::json!({
-        "status": if patches_failed > 0 { "partial_failure" } else { "success" },
+        "status": status,
         "found": selected.len(),
         "downloaded": patches_added,
         "skipped": patches_skipped,
         "failed": patches_failed,
         "applied": if apply_succeeded { patches_added } else { 0 },
-        "updated": updates.len(),
+        "updated": patches_updated,
         "patches": downloaded_patches,
     });
     // Surface release-narrowing fallbacks (uninstalled package / no
@@ -979,7 +994,6 @@ pub async fn download_and_apply_patches(
         result_json["warnings"] = serde_json::json!(narrow_warnings);
     }
 
-    let exit_code = if patches_failed > 0 || (!apply_succeeded && patches_added > 0 && !params.save_only) { 1 } else { 0 };
     (exit_code, result_json)
 }
 
@@ -1548,6 +1562,15 @@ async fn save_and_apply_patch(
         }
     }
 
+    // The apply step ran (patch added, not --save-only) but failed →
+    // partial failure. The `status` field must agree with the exit code
+    // returned below; a hardcoded `success` alongside a non-zero exit
+    // misleads JSON consumers.
+    let apply_failed = !apply_succeeded && added && !args.save_only;
+    // No "download failed" concept here — a blob failure early-returns
+    // with status `error` above — so only the apply step can degrade us.
+    let (status, exit_code) = run_outcome(false, apply_failed);
+
     if args.common.json {
         let mut patch_record = serde_json::json!({
             "purl": patch.purl,
@@ -1560,7 +1583,7 @@ async fn save_and_apply_patch(
             merge_metadata(&mut patch_record, patch_event_metadata(&patch));
         }
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "status": "success",
+            "status": status,
             "found": 1,
             "downloaded": if added { 1 } else { 0 },
             "applied": if apply_succeeded { 1 } else { 0 },
@@ -1568,7 +1591,7 @@ async fn save_and_apply_patch(
         })).unwrap());
     }
 
-    if !apply_succeeded && added && !args.save_only { 1 } else { 0 }
+    exit_code
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
@@ -1998,6 +2021,51 @@ mod tests {
         // The empty vulnerabilities array is still present so the
         // shape stays consistent.
         assert_eq!(meta["vulnerabilities"].as_array().unwrap().len(), 0);
+    }
+
+    // --- run_outcome -----------------------------------------------------
+    // The `status` field and the process exit code are derived from the
+    // same predicate. Regression guard: a failed *apply* step (no download
+    // failures) must still report `partial_failure` AND exit 1 — the old
+    // code keyed `status` only on download failures, so it printed
+    // `success` next to a non-zero exit code.
+
+    #[test]
+    fn run_outcome_clean_is_success_exit_zero() {
+        assert_eq!(run_outcome(false, false), ("success", 0));
+    }
+
+    #[test]
+    fn run_outcome_download_failure_is_partial_exit_one() {
+        assert_eq!(run_outcome(true, false), ("partial_failure", 1));
+    }
+
+    #[test]
+    fn run_outcome_apply_failure_alone_is_partial_exit_one() {
+        // The load-bearing case: nothing failed to download, but the apply
+        // step failed. status MUST agree with the non-zero exit code.
+        assert_eq!(run_outcome(false, true), ("partial_failure", 1));
+    }
+
+    #[test]
+    fn run_outcome_both_failures_is_partial_exit_one() {
+        assert_eq!(run_outcome(true, true), ("partial_failure", 1));
+    }
+
+    #[test]
+    fn run_outcome_status_and_exit_never_disagree() {
+        // Exhaustive: a `success` status iff exit 0, `partial_failure` iff
+        // exit 1, for every input combination.
+        for pf in [false, true] {
+            for af in [false, true] {
+                let (status, code) = run_outcome(pf, af);
+                assert_eq!(
+                    status == "success",
+                    code == 0,
+                    "status/exit disagree for patches_failed={pf}, apply_failed={af}"
+                );
+            }
+        }
     }
 
     // --- truncate_with_ellipsis ------------------------------------------

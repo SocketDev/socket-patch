@@ -564,6 +564,52 @@ mod tests {
     }
 
     #[test]
+    fn merge_qualified_drops_base_with_no_caller_variant() {
+        // Rollback semantics: the result map must contain only
+        // caller-supplied (manifest) PURLs. A crawler-returned base PURL
+        // with no qualified caller variant that strips to it must be
+        // dropped, never inserted under its bare base key. Guards against
+        // a regression that leaks the raw crawler key into the output.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let purls = vec!["pkg:pypi/flask@3.0.0?artifact_id=wheel".to_string()];
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[("pkg:pypi/requests@2.28.0", "/sp")]),
+        );
+        assert!(out.is_empty());
+        assert!(!out.contains_key("pkg:pypi/requests@2.28.0"));
+    }
+
+    #[test]
+    fn merge_qualified_isolates_distinct_bases_in_one_call() {
+        // Two unrelated installed packages returned together must each map
+        // only to their own qualified variant — no cross-base bleed.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        let purls = vec![
+            "pkg:pypi/requests@2.28.0?artifact_id=wheel".to_string(),
+            "pkg:pypi/flask@3.0.0?artifact_id=sdist".to_string(),
+        ];
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[
+                ("pkg:pypi/requests@2.28.0", "/req"),
+                ("pkg:pypi/flask@3.0.0", "/flask"),
+            ]),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.get("pkg:pypi/requests@2.28.0?artifact_id=wheel"),
+            Some(&PathBuf::from("/req"))
+        );
+        assert_eq!(
+            out.get("pkg:pypi/flask@3.0.0?artifact_id=sdist"),
+            Some(&PathBuf::from("/flask"))
+        );
+    }
+
+    #[test]
     fn merge_qualified_keeps_first_path_per_qualified_key() {
         // First discovered path wins for a given qualified key, mirroring
         // the per-path iteration in the scan macro.
@@ -606,6 +652,20 @@ mod tests {
                 "pkg:pypi/requests@2.28.0".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn merge_first_wins_accumulates_distinct_keys_across_calls() {
+        // The shared `out` map is fed once per discovered path and once per
+        // ecosystem; distinct keys from separate calls must all survive.
+        let mut out: HashMap<String, PathBuf> = HashMap::new();
+        merge_first_wins(&mut out, &[], packages(&[("pkg:npm/foo@1.0", "/a")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:cargo/bar@2.0", "/b")]));
+        merge_first_wins(&mut out, &[], packages(&[("pkg:gem/baz@3.0", "/c")]));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.get("pkg:npm/foo@1.0"), Some(&PathBuf::from("/a")));
+        assert_eq!(out.get("pkg:cargo/bar@2.0"), Some(&PathBuf::from("/b")));
+        assert_eq!(out.get("pkg:gem/baz@3.0"), Some(&PathBuf::from("/c")));
     }
 
     #[test]
@@ -654,6 +714,22 @@ mod tests {
         assert!(!env_truthy(key));
         std::env::remove_var(key);
         assert!(!env_truthy(key));
+    }
+
+    #[cfg(any(feature = "maven", feature = "nuget"))]
+    #[test]
+    fn env_truthy_rejects_empty_and_padded_values() {
+        // The experimental gates must NOT open on an empty assignment
+        // (`SOCKET_EXPERIMENTAL_MAVEN=`) or on whitespace-padded values —
+        // only the exact tokens `1` / `true` (any case) enable them.
+        let key = "SOCKET_TEST_ENV_TRUTHY_EDGE";
+        for falsey in ["", " ", "1 ", " 1", "1\n", "true ", "tru", "11", "01"] {
+            std::env::set_var(key, falsey);
+            assert!(!env_truthy(key), "{falsey:?} must not be truthy");
+        }
+        std::env::set_var(key, "TRUE");
+        assert!(env_truthy(key));
+        std::env::remove_var(key);
     }
 
     #[test]
@@ -771,6 +847,27 @@ mod tests {
             map.get(&Ecosystem::Pypi),
             Some(&vec!["pkg:pypi/bar@2.0".to_string()])
         );
+    }
+
+    #[test]
+    fn partition_purls_allow_list_is_exact_match() {
+        // The `--ecosystems` filter must compare against `cli_name()`
+        // exactly: neither a prefix (`"np"`) nor a different case (`"NPM"`)
+        // may smuggle an out-of-scope PURL through. Guards the dispatch
+        // filter against becoming a loose/catch-all match.
+        let purls = vec!["pkg:npm/foo@1.0".to_string()];
+        for bad in ["np", "npmm", "NPM", "Npm", " npm", "npm "] {
+            let allowed = vec![bad.to_string()];
+            let map = partition_purls(&purls, Some(allowed.as_slice()));
+            assert!(
+                map.is_empty(),
+                "allow-list entry {bad:?} must not match cli_name \"npm\""
+            );
+        }
+        // The exact name still matches.
+        let allowed = vec!["npm".to_string()];
+        let map = partition_purls(&purls, Some(allowed.as_slice()));
+        assert!(map.contains_key(&Ecosystem::Npm));
     }
 
     #[test]

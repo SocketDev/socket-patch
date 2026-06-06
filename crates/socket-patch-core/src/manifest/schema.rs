@@ -33,12 +33,43 @@ pub struct PatchRecord {
     pub tier: String,
 }
 
+/// Persisted `setup` configuration (CLI_CONTRACT property 9). Lives under the
+/// manifest's `setup` key so a fresh clone's `setup` / `setup --check` honors it
+/// without re-passing flags.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupConfig {
+    /// Workspace-member paths (relative to the repo root, forward-slashed) that
+    /// `setup` must NOT configure — and `setup --check` must not flag as
+    /// needing configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Ecosystems (by `Ecosystem::cli_name`, e.g. `"pypi"`) the user runs
+    /// `socket-patch apply` for by hand, so their patches are still attested in
+    /// VEX even though no auto-install hook is wired (CLI_CONTRACT property 7).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual: Vec<String>,
+}
+
+impl SetupConfig {
+    /// Whether this carries no setup state (so the manifest can omit the key).
+    pub fn is_empty(&self) -> bool {
+        self.exclude.is_empty() && self.manual.is_empty()
+    }
+}
+
 /// The top-level patch manifest structure.
 /// Stored as `.socket/manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PatchManifest {
     /// Maps package PURL (e.g., "pkg:npm/lodash@4.17.21") -> patch record.
     pub patches: HashMap<String, PatchRecord>,
+    /// Optional persisted `setup` state (e.g. excluded workspace members).
+    /// Absent on manifests that predate / don't use it (serde default), and
+    /// omitted from the serialized form when empty so existing manifests are
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupConfig>,
 }
 
 impl PatchManifest {
@@ -46,6 +77,7 @@ impl PatchManifest {
     pub fn new() -> Self {
         Self {
             patches: HashMap::new(),
+            setup: None,
         }
     }
 }

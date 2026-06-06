@@ -7,6 +7,8 @@ use socket_patch_core::cargo_setup::{
 #[cfg(feature = "golang")]
 use socket_patch_core::go_setup::{self, GoSetupStatus};
 use socket_patch_core::gem_setup::{self, GemSetupStatus};
+#[cfg(feature = "composer")]
+use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
@@ -20,11 +22,16 @@ use socket_patch_core::pth_hook::{
     add_hook_dependency, deps_contain_hook, detect_python_pm, remove_hook_dependency, ManifestKind,
     PthEditResult, PthStatus, PythonPackageManager,
 };
+use socket_patch_core::crawlers::CrawlerOptions;
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::utils::telemetry::track_patch_setup;
+use socket_patch_core::vex::applied_patches;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::args::GlobalArgs;
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::output::stdin_is_tty;
 
 /// Stringify the detected npm-family manager for telemetry.
@@ -37,12 +44,14 @@ fn manager_name(pm: PackageManager) -> &'static str {
 
 /// Compose the `+`-joined telemetry manager tag across the ecosystems in scope
 /// (e.g. `npm+pypi+cargo`), or `none`.
+#[allow(clippy::too_many_arguments)]
 fn telemetry_manager_str(
     npm: bool,
     py: bool,
     cargo: bool,
     go: bool,
     gem: bool,
+    composer: bool,
     npm_pm: PackageManager,
 ) -> String {
     let mut parts: Vec<&str> = Vec::new();
@@ -60,6 +69,9 @@ fn telemetry_manager_str(
     }
     if gem {
         parts.push("gem");
+    }
+    if composer {
+        parts.push("composer");
     }
     if parts.is_empty() {
         "none".to_string()
@@ -80,14 +92,27 @@ pub struct SetupArgs {
     )]
     pub check: bool,
 
-    /// Revert the install hooks that `setup` added (npm `package.json` scripts
-    /// and the Python `socket-patch-hook` dependency).
+    /// Revert the install hooks that `setup` added: npm `package.json` scripts,
+    /// the Python `socket-patch[hook]` dependency, the cargo `socket-patch-guard`
+    /// dependency + `[env]`, the Go guard package + blank imports, and the gem
+    /// Bundler plugin wiring.
     #[arg(
         long = "remove",
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub remove: bool,
+
+    /// Workspace-member path(s) to exclude from setup (comma-separated, relative
+    /// to the repo root). The exclusion is persisted in `.socket/manifest.json`
+    /// so `setup --check` and a fresh clone honor it without re-passing the flag
+    /// (CLI_CONTRACT property 9).
+    #[arg(
+        long = "exclude",
+        env = "SOCKET_SETUP_EXCLUDE",
+        value_delimiter = ',',
+    )]
+    pub exclude: Vec<String>,
 
     #[command(flatten)]
     pub common: GlobalArgs,
@@ -106,20 +131,29 @@ pub async fn run(args: SetupArgs) -> i32 {
 /// Discover the package.json files `setup`/`check`/`remove` should act on,
 /// applying the pnpm "root-only" filtering. Returns an empty vec when none are
 /// found (callers also consider Python before reporting `no_files`).
-async fn discover(args: &SetupArgs) -> Vec<PackageJsonLocation> {
+async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
+    if !eco_in_scope(&args.common, ECO_NPM) {
+        return Vec::new();
+    }
     let find_result = find_package_json_files(&args.common.cwd).await;
 
     // For pnpm monorepos, only update root package.json. pnpm runs root
     // postinstall on `pnpm install`, so workspace-level postinstall scripts are
     // unnecessary and would fail under pnpm's strict module isolation.
-    match find_result.workspace_type {
+    let files: Vec<PackageJsonLocation> = match find_result.workspace_type {
         WorkspaceType::Pnpm => find_result
             .files
             .into_iter()
             .filter(|loc| loc.is_root)
             .collect(),
         _ => find_result.files,
-    }
+    };
+
+    // Property 9: drop excluded workspace members (the root is never excludable).
+    files
+        .into_iter()
+        .filter(|loc| loc.is_root || !is_member_excluded(&loc.path, &args.common.cwd, excludes))
+        .collect()
 }
 
 /// Emit the shared "nothing found" result and exit code.
@@ -145,6 +179,208 @@ fn pathdiff(path: &str, base: &Path) -> String {
         .map(|r| r.display().to_string())
         .unwrap_or_else(|_| path.to_string())
 }
+
+/// Whether an ecosystem is in scope for this run, honoring the global
+/// `--ecosystems` filter (`CLI_CONTRACT.md` → "Setup command contract",
+/// property 2). With no filter (or an empty one) every ecosystem is in scope.
+/// `names` lists the accepted tokens for the ecosystem — its canonical
+/// `Ecosystem::cli_name()` plus any friendly alias (e.g. `golang`/`go`,
+/// `pypi`/`python`, `gem`/`ruby`) — matched case-insensitively, mirroring the
+/// semantics `apply` already uses (`cargo_in_local_scope`/`go_in_local_scope`).
+fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
+    match &common.ecosystems {
+        None => true,
+        Some(list) if list.is_empty() => true,
+        Some(list) => list
+            .iter()
+            .any(|e| names.iter().any(|n| e.eq_ignore_ascii_case(n))),
+    }
+}
+
+/// Normalize a workspace-member / exclude path for comparison: forward slashes,
+/// no leading `./`, no trailing slash.
+fn normalize_rel_path(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let p = p.strip_prefix("./").unwrap_or(&p);
+    p.trim_end_matches('/').to_string()
+}
+
+/// Whether a discovered member manifest (`package.json` / `Cargo.toml`) lies in
+/// an excluded workspace-member directory (relative to `cwd`). The repo root
+/// (relative path `""`) is never excludable — `--exclude` targets members.
+/// (CLI_CONTRACT property 9.)
+fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let dir = match manifest_path.parent() {
+        Some(d) => d,
+        None => return false,
+    };
+    let rel = match dir.strip_prefix(cwd) {
+        Ok(r) => normalize_rel_path(&r.to_string_lossy()),
+        Err(_) => return false, // outside cwd → not an excludable member
+    };
+    if rel.is_empty() {
+        return false;
+    }
+    excludes.iter().any(|e| normalize_rel_path(e) == rel)
+}
+
+/// The persisted `setup.exclude` list from `.socket/manifest.json` (empty if no
+/// manifest / no setup state). Read-only.
+async fn read_setup_excludes(common: &GlobalArgs) -> Vec<String> {
+    match read_manifest(&common.resolved_manifest_path()).await {
+        Ok(Some(m)) => m
+            .setup
+            .map(|s| s.exclude)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| normalize_rel_path(e))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The exclude set in effect for this run: the persisted `setup.exclude` union
+/// the `--exclude` flag values (all normalized). This is what a clone inherits
+/// — a clone with no flag still reads the persisted set.
+async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String> {
+    let mut set = read_setup_excludes(common).await;
+    for e in flag {
+        let n = normalize_rel_path(e);
+        if !n.is_empty() && !set.contains(&n) {
+            set.push(n);
+        }
+    }
+    set
+}
+
+/// Persist the effective exclude set into `.socket/manifest.json` (creating a
+/// minimal manifest if none exists) so `--check` and a fresh clone honor it
+/// without re-passing `--exclude`. No-op when the set is empty or already
+/// exactly persisted (keeps the manifest byte-stable). Never called under
+/// `--dry-run`.
+async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) {
+    if excludes.is_empty() {
+        return;
+    }
+    let path = common.resolved_manifest_path();
+    let existing = read_manifest(&path).await.ok().flatten();
+    let mut merged: Vec<String> = excludes.to_vec();
+    merged.sort();
+    merged.dedup();
+    if existing
+        .as_ref()
+        .and_then(|m| m.setup.as_ref())
+        .map(|s| &s.exclude)
+        == Some(&merged)
+    {
+        return; // already persisted exactly — don't rewrite
+    }
+    // Preserve any existing `manual` declarations (property 7) when rewriting.
+    let manual = existing
+        .as_ref()
+        .and_then(|m| m.setup.as_ref())
+        .map(|s| s.manual.clone())
+        .unwrap_or_default();
+    let mut manifest = existing.unwrap_or_else(PatchManifest::new);
+    manifest.setup = Some(SetupConfig {
+        exclude: merged,
+        manual,
+    });
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = write_manifest(&path, &manifest).await;
+}
+
+/// Which ecosystems are **actually set up** at `cwd` — i.e. their auto-repatch
+/// hook is present on disk (the same presence checks `setup --check` runs). VEX
+/// uses this (∪ the manifest's `manual` declarations) to attest patches only for
+/// set-up-or-manual ecosystems (CLI_CONTRACT property 7). Read-only; ignores the
+/// `--ecosystems` filter (it reports real on-disk state).
+pub(crate) async fn configured_ecosystems(
+    common: &GlobalArgs,
+) -> std::collections::HashSet<socket_patch_core::crawlers::Ecosystem> {
+    use socket_patch_core::crawlers::Ecosystem;
+    let mut set = std::collections::HashSet::new();
+
+    // npm: any discovered package.json whose hook scripts are present.
+    let npm = find_package_json_files(&common.cwd).await;
+    for loc in &npm.files {
+        if let Ok(content) = tokio::fs::read_to_string(&loc.path).await {
+            if !is_setup_configured_str(&content).needs_update {
+                set.insert(Ecosystem::Npm);
+                break;
+            }
+        }
+    }
+
+    // pypi: a chosen python manifest carries the `socket-patch[hook]` dep.
+    // Detect on-disk state DIRECTLY — not via `plan_python`, which applies the
+    // `--ecosystems` filter; this probe must report real state regardless of it
+    // (e.g. `vex --ecosystems cargo` must still see a set-up python project).
+    if is_python_project(&common.cwd).await {
+        let pm = detect_python_pm(&common.cwd).await;
+        for (path, _) in choose_python_manifests(&common.cwd, pm).await {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if deps_contain_hook(&content) {
+                    set.insert(Ecosystem::Pypi);
+                    break;
+                }
+            }
+        }
+    }
+
+    // gem: the managed plugin directive is present in the Gemfile.
+    if let Some(project) = gem_setup::discover_bundler_project(&common.cwd).await {
+        if let Ok(content) = tokio::fs::read_to_string(&project.gemfile).await {
+            if gem_setup::is_plugin_directive_present(&content) {
+                set.insert(Ecosystem::Gem);
+            }
+        }
+    }
+
+    #[cfg(feature = "cargo")]
+    if let Some(project) = discover_cargo_project(&common.cwd).await {
+        for member in &project.members {
+            if let Ok(content) = tokio::fs::read_to_string(member).await {
+                if is_guard_dep_present(&content) {
+                    set.insert(Ecosystem::Cargo);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "golang")]
+    if let Some(module) = go_setup::discover_go_module(&common.cwd).await {
+        if go_setup::guard_files_present(&module.root).await {
+            set.insert(Ecosystem::Golang);
+        }
+    }
+
+    #[cfg(feature = "composer")]
+    if let Some(project) = composer_setup::discover_composer_project(&common.cwd).await {
+        if let Ok(content) = tokio::fs::read_to_string(&project.composer_json).await {
+            if composer_setup::is_hook_present(&content) {
+                set.insert(Ecosystem::Composer);
+            }
+        }
+    }
+
+    set
+}
+
+// Canonical `--ecosystems` token sets per setup branch (see `eco_in_scope`).
+const ECO_NPM: &[&str] = &["npm"];
+const ECO_PYPI: &[&str] = &["pypi", "python"];
+const ECO_CARGO: &[&str] = &["cargo"];
+const ECO_GOLANG: &[&str] = &["golang", "go"];
+const ECO_GEM: &[&str] = &["gem", "ruby"];
+#[cfg(feature = "composer")]
+const ECO_COMPOSER: &[&str] = &["composer", "php"];
 
 // ─────────────────────────────────────────────────────────────────────────
 // Python (.pth hook) helpers
@@ -196,6 +432,9 @@ async fn choose_python_manifests(
 }
 
 async fn plan_python(common: &GlobalArgs) -> Option<PythonPlan> {
+    if !eco_in_scope(common, ECO_PYPI) {
+        return None;
+    }
     if !is_python_project(&common.cwd).await {
         return None;
     }
@@ -312,9 +551,17 @@ struct SetupOutcome {
 /// Build the cargo outcome for a setup (`remove=false`) or remove
 /// (`remove=true`) run at the given `dry_run` setting.
 #[cfg(feature = "cargo")]
-async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+async fn build_cargo_outcome(
+    common: &GlobalArgs,
+    remove: bool,
+    dry_run: bool,
+    excludes: &[String],
+) -> SetupOutcome {
     use socket_patch_core::patch::cargo_config;
 
+    if !eco_in_scope(common, ECO_CARGO) {
+        return SetupOutcome::default();
+    }
     let project = match discover_cargo_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
@@ -325,10 +572,14 @@ async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -
         ..Default::default()
     };
 
-    // Per-member guard dependency edits.
+    // Per-member guard dependency edits, skipping excluded members (property 9).
     let version = guard_version();
     let mut results: Vec<(String, CargoEditResult)> = Vec::new();
-    for member in &project.members {
+    for member in project
+        .members
+        .iter()
+        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
+    {
         let res = if remove {
             remove_guard_dep(member, dry_run).await
         } else {
@@ -381,7 +632,12 @@ async fn build_cargo_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -
 }
 
 #[cfg(not(feature = "cargo"))]
-async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+async fn build_cargo_outcome(
+    _common: &GlobalArgs,
+    _remove: bool,
+    _dry_run: bool,
+    _excludes: &[String],
+) -> SetupOutcome {
     SetupOutcome::default()
 }
 
@@ -394,6 +650,9 @@ async fn build_cargo_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool
 /// A no-op `Default` when the `golang` feature is off.
 #[cfg(feature = "golang")]
 async fn build_go_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+    if !eco_in_scope(common, ECO_GOLANG) {
+        return SetupOutcome::default();
+    }
     let module = match go_setup::discover_go_module(&common.cwd).await {
         Some(m) => m,
         None => return SetupOutcome::default(),
@@ -515,6 +774,9 @@ async fn finalize_go(_common: &GlobalArgs) -> Vec<String> {
 /// `.socket/bundler-plugin/` plugin files. Gem is an unconditional ecosystem,
 /// so (unlike cargo/go) this is never feature-gated.
 async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+    if !eco_in_scope(common, ECO_GEM) {
+        return SetupOutcome::default();
+    }
     let project = match gem_setup::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return SetupOutcome::default(),
@@ -574,6 +836,127 @@ fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Composer (composer.json scripts post-install/post-update hook) helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build the composer branch's contribution to a setup/remove run: add (or
+/// remove) the `socket-patch apply` command in `composer.json`'s
+/// `post-install-cmd` / `post-update-cmd` script events. Feature-gated behind
+/// `composer` (a no-op `Default` when off), exactly like the cargo/go branches —
+/// composer apply itself only exists with the feature, so wiring a hook without
+/// it would be incoherent.
+#[cfg(feature = "composer")]
+async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
+    if !eco_in_scope(common, ECO_COMPOSER) {
+        return SetupOutcome::default();
+    }
+    let project = match composer_setup::discover_composer_project(&common.cwd).await {
+        Some(p) => p,
+        None => return SetupOutcome::default(),
+    };
+
+    let mut out = SetupOutcome {
+        present: true,
+        ..Default::default()
+    };
+
+    let r = if remove {
+        composer_setup::remove_hook(&project, dry_run).await
+    } else {
+        composer_setup::add_hook(&project, dry_run).await
+    };
+
+    let mut added_paths: Vec<String> = Vec::new();
+    match r.status {
+        ComposerSetupStatus::Updated => {
+            out.changed += 1;
+            added_paths.push(r.path.clone());
+        }
+        ComposerSetupStatus::AlreadyConfigured => out.already += 1,
+        ComposerSetupStatus::Error => out.errors += 1,
+    }
+    out.json_files.push(serde_json::json!({
+        "kind": r.kind,
+        "path": r.path,
+        "status": composer_status_str(&r.status, remove),
+        "error": r.error,
+    }));
+
+    if !added_paths.is_empty() {
+        let header = if remove {
+            "Composer: remove the socket-patch re-apply hook from:"
+        } else {
+            "Composer: add the socket-patch re-apply hook to:"
+        };
+        out.preview.push(header.to_string());
+        for p in &added_paths {
+            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+        }
+    }
+
+    out
+}
+
+#[cfg(not(feature = "composer"))]
+async fn build_composer_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+    SetupOutcome::default()
+}
+
+#[cfg(feature = "composer")]
+fn composer_status_str(s: &ComposerSetupStatus, for_remove: bool) -> &'static str {
+    match (s, for_remove) {
+        (ComposerSetupStatus::Updated, false) => "updated",
+        (ComposerSetupStatus::Updated, true) => "removed",
+        (ComposerSetupStatus::AlreadyConfigured, false) => "already_configured",
+        (ComposerSetupStatus::AlreadyConfigured, true) => "not_configured",
+        (ComposerSetupStatus::Error, _) => "error",
+    }
+}
+
+/// Append composer check entry (the `composer.json` hook presence) to the shared
+/// `run_check` entries list. Returns whether a composer project was found.
+/// Checks the SETUP wiring only — patch consistency is the shared
+/// `append_patch_consistency_entries` pass.
+#[cfg(feature = "composer")]
+async fn append_composer_check_entries(
+    common: &GlobalArgs,
+    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    if !eco_in_scope(common, ECO_COMPOSER) {
+        return false;
+    }
+    let project = match composer_setup::discover_composer_project(&common.cwd).await {
+        Some(p) => p,
+        None => return false,
+    };
+    let (state, err) = match tokio::fs::read_to_string(&project.composer_json).await {
+        Ok(content) => {
+            if composer_setup::is_hook_present(&content) {
+                (CheckState::Configured, None)
+            } else {
+                (CheckState::NeedsConfiguration, None)
+            }
+        }
+        Err(e) => (CheckState::Error, Some(e.to_string())),
+    };
+    entries.push((
+        "composer",
+        project.composer_json.display().to_string(),
+        state,
+        err,
+    ));
+    true
+}
+
+#[cfg(not(feature = "composer"))]
+async fn append_composer_check_entries(
+    _common: &GlobalArgs,
+    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) -> bool {
+    false
+}
+
 /// Materialise gem patches right after wiring the plugin (the "automatic" step)
 /// so the first `bundle install` finds them already applied. Best-effort and
 /// offline; a non-zero exit becomes a warning — the plugin heals on the next
@@ -616,6 +999,9 @@ async fn append_gem_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) -> bool {
+    if !eco_in_scope(common, ECO_GEM) {
+        return false;
+    }
     let project = match gem_setup::discover_bundler_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
@@ -643,6 +1029,56 @@ async fn append_gem_check_entries(
         None,
     ));
     true
+}
+
+/// Append a `needs_configuration` entry for every in-scope manifest patch that
+/// is installed but NOT correctly applied on disk (a file's hash != its
+/// `afterHash`). This is the `apply --check` invariant that property 4 requires
+/// `setup --check` to prove *in addition to* hook presence: a repo with hooks
+/// wired but patches drifted/un-applied is not in a correctly-patched state.
+///
+/// Reuses the same machinery `vex` uses — the qualified-aware rollback resolver
+/// (so release-variant PURLs resolve) honoring `--ecosystems`, then
+/// [`applied_patches`]. An *uninstalled* package (`package_not_found`, also the
+/// bucket for out-of-scope PURLs absent from the map) cannot be patched yet, and
+/// a degenerate zero-file record (`no_files`) has nothing to hash — neither is
+/// drift, so both are skipped. A missing/empty/unreadable manifest contributes
+/// nothing (hook presence alone decides). Read-only: it crawls but never writes.
+async fn append_patch_consistency_entries(
+    common: &GlobalArgs,
+    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+) {
+    let manifest_path = common.resolved_manifest_path();
+    let manifest = match read_manifest(&manifest_path).await {
+        Ok(Some(m)) if !m.patches.is_empty() => m,
+        _ => return,
+    };
+
+    let purls: Vec<String> = manifest.patches.keys().cloned().collect();
+    let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
+    let crawler_options = CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
+        batch_size: 0, // unused for find_packages_for_rollback
+    };
+    let package_paths =
+        find_packages_for_rollback(&partitioned, &crawler_options, common.silent).await;
+
+    let outcome = applied_patches(&manifest, &package_paths).await;
+    for failed in &outcome.failed {
+        match failed.reason.as_str() {
+            // Not installed (or out of scope) / nothing to hash → not drift.
+            "package_not_found" | "no_files" => continue,
+            // Installed but the on-disk file is not at its afterHash → drift.
+            _ => entries.push((
+                "patch",
+                failed.purl.clone(),
+                CheckState::NeedsConfiguration,
+                Some(format!("patch not applied on disk ({})", failed.reason)),
+            )),
+        }
+    }
 }
 
 /// Combine two ecosystem outcomes into one for the shared preview/envelope
@@ -707,14 +1143,22 @@ fn env_result(config_path: &Path, change: Result<bool, String>) -> CargoEditResu
 async fn append_cargo_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+    excludes: &[String],
 ) -> bool {
     use socket_patch_core::patch::cargo_config;
 
+    if !eco_in_scope(common, ECO_CARGO) {
+        return false;
+    }
     let project = match discover_cargo_project(&common.cwd).await {
         Some(p) => p,
         None => return false,
     };
-    for member in &project.members {
+    for member in project
+        .members
+        .iter()
+        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
+    {
         let (state, err) = match tokio::fs::read_to_string(member).await {
             Ok(content) => {
                 if is_guard_dep_present(&content) {
@@ -745,6 +1189,7 @@ async fn append_cargo_check_entries(
 async fn append_cargo_check_entries(
     _common: &GlobalArgs,
     _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
+    _excludes: &[String],
 ) -> bool {
     false
 }
@@ -757,6 +1202,9 @@ async fn append_go_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) -> bool {
+    if !eco_in_scope(common, ECO_GOLANG) {
+        return false;
+    }
     let module = match go_setup::discover_go_module(&common.cwd).await {
         Some(m) => m,
         None => return false,
@@ -809,10 +1257,14 @@ enum CheckState {
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     if !args.common.json {
-        println!("Searching for package.json / Python / Cargo / Go / Bundler manifests...");
+        println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
     }
 
-    let npm_files = discover(args).await;
+    // Excluded members (persisted in the manifest + any passed via `--exclude`)
+    // are skipped by both discovery and the cargo check. Read-only: `--check`
+    // never persists.
+    let excludes = effective_excludes(&args.common, &args.exclude).await;
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(&args.common).await;
 
     // (kind, path, state, error)
@@ -856,9 +1308,15 @@ async fn run_check(args: &SetupArgs) -> i32 {
         }
     }
 
-    append_cargo_check_entries(&args.common, &mut entries).await;
+    append_cargo_check_entries(&args.common, &mut entries, &excludes).await;
     append_go_check_entries(&args.common, &mut entries).await;
     append_gem_check_entries(&args.common, &mut entries).await;
+    append_composer_check_entries(&args.common, &mut entries).await;
+
+    // Property 4: prove a correctly-patched state, not just hook presence —
+    // every in-scope manifest patch must be applied on disk (`apply --check`
+    // invariant). Drifted/un-applied patches add `needs_configuration` entries.
+    append_patch_consistency_entries(&args.common, &mut entries).await;
 
     if entries.is_empty() {
         return report_no_files(args, "no_files");
@@ -946,26 +1404,34 @@ fn render_removed(new: &Option<String>) -> String {
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     if !common.json {
-        println!("Searching for package.json / Python / Cargo / Go / Bundler manifests...");
+        println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
     }
 
-    let npm_files = discover(args).await;
+    // Honor the persisted/`--exclude` member set so we never touch a member that
+    // was deliberately excluded from setup. Remove does not change the set.
+    let excludes = effective_excludes(common, &args.exclude).await;
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    let cargo_preview = build_cargo_outcome(common, true, true).await;
+    let cargo_preview = build_cargo_outcome(common, true, true, &excludes).await;
     let go_preview = build_go_outcome(common, true, true).await;
     let gem_preview = build_gem_outcome(common, true, true).await;
+    let composer_preview = build_composer_outcome(common, true, true).await;
     if npm_files.is_empty()
         && py_plan.is_none()
         && !cargo_preview.present
         && !go_preview.present
         && !gem_preview.present
+        && !composer_preview.present
     {
         return report_no_files(args, "no_files");
     }
     let cargo_present = cargo_preview.present;
     let go_present = go_preview.present;
     let gem_present = gem_preview.present;
-    let cargo_preview = merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview);
+    let cargo_preview = merge_outcomes(
+        merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview),
+        composer_preview,
+    );
 
     // Preview (dry_run=true never writes).
     let mut npm_preview = Vec::new();
@@ -1047,14 +1513,18 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, true, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go + gem removal (guard dep/[env] root; go guard package +
-    // imports; gem Gemfile `plugin` block + generated plugin dir).
+    // Real cargo + go + gem + composer removal (guard dep/[env] root; go guard
+    // package + imports; gem Gemfile `plugin` block + generated plugin dir;
+    // composer.json script-event command).
     let cargo_results = merge_outcomes(
         merge_outcomes(
-            build_cargo_outcome(common, true, false).await,
-            build_go_outcome(common, true, false).await,
+            merge_outcomes(
+                build_cargo_outcome(common, true, false, &excludes).await,
+                build_go_outcome(common, true, false).await,
+            ),
+            build_gem_outcome(common, true, false).await,
         ),
-        build_gem_outcome(common, true, false).await,
+        build_composer_outcome(common, true, false).await,
     );
 
     let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
@@ -1112,6 +1582,19 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     }
 }
 
+/// Error messages from a cargo/go/gem [`SetupOutcome`]'s rendered `files[]`
+/// entries — the only place per-edit errors for those ecosystems are retained.
+/// The setup/remove previews use this so their human-mode "Errors:" sections
+/// actually list cargo/go/gem failures, honoring the "(see errors above)" line
+/// both flows print when `preview_errors > 0`.
+fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
+    o.json_files
+        .iter()
+        .filter(|f| f.get("status").and_then(|s| s.as_str()) == Some("error"))
+        .filter_map(|f| f.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .collect()
+}
+
 fn print_remove_preview(
     npm: &[RemoveResult],
     py: &[PthEditResult],
@@ -1143,6 +1626,27 @@ fn print_remove_preview(
     if !cargo.preview.is_empty() {
         for line in &cargo.preview {
             println!("{line}");
+        }
+        println!();
+    }
+
+    // Surface failures so the "(see errors above)" line `run_remove` prints when
+    // nothing could be removed actually points at something.
+    let mut errs: Vec<String> = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .filter_map(|r| r.error.clone())
+        .chain(
+            py.iter()
+                .filter(|r| r.status == PthStatus::Error)
+                .filter_map(|r| r.error.clone()),
+        )
+        .collect();
+    errs.extend(outcome_error_messages(cargo));
+    if !errs.is_empty() {
+        println!("Errors:");
+        for e in &errs {
+            println!("  ! {e}");
         }
         println!();
     }
@@ -1223,18 +1727,28 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         println!("Configuring socket-patch install hooks...");
     }
 
-    let npm_files = discover(args).await;
+    // Resolve the effective exclude set (persisted + `--exclude`) and, on a real
+    // run, persist it so `--check` and a fresh clone honor it without the flag.
+    // Dry-run never writes the manifest. Excluded members are then skipped by
+    // discovery and the cargo branch.
+    let excludes = effective_excludes(common, &args.exclude).await;
+    if !common.dry_run {
+        persist_setup_excludes(common, &excludes).await;
+    }
+    let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    // Cargo + Go + Gem previews (dry-run); `.present` also tells us each project exists.
-    let cargo_preview = build_cargo_outcome(common, false, true).await;
+    // Cargo + Go + Gem + Composer previews (dry-run); `.present` also tells us each project exists.
+    let cargo_preview = build_cargo_outcome(common, false, true, &excludes).await;
     let go_preview = build_go_outcome(common, false, true).await;
     let gem_preview = build_gem_outcome(common, false, true).await;
+    let composer_preview = build_composer_outcome(common, false, true).await;
 
     if npm_files.is_empty()
         && py_plan.is_none()
         && !cargo_preview.present
         && !go_preview.present
         && !gem_preview.present
+        && !composer_preview.present
     {
         if common.json {
             println!(
@@ -1249,7 +1763,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            println!("No package.json, Python, Cargo, Go, or Bundler project found");
+            println!("No package.json, Python, Cargo, Go, Bundler, or Composer project found");
         }
         return 0;
     }
@@ -1257,7 +1771,11 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let cargo_present = cargo_preview.present;
     let go_present = go_preview.present;
     let gem_present = gem_preview.present;
-    let cargo_preview = merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview);
+    let composer_present = composer_preview.present;
+    let cargo_preview = merge_outcomes(
+        merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview),
+        composer_preview,
+    );
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
@@ -1267,6 +1785,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         cargo_present,
         go_present,
         gem_present,
+        composer_present,
         npm_pm,
     );
     track_patch_setup(
@@ -1364,14 +1883,18 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go + gem edits (cargo guard dep/[env] root; go guard package +
-    // per-main blank imports; gem Gemfile `plugin` block + generated plugin dir).
+    // Real cargo + go + gem + composer edits (cargo guard dep/[env] root; go guard
+    // package + per-main blank imports; gem Gemfile `plugin` block + generated
+    // plugin dir; composer.json script-event command).
     let cargo_results = merge_outcomes(
         merge_outcomes(
-            build_cargo_outcome(common, false, false).await,
-            build_go_outcome(common, false, false).await,
+            merge_outcomes(
+                build_cargo_outcome(common, false, false, &excludes).await,
+                build_go_outcome(common, false, false).await,
+            ),
+            build_gem_outcome(common, false, false).await,
         ),
-        build_gem_outcome(common, false, false).await,
+        build_composer_outcome(common, false, false).await,
     );
 
     // Materialise the go.mod `replace` redirects now so the first `go test`/run
@@ -1488,19 +2011,20 @@ fn print_setup_preview(
         );
     }
 
-    let errs: Vec<&str> = npm
+    let mut errs: Vec<String> = npm
         .iter()
         .filter(|r| r.status == UpdateStatus::Error)
-        .filter_map(|r| r.error.as_deref())
+        .filter_map(|r| r.error.clone())
         .chain(
             py.iter()
                 .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.as_deref()),
+                .filter_map(|r| r.error.clone()),
         )
         .collect();
+    errs.extend(outcome_error_messages(cargo));
     if !errs.is_empty() {
         println!("\nErrors:");
-        for e in errs {
+        for e in &errs {
             println!("  ! {e}");
         }
     }

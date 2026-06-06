@@ -246,7 +246,7 @@ async fn run_removes_matching_patch_and_exits_zero() {
         "pkg:npm/bar@2".to_string(),
         record("22222222-2222-2222-2222-222222222222"),
     );
-    write_manifest(&manifest_path, &PatchManifest { patches })
+    write_manifest(&manifest_path, &PatchManifest { patches, setup: None })
         .await
         .expect("write manifest");
 

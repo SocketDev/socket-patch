@@ -1,6 +1,6 @@
 # Socket Patch CLI
 
-Apply security patches to npm and Python dependencies without waiting for upstream fixes.
+Apply security patches to your dependencies — npm, PyPI, Cargo, Go, Ruby gems, and more — without waiting for upstream fixes.
 
 ## Installation
 
@@ -69,6 +69,26 @@ ecosystems:
 ```bash
 cargo install socket-patch-cli --features golang,maven,composer,nuget,deno
 ```
+
+### RubyGems
+
+```bash
+gem install socket-patch
+```
+
+A thin launcher gem: on first run it downloads the prebuilt binary for your
+platform from the matching GitHub release, verifies its SHA-256, caches it, and
+execs it. Set `SOCKET_PATCH_BIN` to an existing binary to skip the download.
+
+### Composer
+
+```bash
+composer require socketsecurity/socket-patch
+vendor/bin/socket-patch --help
+```
+
+Same launcher model as the RubyGems package (download-on-first-run, cached,
+`SOCKET_PATCH_BIN` to bypass).
 
 ## Quick Start
 
@@ -386,8 +406,13 @@ socket-patch repair --json
 
 Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
 
-- **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches.
+- **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches (pnpm: root package only).
 - **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
+- **Cargo** — adds a `socket-patch-guard` build dependency to each workspace member's `Cargo.toml` plus an `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml`. The guard's build script re-applies patches on every `cargo build` and is **fail-closed** — a build using stale/unpatched sources fails loudly. (Requires the `socket-patch` CLI on `PATH` at build time.)
+- **Go** — generates a committed `internal/socketpatchguard/` guard package plus a blank import in each `main` package. The guard re-applies patches and gates both `go test ./...` (CI) and every `go run` / binary launch via `init()` — **fail-closed**. Fully self-contained committed source. (Requires the `socket-patch` CLI on `PATH`.)
+- **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
+- **Composer (PHP)** *(opt-in `composer` feature)* — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. Only available in a build compiled with `--features composer`. (Requires the `socket-patch` CLI on `PATH`.)
+- **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
 
 **Usage:**
 ```bash
@@ -400,7 +425,7 @@ socket-patch setup --remove   # revert what setup added
 | Flag | Description |
 |------|-------------|
 | `--check` | Read-only verification that every manifest is configured; exits non-zero if any still needs setup. Never writes (safe in CI). Conflicts with `--remove`. |
-| `--remove` | Revert the install hooks `setup` added (npm `package.json` scripts and the Python `socket-patch[hook]` dependency). |
+| `--remove` | Revert the install hooks `setup` added (npm `package.json` scripts, the Python `socket-patch[hook]` dependency, the cargo `socket-patch-guard` dependency + `[env]`, the Go guard package + imports, and the gem Bundler plugin wiring). |
 
 #### Disabling / opting out (Python hook)
 
@@ -421,7 +446,7 @@ On interpreter startup, *only when the set of installed packages changed*, the h
 
 **Examples:**
 ```bash
-# Interactive setup (npm and/or Python, auto-detected)
+# Interactive setup (all detected ecosystems, auto-detected)
 socket-patch setup
 
 # Non-interactive

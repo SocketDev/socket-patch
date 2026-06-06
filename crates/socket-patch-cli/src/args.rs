@@ -49,6 +49,27 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
     }
 }
 
+/// clap value-parser for boolean flags backed by an env var.
+///
+/// Identical to clap's stock `BoolishValueParser` (case-insensitive
+/// `true/false`, `yes/no`, `on/off`, `1/0`) **except** that an empty string is
+/// treated as `false` rather than rejected.
+///
+/// Without this, an exported-but-empty env var — e.g. `SOCKET_OFFLINE=` or
+/// `SOCKET_JSON=`, which shells and CI routinely set to mean "unset" — made
+/// clap abort the whole command with `invalid value '' for '--offline': value
+/// was not a boolean`. Every bool flag here reads such an env var, so a single
+/// stray empty var crashed every subcommand before it could do any work.
+fn parse_bool_flag(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "" | "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
+        "y" | "yes" | "t" | "true" | "on" | "1" => Ok(true),
+        other => Err(format!(
+            "`{other}` is not a boolean (expected one of: true, false, yes, no, on, off, 1, 0)"
+        )),
+    }
+}
+
 /// Arguments inherited by every subcommand via `#[command(flatten)]`.
 ///
 /// **Every** global flag is parseable on **every** subcommand. Commands that
@@ -119,7 +140,7 @@ pub struct GlobalArgs {
         long,
         env = "SOCKET_OFFLINE",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub offline: bool,
 
@@ -129,7 +150,7 @@ pub struct GlobalArgs {
         short = 'g',
         env = "SOCKET_GLOBAL",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub global: bool,
 
@@ -143,7 +164,7 @@ pub struct GlobalArgs {
         short = 'j',
         env = "SOCKET_JSON",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub json: bool,
 
@@ -153,7 +174,7 @@ pub struct GlobalArgs {
         short = 'v',
         env = "SOCKET_VERBOSE",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub verbose: bool,
 
@@ -163,7 +184,7 @@ pub struct GlobalArgs {
         short = 's',
         env = "SOCKET_SILENT",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub silent: bool,
 
@@ -172,7 +193,7 @@ pub struct GlobalArgs {
         long = "dry-run",
         env = "SOCKET_DRY_RUN",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub dry_run: bool,
 
@@ -182,7 +203,7 @@ pub struct GlobalArgs {
         short = 'y',
         env = "SOCKET_YES",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub yes: bool,
 
@@ -207,7 +228,7 @@ pub struct GlobalArgs {
         long = "break-lock",
         env = "SOCKET_BREAK_LOCK",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub break_lock: bool,
 
@@ -216,7 +237,7 @@ pub struct GlobalArgs {
         long = "debug",
         env = "SOCKET_DEBUG",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub debug: bool,
 
@@ -225,7 +246,7 @@ pub struct GlobalArgs {
         long = "no-telemetry",
         env = "SOCKET_TELEMETRY_DISABLED",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = parse_bool_flag,
     )]
     pub no_telemetry: bool,
 }
@@ -317,6 +338,169 @@ impl Default for GlobalArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    /// Minimal harness so we can exercise clap's parse + env-var resolution of
+    /// `GlobalArgs` exactly as a real subcommand would (it is `flatten`ed).
+    #[derive(Parser, Debug)]
+    struct TestCli {
+        #[command(flatten)]
+        common: GlobalArgs,
+    }
+
+    /// Full list of env vars `GlobalArgs` reads, so each clap-parse test starts
+    /// from a known-clean environment (no ambient `SOCKET_*` bleed-through).
+    const SOCKET_ENV_VARS: &[&str] = &[
+        "SOCKET_CWD",
+        "SOCKET_MANIFEST_PATH",
+        "SOCKET_API_URL",
+        "SOCKET_API_TOKEN",
+        "SOCKET_ORG_SLUG",
+        "SOCKET_PROXY_URL",
+        "SOCKET_ECOSYSTEMS",
+        "SOCKET_DOWNLOAD_MODE",
+        "SOCKET_OFFLINE",
+        "SOCKET_GLOBAL",
+        "SOCKET_GLOBAL_PREFIX",
+        "SOCKET_JSON",
+        "SOCKET_VERBOSE",
+        "SOCKET_SILENT",
+        "SOCKET_DRY_RUN",
+        "SOCKET_YES",
+        "SOCKET_LOCK_TIMEOUT",
+        "SOCKET_BREAK_LOCK",
+        "SOCKET_DEBUG",
+        "SOCKET_TELEMETRY_DISABLED",
+    ];
+
+    /// Snapshot/clear every `SOCKET_*` var, run `f`, then restore. Keeps the
+    /// env-mutating clap tests hermetic and reversible.
+    fn with_clean_socket_env(f: impl FnOnce()) {
+        let saved: Vec<(&str, Option<String>)> = SOCKET_ENV_VARS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+        for &k in SOCKET_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// `parse_bool_flag` accepts the same vocabulary as clap's
+    /// `BoolishValueParser`, case-insensitively and with surrounding whitespace
+    /// trimmed.
+    #[test]
+    fn parse_bool_flag_accepts_boolish_vocabulary() {
+        for t in ["1", "true", "TRUE", "True", "yes", "Y", "on", "  on  ", "t"] {
+            assert_eq!(parse_bool_flag(t), Ok(true), "{t:?} should be true");
+        }
+        for f in ["0", "false", "FALSE", "no", "N", "off", "  off  ", "f"] {
+            assert_eq!(parse_bool_flag(f), Ok(false), "{f:?} should be false");
+        }
+    }
+
+    /// The bug fix: an empty (or whitespace-only) string is `false`, not an
+    /// error. Shells/CI export `SOCKET_OFFLINE=` to mean "unset".
+    #[test]
+    fn parse_bool_flag_treats_empty_as_false() {
+        assert_eq!(parse_bool_flag(""), Ok(false));
+        assert_eq!(parse_bool_flag("   "), Ok(false));
+    }
+
+    /// Genuinely non-boolean values are still rejected (we didn't make the
+    /// parser permissive — only empty is special-cased).
+    #[test]
+    fn parse_bool_flag_rejects_non_boolean() {
+        assert!(parse_bool_flag("garbage").is_err());
+        assert!(parse_bool_flag("2").is_err());
+        assert!(parse_bool_flag("tru").is_err());
+    }
+
+    /// Regression: an exported-but-empty bool env var must NOT crash the parse.
+    /// Before the fix, `BoolishValueParser` aborted with "value was not a
+    /// boolean", taking down every subcommand. Now it resolves to `false`.
+    #[test]
+    #[serial_test::serial]
+    fn empty_bool_env_var_parses_as_false_not_crash() {
+        with_clean_socket_env(|| {
+            for var in ["SOCKET_OFFLINE", "SOCKET_JSON", "SOCKET_VERBOSE", "SOCKET_GLOBAL"] {
+                std::env::set_var(var, "");
+            }
+            let cli = TestCli::try_parse_from(["socket-patch"])
+                .expect("empty bool env vars must not abort the parse");
+            assert!(!cli.common.offline);
+            assert!(!cli.common.json);
+            assert!(!cli.common.verbose);
+            assert!(!cli.common.global);
+            for var in ["SOCKET_OFFLINE", "SOCKET_JSON", "SOCKET_VERBOSE", "SOCKET_GLOBAL"] {
+                std::env::remove_var(var);
+            }
+        });
+    }
+
+    /// A truthy bool env var resolves to `true` through clap.
+    #[test]
+    #[serial_test::serial]
+    fn truthy_bool_env_var_parses_as_true() {
+        with_clean_socket_env(|| {
+            std::env::set_var("SOCKET_OFFLINE", "1");
+            std::env::set_var("SOCKET_JSON", "true");
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert!(cli.common.offline);
+            assert!(cli.common.json);
+            std::env::remove_var("SOCKET_OFFLINE");
+            std::env::remove_var("SOCKET_JSON");
+        });
+    }
+
+    /// A non-boolean bool env var is still a hard parse error — the empty-string
+    /// special case must not have widened into "accept anything".
+    #[test]
+    #[serial_test::serial]
+    fn garbage_bool_env_var_is_rejected() {
+        with_clean_socket_env(|| {
+            std::env::set_var("SOCKET_OFFLINE", "garbage");
+            assert!(TestCli::try_parse_from(["socket-patch"]).is_err());
+            std::env::remove_var("SOCKET_OFFLINE");
+        });
+    }
+
+    /// The bare CLI flag still toggles `true` (the value_parser applies to the
+    /// env path; on the command line `--offline` remains a no-value flag).
+    #[test]
+    #[serial_test::serial]
+    fn bare_cli_flag_sets_true() {
+        with_clean_socket_env(|| {
+            let cli = TestCli::try_parse_from(["socket-patch", "--offline", "--json"]).unwrap();
+            assert!(cli.common.offline);
+            assert!(cli.common.json);
+        });
+    }
+
+    /// With nothing set, every bool defaults to `false`.
+    #[test]
+    #[serial_test::serial]
+    fn bools_default_false_when_unset() {
+        with_clean_socket_env(|| {
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert!(!cli.common.offline);
+            assert!(!cli.common.json);
+            assert!(!cli.common.verbose);
+            assert!(!cli.common.silent);
+            assert!(!cli.common.global);
+            assert!(!cli.common.dry_run);
+            assert!(!cli.common.yes);
+            assert!(!cli.common.break_lock);
+            assert!(!cli.common.debug);
+            assert!(!cli.common.no_telemetry);
+        });
+    }
 
     /// `api_client_overrides` must forward every populated value verbatim.
     #[test]

@@ -58,7 +58,7 @@ fn manifest_with_after_hashes(after: &[&str]) -> PatchManifest {
             tier: "free".to_string(),
         },
     );
-    PatchManifest { patches }
+    PatchManifest { patches, setup: None }
 }
 
 /// Count the directory entries under `dir` (used to prove a short-circuit
@@ -348,6 +348,114 @@ async fn fetch_blobs_by_hash_mixes_skip_and_download_attempt() {
     // is untouched.
     assert!(!blobs.join(absent).exists(), "failed download must not leave a file");
     assert_eq!(std::fs::read(blobs.join(present)).unwrap(), b"present");
+}
+
+// ── Content-hash verification (mock-server driven) ──────────────────
+//
+// These drive the success and mismatch branches of `download_hashes`'s
+// content verification, which the closed-port tests above can never reach
+// (they fail before any body is returned). The blob's name IS its
+// git-sha256, so the server must serve bytes that hash to the requested
+// name for the download to be accepted.
+
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+use wiremock::matchers::{method, path as path_matcher};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// A public-proxy client pointed at `base` (so binary fetches go to
+/// `<base>/patch/blob/<hash>`).
+fn proxy_client(base: &str) -> ApiClient {
+    ApiClient::new(ApiClientOptions {
+        api_url: base.to_string(),
+        api_token: None,
+        use_public_proxy: true,
+        org_slug: None,
+    })
+}
+
+/// A blob whose content hashes to the requested name is written to disk
+/// and counted as downloaded. Proves the happy path of `download_hashes`'s
+/// verify-then-write logic end to end.
+#[tokio::test]
+async fn fetch_missing_blobs_accepts_and_writes_matching_content() {
+    let content = b"the genuine patched file body";
+    let hash = compute_git_sha256_from_bytes(content);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/blob/{hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+    let manifest = manifest_with_after_hashes(&[&hash]);
+    let client = proxy_client(&server.uri());
+
+    let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
+    assert_eq!(result.total, 1);
+    assert_eq!(result.downloaded, 1, "matching content must be accepted");
+    assert_eq!(result.failed, 0);
+    // Written under its content-addressed name, byte-for-byte.
+    assert_eq!(std::fs::read(blobs.join(&hash)).unwrap(), content);
+    // No staging litter survived the atomic write.
+    let names: Vec<String> = std::fs::read_dir(&blobs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![hash], "exactly the blob, no temp files: {names:?}");
+}
+
+/// A server that returns bytes NOT matching the requested hash must be
+/// rejected as a content mismatch — and crucially must NOT leave a file at
+/// the content-addressed path (which a later run would trust as valid).
+#[tokio::test]
+async fn fetch_missing_blobs_rejects_content_hash_mismatch_and_writes_nothing() {
+    // Ask for the hash of `expected`, but have the server send `tampered`.
+    let expected = b"the genuine patched file body";
+    let hash = compute_git_sha256_from_bytes(expected);
+    let tampered = b"surprise! malicious or corrupted payload";
+    assert_ne!(
+        compute_git_sha256_from_bytes(tampered),
+        hash,
+        "fixture sanity: tampered bytes must hash differently"
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/blob/{hash}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tampered.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+    let manifest = manifest_with_after_hashes(&[&hash]);
+    let client = proxy_client(&server.uri());
+
+    let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
+    assert_eq!(result.total, 1);
+    assert_eq!(result.downloaded, 0, "mismatched content must be refused");
+    assert_eq!(result.failed, 1);
+    assert!(result.results[0].error.as_deref().unwrap().contains("mismatch"));
+
+    // The integrity invariant: nothing — not even a partial/tampered file —
+    // may sit at the content-addressed path, or a subsequent run's presence
+    // check would silently trust it without re-verifying.
+    assert!(
+        !blobs.join(&hash).exists(),
+        "rejected content must not be persisted at its claimed hash path"
+    );
+    assert_eq!(
+        dir_entry_count(&blobs),
+        0,
+        "no blob and no staging litter after a rejected download"
+    );
 }
 
 /// `get_missing_blobs` against a manifest that lists no patches

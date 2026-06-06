@@ -160,7 +160,7 @@ mod tests {
             },
         );
 
-        PatchManifest { patches }
+        PatchManifest { patches, setup: None }
     }
 
     #[test]

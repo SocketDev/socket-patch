@@ -54,4 +54,42 @@ pyproject="$REPO_ROOT/pypi/socket-patch/pyproject.toml"
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$pyproject"
 rm -f "$pyproject.bak"
 
+# Update the PyPI hook package version. The release build (build-pypi-wheels.py)
+# injects --version at wheel-build time, so this keeps the source-of-truth
+# pyproject.toml in sync for local builds and avoids a stale version field.
+hook_pyproject="$REPO_ROOT/pypi/socket-patch-hook/pyproject.toml"
+sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$hook_pyproject"
+rm -f "$hook_pyproject.bak"
+
+# Update the Ruby Bundler-plugin gem version (Phase 2 scaffolding). The in-tree
+# plugin is the active mechanism today; keep the published gem's version in sync
+# so a release publishes a version matching the CLI.
+gemspec="$REPO_ROOT/gem/socket-patch-bundler/socket-patch-bundler.gemspec"
+if [ -f "$gemspec" ]; then
+  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$gemspec"
+  rm -f "$gemspec.bak"
+fi
+
+# Update the RubyGems CLI launcher gem (gemspec version + the VERSION constant
+# the launcher uses to pick the matching GitHub release binary).
+ruby_cli_gemspec="$REPO_ROOT/gem/socket-patch/socket-patch.gemspec"
+if [ -f "$ruby_cli_gemspec" ]; then
+  sed -i.bak "s/s\.version *= *\".*\"/s.version     = \"$VERSION\"/" "$ruby_cli_gemspec"
+  rm -f "$ruby_cli_gemspec.bak"
+fi
+ruby_cli_launcher="$REPO_ROOT/gem/socket-patch/lib/socket_patch/launcher.rb"
+if [ -f "$ruby_cli_launcher" ]; then
+  sed -i.bak "s/VERSION = \".*\"/VERSION = \"$VERSION\"/" "$ruby_cli_launcher"
+  rm -f "$ruby_cli_launcher.bak"
+fi
+
+# Update the Composer CLI launcher's baked-in version (the release it fetches).
+# Packagist derives the package version from the git tag, so composer.json has
+# no version field — only the launcher constant needs syncing.
+composer_cli_bin="$REPO_ROOT/composer/socket-patch/bin/socket-patch"
+if [ -f "$composer_cli_bin" ]; then
+  sed -i.bak "s/const SP_VERSION = '.*';/const SP_VERSION = '$VERSION';/" "$composer_cli_bin"
+  rm -f "$composer_cli_bin.bak"
+fi
+
 echo "Synced version to $VERSION"

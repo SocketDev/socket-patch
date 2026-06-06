@@ -22,9 +22,11 @@ impl NuGetCrawler {
     /// In global mode, returns the global NuGet packages folder
     /// (`NUGET_PACKAGES` env var or `~/.nuget/packages/`).
     ///
-    /// In local mode (in priority order):
+    /// In local mode, discovery is gated on `cwd` actually being a .NET
+    /// project (see [`is_dotnet_project`]). When that gate passes, paths
+    /// are returned in priority order:
     /// 1. `<cwd>/packages/` folder (legacy packages.config layout)
-    /// 2. Global cache — but only if cwd contains a .NET project file
+    /// 2. Global cache (`NUGET_PACKAGES` / `~/.nuget/packages/`)
     /// 3. Paths discovered from `obj/project.assets.json`
     pub async fn get_nuget_package_paths(
         &self,
@@ -44,18 +46,29 @@ impl NuGetCrawler {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
 
+        // Local discovery is gated on `cwd` actually being a .NET project.
+        // A bare `packages/` directory is NOT NuGet-specific — `packages/`
+        // is the conventional workspace layout for JS/TS monorepos (lerna,
+        // pnpm, yarn, turborepo) — and `obj/project.assets.json` only ever
+        // appears alongside a .NET project file. `crawl_all_ecosystems`
+        // runs every crawler against the same `cwd`, so scanning these
+        // paths without a .NET marker would misclassify another
+        // ecosystem's tree as NuGet sources. Mirrors `CargoCrawler`'s
+        // gate-first fix for the shared `vendor/` layout.
+        if !is_dotnet_project(&options.cwd).await {
+            return Ok(paths);
+        }
+
         // 1. Check <cwd>/packages/ (legacy packages.config layout)
         let packages_dir = options.cwd.join("packages");
         if is_dir(&packages_dir).await && seen.insert(packages_dir.clone()) {
             paths.push(packages_dir);
         }
 
-        // 2. Fall back to global cache if this looks like a .NET project
-        if is_dotnet_project(&options.cwd).await {
-            let home = nuget_home();
-            if is_dir(&home).await && seen.insert(home.clone()) {
-                paths.push(home);
-            }
+        // 2. Fall back to the global cache.
+        let home = nuget_home();
+        if is_dir(&home).await && seen.insert(home.clone()) {
+            paths.push(home);
         }
 
         // 3. Check obj/ dirs for project.assets.json
@@ -332,7 +345,11 @@ async fn is_dotnet_project(cwd: &Path) -> bool {
                     return true;
                 }
             }
-            if name == "NuGet.Config" || name == "nuget.config" {
+            // `packages.config` is the defining marker for the legacy
+            // packages.config layout that pairs with `<cwd>/packages/`;
+            // recognize it (and the NuGet config file) so the local-mode
+            // gate admits those projects.
+            if name == "NuGet.Config" || name == "nuget.config" || name == "packages.config" {
                 return true;
             }
         }
@@ -681,6 +698,91 @@ mod tests {
         let paths = discover_paths_from_assets(dir.path()).await;
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], pkg_folder);
+    }
+
+    /// Regression: local-mode discovery must be gated on `cwd` being a
+    /// .NET project. A JS/TS monorepo conventionally keeps a top-level
+    /// `packages/` directory; because `crawl_all_ecosystems` runs every
+    /// crawler against the same `cwd`, an ungated NuGet crawler would
+    /// walk that JS `packages/` tree and report it as NuGet sources.
+    #[tokio::test]
+    async fn test_get_paths_skips_packages_dir_in_non_dotnet_project() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A bare `packages/` folder (e.g. a pnpm/lerna workspace) with no
+        // .NET project marker present.
+        tokio::fs::create_dir_all(dir.path().join("packages").join("some-js-lib"))
+            .await
+            .unwrap();
+        // An `obj/project.assets.json` lookalike must also be ignored
+        // without a .NET marker.
+        let obj_dir = dir.path().join("obj");
+        tokio::fs::create_dir_all(&obj_dir).await.unwrap();
+        tokio::fs::write(
+            obj_dir.join("project.assets.json"),
+            r#"{"packageFolders":{"/tmp":{}}}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
+        assert!(
+            paths.is_empty(),
+            "non-.NET project must yield no local paths, got {paths:?}"
+        );
+    }
+
+    /// Companion to the gate test: once a .NET project marker is present,
+    /// the local `packages/` directory is discovered as before.
+    #[tokio::test]
+    async fn test_get_paths_finds_packages_dir_in_dotnet_project() {
+        let dir = tempfile::tempdir().unwrap();
+
+        tokio::fs::create_dir_all(dir.path().join("packages"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("MyApp.csproj"), "<Project/>")
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
+        assert!(
+            paths.contains(&dir.path().join("packages")),
+            "a .NET project's packages/ dir must be discovered, got {paths:?}"
+        );
+    }
+
+    /// A legacy packages.config project may not expose its `.csproj` at
+    /// the scanned `cwd`, so `packages.config` itself must satisfy the
+    /// .NET-project gate that admits the paired `packages/` folder.
+    #[tokio::test]
+    async fn test_packages_config_is_a_dotnet_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!super::is_dotnet_project(dir.path()).await);
+
+        tokio::fs::write(
+            dir.path().join("packages.config"),
+            r#"<?xml version="1.0"?><packages/>"#,
+        )
+        .await
+        .unwrap();
+        assert!(super::is_dotnet_project(dir.path()).await);
     }
 
     #[tokio::test]

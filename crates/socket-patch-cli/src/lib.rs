@@ -104,6 +104,13 @@ pub fn parse_with_uuid_fallback(argv: Vec<String>) -> Result<Cli, clap::Error> {
                 new_args.extend_from_slice(&argv[1..]);
                 match Cli::try_parse_from(&new_args) {
                     Ok(cli) => Ok(cli),
+                    // clap models `--help`/`--version` as `Err`, but they are
+                    // display requests, not parse failures. For those the
+                    // rewritten `get` form is the correct thing to show, so
+                    // surface the rewrite's error (which clap exits 0 on).
+                    // Only genuine failures (those clap prints to stderr) fall
+                    // back to the original un-rewritten error.
+                    Err(rewrite_err) if !rewrite_err.use_stderr() => Err(rewrite_err),
                     Err(_) => Err(err),
                 }
             } else {
@@ -335,5 +342,61 @@ mod tests {
         // NOT UnknownArgument (which is what the rewrite parse would have
         // produced).
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn fallback_forwards_help_to_rewritten_get() {
+        // `socket-patch <UUID> --help` must display the rewritten `get`
+        // command's help rather than swallowing it and surfacing the original
+        // "invalid subcommand" error. clap models `--help` as an `Err`, but it
+        // is a display request (exit 0), so the fallback must surface THAT
+        // error, not the original InvalidSubcommand (which would exit 2).
+        let err = match parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--help"])) {
+            Ok(_) => panic!("clap surfaces --help as an Err"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelp,
+            "bare-UUID + --help should show get's help, not the original error"
+        );
+        // Display requests exit 0 and print to stdout, not stderr.
+        assert!(!err.use_stderr());
+        assert_eq!(err.exit_code(), 0);
+        // The rendered help is for the rewritten `get` command, proving the
+        // rewrite's error (not the original) was surfaced.
+        assert!(err.to_string().contains("socket-patch get"));
+    }
+
+    #[test]
+    fn fallback_forwards_version_to_rewritten_get() {
+        // `--version` is likewise a display request that propagates to
+        // subcommands (propagate_version = true); it must not be swallowed.
+        let err = match parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--version"])) {
+            Ok(_) => panic!("clap surfaces --version as an Err"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(!err.use_stderr());
+        assert_eq!(err.exit_code(), 0);
+    }
+
+    #[test]
+    fn fallback_genuine_rewrite_failure_still_uses_original_error() {
+        // Regression guard for the fix: a *real* rewrite failure (one clap
+        // prints to stderr) must still fall back to the original error, so the
+        // help/version carve-out doesn't accidentally swallow legitimate
+        // failures. An unknown flag makes the rewrite fail with UnknownArgument
+        // (use_stderr == true), so the original InvalidSubcommand wins.
+        let err = match parse_with_uuid_fallback(argv(&[
+            "socket-patch",
+            UUID,
+            "--definitely-not-a-real-flag",
+        ])) {
+            Ok(_) => panic!("expected parse to fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        assert!(err.use_stderr());
     }
 }

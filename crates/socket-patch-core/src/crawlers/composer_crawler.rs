@@ -644,6 +644,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_crawl_all_composer_v1_flat_array_end_to_end() {
+        // crawl_all was only covered with the Composer 2 `{"packages": [...]}`
+        // wrapper; pin the Composer 1 bare-array path end-to-end (discovery,
+        // on-disk check, PURL build) so a regression in the v1 fallback in
+        // read_installed_json is caught at the public-API level.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"[
+                {"name": "monolog/monolog", "version": "2.9.1"},
+                {"name": "psr/log", "version": "v3.0.0"}
+            ]"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("psr").join("log"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.lock"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 2);
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert!(purls.contains("pkg:composer/monolog/monolog@2.9.1"));
+        // The `v` prefix is normalized away even via the v1 array path.
+        assert!(purls.contains("pkg:composer/psr/log@3.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_read_installed_json_missing_or_invalid_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path();
+
+        // No composer/installed.json at all -> empty, no panic.
+        assert!(read_installed_json(vendor_dir).await.is_empty());
+
+        // Present but not valid JSON -> empty, no panic.
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(composer_dir.join("installed.json"), "{ not json")
+            .await
+            .unwrap();
+        assert!(read_installed_json(vendor_dir).await.is_empty());
+
+        // Valid JSON but the wrong shape (neither a bare array nor a
+        // `{"packages": [...]}` object) -> empty.
+        tokio::fs::write(composer_dir.join("installed.json"), r#"{"packages": 42}"#)
+            .await
+            .unwrap();
+        assert!(read_installed_json(vendor_dir).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_requires_installed_json() {
+        // A package directory present on disk but with NO installed.json
+        // must not be returned: the crawler cannot corroborate the version,
+        // so it stays consistent with crawl_all (which also yields nothing
+        // without installed.json) rather than blindly trusting the path.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        tokio::fs::create_dir_all(vendor_dir.join("monolog").join("monolog"))
+            .await
+            .unwrap();
+        // Note: deliberately no vendor/composer/installed.json.
+
+        let crawler = ComposerCrawler::new();
+        let purls = vec!["pkg:composer/monolog/monolog@3.5.0".to_string()];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_skips_package_missing_on_disk() {
+        // installed.json lists the package at the requested version, but its
+        // vendor directory is absent (e.g. a metapackage or a custom install
+        // path). find_by_purls must skip it — there are no files to patch.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "meta/package", "version": "1.0.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        // Deliberately do not create vendor/meta/package.
+
+        let crawler = ComposerCrawler::new();
+        let purls = vec!["pkg:composer/meta/package@1.0.0".to_string()];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_dedups_repeated_normalized_purls() {
+        // Two installed.json entries that normalize to the same PURL (one
+        // `v`-prefixed, one bare) must collapse to a single CrawledPackage so
+        // the same on-disk package isn't reported twice.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "symfony/console", "version": "v6.4.1"},
+                {"name": "symfony/console", "version": "6.4.1"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("symfony").join("console"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].purl, "pkg:composer/symfony/console@6.4.1");
+    }
+
+    #[tokio::test]
     async fn test_find_by_purls_version_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let vendor_dir = dir.path().join("vendor");

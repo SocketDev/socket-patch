@@ -322,16 +322,21 @@ impl NpmCrawler {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         // Parse each PURL to extract the directory key and expected version.
+        //
+        // `purl` is the *verbatim* caller-supplied PURL, including any
+        // `?qualifiers`. The result map is keyed by this exact string: the
+        // dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
+        // so it looks results back up under the PURL it handed in. Keying by a
+        // reconstructed/stripped PURL silently loses every qualified PURL
+        // (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
         struct Target {
             namespace: Option<String>,
             name: String,
             version: String,
-            #[allow(dead_code)]
             purl: String,
             dir_key: String,
         }
 
-        let purl_set: HashSet<&str> = purls.iter().map(|s| s.as_str()).collect();
         let mut targets: Vec<Target> = Vec::new();
 
         for purl in purls {
@@ -356,19 +361,16 @@ impl NpmCrawler {
 
             if let Some((_, version)) = read_package_json(&pkg_json_path).await {
                 if version == target.version {
-                    let purl = build_npm_purl(target.namespace.as_deref(), &target.name, &version);
-                    if purl_set.contains(purl.as_str()) {
-                        result.insert(
-                            purl.clone(),
-                            CrawledPackage {
-                                name: target.name.clone(),
-                                version,
-                                namespace: target.namespace.clone(),
-                                purl,
-                                path: pkg_path.clone(),
-                            },
-                        );
-                    }
+                    result.insert(
+                        target.purl.clone(),
+                        CrawledPackage {
+                            name: target.name.clone(),
+                            version,
+                            namespace: target.namespace.clone(),
+                            purl: target.purl.clone(),
+                            path: pkg_path.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -976,5 +978,116 @@ mod tests {
         assert!(result.contains_key("pkg:npm/foo@1.0.0"));
         assert!(result.contains_key("pkg:npm/@types/node@20.0.0"));
         assert!(!result.contains_key("pkg:npm/not-installed@0.0.1"));
+    }
+
+    /// Regression: a qualified PURL (carrying `?qualifiers`) must resolve and
+    /// be keyed by the *verbatim* input PURL — not a reconstructed, stripped
+    /// form. The dispatcher drives npm with `passthrough_purls` +
+    /// `merge_first_wins`, so it looks the result back up under the exact PURL
+    /// it passed in. Keying by the stripped PURL silently dropped every
+    /// qualified npm PURL from apply/rollback.
+    #[tokio::test]
+    async fn test_find_by_purls_resolves_qualified_purl_keyed_by_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+
+        let foo_dir = nm.join("foo");
+        tokio::fs::create_dir_all(&foo_dir).await.unwrap();
+        tokio::fs::write(
+            foo_dir.join("package.json"),
+            r#"{"name": "foo", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        // Scoped package with a qualifier too.
+        let types_dir = nm.join("@types").join("node");
+        tokio::fs::create_dir_all(&types_dir).await.unwrap();
+        tokio::fs::write(
+            types_dir.join("package.json"),
+            r#"{"name": "@types/node", "version": "20.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let unscoped_q = "pkg:npm/foo@1.0.0?vcs_url=https://github.com/x/foo".to_string();
+        let scoped_q = "pkg:npm/@types/node@20.0.0?repository_url=https://npmjs.org".to_string();
+        let purls = vec![unscoped_q.clone(), scoped_q.clone()];
+
+        let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        // Keyed by the verbatim qualified input, and the stored PURL matches.
+        let foo = result.get(&unscoped_q).expect("qualified unscoped resolved");
+        assert_eq!(foo.purl, unscoped_q);
+        assert_eq!(foo.name, "foo");
+        assert_eq!(foo.version, "1.0.0");
+
+        let node = result.get(&scoped_q).expect("qualified scoped resolved");
+        assert_eq!(node.purl, scoped_q);
+        assert_eq!(node.namespace.as_deref(), Some("@types"));
+        assert_eq!(node.name, "node");
+    }
+
+    /// Two distinct qualifiers over the same base package must each resolve
+    /// to their own entry (the dispatcher passes them through verbatim).
+    #[tokio::test]
+    async fn test_find_by_purls_distinct_qualifiers_same_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        let foo_dir = nm.join("foo");
+        tokio::fs::create_dir_all(&foo_dir).await.unwrap();
+        tokio::fs::write(
+            foo_dir.join("package.json"),
+            r#"{"name": "foo", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let q1 = "pkg:npm/foo@1.0.0?a=1".to_string();
+        let q2 = "pkg:npm/foo@1.0.0?b=2".to_string();
+
+        let crawler = NpmCrawler::new();
+        let result = crawler
+            .find_by_purls(&nm, &[q1.clone(), q2.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get(&q1).unwrap().path, foo_dir);
+        assert_eq!(result.get(&q2).unwrap().path, foo_dir);
+    }
+
+    /// A PURL whose version is not the one on disk must be skipped, while a
+    /// sibling PURL for the installed version is kept.
+    #[tokio::test]
+    async fn test_find_by_purls_skips_absent_version_keeps_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        let foo_dir = nm.join("foo");
+        tokio::fs::create_dir_all(&foo_dir).await.unwrap();
+        tokio::fs::write(
+            foo_dir.join("package.json"),
+            r#"{"name": "foo", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let result = crawler
+            .find_by_purls(
+                &nm,
+                &[
+                    "pkg:npm/foo@1.0.0".to_string(),
+                    "pkg:npm/foo@9.9.9".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("pkg:npm/foo@1.0.0"));
+        assert!(!result.contains_key("pkg:npm/foo@9.9.9"));
     }
 }

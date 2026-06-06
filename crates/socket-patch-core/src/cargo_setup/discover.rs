@@ -107,11 +107,18 @@ async fn find_workspace_root(start_manifest: &Path) -> Option<PathBuf> {
 }
 
 /// Expand one `[workspace] members` pattern (relative to `root`) into member
-/// `Cargo.toml` paths. Supports a bare path (`crate-a`), a single trailing
-/// glob (`crates/*`), and `*`. Deeper globs (`crates/**`) are not expanded.
+/// `Cargo.toml` paths. Supports a bare path (`crate-a`), a single-level glob
+/// (`crates/*` / `*`), and the recursive glob (`crates/**` / `**`), which Cargo
+/// accepts and which `setup` must honor so a deeply-nested member is configured
+/// (property 9). `/**` is checked before `/*` (a `crates/**` pattern ends in
+/// `**`, not `/*`, but the explicit order keeps intent clear).
 async fn expand_member(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let pattern = pattern.replace('\\', "/");
-    if let Some(prefix) = pattern.strip_suffix("/*") {
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        glob_dir_recursive(&root.join(prefix)).await
+    } else if pattern == "**" {
+        glob_dir_recursive(root).await
+    } else if let Some(prefix) = pattern.strip_suffix("/*") {
         glob_dir(&root.join(prefix)).await
     } else if pattern == "*" {
         glob_dir(root).await
@@ -133,14 +140,65 @@ async fn glob_dir(base: &Path) -> Vec<PathBuf> {
         Err(_) => return out,
     };
     while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
-            let manifest = entry.path().join("Cargo.toml");
+        // `entry.file_type()` reflects the dir entry itself, which for a
+        // symlink reports `is_dir() == false` — so a symlinked member
+        // directory (which Cargo accepts and expands) would be silently
+        // skipped. Stat the path instead so symlinks are followed.
+        let path = entry.path();
+        if fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
+            let manifest = path.join("Cargo.toml");
             if fs::metadata(&manifest).await.is_ok() {
                 out.push(manifest);
             }
         }
     }
     out
+}
+
+/// Recursive-glob (`**`) expansion: every subdirectory of `base`, at any depth,
+/// that contains a `Cargo.toml`. Skips hidden dirs and `target/` so a build
+/// tree is never walked. Bounded depth as a loop backstop.
+async fn glob_dir_recursive(base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_manifests_recursive(base, 0, &mut out).await;
+    out
+}
+
+async fn collect_manifests_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 20 {
+        return;
+    }
+    let mut rd = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        // Use the dir-entry's own type (does NOT follow symlinks): a `**` walk
+        // must not traverse a symlinked dir — it could loop back to an ancestor
+        // (so the workspace root's own `Cargo.toml` reappears as a duplicate
+        // member) or escape the repo entirely (so `setup` would edit an
+        // out-of-tree `Cargo.toml`, breaking the in-repo-only contract). The
+        // `glob` crate's `**` likewise does not follow symlinks. (The
+        // single-level `glob_dir` still follows a symlinked direct member.)
+        let ft = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        let path = entry.path();
+        let manifest = path.join("Cargo.toml");
+        if fs::metadata(&manifest).await.is_ok() {
+            out.push(manifest);
+        }
+        Box::pin(collect_manifests_recursive(&path, depth + 1, out)).await;
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +261,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_workspace_recursive_double_glob() {
+        // Property 9: `members = ["crates/**"]` must reach a member nested
+        // several directories deep (`crates/group/leaf`), which the single-level
+        // `crates/*` expansion would miss.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/**\"]\n",
+        )
+        .await;
+        write(
+            &root.join("crates/group/leaf/Cargo.toml"),
+            "[package]\nname=\"leaf\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // A sibling at a different depth is also matched by `**`.
+        write(
+            &root.join("crates/top/Cargo.toml"),
+            "[package]\nname=\"top\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // A `target/` build dir must NOT be walked even if it holds a Cargo.toml.
+        write(
+            &root.join("crates/group/target/junk/Cargo.toml"),
+            "[package]\nname=\"junk\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(
+            proj.members.contains(&root.join("crates/group/leaf/Cargo.toml")),
+            "deeply-nested member must be discovered via `crates/**`, got {:?}",
+            proj.members
+        );
+        assert!(proj.members.contains(&root.join("crates/top/Cargo.toml")));
+        assert!(
+            !proj.members.iter().any(|m| m.to_string_lossy().contains("target")),
+            "target/ build dir must not be walked, got {:?}",
+            proj.members
+        );
+        assert_eq!(proj.members.len(), 2, "exactly leaf + top: {:?}", proj.members);
+    }
+
+    // A recursive `crates/**` glob must NOT follow symlinked directories: a
+    // loop symlink back to the root would re-add the workspace manifest as a
+    // duplicate member, and an escaping symlink would let `setup` edit an
+    // out-of-tree `Cargo.toml`. (Contrast the single-level `crates/*` case,
+    // which intentionally follows a symlinked direct member.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_recursive_glob_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/**\"]\n",
+        )
+        .await;
+        write(
+            &root.join("crates/real/Cargo.toml"),
+            "[package]\nname=\"real\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        fs::create_dir_all(root.join("crates")).await.unwrap();
+        // Loop: crates/loop -> the workspace root (would re-discover root Cargo.toml).
+        std::os::unix::fs::symlink(root, root.join("crates/loop")).unwrap();
+        // Escape: crates/escape -> an unrelated dir OUTSIDE the repo.
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            &outside.path().join("Cargo.toml"),
+            "[package]\nname=\"outside\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        std::os::unix::fs::symlink(outside.path(), root.join("crates/escape")).unwrap();
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert_eq!(
+            proj.members,
+            vec![root.join("crates/real/Cargo.toml")],
+            "recursive `**` must find only the real nested member — never the root \
+             via the loop symlink, never the out-of-tree crate via the escape symlink; got {:?}",
+            proj.members
+        );
+    }
+
+    #[tokio::test]
     async fn test_virtual_manifest_explicit_members() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -253,6 +398,40 @@ mod tests {
         let proj = discover_cargo_project(&member).await.unwrap();
         assert_eq!(proj.root, root, "should resolve up to the workspace root");
         assert_eq!(proj.members, vec![root.join("crates/a/Cargo.toml")]);
+    }
+
+    // A member directory reached through a symlink (Cargo follows symlinked
+    // members when expanding a `crates/*` glob) must still be discovered. The
+    // old `DirEntry::file_type()` gate reported the symlink as a non-directory
+    // and silently dropped it, leaving that member unconfigured by `setup`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_globbed_member_through_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .await;
+        // The real crate lives outside `crates/`; `crates/a` is a symlink to it.
+        write(
+            &root.join("real/Cargo.toml"),
+            "[package]\nname=\"a\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        fs::create_dir_all(root.join("crates")).await.unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("crates/a")).unwrap();
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(
+            proj.members.contains(&root.join("crates/a/Cargo.toml")),
+            "symlinked workspace member must be discovered, got {:?}",
+            proj.members
+        );
+        // It must be the real member, not the virtual-manifest fallback.
+        assert!(!proj.members.contains(&root.join("Cargo.toml")));
+        assert_eq!(proj.members.len(), 1);
     }
 
     #[tokio::test]

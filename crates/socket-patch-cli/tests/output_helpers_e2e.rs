@@ -6,7 +6,7 @@
 //! every ANSI branch was uncovered. These tests drive each branch
 //! directly via the lib's pub API.
 
-use socket_patch_cli::output::{color, format_severity};
+use socket_patch_cli::output::{color, format_severity, select_one, SelectError};
 
 #[test]
 fn format_severity_no_color_returns_input_verbatim() {
@@ -100,4 +100,22 @@ fn color_with_empty_text_still_wraps() {
     // colour is enabled.
     let out = color("", "31", true);
     assert_eq!(out, "\x1b[31m\x1b[0m");
+}
+
+#[test]
+fn select_one_empty_options_does_not_yield_out_of_bounds_index() {
+    // A public helper documented to "auto-select the first option" must not
+    // return `Ok(0)` when there is no first option — that index would panic
+    // any caller that does `options[idx]`. The empty-list guard runs before
+    // any stdin read, so this is safe under both TTY and non-TTY.
+    let empty: Vec<String> = Vec::new();
+    assert!(
+        matches!(select_one("pick", &empty, false), Err(SelectError::Cancelled)),
+        "empty non-JSON select must be Cancelled"
+    );
+    // JSON mode is still decided first.
+    assert!(matches!(
+        select_one("pick", &empty, true),
+        Err(SelectError::JsonModeNeedsExplicit)
+    ));
 }

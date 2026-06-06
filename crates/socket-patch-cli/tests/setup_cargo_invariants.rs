@@ -227,3 +227,49 @@ fn setup_cargo_configures_workspace_members() {
         .count();
     assert_eq!(env_entries, 1, "exactly one cargo_env entry: {v}");
 }
+
+// ---------------------------------------------------------------------------
+// Release-flow guard. `setup` MUST write the guard as a bare crates.io version
+// spec (`socket-patch-guard = "<major.minor>"`) — never a `path =`/`git =`
+// table. Production resolves that version from crates.io, so the crate has to be
+// published every release (release.yml's cargo-publish job). The other cargo
+// tests in this repo wire the guard via a local `path =` dep, which would mask a
+// regression that swapped the production spec to a path/git form (and hide the
+// publish requirement entirely — exactly how the unpublished-guard breakage went
+// unnoticed). This pins the published-version contract on the real `setup` path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_writes_guard_as_publishable_crates_io_version() {
+    // Mirrors `guard_version()` in commands/setup.rs: the major.minor of the
+    // crate version, which is the workspace version that gets published.
+    let full = env!("CARGO_PKG_VERSION");
+    let mut parts = full.split('.');
+    let expected = match (parts.next(), parts.next()) {
+        (Some(major), Some(minor)) => format!("{major}.{minor}"),
+        _ => full.to_string(),
+    };
+
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let manifest = proj.path().join("Cargo.toml");
+    write(&manifest, SINGLE_CRATE);
+
+    let (code, v) = run_setup_in(proj.path(), home.path(), &["--yes"]);
+    assert_eq!(code, 0, "cargo setup should succeed: {v}");
+
+    let toml = read(&manifest);
+    // Bare-version form, pinned to the crate's major.minor so the published
+    // `socket-patch-guard` resolves the `^{major.minor}` spec.
+    assert!(
+        toml.contains(&format!("socket-patch-guard = \"{expected}\"")),
+        "guard must be a bare crates.io version `socket-patch-guard = \"{expected}\"` \
+         (publishable form); got Cargo.toml:\n{toml}"
+    );
+    // Never a path/git table — that would 404-mask the publish requirement.
+    assert!(
+        !toml.contains("socket-patch-guard = {"),
+        "guard must NOT be a path/git table dependency (the crate must resolve \
+         from crates.io); got Cargo.toml:\n{toml}"
+    );
+}

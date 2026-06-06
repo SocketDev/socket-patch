@@ -600,7 +600,12 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
         .filter(|t| !t.is_empty());
     let resolved_org_slug = overrides
         .org_slug
-        .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok());
+        .or_else(|| std::env::var("SOCKET_ORG_SLUG").ok())
+        // Treat an empty slug as "not provided" (mirroring the api_token
+        // handling above). Otherwise `SOCKET_ORG_SLUG=""` would be taken as
+        // an explicit slug, skip auto-resolution, and build broken
+        // `/v0/orgs//patches/...` URLs with an empty slug segment.
+        .filter(|s| !s.is_empty());
 
     if api_token.is_none() {
         let proxy_url = overrides.proxy_url.unwrap_or_else(|| {
@@ -721,11 +726,15 @@ pub fn looks_like_token_hash(token: &str) -> bool {
 pub fn validate_token_shape(token: &str) -> Option<String> {
     let has_prefix = token.starts_with("sktsec_");
     let has_suffix = token.ends_with("_api") || token.ends_with("_agent");
-    let plausible_len = token.len() >= 55;
+    // Measure in characters, not bytes: the preview/length reporting below
+    // counts characters (and the message literally says "chars"), so a
+    // multi-byte token must be sized the same way. Using `token.len()` here
+    // would over-count the length and mis-slice the redaction tail.
+    let len = token.chars().count();
+    let plausible_len = len >= 55;
     if has_prefix && has_suffix && plausible_len {
         return None;
     }
-    let len = token.len();
     let head: String = token.chars().take(8).collect();
     let tail_start = len.saturating_sub(4);
     let tail: String = token.chars().skip(tail_start).collect();
@@ -1047,6 +1056,36 @@ mod tests {
         assert!(client.use_public_proxy);
     }
 
+    #[tokio::test]
+    async fn empty_org_slug_override_does_not_become_empty_slug() {
+        // Regression: an empty org slug (override or `SOCKET_ORG_SLUG=""`)
+        // must be treated as "not provided" and trigger auto-resolution —
+        // not be taken verbatim as an explicit slug, which would build broken
+        // `/v0/orgs//patches/...` URLs. Auto-resolution here targets an
+        // unreachable URL, so it fails and leaves the slug `None` (never
+        // `Some("")`). The buggy code skipped resolution and yielded `Some("")`.
+        std::env::remove_var("SOCKET_ORG_SLUG");
+        std::env::remove_var("SOCKET_API_URL");
+        let (client, is_public) = get_api_client_with_overrides(ApiClientEnvOverrides {
+            api_url: Some("http://127.0.0.1:1".to_string()),
+            api_token: Some("sktsec_token_placeholder_value".to_string()),
+            org_slug: Some(String::new()),
+            proxy_url: None,
+        })
+        .await;
+        assert!(!is_public, "a token was provided, so not public-proxy mode");
+        assert_ne!(
+            client.org_slug().map(String::as_str),
+            Some(""),
+            "empty slug must never propagate as an explicit org segment"
+        );
+        assert!(
+            client.org_slug().is_none(),
+            "failed auto-resolution should leave the slug unset, got {:?}",
+            client.org_slug()
+        );
+    }
+
     // ── Group 6: convert_search_result_to_batch_info edge cases ──────
 
     fn make_vuln(summary: &str, severity: &str, cves: Vec<&str>) -> VulnerabilityResponse {
@@ -1354,6 +1393,35 @@ mod tests {
     fn validate_token_shape_flags_missing_suffix() {
         let raw = format!("sktsec_{}", "x".repeat(50));
         assert!(validate_token_shape(&raw).is_some());
+    }
+
+    #[test]
+    fn validate_token_shape_redacts_by_chars_not_bytes() {
+        // Regression: the preview tail and the "(N chars)" count must be
+        // measured in *characters*, not bytes. A multi-byte token used to be
+        // sized with `token.len()` (bytes), which over-reported the length
+        // and mis-sliced the "last 4 chars" tail.
+        //
+        // 1 multi-byte char ('é', 2 bytes) + 16 ASCII + "WXYZ" = 21 chars /
+        // 22 bytes. Correct redaction keeps the last 4 chars ("WXYZ") and
+        // reports 21 chars; the byte-based bug yielded "XYZ" and "22 chars".
+        let token = format!("é{}WXYZ", "0123456789012345");
+        assert_eq!(token.chars().count(), 21);
+        assert_ne!(token.len(), token.chars().count(), "must be multi-byte");
+
+        let msg = validate_token_shape(&token).expect("non-canonical token must be flagged");
+        assert!(
+            msg.contains("(21 chars)"),
+            "length must be reported in characters; got: {msg}"
+        );
+        assert!(
+            msg.contains("...WXYZ"),
+            "redaction tail must be the last 4 *characters*; got: {msg}"
+        );
+        assert!(
+            !msg.contains("(22 chars)"),
+            "byte count must not leak into the char-labeled message; got: {msg}"
+        );
     }
 
     #[test]

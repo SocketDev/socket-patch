@@ -487,4 +487,71 @@ mod tests {
         assert_eq!(Ecosystem::Nuget.cli_name(), "nuget");
         assert_eq!(Ecosystem::Nuget.display_name(), "nuget");
     }
+
+    /// `partition_purls` filters by `from_purl(p).cli_name()` against the
+    /// `--ecosystems` tokens. Deno is the one variant whose PURL type
+    /// (`jsr`) differs from its cli_name (`deno`), so the
+    /// classify→cli_name chain must still land on `"deno"` or
+    /// `--ecosystems deno` would silently drop every JSR package. The
+    /// existing tests pin the two halves separately; this pins the join.
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_jsr_purl_classifies_to_deno_cli_token() {
+        assert_eq!(
+            Ecosystem::from_purl("pkg:jsr/@std/path@0.220.0").map(|e| e.cli_name()),
+            Some("deno")
+        );
+    }
+
+    /// `test_from_purl_ignores_qualifiers` only exercises npm/pypi/gem.
+    /// The feature-gated ecosystems carry qualifiers in the wild too
+    /// (`?repository_url=` for jsr/maven, `?classifier=&ext=` for maven,
+    /// version-suffixed module paths for go), and classification must
+    /// still key off the type prefix alone.
+    #[test]
+    fn test_from_purl_ignores_qualifiers_feature_gated() {
+        #[cfg(feature = "cargo")]
+        assert_eq!(
+            Ecosystem::from_purl("pkg:cargo/serde@1.0.200?foo=bar"),
+            Some(Ecosystem::Cargo)
+        );
+        #[cfg(feature = "maven")]
+        assert_eq!(
+            Ecosystem::from_purl(
+                "pkg:maven/org.apache.commons/commons-lang3@3.12.0?classifier=sources&ext=jar"
+            ),
+            Some(Ecosystem::Maven)
+        );
+        #[cfg(feature = "golang")]
+        assert_eq!(
+            Ecosystem::from_purl("pkg:golang/github.com/go-redis/cache/v9@v9.0.0?foo=bar"),
+            Some(Ecosystem::Golang)
+        );
+        #[cfg(feature = "composer")]
+        assert_eq!(
+            Ecosystem::from_purl("pkg:composer/monolog/monolog@3.5.0?dev=true"),
+            Some(Ecosystem::Composer)
+        );
+        #[cfg(feature = "nuget")]
+        assert_eq!(
+            Ecosystem::from_purl("pkg:nuget/Newtonsoft.Json@13.0.3?foo=bar"),
+            Some(Ecosystem::Nuget)
+        );
+        #[cfg(feature = "deno")]
+        assert_eq!(
+            Ecosystem::from_purl("pkg:jsr/@std/path@0.220.0?repository_url=https://jsr.io"),
+            Some(Ecosystem::Deno)
+        );
+    }
+
+    /// The documented default batch size is 100. A regression to 0 would
+    /// reintroduce the batch-size-0 division/panic class of bug seen in
+    /// the scan path, so pin the contract here at the source of truth.
+    #[test]
+    fn test_crawler_options_default_batch_size() {
+        let opts = CrawlerOptions::default();
+        assert_eq!(opts.batch_size, 100);
+        assert!(!opts.global);
+        assert!(opts.global_prefix.is_none());
+    }
 }

@@ -115,6 +115,28 @@ fn ecosystems_flag_parses_on_setup() {
 }
 
 #[test]
+fn exclude_flag_parses_csv_on_setup() {
+    // Setup command contract, property 9 ("with exclude"): `setup` accepts
+    // `--exclude` as a comma-split list of workspace-member paths. Pins the
+    // parse surface (CSV delimiter); the persist + skip behavior is exercised in
+    // setup_contract_gaps::setup_honors_exclude_for_a_workspace_member.
+    let csv = parse_setup(&["--exclude", "packages/a,packages/b"]);
+    assert_eq!(
+        csv.exclude,
+        vec!["packages/a".to_string(), "packages/b".to_string()],
+        "setup must split --exclude on commas"
+    );
+    // Repeated flags accumulate too.
+    let repeated = parse_setup(&["--exclude", "packages/a", "--exclude", "packages/b"]);
+    assert_eq!(
+        repeated.exclude,
+        vec!["packages/a".to_string(), "packages/b".to_string()]
+    );
+    // Default: empty (no exclusions).
+    assert!(parse_setup(&[]).exclude.is_empty(), "no --exclude ⇒ empty");
+}
+
+#[test]
 fn check_and_remove_conflict() {
     let result = Cli::try_parse_from(["socket-patch", "setup", "--check", "--remove"]);
     let err = match result {
@@ -164,6 +186,7 @@ async fn run_empty_tempdir_exits_zero() {
     let args = SetupArgs {
         check: false,
         remove: false,
+        exclude: Vec::new(),
         common: socket_patch_cli::args::GlobalArgs {
             cwd: tempdir.path().to_path_buf(),
             dry_run: false,

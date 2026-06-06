@@ -20,8 +20,14 @@ use std::process::Command;
 use serde_json::Value;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
+    PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
+
+/// Every setup-supported ecosystem, declared `manual` in test fixtures so the
+/// property-7 setup-state filter (`commands/setup::configured_ecosystems`) does
+/// not drop these patches — these tests exercise VEX document GENERATION, not
+/// setup state, so they opt every patch in via the `manual` escape hatch.
+const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -58,9 +64,14 @@ fn cli() -> Command {
 fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let dir = cwd.join(".socket");
     std::fs::create_dir_all(&dir).unwrap();
+    let mut m = manifest.clone();
+    m.setup = Some(SetupConfig {
+        exclude: Vec::new(),
+        manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
+    });
     std::fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(manifest).unwrap(),
+        serde_json::to_string_pretty(&m).unwrap(),
     )
     .unwrap();
 }
@@ -762,6 +773,220 @@ fn verify_mode_resolves_qualified_pypi_purl() {
     assert_eq!(subs[0]["@id"], qualified_purl);
 
     maybe_validate_with_vexctl(&String::from_utf8_lossy(&out.stdout));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// JSON-envelope partial-failure regression — verify mode where SOME
+// patches verify and some don't. The doc is still generated (so the run
+// succeeds, exit 0), but the envelope must report `partialFailure` and
+// carry one `verified` event per applied subcomponent plus one `skipped`
+// event (with the routing reason in `errorCode`) per omitted patch. This
+// is the `--json` twin of `verify_mode_includes_applied_omits_unapplied`,
+// which only exercised the human/stdout-doc path.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn json_envelope_partial_failure_on_mixed_verify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // One npm package laid down "patched" (file hashes to afterHash) and
+    // one whose file is absent (verify reports file_not_found).
+    let nm = cwd.join("node_modules");
+    let applied_pkg = nm.join("applied-pkg");
+    std::fs::create_dir_all(&applied_pkg).unwrap();
+    std::fs::write(
+        applied_pkg.join("package.json"),
+        r#"{"name":"applied-pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let patched_content = b"patched index";
+    let after_hash = compute_git_sha256_from_bytes(patched_content);
+    std::fs::write(applied_pkg.join("index.js"), patched_content).unwrap();
+
+    let unapplied_pkg = nm.join("unapplied-pkg");
+    std::fs::create_dir_all(&unapplied_pkg).unwrap();
+    std::fs::write(
+        unapplied_pkg.join("package.json"),
+        r#"{"name":"unapplied-pkg","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    // No matching file on disk → verify reports file_not_found.
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/applied-pkg@1.0.0".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            after_hash.as_str(),
+            "GHSA-applied",
+            &["CVE-APPLIED"],
+        ),
+    );
+    manifest.patches.insert(
+        "pkg:npm/unapplied-pkg@2.0.0".to_string(),
+        make_record(
+            "22222222-2222-4222-8222-222222222222",
+            "package/missing.js",
+            "c".repeat(64).as_str(),
+            "d".repeat(64).as_str(),
+            "GHSA-unapplied",
+            &["CVE-UNAPPLIED"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/test-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+
+    // The document was generated (one patch verified), so the run is a
+    // success at the process level — exit 0 — even though one patch was
+    // omitted. The omission surfaces in the envelope, not the exit code.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a partial verify (≥1 applied) must still exit 0. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(env["command"], "vex");
+    assert_eq!(
+        env["status"], "partialFailure",
+        "mixed verify must report partialFailure, not success. env:\n{env}"
+    );
+    assert_eq!(env["summary"]["verified"], 1, "one applied subcomponent");
+    assert_eq!(env["summary"]["skipped"], 1, "one omitted patch");
+
+    let events = env["events"].as_array().unwrap();
+    // The applied patch surfaces as a `verified` event keyed by its PURL.
+    assert!(
+        events.iter().any(|e| e["action"] == "verified"
+            && e["purl"] == "pkg:npm/applied-pkg@1.0.0"),
+        "expected a verified event for the applied package. events:\n{events:#?}"
+    );
+    // The omitted patch surfaces as a `skipped` event whose `errorCode`
+    // carries the verification reason tag (NOT the human message — the
+    // tag is what programmatic consumers route on).
+    let skipped = events
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["purl"] == "pkg:npm/unapplied-pkg@2.0.0")
+        .expect("expected a skipped event for the unapplied package");
+    assert_eq!(
+        skipped["errorCode"], "file_not_found",
+        "the skip reason tag must land in errorCode for routing. event:\n{skipped}"
+    );
+
+    // The VEX document at --output carries only the applied patch.
+    let vex_text = std::fs::read_to_string(&vex_path).unwrap();
+    let doc: Value = serde_json::from_str(&vex_text).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "only the applied patch is attested. doc:\n{vex_text}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-applied");
+    assert!(
+        !vex_text.contains("GHSA-unapplied"),
+        "the omitted patch's vuln must not leak into the doc:\n{vex_text}"
+    );
+    maybe_validate_with_vexctl(&vex_text);
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `--compact` output shape — the flag selects `serde_json::to_string`
+// (single line, no inter-token whitespace) over `to_string_pretty`. Pin
+// the actual on-the-wire shape so a flipped branch (compact ⇄ pretty) is
+// caught; no other test exercises `--compact`.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn compact_flag_emits_single_line_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/lodash@4.17.20".to_string(),
+        make_record(
+            "11111111-1111-4111-8111-111111111111",
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            "b".repeat(64).as_str(),
+            "GHSA-aaaa-bbbb-cccc",
+            &["CVE-2024-1111"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--compact",
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "compact vex must succeed. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // The document is the only thing on stdout. Compact serialization is
+    // a single line: after trimming the trailing newline from `println!`,
+    // there must be no interior newline and no `": "`/`",\n"` pretty
+    // spacing. A pretty (default) doc would span many lines.
+    let trimmed = stdout.trim_end_matches('\n');
+    assert!(
+        !trimmed.contains('\n'),
+        "compact output must be a single line, got multi-line:\n{stdout}"
+    );
+    assert!(
+        !trimmed.contains("\n  "),
+        "compact output must not carry pretty-print indentation"
+    );
+    // It must still be valid OpenVEX with the expected statement.
+    let doc: Value = serde_json::from_str(trimmed).expect("compact output must be valid JSON");
+    assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1);
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-aaaa-bbbb-cccc");
+
+    // Control: the SAME inputs without --compact span multiple lines, so
+    // the single-line assertion above is discriminating (not vacuous).
+    let pretty = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    let pretty_stdout = String::from_utf8(pretty.stdout).unwrap();
+    assert!(
+        pretty_stdout.trim_end_matches('\n').contains('\n'),
+        "pretty (default) output should be multi-line — control for the compact assertion"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────

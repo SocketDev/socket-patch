@@ -35,6 +35,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_JSON",
     "SOCKET_DRY_RUN",
     "SOCKET_YES",
+    "SOCKET_SETUP_EXCLUDE",
     "SOCKET_VEX_NO_VERIFY",
     "SOCKET_VEX_PRODUCT",
     "SOCKET_DEBUG",
@@ -81,16 +82,12 @@ fn git_sha256(content: &[u8]) -> String {
 // Property 2 — ecosystem-scoped. `setup --ecosystems npm` must act on ONLY the
 // npm manifest, leaving the python (and cargo) manifests untouched.
 //
-// CURRENTLY RED: `setup` parses `--ecosystems` (see cli_parse_setup.rs) but the
-// run paths never consult `args.common.ecosystems` — they always process npm +
-// python + cargo. So `requirements.txt` gets the hook line despite the filter.
+// SHIPPED: `setup` now honors `--ecosystems` via the `eco_in_scope` gating in
+// commands/setup.rs (discover / plan_python / build_*_outcome / append_*_check).
+// This pin is now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-// Gap pin (non-blocking, runnable via --ignored): encodes the intended behavior
-// but stays off the blocking CI suite, consistent with the experimental-ecosystem
-// and exclude-placeholder convention. Un-ignore when property 2 ships.
-#[ignore = "gap: setup does not yet honor --ecosystems; see CLI_CONTRACT 'Setup command contract' property 2"]
 fn setup_ecosystems_filter_scopes_work_to_named_ecosystem() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -125,15 +122,14 @@ fn setup_ecosystems_filter_scopes_work_to_named_ecosystem() {
 // present but a manifest patch NOT applied on disk (file hash != afterHash),
 // `setup --check` must report needs-configuration / exit non-zero.
 //
-// CURRENTLY RED: `run_check` only inspects hook presence
-// (is_setup_configured_str / deps_contain_hook / is_guard_dep_present); it never
-// reads `.socket/manifest.json` nor verifies on-disk hashes, so a hooked-but-
-// unpatched repo is reported `configured` / exit 0.
+// SHIPPED: `run_check` now also verifies on-disk patch consistency via
+// `append_patch_consistency_entries` (reads `.socket/manifest.json`, resolves
+// installed package paths, and runs the `applied_patches` afterHash check), so a
+// hooked-but-unpatched repo reports `needs_configuration` / exit 1. This pin is
+// now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-// Gap pin (non-blocking, runnable via --ignored). Un-ignore when property 4 ships.
-#[ignore = "gap: setup --check does not yet verify on-disk patch consistency; see CLI_CONTRACT 'Setup command contract' property 4"]
 fn setup_check_detects_unapplied_manifest_patch() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -192,17 +188,17 @@ fn setup_check_detects_unapplied_manifest_patch() {
 // has a pypi patch but pypi is NOT set up (no requirements.txt / pyproject hook),
 // so the document must contain zero statements (exit 1, no applicable patches).
 //
-// CURRENTLY RED: VEX has no notion of setup state. With `--no-verify` it trusts
-// the manifest wholesale and emits the statement regardless of whether pypi was
-// ever set up — so it writes a 1-statement document and exits 0.
+// SHIPPED: VEX now filters by setup state — `generate_vex` drops patches whose
+// ecosystem is neither set up (`commands/setup::configured_ecosystems`) nor
+// declared `manual` in the manifest's `setup.manual`. With pypi un-set-up and
+// not manual, the only patch is dropped → no applicable patches → exit 1. This
+// pin is now an active (non-ignored) regression guard.
 //
-// (The converse — declaring pypi `manual` to re-include it — is follow-up work;
-// see the `#[ignore]`d placeholder below.)
+// (The converse — declaring pypi `manual` to re-include it — is exercised by the
+// `manual` escape hatch the e2e_vex / e2e_embedded_vex fixtures rely on.)
 // ===========================================================================
 
 #[test]
-// Gap pin (non-blocking, runnable via --ignored). Un-ignore when property 7 ships.
-#[ignore = "gap: VEX has no notion of setup state; see CLI_CONTRACT 'Setup command contract' property 7"]
 fn vex_omits_patches_for_unconfigured_ecosystem() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -259,15 +255,14 @@ fn vex_omits_patches_for_unconfigured_ecosystem() {
 // `setup` *created* should be cleaned up on `--remove`, restoring the exact
 // pre-setup tree.
 //
-// CURRENTLY RED: `drop_env_root` removes the `[env] SOCKET_PATCH_ROOT` key but
-// leaves an empty `.cargo/config.toml` (and the `.cargo/` dir) behind, so a repo
-// that had no `.cargo/` before setup is not restored exactly.
+// SHIPPED: `edit_config` (cargo_config.rs) now deletes an emptied socket-created
+// `.cargo/config.toml` and prunes the now-empty `.cargo/` dir, so a repo that had
+// no `.cargo/` before setup is restored exactly. This pin is now an active
+// (non-ignored) regression guard.
 // ===========================================================================
 
 #[cfg(feature = "cargo")]
 #[test]
-// Gap pin (non-blocking, runnable via --ignored). Un-ignore when the residue is cleaned up.
-#[ignore = "gap: setup --remove leaves an empty .cargo/config.toml; see CLI_CONTRACT 'Setup command contract' property 8"]
 fn setup_remove_cleans_up_cargo_config_it_created() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -298,19 +293,83 @@ fn setup_remove_cleans_up_cargo_config_it_created() {
 }
 
 // ===========================================================================
-// Property 9 (exclude) — follow-up work. The `--exclude` flag and its persisted
-// home (a sub-property of `.socket/manifest.json`) are not implemented yet, so
-// this placeholder is `#[ignore]`d: it documents the intended behavior without
-// failing the default suite. Un-ignore it when the exclude mechanism lands.
+// Property 9 (exclude) — SHIPPED. `setup --exclude <member>` skips that member
+// and PERSISTS the exclusion under `.socket/manifest.json`'s `setup.exclude`, so
+// a later `--check` (and a fresh clone) honor it without re-passing the flag.
+// This pin is now an active (non-ignored) regression guard.
 // ===========================================================================
 
 #[test]
-#[ignore = "exclude mechanism is follow-up; see CLI_CONTRACT 'Setup command contract' property 9"]
 fn setup_honors_exclude_for_a_workspace_member() {
-    // Intended behavior once implemented:
-    //   - root package.json + packages/a configured,
-    //   - packages/b skipped because it was excluded,
-    //   - the exclusion persisted in .socket/manifest.json so `--check`, `apply`,
-    //     and a fresh clone all honor it (no re-passing of --exclude).
-    panic!("pending: --exclude flag + .socket/manifest.json exclude sub-property");
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    // npm workspace: root + two members.
+    write(
+        &proj.path().join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/a/package.json"),
+        r#"{ "name": "a", "version": "1.0.0" }"#,
+    );
+    write(
+        &proj.path().join("packages/b/package.json"),
+        r#"{ "name": "b", "version": "1.0.0" }"#,
+    );
+
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
+
+    // Setup, excluding packages/b.
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--json", "--yes", "--exclude", "packages/b"],
+    );
+    assert_eq!(code, 0, "scoped setup should succeed:\n{stdout}");
+
+    // Root + packages/a configured; packages/b left untouched.
+    assert!(
+        read(proj.path().join("package.json")).contains("socket-patch"),
+        "the root must be configured (never excludable)"
+    );
+    assert!(
+        read(proj.path().join("packages/a/package.json")).contains("socket-patch"),
+        "the included member packages/a must be configured"
+    );
+    assert!(
+        !read(proj.path().join("packages/b/package.json")).contains("socket-patch"),
+        "the EXCLUDED member packages/b must NOT be configured"
+    );
+
+    // The exclusion is persisted under `setup.exclude` in the manifest.
+    let manifest = read(proj.path().join(".socket/manifest.json"));
+    let mv: serde_json::Value = serde_json::from_str(&manifest).expect("manifest is JSON");
+    let excl = mv["setup"]["exclude"]
+        .as_array()
+        .unwrap_or_else(|| panic!("manifest must carry setup.exclude:\n{manifest}"));
+    assert!(
+        excl.iter().any(|v| v == "packages/b"),
+        "the exclusion must persist in the manifest:\n{manifest}"
+    );
+
+    // A fresh `--check` WITHOUT re-passing --exclude honors the persisted set:
+    // the excluded member must not count as needing configuration → `configured`.
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    assert_eq!(
+        code, 0,
+        "check must pass — the excluded member must not be flagged as needing setup:\n{stdout}"
+    );
+    let cv: serde_json::Value = serde_json::from_str(&stdout).expect("check JSON");
+    assert_eq!(
+        cv["status"], "configured",
+        "check must report `configured`, honoring the persisted exclude:\n{stdout}"
+    );
+    assert!(
+        !cv["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"].as_str().is_some_and(|p| p.contains("packages/b"))),
+        "the excluded member must not appear among the checked files:\n{stdout}"
+    );
 }

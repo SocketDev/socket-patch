@@ -131,13 +131,14 @@ impl CargoCrawler {
             return Ok(Self::get_registry_src_paths().await);
         }
 
-        // Local mode: check vendor first
-        let vendor_dir = options.cwd.join("vendor");
-        if is_dir(&vendor_dir).await {
-            return Ok(vec![vendor_dir]);
-        }
-
-        // Only fall back to global registry if this looks like a Cargo project
+        // Local mode is gated on this actually being a Cargo project. A
+        // bare `vendor/` directory is NOT cargo-specific — it is the
+        // standard layout for Composer (PHP) and Go — so we must confirm
+        // a `Cargo.toml`/`Cargo.lock` is present in `cwd` *before*
+        // treating `vendor/` (or the global registry) as cargo crate
+        // sources. Checking `vendor/` first would misclassify a non-Rust
+        // project's vendor tree as cargo sources, violating the contract
+        // documented above.
         let has_cargo_toml = tokio::fs::metadata(options.cwd.join("Cargo.toml"))
             .await
             .is_ok();
@@ -145,12 +146,19 @@ impl CargoCrawler {
             .await
             .is_ok();
 
-        if has_cargo_toml || has_cargo_lock {
-            return Ok(Self::get_registry_src_paths().await);
+        if !(has_cargo_toml || has_cargo_lock) {
+            // Not a Cargo project — return empty.
+            return Ok(Vec::new());
         }
 
-        // Not a Cargo project — return empty
-        Ok(Vec::new())
+        // Cargo project: prefer a vendored source tree if present, else
+        // fall back to the global registry cache.
+        let vendor_dir = options.cwd.join("vendor");
+        if is_dir(&vendor_dir).await {
+            return Ok(vec![vendor_dir]);
+        }
+
+        Ok(Self::get_registry_src_paths().await)
     }
 
     /// Crawl all discovered crate source directories and return every
@@ -656,6 +664,16 @@ version = "fake"
         .await
         .unwrap();
 
+        // A cargo-vendored project always carries a root Cargo.toml; the
+        // vendor tree is only honored once we've confirmed this is a Rust
+        // project.
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .unwrap();
+
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {
             cwd: dir.path().to_path_buf(),
@@ -667,6 +685,79 @@ version = "fake"
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], vendor);
+    }
+
+    /// Regression: a `vendor/` directory in a *non-Rust* project (here a
+    /// stand-in for Composer/Go, which both use `vendor/`) must NOT be
+    /// claimed by the cargo crawler. Without a `Cargo.toml`/`Cargo.lock`
+    /// in `cwd` the crawler is required to return no paths — otherwise it
+    /// would walk an unrelated ecosystem's vendor tree as cargo sources.
+    #[tokio::test]
+    async fn test_vendor_dir_in_non_cargo_project_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("vendor");
+        // Mimic a Composer layout: vendor/<org>/<pkg>/composer.json
+        let pkg = vendor.join("monolog").join("monolog");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("composer.json"), "{}").await.unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let paths = crawler.get_crate_source_paths(&options).await.unwrap();
+        assert!(
+            paths.is_empty(),
+            "non-Rust project's vendor/ must not be scanned as cargo sources, got {paths:?}"
+        );
+    }
+
+    /// A `Cargo.lock` alone (no `Cargo.toml`) is still a Rust project, so
+    /// the vendor tree should be honored.
+    #[tokio::test]
+    async fn test_vendor_dir_honored_with_only_cargo_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("vendor");
+        tokio::fs::create_dir_all(&vendor).await.unwrap();
+        tokio::fs::write(dir.path().join("Cargo.lock"), "version = 3\n")
+            .await
+            .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let paths = crawler.get_crate_source_paths(&options).await.unwrap();
+        assert_eq!(paths, vec![vendor]);
+    }
+
+    /// `--global-prefix` must override the local-mode Cargo-project gate:
+    /// an explicit prefix is honored regardless of whether `cwd` looks
+    /// like a Rust project.
+    #[tokio::test]
+    async fn test_global_prefix_bypasses_cargo_project_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("custom-registry");
+        tokio::fs::create_dir_all(&prefix).await.unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(), // no Cargo.toml/Cargo.lock here
+            global: false,
+            global_prefix: Some(prefix.clone()),
+            batch_size: 100,
+        };
+
+        let paths = crawler.get_crate_source_paths(&options).await.unwrap();
+        assert_eq!(paths, vec![prefix]);
     }
 
     /// Dir name `"-1.0.0"` — the loop finds `i=0` (first `-` is at index 0,

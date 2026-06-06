@@ -146,6 +146,11 @@ fn scan_discovers_fake_registry_crates() {
 fn scan_discovers_vendor_crates() {
     let dir = tempfile::tempdir().unwrap();
 
+    // A bare `vendor/` dir is not cargo-specific; the crawler only treats it as
+    // a crate source once the root is identified as a Cargo project. A vendored
+    // project always carries a lockfile, so stage one as the project marker.
+    std::fs::write(dir.path().join("Cargo.lock"), "version = 3\n").unwrap();
+
     // Set up vendor directory
     let vendor_dir = dir.path().join("vendor");
 
