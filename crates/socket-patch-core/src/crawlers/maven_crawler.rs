@@ -59,19 +59,59 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
     }
 }
 
-/// Does the opening tag for `element` on this line self-close
-/// (e.g. `<dependencies/>` or `<dependencies foo="x"/>`)? Such a tag opens
-/// and closes in one shot and must not change the skip-section depth.
-fn opening_tag_self_closes(line: &str, element: &str) -> bool {
-    let open = format!("<{element}");
-    let Some(pos) = line.find(&open) else {
-        return false;
-    };
-    let after = &line[pos + open.len()..];
-    match after.find('>') {
-        Some(gt) => after[..gt].trim_end().ends_with('/'),
-        None => false,
+/// Find the first *real* opening tag for `element` on this line and report
+/// whether it self-closes (`Some(true)` for `<dependencies/>`, `Some(false)`
+/// for a plain `<dependencies>` or `<dependencies foo="x">`); `None` if there
+/// is no opening tag at all.
+///
+/// "Real" means there is a tag boundary immediately after the element name —
+/// `>`, `/`, whitespace, or end-of-line. This is critical: a bare substring
+/// match would prefix-match a *different* element such as `<buildtools>` as if
+/// it opened `<build>`. Because the corresponding close `</buildtools>` never
+/// equals `</build>`, that phantom open would never be matched by a close and
+/// would leak the entire remainder of the document into the skip section,
+/// dropping the project's real coordinates.
+fn opening_tag(line: &str, element: &str) -> Option<bool> {
+    let needle = format!("<{element}");
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(&needle) {
+        let pos = from + rel;
+        let after = &line[pos + needle.len()..];
+        match after.chars().next() {
+            // Tag name runs to the end of the line (attributes continue on the
+            // next line): a real, non-self-closing open.
+            None => return Some(false),
+            Some(c) if c == '>' || c == '/' || c.is_whitespace() => {
+                let self_closes = match after.find('>') {
+                    Some(gt) => after[..gt].trim_end().ends_with('/'),
+                    None => false,
+                };
+                return Some(self_closes);
+            }
+            // Prefix match of a longer name (`<buildtools>`): keep scanning for
+            // a genuine `<build>`/`<build ...>`/`<build/>` later on the line.
+            _ => from = pos + needle.len(),
+        }
     }
+    None
+}
+
+/// Does this line contain a *real* closing tag `</element>` (tolerating
+/// whitespace before `>`, e.g. `</build >`)? The boundary `>` is required, so
+/// `</buildtools>` is not treated as a close of `</build>` — mirroring the
+/// boundary discipline of [`opening_tag`].
+fn contains_closing_tag(line: &str, element: &str) -> bool {
+    let needle = format!("</{element}");
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(&needle) {
+        let pos = from + rel;
+        let after = &line[pos + needle.len()..];
+        if after.trim_start().starts_with('>') {
+            return true;
+        }
+        from = pos + needle.len();
+    }
+    false
 }
 
 /// Parse `groupId`, `artifactId`, and `version` from a POM XML file.
@@ -113,11 +153,10 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         // (`<dependencies/>`) leaves the depth unchanged; only a lone open
         // increments and a lone close decrements.
         for section in &skip_sections {
-            let open_tag = format!("<{section}");
-            let close_tag = format!("</{section}>");
-            let has_open = trimmed.contains(&open_tag);
-            let has_close = trimmed.contains(&close_tag);
-            if has_open && !has_close && !opening_tag_self_closes(trimmed, section) {
+            let open = opening_tag(trimmed, section);
+            let has_open = open.is_some();
+            let has_close = contains_closing_tag(trimmed, section);
+            if has_open && !has_close && open != Some(true) {
                 skip_depth += 1;
             } else if has_close && !has_open {
                 skip_depth = skip_depth.saturating_sub(1);
@@ -130,14 +169,15 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 
         // Track parent section (a self-closing `<parent/>` carries no
         // coordinates, so it never opens a parent block).
-        if trimmed.contains("<parent")
-            && !trimmed.contains("</parent")
-            && !opening_tag_self_closes(trimmed, "parent")
+        let parent_open = opening_tag(trimmed, "parent");
+        if parent_open.is_some()
+            && !contains_closing_tag(trimmed, "parent")
+            && parent_open != Some(true)
         {
             in_parent = true;
             continue;
         }
-        if trimmed.contains("</parent>") {
+        if contains_closing_tag(trimmed, "parent") {
             in_parent = false;
             continue;
         }
@@ -830,6 +870,121 @@ mod tests {
         assert_eq!(pkgs[0].name, "child");
         assert_eq!(pkgs[0].version, "2.0.0");
         assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+    }
+
+    #[test]
+    fn test_parse_pom_foreign_element_prefixed_with_skip_name() {
+        // REGRESSION: a top-level element whose name merely *starts with* a
+        // skip-section name (here `<buildtools>` vs the `build` skip section,
+        // and `<modulesInfo>` vs `modules`) must NOT open a skip section.
+        //
+        // The opening match was a bare substring (`<build`), so `<buildtools>`
+        // matched as an open; its close `</buildtools>` never equals `</build>`,
+        // so the phantom open never balanced and `skip_depth` stayed >0 for the
+        // rest of the file — swallowing the project's real coordinates.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <buildtools>ci-metadata</buildtools>
+  <modulesInfo>x</modulesInfo>
+  <artifactId>my-app</artifactId>
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_foreign_prefixed_element_does_not_swallow_trailing_coords() {
+        // The decoy element appears BEFORE all coordinates, so if it wrongly
+        // opened a skip section every coordinate would be lost and parse would
+        // return None instead of the real package.
+        let content = r#"<project>
+  <modulesInfo>aggregator-notes</modulesInfo>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>2.5.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "2.5.0");
+    }
+
+    #[test]
+    fn test_parse_pom_skip_section_close_tag_with_whitespace() {
+        // XML permits whitespace before `>` in a closing tag (`</build >`).
+        // The exact `</build>` match used to miss it, leaving `build` open and
+        // leaking the plugin's coordinates. The boundary-aware close handles it.
+        let content = r#"<project>
+  <groupId>com.example</groupId>
+  <artifactId>my-app</artifactId>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.leak</groupId>
+        <artifactId>leak-plugin</artifactId>
+        <version>9.9.9</version>
+      </plugin>
+    </plugins>
+  </build >
+  <version>1.0.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "com.example");
+        assert_eq!(a, "my-app");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_pom_parent_block_with_foreign_prefixed_child() {
+        // A `<parentLink>` decoy must not be mistaken for opening the real
+        // `<parent>` block, and the real `<parent>` groupId must still be the
+        // fallback when the project omits its own groupId.
+        let content = r#"<project>
+  <parentLink>https://example.com</parentLink>
+  <parent>
+    <groupId>org.apache</groupId>
+    <artifactId>apache</artifactId>
+    <version>30</version>
+  </parent>
+  <artifactId>commons-lang3</artifactId>
+  <version>3.12.0</version>
+</project>"#;
+        let (g, a, v) = parse_pom_group_artifact_version(content).unwrap();
+        assert_eq!(g, "org.apache");
+        assert_eq!(a, "commons-lang3");
+        assert_eq!(v, "3.12.0");
+    }
+
+    // ---- opening_tag / contains_closing_tag boundary tests ----
+
+    #[test]
+    fn test_opening_tag_boundary() {
+        // Real opening tags.
+        assert_eq!(opening_tag("<build>", "build"), Some(false));
+        assert_eq!(opening_tag("  <build attr=\"x\">", "build"), Some(false));
+        assert_eq!(opening_tag("<build/>", "build"), Some(true));
+        assert_eq!(opening_tag("<build foo=\"x\" />", "build"), Some(true));
+        // Attribute list spilling onto the next line — name at end of line.
+        assert_eq!(opening_tag("<build", "build"), Some(false));
+        // Prefix-only matches are NOT opening tags.
+        assert_eq!(opening_tag("<buildtools>", "build"), None);
+        assert_eq!(opening_tag("<modulesInfo>x</modulesInfo>", "modules"), None);
+        // Close tags are not opens.
+        assert_eq!(opening_tag("</build>", "build"), None);
+        // A genuine open later on a line that starts with a decoy prefix.
+        assert_eq!(opening_tag("<buildtools/> <build>", "build"), Some(false));
+    }
+
+    #[test]
+    fn test_contains_closing_tag_boundary() {
+        assert!(contains_closing_tag("</build>", "build"));
+        assert!(contains_closing_tag("</build >", "build")); // whitespace tolerated
+        assert!(contains_closing_tag("stuff </build> more", "build"));
+        assert!(!contains_closing_tag("</buildtools>", "build")); // prefix decoy
+        assert!(!contains_closing_tag("<build>", "build")); // open is not a close
     }
 
     // ---- extract_xml_value tests ----

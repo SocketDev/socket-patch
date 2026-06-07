@@ -780,6 +780,30 @@ mod tests {
         assert!(NpmCrawler::parse_purl_components("not-a-purl").is_none());
     }
 
+    /// The `?qualifier` is stripped *before* `rfind('@')` splits the
+    /// version, so an `@` living inside a qualifier value
+    /// (`vcs_url=git@github.com:...`) must not be mistaken for the
+    /// version separator. Reordering those two steps would parse the
+    /// version as `github.com:...` and break apply/rollback for any
+    /// PURL whose qualifier carries an `@`.
+    #[test]
+    fn test_parse_purl_components_qualifier_with_at_sign() {
+        let (ns, name, ver) =
+            NpmCrawler::parse_purl_components("pkg:npm/foo@1.0.0?vcs_url=git@github.com:x/y.git")
+                .unwrap();
+        assert!(ns.is_none());
+        assert_eq!(name, "foo");
+        assert_eq!(ver, "1.0.0");
+
+        let (ns, name, ver) = NpmCrawler::parse_purl_components(
+            "pkg:npm/@types/node@20.0.0?maintainer=a@b.com",
+        )
+        .unwrap();
+        assert_eq!(ns.as_deref(), Some("@types"));
+        assert_eq!(name, "node");
+        assert_eq!(ver, "20.0.0");
+    }
+
     #[tokio::test]
     async fn test_read_package_json_valid() {
         let dir = tempfile::tempdir().unwrap();

@@ -530,6 +530,37 @@ fn setup_check_no_files_exits_zero() {
     assert_eq!(code, 0, "no files should still exit 0; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "no_files");
+    // The `no_files` envelope must keep the documented `--check` shape
+    // (CLI_CONTRACT "Setup command contract") — the summary counts are
+    // always-present, zero-valued fields, NOT dropped. A consumer reading
+    // `.needsConfiguration` must see 0, not null.
+    assert_eq!(v["configured"], 0, "missing/`null` configured; stdout=\n{stdout}");
+    assert_eq!(
+        v["needsConfiguration"], 0,
+        "missing/`null` needsConfiguration; stdout=\n{stdout}"
+    );
+    assert_eq!(v["errors"], 0, "missing/`null` errors; stdout=\n{stdout}");
+    assert!(v["files"].as_array().is_some_and(|a| a.is_empty()));
+}
+
+#[test]
+fn setup_remove_no_files_exits_zero_with_full_envelope() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout) = run_setup(tmp.path(), &["--remove", "--yes"]);
+    assert_eq!(code, 0, "no files should still exit 0; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "no_files");
+    // The `no_files` envelope must keep the documented `--remove` shape
+    // (removed/notConfigured/errors), present and zero — not dropped. This
+    // mirrors the plain-`setup` `no_files` envelope, which already carries its
+    // own counts; the `--remove`/`--check` variants must not diverge.
+    assert_eq!(v["removed"], 0, "missing/`null` removed; stdout=\n{stdout}");
+    assert_eq!(
+        v["notConfigured"], 0,
+        "missing/`null` notConfigured; stdout=\n{stdout}"
+    );
+    assert_eq!(v["errors"], 0, "missing/`null` errors; stdout=\n{stdout}");
+    assert!(v["files"].as_array().is_some_and(|a| a.is_empty()));
 }
 
 #[test]

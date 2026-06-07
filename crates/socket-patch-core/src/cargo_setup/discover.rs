@@ -45,9 +45,14 @@ pub async fn discover_cargo_project(cwd: &Path) -> Option<CargoProject> {
     }
 
     // `[workspace] members = [...]` (with single-trailing-`*` glob support).
+    // Read via `as_table_like` so the equally-valid inline form
+    // `workspace = { members = [...] }` is honored too — otherwise its members
+    // are silently dropped even though `find_workspace_root` (which only checks
+    // `.is_some()`) still treats it as the workspace root. Mirrors the
+    // inline-aware `[dependencies]` handling in `update::is_guard_dep_present`.
     if let Some(arr) = doc
         .get("workspace")
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
         .and_then(|w| w.get("members"))
         .and_then(Item::as_array)
     {
@@ -438,5 +443,187 @@ mod tests {
     async fn test_no_cargo_toml() {
         let dir = tempfile::tempdir().unwrap();
         assert!(discover_cargo_project(dir.path()).await.is_none());
+    }
+
+    // A bare-path member that does not resolve to a `Cargo.toml` must be
+    // silently skipped without aborting discovery of the valid siblings.
+    #[tokio::test]
+    async fn test_nonexistent_bare_member_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"ghost\", \"lib\"]\n",
+        )
+        .await;
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        write(
+            &root.join("lib/Cargo.toml"),
+            "[package]\nname=\"lib\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // `ghost` is listed but the directory has no Cargo.toml (it doesn't even
+        // exist) — Cargo would error, but `setup` must just skip it.
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(proj.members.contains(&root.join("app/Cargo.toml")));
+        assert!(proj.members.contains(&root.join("lib/Cargo.toml")));
+        assert!(
+            !proj.members.iter().any(|m| m.to_string_lossy().contains("ghost")),
+            "unresolved member must not be added, got {:?}",
+            proj.members
+        );
+        assert_eq!(proj.members.len(), 2);
+    }
+
+    // Root `[package]` + recursive `crates/**`: the root manifest is a member
+    // (via `[package]`) and every nested crate is discovered, with no path
+    // appearing twice.
+    #[tokio::test]
+    async fn test_recursive_glob_with_root_package_and_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n\n[workspace]\nmembers = [\"crates/**\"]\n",
+        )
+        .await;
+        write(
+            &root.join("crates/a/Cargo.toml"),
+            "[package]\nname=\"a\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        write(
+            &root.join("crates/group/deep/Cargo.toml"),
+            "[package]\nname=\"deep\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(proj.members.contains(&root.join("Cargo.toml")));
+        assert!(proj.members.contains(&root.join("crates/a/Cargo.toml")));
+        assert!(proj.members.contains(&root.join("crates/group/deep/Cargo.toml")));
+        assert_eq!(proj.members.len(), 3, "no duplicates: {:?}", proj.members);
+
+        // No path appears twice.
+        let mut sorted = proj.members.clone();
+        sorted.sort();
+        let deduped_len = {
+            let mut s = sorted.clone();
+            s.dedup();
+            s.len()
+        };
+        assert_eq!(sorted.len(), deduped_len, "members contain a duplicate: {:?}", proj.members);
+    }
+
+    // Single-level `*` at the workspace root finds direct crate dirs and ignores
+    // an immediate subdir that has no `Cargo.toml`.
+    #[tokio::test]
+    async fn test_single_level_star_at_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Cargo.toml"), "[workspace]\nmembers = [\"*\"]\n").await;
+        write(
+            &root.join("alpha/Cargo.toml"),
+            "[package]\nname=\"alpha\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        write(
+            &root.join("beta/Cargo.toml"),
+            "[package]\nname=\"beta\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        // A non-crate dir at the same level is ignored.
+        fs::create_dir_all(root.join("docs")).await.unwrap();
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(proj.members.contains(&root.join("alpha/Cargo.toml")));
+        assert!(proj.members.contains(&root.join("beta/Cargo.toml")));
+        assert_eq!(proj.members.len(), 2, "only the two crate dirs: {:?}", proj.members);
+    }
+
+    // The `[workspace]`/`members` tables may be written as an inline table —
+    // `workspace = { members = [...] }` is valid TOML that Cargo (serde)
+    // accepts exactly like a `[workspace]` section. The reader must see through
+    // it via `as_table_like`, just as `is_guard_dep_present` does for inline
+    // `[dependencies]`. The old `as_table` gate returned None for the inline
+    // form, so every member was silently dropped (only the virtual-manifest
+    // fallback survived) — leaving the members unconfigured by `setup`, even
+    // though `find_workspace_root` still treats it as the workspace root.
+    #[tokio::test]
+    async fn test_inline_workspace_members_are_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Inline workspace table — NO `[package]`, so the only way to get real
+        // members is to read the inline `members` array.
+        write(
+            &root.join("Cargo.toml"),
+            "workspace = { members = [\"crates/*\"] }\n",
+        )
+        .await;
+        write(
+            &root.join("crates/a/Cargo.toml"),
+            "[package]\nname=\"a\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        write(
+            &root.join("crates/b/Cargo.toml"),
+            "[package]\nname=\"b\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert_eq!(proj.root, root);
+        assert!(
+            proj.members.contains(&root.join("crates/a/Cargo.toml")),
+            "inline-workspace member `a` must be discovered, got {:?}",
+            proj.members
+        );
+        assert!(
+            proj.members.contains(&root.join("crates/b/Cargo.toml")),
+            "inline-workspace member `b` must be discovered, got {:?}",
+            proj.members
+        );
+        // Exactly the two real members — NOT the virtual-manifest fallback
+        // (which would wrongly list the root `Cargo.toml` alone).
+        assert_eq!(
+            proj.members.len(),
+            2,
+            "must be the two inline members, not the virtual fallback: {:?}",
+            proj.members
+        );
+        assert!(!proj.members.contains(&root.join("Cargo.toml")));
+    }
+
+    // An inline workspace table with an explicit (non-glob) member list must
+    // also resolve through the same `as_table_like` path.
+    #[tokio::test]
+    async fn test_inline_workspace_explicit_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "workspace = { members = [\"app\", \"lib\"] }\n",
+        )
+        .await;
+        write(
+            &root.join("app/Cargo.toml"),
+            "[package]\nname=\"app\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+        write(
+            &root.join("lib/Cargo.toml"),
+            "[package]\nname=\"lib\"\nversion=\"0.1.0\"\n",
+        )
+        .await;
+
+        let proj = discover_cargo_project(root).await.unwrap();
+        assert!(proj.members.contains(&root.join("app/Cargo.toml")));
+        assert!(proj.members.contains(&root.join("lib/Cargo.toml")));
+        assert_eq!(proj.members.len(), 2, "{:?}", proj.members);
     }
 }

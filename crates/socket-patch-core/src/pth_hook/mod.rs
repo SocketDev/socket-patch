@@ -21,5 +21,6 @@ pub mod edit;
 
 pub use detect::{deps_contain_hook, detect_python_pm, PythonPackageManager, HOOK_DEP};
 pub use edit::{
-    add_hook_dependency, remove_hook_dependency, ManifestKind, PthEditResult, PthStatus,
+    add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
+    PthEditResult, PthStatus,
 };

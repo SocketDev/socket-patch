@@ -190,6 +190,76 @@ mod tests {
         }
     }
 
+    /// Regression: `list_dir_entries` must hit the `read_dir` Err arm
+    /// when handed a path that is a regular file (not a directory) and
+    /// return an empty vec rather than panic. Crawlers routinely probe
+    /// candidate paths that may turn out to be files (e.g. a stray
+    /// `node_modules` that is actually a file), and rely on this
+    /// fail-soft behavior.
+    #[tokio::test]
+    async fn list_dir_entries_on_a_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not_a_dir");
+        tokio::fs::write(&file, b"x").await.unwrap();
+        let entries = list_dir_entries(&file).await;
+        assert!(
+            entries.is_empty(),
+            "read_dir on a regular file must yield no entries"
+        );
+    }
+
+    /// Regression: `entry_is_dir` must resolve a *chain* of symlinks,
+    /// not just a single hop. `link_a -> link_b -> real_dir` has to
+    /// report `true`; otherwise a crawler walking through indirection
+    /// (common in pnpm/virtualenv layouts) would silently skip the
+    /// package directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entry_is_dir_follows_symlink_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real_dir");
+        tokio::fs::create_dir(&real_dir).await.unwrap();
+        let link_b = tmp.path().join("link_b");
+        tokio::fs::symlink(&real_dir, &link_b).await.unwrap();
+        // link_a points at link_b, which points at real_dir.
+        tokio::fs::symlink(&link_b, tmp.path().join("link_a"))
+            .await
+            .unwrap();
+
+        let link = list_dir_entries(tmp.path())
+            .await
+            .into_iter()
+            .find(|e| e.file_name().to_string_lossy() == "link_a")
+            .expect("chained symlink entry present");
+        assert!(
+            entry_is_dir(&link).await,
+            "a chain of symlinks ending at a directory must resolve to is_dir = true"
+        );
+    }
+
+    /// `entry_file_type` reports the plain kinds (dir / file) faithfully
+    /// when no symlink is involved — it only diverges from
+    /// `entry_is_dir` on links.
+    #[tokio::test]
+    async fn entry_file_type_reports_plain_dir_and_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(tmp.path().join("d")).await.unwrap();
+        tokio::fs::write(tmp.path().join("f"), b"x").await.unwrap();
+        for entry in list_dir_entries(tmp.path()).await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let ft = entry_file_type(&entry).await.expect("file_type available");
+            match name.as_str() {
+                "d" => {
+                    assert!(ft.is_dir() && !ft.is_symlink(), "d is a plain dir");
+                }
+                "f" => {
+                    assert!(ft.is_file() && !ft.is_symlink(), "f is a plain file");
+                }
+                other => panic!("unexpected entry: {other}"),
+            }
+        }
+    }
+
     /// `entry_file_type` is the symlink-aware counterpart: it reports
     /// the link itself (`is_symlink`), never the resolved target.
     #[cfg(unix)]

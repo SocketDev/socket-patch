@@ -103,10 +103,16 @@ pub async fn cleanup_unused_archives(
 ) -> Result<CleanupResult, std::io::Error> {
     let used_uuids: HashSet<String> = manifest.patches.values().map(|r| r.uuid.clone()).collect();
     cleanup_dir(archives_dir, dry_run, |name| {
-        // Strip the .tar.gz suffix to recover the UUID; if it doesn't
-        // end in .tar.gz, treat the entry as orphaned (not "used").
-        let uuid_part = name.strip_suffix(".tar.gz").unwrap_or(name);
-        used_uuids.contains(uuid_part)
+        // Strip the .tar.gz suffix to recover the UUID. A file that does
+        // not end in .tar.gz is never a valid archive, so it is always an
+        // orphan -- even if its bare name happens to equal a manifest UUID
+        // (e.g. a stray `<uuid>` file with no extension). Returning false
+        // here keeps that contract: only well-formed `<uuid>.tar.gz` files
+        // whose UUID is referenced are kept.
+        match name.strip_suffix(".tar.gz") {
+            Some(uuid_part) => used_uuids.contains(uuid_part),
+            None => false,
+        }
     })
     .await
 }
@@ -502,6 +508,64 @@ mod tests {
 
         assert_eq!(result.blobs_removed, 1);
         assert!(result.removed_blobs.contains(&"stray.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_removes_bare_uuid_without_extension() {
+        // Regression: a stray file whose *bare* name equals a referenced
+        // manifest UUID but lacks the `.tar.gz` extension is NOT a valid
+        // archive and must be removed as an orphan. The previous
+        // `strip_suffix(..).unwrap_or(name)` form fell back to matching the
+        // whole filename against the UUID set and incorrectly KEPT it.
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let manifest = create_test_manifest();
+        // Bare UUID, no extension -- must be treated as an orphan.
+        tokio::fs::write(archives.join(TEST_UUID), b"not an archive")
+            .await
+            .unwrap();
+        // The legitimate archive for the same UUID must survive.
+        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz")), b"keep")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_archives(&manifest, &archives, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_removed, 1);
+        assert!(result.removed_blobs.contains(&TEST_UUID.to_string()));
+        assert!(tokio::fs::metadata(archives.join(TEST_UUID)).await.is_err());
+        assert!(
+            tokio::fs::metadata(archives.join(format!("{TEST_UUID}.tar.gz")))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_archives_removes_wrong_suffix_with_uuid_stem() {
+        // A file named `<uuid>.tar.gz.bak` (or any non-`.tar.gz` suffix) does
+        // not end in `.tar.gz`, so it is an orphan regardless of its stem.
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("packages");
+        tokio::fs::create_dir_all(&archives).await.unwrap();
+
+        let manifest = create_test_manifest();
+        tokio::fs::write(archives.join(format!("{TEST_UUID}.tar.gz.bak")), b"junk")
+            .await
+            .unwrap();
+
+        let result = cleanup_unused_archives(&manifest, &archives, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_removed, 1);
+        assert!(result
+            .removed_blobs
+            .contains(&format!("{TEST_UUID}.tar.gz.bak")));
     }
 
     #[tokio::test]

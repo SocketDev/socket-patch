@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-use crate::patch::apply::{apply_file_patch, normalize_file_path};
+use crate::patch::apply::{apply_file_patch, is_safe_relative_subpath, normalize_file_path};
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
@@ -153,6 +153,28 @@ async fn update_entries(
 ) -> Result<(), SidecarError> {
     for file_name in patched {
         let normalized = normalize_file_path(file_name).to_string();
+
+        // SECURITY (fail closed): `normalized` is joined to `pkg_path` and
+        // both read (to hash) and used as a `.cargo-checksum.json` key. An
+        // escaping key (`../../etc/passwd`, an absolute path) would make us
+        // hash an arbitrary out-of-tree file and embed its digest under a
+        // bogus key in the committed checksum — an info leak that also
+        // corrupts the checksum so cargo can no longer verify the crate.
+        // The apply *write* path (`apply_file_patch`) already refuses these,
+        // but `fixup` is `pub(crate)` and reached directly via `dispatch_fixup`
+        // and tests, so the *read* path must guard itself too. Mirror apply's
+        // `InvalidData` refusal rather than silently skipping — an escaping
+        // key never names a legitimate patch target.
+        if !is_safe_relative_subpath(&normalized) {
+            return Err(SidecarError::Io {
+                path: file_name.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unsafe patch path (escapes package directory): {file_name}"),
+                ),
+            });
+        }
+
         let on_disk = pkg_path.join(&normalized);
         let hash = sha256_file(&on_disk)
             .await
@@ -459,6 +481,76 @@ mod tests {
             post["files"]["src/lib.rs"].as_str().unwrap(),
             expected_sha256(b"patched lib")
         );
+    }
+
+    /// Security regression (path escape via `..`): a poisoned patch
+    /// entry whose key walks out of the package dir must be refused —
+    /// NOT hashed and embedded under an escaping key in the committed
+    /// checksum. Before the guard, `sha256_file` read the out-of-tree
+    /// target and `update_entries` inserted `../secret.txt` into the
+    /// `files` map (info leak + checksum corruption).
+    #[tokio::test]
+    async fn refuses_dotdot_escape_path() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+
+        // A secret living OUTSIDE the package dir, reachable only via `..`.
+        let secret = d.path().join("secret.txt");
+        tokio::fs::write(&secret, b"top secret bytes").await.unwrap();
+
+        let starting = serde_json::json!({
+            "files": { "Cargo.toml": "ff".repeat(32) },
+            "package": "x",
+        });
+        let checksum = pkg.join(CHECKSUM_FILE);
+        let original = serde_json::to_string_pretty(&starting).unwrap();
+        tokio::fs::write(&checksum, &original).await.unwrap();
+
+        let err = fixup(&pkg, &["../secret.txt".to_string()])
+            .await
+            .unwrap_err();
+        match err {
+            SidecarError::Io { path, source } => {
+                assert!(path.contains("secret.txt"), "error must name the bad key");
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected InvalidData Io error, got {other:?}"),
+        }
+
+        // The checksum file must be untouched — no escaping key, no leaked
+        // hash of the secret.
+        let after = tokio::fs::read_to_string(&checksum).await.unwrap();
+        assert_eq!(after, original, "checksum must not be rewritten on refusal");
+        assert!(
+            !after.contains(&expected_sha256(b"top secret bytes")),
+            "the out-of-tree secret's hash must never be embedded"
+        );
+    }
+
+    /// Security regression (absolute-path escape): `Path::join` discards
+    /// the base when the key is absolute, so an absolute key would hash
+    /// an arbitrary system file. Must be refused exactly like `..`.
+    #[tokio::test]
+    async fn refuses_absolute_escape_path() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        let starting = serde_json::json!({
+            "files": { "Cargo.toml": "ff".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(CHECKSUM_FILE),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = fixup(pkg, &["/etc/hosts".to_string()]).await.unwrap_err();
+        assert!(matches!(
+            err,
+            SidecarError::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     /// Atomicity hygiene: the stage+rename commit must leave no

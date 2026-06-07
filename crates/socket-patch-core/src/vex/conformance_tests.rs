@@ -362,6 +362,21 @@ fn document_timestamp_is_rfc3339_z_form() {
     assert_eq!(&doc.timestamp[10..11], "T");
     assert_eq!(&doc.timestamp[13..14], ":");
     assert_eq!(&doc.timestamp[16..17], ":");
+    // Separators alone are not enough — a regression that emitted
+    // `20X4-..` with correct punctuation would slip through. Assert the
+    // numeric fields actually parse into plausible calendar ranges.
+    let year: u32 = doc.timestamp[0..4].parse().expect("year digits");
+    let month: u32 = doc.timestamp[5..7].parse().expect("month digits");
+    let day: u32 = doc.timestamp[8..10].parse().expect("day digits");
+    let hour: u32 = doc.timestamp[11..13].parse().expect("hour digits");
+    let minute: u32 = doc.timestamp[14..16].parse().expect("minute digits");
+    let second: u32 = doc.timestamp[17..19].parse().expect("second digits");
+    assert!((1970..3000).contains(&year), "year out of range: {year}");
+    assert!((1..=12).contains(&month), "month out of range: {month}");
+    assert!((1..=31).contains(&day), "day out of range: {day}");
+    assert!(hour < 24, "hour out of range: {hour}");
+    assert!(minute < 60, "minute out of range: {minute}");
+    assert!(second < 60, "second out of range: {second}");
 }
 
 // ── 8. Document revision counter ────────────────────────────────
@@ -372,6 +387,22 @@ fn newly_built_document_starts_at_version_1() {
     // each update to the document."
     let doc = sample_doc();
     assert_eq!(doc.version, 1);
+}
+
+#[test]
+fn document_version_serializes_as_a_json_number_not_string() {
+    // Regression: the struct field is `u32`, but a future `#[serde]`
+    // attribute (or a switch to `String`) could emit `"version": "1"`.
+    // OpenVEX validators (vexctl/Grype) require an integer here, so pin
+    // the JSON *type* — `doc.version == 1` (test above) can't catch a
+    // numeric-string drift since serde would still round-trip it.
+    let v = serde_json::to_value(sample_doc()).unwrap();
+    assert!(
+        v["version"].is_u64(),
+        "version must serialize as a JSON number, got {:?}",
+        v["version"]
+    );
+    assert_eq!(v["version"].as_u64(), Some(1));
 }
 
 // ── 9. Full round-trip with every optional field populated ──────
@@ -619,4 +650,55 @@ fn statement_level_id_renders_under_at_sign() {
     let obj = v.as_object().unwrap();
     assert!(!obj.contains_key("@id"), "absent statement id must omit @id");
     assert!(!obj.contains_key("id"));
+}
+
+// ── 17. One statement per vulnerability id (grouping invariant) ──
+
+#[test]
+fn no_two_statements_share_a_vulnerability_name() {
+    // The builder's transpose groups by vuln id, so a well-formed doc
+    // never emits two statements for the same vulnerability — merging
+    // collapses them into one (with all PURLs as subcomponents). Pin
+    // that at the document layer: `sample_doc` carries two *distinct*
+    // vulns (GHSA-aaaa / GHSA-bbbb) and `merged_doc` collapses a shared
+    // one (GHSA-shared) to a single statement. A grouping regression
+    // (e.g. keying on purl+vuln instead of vuln) would surface as a
+    // duplicate name here.
+    for doc in [sample_doc(), merged_doc()] {
+        let mut seen = std::collections::HashSet::new();
+        for st in &doc.statements {
+            assert!(
+                seen.insert(st.vulnerability.name.clone()),
+                "duplicate vulnerability name {:?} across statements",
+                st.vulnerability.name
+            );
+        }
+    }
+    // Non-vacuity: the two fixtures exercise both the multi-statement
+    // (distinct vulns) and the single-merged-statement shapes.
+    assert_eq!(sample_doc().statements.len(), 2);
+    assert_eq!(merged_doc().statements.len(), 1);
+}
+
+// ── 18. Fixtures stay non-vacuous (guards the tests above) ──────
+
+#[test]
+fn fixtures_carry_subcomponents_so_at_id_walks_have_teeth() {
+    // Several tests above (#2 `@`-prefix walk, #6 non-emptiness) only
+    // reach the subcomponent assertions when the fixture actually
+    // produces subcomponents. If a future fixture edit dropped them,
+    // those tests would pass vacuously. Pin the precondition directly.
+    for st in &sample_doc().statements {
+        for p in &st.products {
+            assert!(
+                !p.subcomponents.is_empty(),
+                "sample_doc product must carry >=1 subcomponent"
+            );
+        }
+    }
+    let merged = merged_doc();
+    assert!(
+        merged.statements[0].products[0].subcomponents.len() >= 2,
+        "merged_doc must produce a product with >=2 subcomponents"
+    );
 }

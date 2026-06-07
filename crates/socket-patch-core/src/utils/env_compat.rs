@@ -89,7 +89,14 @@ pub const LEGACY_ENV_RENAMES: &[(&str, &str)] = &[
 /// The warning fires unconditionally — even under `--silent` / `--json`
 /// — so the transition signal isn't swallowed in CI logs.
 pub fn promote_legacy_env_vars() {
-    for (new_name, legacy_name) in LEGACY_ENV_RENAMES {
+    promote_renames(LEGACY_ENV_RENAMES);
+}
+
+/// Core of [`promote_legacy_env_vars`], parameterized over the rename table so
+/// it can be exercised in tests with isolated env-var names (the real names are
+/// read concurrently by other tests in this binary).
+fn promote_renames(renames: &[(&'static str, &'static str)]) {
+    for &(new_name, legacy_name) in renames {
         let new_already_set = std::env::var(new_name)
             .ok()
             .filter(|v| !v.is_empty())
@@ -195,6 +202,61 @@ mod tests {
         std::env::set_var(LEGACY, "");
         assert_eq!(read_env_with_legacy(NEW, LEGACY), None);
         std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    /// `promote_renames` copies a set legacy value over to the unset new name,
+    /// so downstream readers (clap `env =`, core code) only need the new name.
+    #[test]
+    fn promote_copies_legacy_to_new_when_new_unset() {
+        const NEW: &str = "SOCKET_TEST_PROMOTE_COPY_NEW";
+        const LEGACY: &str = "SOCKET_TEST_PROMOTE_COPY_NEW_PATCH";
+        std::env::remove_var(NEW);
+        std::env::set_var(LEGACY, "legacy-value");
+        promote_renames(&[(NEW, LEGACY)]);
+        assert_eq!(std::env::var(NEW).ok().as_deref(), Some("legacy-value"));
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    /// A non-empty new value must win: promote must not clobber it with the
+    /// legacy value.
+    #[test]
+    fn promote_does_not_clobber_existing_new() {
+        const NEW: &str = "SOCKET_TEST_PROMOTE_KEEP_NEW";
+        const LEGACY: &str = "SOCKET_TEST_PROMOTE_KEEP_NEW_PATCH";
+        std::env::set_var(NEW, "new-value");
+        std::env::set_var(LEGACY, "legacy-value");
+        promote_renames(&[(NEW, LEGACY)]);
+        assert_eq!(std::env::var(NEW).ok().as_deref(), Some("new-value"));
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    /// An empty new value counts as unset, so the legacy value is promoted in
+    /// over it — mirroring `read_env_with_legacy`'s empty-is-unset rule.
+    #[test]
+    fn promote_treats_empty_new_as_unset() {
+        const NEW: &str = "SOCKET_TEST_PROMOTE_EMPTY_NEW";
+        const LEGACY: &str = "SOCKET_TEST_PROMOTE_EMPTY_NEW_PATCH";
+        std::env::set_var(NEW, "");
+        std::env::set_var(LEGACY, "legacy-value");
+        promote_renames(&[(NEW, LEGACY)]);
+        assert_eq!(std::env::var(NEW).ok().as_deref(), Some("legacy-value"));
+        std::env::remove_var(NEW);
+        std::env::remove_var(LEGACY);
+    }
+
+    /// An empty legacy value is not promoted (empty == unset on the legacy
+    /// side too), leaving the new name untouched.
+    #[test]
+    fn promote_ignores_empty_legacy() {
+        const NEW: &str = "SOCKET_TEST_PROMOTE_EMPTY_LEGACY_NEW";
+        const LEGACY: &str = "SOCKET_TEST_PROMOTE_EMPTY_LEGACY_NEW_PATCH";
+        std::env::remove_var(NEW);
+        std::env::set_var(LEGACY, "");
+        promote_renames(&[(NEW, LEGACY)]);
+        assert_eq!(std::env::var(NEW).ok(), None);
         std::env::remove_var(LEGACY);
     }
 }

@@ -262,6 +262,37 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_preserves_user_gems_added_below_the_block() {
+        // Real-world flow: setup appends the block, then the user adds more
+        // gems AFTER it. `remove` must excise exactly our "\n<block>" and leave
+        // the user's later additions intact with clean formatting — never strip
+        // a user line or glue two lines together.
+        let added = gemfile_add(GEMFILE).unwrap();
+        let user_edited = format!("{added}gem 'extra', '2.0'\n");
+        assert!(is_plugin_directive_present(&user_edited));
+        assert_eq!(
+            gemfile_remove(&user_edited).unwrap(),
+            format!("{GEMFILE}gem 'extra', '2.0'\n"),
+            "only our block is removed; the user's later gems survive verbatim"
+        );
+    }
+
+    #[test]
+    fn test_round_trips_crlf_content_byte_for_byte() {
+        // A Windows-authored Gemfile uses CRLF line endings. add appends an
+        // LF-delimited block; remove must still restore the original CRLF bytes
+        // exactly (the separator/block we strip is our own LF, not the user's).
+        let crlf = "source 'https://rubygems.org'\r\ngem 'colorize', '1.1.0'\r\n";
+        let added = gemfile_add(crlf).unwrap();
+        assert!(is_plugin_directive_present(&added));
+        assert_eq!(
+            gemfile_remove(&added).unwrap(),
+            crlf,
+            "CRLF user content restored byte-for-byte"
+        );
+    }
+
+    #[test]
     fn test_closing_marker_alone_is_not_detected_as_present() {
         // The "<<<" closing line must not satisfy the ">>>" opening marker.
         let closing_only = "gem 'x'\n# <<< socket-patch:managed <<<\n";

@@ -544,6 +544,33 @@ mod tests {
         );
     }
 
+    /// Every enabled ecosystem must have a *unique* `cli_name`: the
+    /// `--ecosystems` flag parses these tokens, so two ecosystems sharing
+    /// one token would make the flag ambiguous and silently route or drop
+    /// packages. A copy-paste in the `cli_name` match arm is exactly the
+    /// kind of regression this guards.
+    #[test]
+    fn test_all_cli_names_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for eco in Ecosystem::all() {
+            assert!(
+                seen.insert(eco.cli_name()),
+                "duplicate cli_name {:?}",
+                eco.cli_name()
+            );
+        }
+    }
+
+    /// `all()` is a hand-maintained list parallel to the enum; an accidental
+    /// duplicate entry would inflate counts and double-crawl. Pin uniqueness.
+    #[test]
+    fn test_all_has_no_duplicate_variants() {
+        let mut seen = std::collections::HashSet::new();
+        for eco in Ecosystem::all() {
+            assert!(seen.insert(*eco), "duplicate variant {:?} in all()", eco);
+        }
+    }
+
     /// The documented default batch size is 100. A regression to 0 would
     /// reintroduce the batch-size-0 division/panic class of bug seen in
     /// the scan path, so pin the contract here at the source of truth.

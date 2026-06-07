@@ -6,6 +6,57 @@ use super::detect::{
     PackageManager,
 };
 
+/// Atomically write `content` to `path`.
+///
+/// A bare `fs::write` truncates the target before writing, so a crash, power
+/// loss, or interrupted process mid-write would leave the user's
+/// `package.json` truncated or empty — destroying the file we only meant to
+/// append two scripts to. Instead we write to a sibling stage file, fsync it,
+/// then rename over the target (rename is atomic on the same filesystem) so the
+/// reader ever sees either the old bytes or the complete new bytes. Mirrors the
+/// hardened writer in `manifest/operations.rs`.
+async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "package.json".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
 pub struct UpdateResult {
@@ -76,7 +127,7 @@ pub async fn update_package_json(
             }
 
             if !dry_run {
-                if let Err(e) = fs::write(package_json_path, &new_content).await {
+                if let Err(e) = atomic_write(package_json_path, &new_content).await {
                     return UpdateResult {
                         path: path_str,
                         status: UpdateStatus::Error,
@@ -171,7 +222,7 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
             }
 
             if !dry_run {
-                if let Err(e) = fs::write(package_json_path, &new_content).await {
+                if let Err(e) = atomic_write(package_json_path, &new_content).await {
                     return RemoveResult {
                         path: path_str,
                         status: RemoveStatus::Error,
@@ -443,6 +494,72 @@ mod tests {
         assert!(result.new_script.contains("socket-patch apply"));
         assert!(result.new_script.contains("echo hi"));
         assert_eq!(fs::read_to_string(&pkg).await.unwrap(), original);
+    }
+
+    /// After a successful (non-dry-run) write the staged temp file must be
+    /// renamed into place, never left behind. A leaked `.socket-stage-*`
+    /// sibling would signal the atomic write didn't complete its rename.
+    async fn count_stage_litter(dir: &Path) -> usize {
+        let mut rd = fs::read_dir(dir).await.unwrap();
+        let mut n = 0;
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".socket-stage-")
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn test_update_atomic_write_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+        assert_eq!(result.status, UpdateStatus::Updated);
+        // The write must have gone through stage+rename and cleaned up.
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+        // And produced valid, fully-written JSON (not a truncated stage).
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed["scripts"]["postinstall"].is_string());
+        assert!(parsed["scripts"]["dependencies"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_remove_atomic_write_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        update_package_json(&pkg, false, PackageManager::Npm).await;
+
+        let result = remove_package_json(&pkg, false).await;
+        assert_eq!(result.status, RemoveStatus::Removed);
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+        assert!(!content.contains("socket-patch"));
+    }
+
+    /// A dry-run must never create a stage file either — it does no I/O at all.
+    #[tokio::test]
+    async fn test_update_dry_run_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(&pkg, r#"{"name":"x","scripts":{"build":"tsc"}}"#)
+            .await
+            .unwrap();
+        update_package_json(&pkg, true, PackageManager::Npm).await;
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
     }
 
     // ── remove_package_json ─────────────────────────────────────────

@@ -789,4 +789,89 @@ mod tests {
         assert_eq!(v["events"][0]["details"]["tier"], "free");
         assert_eq!(v["events"][0]["details"]["vulns"], serde_json::json!([1, 2]));
     }
+
+    #[test]
+    fn failed_event_serializes_error_not_reason() {
+        // `with_error` is exercised by several tests, but they all assert
+        // only `status`/`summary` — none ever inspected the serialized
+        // event. Per CLI_CONTRACT.md a `failed` event carries `errorCode`
+        // + `error`; the human `reason` field is reserved for `skipped`.
+        // Pin both halves so a builder that mis-routed the message into
+        // `reason` (or dropped the routing tag) can't slip through.
+        let event = PatchEvent::new(PatchAction::Failed, "pkg:npm/bar@2.0.0")
+            .with_error("apply_failed", "hash mismatch after write");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["action"], "failed");
+        assert_eq!(obj["errorCode"], "apply_failed");
+        assert_eq!(obj["error"], "hash mismatch after write");
+        // The Failed path must NOT populate `reason` — that key is the
+        // skipped/human channel and a consumer routing on its presence
+        // would misclassify the event.
+        assert!(!obj.contains_key("reason"));
+    }
+
+    #[test]
+    fn skipped_reason_does_not_leak_into_error_field() {
+        // Mirror of the above for `with_reason`: it sets `errorCode` +
+        // `reason` and must leave `error` unset, so a skip is never
+        // mistaken for a hard failure by a consumer keying on `error`.
+        let event = PatchEvent::new(PatchAction::Skipped, "pkg:npm/foo@1.0.0")
+            .with_reason("already_patched", "Files match afterHash");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["errorCode"], "already_patched");
+        assert_eq!(obj["reason"], "Files match afterHash");
+        assert!(!obj.contains_key("error"));
+    }
+
+    #[test]
+    fn every_command_serializes_to_its_contract_tag() {
+        // `empty_envelope_has_stable_shape`/`special_statuses_*` only ever
+        // serialized `scan`/`remove`/`get`. Pin the full `Command`
+        // vocabulary (lowercase, no separators) so a renamed or reordered
+        // `rename_all` arm can't silently change what `command` a
+        // consumer routes on.
+        for (command, tag) in [
+            (Command::Apply, "apply"),
+            (Command::Rollback, "rollback"),
+            (Command::Get, "get"),
+            (Command::Scan, "scan"),
+            (Command::List, "list"),
+            (Command::Remove, "remove"),
+            (Command::Repair, "repair"),
+            (Command::Setup, "setup"),
+            (Command::Unlock, "unlock"),
+            (Command::Vex, "vex"),
+        ] {
+            let serialized = serde_json::to_string(&command).unwrap();
+            assert_eq!(serialized, format!("\"{tag}\""), "Command::{command:?}");
+        }
+    }
+
+    #[test]
+    fn recording_failed_overrides_success_like_status() {
+        // The exit-code contract treats any `failed` event as exit 1
+        // ("Exit 1 when status is partialFailure (any events[*].action ==
+        // \"failed\")"). `record` enforces that by escalating every
+        // non-Error status — including the success-like specials
+        // (`notFound`, `noManifest`, `paidRequired`) — to PartialFailure.
+        // Only a hard `Error` outranks it. Pin that so the auto-escalation
+        // can't regress to leaving a `failed` event under an exit-0 status.
+        for start in [Status::NotFound, Status::NoManifest, Status::PaidRequired] {
+            let mut env = Envelope::new(Command::Remove);
+            env.status = start;
+            env.record(
+                PatchEvent::new(PatchAction::Failed, "pkg:npm/bar@2.0.0")
+                    .with_error("rollback_failed", "boom"),
+            );
+            assert_eq!(
+                env.status,
+                Status::PartialFailure,
+                "{start:?} + failed event must escalate to partialFailure"
+            );
+        }
+    }
 }

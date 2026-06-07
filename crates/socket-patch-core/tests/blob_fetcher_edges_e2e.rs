@@ -458,6 +458,270 @@ async fn fetch_missing_blobs_rejects_content_hash_mismatch_and_writes_nothing() 
     );
 }
 
+/// `fetch_blob` returning `Ok(None)` (a 404 from the server) is recorded
+/// as a failure with the "not found" message, and writes no file. The
+/// closed-port tests can only reach the transport-error arm, never this
+/// "server answered, but with 404" arm.
+#[tokio::test]
+async fn fetch_missing_blobs_records_404_as_not_found() {
+    let hash = "a".repeat(64);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/blob/{hash}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+    let manifest = manifest_with_after_hashes(&[&hash]);
+    let client = proxy_client(&server.uri());
+
+    let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
+    assert_eq!(result.total, 1);
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.failed, 1);
+    assert!(result.results[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("not found"));
+    assert!(!blobs.join(&hash).exists(), "a 404 must not leave a file");
+    assert_eq!(dir_entry_count(&blobs), 0);
+}
+
+/// A manifest whose `afterHash` is uppercase hex must still be accepted
+/// when the server serves byte-for-byte correct content (whose computed
+/// git-sha256 is lowercase). Exercises the case-insensitive verification
+/// end to end — a case-sensitive comparison would wrongly reject it.
+#[tokio::test]
+async fn fetch_missing_blobs_accepts_uppercase_manifest_hash() {
+    let content = b"content addressed by an uppercase manifest hash";
+    let hash_lower = compute_git_sha256_from_bytes(content);
+    let hash_upper = hash_lower.to_ascii_uppercase();
+    assert_ne!(hash_lower, hash_upper, "fixture: hash must have hex letters");
+
+    let server = MockServer::start().await;
+    // The request path carries the manifest's (uppercase) hash verbatim.
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/blob/{hash_upper}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    std::fs::create_dir(&blobs).unwrap();
+    let manifest = manifest_with_after_hashes(&[&hash_upper]);
+    let client = proxy_client(&server.uri());
+
+    let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
+    assert_eq!(result.downloaded, 1, "uppercase-hash content must be accepted");
+    assert_eq!(result.failed, 0);
+    assert_eq!(std::fs::read(blobs.join(&hash_upper)).unwrap(), content);
+}
+
+// ── Archive (diff / package) download path ──────────────────────────
+//
+// `fetch_missing_archives_inner` (driven via `fetch_missing_sources` in
+// Diff / Package mode) is otherwise only reached on the closed-port
+// transport-error arm. These drive the success-write, 404, and
+// progress-callback arms against a mock proxy. Archives are uuid-named
+// and have no content hash, so the only integrity guarantee is the atomic
+// write — assert no staging litter survives.
+
+/// Build a manifest carrying a set of patch UUIDs (each as its own PURL).
+fn manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
+    let mut patches = HashMap::new();
+    for (i, uuid) in uuids.iter().enumerate() {
+        patches.insert(
+            format!("pkg:npm/test-{i}@1.0.0"),
+            PatchRecord {
+                uuid: (*uuid).to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: "test".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+    }
+    PatchManifest { patches, setup: None }
+}
+
+#[tokio::test]
+async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let archive_bytes = b"\x1f\x8b\x08 fake-but-opaque tar.gz payload";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/diff/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let diffs = tmp.path().join("diffs");
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir(&diffs).unwrap();
+    let sources = PatchSources {
+        blobs_path: &blobs,
+        packages_path: None,
+        diffs_path: Some(&diffs),
+    };
+    let manifest = manifest_with_uuids(&[uuid]);
+    let client = proxy_client(&server.uri());
+
+    let result =
+        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
+    assert_eq!(result.total, 1);
+    assert_eq!(result.downloaded, 1, "diff archive must be downloaded");
+    assert_eq!(result.failed, 0);
+    // The result's `hash` field carries the UUID for archive modes.
+    assert_eq!(result.results[0].hash, uuid);
+    // Written under `<uuid>.tar.gz`, byte-for-byte, with no staging litter.
+    assert_eq!(
+        std::fs::read(diffs.join(format!("{uuid}.tar.gz"))).unwrap(),
+        archive_bytes
+    );
+    let names: Vec<String> = std::fs::read_dir(&diffs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![format!("{uuid}.tar.gz")], "no temp files: {names:?}");
+    // A re-run finds the archive present and short-circuits (no second GET;
+    // the mock's `.expect(1)` would trip on a second request).
+    let again =
+        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
+    assert_eq!(again.total, 0, "already-present archive → nothing to do");
+}
+
+#[tokio::test]
+async fn fetch_missing_sources_package_downloads_via_package_endpoint() {
+    // Distinct from the diff test: Package mode must hit `/patch/package/`
+    // and write into the packages dir, proving the kind→endpoint→dir wiring
+    // isn't crossed.
+    let uuid = "22222222-2222-4222-8222-222222222222";
+    let archive_bytes = b"package archive bytes";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/package/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let packages = tmp.path().join("packages");
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir(&packages).unwrap();
+    let sources = PatchSources {
+        blobs_path: &blobs,
+        packages_path: Some(&packages),
+        diffs_path: None,
+    };
+    let manifest = manifest_with_uuids(&[uuid]);
+    let client = proxy_client(&server.uri());
+
+    let result =
+        fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
+    assert_eq!(result.downloaded, 1);
+    assert_eq!(result.failed, 0);
+    assert_eq!(
+        std::fs::read(packages.join(format!("{uuid}.tar.gz"))).unwrap(),
+        archive_bytes
+    );
+}
+
+#[tokio::test]
+async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
+    let uuid = "33333333-3333-4333-8333-333333333333";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/diff/{uuid}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let diffs = tmp.path().join("diffs");
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir(&diffs).unwrap();
+    let sources = PatchSources {
+        blobs_path: &blobs,
+        packages_path: None,
+        diffs_path: Some(&diffs),
+    };
+    let manifest = manifest_with_uuids(&[uuid]);
+    let client = proxy_client(&server.uri());
+
+    let result =
+        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
+    assert_eq!(result.total, 1);
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.failed, 1);
+    let err = result.results[0].error.as_deref().unwrap();
+    assert!(err.contains("Diff"), "message should name the kind: {err}");
+    assert!(err.contains("not found"), "message should say not found: {err}");
+    // Nothing written for a 404.
+    assert_eq!(dir_entry_count(&diffs), 0);
+}
+
+/// The progress callback fires once per downloaded archive with a 1-based
+/// index and the correct total.
+#[tokio::test]
+async fn fetch_missing_sources_diff_invokes_progress_callback() {
+    use std::sync::Mutex;
+    let uuid = "44444444-4444-4444-8444-444444444444";
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/diff/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blobs = tmp.path().join("blobs");
+    let diffs = tmp.path().join("diffs");
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir(&diffs).unwrap();
+    let sources = PatchSources {
+        blobs_path: &blobs,
+        packages_path: None,
+        diffs_path: Some(&diffs),
+    };
+    let manifest = manifest_with_uuids(&[uuid]);
+    let client = proxy_client(&server.uri());
+
+    let calls: std::sync::Arc<Mutex<Vec<(String, usize, usize)>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let calls_cb = calls.clone();
+    let cb: socket_patch_core::api::blob_fetcher::OnProgress =
+        Box::new(move |h: &str, idx: usize, total: usize| {
+            calls_cb.lock().unwrap().push((h.to_string(), idx, total));
+        });
+
+    let _ =
+        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, Some(&cb)).await;
+
+    let recorded = calls.lock().unwrap().clone();
+    assert_eq!(recorded, vec![(uuid.to_string(), 1, 1)]);
+}
+
 /// `get_missing_blobs` against a manifest that lists no patches
 /// returns the empty set. Covers the early-return inside the
 /// function — the existing apply tests always stage at least one

@@ -18,6 +18,58 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, spec_is_hook, HOOK_DEP};
 
+/// Atomically write `content` to `path`.
+///
+/// A bare `fs::write` truncates the target before writing, so a crash, power
+/// loss, or interrupted process mid-write would leave the user's hand-authored
+/// `pyproject.toml` / `requirements.txt` (with its comments, formatting, and
+/// other dependencies) truncated or empty — destroying the file we only meant
+/// to add one dependency line to. Instead we write to a sibling stage file,
+/// fsync it, then rename over the target (rename is atomic on the same
+/// filesystem) so a reader ever sees either the old bytes or the complete new
+/// bytes. Mirrors the hardened writer in `package_json::update`.
+async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "manifest".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Which manifest format a path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestKind {
@@ -84,7 +136,7 @@ pub async fn add_hook_dependency(path: &Path, kind: ManifestKind, dry_run: bool)
         Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
         Ok(Some(new_content)) => {
             if !dry_run {
-                if let Err(e) = fs::write(path, &new_content).await {
+                if let Err(e) = atomic_write(path, &new_content).await {
                     return PthEditResult::err(path, kind, e.to_string());
                 }
             }
@@ -119,7 +171,7 @@ pub async fn remove_hook_dependency(
         Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
         Ok(Some(new_content)) => {
             if !dry_run {
-                if let Err(e) = fs::write(path, &new_content).await {
+                if let Err(e) = atomic_write(path, &new_content).await {
                     return PthEditResult::err(path, kind, e.to_string());
                 }
             }
@@ -372,6 +424,64 @@ fn item_has_hook_extra(item: &Item) -> bool {
         .unwrap_or(false)
 }
 
+/// True if a parsed `pyproject.toml` already declares the hook dependency in any
+/// form `setup` could have written: a PEP 621 `[project].dependencies` entry, a
+/// classic-Poetry `socket-patch` dep carrying the `hook` extra, or a legacy bare
+/// `socket-patch-hook` key.
+///
+/// This is the structural counterpart to the textual
+/// [`super::detect::deps_contain_hook`]. It exists because `poetry_add` writes
+/// the hook as `socket-patch = { version = "*", extras = ["hook"] }`, which has
+/// no literal `socket-patch[hook]` substring — so the textual probe reports a
+/// freshly-and-correctly-configured classic-Poetry project as *unconfigured*.
+/// The `setup --check` / state probes must use this for `pyproject.toml` so a
+/// round-trip (setup → check) is consistent. Falls back to the textual check on
+/// unparseable TOML (best effort rather than a hard failure).
+pub fn pyproject_contains_hook(content: &str) -> bool {
+    let doc = match content.parse::<DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return deps_contain_hook(content),
+    };
+
+    // PEP 621 `[project].dependencies` (the textual `socket-patch[hook]` spec,
+    // or the bare `socket-patch-hook` wheel).
+    let in_pep621 = doc
+        .get("project")
+        .and_then(Item::as_table)
+        .and_then(|p| p.get("dependencies"))
+        .and_then(Item::as_array)
+        .map(|deps| {
+            deps.iter()
+                .any(|v| v.as_str().map(spec_is_hook).unwrap_or(false))
+        })
+        .unwrap_or(false);
+    if in_pep621 {
+        return true;
+    }
+
+    // Classic Poetry `[tool.poetry.dependencies]`: a bare `socket-patch-hook`
+    // key, or a `socket-patch` dep carrying the `hook` extra.
+    if let Some(deps) = doc
+        .get("tool")
+        .and_then(Item::as_table)
+        .and_then(|t| t.get("poetry"))
+        .and_then(Item::as_table)
+        .and_then(|p| p.get("dependencies"))
+        .and_then(Item::as_table)
+    {
+        if deps.contains_key("socket-patch-hook") {
+            return true;
+        }
+        if let Some(item) = deps.get("socket-patch") {
+            if item_has_hook_extra(item) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +698,157 @@ mod tests {
         let res = add_hook_dependency(&req, ManifestKind::Requirements, true).await;
         assert_eq!(res.status, PthStatus::Updated);
         assert!(!req.exists(), "dry-run must not create the file");
+    }
+
+    // ── atomic-write contract (no truncation / no stage litter) ──────
+    //
+    // The edit must go through stage+fsync+rename, never a bare truncating
+    // write, so a crash can't leave the user's hand-authored manifest empty.
+    // A leaked `.socket-stage-*` sibling would mean the rename didn't complete.
+
+    async fn count_stage_litter(dir: &Path) -> usize {
+        let mut rd = tokio::fs::read_dir(dir).await.unwrap();
+        let mut n = 0;
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".socket-stage-")
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn test_add_pyproject_atomic_no_litter_and_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("pyproject.toml");
+        let original = "[build-system]\nrequires = [\"setuptools\"]\n\n[project]\nname = \"x\"\ndependencies = [\"requests\"]\n";
+        tokio::fs::write(&py, original).await.unwrap();
+
+        let res = add_hook_dependency(&py, ManifestKind::Pyproject, false).await;
+        assert_eq!(res.status, PthStatus::Updated);
+
+        // No half-written stage file left behind.
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+        // The file is fully written, valid TOML, and preserved prior content.
+        let body = tokio::fs::read_to_string(&py).await.unwrap();
+        let doc = body.parse::<DocumentMut>().unwrap();
+        assert!(body.contains("[build-system]"));
+        let deps = doc["project"]["dependencies"].as_array().unwrap();
+        assert!(deps.iter().any(|v| v.as_str() == Some("requests")));
+        assert!(deps.iter().any(|v| v.as_str() == Some("socket-patch[hook]")));
+    }
+
+    #[tokio::test]
+    async fn test_remove_requirements_atomic_no_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = dir.path().join("requirements.txt");
+        tokio::fs::write(&req, "requests\nsocket-patch[hook]\n")
+            .await
+            .unwrap();
+
+        let res = remove_hook_dependency(&req, ManifestKind::Requirements, false).await;
+        assert_eq!(res.status, PthStatus::Updated);
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+        assert_eq!(
+            tokio::fs::read_to_string(&req).await.unwrap(),
+            "requests\n"
+        );
+    }
+
+    // ── structural hook detection (pyproject_contains_hook) ──────────
+    //
+    // The `setup --check` probe must agree with what `setup` wrote. The classic
+    // Poetry form has no `socket-patch[hook]` substring, so the textual probe
+    // alone mis-reports a configured project as needing configuration.
+
+    #[test]
+    fn test_pyproject_contains_hook_poetry_form_roundtrips() {
+        // Regression: poetry_add writes the structural `extras = ["hook"]` form;
+        // the textual probe can't see it, but the structural one must.
+        let toml = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\npython = \"^3.9\"\n";
+        let out = pyproject_add(toml).unwrap().unwrap();
+        assert!(
+            pyproject_contains_hook(&out),
+            "structural probe must see the poetry extras form:\n{out}"
+        );
+        // This is precisely why the structural probe is needed: the textual one
+        // (used for requirements.txt) cannot detect the poetry form.
+        assert!(
+            !deps_contain_hook(&out),
+            "textual probe is (by design) blind to the poetry form; if this \
+             ever becomes true the structural probe may be redundant:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_pyproject_contains_hook_pep621_and_wheel() {
+        // PEP 621 array, extra spelling.
+        assert!(pyproject_contains_hook(
+            "[project]\ndependencies = [\"requests\", \"socket-patch[hook]>=3.3.0\"]\n"
+        ));
+        // PEP 621 array, bare wheel spelling.
+        assert!(pyproject_contains_hook(
+            "[project]\ndependencies = [\"socket-patch-hook\"]\n"
+        ));
+        // Poetry bare-wheel key.
+        assert!(pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket-patch-hook = \"*\"\n"
+        ));
+    }
+
+    #[test]
+    fn test_pyproject_contains_hook_negative() {
+        // A plain socket-patch dep (CLI only, no hook) is NOT the hook — in
+        // either surface.
+        assert!(!pyproject_contains_hook(
+            "[project]\ndependencies = [\"socket-patch>=3.3.0\"]\n"
+        ));
+        assert!(!pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket-patch = \"^3.3.0\"\n"
+        ));
+        // A socket-patch dep carrying some *other* extra is not the hook.
+        assert!(!pyproject_contains_hook(
+            "[tool.poetry.dependencies]\nsocket-patch = {version = \"*\", extras = [\"cli\"]}\n"
+        ));
+        // Empty / unrelated.
+        assert!(!pyproject_contains_hook("[project]\nname = \"x\"\n"));
+    }
+
+    #[test]
+    fn test_pyproject_contains_hook_malformed_falls_back_to_textual() {
+        // Unparseable TOML: fall back to the textual probe rather than hard-fail.
+        assert!(pyproject_contains_hook("this = = not toml [[[ socket-patch[hook]"));
+        assert!(!pyproject_contains_hook("this = = not toml [[[ requests"));
+    }
+
+    #[test]
+    fn test_pyproject_contains_hook_after_remove_is_false() {
+        // Round-trip: add then remove → structural probe reports not-configured.
+        let toml = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\nsocket-patch = \"^3.3.0\"\n";
+        let added = pyproject_add(toml).unwrap().unwrap();
+        assert!(pyproject_contains_hook(&added));
+        let removed = pyproject_remove(&added).unwrap().unwrap();
+        assert!(
+            !pyproject_contains_hook(&removed),
+            "after remove the hook must be gone:\n{removed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_does_no_io_for_pyproject() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("pyproject.toml");
+        let original = "[project]\nname = \"x\"\ndependencies = [\"requests\"]\n";
+        tokio::fs::write(&py, original).await.unwrap();
+
+        let res = add_hook_dependency(&py, ManifestKind::Pyproject, true).await;
+        assert_eq!(res.status, PthStatus::Updated);
+        // Dry-run must neither stage nor mutate the original.
+        assert_eq!(count_stage_litter(dir.path()).await, 0);
+        assert_eq!(tokio::fs::read_to_string(&py).await.unwrap(), original);
     }
 }

@@ -750,6 +750,93 @@ mod tests {
         assert_eq!(purls, HashSet::from(["pkg:gem/rails@7.1.0"]));
     }
 
+    /// A requested version that is *longer* than what is installed must
+    /// not resolve. The prefix scan keys on `<name>-<version>-`, so a
+    /// requested `1.0.0` must reject both a plain `foo-1.0/` and a
+    /// platform `foo-1.0-x86_64-linux/` (installed version `1.0`). Guards
+    /// against a future change that compares versions bidirectionally.
+    #[tokio::test]
+    async fn find_by_purls_rejects_longer_requested_version() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(dir.path().join("foo-1.0").join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("foo-1.0-x86_64-linux").join("lib"))
+            .await
+            .unwrap();
+        let crawler = RubyCrawler::new();
+        let result = crawler
+            .find_by_purls(dir.path(), &["pkg:gem/foo@1.0.0".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            result.is_empty(),
+            "1.0.0 must not match installed 1.0 dirs: {result:?}"
+        );
+    }
+
+    /// The exact-match arm of `locate_gem_dir` must *verify gem content*,
+    /// not merely accept that `<name>-<version>/` exists on disk. When the
+    /// exact dir is present but empty (no `lib/`, no `.gemspec` — a
+    /// malformed/partial install), resolution must fall through to a valid
+    /// platform sibling rather than returning the hollow exact dir.
+    #[tokio::test]
+    async fn locate_gem_dir_skips_invalid_exact_for_valid_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        // Exact dir exists but is hollow — not a real gem.
+        tokio::fs::create_dir_all(dir.path().join("nokogiri-1.16.5"))
+            .await
+            .unwrap();
+        // Valid platform sibling.
+        let plat = dir.path().join("nokogiri-1.16.5-x86_64-linux");
+        tokio::fs::create_dir_all(plat.join("lib")).await.unwrap();
+
+        let crawler = RubyCrawler::new();
+        let result = crawler
+            .find_by_purls(dir.path(), &["pkg:gem/nokogiri@1.16.5".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("pkg:gem/nokogiri@1.16.5").unwrap().path, plat);
+    }
+
+    /// `parse_gem_env_output` is the pure parser for `gem env <key>`
+    /// stdout: empty/whitespace-only input yields `None` (gem absent or no
+    /// path), and surrounding whitespace/newlines are trimmed off a real
+    /// path so it joins cleanly with `gems/`.
+    #[test]
+    fn parse_gem_env_output_contract() {
+        assert_eq!(parse_gem_env_output(""), None);
+        assert_eq!(parse_gem_env_output("   \n\t "), None);
+        assert_eq!(
+            parse_gem_env_output("  /usr/lib/ruby/gems/3.2.0\n"),
+            Some("/usr/lib/ruby/gems/3.2.0".to_string())
+        );
+    }
+
+    /// Local mode must not walk the global gem store for a non-Ruby
+    /// project: with no `vendor/bundle/ruby/` and neither `Gemfile` nor
+    /// `Gemfile.lock` present, `get_gem_paths` returns empty (it never even
+    /// shells out to `gem env`). This pins the project-detection gate that
+    /// keeps a JS/Python checkout from being scanned as Ruby.
+    #[tokio::test]
+    async fn get_gem_paths_empty_for_non_ruby_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // A decoy non-Ruby file; no Gemfile, no vendor/bundle/ruby.
+        tokio::fs::write(dir.path().join("package.json"), b"{}")
+            .await
+            .unwrap();
+        let crawler = RubyCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+        let paths = crawler.get_gem_paths(&options).await.unwrap();
+        assert!(paths.is_empty(), "non-Ruby project must yield no gem paths: {paths:?}");
+    }
+
     /// Gem names with embedded underscores/digits and multi-dash names
     /// must keep their full name; the version starts at the first
     /// dash-then-digit boundary.

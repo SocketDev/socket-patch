@@ -1,8 +1,18 @@
-/// Strip query string qualifiers from a PURL.
+/// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
+/// leaving the canonical `pkg:type/namespace/name@version` base.
 ///
-/// e.g., `"pkg:pypi/requests@2.28.0?artifact_id=abc"` -> `"pkg:pypi/requests@2.28.0"`
+/// The PURL grammar is `pkg:type/ns/name@version?qualifiers#subpath`, so a
+/// subpath can appear *with or without* a preceding qualifier. Cutting only
+/// at `?` would let a bare `#subpath` (no qualifier) leak into the base —
+/// corrupting the version when the result is later split on `@`, and
+/// breaking the grouping/matching keys callers build from it (two PURLs for
+/// the same `name@version` differing only by subpath must collapse to one
+/// base). So we cut at whichever of `?`/`#` comes first.
+///
+/// e.g. `"pkg:pypi/requests@2.28.0?artifact_id=abc"` -> `"pkg:pypi/requests@2.28.0"`
+/// and `"pkg:golang/github.com/foo/bar@v1.0.0#cmd/tool"` -> `"pkg:golang/github.com/foo/bar@v1.0.0"`
 pub fn strip_purl_qualifiers(purl: &str) -> &str {
-    match purl.find('?') {
+    match purl.find(['?', '#']) {
         Some(idx) => &purl[..idx],
         None => purl,
     }
@@ -242,7 +252,11 @@ pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     if identifier.contains('?') {
         manifest_key == identifier
     } else {
-        strip_purl_qualifiers(manifest_key) == identifier
+        // Base identifier: compare bases. Strip both sides so a subpath
+        // (`#...`) carried by either the key or the identifier doesn't
+        // defeat the match — `strip_purl_qualifiers(identifier)` is a no-op
+        // for a plain base PURL, so existing behaviour is unchanged.
+        strip_purl_qualifiers(manifest_key) == strip_purl_qualifiers(identifier)
     }
 }
 
@@ -672,5 +686,77 @@ mod tests {
             "pkg:gem/nokogiri@1.16.5?platform=java",
             "pkg:gem/nokogiri@1.16.5"
         ));
+    }
+
+    // --- Regression: PURL subpath (`#...`) handling -------------------------
+    //
+    // The PURL grammar is `pkg:type/ns/name@version?qualifiers#subpath`. A
+    // subpath can appear *without* a preceding qualifier, so stripping only
+    // at `?` lets it leak into the base — which then corrupts the version
+    // (split on `@`) and breaks every grouping/matching key built from it.
+
+    #[test]
+    fn test_strip_subpath_without_qualifier() {
+        // No `?`, but a trailing `#subpath` must still be removed.
+        assert_eq!(
+            strip_purl_qualifiers("pkg:golang/github.com/foo/bar@v1.0.0#cmd/tool"),
+            "pkg:golang/github.com/foo/bar@v1.0.0"
+        );
+    }
+
+    #[test]
+    fn test_strip_qualifier_and_subpath_together() {
+        // Cutting at the first of `?`/`#` removes both components at once.
+        assert_eq!(
+            strip_purl_qualifiers("pkg:pypi/requests@2.28.0?artifact_id=abc#dist/info"),
+            "pkg:pypi/requests@2.28.0"
+        );
+    }
+
+    #[test]
+    fn test_parse_pypi_subpath_not_folded_into_version() {
+        // The `#dist` must not bleed into the parsed version.
+        assert_eq!(
+            parse_pypi_purl("pkg:pypi/requests@2.28.0#dist"),
+            Some(("requests", "2.28.0"))
+        );
+    }
+
+    #[cfg(feature = "golang")]
+    #[test]
+    fn test_parse_golang_subpath_stripped() {
+        // Go subpaths point at a sub-package of the same module; the parsed
+        // version must remain clean.
+        assert_eq!(
+            parse_golang_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1#middleware"),
+            Some(("github.com/gin-gonic/gin", "v1.9.1"))
+        );
+    }
+
+    #[test]
+    fn test_purl_matches_identifier_base_id_matches_subpath_bearing_key() {
+        // A manifest key carrying a subpath must still match its own base
+        // identifier — they describe the same package@version.
+        assert!(purl_matches_identifier(
+            "pkg:golang/github.com/foo/bar@v1.0.0#cmd/tool",
+            "pkg:golang/github.com/foo/bar@v1.0.0"
+        ));
+        // ...but a different version still must not match.
+        assert!(!purl_matches_identifier(
+            "pkg:golang/github.com/foo/bar@v2.0.0#cmd/tool",
+            "pkg:golang/github.com/foo/bar@v1.0.0"
+        ));
+    }
+
+    // --- Regression: name must not absorb the version separator -------------
+
+    #[test]
+    fn test_parse_multiple_at_takes_last_as_version_separator() {
+        // `rfind('@')` (not `find`) ensures the *last* `@` splits the
+        // version, so a name/path that itself contained an `@` keeps it.
+        assert_eq!(
+            parse_pypi_purl("pkg:pypi/weird@name@1.0.0"),
+            Some(("weird@name", "1.0.0"))
+        );
     }
 }

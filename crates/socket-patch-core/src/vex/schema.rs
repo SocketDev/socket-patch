@@ -736,4 +736,63 @@ mod tests {
             );
         }
     }
+
+    /// Document-level multi-word key `last_updated` must stay snake_case
+    /// too. `Document` has no `rename_all`, so this guards against a
+    /// future `rename_all = "camelCase"` slipping in (ser/de would stay
+    /// symmetric, so the round-trip tests can't catch it).
+    #[test]
+    fn document_multiword_keys_emit_in_snake_case() {
+        let mut doc = empty_doc();
+        doc.last_updated = Some("2024-02-01T00:00:00Z".to_string());
+        let v = serde_json::to_value(&doc).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("last_updated"), "missing snake_case key");
+        assert!(
+            !obj.contains_key("lastUpdated"),
+            "camelCase last_updated must never be emitted"
+        );
+    }
+
+    /// An unknown `status` literal must fail to parse even when it's
+    /// nested inside an otherwise-valid full document — not just when
+    /// the bare `Status` enum is deserialized in isolation. Pins that
+    /// the enum's strictness survives composition into `Statement`.
+    #[test]
+    fn document_with_unknown_status_literal_is_rejected() {
+        let bad = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": 1,
+            "statements": [
+              {
+                "vulnerability": {"name": "GHSA-x"},
+                "products": [{"@id": "pkg:npm/app@1.0.0"}],
+                "status": "totally_made_up"
+              }
+            ]
+        }"#;
+        let r: Result<Document, _> = serde_json::from_str(bad);
+        assert!(r.is_err(), "unknown nested status literal must fail to parse");
+    }
+
+    /// A document `version` supplied as a JSON string (`"1"`) must be
+    /// rejected — the field is `u32` and OpenVEX validators require a
+    /// JSON number. Guards against a producer/consumer drift where the
+    /// counter is quoted.
+    #[test]
+    fn document_version_as_json_string_is_rejected() {
+        let bad = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": "1",
+            "statements": []
+        }"#;
+        let r: Result<Document, _> = serde_json::from_str(bad);
+        assert!(r.is_err(), "string-typed version must fail to parse");
+    }
 }

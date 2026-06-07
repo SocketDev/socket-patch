@@ -37,8 +37,9 @@ pub enum NpmPkgManager {
     /// yarn classic — `yarn.lock` present, real `node_modules/`, no
     /// PnP loader. Behaves like npm at the FS level.
     YarnClassic,
-    /// yarn-berry with Plug'n'Play (`.pnp.cjs` present). Packages
-    /// live inside `.yarn/cache/*.zip`. Apply must refuse.
+    /// yarn-berry with Plug'n'Play (`.pnp.cjs`, `.pnp.js`, or
+    /// `.pnp.loader.mjs` present). Packages live inside
+    /// `.yarn/cache/*.zip`. Apply must refuse.
     YarnBerryPnP,
     /// bun-managed project — `bun.lock` (text, current default) or
     /// `bun.lockb` (binary, legacy) at the project root. Bun
@@ -58,7 +59,7 @@ pub enum NpmPkgManager {
 ///
 /// Precedence (first match wins):
 ///
-/// 1. `.pnp.cjs` or `.pnp.loader.mjs` → yarn-berry PnP.
+/// 1. `.pnp.cjs`, `.pnp.js`, or `.pnp.loader.mjs` → yarn-berry PnP.
 /// 2. `bun.lock` or `bun.lockb` (+ `node_modules/`) → bun.
 /// 3. `node_modules/.modules.yaml` or `node_modules/.pnpm/` → pnpm.
 /// 4. `yarn.lock` (without PnP markers) + `node_modules/` → yarn classic.
@@ -71,8 +72,17 @@ pub enum NpmPkgManager {
 /// lockfile filename disambiguates cleanly.
 pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     // 1. yarn-berry PnP — highest priority because it determines
-    //    whether the npm crawler can find anything at all.
-    if project_root.join(".pnp.cjs").is_file() || project_root.join(".pnp.loader.mjs").is_file() {
+    //    whether the npm crawler can find anything at all. Yarn 3+
+    //    emits `.pnp.cjs`; Yarn 2.x emitted `.pnp.js` (renamed to
+    //    `.cjs` in 3.0 to dodge `"type": "module"` resolution); newer
+    //    installs may also ship the ESM `.pnp.loader.mjs`. All three
+    //    mean "packages aren't on disk" — refuse rather than silently
+    //    fall through to Unknown (a Yarn 2 PnP tree has no
+    //    `node_modules/`, so it would otherwise escape the refusal).
+    if project_root.join(".pnp.cjs").is_file()
+        || project_root.join(".pnp.js").is_file()
+        || project_root.join(".pnp.loader.mjs").is_file()
+    {
         return NpmPkgManager::YarnBerryPnP;
     }
 
@@ -325,6 +335,48 @@ mod tests {
             detect_npm_pkg_manager(d.path()),
             NpmPkgManager::YarnBerryPnP
         );
+    }
+
+    /// Yarn 2.x (berry) emitted the PnP loader as `.pnp.js` — Yarn 3.0
+    /// renamed it to `.pnp.cjs`. A Yarn 2 PnP tree has no
+    /// `node_modules/` on disk, so if `.pnp.js` isn't recognized the
+    /// project escapes the safety-critical refusal and silently
+    /// classifies as Unknown. Pin the legacy marker so the refusal
+    /// fires for Yarn 2 installs too.
+    #[test]
+    fn yarn_berry_pnp_via_legacy_pnp_js() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.js"), "").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// The legacy `.pnp.js` marker must outrank bun as well — same
+    /// structural override as `.pnp.cjs`/`.pnp.loader.mjs`: packages
+    /// aren't on disk, so refuse regardless of a stray lockfile or an
+    /// installed `node_modules/`.
+    #[test]
+    fn yarn_berry_legacy_pnp_js_priority_over_bun() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".pnp.js"), "").unwrap();
+        std::fs::write(d.path().join("bun.lock"), "").unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager(d.path()),
+            NpmPkgManager::YarnBerryPnP
+        );
+    }
+
+    /// Robustness: `.pnp.js` as a *directory* (not a regular file) must
+    /// not trip the PnP branch — the check is `.is_file()`. With no
+    /// other markers it falls through to Unknown.
+    #[test]
+    fn pnp_js_as_dir_does_not_trigger_pnp() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".pnp.js")).unwrap();
+        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
     }
 
     /// Layout assumption: detection is *install*-based, not

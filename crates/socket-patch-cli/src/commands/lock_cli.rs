@@ -104,7 +104,14 @@ pub fn acquire_or_emit(
         match acquire(socket_dir, Duration::ZERO) {
             Ok(guard) => drop(guard),
             Err(LockError::Held) => {
-                let msg = held_message(timeout);
+                // The probe above is a *non-blocking* try-once
+                // (`Duration::ZERO`), so report a zero wait. Threading
+                // the caller's `timeout` here would claim a "(waited …)"
+                // that never happened — the probe refuses a live holder
+                // immediately, it does not wait out the budget first.
+                // `break_probe_held_message` takes no timeout precisely so
+                // the wrong value can't be passed back in.
+                let msg = break_probe_held_message();
                 emit(command, json, silent, dry_run, "lock_held", &msg, Some(socket_dir));
                 return Err(1);
             }
@@ -190,6 +197,16 @@ pub fn lock_broken_event(socket_dir: &Path) -> PatchEvent {
 /// don't drift on the action / errorCode pair.
 pub fn record_lock_broken(env: &mut Envelope, socket_dir: &Path) {
     env.record(lock_broken_event(socket_dir));
+}
+
+/// Contention message for the `--break-lock` pre-acquire probe. That
+/// probe is hard-wired to a non-blocking try-once (`Duration::ZERO`), so
+/// the message must never claim a wait, regardless of the caller's
+/// `--lock-timeout`. Kept timeout-free on purpose: the call site cannot
+/// thread the full budget back in and fabricate a "(waited …)" clause
+/// for time that was never spent.
+fn break_probe_held_message() -> String {
+    held_message(Duration::ZERO)
 }
 
 /// Human-readable description of a `lock_held` contention for the given
@@ -490,6 +507,26 @@ mod tests {
     fn held_message_zero_timeout_omits_waited_clause() {
         let msg = held_message(Duration::ZERO);
         assert!(!msg.contains("waited"), "zero budget should not claim a wait: {msg}");
+    }
+
+    /// Regression: the `--break-lock` pre-acquire probe is a non-blocking
+    /// try-once, so its `lock_held` refusal must NEVER claim a wait — even
+    /// when the caller passes a positive `--lock-timeout`. The earlier
+    /// code threaded the full `timeout` into the probe's message, so a
+    /// `--break-lock --lock-timeout 250ms` against a live holder reported
+    /// `(waited 250ms)` despite refusing immediately. The probe message is
+    /// now timeout-free by construction; this pins that it carries no wait
+    /// clause.
+    #[test]
+    fn break_probe_held_message_never_claims_a_wait() {
+        let msg = break_probe_held_message();
+        assert!(
+            !msg.contains("waited"),
+            "break-lock probe refuses immediately and must not claim a wait: {msg}"
+        );
+        // It is still the same identity sentence the rest of the code
+        // emits for contention, just without the trailing budget clause.
+        assert_eq!(msg, held_message(Duration::ZERO));
     }
 
     /// The `--json` failure envelope (previously emitted only via

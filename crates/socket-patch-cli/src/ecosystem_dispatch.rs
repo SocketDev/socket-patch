@@ -880,4 +880,159 @@ mod tests {
         let map = partition_purls(&purls, Some(allowed.as_slice()));
         assert!(map.is_empty());
     }
+
+    // ---- dispatch_find orchestration (end-to-end via real crawlers) ------
+    //
+    // The pure merge/override helpers above are covered in isolation. These
+    // exercise the full `dispatch_find` wiring — discover-paths → find_by_purls
+    // → unified `purl -> path` map — through the real npm crawler against a
+    // temp `node_modules`, so a regression in the macro plumbing (wrong
+    // crawler/path method, dropped result, swapped merge) is caught.
+
+    use std::io::Write as _;
+
+    /// Lay down `node_modules/<name>/package.json` under `root` with the
+    /// given version, returning the package directory the crawler should
+    /// resolve the PURL to.
+    fn write_npm_package(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
+        let pkg_dir = root.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let mut f = std::fs::File::create(pkg_dir.join("package.json")).unwrap();
+        write!(f, r#"{{"name":"{name}","version":"{version}"}}"#).unwrap();
+        pkg_dir
+    }
+
+    fn local_options(cwd: PathBuf) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd,
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_packages_for_purls_maps_npm_purl_to_install_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = write_npm_package(tmp.path(), "foo", "1.0.0");
+
+        let partitioned = partition_purls(&["pkg:npm/foo@1.0.0".to_string()], None);
+        let out =
+            find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
+                .await;
+
+        // The unified map must key the result by the exact PURL handed in
+        // (npm = passthrough + first-wins) and point at the install dir.
+        assert_eq!(out.get("pkg:npm/foo@1.0.0"), Some(&pkg_dir));
+    }
+
+    #[tokio::test]
+    async fn find_packages_for_purls_skips_version_mismatch() {
+        // The crawler only matches an installed dir whose version equals the
+        // PURL's; a mismatched version must yield no mapping (guards against
+        // the dispatch returning a path for the wrong release).
+        let tmp = tempfile::tempdir().unwrap();
+        write_npm_package(tmp.path(), "foo", "2.0.0");
+
+        let partitioned = partition_purls(&["pkg:npm/foo@1.0.0".to_string()], None);
+        let out =
+            find_packages_for_purls(&partitioned, &local_options(tmp.path().to_path_buf()), true)
+                .await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_packages_for_rollback_keeps_full_npm_key() {
+        // Non-variant ecosystems use `merge_first_wins` even on the rollback
+        // path, so a qualified npm PURL must round-trip under its exact key
+        // (a regression that routed npm through `merge_qualified` would drop
+        // it, since the crawler echoes the verbatim PURL back).
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = write_npm_package(tmp.path(), "foo", "1.0.0");
+
+        let qualified = "pkg:npm/foo@1.0.0?vcs_url=git@github.com".to_string();
+        let partitioned = partition_purls(std::slice::from_ref(&qualified), None);
+        let out =
+            find_packages_for_rollback(&partitioned, &local_options(tmp.path().to_path_buf()), true)
+                .await;
+        assert_eq!(out.get(&qualified), Some(&pkg_dir));
+    }
+
+    #[tokio::test]
+    async fn dispatch_find_empty_partition_yields_empty_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty: HashMap<Ecosystem, Vec<String>> = HashMap::new();
+        let opts = local_options(tmp.path().to_path_buf());
+        assert!(find_packages_for_purls(&empty, &opts, true).await.is_empty());
+        assert!(find_packages_for_rollback(&empty, &opts, true)
+            .await
+            .is_empty());
+    }
+
+    // ---- experimental Maven/NuGet runtime gates --------------------------
+    //
+    // `crawl_all_ecosystems` only walks Maven / NuGet when the operator has
+    // opted in via `SOCKET_EXPERIMENTAL_*`. The gate's observable effect is
+    // whether the ecosystem appears in the returned per-ecosystem `counts`
+    // map at all: a crawled-but-empty ecosystem gets a `0` entry; a gated-off
+    // one gets no entry. That distinction lets us test the gate without a
+    // real Maven repo / NuGet cache fixture.
+
+    #[cfg(feature = "maven")]
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn crawl_all_gates_maven_on_runtime_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = local_options(tmp.path().to_path_buf());
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+        let (_, counts) = crawl_all_ecosystems(&opts).await;
+        assert!(
+            !counts.contains_key(&Ecosystem::Maven),
+            "Maven must not be crawled when the experimental flag is unset"
+        );
+
+        std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
+        let (_, counts) = crawl_all_ecosystems(&opts).await;
+        assert!(
+            counts.contains_key(&Ecosystem::Maven),
+            "Maven must be crawled once the experimental flag is set"
+        );
+        std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+    }
+
+    #[cfg(feature = "nuget")]
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn crawl_all_gates_nuget_on_runtime_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = local_options(tmp.path().to_path_buf());
+
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+        let (_, counts) = crawl_all_ecosystems(&opts).await;
+        assert!(
+            !counts.contains_key(&Ecosystem::Nuget),
+            "NuGet must not be crawled when the experimental flag is unset"
+        );
+
+        std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
+        let (_, counts) = crawl_all_ecosystems(&opts).await;
+        assert!(
+            counts.contains_key(&Ecosystem::Nuget),
+            "NuGet must be crawled once the experimental flag is set"
+        );
+        std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+    }
+
+    /// The always-on ecosystems must appear in `counts` unconditionally —
+    /// guards against one being accidentally moved behind a runtime gate.
+    #[tokio::test]
+    #[serial_test::serial(experimental_gate_env)]
+    async fn crawl_all_always_includes_core_ecosystems() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, counts) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
+        assert!(counts.contains_key(&Ecosystem::Npm));
+        assert!(counts.contains_key(&Ecosystem::Pypi));
+        assert!(counts.contains_key(&Ecosystem::Gem));
+    }
 }

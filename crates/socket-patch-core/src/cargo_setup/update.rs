@@ -129,6 +129,20 @@ fn guard_dep_add(content: &str, version: &str) -> Result<Option<String>, String>
     let mut doc = content
         .parse::<DocumentMut>()
         .map_err(|e| format!("Invalid Cargo.toml: {e}"))?;
+    // A *virtual* workspace manifest (`[workspace]` but no `[package]`) cannot
+    // carry a `[dependencies]` section — cargo rejects it with "this virtual
+    // manifest specifies a `dependencies` section, which is not allowed". Adding
+    // the guard here would corrupt the manifest, and there is no crate to build
+    // anyway (the guard belongs in each *member*). Refuse rather than write a
+    // file cargo can no longer parse. (Reachable via `discover`'s empty-members
+    // fallback, which hands the workspace root to `setup`.)
+    if doc.contains_key("workspace") && !doc.contains_key("package") {
+        return Err(
+            "Cargo.toml is a virtual workspace manifest (no `[package]`); the guard \
+             dependency belongs in each member crate, not the workspace root"
+                .to_string(),
+        );
+    }
     let root = doc.as_table_mut();
     let deps = ensure_table(root, "dependencies")?;
     if deps.contains_key(GUARD_CRATE) {
@@ -192,15 +206,23 @@ mod tests {
 
     #[test]
     fn test_add_into_inline_dependencies_table() {
-        // `dependencies = { … }` is a valid (if uncommon) inline table. The
-        // reader (`is_guard_dep_present`) sees through it via `as_table_like`,
-        // so the writer must too — otherwise add errors on a valid manifest.
-        let toml = "[package]\nname = \"x\"\ndependencies = { serde = \"1\" }\n";
+        // `dependencies = { … }` is a valid (if uncommon) *root-level* inline
+        // table. The reader (`is_guard_dep_present`) sees through it via
+        // `as_table_like`, so the writer must insert INTO it too — otherwise add
+        // would either error or fork a second `[dependencies]` (a duplicate key,
+        // which is invalid TOML). The `dependencies` key must be at the document
+        // root, NOT under `[package]` (where it would belong to `package.*` and
+        // the writer would never touch it — masking this very regression).
+        let toml = "dependencies = { serde = \"1\" }\n";
         let out = guard_dep_add(toml, "3.3").unwrap().unwrap();
         assert!(is_guard_dep_present(&out));
         assert!(out.contains("serde = \"1\""));
+        // Round-trips through a parser (proves it is not a duplicate-key file).
         let doc = out.parse::<DocumentMut>().unwrap();
         assert_eq!(doc["dependencies"][GUARD_CRATE].as_str(), Some("3.3"));
+        // The guard lives in the SAME (inline) table as serde — there is exactly
+        // one `dependencies` key, still inline.
+        assert!(doc["dependencies"].is_inline_table());
     }
 
     #[test]
@@ -269,6 +291,99 @@ mod tests {
         assert_eq!(res.status, CargoSetupStatus::AlreadyConfigured);
     }
 
+    #[test]
+    fn test_add_to_virtual_workspace_manifest_is_error() {
+        // A virtual manifest (`[workspace]`, no `[package]`) cannot hold a
+        // `[dependencies]` section — cargo refuses to parse it. `add` must NOT
+        // produce such a file; it errors instead so `setup` surfaces the problem
+        // rather than silently corrupting the workspace root.
+        let toml = "[workspace]\nmembers = [\"crates/*\"]\n";
+        let err = guard_dep_add(toml, "3.3").unwrap_err();
+        assert!(
+            err.contains("virtual workspace manifest"),
+            "expected a virtual-manifest error, got: {err}"
+        );
+        // The async wrapper reports it as Error, not a (corrupting) Updated.
+        // (Covered indirectly; the pure transform is the contract.)
+    }
+
+    #[test]
+    fn test_add_to_root_package_with_workspace_is_allowed() {
+        // A *root package* (`[package]` AND `[workspace]`) is a real crate and
+        // CAN carry `[dependencies]` — the virtual-manifest guard must not reject
+        // it. This is the common single-repo-with-root-crate layout.
+        let toml = "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"crates/*\"]\n";
+        let out = guard_dep_add(toml, "3.3").unwrap().unwrap();
+        assert!(is_guard_dep_present(&out));
+        // The produced manifest still parses (no duplicate/invalid section).
+        assert!(out.parse::<DocumentMut>().is_ok());
+    }
+
+    #[test]
+    fn test_add_into_root_inline_does_not_fork_a_second_table() {
+        // Regression guard: inserting into a root-level inline `dependencies`
+        // must mutate THAT table, never append a separate `[dependencies]`
+        // header (which would be a duplicate key → unparseable).
+        let toml = "dependencies = { serde = \"1\" }\n";
+        let out = guard_dep_add(toml, "3.3").unwrap().unwrap();
+        assert_eq!(
+            out.matches("dependencies").count(),
+            1,
+            "must not fork a second dependencies table: {out}"
+        );
+        assert!(out.parse::<DocumentMut>().is_ok(), "must stay valid TOML: {out}");
+    }
+
+    #[test]
+    fn test_add_then_remove_round_trips_byte_for_byte() {
+        // add into an existing `[dependencies]`, then remove, must restore the
+        // original manifest exactly (formatting + comments preserved).
+        let toml = "# top\n[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"  # json\n";
+        let added = guard_dep_add(toml, "3.3").unwrap().unwrap();
+        let removed = guard_dep_remove(&added).unwrap().unwrap();
+        assert_eq!(removed, toml, "add→remove must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn test_dotted_guard_header_is_present_and_removable() {
+        // The guard pinned via a `[dependencies.socket-patch-guard]` section
+        // header (a sub-table) must be detected AND actually removed — not a
+        // silent no-op that leaves it behind.
+        let toml = "[dependencies.socket-patch-guard]\nversion = \"3.3\"\nfeatures = [\"x\"]\n";
+        assert!(is_guard_dep_present(toml));
+        // Idempotent add (already configured).
+        assert!(guard_dep_add(toml, "3.3").unwrap().is_none());
+        let out = guard_dep_remove(toml).unwrap().unwrap();
+        assert!(!is_guard_dep_present(&out), "dotted guard must be removed");
+    }
+
+    #[tokio::test]
+    async fn test_remove_dry_run_does_not_write() {
+        // The remove dry-run branch was previously untested.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        let body = "[dependencies]\nsocket-patch-guard = \"3.3\"\nserde = \"1\"\n";
+        tokio::fs::write(&cargo, body).await.unwrap();
+        let res = remove_guard_dep(&cargo, true).await;
+        assert_eq!(res.status, CargoSetupStatus::Updated);
+        let on_disk = tokio::fs::read_to_string(&cargo).await.unwrap();
+        assert_eq!(on_disk, body, "dry-run must not modify the file");
+    }
+
+    #[tokio::test]
+    async fn test_add_to_virtual_manifest_wrapper_reports_error_without_writing() {
+        // End-to-end: the async wrapper turns the virtual-manifest refusal into
+        // an Error result and leaves the file byte-for-byte unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        let body = "[workspace]\nmembers = [\"a\", \"b\"]\n";
+        tokio::fs::write(&cargo, body).await.unwrap();
+        let res = add_guard_dep(&cargo, "3.3", false).await;
+        assert_eq!(res.status, CargoSetupStatus::Error);
+        let on_disk = tokio::fs::read_to_string(&cargo).await.unwrap();
+        assert_eq!(on_disk, body, "must not corrupt the virtual manifest");
+    }
+
     #[tokio::test]
     async fn test_add_dry_run_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -285,3 +400,5 @@ mod tests {
         );
     }
 }
+
+

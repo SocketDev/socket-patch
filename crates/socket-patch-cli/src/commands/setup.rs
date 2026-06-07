@@ -19,8 +19,8 @@ use socket_patch_core::package_json::update::{
     UpdateStatus,
 };
 use socket_patch_core::pth_hook::{
-    add_hook_dependency, deps_contain_hook, detect_python_pm, remove_hook_dependency, ManifestKind,
-    PthEditResult, PthStatus, PythonPackageManager,
+    add_hook_dependency, deps_contain_hook, detect_python_pm, pyproject_contains_hook,
+    remove_hook_dependency, ManifestKind, PthEditResult, PthStatus, PythonPackageManager,
 };
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
@@ -156,19 +156,27 @@ async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocat
         .collect()
 }
 
-/// Emit the shared "nothing found" result and exit code.
-fn report_no_files(args: &SetupArgs, status: &str) -> i32 {
+/// Emit the shared "nothing found" result and exit code. `counts` carries the
+/// per-command zero-valued summary fields (`check` → configured/needs/errors,
+/// `remove` → removed/notConfigured/errors) so the `no_files` envelope keeps the
+/// documented shape (CLI_CONTRACT "Setup command contract") instead of dropping
+/// them — matching what the plain `setup` `no_files` path already emits.
+fn report_no_files(args: &SetupArgs, status: &str, counts: &[(&str, i64)]) -> i32 {
     if args.common.json {
+        // `serde_json::Map` preserves insertion order (the crate enables
+        // `preserve_order`), so status → counts → files comes out in that order.
+        let mut map = serde_json::Map::new();
+        map.insert("status".to_string(), serde_json::json!(status));
+        for (key, value) in counts {
+            map.insert((*key).to_string(), serde_json::json!(value));
+        }
+        map.insert("files".to_string(), serde_json::json!([]));
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": status,
-                "files": [],
-            }))
-            .unwrap()
+            serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
         );
     } else {
-        println!("No package.json or Python project found");
+        println!("No package.json, Python, Cargo, Go, Bundler, or Composer project found");
     }
     0
 }
@@ -323,9 +331,9 @@ pub(crate) async fn configured_ecosystems(
     // (e.g. `vex --ecosystems cargo` must still see a set-up python project).
     if is_python_project(&common.cwd).await {
         let pm = detect_python_pm(&common.cwd).await;
-        for (path, _) in choose_python_manifests(&common.cwd, pm).await {
+        for (path, kind) in choose_python_manifests(&common.cwd, pm).await {
             if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                if deps_contain_hook(&content) {
+                if manifest_contains_hook(kind, &content) {
                     set.insert(Ecosystem::Pypi);
                     break;
                 }
@@ -385,6 +393,19 @@ const ECO_COMPOSER: &[&str] = &["composer", "php"];
 // ─────────────────────────────────────────────────────────────────────────
 // Python (.pth hook) helpers
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Is the hook dependency present in a Python manifest's content? Picks the
+/// right detector for the manifest kind: `pyproject.toml` needs the *structural*
+/// probe ([`pyproject_contains_hook`]) because the classic-Poetry form
+/// (`socket-patch = { extras = ["hook"] }`) has no literal `socket-patch[hook]`
+/// substring, so the textual probe would mis-report a configured project;
+/// `requirements.txt` uses the textual line probe.
+fn manifest_contains_hook(kind: ManifestKind, content: &str) -> bool {
+    match kind {
+        ManifestKind::Pyproject => pyproject_contains_hook(content),
+        ManifestKind::Requirements => deps_contain_hook(content),
+    }
+}
 
 /// A Python manifest `setup` will edit, plus the resolved package manager.
 struct PythonPlan {
@@ -1290,7 +1311,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
         for (path, kind) in &plan.manifests {
             let (state, err) = match tokio::fs::read_to_string(path).await {
                 Ok(content) => {
-                    if deps_contain_hook(&content) {
+                    if manifest_contains_hook(*kind, &content) {
                         (CheckState::Configured, None)
                     } else {
                         (CheckState::NeedsConfiguration, None)
@@ -1319,7 +1340,11 @@ async fn run_check(args: &SetupArgs) -> i32 {
     append_patch_consistency_entries(&args.common, &mut entries).await;
 
     if entries.is_empty() {
-        return report_no_files(args, "no_files");
+        return report_no_files(
+            args,
+            "no_files",
+            &[("configured", 0), ("needsConfiguration", 0), ("errors", 0)],
+        );
     }
 
     let configured = entries.iter().filter(|(_, _, s, _)| *s == CheckState::Configured).count();
@@ -1423,7 +1448,11 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         && !gem_preview.present
         && !composer_preview.present
     {
-        return report_no_files(args, "no_files");
+        return report_no_files(
+            args,
+            "no_files",
+            &[("removed", 0), ("notConfigured", 0), ("errors", 0)],
+        );
     }
     let cargo_present = cargo_preview.present;
     let go_present = go_preview.present;

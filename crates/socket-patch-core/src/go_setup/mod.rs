@@ -272,6 +272,7 @@ fn find_main_dirs_inner<'a>(
             } else if ft.is_file()
                 && name.ends_with(".go")
                 && !name.ends_with("_test.go")
+                && !is_skipped_go_file(&name)
                 && file_is_package_main(&entry.path()).await
             {
                 has_main = true;
@@ -298,6 +299,16 @@ fn is_skipped_dir(name: &str) -> bool {
         || name.starts_with('_')
 }
 
+/// True if the go tool itself ignores this `.go` file by name. Files whose names
+/// begin with `.` or `_` are excluded from the build by `go/build` (the same
+/// convention that hides `.`/`_`-prefixed directories). A `_gen.go` declaring
+/// `package main` inside a library package must NOT make that dir look like a
+/// main dir — doing so would drop a conflicting `package main` import file and
+/// break the build (the file-level twin of the `//go:build ignore` guard).
+fn is_skipped_go_file(name: &str) -> bool {
+    name.starts_with('.') || name.starts_with('_')
+}
+
 /// True if a `.go` file's package clause is `package main` AND the file is not
 /// excluded from the build by an `ignore` build constraint. The `ignore` tag is
 /// the conventional marker for files the toolchain never compiles (e.g. `go run
@@ -308,7 +319,12 @@ async fn file_is_package_main(path: &Path) -> bool {
     let Ok(content) = fs::read_to_string(path).await else {
         return false;
     };
-    if has_ignore_build_tag(&content) {
+    // Go permits a leading UTF-8 BOM (U+FEFF) as the first code point of a source
+    // file. Strip it before parsing, or the package clause would read as the
+    // token `"\u{feff}package"` and a real `main` package would be missed — a
+    // fail-open: the dir gets no guard import.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    if has_ignore_build_tag(content) {
         return false;
     }
     // The package clause is the first non-blank, non-comment line. Strip BOTH
@@ -318,7 +334,7 @@ async fn file_is_package_main(path: &Path) -> bool {
     // `package main` import file into a non-main dir and break the build with
     // two conflicting package clauses. We also must stop AT the package clause,
     // not scan the whole file, for the same reason.
-    let cleaned = strip_go_comments(&content);
+    let cleaned = strip_go_comments(content);
     for line in cleaned.lines() {
         let t = line.trim();
         if t.is_empty() {
@@ -565,6 +581,63 @@ mod tests {
             !dirs.contains(&root.join("tool")),
             "+build ignore generator must not make tool/ a main dir"
         );
+    }
+
+    #[tokio::test]
+    async fn test_underscore_and_dot_prefixed_main_file_is_not_a_main_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("go.mod"), "module example.com/app\n\ngo 1.21\n").await;
+        // A real library package dir that also holds `_`/`.`-prefixed files that
+        // declare `package main`. The go tool IGNORES files whose names begin
+        // with `.` or `_`, so this dir's package is `lib`, NOT main — we must not
+        // drop a `package main` import file here (it would conflict and break the
+        // build). Twin of the `//go:build ignore` exclusion.
+        write(&root.join("pkg/lib.go"), "package lib\n").await;
+        write(
+            &root.join("pkg/_gen.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .await;
+        write(
+            &root.join("pkg/.hidden.go"),
+            "package main\n\nfunc main() {}\n",
+        )
+        .await;
+
+        let dirs = find_main_package_dirs(root).await;
+        assert!(
+            !dirs.contains(&root.join("pkg")),
+            "`_`/`.`-prefixed main file must not make pkg/ a main dir: {dirs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bom_prefixed_main_file_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("go.mod"), "module example.com/app\n\ngo 1.21\n").await;
+        // Go permits a leading UTF-8 BOM. A real `package main` file that starts
+        // with one must still be detected — a false negative is fail-open (the
+        // guard import is never wired for this binary).
+        write(
+            &root.join("cmd/app/main.go"),
+            "\u{feff}package main\n\nfunc main() {}\n",
+        )
+        .await;
+        let dirs = find_main_package_dirs(root).await;
+        assert!(
+            dirs.contains(&root.join("cmd/app")),
+            "BOM-prefixed `package main` must still be detected: {dirs:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_skipped_go_file() {
+        assert!(is_skipped_go_file("_gen.go"));
+        assert!(is_skipped_go_file(".hidden.go"));
+        assert!(!is_skipped_go_file("main.go"));
+        assert!(!is_skipped_go_file("gen_main.go")); // underscore not at start
     }
 
     #[tokio::test]

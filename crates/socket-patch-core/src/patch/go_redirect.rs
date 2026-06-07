@@ -125,6 +125,44 @@ fn copy_dir_for(project_root: &Path, module: &str, version: &str) -> PathBuf {
         .join(format!("{module}@{version}"))
 }
 
+/// SECURITY: the `module`+`version` key the on-disk copy dir
+/// (`.socket/go-patches/<module>@<version>/`) and the `replace` target path, so
+/// a tampered manifest PURL must not be able to make them escape
+/// `.socket/go-patches/`. A `..`/`.` segment, an absolute path, or a backslash/
+/// NUL would otherwise let `apply` copy + write the patched tree (or `rollback`
+/// delete a tree) at an arbitrary filesystem location outside the project.
+///
+/// Unlike a cargo crate name, a Go module path legitimately contains `/`
+/// separators (`github.com/foo/bar`), so we validate it **per segment** rather
+/// than rejecting all separators. A real Go module path never contains a `..`/
+/// `.` segment or a backslash, so fail-closed rejection is safe.
+fn is_safe_redirect_module(module: &str) -> bool {
+    if module.is_empty() || module.starts_with('/') || module.contains('\\') || module.contains('\0')
+    {
+        return false;
+    }
+    module
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// A Go module version (e.g. `v1.4.2`, `v0.0.0-2006…-abcdef`) is a single path
+/// segment — no separators, no `..`. Mirrors the cargo redirect guard.
+fn is_safe_redirect_version(version: &str) -> bool {
+    !version.is_empty()
+        && version != "."
+        && version != ".."
+        && !version.contains('/')
+        && !version.contains('\\')
+        && !version.contains('\0')
+}
+
+/// True iff both coordinates are safe to key an on-disk copy dir / `replace`
+/// path. Reject fail-closed before any disk access.
+fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
+    is_safe_redirect_module(module) && is_safe_redirect_version(version)
+}
+
 /// Materialise a project-local patched copy and wire up the `replace` redirect.
 ///
 /// * `pristine_src` — the pristine module-cache source dir (the crawler's
@@ -144,6 +182,23 @@ pub async fn apply_go_redirect(
     dry_run: bool,
     force: bool,
 ) -> ApplyResult {
+    // SECURITY: refuse coordinates that would escape `.socket/go-patches/`.
+    // A `..`/separator-laden `module`/`version` (a tampered manifest PURL) would
+    // otherwise make `fresh_copy` + the apply pipeline write the patched tree to
+    // an arbitrary location. Fail-closed before any disk access.
+    if !are_safe_redirect_coords(module, version) {
+        return synthesized_result(
+            purl,
+            Path::new(""),
+            Vec::new(),
+            false,
+            Some(format!(
+                "refusing go redirect for unsafe coordinates `{module}`/`{version}` \
+                 (a `..` segment, absolute path, or separator would escape .socket/go-patches/)"
+            )),
+        );
+    }
+
     let copy_dir = copy_dir_for(project_root, module, version);
 
     // A redirect with no files to patch is meaningless: no-op success, no
@@ -233,6 +288,16 @@ pub async fn remove_go_redirect(
         )
     })?;
 
+    // SECURITY: the copy dir is `.socket/go-patches/<module>@<version>/` and is
+    // about to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
+    // absolute) would target a tree outside the project for deletion — refuse.
+    if !are_safe_redirect_coords(module, version) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to remove go redirect for unsafe coordinates: {purl}"),
+        ));
+    }
+
     go_mod_edit::drop_replace_entry(project_root, module, dry_run)
         .await
         .map_err(std::io::Error::other)?;
@@ -321,6 +386,13 @@ pub async fn verify_go_redirect_state(
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };
+
+        // SECURITY: skip coordinates that would resolve the copy dir outside
+        // `.socket/go-patches/` (a tampered manifest); never stat/hash files
+        // outside the project tree during an audit. Mirrors the apply guard.
+        if !are_safe_redirect_coords(module, version) {
+            continue;
+        }
 
         // go.mod `require` cross-check: if the graph resolves this module to a
         // version that is NOT the patched one, the version-pinned `replace` is
@@ -429,12 +501,65 @@ async fn redirect_in_sync(
 
 /// Synthesize Go's minimal `go.mod` (`module <path>`) in the copy iff it has
 /// none — required for a `replace` target derived from a pre-modules package.
+///
+/// The copy under `.socket/go-patches/` is a *committed artifact* that the build
+/// redirects to, so its `go.mod` is committed to the repo. Write it atomically
+/// (stage + fsync + rename) rather than with a bare truncating `fs::write`: a
+/// crash / power loss / `ENOSPC` mid-write would otherwise commit a torn or
+/// empty `go.mod`. A reader (a concurrent `go build`, or the file landing in a
+/// commit) then only ever sees the complete file, never a half-written one.
 async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::io::Result<()> {
     let go_mod = copy_dir.join("go.mod");
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());
     }
-    tokio::fs::write(&go_mod, format!("module {module}\n")).await
+    atomic_write(&go_mod, format!("module {module}\n").as_bytes()).await
+}
+
+/// Atomically commit `content` to `path` via stage + fsync + rename. Mirrors the
+/// hardened writers in [`crate::patch::cargo_config`] /
+/// [`crate::patch::go_mod_edit`]: a reader/recovering process only ever sees the
+/// complete old or complete new bytes, never a truncated intermediate.
+async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "go.mod".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory so
+    // the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
 }
 
 fn synthesized_result(
@@ -716,6 +841,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_synthesized_go_mod_is_atomic_no_litter() {
+        // The synthesized go.mod must be committed atomically: after apply the
+        // copy dir holds the real go.mod with the full `module …` line and NO
+        // leftover `.socket-stage-*` sibling (a torn/empty go.mod or a stage-file
+        // litter would be exactly the corruption the atomic writer prevents).
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        // Pre-modules package → synthesis path is exercised.
+        tokio::fs::remove_file(pristine.join("go.mod")).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let result = apply_go_redirect(
+            PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false,
+        )
+        .await;
+        assert!(result.success, "apply failed: {:?}", result.error);
+
+        let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        assert_eq!(
+            tokio::fs::read_to_string(copy.join("go.mod")).await.unwrap(),
+            "module github.com/foo/bar\n",
+            "synthesized go.mod must be the complete module line, never torn/empty"
+        );
+        // No stage-file litter anywhere in the copy dir.
+        let mut rd = tokio::fs::read_dir(&copy).await.unwrap();
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "stage file must be renamed away, found litter: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_remove_drops_directive_and_copy() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
@@ -878,6 +1038,159 @@ mod tests {
         let result = apply_go_redirect(PURL, MODULE, VERSION, root, root, &files, &sources, None, false, false).await;
         assert!(result.success);
         assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    // ── filesystem-safety: coordinate traversal ──────────────────────────
+
+    #[test]
+    fn test_safe_redirect_coords() {
+        // Legitimate multi-segment module + semver-ish version.
+        assert!(are_safe_redirect_coords("github.com/foo/bar", "v1.4.2"));
+        assert!(are_safe_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));
+        assert!(are_safe_redirect_coords(
+            "github.com/foo/bar/v2",
+            "v2.0.0-20210101000000-abcdef123456"
+        ));
+        // Traversal / escape attempts in the module.
+        assert!(!are_safe_redirect_coords("../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("github.com/../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("/abs/path", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("github.com//bar", "v1.0.0")); // empty segment
+        assert!(!are_safe_redirect_coords("foo/./bar", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("foo\\bar", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("", "v1.0.0"));
+        // Traversal / separators in the version.
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", "../../../evil"));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", "v1/0/0"));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", ".."));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", ""));
+    }
+
+    /// SECURITY regression: a tampered manifest PURL with `..` in the module path
+    /// must NOT let `apply` copy + write the patched tree outside
+    /// `.socket/go-patches/`. Without the guard `copy_dir_for` would resolve to
+    /// `<project>/.socket/go-patches/../../../escape@v1.0.0` and `fresh_copy`
+    /// would materialise it there.
+    #[tokio::test]
+    async fn test_apply_rejects_traversal_module() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let escaped = root.parent().unwrap().join("escape@v1.0.0");
+        let _ = remove_tree(&escaped).await; // clear any stale copy
+
+        let result = apply_go_redirect(
+            "pkg:golang/../../../escape@v1.0.0",
+            "../../../escape",
+            "v1.0.0",
+            &pristine,
+            root,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(!result.success, "traversal coordinates must be refused");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("unsafe"),
+            "error should explain the refusal: {:?}",
+            result.error
+        );
+        assert!(
+            !escaped.exists(),
+            "no copy may be written outside .socket/go-patches/ (found {})",
+            escaped.display()
+        );
+        // go.mod was never touched (no replace directive added).
+        assert!(read_replace_entries(root).await.is_empty());
+        let _ = remove_tree(&escaped).await;
+    }
+
+    /// A `version` carrying a separator is equally rejected (it keys the copy dir
+    /// and the `replace` path).
+    #[tokio::test]
+    async fn test_apply_rejects_traversal_version() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_go_redirect(
+            "pkg:golang/github.com/foo/bar@../../../evil",
+            MODULE,
+            "../../../evil",
+            &pristine,
+            root,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert!(!result.success);
+        // go.mod is byte-unchanged.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+            gomod_before
+        );
+    }
+
+    /// SECURITY regression: `remove` must refuse unsafe coordinates rather than
+    /// `remove_tree` a directory outside the project.
+    #[tokio::test]
+    async fn test_remove_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n").await.unwrap();
+        // A precious directory that is a sibling of the project root.
+        let precious = root.parent().unwrap().join("precious@v1.0.0");
+        tokio::fs::create_dir_all(&precious).await.unwrap();
+        tokio::fs::write(precious.join("keep.txt"), b"keep").await.unwrap();
+
+        let err = remove_go_redirect("pkg:golang/../../../precious@v1.0.0", root, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            precious.exists() && precious.join("keep.txt").exists(),
+            "remove must not delete a tree outside the project"
+        );
+        tokio::fs::remove_dir_all(&precious).await.unwrap();
+    }
+
+    /// SECURITY regression: an audit must not stat/hash files outside the tree
+    /// for an unsafe coordinate — it is skipped, not chased through `..`.
+    #[tokio::test]
+    async fn test_verify_skips_unsafe_coords() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n").await.unwrap();
+
+        let unsafe_purl = "pkg:golang/../../../escape@v1.0.0";
+        let mut manifest = PatchManifest::new();
+        let mut files = HashMap::new();
+        files.insert(
+            "package/x.go".to_string(),
+            PatchFileInfo { before_hash: "b".into(), after_hash: "a".into() },
+        );
+        manifest.patches.insert(
+            unsafe_purl.to_string(),
+            crate::manifest::schema::PatchRecord {
+                uuid: "u".into(),
+                exported_at: "t".into(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let desired: HashSet<String> = [unsafe_purl.to_string()].into_iter().collect();
+        // The unsafe coord is silently skipped → no drift (and no escape-stat).
+        assert!(verify_go_redirect_state(root, &manifest, &desired).await.is_ok());
     }
 
     #[test]

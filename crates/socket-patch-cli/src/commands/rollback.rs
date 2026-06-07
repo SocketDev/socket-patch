@@ -37,10 +37,11 @@ struct PatchToRollback {
     patch: PatchRecord,
 }
 
-// ── local-cargo redirect helpers ─────────────────────────────────────────────
-// Local cargo rolls back by dropping the project-local `[patch]` redirect +
-// patched copy (no in-place restore, no before-blob). Inert stubs in a build
-// without the `cargo` feature.
+// ── local-redirect rollback helpers (cargo + go) ─────────────────────────────
+// Local cargo/go roll back by dropping the project-local redirect (cargo's
+// `[patch]` entry / go's `replace` directive) + the patched copy — no in-place
+// restore, no before-blob. Each helper is an inert stub in a build without its
+// respective feature.
 
 /// True for a cargo PURL in local mode (no `--global` / `--global-prefix`).
 #[cfg(feature = "cargo")]
@@ -51,30 +52,51 @@ fn is_local_cargo(purl: &str, common: &GlobalArgs) -> bool {
         && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
 }
 
-/// Copy of `manifest` with local-cargo PURLs removed — used for the
-/// before-blob gate, which those PURLs never need (redirect rollback reads no
-/// blobs). Avoids blocking an offline redirect rollback on absent blobs.
-#[cfg(feature = "cargo")]
-fn exclude_local_cargo(manifest: &PatchManifest, common: &GlobalArgs) -> PatchManifest {
+/// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
+#[cfg(feature = "golang")]
+fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
+    use socket_patch_core::crawlers::Ecosystem;
+    !common.global
+        && common.global_prefix.is_none()
+        && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
+}
+
+/// True when `purl` rolls back by dropping a project-local redirect (cargo or
+/// go in local mode) rather than restoring bytes from a before-blob. The
+/// before-blob gate uses this to skip those PURLs — they read no blobs, so a
+/// missing before-blob must not block (or trigger a needless download for) an
+/// offline redirect rollback.
+fn is_local_redirect(purl: &str, common: &GlobalArgs) -> bool {
+    #[cfg(feature = "cargo")]
+    if is_local_cargo(purl, common) {
+        return true;
+    }
+    #[cfg(feature = "golang")]
+    if is_local_go(purl, common) {
+        return true;
+    }
+    let _ = (purl, common);
+    false
+}
+
+/// Copy of `manifest` with local-redirect PURLs (cargo + go) removed — used for
+/// the before-blob gate, which those PURLs never need. Avoids blocking an
+/// offline redirect rollback on absent blobs.
+fn exclude_local_redirects(manifest: &PatchManifest, common: &GlobalArgs) -> PatchManifest {
     PatchManifest {
         patches: manifest
             .patches
             .iter()
-            .filter(|(purl, _)| !is_local_cargo(purl, common))
+            .filter(|(purl, _)| !is_local_redirect(purl, common))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         setup: manifest.setup.clone(),
     }
 }
 
-#[cfg(not(feature = "cargo"))]
-fn exclude_local_cargo(manifest: &PatchManifest, _common: &GlobalArgs) -> PatchManifest {
-    manifest.clone()
-}
-
 /// Roll back a local-cargo redirect (drop the `[patch]` entry + copy), or
-/// `None` if `purl` isn't a local-cargo target (caller falls back to in-place
-/// rollback).
+/// `None` if `purl` isn't a local-cargo target (caller falls back to the next
+/// backend, ultimately in-place rollback).
 #[cfg(feature = "cargo")]
 async fn try_rollback_local_cargo(
     purl: &str,
@@ -111,6 +133,50 @@ async fn try_rollback_local_cargo(
 
 #[cfg(not(feature = "cargo"))]
 async fn try_rollback_local_cargo(
+    _purl: &str,
+    _pkg_path: &Path,
+    _patch: &PatchRecord,
+    _common: &GlobalArgs,
+) -> Option<RollbackResult> {
+    None
+}
+
+/// Roll back a local-go redirect (drop the `go.mod` `replace` directive + the
+/// patched copy under `.socket/go-patches/`), or `None` if `purl` isn't a
+/// local-go target (caller falls back to in-place rollback). The module cache
+/// is left pristine by the redirect, so — exactly like cargo — there is no
+/// before-blob to restore; mirrors apply's `try_local_go_apply`. Go has no
+/// `vendor/` fallthrough (apply always redirects local go), so there is no
+/// vendored discriminator here.
+#[cfg(feature = "golang")]
+async fn try_rollback_local_go(
+    purl: &str,
+    pkg_path: &Path,
+    patch: &PatchRecord,
+    common: &GlobalArgs,
+) -> Option<RollbackResult> {
+    use socket_patch_core::patch::go_redirect::remove_go_redirect;
+    if !is_local_go(purl, common) {
+        return None;
+    }
+    let mut result = RollbackResult {
+        package_key: purl.to_string(),
+        package_path: pkg_path.display().to_string(),
+        success: true,
+        files_verified: Vec::new(),
+        files_rolled_back: patch.files.keys().cloned().collect(),
+        error: None,
+    };
+    if let Err(e) = remove_go_redirect(purl, &common.cwd, common.dry_run).await {
+        result.success = false;
+        result.files_rolled_back.clear();
+        result.error = Some(e.to_string());
+    }
+    Some(result)
+}
+
+#[cfg(not(feature = "golang"))]
+async fn try_rollback_local_go(
     _purl: &str,
     _pkg_path: &Path,
     _patch: &PatchRecord,
@@ -500,11 +566,11 @@ async fn rollback_patches_inner(
         setup: None,
     };
 
-    // Check for missing beforeHash blobs. Local-cargo PURLs are excluded:
-    // their rollback just drops the `[patch]` redirect + copy and reads no
-    // blobs, so a missing before-blob must not block an offline redirect
-    // rollback.
-    let gate_manifest = exclude_local_cargo(&filtered_manifest, &args.common);
+    // Check for missing beforeHash blobs. Local-redirect PURLs (cargo + go)
+    // are excluded: their rollback just drops the project-local redirect + copy
+    // and reads no blobs, so a missing before-blob must not block an offline
+    // redirect rollback.
+    let gate_manifest = exclude_local_redirects(&filtered_manifest, &args.common);
     let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.common.offline {
@@ -628,21 +694,25 @@ async fn rollback_patches_inner(
                 None => continue,
             };
 
-            // Local cargo drops the project-local redirect; everything else —
-            // npm/pypi, and cargo under --global — restores in place. In a
-            // build without the `cargo` feature this is an inert `None`.
+            // Local cargo/go drop the project-local redirect; everything else —
+            // npm/pypi, and cargo/go under --global/--global-prefix — restores
+            // in place. Without the respective feature the `try_rollback_local_*`
+            // helpers are inert `None`s.
             let result = match try_rollback_local_cargo(purl, pkg_path, patch, &args.common).await {
                 Some(r) => r,
-                None => {
-                    rollback_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &blobs_path,
-                        args.common.dry_run,
-                    )
-                    .await
-                }
+                None => match try_rollback_local_go(purl, pkg_path, patch, &args.common).await {
+                    Some(r) => r,
+                    None => {
+                        rollback_package_patch(
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &blobs_path,
+                            args.common.dry_run,
+                        )
+                        .await
+                    }
+                },
             };
 
             if !result.success {
@@ -955,7 +1025,7 @@ mod tests {
     }
 
     /// Regression: a local-cargo before-hash that is absent on disk must NOT
-    /// count as missing once the manifest is run through `exclude_local_cargo`
+    /// count as missing once the manifest is run through `exclude_local_redirects`
     /// — for the initial gate or the post-download re-check. Before the fix
     /// the re-check used the full filtered manifest, so a present-npm +
     /// missing-cargo manifest still reported the cargo blob missing and
@@ -991,11 +1061,174 @@ mod tests {
         // Gate manifest: the local-cargo PURL is excluded, so its before-blob
         // is not counted as missing. With the npm blob present, the gate (and
         // the re-check that now reuses it) reports nothing missing.
-        let gate = exclude_local_cargo(&manifest, &common);
+        let gate = exclude_local_redirects(&manifest, &common);
         let gate_missing = get_missing_before_blobs(&gate, blobs).await;
         assert!(
             gate_missing.is_empty(),
             "gate must exclude local-cargo before-blobs, got {gate_missing:?}"
         );
+    }
+
+    /// Regression: local-GO redirects must be excluded from the before-blob
+    /// gate exactly like local-cargo. A go redirect drops the `go.mod`
+    /// `replace` directive + the patched copy and reads no before-blob, so a
+    /// missing before-blob must not abort (nor trigger a needless download for)
+    /// an offline local-go rollback. Before the fix only cargo was excluded, so
+    /// a local-go patch with an absent before-blob aborted the whole rollback
+    /// under `--offline`.
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn gate_manifest_excludes_local_go_before_blobs_from_missing_check() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1".to_string(),
+            record_with_file("uuid-go", "errors.go", "go_before"),
+        );
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "index.js", "npm_before"),
+        );
+        let manifest = PatchManifest { patches, setup: None };
+
+        // Local mode (no --global / --global-prefix).
+        let common = crate::args::GlobalArgs::default();
+        assert!(!common.global && common.global_prefix.is_none());
+
+        // Blobs dir holds only the npm before-blob; the go one is absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path();
+        tokio::fs::write(blobs.join("npm_before"), b"x").await.unwrap();
+
+        // Full manifest: the go before-blob shows up as missing — exactly what
+        // the buggy (cargo-only) gate left in, spuriously aborting rollback.
+        let full_missing = get_missing_before_blobs(&manifest, blobs).await;
+        assert!(full_missing.contains("go_before"));
+
+        // Gate manifest: the local-go PURL is excluded, so its before-blob is
+        // not counted as missing. With the npm blob present, the gate reports
+        // nothing missing.
+        let gate = exclude_local_redirects(&manifest, &common);
+        let gate_missing = get_missing_before_blobs(&gate, blobs).await;
+        assert!(
+            gate_missing.is_empty(),
+            "gate must exclude local-go before-blobs, got {gate_missing:?}"
+        );
+
+        // And `is_local_redirect` must classify the go PURL as a redirect in
+        // local mode but a global PURL as in-place (gate must keep the latter).
+        assert!(is_local_redirect("pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1", &common));
+        let global = crate::args::GlobalArgs {
+            global: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        assert!(!is_local_redirect("pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1", &global));
+    }
+
+    /// Regression: rolling back a local-GO patch must DROP the project-local
+    /// redirect (the `go.mod` `replace` directive + the patched copy under
+    /// `.socket/go-patches/`), not fall through to in-place rollback.
+    ///
+    /// Before the fix, `rollback` only had a cargo redirect backend; a go PURL
+    /// fell through to `rollback_package_patch` against the pristine module
+    /// cache, every file verified `AlreadyOriginal`, and the redirect was left
+    /// active — a silent no-op that reported "already original" while the build
+    /// kept using the patched copy.
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn try_rollback_local_go_drops_redirect_and_copy() {
+        use socket_patch_core::patch::go_mod_edit::{
+            ensure_replace_entry, read_replace_entries,
+        };
+
+        const MODULE: &str = "github.com/foo/bar";
+        const VERSION: &str = "v1.4.2";
+        const PURL: &str = "pkg:golang/github.com/foo/bar@v1.4.2";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A go.mod with a require directive (NOT socket-owned) plus the
+        // socket-owned replace directive a prior apply would have written.
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module myproj\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+        )
+        .await
+        .unwrap();
+        let changed = ensure_replace_entry(root, MODULE, VERSION, false)
+            .await
+            .unwrap();
+        assert!(changed, "fixture must install a socket-owned replace");
+
+        // The patched copy the redirect points at.
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+        tokio::fs::write(copy_dir.join("errors.go"), b"// patched\n")
+            .await
+            .unwrap();
+
+        // Sanity: the redirect is in place before rollback.
+        assert!(read_replace_entries(root)
+            .await
+            .iter()
+            .any(|e| e.module == MODULE && e.socket_owned));
+
+        let patch = record_with_file("uuid-go", "errors.go", "go_before");
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            ..crate::args::GlobalArgs::default()
+        };
+
+        // `pkg_path` is the (unused for go) pristine module-cache dir.
+        let result = try_rollback_local_go(PURL, root, &patch, &common)
+            .await
+            .expect("go PURL in local mode must be handled by the go backend");
+
+        assert!(result.success, "rollback failed: {:?}", result.error);
+        assert!(
+            result.files_rolled_back.contains(&"errors.go".to_string()),
+            "the patched file must be reported rolled back, got {:?}",
+            result.files_rolled_back
+        );
+
+        // The socket-owned replace directive is gone...
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .all(|e| !(e.module == MODULE && e.socket_owned)),
+            "socket-owned replace directive must be dropped"
+        );
+        // ...the require directive (user-authored) survives...
+        assert!(tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap()
+            .contains("require github.com/foo/bar v1.4.2"));
+        // ...and the patched copy is removed.
+        assert!(
+            !copy_dir.exists(),
+            "patched copy under .socket/go-patches must be removed"
+        );
+    }
+
+    /// A go PURL under `--global` is an in-place module-cache rollback, NOT a
+    /// redirect — `try_rollback_local_go` must decline it so the caller falls
+    /// through to `rollback_package_patch`.
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn try_rollback_local_go_declines_global() {
+        let patch = record_with_file("uuid-go", "errors.go", "go_before");
+        let global = crate::args::GlobalArgs {
+            global: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let result = try_rollback_local_go(
+            "pkg:golang/github.com/foo/bar@v1.4.2",
+            Path::new("/nonexistent"),
+            &patch,
+            &global,
+        )
+        .await;
+        assert!(result.is_none(), "global go must not use the redirect backend");
     }
 }

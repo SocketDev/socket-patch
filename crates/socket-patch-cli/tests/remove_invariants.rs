@@ -300,6 +300,75 @@ fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
 }
 
 // ---------------------------------------------------------------------------
+// Blob-sweep artifact event must not inflate the removed count
+// ---------------------------------------------------------------------------
+
+/// When `remove` sweeps an orphaned blob (or rolls files back) it appends a
+/// purl-less, artifact-level `Removed` event carrying `details.blobsRemoved` /
+/// `details.rolledBack`. That carrier is metadata — NOT a removed manifest
+/// entry — so it must never bump `summary.removed`.
+///
+/// Every other test passes `--skip-rollback` against a manifest whose afterHash
+/// blobs aren't present on disk, so the cleanup phase sweeps nothing and the
+/// carrier never fires — leaving this path completely uncovered. Here we stage
+/// both patches' afterHash blobs in `.socket/blobs`, remove A, and force a
+/// real one-blob sweep (A's afterHash blob becomes unreferenced; B's stays).
+///
+/// The contract: exactly ONE manifest entry was deleted, so `summary.removed`
+/// must be 1 — matching the single per-purl `removed` event — even though the
+/// event stream also carries the artifact carrier reporting `blobsRemoved: 1`.
+/// A regression that routes the carrier through the summary-bumping `record`
+/// path would report `removed: 2` and flip this test red.
+#[test]
+fn remove_blob_sweep_does_not_inflate_removed_count() {
+    // afterHash values from TWO_PATCH_MANIFEST.
+    const AFTER_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const AFTER_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(AFTER_A), b"blob-a").expect("stage blob A");
+    std::fs::write(blobs.join(AFTER_B), b"blob-b").expect("stage blob B");
+
+    let (code, stdout) = run_remove(tmp.path(), "pkg:npm/__remove_test_a__@1.0.0", &[]);
+    assert_eq!(code, 0, "remove must succeed; stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["status"], "success");
+
+    // The crux: one entry removed → summary.removed == 1, NOT 2.
+    assert_eq!(
+        v["summary"]["removed"], 1,
+        "the blob-sweep carrier event must not inflate summary.removed; envelope={v}"
+    );
+
+    let events = v["events"].as_array().expect("events array");
+    // Exactly one per-purl Removed event, naming A.
+    let removed_purls: Vec<&str> = events
+        .iter()
+        .filter(|e| e["action"] == "removed" && e["purl"].is_string())
+        .map(|e| e["purl"].as_str().unwrap())
+        .collect();
+    assert_eq!(removed_purls, vec!["pkg:npm/__remove_test_a__@1.0.0"]);
+
+    // The artifact carrier is still present (purl-less) and reports the sweep.
+    let carrier = events
+        .iter()
+        .find(|e| e["action"] == "removed" && e["purl"].is_null())
+        .expect("artifact-level Removed carrier event must be present");
+    assert_eq!(
+        carrier["details"]["blobsRemoved"], 1,
+        "exactly A's orphaned afterHash blob should be swept; carrier={carrier}"
+    );
+
+    // B's afterHash blob is still referenced, so it must survive on disk;
+    // A's must be gone.
+    assert!(!blobs.join(AFTER_A).exists(), "A's orphaned blob must be swept");
+    assert!(blobs.join(AFTER_B).exists(), "B's referenced blob must remain");
+}
+
+// ---------------------------------------------------------------------------
 // Manifest-path override
 // ---------------------------------------------------------------------------
 

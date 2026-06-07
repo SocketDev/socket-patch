@@ -21,8 +21,8 @@ pub fn format_severity(s: &str, use_color: bool) -> String {
         return s.to_string();
     }
     match s.to_lowercase().as_str() {
-        "critical" => format!("\x1b[31m{s}\x1b[0m"),
-        "high" => format!("\x1b[91m{s}\x1b[0m"),
+        "critical" => format!("\x1b[91m{s}\x1b[0m"),
+        "high" => format!("\x1b[31m{s}\x1b[0m"),
         "medium" => format!("\x1b[33m{s}\x1b[0m"),
         "low" => format!("\x1b[36m{s}\x1b[0m"),
         _ => s.to_string(),
@@ -114,7 +114,7 @@ mod tests {
         assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
         assert!(out.contains("critical"), "expected input verbatim: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
-        assert!(out.contains("31"), "expected red code 31: {out:?}");
+        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
     }
 
     #[test]
@@ -123,7 +123,7 @@ mod tests {
         assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
         assert!(out.contains("high"), "expected input verbatim: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
-        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
+        assert!(out.contains("31"), "expected red code 31: {out:?}");
     }
 
     #[test]
@@ -150,7 +150,7 @@ mod tests {
         assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
         assert!(out.contains("CRITICAL"), "expected input verbatim: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
-        assert!(out.contains("31"), "expected red code 31: {out:?}");
+        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
     }
 
     #[test]
@@ -159,7 +159,7 @@ mod tests {
         assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
         assert!(out.contains("Critical"), "expected input verbatim: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
-        assert!(out.contains("31"), "expected red code 31: {out:?}");
+        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         assert!(out.starts_with("\x1b["), "expected ANSI prefix: {out:?}");
         assert!(out.contains("HIGH"), "expected input verbatim: {out:?}");
         assert!(out.ends_with("\x1b[0m"), "expected ANSI reset: {out:?}");
-        assert!(out.contains("91"), "expected bright-red code 91: {out:?}");
+        assert!(out.contains("31"), "expected red code 31: {out:?}");
     }
 
     #[test]
@@ -214,6 +214,41 @@ mod tests {
     fn format_severity_empty_with_color_passes_through() {
         let out = format_severity("", true);
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_severity_full_color_ramp_is_exact() {
+        // Pin every known arm to its exact wrapper so an accidental palette
+        // edit is caught, not just "contains a digit".
+        assert_eq!(format_severity("critical", true), "\x1b[91mcritical\x1b[0m");
+        assert_eq!(format_severity("high", true), "\x1b[31mhigh\x1b[0m");
+        assert_eq!(format_severity("medium", true), "\x1b[33mmedium\x1b[0m");
+        assert_eq!(format_severity("low", true), "\x1b[36mlow\x1b[0m");
+    }
+
+    #[test]
+    fn format_severity_critical_is_more_prominent_than_high() {
+        // Regression: `critical` is the worst severity and must render at
+        // least as loud as `high`. The ramp uses the high-intensity (9x) red
+        // for critical and the standard (3x) red for high; swapping them (the
+        // original bug) made `high` brighter than `critical`.
+        let crit = format_severity("critical", true);
+        let high = format_severity("high", true);
+        assert_ne!(crit, high, "critical and high must use distinct colors");
+        assert!(
+            crit.contains("\x1b[91m"),
+            "critical must use high-intensity red 91: {crit:?}"
+        );
+        assert!(
+            high.contains("\x1b[31m"),
+            "high must use standard red 31: {high:?}"
+        );
+        // Guard the inversion directly: critical must not be wrapped in the
+        // duller standard-red code that belongs to `high`.
+        assert!(
+            !crit.contains("\x1b[31m"),
+            "critical must not use the duller standard red reserved for high: {crit:?}"
+        );
     }
 
     // ---- color ----

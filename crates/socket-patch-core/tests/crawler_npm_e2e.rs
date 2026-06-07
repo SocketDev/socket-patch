@@ -509,6 +509,48 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     assert_eq!(pkg.purl, qualified);
 }
 
+/// Regression: a qualifier value that itself contains an `@`
+/// (`?vcs_url=git@github.com:...`) must NOT corrupt version parsing.
+/// `parse_purl_components` strips the `?qualifier` *before* it calls
+/// `rfind('@')` to split name from version. If those two steps were
+/// reordered, `rfind('@')` would latch onto the `@` inside `git@github`
+/// and parse a bogus version (`github.com:...`), so the package would
+/// fail to match its on-disk `1.0.0` and silently drop out of
+/// apply/rollback. The existing qualified-PURL tests only use
+/// qualifiers WITHOUT an `@`, so they cannot catch a strip-order
+/// regression — this pins it.
+#[tokio::test]
+async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    stage_npm_pkg(&nm, "foo", "1.0.0").await;
+    stage_npm_pkg(&nm, "@types/node", "20.0.0").await;
+
+    let crawler = NpmCrawler;
+    let unscoped_q = "pkg:npm/foo@1.0.0?vcs_url=git@github.com:x/y.git".to_string();
+    let scoped_q = "pkg:npm/@types/node@20.0.0?maintainer=a@b.com".to_string();
+    let result = crawler
+        .find_by_purls(&nm, &[unscoped_q.clone(), scoped_q.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 2, "both @-bearing qualifiers must resolve");
+    let foo = result
+        .get(&unscoped_q)
+        .expect("@-in-qualifier unscoped PURL must resolve to foo@1.0.0");
+    assert_eq!(foo.name, "foo");
+    assert_eq!(foo.version, "1.0.0");
+    assert_eq!(foo.purl, unscoped_q);
+
+    let node = result
+        .get(&scoped_q)
+        .expect("@-in-qualifier scoped PURL must resolve to @types/node@20.0.0");
+    assert_eq!(node.namespace.as_deref(), Some("@types"));
+    assert_eq!(node.name, "node");
+    assert_eq!(node.version, "20.0.0");
+    assert_eq!(node.purl, scoped_q);
+}
+
 /// PURL with no `@` (no version separator) must be rejected via the
 /// `rfind('@')?` arm (line 707).
 #[tokio::test]

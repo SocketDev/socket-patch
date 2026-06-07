@@ -149,11 +149,21 @@ async fn preview_apply_gc(
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
 ) -> GcSummary {
-    let manifest = match read_manifest(manifest_path).await {
+    let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         _ => return GcSummary::default(),
     };
     let prunable = detect_prunable(&manifest, scanned_purls);
+    // Mirror `run_apply_gc`: drop the prunable entries from the manifest
+    // *before* computing orphans (no write — this is the preview). The
+    // cleanup helpers derive the "referenced" blob/archive set from the
+    // manifest they're handed, so leaving the prunable entries in place
+    // would keep their blobs marked as used and the preview would
+    // under-report `orphan*`/`bytesReclaimable` relative to what the real
+    // `--prune`/`--sync` run actually frees.
+    for purl in &prunable {
+        manifest.patches.remove(purl);
+    }
     run_gc(&manifest, prunable, socket_dir, /*dry_run=*/true).await
 }
 
@@ -1466,6 +1476,128 @@ mod tests {
         ]);
         let out = detect_prunable(&m, &scanned(&[]));
         assert_eq!(out.len(), 2, "all variants of a gone package should prune");
+    }
+
+    // ---- preview_apply_gc / run_apply_gc parity ----------------------------
+    // The dry-run preview MUST report the same orphan blobs/archives the real
+    // (wet) prune would remove. Both delete the prunable manifest entries
+    // first, then sweep; the cleanup helpers derive the "still referenced"
+    // blob set from the manifest they're handed, so a preview that swept
+    // against the un-pruned manifest would keep the prunable entries' blobs
+    // marked "used" and under-report `orphan*`/`bytesReclaimable`.
+
+    /// Write a manifest holding a single entry that references one afterHash
+    /// blob, plant that blob on disk, and return `(manifest_path, socket_dir,
+    /// blob_path)`.
+    fn seed_manifest_with_blob(
+        tmp: &std::path::Path,
+        purl: &str,
+        after_hash: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let socket_dir = tmp.join(".socket");
+        let blobs_dir = socket_dir.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let blob_path = blobs_dir.join(after_hash);
+        // Non-trivial size so `bytesReclaimable`/`bytesFreed` is observably > 0.
+        std::fs::write(&blob_path, vec![0u8; 64]).unwrap();
+
+        let manifest_path = socket_dir.join("manifest.json");
+        let manifest = serde_json::json!({
+            "patches": {
+                purl: {
+                    "uuid": "11111111-1111-4111-8111-111111111111",
+                    "exportedAt": "2024-01-01T00:00:00Z",
+                    "files": {
+                        "package/index.js": {
+                            "beforeHash": "0".repeat(64),
+                            "afterHash": after_hash,
+                        }
+                    },
+                    "vulnerabilities": {},
+                    "description": "seed",
+                    "license": "MIT",
+                    "tier": "free",
+                }
+            }
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        (manifest_path, socket_dir, blob_path)
+    }
+
+    #[tokio::test]
+    async fn preview_apply_gc_reports_blobs_of_prunable_entry() {
+        // The package is not installed (empty scan), so its entry is prunable
+        // and its only blob is reclaimable. A correct PREVIEW must count that
+        // blob even though it is still referenced by the not-yet-pruned entry.
+        let tmp = tempfile::tempdir().unwrap();
+        let after_hash = "a".repeat(64);
+        let (manifest_path, socket_dir, blob_path) =
+            seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
+
+        let scanned: HashSet<String> = HashSet::new();
+        let preview = preview_apply_gc(&manifest_path, &socket_dir, &scanned).await;
+
+        assert_eq!(
+            preview.pruned,
+            vec!["pkg:npm/gone@1.0.0".to_string()],
+            "preview must list the uninstalled entry as prunable"
+        );
+        assert_eq!(
+            preview.blobs.blobs_removed, 1,
+            "preview must count the prunable entry's blob as an orphan \
+             (regression: it was masked because the entry still referenced it)"
+        );
+        assert!(
+            preview.total_bytes() > 0,
+            "bytesReclaimable must be > 0 when an orphan blob would be freed"
+        );
+        // Preview is non-mutating: blob and manifest untouched.
+        assert!(blob_path.exists(), "dry-run preview must not delete the blob");
+        let m = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            m.patches.contains_key("pkg:npm/gone@1.0.0"),
+            "dry-run preview must not prune the manifest entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_and_apply_gc_agree_on_orphan_counts() {
+        // The preview's reclaimable counts must equal what the wet run frees.
+        let after_hash = "b".repeat(64);
+
+        let tmp_preview = tempfile::tempdir().unwrap();
+        let (mp_p, sd_p, blob_p) =
+            seed_manifest_with_blob(tmp_preview.path(), "pkg:npm/gone@1.0.0", &after_hash);
+        let scanned: HashSet<String> = HashSet::new();
+        let preview = preview_apply_gc(&mp_p, &sd_p, &scanned).await;
+        assert!(blob_p.exists(), "preview must not mutate");
+
+        let tmp_wet = tempfile::tempdir().unwrap();
+        let (mp_w, sd_w, blob_w) =
+            seed_manifest_with_blob(tmp_wet.path(), "pkg:npm/gone@1.0.0", &after_hash);
+        let wet = run_apply_gc(&mp_w, &sd_w, &scanned).await;
+
+        assert_eq!(
+            preview.blobs.blobs_removed, wet.blobs.blobs_removed,
+            "preview and wet run must agree on the orphan-blob count"
+        );
+        assert_eq!(
+            preview.total_bytes(),
+            wet.total_bytes(),
+            "preview and wet run must agree on reclaimable bytes"
+        );
+        assert_eq!(preview.pruned, wet.pruned, "prunable set must match");
+        // The wet run actually removed the blob and pruned the entry.
+        assert!(!blob_w.exists(), "wet run must delete the orphan blob");
+        let m = read_manifest(&mp_w).await.unwrap().unwrap();
+        assert!(
+            !m.patches.contains_key("pkg:npm/gone@1.0.0"),
+            "wet run must prune the entry"
+        );
     }
 
     // ---- collect_vuln_ids --------------------------------------------------

@@ -249,6 +249,23 @@ impl NuGetCrawler {
 
             let ver_name = ver_entry.file_name();
             let ver_str = ver_name.to_string_lossy();
+
+            // A global-cache name directory contains only *version*
+            // subdirectories, and a NuGet version always begins with a
+            // numeric major component (SemVer). A legacy
+            // `<Name>.<Version>/` package, by contrast, contains content
+            // folders (`lib/`, `tools/`, `runtimes/`, `build/`, …), none
+            // of which start with a digit. Without this shape check, a
+            // legacy package whose content folder happens to verify (e.g.
+            // a `tools/lib/` tool package missing its top-level `.nuspec`)
+            // would be misread as a global-cache layout and emitted with a
+            // garbage `@<folder>` version (e.g. `pkg:nuget/Foo.1.0.0@tools`)
+            // — masking the real `pkg:nuget/Foo@1.0.0` the legacy branch
+            // would otherwise produce.
+            if !ver_str.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+
             let ver_path = name_dir.join(&*ver_str);
 
             if self.verify_nuget_package(&ver_path).await {
@@ -783,6 +800,119 @@ mod tests {
         .await
         .unwrap();
         assert!(super::is_dotnet_project(dir.path()).await);
+    }
+
+    /// Regression: a well-formed legacy `<Name>.<Version>/` package that
+    /// also ships a content folder containing a `lib/` (a common tool /
+    /// runtime layout, e.g. `tools/lib/`) must still be reported with its
+    /// real identity. Before the version-shape gate in
+    /// `scan_global_cache_package`, the content folder verified and was
+    /// mistaken for a version directory, so the package was emitted as a
+    /// garbage `pkg:nuget/Foo.1.0.0@tools` and the real
+    /// `pkg:nuget/Foo@1.0.0` (which the legacy branch would have produced)
+    /// was lost to the `continue`.
+    #[tokio::test]
+    async fn test_legacy_pkg_with_nested_lib_folder_is_not_misparsed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let pkg = dir.path().join("Foo.1.0.0");
+        // Top-level marker — this is a valid legacy package.
+        tokio::fs::create_dir_all(pkg.join("lib")).await.unwrap();
+        // A content folder that itself contains a lib/ dir. This is what
+        // tripped the old global-cache heuristic.
+        tokio::fs::create_dir_all(pkg.join("tools").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let pkgs = crawler.crawl_all(&options).await;
+        let purls: Vec<&str> = pkgs.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(
+            purls,
+            vec!["pkg:nuget/Foo@1.0.0"],
+            "legacy package must report its real identity, not a content folder; got {pkgs:?}"
+        );
+    }
+
+    /// Regression companion: a *malformed* legacy package (no top-level
+    /// `lib/` or `.nuspec`, only a nested verifying content folder) must
+    /// yield nothing rather than a garbage `@<folder>` package.
+    #[tokio::test]
+    async fn test_legacy_pkg_missing_marker_with_nested_lib_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let pkg = dir.path().join("Foo.1.0.0");
+        tokio::fs::create_dir_all(pkg.join("tools").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let pkgs = crawler.crawl_all(&options).await;
+        assert!(
+            pkgs.is_empty(),
+            "an unverifiable legacy dir must not emit a garbage version; got {pkgs:?}"
+        );
+    }
+
+    /// Guard the version-shape gate itself: a genuine global-cache package
+    /// (whose version dir starts with a digit) must still be discovered,
+    /// including multiple versions of the same id.
+    #[tokio::test]
+    async fn test_global_cache_multi_version_still_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for v in ["13.0.1", "13.0.3"] {
+            let p = dir.path().join("newtonsoft.json").join(v);
+            tokio::fs::create_dir_all(p.join("lib")).await.unwrap();
+        }
+        // A non-version sibling dir under the id (should be ignored, not
+        // emitted as `@tools`).
+        tokio::fs::create_dir_all(
+            dir.path()
+                .join("newtonsoft.json")
+                .join("tools")
+                .join("lib"),
+        )
+        .await
+        .unwrap();
+
+        let crawler = NuGetCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let mut purls: Vec<String> = crawler
+            .crawl_all(&options)
+            .await
+            .iter()
+            .map(|p| p.purl.clone())
+            .collect();
+        purls.sort_unstable();
+        assert_eq!(
+            purls,
+            vec![
+                "pkg:nuget/newtonsoft.json@13.0.1".to_string(),
+                "pkg:nuget/newtonsoft.json@13.0.3".to_string(),
+            ],
+            "both versions discovered, non-version sibling ignored"
+        );
     }
 
     #[tokio::test]

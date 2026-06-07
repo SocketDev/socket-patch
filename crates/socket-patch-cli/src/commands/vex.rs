@@ -239,13 +239,6 @@ pub async fn run(args: VexArgs) -> i32 {
     }
 }
 
-/// Core VEX pipeline shared by the standalone `vex` command and the
-/// embedded `apply`/`scan` `--vex` paths: resolve the product, verify the
-/// manifest against disk (unless `no_verify`), build the OpenVEX document,
-/// serialize, write (or print to stdout when `output` is `None`), and fire
-/// telemetry. Returns a [`VexWriteSummary`] on success or a structured
-/// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
-/// telemetry is fired here so every caller reports consistently.
 /// Map a `setup.manual` entry to an `Ecosystem`. Accepts the canonical
 /// `cli_name` plus the friendly aliases `setup --exclude`/`--ecosystems` accept
 /// (`go`/`golang`, `python`/`pypi`, `ruby`/`gem`, `php`/`composer`). Names for
@@ -275,6 +268,13 @@ fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
     }
 }
 
+/// Core VEX pipeline shared by the standalone `vex` command and the
+/// embedded `apply`/`scan` `--vex` paths: resolve the product, verify the
+/// manifest against disk (unless `no_verify`), build the OpenVEX document,
+/// serialize, write (or print to stdout when `output` is `None`), and fire
+/// telemetry. Returns a [`VexWriteSummary`] on success or a structured
+/// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
+/// telemetry is fired here so every caller reports consistently.
 pub(crate) async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
@@ -599,6 +599,28 @@ mod tests {
         assert_eq!(ecosystem_from_manual_name("nuget"), Some(Ecosystem::Nuget));
         #[cfg(feature = "deno")]
         assert_eq!(ecosystem_from_manual_name("deno"), Some(Ecosystem::Deno));
+    }
+
+    // Property 7 completeness, the reverse direction of the test above and
+    // future-proof: every ecosystem the build can classify a PURL for (i.e.
+    // every `Ecosystem::all()` variant) MUST round-trip through its canonical
+    // `cli_name` back to itself via `ecosystem_from_manual_name`. Otherwise a
+    // `manual`-declared patch for that ecosystem would be silently dropped from
+    // the VEX doc by the `retain` in `generate_vex`. Iterating `all()` (rather
+    // than hard-coding names) means adding a new ecosystem without wiring up its
+    // `manual` alias fails this test instead of shipping a silent drop.
+    #[test]
+    fn every_compiled_ecosystem_is_declarable_manual_via_cli_name() {
+        for &e in Ecosystem::all() {
+            assert_eq!(
+                ecosystem_from_manual_name(e.cli_name()),
+                Some(e),
+                "ecosystem {:?} (cli_name {:?}) is not reachable via ecosystem_from_manual_name — \
+                 its `manual`-declared patches would be silently dropped from VEX",
+                e,
+                e.cli_name(),
+            );
+        }
     }
 
     #[derive(Parser)]

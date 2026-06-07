@@ -240,6 +240,28 @@ mod tests {
         assert_eq!(code, 0);
     }
 
+    /// A stale lock *file* left on disk by a crashed run — with **no**
+    /// live OS holder — must read as `free` (exit 0), and a plain probe
+    /// must leave that file in place. Guards against a regression where
+    /// the verdict keys off `apply.lock` merely *existing* rather than
+    /// off a live advisory lock. (The e2e suite proves this via a
+    /// release-then-reprobe; this pins it at the unit level too.)
+    #[tokio::test]
+    async fn run_reports_free_when_stale_lock_file_present_but_not_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        // Leftover file, but nobody holds the OS lock.
+        std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
+
+        let code = run(args_in(dir.path(), false)).await;
+        assert_eq!(code, 0, "an unheld leftover lock file must read as free");
+        assert!(
+            socket_dir.join("apply.lock").is_file(),
+            "a plain (no --release) probe must not delete the file"
+        );
+    }
+
     /// Active holder (via core `acquire`) → `unlock` reports
     /// `held`, exits 1, and the file remains on disk.
     #[tokio::test]
@@ -292,6 +314,26 @@ mod tests {
         assert!(
             !socket_dir.join("apply.lock").exists(),
             "--release must not leave a probe-created lock file behind"
+        );
+    }
+
+    /// `--release` against a stale (unheld) leftover removes it and
+    /// exits 0 — the recovery path. Distinct from
+    /// `run_deletes_lock_file_when_release_and_free` only in intent
+    /// (post-crash leftover), but kept as a named guard so the
+    /// stale-file recovery contract is explicit.
+    #[tokio::test]
+    async fn run_release_removes_stale_unheld_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join(".socket");
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::write(socket_dir.join("apply.lock"), b"crashed-run-leftover").unwrap();
+
+        let code = run(args_in(dir.path(), true)).await;
+        assert_eq!(code, 0);
+        assert!(
+            !socket_dir.join("apply.lock").exists(),
+            "--release must remove an unheld stale lock file"
         );
     }
 

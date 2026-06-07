@@ -295,8 +295,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 // is non-zero so the `rolledBack` count is still reported
                 // even when no blobs happened to be swept (e.g. the removed
                 // patch's afterHash blobs are still referenced elsewhere).
+                //
+                // Pushed directly rather than via `env.record`: this is a
+                // purl-less metadata carrier, not a removed manifest entry.
+                // The per-purl events above are the authoritative
+                // patch-removal count, so `summary.removed` must equal the
+                // number of entries deleted (`removed.len()`) — letting this
+                // carrier bump `removed` too would double-count, reporting
+                // e.g. `removed: 2` for a single-patch removal that happened
+                // to sweep an orphan blob. Consumers read the blob/rollback
+                // totals from `details`, never from `summary.removed`.
                 if blobs_removed > 0 || rollback_count > 0 {
-                    env.record(
+                    env.events.push(
                         PatchEvent::artifact(PatchAction::Removed).with_details(serde_json::json!({
                             "blobsRemoved": blobs_removed,
                             "rolledBack": rollback_count,

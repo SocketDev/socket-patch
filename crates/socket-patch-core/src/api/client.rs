@@ -168,40 +168,25 @@ impl ApiClient {
     ) -> Result<Option<T>, ApiError> {
         let status = resp.status();
 
-        match status {
-            StatusCode::OK => {
-                let body = resp
-                    .json::<T>()
-                    .await
-                    .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
-                Ok(Some(body))
-            }
-            StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized(
-                "Unauthorized: Invalid API token".into(),
-            )),
-            StatusCode::FORBIDDEN => {
-                let msg = if use_public_proxy {
-                    "Forbidden: This patch is only available to paid subscribers. \
-                     Sign up at https://socket.dev to access paid patches."
-                } else {
-                    "Forbidden: Access denied. This may be a paid patch or \
-                     you may not have access to this organization."
-                };
-                Err(ApiError::Forbidden(msg.into()))
-            }
-            StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited(
-                "Rate limit exceeded. Please try again later.".into(),
-            )),
-            _ => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(ApiError::Other(format!(
-                    "API request failed with status {}: {}",
-                    status.as_u16(),
-                    text
-                )))
-            }
+        if status == StatusCode::OK {
+            let body = resp
+                .json::<T>()
+                .await
+                .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+            return Ok(Some(body));
         }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if let Some(err) = classify_auth_error(status, use_public_proxy) {
+            return Err(err);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(ApiError::Other(format!(
+            "API request failed with status {}: {}",
+            status.as_u16(),
+            text
+        )))
     }
 
     // ── Public API methods ────────────────────────────────────────────
@@ -520,28 +505,36 @@ impl ApiClient {
 
         let status = resp.status();
 
-        match status {
-            StatusCode::OK => {
-                let bytes = resp.bytes().await.map_err(|e| {
-                    ApiError::Network(format!(
-                        "Error reading {} body for {}: {}",
-                        label, identifier, e
-                    ))
-                })?;
-                Ok(Some(bytes.to_vec()))
-            }
-            StatusCode::NOT_FOUND => Ok(None),
-            _ => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(ApiError::Other(format!(
-                    "Failed to fetch {} {}: status {} - {}",
-                    label,
-                    identifier,
-                    status.as_u16(),
-                    text,
-                )))
-            }
+        if status == StatusCode::OK {
+            let bytes = resp.bytes().await.map_err(|e| {
+                ApiError::Network(format!(
+                    "Error reading {} body for {}: {}",
+                    label, identifier, e
+                ))
+            })?;
+            return Ok(Some(bytes.to_vec()));
         }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        // Classify 401/403/429 identically to the JSON transport path
+        // (`handle_json_response`). Without this an authenticated blob/diff/
+        // package fetch that 401s/403s would surface as `ApiError::Other`,
+        // which `is_fallback_candidate` ignores — silently disabling the
+        // auth→proxy fallback for binary downloads. `use_auth` is the
+        // authenticated-endpoint flag, so `!use_auth` is the proxy case that
+        // drives the paid-patch wording.
+        if let Some(err) = classify_auth_error(status, !use_auth) {
+            return Err(err);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(ApiError::Other(format!(
+            "Failed to fetch {} {}: status {} - {}",
+            label,
+            identifier,
+            status.as_u16(),
+            text,
+        )))
     }
 }
 
@@ -765,6 +758,41 @@ pub fn validate_token_shape(token: &str) -> Option<String> {
 /// so they remain visible to the operator.
 pub fn is_fallback_candidate(err: &ApiError) -> bool {
     matches!(err, ApiError::Unauthorized(_) | ApiError::Forbidden(_))
+}
+
+/// Map the well-known auth / rate-limit HTTP statuses (401 / 403 / 429) to
+/// their tailored [`ApiError`] variant. Returns `None` for any other status,
+/// leaving `OK` / `404` / fallthrough handling to the caller.
+///
+/// Shared by both transport paths — the JSON [`ApiClient::handle_json_response`]
+/// *and* the binary [`ApiClient::fetch_binary`] — so a 401/403 is classified
+/// identically regardless of whether the body is JSON or octet-stream. This is
+/// what [`is_fallback_candidate`] keys on to reroute auth→proxy: a binary
+/// download that buried these statuses under [`ApiError::Other`] would silently
+/// skip the fallback (and lose the operator-facing message).
+///
+/// `use_public_proxy` selects the 403 wording (paid-subscriber hint vs.
+/// org-access hint).
+fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<ApiError> {
+    match status {
+        StatusCode::UNAUTHORIZED => Some(ApiError::Unauthorized(
+            "Unauthorized: Invalid API token".into(),
+        )),
+        StatusCode::FORBIDDEN => {
+            let msg = if use_public_proxy {
+                "Forbidden: This patch is only available to paid subscribers. \
+                 Sign up at https://socket.dev to access paid patches."
+            } else {
+                "Forbidden: Access denied. This may be a paid patch or \
+                 you may not have access to this organization."
+            };
+            Some(ApiError::Forbidden(msg.into()))
+        }
+        StatusCode::TOO_MANY_REQUESTS => Some(ApiError::RateLimited(
+            "Rate limit exceeded. Please try again later.".into(),
+        )),
+        _ => None,
+    }
 }
 
 /// Choose an org slug from the list returned by `/v0/organizations`.
@@ -1422,6 +1450,60 @@ mod tests {
             !msg.contains("(22 chars)"),
             "byte count must not leak into the char-labeled message; got: {msg}"
         );
+    }
+
+    // ── classify_auth_error: shared 401/403/429 classification ──────────
+    //
+    // Regression: `fetch_binary` used to fold *every* non-OK/404 status into
+    // `ApiError::Other`, so an authenticated blob/diff/package fetch that
+    // 401'd/403'd was never recognized by `is_fallback_candidate` and the
+    // auth→proxy fallback silently never fired. Both transport paths now route
+    // through this shared classifier; these pin its contract directly.
+
+    #[test]
+    fn classify_auth_error_maps_401_to_unauthorized() {
+        let err = classify_auth_error(StatusCode::UNAUTHORIZED, false)
+            .expect("401 must classify");
+        assert!(matches!(err, ApiError::Unauthorized(_)));
+        assert!(is_fallback_candidate(&err), "401 must drive the proxy fallback");
+    }
+
+    #[test]
+    fn classify_auth_error_maps_403_to_forbidden_with_proxy_wording() {
+        // Proxy path (use_public_proxy = true) → paid-subscriber hint.
+        let proxy = classify_auth_error(StatusCode::FORBIDDEN, true).expect("403 classifies");
+        assert!(matches!(proxy, ApiError::Forbidden(_)));
+        assert!(is_fallback_candidate(&proxy), "403 must drive the proxy fallback");
+        assert!(
+            proxy.to_string().contains("paid subscribers"),
+            "proxy 403 must carry the paid-subscriber hint; got: {proxy}"
+        );
+
+        // Authenticated path (use_public_proxy = false) → org-access wording.
+        let auth = classify_auth_error(StatusCode::FORBIDDEN, false).expect("403 classifies");
+        assert!(
+            auth.to_string().contains("organization"),
+            "authenticated 403 must carry the org-access wording; got: {auth}"
+        );
+    }
+
+    #[test]
+    fn classify_auth_error_maps_429_to_rate_limited() {
+        let err = classify_auth_error(StatusCode::TOO_MANY_REQUESTS, false)
+            .expect("429 must classify");
+        assert!(matches!(err, ApiError::RateLimited(_)));
+        // Rate limits are intentionally *not* a fallback candidate — they
+        // surface as-is so the operator sees them.
+        assert!(!is_fallback_candidate(&err));
+    }
+
+    #[test]
+    fn classify_auth_error_returns_none_for_other_statuses() {
+        // OK / 404 / 5xx are handled by the caller, not this classifier.
+        assert!(classify_auth_error(StatusCode::OK, false).is_none());
+        assert!(classify_auth_error(StatusCode::NOT_FOUND, false).is_none());
+        assert!(classify_auth_error(StatusCode::INTERNAL_SERVER_ERROR, false).is_none());
+        assert!(classify_auth_error(StatusCode::BAD_GATEWAY, true).is_none());
     }
 
     #[test]

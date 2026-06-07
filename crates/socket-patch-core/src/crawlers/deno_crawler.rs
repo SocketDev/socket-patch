@@ -420,6 +420,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_by_purls_skips_when_version_path_is_a_file() {
+        // Malformed layout: the `<scope>/<name>/<version>` leaf is a
+        // regular file, not the expected version directory. The `is_dir`
+        // gate must reject it rather than emit a CrawledPackage whose
+        // `path` points at a non-directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let name_dir = tmp.path().join("@std").join("path");
+        tokio::fs::create_dir_all(&name_dir).await.unwrap();
+        tokio::fs::write(name_dir.join("0.220.0"), b"not a dir")
+            .await
+            .unwrap();
+
+        let crawler = DenoCrawler;
+        let result = crawler
+            .find_by_purls(tmp.path(), &["pkg:jsr/@std/path@0.220.0".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            result.is_empty(),
+            "a file at the version path must not resolve, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_tolerates_malformed_tree_without_emitting_phantoms() {
+        // A grab-bag of malformed shapes that must all be skipped without
+        // panicking: an empty scope dir, a scoped package with no version
+        // dirs, and a non-`@` top-level dir holding a version-shaped tree.
+        let tmp = tempfile::tempdir().unwrap();
+        // The one real package.
+        stage(tmp.path(), "@std", "path", "0.220.0").await;
+        // Empty scope dir — no name children.
+        tokio::fs::create_dir_all(tmp.path().join("@empty"))
+            .await
+            .unwrap();
+        // Scoped package whose name dir has no version children.
+        tokio::fs::create_dir_all(tmp.path().join("@std").join("nover"))
+            .await
+            .unwrap();
+        // Non-`@` top-level dir with an otherwise-valid-looking subtree.
+        tokio::fs::create_dir_all(tmp.path().join("bare").join("pkg").join("1.0.0"))
+            .await
+            .unwrap();
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        scan_jsr_cache(tmp.path(), &mut seen, &mut out).await;
+
+        assert_eq!(out.len(), 1, "got {:?}", out);
+        assert_eq!(out[0].purl, "pkg:jsr/@std/path@0.220.0");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crawl_all_local_without_marker_returns_empty() {
+        // crawl_all in LOCAL mode (no global / no prefix) must yield
+        // nothing when the cwd has no Deno project marker, even if a
+        // populated cache is reachable via DENO_DIR. Guards the
+        // project-marker gate wiring through crawl_all, not just
+        // get_jsr_cache_paths in isolation.
+        let project = tempfile::tempdir().unwrap();
+        let deno_home = tempfile::tempdir().unwrap();
+        let jsr = deno_home.path().join("npm").join("jsr.io");
+        stage(&jsr, "@std", "path", "0.220.0").await;
+        let _g = EnvGuard::set("DENO_DIR", deno_home.path().to_str().unwrap());
+
+        let crawler = DenoCrawler;
+        let opts = CrawlerOptions {
+            cwd: project.path().to_path_buf(), // no deno.json/.jsonc/.lock
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+        assert!(crawler.crawl_all(&opts).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn find_by_purls_skips_absent_version_keeps_present() {
         let tmp = tempfile::tempdir().unwrap();
         stage(tmp.path(), "@std", "path", "0.220.0").await;

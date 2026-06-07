@@ -81,13 +81,65 @@ pub async fn read_manifest(
 }
 
 /// Write a manifest to the filesystem with pretty-printed JSON.
+///
+/// The write is atomic: the JSON is staged in a sibling temp file, fsync'd,
+/// then renamed over `path`. A bare `tokio::fs::write` would truncate the
+/// existing manifest up front and stream the bytes in place, so a crash (or
+/// ENOSPC) mid-write leaves a half-written file on disk. That matters here
+/// because [`read_manifest`] treats malformed JSON as a hard `InvalidData`
+/// error -- a torn manifest would brick every subsequent command
+/// (apply/list/remove/rollback/repair) rather than degrading gracefully.
+/// Staging + rename guarantees readers only ever observe the old or the new
+/// manifest, never a partial one.
 pub async fn write_manifest(
     path: impl AsRef<Path>,
     manifest: &PatchManifest,
 ) -> Result<(), std::io::Error> {
+    let path = path.as_ref();
     let content = serde_json::to_string_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(path, content).await
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "manifest.json".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // Durability: `sync_all` flushed the file's data, but the rename only
+    // updated the parent directory entry. fsync the directory so the rename
+    // itself survives a crash. Unix only; best-effort, since a directory we
+    // can't open for fsync must not fail an otherwise-successful write.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -370,6 +422,72 @@ mod tests {
         assert!(read_back.is_some());
         let read_back = read_back.unwrap();
         assert_eq!(read_back.patches.len(), 2);
+    }
+
+    // Regression: write_manifest must be atomic -- it stages a temp file and
+    // renames it over the target. After a successful write, no `.socket-stage-*`
+    // litter may remain in the directory (a leaked stage file would accumulate
+    // and could be mistaken for a manifest by directory walkers).
+    #[tokio::test]
+    async fn test_write_manifest_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        let manifest = create_test_manifest();
+        write_manifest(&path, &manifest).await.unwrap();
+        // Overwrite a second time to exercise the rename-over-existing path.
+        write_manifest(&path, &manifest).await.unwrap();
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "atomic write must not leave a staging file behind, found {name}"
+            );
+        }
+        // Final file must be a single, fully-readable manifest.
+        assert_eq!(read_manifest(&path).await.unwrap().unwrap(), manifest);
+    }
+
+    // Regression: a failed write_manifest must NOT clobber an existing, valid
+    // manifest. Because the new content is staged in a temp file and only
+    // rename()d over the target on success, a write that fails before the
+    // rename (here: the target's parent directory does not exist, so even
+    // staging fails) leaves any prior manifest untouched. This is the property
+    // that prevents a half-written manifest from bricking later commands.
+    #[tokio::test]
+    async fn test_write_manifest_failure_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        // Establish a valid, on-disk manifest.
+        let original = create_test_manifest();
+        write_manifest(&path, &original).await.unwrap();
+
+        // A write that fails before the rename: target's parent dir is missing,
+        // so staging the temp file (create_new in the missing parent) errors.
+        let bad = dir.path().join("does-not-exist").join("manifest.json");
+        let mut other = create_test_manifest();
+        other.patches.clear(); // a different payload, so we'd notice a clobber
+        let result = write_manifest(&bad, &other).await;
+        assert!(result.is_err(), "writing into a missing dir must fail");
+
+        // The pre-existing manifest is untouched (atomicity: nothing is mutated
+        // unless the staged write fully succeeds and renames into place).
+        assert_eq!(read_manifest(&path).await.unwrap().unwrap(), original);
+
+        // No stage litter leaked into the dir alongside the good manifest.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".socket-stage-"),
+                "a failed write must not leave stage litter, found {name}"
+            );
+        }
     }
 
     #[test]

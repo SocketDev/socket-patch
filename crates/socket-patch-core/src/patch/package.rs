@@ -105,22 +105,55 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
         let normalized = normalize_entry_path(&path_str).to_string();
         let normalized_path = Path::new(&normalized);
 
-        // Reject absolute paths or any `..` components.
+        // This is THE path-safety chokepoint for archive entries (see the
+        // module note): every entry must be a *relative* path that stays
+        // strictly inside the package directory. The bytes are later joined
+        // onto `pkg_path` and written, so anything that escapes here escapes
+        // for real. Reject, in order:
         //
-        // `Path::is_absolute()` is platform-aware: on Windows it requires
-        // a drive letter or UNC prefix, so a tar entry like `/etc/passwd`
-        // is NOT considered absolute and would slip through. Explicitly
-        // check the leading byte for `/` and `\` so the guard rejects
-        // POSIX-style absolute paths on every platform.
+        //  - Empty paths. A normalized path of "" (e.g. a raw entry named
+        //    `package/`) resolves to the package directory *itself*; joining
+        //    "" onto `pkg_path` yields `pkg_path`, so a write would target
+        //    the directory. `.` / `./` collapse the same way — neither names
+        //    a file, so both are caught by the "must contain a real segment"
+        //    rule below.
+        //  - NUL bytes. A path like `safe.txt\0../../etc/passwd` can be read
+        //    one way by Rust's `OsStr` and another by a C string boundary;
+        //    refuse the ambiguity outright (mirrors `is_safe_relative_subpath`
+        //    in apply.rs).
+        //  - Leading `/` or `\`. `Path::is_absolute()` is platform-aware: on
+        //    Windows it needs a drive/UNC prefix, so `/etc/passwd` is NOT
+        //    "absolute" there and would slip through; on Unix a leading `\`
+        //    is an ordinary char. Checking the raw leading byte rejects both
+        //    POSIX- and Windows-style root-relative paths on every platform.
+        //  - Any component that isn't a plain name or `.`. This rejects `..`
+        //    parent traversal, a root component, AND a Windows drive prefix
+        //    such as `C:foo` (`Component::Prefix`), which `is_absolute()`
+        //    reports as non-absolute and the old `any(ParentDir)` check
+        //    missed entirely.
+        //  - Paths with no real segment at all (`.`, `./`), which would
+        //    otherwise pass the component filter but still resolve to the
+        //    package directory.
+        use std::path::Component;
         let leading_separator = normalized
             .as_bytes()
             .first()
             .is_some_and(|b| *b == b'/' || *b == b'\\');
-        if normalized_path.is_absolute()
+        let mut saw_normal_component = false;
+        let all_components_safe = normalized_path.components().all(|c| match c {
+            Component::Normal(_) => {
+                saw_normal_component = true;
+                true
+            }
+            Component::CurDir => true,
+            _ => false,
+        });
+        if normalized.is_empty()
+            || normalized.as_bytes().contains(&0)
             || leading_separator
-            || normalized_path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || normalized_path.is_absolute()
+            || !all_components_safe
+            || !saw_normal_component
         {
             return Err(ArchiveError::UnsafePath(path_str));
         }
@@ -364,6 +397,144 @@ mod tests {
 
         let err = read_archive_to_map(&archive).unwrap_err();
         assert!(matches!(err, ArchiveError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn test_read_archive_rejects_empty_normalized_path() {
+        // A raw regular-file entry named `package/` normalizes to "" — which
+        // resolves to the package directory itself (`pkg_path.join("")` ==
+        // `pkg_path`). Such an entry must be rejected, not handed downstream
+        // as a writable "file".
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"package/", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::UnsafePath(_)),
+            "empty normalized path must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_archive_rejects_curdir_only_path() {
+        // `.` (and `./`) name no file — they collapse to the package
+        // directory. They have a CurDir component but no Normal component,
+        // so the "must contain a real segment" rule must reject them.
+        let dir = tempfile::tempdir().unwrap();
+        for name in [&b"."[..], &b"./"[..]] {
+            let archive = dir.path().join("arc.tar.gz");
+            write_raw_archive(&archive, name, b"evil");
+            let err = read_archive_to_map(&archive).unwrap_err();
+            assert!(
+                matches!(err, ArchiveError::UnsafePath(_)),
+                "curdir-only path {:?} must be rejected, got {err:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// Build one 512-byte ustar header block for `name`/`typeflag`/`size`.
+    fn ustar_block(name: &[u8], typeflag: u8, size: u64) -> [u8; 512] {
+        let mut block = [0u8; 512];
+        let copy_len = name.len().min(100);
+        block[..copy_len].copy_from_slice(&name[..copy_len]);
+        block[100..108].copy_from_slice(b"0000644\0");
+        let size_str = format!("{:011o}", size);
+        block[124..135].copy_from_slice(size_str.as_bytes());
+        block[135] = 0;
+        block[136..147].copy_from_slice(b"00000000000");
+        block[147] = 0;
+        block[156] = typeflag;
+        block[257..263].copy_from_slice(b"ustar\0");
+        block[263..265].copy_from_slice(b"00");
+        block[148..156].fill(b' ');
+        let sum: u32 = block.iter().map(|&b| b as u32).sum();
+        let sum_str = format!("{:06o}\0 ", sum);
+        block[148..156].copy_from_slice(sum_str.as_bytes());
+        block
+    }
+
+    /// Write a `.tar.gz` whose single regular-file entry carries `long_name`
+    /// via a GNU `././@LongLink` (typeflag `L`) pseudo-entry. This is the only
+    /// way to smuggle bytes a plain ustar name field can't hold — notably an
+    /// embedded NUL (the ustar name field is NUL-terminated).
+    fn write_gnu_longname_archive(path: &Path, long_name: &[u8], data: &[u8]) {
+        let mut tar_bytes = Vec::new();
+        // GNU long-name body = the name plus a single trailing NUL (the tar
+        // reader trims exactly one trailing NUL, preserving any embedded ones).
+        let mut lname = long_name.to_vec();
+        lname.push(0);
+        tar_bytes.extend_from_slice(&ustar_block(b"././@LongLink", b'L', lname.len() as u64));
+        tar_bytes.extend_from_slice(&lname);
+        let pad = (512 - (lname.len() % 512)) % 512;
+        tar_bytes.extend(std::iter::repeat_n(0u8, pad));
+        // The real entry. Its own name field is a harmless placeholder; the
+        // preceding long-name entry overrides it.
+        tar_bytes.extend_from_slice(&ustar_block(b"placeholder", b'0', data.len() as u64));
+        tar_bytes.extend_from_slice(data);
+        let pad = if data.is_empty() {
+            0
+        } else {
+            (512 - (data.len() % 512)) % 512
+        };
+        tar_bytes.extend(std::iter::repeat_n(0u8, pad));
+        tar_bytes.extend([0u8; 1024]);
+
+        let file = std::fs::File::create(path).unwrap();
+        let mut gz = GzEncoder::new(file, Compression::default());
+        gz.write_all(&tar_bytes).unwrap();
+        gz.finish().unwrap();
+    }
+
+    #[test]
+    fn test_read_archive_rejects_nul_byte_path() {
+        // A plain ustar name field is NUL-terminated, so an embedded NUL can
+        // only reach the validator through a GNU long-name entry. `safe\0evil`
+        // is a single path component (no `/`, no `..`, not absolute) — so it
+        // is ONLY rejectable by the explicit NUL guard, which mirrors
+        // `is_safe_relative_subpath` in apply.rs. Refuse the OsStr/C-string
+        // truncation ambiguity outright.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_gnu_longname_archive(&archive, b"safe\0evil.txt", b"evil");
+
+        let err = read_archive_to_map(&archive).unwrap_err();
+        assert!(
+            matches!(err, ArchiveError::UnsafePath(_)),
+            "embedded-NUL long-name path must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_archive_accepts_gnu_longname_without_nul() {
+        // Sanity check that the long-name machinery itself works (so the NUL
+        // test above isn't vacuously passing because long names are dropped).
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        let long = format!("package/{}.js", "a".repeat(120));
+        write_gnu_longname_archive(&archive, long.as_bytes(), b"ok");
+
+        let map = read_archive_to_map(&archive).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.values().next().map(|v| v.as_slice()), Some(&b"ok"[..]));
+    }
+
+    #[test]
+    fn test_read_archive_accepts_curdir_prefixed_real_path() {
+        // The hardening must NOT over-reject: a leading `./` in front of a
+        // real segment is a legitimate relative path and must still pass.
+        // Use the raw writer so the literal `./` reaches the validator (the
+        // tar `Builder` would otherwise normalize the prefix away).
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_raw_archive(&archive, b"./lib/util.js", b"ok");
+
+        let map = read_archive_to_map(&archive).unwrap();
+        // The entry survives validation (the `./` segment is preserved in the
+        // key, matching the existing non-canonicalizing behavior).
+        assert_eq!(map.len(), 1, "curdir-prefixed real path must be accepted");
+        assert_eq!(map.values().next().map(|v| v.as_slice()), Some(&b"ok"[..]));
     }
 
     #[test]

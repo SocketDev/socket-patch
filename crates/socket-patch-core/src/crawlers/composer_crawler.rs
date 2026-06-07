@@ -88,16 +88,28 @@ impl ComposerCrawler {
                     // version (often `v6.4.1`); PURLs use the bare numeric
                     // version, so normalize before building the PURL.
                     let version = normalize_version(&entry.version).to_string();
-                    let purl = crate::utils::purl::build_composer_purl(namespace, name, &version);
+
+                    // Composer/Packagist treat package names
+                    // case-insensitively and the canonical PURL is
+                    // lowercase, but installed.json records the *pretty*
+                    // (case-preserved) name. Lowercase the namespace/name
+                    // for the PURL so it matches the canonical form Socket's
+                    // catalog uses; the on-disk `path` keeps the original
+                    // casing (Composer writes the vendor dir with the pretty
+                    // name, which matters on case-sensitive filesystems).
+                    let ns_canon = namespace.to_ascii_lowercase();
+                    let name_canon = name.to_ascii_lowercase();
+                    let purl =
+                        crate::utils::purl::build_composer_purl(&ns_canon, &name_canon, &version);
 
                     if !seen.insert(purl.clone()) {
                         continue;
                     }
 
                     packages.push(CrawledPackage {
-                        name: name.to_string(),
+                        name: name_canon,
                         version,
-                        namespace: Some(namespace.to_string()),
+                        namespace: Some(ns_canon),
                         purl,
                         path: pkg_path,
                     });
@@ -116,40 +128,60 @@ impl ComposerCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
-        // Build a name -> version lookup from installed.json
+        // Build a case-insensitive lookup from installed.json. Composer
+        // package names are case-insensitive and the canonical PURL is
+        // lowercase, but installed.json records the *pretty* (case-preserved)
+        // name and Composer writes the vendor directory with that same
+        // casing. Key the map by the lowercased name and carry the original
+        // name so the real on-disk path can be reconstructed even on
+        // case-sensitive filesystems.
         let entries = read_installed_json(vendor_path).await;
-        let installed: HashMap<String, String> =
-            entries.into_iter().map(|e| (e.name, e.version)).collect();
+        let installed: HashMap<String, (String, String)> = entries
+            .into_iter()
+            .map(|e| (e.name.to_ascii_lowercase(), (e.name, e.version)))
+            .collect();
 
         for purl in purls {
             if let Some(((namespace, name), version)) =
                 crate::utils::purl::parse_composer_purl(purl)
             {
-                let full_name = format!("{namespace}/{name}");
-                let pkg_dir = vendor_path.join(namespace).join(name);
+                let full_name = format!("{namespace}/{name}").to_ascii_lowercase();
 
-                if !is_dir(&pkg_dir).await {
+                let Some((installed_name, installed_version)) = installed.get(&full_name) else {
                     continue;
-                }
+                };
 
                 // Verify version matches installed.json. Compare on the
                 // normalized version so a `v`-prefixed installed.json
                 // version (`v6.4.1`) matches a bare PURL version (`6.4.1`)
                 // and vice versa.
-                if let Some(installed_version) = installed.get(&full_name) {
-                    if normalize_version(installed_version) == normalize_version(version) {
-                        result.insert(
-                            purl.clone(),
-                            CrawledPackage {
-                                name: name.to_string(),
-                                version: version.to_string(),
-                                namespace: Some(namespace.to_string()),
-                                purl: purl.clone(),
-                                path: pkg_dir,
-                            },
-                        );
-                    }
+                if normalize_version(installed_version) != normalize_version(version) {
+                    continue;
                 }
+
+                // Resolve the on-disk directory using the original casing
+                // recorded in installed.json, which is what Composer wrote to
+                // disk — the canonical (lowercase) PURL name would miss it on
+                // a case-sensitive filesystem.
+                let pkg_dir = match installed_name.split_once('/') {
+                    Some((ns, n)) => vendor_path.join(ns).join(n),
+                    None => continue,
+                };
+
+                if !is_dir(&pkg_dir).await {
+                    continue;
+                }
+
+                result.insert(
+                    purl.clone(),
+                    CrawledPackage {
+                        name: name.to_ascii_lowercase(),
+                        version: version.to_string(),
+                        namespace: Some(namespace.to_ascii_lowercase()),
+                        purl: purl.clone(),
+                        path: pkg_dir,
+                    },
+                );
             }
         }
 
@@ -794,6 +826,85 @@ mod tests {
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].purl, "pkg:composer/symfony/console@6.4.1");
+    }
+
+    #[tokio::test]
+    async fn test_crawl_all_canonicalizes_uppercase_name_to_lowercase_purl() {
+        // Composer/Packagist treat package names case-insensitively and the
+        // canonical PURL is lowercase, but installed.json records the pretty
+        // (case-preserved) name. crawl_all must emit a lowercase canonical
+        // PURL so it matches Socket's catalog — otherwise an uppercase pretty
+        // name silently produces an unmatchable PURL and the vuln is missed.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "Foo/Bar", "version": "1.0.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        // Composer writes the vendor directory using the pretty (case-
+        // preserved) name.
+        tokio::fs::create_dir_all(vendor_dir.join("Foo").join("Bar"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("composer.json"), "{}")
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: None,
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        // PURL, name and namespace are the canonical lowercase form...
+        assert_eq!(packages[0].purl, "pkg:composer/foo/bar@1.0.0");
+        assert_eq!(packages[0].name, "bar");
+        assert_eq!(packages[0].namespace, Some("foo".to_string()));
+        // ...but the on-disk path keeps the original casing Composer wrote.
+        assert_eq!(packages[0].path, vendor_dir.join("Foo").join("Bar"));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_canonical_purl_matches_case_preserved_install() {
+        // A canonical (lowercase) PURL must resolve a package whose
+        // installed.json name and on-disk directory carry uppercase letters.
+        // The lookup is case-insensitive and the on-disk path is rebuilt from
+        // the original installed.json casing so it resolves even on a
+        // case-sensitive filesystem.
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [{"name": "Foo/Bar", "version": "1.0.0"}]}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(vendor_dir.join("Foo").join("Bar"))
+            .await
+            .unwrap();
+
+        let crawler = ComposerCrawler::new();
+        let purls = vec!["pkg:composer/foo/bar@1.0.0".to_string()];
+        let result = crawler.find_by_purls(&vendor_dir, &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        let pkg = result.get("pkg:composer/foo/bar@1.0.0").unwrap();
+        // The resolved path points at the real (case-preserved) directory.
+        assert_eq!(pkg.path, vendor_dir.join("Foo").join("Bar"));
+        assert_eq!(pkg.namespace, Some("foo".to_string()));
+        assert_eq!(pkg.name, "bar");
     }
 
     #[tokio::test]

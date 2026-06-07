@@ -159,3 +159,28 @@ fn forged_max_u64_header_is_safe() {
         .expect("clamped apply must succeed on a max-size forged hint");
     assert_eq!(result, after, "max-size forged hint must not corrupt output");
 }
+
+/// Security regression (mirrors the lib's
+/// `test_apply_diff_forged_negative_block_length_does_not_panic`): the
+/// compressed control/diff block lengths in header bytes 8..24 are decoded
+/// with a sign-magnitude scheme. A field with the sign bit set decodes to a
+/// "negative" length whose `as u64` is enormous; qbsdiff's only guard
+/// (`32 + csize + dsize > patch.len()`) uses *wrapping* arithmetic, so the sum
+/// wraps back in-bounds and the subsequent `split_at` panics on
+/// attacker-controlled input. `apply_diff` must reject it as a plain error.
+#[test]
+fn forged_negative_block_length_does_not_panic() {
+    let before = b"the quick brown fox jumps over the lazy dog";
+    let after = b"the quick brown cat jumps over the lazy dog";
+    let mut forged = make_delta(before, after);
+    assert!(forged.len() >= 32, "delta must contain a full header");
+    // Sign-magnitude encoding of a negative control-block length (bytes 8..16).
+    let neg: u64 = 16u64 | (1u64 << 63);
+    forged[8..16].copy_from_slice(&neg.to_le_bytes());
+
+    let result = apply_diff(before, &forged);
+    assert!(
+        result.is_err(),
+        "a forged negative block length must error, not panic the process"
+    );
+}
