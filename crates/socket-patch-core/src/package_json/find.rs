@@ -770,12 +770,23 @@ mod tests {
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
+        // `Path::ends_with` matches whole path components and treats `/` in the
+        // pattern as a separator on every platform (Windows accepts both `/`
+        // and `\`), so this is correct regardless of the OS path separator —
+        // unlike a byte-wise `str::ends_with` on a forward-slash literal, which
+        // fails on Windows' `\`-separated paths.
         assert!(
-            paths.iter().any(|p| p.ends_with("packages/inner/package.json")),
+            result
+                .files
+                .iter()
+                .any(|f| f.path.ends_with("packages/inner/package.json")),
             "first-level member must be found: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.ends_with("packages/inner/sub/leaf/package.json")),
+            result
+                .files
+                .iter()
+                .any(|f| f.path.ends_with("packages/inner/sub/leaf/package.json")),
             "nested-workspace leaf must be found via recursion: {paths:?}"
         );
         // root + inner + leaf, no duplicates.
