@@ -83,7 +83,7 @@ impl SetupConfig {
 /// on-disk `.socket/manifest.json` byte-stable regardless of which in-memory
 /// representation produced it.
 fn setup_is_absent(setup: &Option<SetupConfig>) -> bool {
-    setup.as_ref().map_or(true, SetupConfig::is_empty)
+    setup.as_ref().is_none_or(SetupConfig::is_empty)
 }
 
 /// The top-level patch manifest structure.

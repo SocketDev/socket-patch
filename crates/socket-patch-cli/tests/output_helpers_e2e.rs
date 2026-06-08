@@ -18,14 +18,16 @@ fn format_severity_no_color_returns_input_verbatim() {
 }
 
 #[test]
-fn format_severity_critical_wraps_in_red() {
-    // Exact envelope: red open + verbatim text + reset, nothing else.
-    assert_eq!(format_severity("critical", true), "\x1b[31mcritical\x1b[0m");
+fn format_severity_critical_wraps_in_bright_red() {
+    // Exact envelope: bright-red open + verbatim text + reset, nothing else.
+    // Critical is the most prominent colour (bright red, 91) — strictly more
+    // prominent than high (plain red, 31).
+    assert_eq!(format_severity("critical", true), "\x1b[91mcritical\x1b[0m");
 }
 
 #[test]
-fn format_severity_high_wraps_in_bright_red() {
-    assert_eq!(format_severity("high", true), "\x1b[91mhigh\x1b[0m");
+fn format_severity_high_wraps_in_red() {
+    assert_eq!(format_severity("high", true), "\x1b[31mhigh\x1b[0m");
 }
 
 #[test]
@@ -52,8 +54,8 @@ fn format_severity_case_insensitive() {
     // text must be the caller's verbatim, original-case string (production
     // wraps `{s}`, not the lowercased key). Exact-equality catches both a
     // miscoloured branch and any impl that lowercases the rendered text.
-    assert_eq!(format_severity("CRITICAL", true), "\x1b[31mCRITICAL\x1b[0m");
-    assert_eq!(format_severity("High", true), "\x1b[91mHigh\x1b[0m");
+    assert_eq!(format_severity("CRITICAL", true), "\x1b[91mCRITICAL\x1b[0m");
+    assert_eq!(format_severity("High", true), "\x1b[31mHigh\x1b[0m");
     assert_eq!(format_severity("MEDIUM", true), "\x1b[33mMEDIUM\x1b[0m");
     assert_eq!(format_severity("Low", true), "\x1b[36mLow\x1b[0m");
 }
