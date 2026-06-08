@@ -392,21 +392,23 @@ fn missing_manifest_under_valid_cwd_reports_manifest_not_found_via_binary() {
 }
 
 #[test]
-fn manifest_path_through_regular_file_reports_unreadable_via_binary() {
-    // A genuine I/O error reaching the manifest must be `manifest_unreadable`,
-    // never `manifest_not_found`. Here the manifest path is nested *under a
-    // regular file* (`<file>/manifest.json`), so the OS rejects the read with
-    // ENOTDIR — an I/O error, not file-absence.
+fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
+    // A genuine I/O error reaching an *existing* path must be
+    // `manifest_unreadable`, never `manifest_not_found`. Here the manifest path
+    // points at a directory, so the read fails with a non-absence I/O error
+    // (Unix `IsADirectory` / Windows `PermissionDenied`) — present, but
+    // unreadable. (We use a directory rather than a `<regular-file>/manifest`
+    // path because the latter is `ENOTDIR` on Unix but a NotFound-class error
+    // on Windows, where traversing through a file is legitimately "path not
+    // found"; a directory yields a non-NotFound error on every platform.)
     //
     // Regression: `run()` used to stat the path with `tokio::fs::metadata`
-    // first and treat ANY stat failure as `manifest_not_found`, so this case
-    // (and an unreadable parent dir, etc.) was misreported as a missing file.
-    // Removing that pre-check lets `read_manifest`'s I/O error classify it
-    // correctly.
+    // first and treat ANY stat failure as `manifest_not_found`, masking real
+    // I/O errors. Removing that pre-check lets `read_manifest`'s I/O error
+    // classify it correctly.
     let tmp = tempfile::tempdir().unwrap();
-    let blocker = tmp.path().join("not-a-dir");
-    std::fs::write(&blocker, b"i am a regular file").unwrap();
-    let manifest_path = blocker.join("manifest.json");
+    let manifest_path = tmp.path().join("manifest-is-a-dir");
+    std::fs::create_dir(&manifest_path).unwrap();
 
     let out = run_list_binary(
         tmp.path(),
