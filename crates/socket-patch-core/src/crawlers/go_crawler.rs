@@ -821,4 +821,158 @@ mod tests {
         assert_eq!(pkg.name, "bar");
         assert_eq!(pkg.version, "v1.0.0-RC1");
     }
+
+    #[tokio::test]
+    async fn test_crawl_finds_v2_submodule_beside_v1() {
+        // A `/vN` major-version submodule lives at
+        // `<mod>/v2@<ver>/`, which forces a *plain* `<mod>` directory to
+        // exist alongside the versioned `<mod>@<ver>` leaf. The walk must
+        // descend into the plain `bar/` dir (no `@`) to reach `v2@v2.0.0`
+        // while still parsing the sibling `bar@v1.0.0` leaf — i.e. hitting
+        // a versioned directory must not abort the walk of its siblings.
+        let dir = tempfile::tempdir().unwrap();
+
+        let v1 = dir
+            .path()
+            .join("github.com")
+            .join("foo")
+            .join("bar@v1.0.0");
+        tokio::fs::create_dir_all(&v1).await.unwrap();
+
+        let v2 = dir
+            .path()
+            .join("github.com")
+            .join("foo")
+            .join("bar")
+            .join("v2@v2.0.0");
+        tokio::fs::create_dir_all(&v2).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(packages.len(), 2, "both v1 leaf and v2 submodule found");
+        assert!(purls.contains("pkg:golang/github.com/foo/bar@v1.0.0"));
+        assert!(purls.contains("pkg:golang/github.com/foo/bar/v2@v2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_crawl_finds_multiple_versions_of_same_module() {
+        // Two versions of one module are distinct sibling directories and
+        // must both surface as separate packages (dedup keys on the full
+        // versioned PURL, not the module path).
+        let dir = tempfile::tempdir().unwrap();
+
+        for v in ["gin@v1.9.0", "gin@v1.9.1"] {
+            let d = dir.path().join("github.com").join("gin-gonic").join(v);
+            tokio::fs::create_dir_all(&d).await.unwrap();
+        }
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        let purls: HashSet<_> = packages.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(packages.len(), 2);
+        assert!(purls.contains("pkg:golang/github.com/gin-gonic/gin@v1.9.0"));
+        assert!(purls.contains("pkg:golang/github.com/gin-gonic/gin@v1.9.1"));
+    }
+
+    #[test]
+    fn test_parse_versioned_dir_empty_version_guard() {
+        // A dir name with a trailing `@` and no version (`foo@`) is
+        // malformed metadata: the empty-version guard must yield None
+        // rather than emit a package with an empty version that would
+        // build a dangling `pkg:golang/foo@` PURL.
+        let base = std::path::Path::new("/cache");
+        let dir = std::path::Path::new("/cache/github.com/foo/bar@");
+        let mut seen = HashSet::new();
+        let crawler = GoCrawler;
+        let result = crawler.parse_versioned_dir(base, dir, "bar@", &mut seen);
+        assert!(result.is_none(), "empty version must yield None");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_qualified_purl_keys_by_input() {
+        // A PURL carrying `?` qualifiers must still resolve the on-disk
+        // dir (qualifiers stripped before parsing) AND be keyed in the
+        // result map by the *exact* input string the caller passed.
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir
+            .path()
+            .join("github.com")
+            .join("gin-gonic")
+            .join("gin@v1.9.1");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let qualified = "pkg:golang/github.com/gin-gonic/gin@v1.9.1?type=module".to_string();
+        let result = crawler
+            .find_by_purls(dir.path(), &[qualified.clone()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key(&qualified));
+        assert_eq!(result[&qualified].name, "gin");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_absent_returns_empty_ok() {
+        // No matching directory on disk → Ok(empty map), never an Err.
+        let dir = tempfile::tempdir().unwrap();
+        let crawler = GoCrawler::new();
+        let result = crawler
+            .find_by_purls(
+                dir.path(),
+                &["pkg:golang/github.com/none/here@v0.0.1".to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_crawl_ignores_stray_file_with_at_sign() {
+        // Only directories are modules. A stray *file* whose name contains
+        // `@` at the cache root (e.g. a leftover lock/marker) must not be
+        // parsed into a ghost package.
+        let dir = tempfile::tempdir().unwrap();
+
+        let real = dir
+            .path()
+            .join("github.com")
+            .join("gin-gonic")
+            .join("gin@v1.9.1");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::write(dir.path().join("stray@v0.0.0"), b"junk")
+            .await
+            .unwrap();
+
+        let crawler = GoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1, "the stray file must be ignored");
+        assert_eq!(
+            packages[0].purl,
+            "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
+        );
+    }
 }

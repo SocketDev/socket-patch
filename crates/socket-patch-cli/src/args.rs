@@ -578,6 +578,88 @@ mod tests {
         );
     }
 
+    /// `parse_supported_ecosystem` accepts every name this build compiles in
+    /// and returns it verbatim.
+    #[test]
+    fn parse_supported_ecosystem_accepts_compiled_in_names() {
+        for e in Ecosystem::all() {
+            let name = e.cli_name();
+            assert_eq!(
+                parse_supported_ecosystem(name),
+                Ok(name.to_string()),
+                "{name:?} is compiled in and must be accepted",
+            );
+        }
+    }
+
+    /// Unsupported / misspelled ecosystem names are rejected with a message
+    /// that names the offending token and lists the supported set.
+    #[test]
+    fn parse_supported_ecosystem_rejects_unknown_names() {
+        for bad in ["bogus", "NPM", "py-pi", ""] {
+            let err = parse_supported_ecosystem(bad)
+                .expect_err("unsupported ecosystem name must be rejected");
+            assert!(err.contains(bad), "error should echo the bad token: {err:?}");
+            assert!(
+                err.contains("supported:"),
+                "error should list the supported set: {err:?}",
+            );
+        }
+    }
+
+    /// End-to-end through clap: `--ecosystems` splits on commas, validates each
+    /// token, and rejects the whole parse if any token is unsupported.
+    #[test]
+    #[serial_test::serial]
+    fn ecosystems_flag_splits_and_validates() {
+        with_clean_socket_env(|| {
+            let cli = TestCli::try_parse_from(["socket-patch", "--ecosystems", "npm,pypi"])
+                .expect("comma-separated supported ecosystems must parse");
+            assert_eq!(
+                cli.common.ecosystems,
+                Some(vec!["npm".to_string(), "pypi".to_string()]),
+            );
+
+            // One bad token in the list aborts the whole parse.
+            assert!(
+                TestCli::try_parse_from(["socket-patch", "--ecosystems", "npm,bogus"]).is_err(),
+                "an unsupported token must fail the parse",
+            );
+        });
+    }
+
+    /// Precedence contract: a CLI value wins over the env var for a string flag.
+    #[test]
+    #[serial_test::serial]
+    fn cli_arg_overrides_env_var() {
+        with_clean_socket_env(|| {
+            std::env::set_var("SOCKET_MANIFEST_PATH", "from-env.json");
+            let cli =
+                TestCli::try_parse_from(["socket-patch", "--manifest-path", "from-cli.json"])
+                    .unwrap();
+            assert_eq!(cli.common.manifest_path, "from-cli.json");
+            std::env::remove_var("SOCKET_MANIFEST_PATH");
+        });
+    }
+
+    /// Precedence contract: the env var is honored when no CLI value is given,
+    /// and the clap-declared default applies when neither is set.
+    #[test]
+    #[serial_test::serial]
+    fn env_var_used_then_default_applies() {
+        with_clean_socket_env(|| {
+            std::env::set_var("SOCKET_MANIFEST_PATH", "from-env.json");
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert_eq!(cli.common.manifest_path, "from-env.json");
+            std::env::remove_var("SOCKET_MANIFEST_PATH");
+
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert_eq!(cli.common.manifest_path, DEFAULT_PATCH_MANIFEST_PATH);
+            assert_eq!(cli.common.download_mode, "diff");
+            assert_eq!(cli.common.cwd, PathBuf::from("."));
+        });
+    }
+
     /// `apply_env_toggles` mirrors `--debug` / `--no-telemetry` into the env
     /// vars core code reads directly, and is a no-op when the flags are off.
     /// `#[serial]` because it mutates process-global env state.

@@ -586,3 +586,61 @@ fn repair_honors_manifest_path_override() {
     assert_eq!(v["summary"]["removed"], 0);
     assert_eq!(v["summary"]["downloaded"], 0);
 }
+
+/// Regression: `--silent` ("Suppress non-error output") must mute the
+/// human-readable progress that `repair` prints to stdout — "Found N
+/// missing", "Downloading…", the cleanup summary and "Repair complete.".
+///
+/// Before the fix every informational print in `repair_inner` was gated on
+/// `--json` ALONE, so `repair --silent` (no `--json`) still flooded stdout,
+/// contradicting the flag's contract (and `get`/`apply`, which gate on
+/// `!json && !silent`). We run an offline repair that has real work to
+/// report — an orphan blob to sweep — once silent and once not, and prove
+/// the silent run emits NOTHING on stdout while the loud control does.
+#[test]
+fn repair_silent_suppresses_human_stdout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    // Keep the referenced blob (survives) plus an orphan (swept) so cleanup
+    // has something to announce in the non-silent control.
+    write_blob(&socket, REFERENCED_HASH, b"kept");
+    let orphan = "deadbeef".repeat(8); // 64 hex chars, not referenced
+    write_blob(&socket, &orphan, b"orphan bytes");
+
+    // Loud control (offline, human mode): stdout must carry the summary.
+    let loud = socket_cmd(tmp.path())
+        .args(["repair", "--offline"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(loud.status.code(), Some(0));
+    let loud_out = String::from_utf8_lossy(&loud.stdout);
+    assert!(
+        loud_out.contains("Repair complete."),
+        "control: human repair must print progress; stdout=\n{loud_out}"
+    );
+
+    // Re-stage the orphan (the control swept it) so the silent run has the
+    // identical workload — only the flag differs.
+    write_blob(&socket, &orphan, b"orphan bytes");
+
+    let silent = socket_cmd(tmp.path())
+        .args(["repair", "--offline", "--silent"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        silent.status.code(),
+        Some(0),
+        "silent repair must still succeed; stderr=\n{}",
+        String::from_utf8_lossy(&silent.stderr),
+    );
+    let silent_out = String::from_utf8_lossy(&silent.stdout);
+    assert!(
+        silent_out.trim().is_empty(),
+        "--silent must suppress all human stdout; got:\n{silent_out}"
+    );
+    // And the work still happened: the orphan was actually swept.
+    assert!(
+        !socket.join("blobs").join(&orphan).exists(),
+        "silent repair must still perform cleanup (orphan should be gone)"
+    );
+}

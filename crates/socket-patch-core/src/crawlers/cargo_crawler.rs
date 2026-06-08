@@ -82,13 +82,28 @@ fn parse_table_header(line: &str) -> Option<&str> {
 }
 
 /// Extract a quoted string value from a `key = "value"` line.
+///
+/// Handles both TOML string flavors that Cargo accepts for `name` /
+/// `version`: basic strings (`"..."`) and literal strings (`'...'`).
+/// A too-strict double-quote-only match would silently drop a crate
+/// whose manifest uses single quotes — and in the vendor layout, where
+/// the directory name carries no version, that crate would become
+/// undiscoverable (and thus unpatchable).
 fn extract_string_value(line: &str, key: &str) -> Option<String> {
     let rest = line.strip_prefix(key)?;
     let rest = rest.trim_start();
     let rest = rest.strip_prefix('=')?;
     let rest = rest.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
+    // The value must open with a quote of one kind; the matching close
+    // is the next quote of the *same* kind (literal strings have no
+    // escapes, and basic strings used for name/version never contain an
+    // escaped quote in practice).
+    let quote = match rest.chars().next()? {
+        c @ ('"' | '\'') => c,
+        _ => return None,
+    };
+    let rest = &rest[1..];
+    let end = rest.find(quote)?;
     Some(rest[..end].to_string())
 }
 
@@ -828,6 +843,103 @@ version = "fake"
 "#;
         // `version` lives under the metadata subtable, not [package].
         assert!(parse_cargo_toml_name_version(content).is_none());
+    }
+
+    // --- regression: single-quoted (literal) string values -------------
+
+    /// TOML literal strings use single quotes and are valid in a
+    /// `Cargo.toml`. The minimal parser must read `name`/`version` from
+    /// them just as it does from basic (double-quoted) strings.
+    #[test]
+    fn test_parse_cargo_toml_single_quoted_values() {
+        let content = "[package]\nname = 'serde'\nversion = '1.0.200'\n";
+        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        assert_eq!(name, "serde");
+        assert_eq!(version, "1.0.200");
+    }
+
+    /// A manifest may legally mix the two string flavors.
+    #[test]
+    fn test_parse_cargo_toml_mixed_quote_values() {
+        let content = "[package]\nname = 'tokio'\nversion = \"1.38.0\"\n";
+        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        assert_eq!(name, "tokio");
+        assert_eq!(version, "1.38.0");
+    }
+
+    /// A `#` inside the closing-quote pair is part of the value; a
+    /// trailing comment after the literal string is ignored. (The `'`
+    /// flavor must find its matching `'`, not a stray `"`.)
+    #[test]
+    fn test_parse_cargo_toml_single_quoted_with_comment() {
+        let content = "[package]\nname = 'serde' # the lib\nversion = '1.0.200'\n";
+        let (name, version) = parse_cargo_toml_name_version(content).unwrap();
+        assert_eq!(name, "serde");
+        assert_eq!(version, "1.0.200");
+    }
+
+    /// `version.workspace = true` must still short-circuit to `None`
+    /// regardless of the quote-handling change (no quotes are involved).
+    #[test]
+    fn test_parse_cargo_toml_workspace_still_none_after_quote_fix() {
+        let content = "[package]\nname = 'my-crate'\nversion.workspace = true\n";
+        assert!(parse_cargo_toml_name_version(content).is_none());
+    }
+
+    /// End-to-end: a vendored crate whose `Cargo.toml` uses single-quoted
+    /// values must still be located by `find_by_purls`. The vendor
+    /// directory name (`serde`) carries no version, so the version can
+    /// only come from the manifest — this is the layout where the
+    /// double-quote-only bug made the crate undiscoverable.
+    #[tokio::test]
+    async fn test_find_by_purls_vendor_single_quoted_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let serde_dir = dir.path().join("serde");
+        tokio::fs::create_dir_all(&serde_dir).await.unwrap();
+        tokio::fs::write(
+            serde_dir.join("Cargo.toml"),
+            "[package]\nname = 'serde'\nversion = '1.0.200'\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let purls = vec!["pkg:cargo/serde@1.0.200".to_string()];
+        let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("pkg:cargo/serde@1.0.200"));
+        assert_eq!(result["pkg:cargo/serde@1.0.200"].version, "1.0.200");
+    }
+
+    /// End-to-end via `crawl_all`: a single-quoted registry manifest is
+    /// parsed from the manifest (not just the dir name), proving the
+    /// value is read rather than recovered by the dir-name fallback.
+    #[tokio::test]
+    async fn test_crawl_all_single_quoted_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // Dir name deliberately disagrees with the manifest version so a
+        // pass can only come from reading the single-quoted manifest.
+        let crate_dir = dir.path().join("serde-9.9.9");
+        tokio::fs::create_dir_all(&crate_dir).await.unwrap();
+        tokio::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = 'serde'\nversion = '1.0.200'\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: dir.path().to_path_buf(),
+            global: false,
+            global_prefix: Some(dir.path().to_path_buf()),
+            batch_size: 100,
+        };
+
+        let packages = crawler.crawl_all(&options).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
     }
 
     // --- regression: dir-name version splitting ------------------------

@@ -608,6 +608,83 @@ mod tests {
         }
     }
 
+    /// Every applied patch lacking a vulnerability record → `None`.
+    /// Distinct from `applied_patch_with_zero_vulnerabilities_emits_no_statement`
+    /// (which mixes a with-vuln patch in): here the *entire* applied set
+    /// is vuln-free, so `grouped` stays empty and the builder must
+    /// short-circuit to `None` rather than emit a statement-less document.
+    #[test]
+    fn all_applied_patches_vuln_free_returns_none() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/a@1.0.0".to_string(),
+            record("u1", vec![]),
+        );
+        manifest.patches.insert(
+            "pkg:npm/b@2.0.0".to_string(),
+            record("u2", vec![]),
+        );
+        let doc = build_document(
+            &manifest,
+            &[
+                "pkg:npm/a@1.0.0".to_string(),
+                "pkg:npm/b@2.0.0".to_string(),
+            ],
+            &opts(),
+        );
+        assert!(doc.is_none(), "no vuln records anywhere → None, not an empty doc");
+    }
+
+    /// Order-independence: the `statements` payload is fully determined
+    /// by the *logical* manifest content, NOT by `HashMap` iteration
+    /// order. `build_is_deterministic_modulo_timestamps` only re-iterates
+    /// the *same* manifest (so it sees the same order twice) — it proves
+    /// purity, not order-independence. Here we build two manifests whose
+    /// patches/vulns/cves are inserted in opposite orders and assert the
+    /// stripped documents are byte-identical, pinning the sort-based
+    /// determinism the transpose relies on.
+    #[test]
+    fn output_is_independent_of_manifest_insertion_order() {
+        let strip = |mut d: Document| -> Document {
+            d.timestamp = String::new();
+            for s in d.statements.iter_mut() {
+                s.timestamp = None;
+            }
+            d
+        };
+
+        // Manifest A: forward insertion order.
+        let mut a = PatchManifest::new();
+        a.patches.insert(
+            "pkg:npm/aaa@1.0.0".to_string(),
+            record("u-a", vec![("GHSA-shared", vec!["CVE-1", "CVE-2"])]),
+        );
+        a.patches.insert(
+            "pkg:npm/zzz@9.0.0".to_string(),
+            record("u-z", vec![("GHSA-shared", vec!["CVE-3"]), ("GHSA-only-z", vec!["CVE-9"])]),
+        );
+
+        // Manifest B: same logical content, reversed insertion order
+        // (and reversed cve order) to force a different iteration order.
+        let mut b = PatchManifest::new();
+        b.patches.insert(
+            "pkg:npm/zzz@9.0.0".to_string(),
+            record("u-z", vec![("GHSA-only-z", vec!["CVE-9"]), ("GHSA-shared", vec!["CVE-3"])]),
+        );
+        b.patches.insert(
+            "pkg:npm/aaa@1.0.0".to_string(),
+            record("u-a", vec![("GHSA-shared", vec!["CVE-2", "CVE-1"])]),
+        );
+
+        let applied = vec![
+            "pkg:npm/aaa@1.0.0".to_string(),
+            "pkg:npm/zzz@9.0.0".to_string(),
+        ];
+        let da = strip(build_document(&a, &applied, &opts()).unwrap());
+        let db = strip(build_document(&b, &applied, &opts()).unwrap());
+        assert_eq!(da, db, "output must not depend on manifest insertion order");
+    }
+
     /// Subcomponent IDs are sorted within a merged statement. Pin
     /// this so downstream tools can rely on stable diff output.
     #[test]

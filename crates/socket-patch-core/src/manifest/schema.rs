@@ -1,5 +1,21 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::{BTreeMap, HashMap};
+
+/// Serialize a `HashMap` with its keys in sorted order so the emitted JSON is
+/// deterministic across runs. The manifest is persisted as `.socket/manifest.json`
+/// and committed to git; `HashMap`'s randomized iteration order would otherwise
+/// re-shuffle the keys on every write, producing spurious diffs and merge
+/// conflicts. This mirrors the `BTreeMap` choice in `vex::schema`, which the
+/// project made for the same "easier diffing across runs" reason. The public
+/// field type stays `HashMap` (so callers and deserialization are unaffected);
+/// only the on-the-wire ordering is pinned.
+fn serialize_sorted<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    V: Serialize,
+{
+    map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
+}
 
 /// Information about a vulnerability fixed by a patch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -25,8 +41,10 @@ pub struct PatchRecord {
     pub uuid: String,
     pub exported_at: String,
     /// Maps relative file path -> hash info.
+    #[serde(serialize_with = "serialize_sorted")]
     pub files: HashMap<String, PatchFileInfo>,
     /// Maps vulnerability ID (e.g., "GHSA-...") -> vulnerability info.
+    #[serde(serialize_with = "serialize_sorted")]
     pub vulnerabilities: HashMap<String, VulnerabilityInfo>,
     pub description: String,
     pub license: String,
@@ -58,17 +76,28 @@ impl SetupConfig {
     }
 }
 
+/// Whether the optional `setup` block should be omitted from the serialized
+/// manifest. It's omitted both when absent (`None`) *and* when present but
+/// carrying no state (`Some` of an empty [`SetupConfig`]) — the two are
+/// logically identical ("no setup state"), so collapsing them keeps the
+/// on-disk `.socket/manifest.json` byte-stable regardless of which in-memory
+/// representation produced it.
+fn setup_is_absent(setup: &Option<SetupConfig>) -> bool {
+    setup.as_ref().is_none_or(SetupConfig::is_empty)
+}
+
 /// The top-level patch manifest structure.
 /// Stored as `.socket/manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PatchManifest {
     /// Maps package PURL (e.g., "pkg:npm/lodash@4.17.21") -> patch record.
+    #[serde(serialize_with = "serialize_sorted")]
     pub patches: HashMap<String, PatchRecord>,
     /// Optional persisted `setup` state (e.g. excluded workspace members).
     /// Absent on manifests that predate / don't use it (serde default), and
     /// omitted from the serialized form when empty so existing manifests are
     /// byte-stable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "setup_is_absent")]
     pub setup: Option<SetupConfig>,
 }
 
@@ -342,6 +371,210 @@ mod tests {
             .unwrap()
             .cves
             .is_empty());
+    }
+
+    // ── Regression: deterministic, sorted serialization ──
+    //
+    // The manifest is persisted as `.socket/manifest.json` and committed to git.
+    // The maps are `HashMap`s, whose iteration order is randomized per instance,
+    // so a naive derive would emit keys in arbitrary order and churn the file on
+    // every write. `serialize_sorted` pins the keys to sorted order. These tests
+    // guard that contract (and would fail if the `serialize_with` attribute were
+    // dropped, surfacing the non-deterministic order).
+
+    // Top-level `patches` keys (PURLs) must be emitted in sorted order, no matter
+    // what order they were inserted in.
+    #[test]
+    fn test_manifest_patches_serialize_in_sorted_order() {
+        let mk = |uuid: &str| PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: "d".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        };
+
+        // Insert in deliberately reverse-sorted order.
+        let mut patches = HashMap::new();
+        patches.insert("pkg:npm/zzz@1.0.0".to_string(), mk("u-z"));
+        patches.insert("pkg:npm/mmm@1.0.0".to_string(), mk("u-m"));
+        patches.insert("pkg:npm/aaa@1.0.0".to_string(), mk("u-a"));
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let a = json.find("pkg:npm/aaa@1.0.0").unwrap();
+        let m = json.find("pkg:npm/mmm@1.0.0").unwrap();
+        let z = json.find("pkg:npm/zzz@1.0.0").unwrap();
+        assert!(
+            a < m && m < z,
+            "patches must serialize in sorted key order, got: {json}"
+        );
+    }
+
+    // Serialization must be byte-stable: two distinct HashMaps (which may have
+    // different internal iteration orders) holding the same logical content must
+    // produce identical JSON. Re-inserting in a different order proves the output
+    // doesn't depend on HashMap iteration order.
+    #[test]
+    fn test_manifest_serialization_is_byte_stable() {
+        let mk = |uuid: &str| {
+            let mut files = HashMap::new();
+            files.insert(
+                "package/z.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "b1".to_string(),
+                    after_hash: "a1".to_string(),
+                },
+            );
+            files.insert(
+                "package/a.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "b2".to_string(),
+                    after_hash: "a2".to_string(),
+                },
+            );
+            let mut vulns = HashMap::new();
+            vulns.insert(
+                "GHSA-zzzz".to_string(),
+                VulnerabilityInfo {
+                    cves: vec![],
+                    summary: "s".to_string(),
+                    severity: "low".to_string(),
+                    description: "d".to_string(),
+                },
+            );
+            vulns.insert(
+                "GHSA-aaaa".to_string(),
+                VulnerabilityInfo {
+                    cves: vec![],
+                    summary: "s".to_string(),
+                    severity: "low".to_string(),
+                    description: "d".to_string(),
+                },
+            );
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: vulns,
+                description: "d".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            }
+        };
+
+        // Two manifests with the same content but opposite patch-insertion order.
+        let mut p1 = HashMap::new();
+        p1.insert("pkg:npm/aaa@1.0.0".to_string(), mk("u-a"));
+        p1.insert("pkg:npm/zzz@1.0.0".to_string(), mk("u-z"));
+        let m1 = PatchManifest {
+            patches: p1,
+            setup: None,
+        };
+
+        let mut p2 = HashMap::new();
+        p2.insert("pkg:npm/zzz@1.0.0".to_string(), mk("u-z"));
+        p2.insert("pkg:npm/aaa@1.0.0".to_string(), mk("u-a"));
+        let m2 = PatchManifest {
+            patches: p2,
+            setup: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string_pretty(&m1).unwrap(),
+            serde_json::to_string_pretty(&m2).unwrap(),
+            "manifest JSON must be byte-stable regardless of HashMap order"
+        );
+
+        // And the nested `files` / `vulnerabilities` keys must themselves be sorted.
+        let json = serde_json::to_string(&m1).unwrap();
+        assert!(json.find("package/a.js").unwrap() < json.find("package/z.js").unwrap());
+        assert!(json.find("GHSA-aaaa").unwrap() < json.find("GHSA-zzzz").unwrap());
+    }
+
+    // ── Regression: the optional `setup` block is omitted when it carries no
+    // state ──
+    //
+    // The field doc promises `setup` is "omitted from the serialized form when
+    // empty so existing manifests are byte-stable." Before the fix, the skip
+    // predicate was `Option::is_none`, so a `Some` of an empty `SetupConfig`
+    // (which a load of `"setup": {}` produces, and which the also-then-dead
+    // `SetupConfig::is_empty` was written to detect) leaked a spurious
+    // `"setup":{}` key, breaking that contract.
+
+    // A `Some` of an empty config must serialize byte-identically to `None`:
+    // no `setup` key at all.
+    #[test]
+    fn test_empty_setup_some_serializes_identically_to_none() {
+        let with_none = PatchManifest {
+            patches: HashMap::new(),
+            setup: None,
+        };
+        let with_empty_some = PatchManifest {
+            patches: HashMap::new(),
+            setup: Some(SetupConfig::default()),
+        };
+
+        let none_json = serde_json::to_string_pretty(&with_none).unwrap();
+        let empty_some_json = serde_json::to_string_pretty(&with_empty_some).unwrap();
+
+        assert!(
+            !none_json.contains("setup"),
+            "a None setup must not emit a `setup` key, got: {none_json}"
+        );
+        assert!(
+            !empty_some_json.contains("setup"),
+            "a Some(empty) setup must also be omitted (byte-stability), got: {empty_some_json}"
+        );
+        assert_eq!(
+            none_json, empty_some_json,
+            "None and Some(empty) setup must serialize byte-identically"
+        );
+    }
+
+    // A manifest deserialized from a literal `"setup": {}` must re-serialize
+    // without the empty block (the normalization the byte-stability contract
+    // depends on).
+    #[test]
+    fn test_loaded_empty_setup_object_is_dropped_on_reserialize() {
+        let json = r#"{ "patches": {}, "setup": {} }"#;
+        let manifest: PatchManifest = serde_json::from_str(json).unwrap();
+        // The empty object parses into a (logically empty) config...
+        assert!(manifest.setup.as_ref().map_or(true, SetupConfig::is_empty));
+        // ...but must not survive into the serialized form.
+        let reserialized = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !reserialized.contains("setup"),
+            "an empty `setup` block must be dropped on re-serialize, got: {reserialized}"
+        );
+    }
+
+    // A *non-empty* setup block must still round-trip in full — the fix must
+    // omit only the empty case, never drop real state.
+    #[test]
+    fn test_populated_setup_roundtrips() {
+        let manifest = PatchManifest {
+            patches: HashMap::new(),
+            setup: Some(SetupConfig {
+                exclude: vec!["crates/member-a".to_string()],
+                manual: vec!["pypi".to_string()],
+            }),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains("\"setup\""), "populated setup must be emitted");
+        assert!(json.contains("crates/member-a"));
+        assert!(json.contains("pypi"));
+
+        let reparsed: PatchManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, reparsed, "populated setup must round-trip exactly");
+        let setup = reparsed.setup.unwrap();
+        assert_eq!(setup.exclude, vec!["crates/member-a".to_string()]);
+        assert_eq!(setup.manual, vec!["pypi".to_string()]);
     }
 
     // A manifest missing the top-level `patches` key must be rejected (the TS

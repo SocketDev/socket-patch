@@ -87,7 +87,15 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
             source,
         })?;
 
-    let deadline = Instant::now() + timeout;
+    // Use `checked_add` so an astronomically large `timeout` (the flag
+    // is a user-supplied `u64` of seconds — e.g. `--lock-timeout` /
+    // `SOCKET_LOCK_TIMEOUT` set to `u64::MAX`) does not panic the whole
+    // process with "overflow when adding duration to instant". An
+    // overflowing deadline is treated as `None` — i.e. wait
+    // indefinitely, which is what a near-infinite timeout asks for —
+    // while still capping each sleep at 100 ms so the loop stays
+    // responsive and `ZERO` keeps its non-blocking try-once semantics.
+    let deadline = Instant::now().checked_add(timeout);
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(LockGuard { _file: file }),
@@ -100,14 +108,22 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
             // then mislabelling it as `Held`. See `is_lock_contended`.
             Err(ref e) if is_lock_contended(e) => {
                 let now = Instant::now();
-                if now >= deadline {
+                // A `None` deadline (timeout overflowed `Instant`) never
+                // elapses; otherwise give up once the budget is spent.
+                if deadline.is_some_and(|d| now >= d) {
                     return Err(LockError::Held);
                 }
                 // Never sleep past the deadline: a sub-100 ms budget
-                // must not be rounded up to a full 100 ms wait. The
-                // remaining slice is always > 0 here (now < deadline).
-                let remaining = deadline - now;
-                std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                // must not be rounded up to a full 100 ms wait. When
+                // there is a deadline the remaining slice is always > 0
+                // here (now < deadline); with no deadline, just use the
+                // full 100 ms quantum.
+                let cap = Duration::from_millis(100);
+                let sleep_for = match deadline {
+                    Some(d) => (d - now).min(cap),
+                    None => cap,
+                };
+                std::thread::sleep(sleep_for);
             }
             Err(source) => {
                 return Err(LockError::Io {
@@ -254,6 +270,59 @@ mod tests {
             "non-blocking acquire should not sleep, took {:?}",
             elapsed
         );
+    }
+
+    /// Regression: a near-infinite, user-supplied timeout must not
+    /// panic the process. `--lock-timeout` / `SOCKET_LOCK_TIMEOUT` is a
+    /// raw `u64` of seconds, so `Duration::from_secs(u64::MAX)` reaches
+    /// `acquire`. `Instant::now() + that` overflows and aborts; the
+    /// `checked_add` deadline turns it into an indefinite wait instead.
+    /// When the lock is free, acquisition still succeeds immediately.
+    #[test]
+    fn overflowing_timeout_does_not_panic_when_free() {
+        let dir = tempfile::tempdir().unwrap();
+        // Would panic ("overflow when adding duration to instant") under
+        // the old `Instant::now() + timeout`.
+        let guard = acquire(dir.path(), Duration::from_secs(u64::MAX)).unwrap();
+        assert!(dir.path().join("apply.lock").is_file());
+        drop(guard);
+    }
+
+    /// Regression companion: with an overflowing (effectively infinite)
+    /// timeout AND a contended lock, `acquire` must *wait* — not panic
+    /// and not give up — and then succeed once the holder releases.
+    /// Proves both the no-overflow-panic fix and that a `None` deadline
+    /// never spuriously elapses into `Held`.
+    #[test]
+    fn overflowing_timeout_waits_then_acquires_on_release() {
+        use std::sync::Arc;
+
+        let dir = Arc::new(tempfile::tempdir().unwrap());
+        let held = acquire(dir.path(), Duration::ZERO).unwrap();
+
+        // Release the lock a little while after the waiter starts.
+        let dir2 = Arc::clone(&dir);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held); // releases the OS lock
+            // Keep the tempdir alive until the waiter has acquired.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(dir2);
+        });
+
+        // u64::MAX seconds == astronomically large; under the bug this
+        // panics before ever sleeping. With the fix it waits indefinitely
+        // and acquires once `held` drops above.
+        let start = Instant::now();
+        let guard = acquire(dir.path(), Duration::from_secs(u64::MAX)).unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(100),
+            "should have waited for the holder to release, waited {:?}",
+            waited
+        );
+        drop(guard);
+        releaser.join().unwrap();
     }
 
     /// The retry loop must not overshoot the deadline by a full sleep

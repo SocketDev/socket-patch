@@ -645,6 +645,130 @@ mod tests {
         assert_eq!(out.failed[0].reason, "hash_mismatch");
     }
 
+    /// SECURITY: a path-escaping manifest key (`../evil.js`) must NEVER
+    /// be attested as applied — even when the out-of-tree file it points
+    /// at happens to hash to the record's `afterHash`. `verify_file_patch`
+    /// fail-closes on the `is_safe_relative_subpath` guard *before* reading
+    /// anything, so a poisoned manifest cannot launder an arbitrary
+    /// on-disk file into a `not_affected` VEX attestation.
+    #[tokio::test]
+    async fn path_escaping_key_is_never_applied() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        tokio::fs::create_dir(&pkg_dir).await.unwrap();
+
+        // An out-of-tree file whose content matches the after_hash we
+        // will claim. If the guard were missing, verification would read
+        // this and wrongly report the patch as applied.
+        let out_of_tree = b"out-of-tree-content";
+        let hash = compute_git_sha256_from_bytes(out_of_tree);
+        tokio::fs::write(root.path().join("evil.js"), out_of_tree)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "../evil.js".to_string(),
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: hash, // matches the out-of-tree file
+            },
+        );
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            PatchRecord {
+                uuid: "u".to_string(),
+                exported_at: String::new(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.clone());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(
+            out.applied.is_empty(),
+            "a path-escaping key must never be attested as applied"
+        );
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].reason, "file_not_found");
+    }
+
+    /// A directory sitting where the manifest expects a file is reported
+    /// as `file_not_found`, not applied — `verify_file_patch` rejects
+    /// non-regular files (the hashing step refuses to read a directory).
+    #[tokio::test]
+    async fn directory_at_file_path_is_not_applied() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        // Create a directory named "index.js" where a file is expected.
+        tokio::fs::create_dir(pkg_dir.path().join("index.js"))
+            .await
+            .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/x@1.0.0".to_string(), pkg_dir.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].reason, "file_not_found");
+    }
+
+    /// Two independently failing PURLs each produce exactly one
+    /// `FailedPatch` — the failed bucket accumulates across PURLs (one
+    /// failure per PURL, not collapsed or duplicated).
+    #[tokio::test]
+    async fn multiple_failing_purls_each_recorded() {
+        // bad1: file present at wrong content → hash_mismatch.
+        let bad1 = tempfile::tempdir().unwrap();
+        tokio::fs::write(bad1.path().join("index.js"), b"wrong")
+            .await
+            .unwrap();
+        // bad2: file absent → file_not_found.
+        let bad2 = tempfile::tempdir().unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/bad1@1.0.0".to_string(),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        );
+        manifest.patches.insert(
+            "pkg:npm/bad2@1.0.0".to_string(),
+            record_with_one_file(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            ),
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/bad1@1.0.0".to_string(), bad1.path().to_path_buf());
+        paths.insert("pkg:npm/bad2@1.0.0".to_string(), bad2.path().to_path_buf());
+
+        let out = applied_patches(&manifest, &paths).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed.len(), 2, "one FailedPatch per failing PURL");
+
+        let mut reasons: Vec<&str> = out.failed.iter().map(|f| f.reason.as_str()).collect();
+        reasons.sort_unstable();
+        assert_eq!(reasons, vec!["file_not_found", "hash_mismatch"]);
+    }
+
     /// At most ONE `FailedPatch` is recorded per PURL even when several
     /// files would fail — `verify_patch_record` returns on the first
     /// failure. Two distinct failing files, single failure recorded.

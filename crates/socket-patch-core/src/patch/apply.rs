@@ -362,8 +362,23 @@ pub async fn apply_file_patch(
     let existing_meta = tokio::fs::metadata(&filepath).await.ok();
 
     // Create parent directories if needed (e.g., new files added by a patch).
+    //
+    // `create_dir_all` needs write permission on the FIRST existing
+    // ancestor of `parent` to materialize the missing chain. Go's module
+    // cache (and some Nix/Bazel layouts) mark package directories
+    // read-only (0o555), so a patch that adds a file under a not-yet-
+    // existing subdir would fail here with EACCES — and the
+    // `DirWriteGuard` below can't help, because it relaxes the immediate
+    // parent, which does not exist yet. Temporarily grant owner-write on
+    // the nearest existing ancestor for the duration of the mkdir, then
+    // restore it exactly. (When `parent` already exists this ancestor IS
+    // `parent`; the guard relax+restore is then a harmless wash before the
+    // dedicated `DirWriteGuard` below re-relaxes it for the write.)
     if let Some(parent) = filepath.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        let mkdir_guard = DirWriteGuard::acquire(nearest_existing_ancestor(parent).await).await;
+        let mkdir_result = tokio::fs::create_dir_all(parent).await;
+        mkdir_guard.restore().await;
+        mkdir_result?;
     }
 
     // The atomic stage+rename below — and the copy-on-write break, which
@@ -469,6 +484,23 @@ impl DirWriteGuard {
             }
         }
     }
+}
+
+/// Walk up from `path` and return the first ancestor that exists on
+/// disk. Used to find the directory whose write bit must be relaxed so
+/// `create_dir_all` can materialize a missing subdir chain. Returns
+/// `None` only if not even the filesystem root resolves (effectively
+/// never), in which case the caller's `DirWriteGuard::acquire(None)` is a
+/// no-op and `create_dir_all` proceeds unguarded.
+async fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if tokio::fs::metadata(p).await.is_ok() {
+            return Some(p);
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 /// Write `content` to `target` atomically via stage + rename.
@@ -2197,6 +2229,95 @@ mod tests {
         assert!(result.files_patched.is_empty());
         let on_disk = tokio::fs::read(pkg_dir.join("index.js")).await.unwrap();
         assert_eq!(on_disk, original);
+    }
+
+    /// New file in a NEW subdirectory inside a read-only package
+    /// directory. Go's module cache marks directories 0o555; a patch that
+    /// adds a file under a not-yet-existing subdir must still apply.
+    /// Regression: `create_dir_all` ran before any directory-permission
+    /// relaxation, so the mkdir failed with EACCES and the patch could not
+    /// be applied at all. The directory's mode must be restored afterward.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_new_file_in_new_subdir_of_readonly_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let patched = b"brand new nested\n";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+        // Deeply nested: forces create_dir_all to build several levels
+        // starting from the read-only package root.
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "a/b/c/new.js", patched, &patched_hash)
+            .await
+            .expect("apply must succeed creating a subdir chain in a read-only pkg dir");
+
+        let path = dir.path().join("a/b/c/new.js");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), patched);
+        // New file still defaults to read-only.
+        assert_eq!(
+            tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o7777,
+            0o444
+        );
+        // The pre-existing read-only package root is restored exactly.
+        assert_eq!(
+            tokio::fs::metadata(dir.path()).await.unwrap().permissions().mode() & 0o7777,
+            0o555,
+            "package root mode must be restored after the mkdir"
+        );
+        // No stage litter at the root.
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".socket-stage-"), "stage leaked: {name}");
+        }
+
+        // Re-grant write so the TempDir can clean itself up.
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
+    /// New file under an EXISTING read-only subdirectory (not the root).
+    /// The immediate parent already exists and is 0o555; the dedicated
+    /// `DirWriteGuard` must relax it for the stage+rename and restore it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_file_patch_new_file_in_existing_readonly_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+        let patched = b"nested\n";
+        let patched_hash = compute_git_sha256_from_bytes(patched);
+
+        // Lock the subdir (and root) read-only.
+        tokio::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        apply_file_patch(dir.path(), "sub/new.js", patched, &patched_hash)
+            .await
+            .expect("apply must succeed in an existing read-only subdir");
+
+        assert_eq!(tokio::fs::read(sub.join("new.js")).await.unwrap(), patched);
+        assert_eq!(
+            tokio::fs::metadata(&sub).await.unwrap().permissions().mode() & 0o7777,
+            0o555,
+            "existing subdir mode must be restored"
+        );
+
+        tokio::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
     }
 
     #[test]

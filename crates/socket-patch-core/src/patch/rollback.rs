@@ -69,6 +69,21 @@ pub async fn verify_file_rollback(
     blobs_path: &Path,
 ) -> VerifyRollbackResult {
     let normalized = normalize_file_path(file_name);
+    // SECURITY: never resolve a key that escapes the package directory.
+    // A poisoned `.socket/manifest.json` key like `../../home/u/.bashrc`
+    // or `/etc/cron.d/x` must not be hashed, restored, or (for new files)
+    // deleted. Mirror the apply path's guard — returning a blocking status
+    // aborts the whole package rollback before the delete loop runs.
+    if !crate::patch::apply::is_safe_relative_subpath(normalized) {
+        return VerifyRollbackResult {
+            file: file_name.to_string(),
+            status: VerifyRollbackStatus::NotFound,
+            message: Some("Unsafe patch path (escapes package directory)".to_string()),
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        };
+    }
     let filepath = pkg_path.join(normalized);
 
     let is_new_file = file_info.before_hash.is_empty();
@@ -302,6 +317,20 @@ pub async fn rollback_package_patch(
         // New files (empty beforeHash): delete instead of restoring.
         if file_info.before_hash.is_empty() {
             let normalized = normalize_file_path(file_name);
+            // SECURITY: this delete path constructs the target itself and
+            // does NOT go through `apply_file_patch`, so it must enforce the
+            // same path-escape guard. Without it a poisoned manifest entry
+            // (empty beforeHash + a `../../`/absolute key) would unlink an
+            // arbitrary file outside the package directory. Verify already
+            // blocks such keys, but defense-in-depth: never trust an
+            // unvalidated key at the syscall.
+            if !crate::patch::apply::is_safe_relative_subpath(normalized) {
+                result.error = Some(format!(
+                    "Unsafe patch path (escapes package directory): {}",
+                    file_name
+                ));
+                return result;
+            }
             let filepath = pkg_path.join(normalized);
             // Unlinking a directory entry requires write permission on the
             // *parent directory*, not the file. Go's module cache marks
@@ -966,6 +995,78 @@ mod tests {
         assert_eq!(
             tokio::fs::read(pkg_dir.path().join("a.js")).await.unwrap(),
             a_original
+        );
+    }
+
+    /// SECURITY (verify path-escape guard): a manifest key that escapes
+    /// the package directory must be refused at verification — never
+    /// hashed or stat'd through `pkg_path.join`. Returns a blocking
+    /// status (not Ready/AlreadyOriginal) so the package rollback aborts.
+    /// Regression: verify joined the raw key with no safety check, the
+    /// same hole the apply path closes with `is_safe_relative_subpath`.
+    #[tokio::test]
+    async fn test_verify_file_rollback_rejects_path_escape() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let file_info = PatchFileInfo {
+            before_hash: "aaa".to_string(),
+            after_hash: "bbb".to_string(),
+        };
+
+        for escape in ["package/../../escape.js", "../escape.js", "/etc/passwd"] {
+            let result =
+                verify_file_rollback(pkg_dir.path(), escape, &file_info, blobs_dir.path()).await;
+            assert_ne!(result.status, VerifyRollbackStatus::Ready, "key: {escape}");
+            assert_ne!(
+                result.status,
+                VerifyRollbackStatus::AlreadyOriginal,
+                "key: {escape}"
+            );
+            assert!(result.message.unwrap().contains("Unsafe patch path"));
+        }
+    }
+
+    /// SECURITY (new-file delete path-escape): the new-file deletion
+    /// branch builds the path itself and calls `remove_file` directly,
+    /// bypassing `apply_file_patch`'s guard. A poisoned manifest with an
+    /// empty `beforeHash` and an escaping key must NOT unlink a file
+    /// outside the package dir. Regression: the bare `remove_file` would
+    /// delete an arbitrary host file.
+    #[tokio::test]
+    async fn test_rollback_package_patch_new_file_path_escape_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        // A sentinel file OUTSIDE the package directory that must survive.
+        let sentinel_content = b"do not delete me\n";
+        let sentinel = root.path().join("sentinel.txt");
+        tokio::fs::write(&sentinel, sentinel_content).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            // Empty beforeHash => "new file", delete branch. afterHash matches
+            // the sentinel so a missing guard would let the delete through.
+            "package/../sentinel.txt".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(sentinel_content),
+            },
+        );
+
+        let result =
+            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+
+        assert!(!result.success, "escaping delete must be refused");
+        assert!(result.files_rolled_back.is_empty());
+        // The out-of-tree sentinel must be untouched.
+        assert_eq!(
+            tokio::fs::read(&sentinel).await.unwrap(),
+            sentinel_content,
+            "rollback must not delete a file outside the package directory"
         );
     }
 

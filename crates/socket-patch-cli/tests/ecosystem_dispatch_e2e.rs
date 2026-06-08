@@ -428,9 +428,22 @@ struct RollbackFixture {
     verify_file: PathBuf,
     /// Extra env vars the crawler needs (cache locations, experimental gates).
     envs: Vec<(String, String)>,
+    /// Run the rollback in `--global` mode. Required for ecosystems whose
+    /// project-local backend is a *redirect* (golang): in local mode the
+    /// patched bytes live in a project-local copy and the module cache is left
+    /// pristine, so rollback drops the redirect rather than restoring the cache
+    /// file in place. Byte-restore — the contract `assert_rollback_restored`
+    /// verifies — only happens on the global/in-place path (the analog of
+    /// cargo's `vendor/` in-place layout). Defaults to local mode.
+    global: bool,
 }
 
-fn run_rollback(cwd: &Path, ecosystem: &str, envs: &[(String, String)]) -> (i32, Value) {
+fn run_rollback(
+    cwd: &Path,
+    ecosystem: &str,
+    global: bool,
+    envs: &[(String, String)],
+) -> (i32, Value) {
     let mut cmd = Command::new(binary());
     cmd.args([
         "rollback",
@@ -439,9 +452,11 @@ fn run_rollback(cwd: &Path, ecosystem: &str, envs: &[(String, String)]) -> (i32,
         "--ecosystems",
         ecosystem,
         "--silent",
-    ])
-    .current_dir(cwd)
-    .env_remove("SOCKET_API_TOKEN");
+    ]);
+    if global {
+        cmd.arg("--global");
+    }
+    cmd.current_dir(cwd).env_remove("SOCKET_API_TOKEN");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -455,7 +470,7 @@ fn run_rollback(cwd: &Path, ecosystem: &str, envs: &[(String, String)]) -> (i32,
 /// Drive a genuine rollback for `fixture` and assert it discovered the
 /// package, restored the file, and reported success for the exact PURL.
 fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixture) {
-    let (code, env) = run_rollback(cwd, ecosystem, &fixture.envs);
+    let (code, env) = run_rollback(cwd, ecosystem, fixture.global, &fixture.envs);
     assert_eq!(
         code, 0,
         "rollback --ecosystems={ecosystem}: expected exit 0; env={env}"
@@ -524,7 +539,7 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
 /// file is left untouched (still PATCHED). Mirrors `assert_apply_not_dispatched`
 /// for the separate `find_packages_for_rollback` code path.
 fn assert_rollback_not_dispatched(cwd: &Path, ecosystem: &str, fixture: &RollbackFixture) {
-    let (code, env) = run_rollback(cwd, ecosystem, &fixture.envs);
+    let (code, env) = run_rollback(cwd, ecosystem, fixture.global, &fixture.envs);
     assert_eq!(
         code, 0,
         "rollback --ecosystems={ecosystem}: out-of-scope rollback should be a clean no-op (exit 0); env={env}"
@@ -575,6 +590,7 @@ fn fixture_npm(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
+        global: false,
     }
 }
 
@@ -605,6 +621,7 @@ fn fixture_pypi(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
+        global: false,
     }
 }
 
@@ -626,6 +643,7 @@ fn fixture_gem(root: &Path) -> RollbackFixture {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
+        global: false,
     }
 }
 
@@ -694,6 +712,7 @@ fn rollback_dispatch_branch_cargo() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
+        global: false,
     };
     assert_rollback_restored(root, "cargo", &fixture);
 }
@@ -716,6 +735,11 @@ fn rollback_dispatch_branch_golang() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![("GOMODCACHE".to_string(), cache.display().to_string())],
+        // Local-go rolls back by dropping the project-local `replace` redirect
+        // and leaves the module cache pristine, so it never restores cache
+        // bytes. Drive the global/in-place path to exercise byte-restore — the
+        // go analog of the cargo test's `vendor/` in-place layout.
+        global: true,
     };
     assert_rollback_restored(root, "golang", &fixture);
 }
@@ -750,6 +774,7 @@ fn rollback_dispatch_branch_maven() {
             ("MAVEN_REPO_LOCAL".to_string(), repo.display().to_string()),
             ("SOCKET_EXPERIMENTAL_MAVEN".to_string(), "1".to_string()),
         ],
+        global: false,
     };
     assert_rollback_restored(root, "maven", &fixture);
 }
@@ -778,6 +803,7 @@ fn rollback_dispatch_branch_composer() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![],
+        global: false,
     };
     assert_rollback_restored(root, "composer", &fixture);
 }
@@ -805,6 +831,7 @@ fn rollback_dispatch_branch_nuget() {
         purl: purl.to_string(),
         verify_file,
         envs: vec![("SOCKET_EXPERIMENTAL_NUGET".to_string(), "1".to_string())],
+        global: false,
     };
     assert_rollback_restored(root, "nuget", &fixture);
 }

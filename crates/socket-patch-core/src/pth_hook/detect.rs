@@ -90,12 +90,19 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
 fn has_table(content: &str, prefix: &str) -> bool {
     content.lines().any(|line| {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix('[') {
-            let header = rest.trim_start_matches('[').trim_end_matches(']');
-            header == prefix || header.starts_with(&format!("{prefix}."))
-        } else {
-            false
-        }
+        let Some(rest) = l.strip_prefix('[') else {
+            return false;
+        };
+        // Tolerate array-of-tables (`[[..]]`) by dropping a second opening
+        // bracket, then take everything up to the closing `]` so a trailing
+        // inline comment (`[tool.uv] # note`) or interior padding
+        // (`[ tool.uv ]`) — both valid TOML — doesn't defeat the match.
+        let rest = rest.trim_start_matches('[');
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let header = rest[..end].trim();
+        header == prefix || header.starts_with(&format!("{prefix}."))
     })
 }
 
@@ -103,10 +110,19 @@ fn has_table(content: &str, prefix: &str) -> bool {
 /// form. Space- and case-insensitive so `socket-patch [hook]` / `Socket-Patch`
 /// are recognised.
 pub fn deps_contain_hook(text: &str) -> bool {
-    let normalized: String = text.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
-    HOOK_MARKERS
-        .iter()
-        .any(|m| normalized.contains(&m.to_lowercase()))
+    // Normalize per line: drop intra-line whitespace so `socket-patch [hook]`
+    // matches, but keep line boundaries intact. Stripping newlines too would
+    // glue adjacent specs together (this is called on whole-file content by
+    // `setup`'s state probe), turning a trailing `socket-patch` plus a following
+    // `[hook]` into a phantom marker — a false positive.
+    text.lines().any(|line| {
+        let normalized: String = line
+            .to_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        HOOK_MARKERS.iter().any(|m| normalized.contains(*m))
+    })
 }
 
 /// True if a single PEP 508 dependency spec is the hook dependency.
@@ -136,6 +152,31 @@ mod tests {
     }
 
     #[test]
+    fn test_deps_contain_hook_no_cross_line_glue() {
+        // `deps_contain_hook` is run on whole-file content by the setup state
+        // probe. Two unrelated specs on adjacent lines must NOT be glued into
+        // a phantom `socket-patch[hook]` marker.
+        let requirements = "socket-patch\n[hook]\nrequests\n";
+        assert!(!deps_contain_hook(requirements));
+
+        // A wrapped TOML dependency array around a plain socket-patch dep also
+        // must not synthesize the marker across line breaks.
+        let pyproject = "dependencies = [\n  \"socket-patch\",\n]\nextras = [\"hook\"]\n";
+        assert!(!deps_contain_hook(pyproject));
+    }
+
+    #[test]
+    fn test_deps_contain_hook_real_marker_in_multiline() {
+        // The genuine hook spec on its own line within whole-file content is
+        // still detected (intra-line spaces tolerated).
+        let requirements = "requests==2.31.0\nsocket-patch [hook]\nflask\n";
+        assert!(deps_contain_hook(requirements));
+        let pyproject =
+            "dependencies = [\n  \"requests\",\n  \"socket-patch[hook]>=3.3.0\",\n]\n";
+        assert!(deps_contain_hook(pyproject));
+    }
+
+    #[test]
     fn test_has_table() {
         let toml = "[tool.poetry]\nname='x'\n[tool.poetry.dependencies]\n";
         assert!(has_table(toml, "tool.poetry"));
@@ -143,6 +184,21 @@ mod tests {
         assert!(has_table("[project]\n", "project"));
         // not fooled by a value that contains the text
         assert!(!has_table("name = \"tool.poetry helper\"\n", "tool.poetry"));
+    }
+
+    #[test]
+    fn test_has_table_trailing_comment_and_padding() {
+        // A trailing inline comment after the header is valid TOML and must
+        // not defeat detection (previously `trim_end_matches(']')` left the
+        // comment glued to the header).
+        assert!(has_table("[tool.uv] # the uv table\n", "tool.uv"));
+        assert!(has_table("[tool.uv.sources]  # comment\n", "tool.uv"));
+        // Interior padding inside the brackets is also valid TOML.
+        assert!(has_table("[ tool.pdm ]\n", "tool.pdm"));
+        // Array-of-tables form, with a comment, still resolves the namespace.
+        assert!(has_table("[[tool.poetry.source]] # extra\n", "tool.poetry"));
+        // A sibling prefix must still not match (no spurious widening).
+        assert!(!has_table("[tool.uvicorn] # web\n", "tool.uv"));
     }
 
     #[tokio::test]

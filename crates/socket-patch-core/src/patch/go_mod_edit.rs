@@ -123,13 +123,67 @@ async fn edit_go_mod(
         None => Ok(false),
         Some(new) => {
             if !dry_run {
-                fs::write(&path, new)
+                atomic_write(&path, new.as_bytes())
                     .await
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
             }
             Ok(true)
         }
     }
+}
+
+/// Atomically commit `content` to `path` via stage + fsync + rename.
+///
+/// A `go.mod` is a *user-owned* file that **defines the module** and carries
+/// the user's own `require`/`exclude`/`retract`/`replace` directives and
+/// comments alongside our socket `replace`. A bare `fs::write` truncates the
+/// target before writing, so a crash, power loss, or `ENOSPC` mid-write would
+/// leave `go.mod` truncated or empty — a corrupted manifest that no longer
+/// builds, when we only meant to add or refresh one line. Instead we stage a
+/// sibling file, fsync it, then rename over the target (atomic on the same
+/// filesystem), so a reader/recovering process only ever sees the complete old
+/// or the complete new bytes. Mirrors the hardened writers in
+/// `patch/cargo_config.rs`, `patch/apply.rs`, and `package_json/update.rs`.
+async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "go.mod".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content).await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = fs::rename(&stage, path).await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
 }
 
 // ── parsing ────────────────────────────────────────────────────────────────
@@ -720,6 +774,65 @@ replace (
             body,
             "dry-run must not write"
         );
+    }
+
+    // ── atomic commit: stage+rename leaves no litter, never truncates ────────
+    /// A real write must rename its `.socket-stage-*` sibling over `go.mod` and
+    /// leave nothing behind — a leftover stage file (or, worse, a half-written
+    /// truncated `go.mod`) is exactly the corruption the atomic writer exists to
+    /// prevent. Mirrors the litter guard in `patch/cargo_config.rs`.
+    #[tokio::test]
+    async fn test_ensure_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+            .await
+            .unwrap());
+
+        // Only go.mod should remain in the project root.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["go.mod".to_string()], "no stage-file litter");
+        assert!(
+            !names.iter().any(|n| n.starts_with(".socket-stage-")),
+            "stage file must be renamed away, not left behind"
+        );
+    }
+
+    /// An overwrite must replace the whole file in one atomic step while
+    /// preserving every unrelated byte (module line, `go` line, `require`s, the
+    /// user's own `replace`, and comments) — the writer stages full new content
+    /// and renames, never truncates-in-place.
+    #[tokio::test]
+    async fn test_ensure_overwrite_preserves_unrelated_content_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "module example.com/app\n\ngo 1.21\n\n// keep me\nrequire github.com/foo/bar v1.4.2\n\nreplace example.com/other v2.0.0 => ../other-fork\n";
+        fs::write(dir.path().join("go.mod"), original).await.unwrap();
+
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+            .await
+            .unwrap());
+
+        let on_disk = fs::read_to_string(dir.path().join("go.mod")).await.unwrap();
+        // Our directive landed…
+        assert!(on_disk.contains(
+            "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
+        ));
+        // …and nothing the user authored was lost.
+        assert!(on_disk.contains("module example.com/app"));
+        assert!(on_disk.contains("// keep me"));
+        assert!(on_disk.contains("require github.com/foo/bar v1.4.2"));
+        assert!(on_disk.contains("replace example.com/other v2.0.0 => ../other-fork"));
+        assert!(on_disk.starts_with(original), "original content kept verbatim as a prefix");
     }
 
     #[tokio::test]

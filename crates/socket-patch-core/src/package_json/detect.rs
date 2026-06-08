@@ -174,15 +174,23 @@ pub fn remove_socket_patch_from_script(script: &str) -> (bool, Option<String>) {
     }
 
     let segments: Vec<&str> = trimmed.split(" && ").collect();
+
+    // `changed` must reflect whether a *socket-patch* segment was removed — not
+    // whether `kept` is merely shorter than `segments`. Filtering also drops
+    // empty segments, so keying `changed` off `kept.len() != segments.len()`
+    // would falsely report a removal for a patch-free script that merely
+    // contained a stray empty segment (e.g. a double `" && "` separator),
+    // violating this function's documented `(false, ..)`/`(true, ..)` contract.
+    let had_patch = segments.iter().any(|s| script_is_configured(s.trim()));
+
     let kept: Vec<&str> = segments
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty() && !script_is_configured(s))
         .collect();
 
-    if kept.len() == segments.len() {
-        // Nothing matched a socket-patch pattern (and no empty segments) —
-        // unchanged.
+    if !had_patch {
+        // No socket-patch pattern present — leave the script as-is.
         return (false, Some(trimmed.to_string()));
     }
 
@@ -752,6 +760,47 @@ mod tests {
         assert_eq!(new, None);
     }
 
+    #[test]
+    fn test_remove_script_empty_segment_no_patch_is_unchanged() {
+        // Regression: a patch-free script with a stray empty segment (double
+        // `" && "`) must report `changed == false`. Keying `changed` off
+        // `kept.len() != segments.len()` previously returned `(true, ..)` here,
+        // violating the documented contract — `(true, ..)` means a socket-patch
+        // segment was removed, which did not happen.
+        let (changed, new) = remove_socket_patch_from_script("echo a &&  && echo b");
+        assert!(!changed, "no socket-patch present, must not report a removal");
+        assert_eq!(new.as_deref(), Some("echo a &&  && echo b"));
+    }
+
+    #[test]
+    fn test_remove_script_patch_in_middle_keeps_siblings() {
+        let (changed, new) =
+            remove_socket_patch_from_script("echo a && socket-patch apply && echo b");
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("echo a && echo b"));
+    }
+
+    #[test]
+    fn test_remove_script_multiple_patch_segments() {
+        // Defensive: more than one socket-patch invocation, all removed.
+        let (changed, new) = remove_socket_patch_from_script(
+            "socket-patch apply && build && npx @socketsecurity/socket-patch apply",
+        );
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn test_remove_script_pnpm_command() {
+        // The pnpm canonical command must be recognized and stripped (it
+        // contains the "socket-patch apply" pattern).
+        let (changed, new) = remove_socket_patch_from_script(
+            "pnpm dlx @socketsecurity/socket-patch apply --silent --ecosystems npm && echo hi",
+        );
+        assert!(changed);
+        assert_eq!(new.as_deref(), Some("echo hi"));
+    }
+
     // ── remove_package_json_object ──────────────────────────────────
 
     #[test]
@@ -783,6 +832,20 @@ mod tests {
         assert!(status.modified);
         assert_eq!(pkg["scripts"]["build"], "tsc");
         assert_eq!(pkg["scripts"]["postinstall"], "echo hi");
+    }
+
+    #[test]
+    fn test_remove_object_noop_when_empty_segment_no_patch() {
+        // Regression: a patch-free script whose only oddity is a stray empty
+        // segment must be a no-op — neither reported modified nor rewritten.
+        let mut pkg: serde_json::Value = serde_json::json!({
+            "name": "test",
+            "scripts": { "postinstall": "echo a &&  && echo b" }
+        });
+        let status = remove_package_json_object(&mut pkg);
+        assert!(!status.modified);
+        // The original (untouched) value must be preserved, empty segment and all.
+        assert_eq!(pkg["scripts"]["postinstall"], "echo a &&  && echo b");
     }
 
     #[test]
@@ -822,6 +885,23 @@ mod tests {
         assert!(modified1);
         let (modified2, _, _) = remove_package_json_content(&removed).unwrap();
         assert!(!modified2);
+    }
+
+    #[test]
+    fn test_remove_content_roundtrip_pnpm() {
+        // update (pnpm) then remove must fully revert to a no-socket-patch state.
+        let original = r#"{"name":"x","scripts":{"build":"tsc"}}"#;
+        let (_, updated, ..) =
+            update_package_json_content(original, PackageManager::Pnpm).unwrap();
+        assert!(updated.contains("pnpm dlx @socketsecurity/socket-patch apply"));
+
+        let (modified, removed, _) = remove_package_json_content(&updated).unwrap();
+        assert!(modified);
+        assert!(!removed.contains("socket-patch"));
+        let parsed: serde_json::Value = serde_json::from_str(&removed).unwrap();
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+        assert!(parsed["scripts"].get("postinstall").is_none());
+        assert!(parsed["scripts"].get("dependencies").is_none());
     }
 
     #[test]

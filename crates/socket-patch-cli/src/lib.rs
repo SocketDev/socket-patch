@@ -296,6 +296,34 @@ mod tests {
     }
 
     #[test]
+    fn fallback_forwards_value_bearing_flag_in_order() {
+        // The existing forwarding tests only use boolean flags, which don't
+        // consume the following token. A value-bearing flag (`--manifest-path
+        // <value>`) exercises the splice ordering differently: an off-by-one in
+        // `extend_from_slice(&argv[1..])` would either drop the flag's value or
+        // shift it onto the wrong token. Passing the flag explicitly wins over
+        // its `SOCKET_MANIFEST_PATH` env fallback, so this holds regardless of
+        // ambient env.
+        let cli = parse_with_uuid_fallback(argv(&[
+            "socket-patch",
+            UUID,
+            "--manifest-path",
+            "custom/forwarded.json",
+        ]))
+        .unwrap();
+        match cli.command {
+            Commands::Get(args) => {
+                assert_eq!(args.identifier, UUID);
+                assert_eq!(
+                    args.common.manifest_path, "custom/forwarded.json",
+                    "the value-bearing flag and its argument must survive the rewrite in order"
+                );
+            }
+            _ => panic!("expected Commands::Get"),
+        }
+    }
+
+    #[test]
     fn fallback_handles_no_args_without_panicking() {
         // Only the program name is present (argv.len() == 1). The
         // `argv.len() >= 2` guard must short-circuit before indexing argv[1],

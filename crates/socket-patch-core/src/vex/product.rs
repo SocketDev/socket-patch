@@ -320,9 +320,12 @@ fn split_remote_host_path(url: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Parse `<key> = "<value>"`. Returns `None` if the key doesn't match,
-/// the value isn't a double-quoted string literal, or the value is
-/// empty. Inline-table forms like `version = { workspace = true }`
+/// Parse `<key> = "<value>"` or `<key> = '<value>'`. Returns `None` if
+/// the key doesn't match, the value isn't a quoted string literal, or
+/// the value is empty. TOML permits BOTH double-quoted basic strings
+/// and single-quoted literal strings, so we accept either delimiter and
+/// terminate at the matching closing quote. Inline-table forms like
+/// `version = { workspace = true }` and bare values like `version = 42`
 /// fail this check and are skipped by the caller.
 fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
     let eq = line.find('=')?;
@@ -331,8 +334,13 @@ fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
         return None;
     }
     let rhs = rhs[1..].trim(); // drop the leading '=' and surrounding ws
-    let stripped = rhs.strip_prefix('"')?;
-    let end = stripped.find('"')?;
+    // The value must open with a string delimiter; match it to its twin.
+    // `'` is a literal string (no escapes), `"` a basic string — for our
+    // purposes (names/versions, which never contain escaped quotes) the
+    // first matching delimiter terminates the value in both cases.
+    let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let stripped = &rhs[quote.len_utf8()..];
+    let end = stripped.find(quote)?;
     let value = &stripped[..end];
     if value.is_empty() {
         None
@@ -1123,6 +1131,105 @@ mod tests {
     /// When multiple manifests are present but NONE parse, there is no
     /// product to surface and therefore no "using X" warning to emit
     /// (it would name a manifest that wasn't actually used).
+    // ── Regression: TOML single-quoted (literal) string values ────────
+    // TOML permits `key = 'value'` (literal strings) as well as
+    // `key = "value"`. The scanner previously only accepted the
+    // double-quoted form, so a manifest written with single quotes
+    // (common with cargo-edit / hand-edited files) yielded None and
+    // product detection silently failed. Mirrors the cargo-crawler
+    // single-quote fix.
+
+    /// `parse_toml_string_kv`: single-quoted literal value is accepted.
+    #[test]
+    fn parse_toml_kv_accepts_single_quoted_value() {
+        assert_eq!(
+            parse_toml_string_kv("name = 'serde'", "name").as_deref(),
+            Some("serde")
+        );
+    }
+
+    /// `parse_toml_string_kv`: empty single-quoted value → None, same as
+    /// the empty double-quoted case.
+    #[test]
+    fn parse_toml_kv_single_quoted_empty_is_none() {
+        assert!(parse_toml_string_kv("name = ''", "name").is_none());
+    }
+
+    /// `parse_toml_string_kv`: a single-quoted literal string keeps any
+    /// embedded double quotes verbatim (literal strings don't process
+    /// escapes), and a leading `'` must NOT terminate on a `"`.
+    #[test]
+    fn parse_toml_kv_single_quoted_preserves_inner_double_quote() {
+        assert_eq!(
+            parse_toml_string_kv(r#"name = 'he said "hi"'"#, "name").as_deref(),
+            Some(r#"he said "hi""#)
+        );
+    }
+
+    /// `parse_toml_string_kv`: an unterminated single-quoted value → None
+    /// (matches the double-quoted unterminated behaviour).
+    #[test]
+    fn parse_toml_kv_single_quoted_unterminated_is_none() {
+        assert!(parse_toml_string_kv("name = 'no-close", "name").is_none());
+    }
+
+    /// `scan_toml_section`: a section using single-quoted name/version is
+    /// parsed end-to-end.
+    #[test]
+    fn scan_toml_section_handles_single_quoted_values() {
+        let toml = "[package]\nname = 'my-rust'\nversion = '2.0.0'\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "my-rust");
+        assert_eq!(v, "2.0.0");
+    }
+
+    /// `scan_toml_section`: mixed quoting (single name, double version)
+    /// works — each value is matched to its own delimiter.
+    #[test]
+    fn scan_toml_section_handles_mixed_quoting() {
+        let toml = "[package]\nname = 'mixed'\nversion = \"3.1.4\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "mixed");
+        assert_eq!(v, "3.1.4");
+    }
+
+    /// End-to-end: a `Cargo.toml` with single-quoted name/version still
+    /// produces a cargo PURL (previously returned None).
+    #[tokio::test]
+    async fn detect_cargo_toml_single_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = 'my-rust'\nversion = '2.0.0'\nedition = '2021'\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/my-rust@2.0.0"));
+    }
+
+    /// End-to-end: a single-quoted `[project]` pyproject still produces a
+    /// PyPI PURL.
+    #[tokio::test]
+    async fn detect_pyproject_single_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = 'my-pylib'\nversion = '0.4.0'\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/my-pylib@0.4.0"));
+    }
+
+    /// Regression guard: a bare (unquoted) numeric value is still
+    /// rejected — the quote-detection must not accept non-string scalars.
+    #[test]
+    fn parse_toml_kv_bare_number_still_rejected() {
+        assert!(parse_toml_string_kv("version = 42", "version").is_none());
+    }
+
     #[tokio::test]
     async fn multi_manifest_all_unparseable_emits_no_warning() {
         let dir = tempfile::tempdir().unwrap();

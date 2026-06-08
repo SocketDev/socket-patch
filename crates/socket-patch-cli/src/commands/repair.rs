@@ -166,6 +166,14 @@ pub(crate) async fn repair_inner(
 
     let download_mode = DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
 
+    // `--silent` ("suppress non-error output") must mute the human-readable
+    // progress just like `--json` does — otherwise a silent repair still
+    // floods stdout with "Found N missing", "Downloading…", cleanup
+    // summaries and "Repair complete.". Gate every informational print on
+    // both, mirroring `get`/`apply`. (The JSON envelope is emitted by the
+    // caller, so nothing here depends on `json` alone.)
+    let quiet = args.common.json || args.common.silent;
+
     let mut downloaded_count = 0usize;
     let mut download_failed_count = 0usize;
     let mut blobs_cleaned = 0usize;
@@ -193,7 +201,7 @@ pub(crate) async fn repair_inner(
 
     if !args.common.offline {
         if !missing_artifacts.is_empty() {
-            if !args.common.json {
+            if !quiet {
                 println!(
                     "Found {} missing {} artifact(s)",
                     missing_artifacts.len(),
@@ -202,7 +210,7 @@ pub(crate) async fn repair_inner(
             }
 
             if args.common.dry_run {
-                if !args.common.json {
+                if !quiet {
                     println!("\nDry run - would download:");
                     for id in missing_artifacts.iter().take(10) {
                         println!("  - {}...", &id[..12.min(id.len())]);
@@ -212,7 +220,7 @@ pub(crate) async fn repair_inner(
                     }
                 }
             } else {
-                if !args.common.json {
+                if !quiet {
                     println!("\nDownloading missing {}s...", download_mode.as_tag());
                 }
                 let (client, _) =
@@ -226,18 +234,18 @@ pub(crate) async fn repair_inner(
                     fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
                 downloaded_count = fetch_result.downloaded;
                 download_failed_count = fetch_result.failed;
-                if !args.common.json {
+                if !quiet {
                     println!("{}", format_fetch_result(&fetch_result));
                 }
             }
-        } else if !args.common.json {
+        } else if !quiet {
             println!(
                 "All {} artifacts are present locally.",
                 download_mode.as_tag()
             );
         }
     } else if !missing_artifacts.is_empty() {
-        if !args.common.json {
+        if !quiet {
             println!(
                 "Warning: {} {} artifact(s) are missing (offline mode - not downloading)",
                 missing_artifacts.len(),
@@ -250,7 +258,7 @@ pub(crate) async fn repair_inner(
                 println!("  ... and {} more", missing_artifacts.len() - 5);
             }
         }
-    } else if !args.common.json {
+    } else if !quiet {
         println!(
             "All {} artifacts are present locally.",
             download_mode.as_tag()
@@ -259,7 +267,7 @@ pub(crate) async fn repair_inner(
 
     // Step 2: Clean up unused artifacts across all three directories.
     if !args.download_only {
-        if !args.common.json {
+        if !quiet {
             println!();
         }
         match cleanup_unused_blobs(&manifest, &blobs_path, args.common.dry_run).await {
@@ -267,7 +275,7 @@ pub(crate) async fn repair_inner(
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
                 bytes_freed += cleanup_result.bytes_freed;
-                if !args.common.json {
+                if !quiet {
                     if cleanup_result.blobs_checked == 0 {
                         println!("No blobs directory found, nothing to clean up.");
                     } else if cleanup_result.blobs_removed == 0 {
@@ -281,7 +289,7 @@ pub(crate) async fn repair_inner(
                 }
             }
             Err(e) => {
-                if !args.common.json {
+                if !quiet {
                     eprintln!("Warning: blob cleanup failed: {e}");
                 }
             }
@@ -293,7 +301,7 @@ pub(crate) async fn repair_inner(
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
                 bytes_freed += cleanup_result.bytes_freed;
-                if !args.common.json && cleanup_result.blobs_removed > 0 {
+                if !quiet && cleanup_result.blobs_removed > 0 {
                     println!(
                         "{}",
                         format_cleanup_result(&cleanup_result, args.common.dry_run)
@@ -302,7 +310,7 @@ pub(crate) async fn repair_inner(
                 }
             }
             Err(e) => {
-                if !args.common.json {
+                if !quiet {
                     eprintln!("Warning: diff cleanup failed: {e}");
                 }
             }
@@ -314,7 +322,7 @@ pub(crate) async fn repair_inner(
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
                 bytes_freed += cleanup_result.bytes_freed;
-                if !args.common.json && cleanup_result.blobs_removed > 0 {
+                if !quiet && cleanup_result.blobs_removed > 0 {
                     println!(
                         "{}",
                         format_cleanup_result(&cleanup_result, args.common.dry_run)
@@ -323,14 +331,14 @@ pub(crate) async fn repair_inner(
                 }
             }
             Err(e) => {
-                if !args.common.json {
+                if !quiet {
                     eprintln!("Warning: package cleanup failed: {e}");
                 }
             }
         }
     }
 
-    if !args.common.dry_run && !args.common.json {
+    if !args.common.dry_run && !quiet {
         println!("\nRepair complete.");
     }
 

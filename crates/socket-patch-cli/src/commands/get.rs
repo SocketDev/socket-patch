@@ -103,6 +103,13 @@ pub(crate) fn max_vuln_severity(
     vulns
         .values()
         .max_by_key(|v| severity_rank(&v.severity))
+        // `max_by_key` only yields `None` for an empty map; a non-empty
+        // map of exclusively unrecognized severities (all rank 0) would
+        // otherwise leak a garbage label like "" or "unknown". Drop it so
+        // the documented "every entry unrecognized → None" contract holds
+        // and `patch_event_metadata` omits `severity` rather than emitting
+        // a meaningless value.
+        .filter(|v| severity_rank(&v.severity) > 0)
         .map(|v| v.severity.clone())
 }
 
@@ -1926,6 +1933,94 @@ mod tests {
     #[test]
     fn max_vuln_severity_returns_none_for_empty() {
         assert_eq!(max_vuln_severity(&HashMap::new()), None);
+    }
+
+    #[test]
+    fn max_vuln_severity_returns_none_when_all_unrecognized() {
+        // Non-empty map but every severity is off-canon (rank 0). Per the
+        // doc contract this must be `None` — NOT `Some("")`/`Some("unknown")`.
+        // Regression guard: `max_by_key` alone returns the element for any
+        // non-empty map, leaking a garbage severity label.
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-a".into(),
+            VulnerabilityResponse {
+                cves: Vec::new(),
+                summary: String::new(),
+                severity: "informational".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-b".into(),
+            VulnerabilityResponse {
+                cves: Vec::new(),
+                summary: String::new(),
+                severity: String::new(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(max_vuln_severity(&vulns), None);
+    }
+
+    #[test]
+    fn max_vuln_severity_recognized_wins_over_unrecognized() {
+        // A single recognized severity alongside unrecognized ones must
+        // surface — the rank-0 filter only suppresses the all-unrecognized
+        // case, never a real label.
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-junk".into(),
+            VulnerabilityResponse {
+                cves: Vec::new(),
+                summary: String::new(),
+                severity: "unknown".into(),
+                description: String::new(),
+            },
+        );
+        vulns.insert(
+            "GHSA-real".into(),
+            VulnerabilityResponse {
+                cves: Vec::new(),
+                summary: String::new(),
+                severity: "low".into(),
+                description: String::new(),
+            },
+        );
+        assert_eq!(max_vuln_severity(&vulns).as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn patch_event_metadata_omits_severity_when_all_unrecognized() {
+        // The consumer-facing contract: a patch whose vulnerabilities all
+        // carry non-canonical severities must NOT emit a `severity` key
+        // (it would otherwise be `""`), while still listing the vulns.
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-aaaa-bbbb-cccc".into(),
+            VulnerabilityResponse {
+                cves: vec!["CVE-2024-0001".into()],
+                summary: "Something".into(),
+                severity: "informational".into(),
+                description: String::new(),
+            },
+        );
+        let patch = PatchResponse {
+            uuid: String::new(),
+            purl: String::new(),
+            published_at: "ts".into(),
+            files: HashMap::new(),
+            vulnerabilities: vulns,
+            description: "desc".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let meta = patch_event_metadata(&patch);
+        assert!(meta.as_object().unwrap().get("severity").is_none());
+        // The vulnerability itself is still surfaced (with its raw label).
+        let vulns_out = meta["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns_out.len(), 1);
+        assert_eq!(vulns_out[0]["severity"], "informational");
     }
 
     #[test]

@@ -302,6 +302,48 @@ mod tests {
         assert!(s.ends_with('Z'), "output must still end with Z");
     }
 
+    /// Plain within-month day carry (not a month/year boundary):
+    /// 2024-05-24 23:59:59 → 2024-05-25 00:00:00. The other boundary
+    /// tests only cross at month edges; this pins the day increment in
+    /// the middle of a month together with the day→00:00:00 time reset.
+    #[test]
+    fn within_month_day_carry() {
+        assert_eq!(
+            format_unix_secs_rfc3339(1_716_595_199),
+            "2024-05-24T23:59:59Z"
+        );
+        assert_eq!(
+            format_unix_secs_rfc3339(1_716_595_200),
+            "2024-05-25T00:00:00Z"
+        );
+    }
+
+    /// RFC 3339 UTC strings with fixed-width zero-padded fields sort
+    /// lexicographically in chronological order. Sweep ~50 years at a
+    /// ~1.7-day stride and assert each output is strictly greater than
+    /// the previous one. This is an oracle-free guard: any regression
+    /// that scrambles a field, drops zero-padding, or miscomputes a
+    /// carry would break monotonicity even where this file's other
+    /// tests don't have an exact expected string.
+    #[test]
+    fn outputs_sort_in_chronological_order() {
+        const STRIDE: u64 = 147_853; // ~1.71 days, coprime-ish with day/year
+        let mut prev = format_unix_secs_rfc3339(0);
+        let mut secs = STRIDE;
+        // 0 .. ~50 years.
+        while secs < 1_600_000_000 {
+            let cur = format_unix_secs_rfc3339(secs);
+            assert!(
+                cur > prev,
+                "non-monotonic at secs={secs}: {prev:?} !< {cur:?}"
+            );
+            // Every output must keep the canonical 20-char shape.
+            assert_eq!(cur.len(), 20, "bad width at secs={secs}: {cur:?}");
+            prev = cur;
+            secs += STRIDE;
+        }
+    }
+
     /// `now_rfc3339` must produce a string that round-trips through
     /// our own `format_unix_secs_rfc3339` — i.e. the year/month/day
     /// fields are within plausible ranges (years 1970..3000, months

@@ -366,6 +366,66 @@ fn empty_file_manifest_reports_manifest_invalid_via_binary() {
     assert_eq!(v["error"]["code"], "manifest_invalid", "got envelope: {v}");
 }
 
+#[test]
+fn missing_manifest_under_valid_cwd_reports_manifest_not_found_via_binary() {
+    // The common missing-manifest case: cwd exists, but `.socket/manifest.json`
+    // does not. `read_manifest` returns `Ok(None)` here, which must surface as
+    // `manifest_not_found` — NOT `manifest_invalid`. (Regression: the `Ok(None)`
+    // arm previously hard-coded `manifest_invalid`, telling consumers a missing
+    // file was corrupt. It was masked by a now-removed metadata pre-check.)
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("stdout must be valid JSON envelope");
+    assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
+    assert_eq!(v["status"], "error");
+    assert_eq!(
+        v["error"]["code"], "manifest_not_found",
+        "missing manifest must be manifest_not_found, got envelope: {v}"
+    );
+    let msg = v["error"]["message"].as_str().expect("error message");
+    assert!(
+        msg.contains("Manifest not found"),
+        "message must name the missing manifest, got: {msg}"
+    );
+}
+
+#[test]
+fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
+    // A genuine I/O error reaching an *existing* path must be
+    // `manifest_unreadable`, never `manifest_not_found`. Here the manifest path
+    // points at a directory, so the read fails with a non-absence I/O error
+    // (Unix `IsADirectory` / Windows `PermissionDenied`) — present, but
+    // unreadable. (We use a directory rather than a `<regular-file>/manifest`
+    // path because the latter is `ENOTDIR` on Unix but a NotFound-class error
+    // on Windows, where traversing through a file is legitimately "path not
+    // found"; a directory yields a non-NotFound error on every platform.)
+    //
+    // Regression: `run()` used to stat the path with `tokio::fs::metadata`
+    // first and treat ANY stat failure as `manifest_not_found`, masking real
+    // I/O errors. Removing that pre-check lets `read_manifest`'s I/O error
+    // classify it correctly.
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = tmp.path().join("manifest-is-a-dir");
+    std::fs::create_dir(&manifest_path).unwrap();
+
+    let out = run_list_binary(
+        tmp.path(),
+        &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("stdout must be valid JSON envelope");
+    assert_eq!(out.status.code(), Some(1), "I/O error must exit 1");
+    assert_eq!(v["status"], "error");
+    assert_eq!(
+        v["error"]["code"], "manifest_unreadable",
+        "a non-absence I/O error must be manifest_unreadable, not \
+         manifest_not_found, got envelope: {v}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Subprocess content tests — the in-process run() tests above only assert the
 // exit code. run() prints the actual listing to stdout (which cannot be

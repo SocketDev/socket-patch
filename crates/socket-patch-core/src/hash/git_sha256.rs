@@ -24,6 +24,10 @@ pub fn compute_git_sha256_from_bytes(data: &[u8]) -> String {
 /// would correspond to no real Git object. Rather than silently return a
 /// corrupt hash, this function reports an [`io::Error`] when the byte count
 /// disagrees with `size`.
+///
+/// To avoid draining an arbitrarily large (or slow/unbounded) stream once the
+/// hash is already known to be invalid, the loop bails out as soon as the bytes
+/// read exceed `size`; it does not keep reading just to report a larger total.
 pub async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
     size: u64,
     mut reader: R,
@@ -41,6 +45,17 @@ pub async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
         }
         hasher.update(&buf[..n]);
         total += n as u64;
+        if total > size {
+            // The stream already yielded more bytes than declared, so the hash
+            // can never match a real Git object. Stop now rather than draining
+            // the (possibly unbounded) remainder just to report a bigger total.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "git sha256: declared size {size} is smaller than the stream (read at least {total} bytes)"
+                ),
+            ));
+        }
     }
 
     if total != size {
@@ -223,6 +238,51 @@ mod tests {
         assert_eq!(sync_hash, async_hash);
     }
 
+    /// An effectively endless reader that records how many bytes it has served.
+    /// Used to prove that the over-size path does not drain the whole stream
+    /// once it knows the declared size is already exceeded.
+    struct EndlessReader {
+        served: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl tokio::io::AsyncRead for EndlessReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let n = buf.remaining();
+            // Fill the buffer with arbitrary non-EOF data.
+            let chunk = vec![0xABu8; n];
+            buf.put_slice(&chunk);
+            self.served
+                .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// With a tiny declared size against an endless stream, the loop must error
+    /// out promptly rather than reading without bound. We allow it to overshoot
+    /// by at most one internal buffer (8192 bytes) before noticing.
+    #[tokio::test]
+    async fn test_async_reader_oversize_bails_without_draining() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader = EndlessReader {
+            served: served.clone(),
+        };
+
+        let result = compute_git_sha256_from_reader(10, reader).await;
+        let err = result.expect_err("endless stream vs tiny size must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // It must have stopped after detecting the overshoot, not kept reading.
+        let total_served = served.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            total_served <= 8192,
+            "reader was drained for {total_served} bytes; should bail within one buffer"
+        );
+    }
+
     /// A zero-length stream with a correctly-declared size of 0 must hash to
     /// the canonical Git empty-blob id, matching the byte-slice path.
     #[tokio::test]
@@ -230,5 +290,43 @@ mod tests {
         let cursor = tokio::io::BufReader::new(&b""[..]);
         let async_hash = compute_git_sha256_from_reader(0, cursor).await.unwrap();
         assert_eq!(async_hash, compute_git_sha256_from_bytes(b""));
+    }
+
+    /// Pin the *reader* path directly to real Git SHA256 output rather than
+    /// only transitively via `compute_git_sha256_from_bytes`. A regression in
+    /// how the reader builds its `blob <size>\0` header (wrong keyword, missing
+    /// NUL, size off-by-one) would slip past the reader-vs-bytes equality tests
+    /// if the bytes path regressed identically; this anchors it independently.
+    #[tokio::test]
+    async fn test_async_reader_known_answer_vectors() {
+        // `printf 'blob 0\0' | shasum -a 256`
+        let empty = tokio::io::BufReader::new(&b""[..]);
+        assert_eq!(
+            compute_git_sha256_from_reader(0, empty).await.unwrap(),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+        );
+        // `printf 'blob 13\0Hello, World!' | shasum -a 256`
+        let body = b"Hello, World!";
+        let cursor = tokio::io::BufReader::new(&body[..]);
+        assert_eq!(
+            compute_git_sha256_from_reader(body.len() as u64, cursor)
+                .await
+                .unwrap(),
+            "e118a058f018dda253bb692320c940091b15e4f19067e12fff110606a111f5da",
+        );
+    }
+
+    /// The error path must trigger on the *first* over-size byte: a stream that
+    /// yields exactly `size` bytes and then one more must be rejected, not
+    /// accepted on a boundary. Guards the strict `>` (vs `>=`) comparison and
+    /// the placement of the check after the total bookkeeping.
+    #[tokio::test]
+    async fn test_async_reader_one_byte_over_errors() {
+        let content = b"exactly-this-many-bytes";
+        let cursor = tokio::io::BufReader::new(&content[..]);
+        // Declare one fewer byte than the stream actually holds.
+        let result = compute_git_sha256_from_reader(content.len() as u64 - 1, cursor).await;
+        let err = result.expect_err("one byte over declared size must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -96,15 +96,14 @@ fn emit_error(args: &ListArgs, code: &str, message: String) {
 pub async fn run(args: ListArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
-    if tokio::fs::metadata(&manifest_path).await.is_err() {
-        emit_error(
-            &args,
-            "manifest_not_found",
-            format!("Manifest not found at {}", manifest_path.display()),
-        );
-        return 1;
-    }
-
+    // `read_manifest` is the single source of truth for the three error
+    // states: `Ok(None)` (file absent), `Err(InvalidData)` (present but
+    // unparseable), and any other `Err` (genuine I/O failure). We deliberately
+    // do NOT stat the path first: a `metadata` pre-check is both redundant and
+    // wrong — it reports *any* stat failure (e.g. an unreadable parent dir) as
+    // `manifest_not_found`, masking real I/O errors that owe a
+    // `manifest_unreadable`, and it opens a TOCTOU window where a file removed
+    // between the stat and the read lands in the wrong error arm.
     match read_manifest(&manifest_path).await {
         Ok(Some(manifest)) => {
             // Sort by PURL so both the JSON envelope and the human-readable
@@ -170,11 +169,16 @@ pub async fn run(args: ListArgs) -> i32 {
             0
         }
         Ok(None) => {
-            // Defensive: `read_manifest` only returns `Ok(None)` for a
-            // missing file, which the metadata pre-check above already
-            // turned into `manifest_not_found`. Kept so a future loader
-            // change can't silently fall through without an envelope.
-            emit_error(&args, "manifest_invalid", "Invalid manifest".to_string());
+            // `read_manifest` returns `Ok(None)` only when the file does not
+            // exist (its documented contract), so this is the missing-manifest
+            // path — `manifest_not_found`, NOT `manifest_invalid` (which means
+            // the file is present but corrupt). See CLI_CONTRACT.md error-code
+            // table.
+            emit_error(
+                &args,
+                "manifest_not_found",
+                format!("Manifest not found at {}", manifest_path.display()),
+            );
             1
         }
         Err(e) => {

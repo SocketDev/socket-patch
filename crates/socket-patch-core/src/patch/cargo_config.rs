@@ -186,7 +186,7 @@ async fn edit_config(
                             .await
                             .map_err(|e| format!("create {}: {e}", parent.display()))?;
                     }
-                    fs::write(&path, new)
+                    atomic_write(&path, new.as_bytes())
                         .await
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
                 }
@@ -194,6 +194,59 @@ async fn edit_config(
             Ok(true)
         }
     }
+}
+
+/// Atomically commit `content` to `path` via stage + fsync + rename.
+///
+/// `.cargo/config.toml` is a *user-owned* file — it can hold `[build]`,
+/// `[net]`, credentials-adjacent settings, and comments alongside our
+/// `[patch]` / `[env]` entries. A bare `fs::write` truncates the target before
+/// writing, so a crash, power loss, or `ENOSPC` mid-write would leave the
+/// user's config truncated or empty, destroying content we only meant to add
+/// two lines to. Instead we write a sibling stage file, fsync it, then rename
+/// over the target (atomic on the same filesystem), so a reader/recovering
+/// process only ever sees the complete old or the complete new bytes. Mirrors
+/// the hardened writers in `patch/apply.rs` and `package_json/update.rs`.
+async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content).await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = fs::rename(&stage, path).await {
+        let _ = fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
 }
 
 // ── pure transforms ──────────────────────────────────────────────────────────
@@ -638,6 +691,77 @@ mod tests {
         let body = fs::read_to_string(cargo_dir.join("config.toml")).await.unwrap();
         assert!(body.contains("jobs = 4"), "user [build] table must be preserved");
         assert!(!body.contains("SOCKET_PATCH_ROOT"));
+    }
+
+    // ── atomic-commit: stage+rename leaves no litter, never truncates ────────
+    /// List the non-hidden-temp entries left under `.cargo/` after a commit. The
+    /// atomic writer stages a `.socket-stage-*` sibling and renames it over the
+    /// target; if any stage file survives, the commit aborted mid-flight (or the
+    /// rename was actually a copy) — both are litter the user would have to clean.
+    async fn stage_litter(cargo_dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rd = fs::read_dir(cargo_dir).await.unwrap();
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.contains("socket-stage") {
+                names.push(n);
+            }
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn test_commit_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ensure_patch_entry(dir.path(), "cfg-if", "1.0.0", false)
+            .await
+            .unwrap());
+        let cargo_dir = dir.path().join(".cargo");
+        assert!(
+            stage_litter(&cargo_dir).await.is_empty(),
+            "create-path commit must rename the stage file away, not leave it"
+        );
+        // A second, mutating upsert (version bump) must also clean up after itself.
+        assert!(ensure_patch_entry(dir.path(), "cfg-if", "1.0.1", false)
+            .await
+            .unwrap());
+        assert!(
+            stage_litter(&cargo_dir).await.is_empty(),
+            "overwrite-path commit must rename the stage file away, not leave it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_overwrites_existing_user_config_in_place() {
+        // The dangerous case the atomic writer protects: an existing user config
+        // we must edit in place. A non-atomic truncate-then-write would risk
+        // leaving this empty on a crash; here we assert the user content survives
+        // and the new entry lands, with no stage file left behind.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).await.unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "# user comment\n[build]\njobs = 7\n\n[net]\nretry = 5\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(ensure_patch_entry(dir.path(), "cfg-if", "1.0.0", false)
+            .await
+            .unwrap());
+
+        let body = fs::read_to_string(cargo_dir.join("config.toml"))
+            .await
+            .unwrap();
+        assert!(body.contains("# user comment"), "comment preserved");
+        assert!(body.contains("jobs = 7"), "[build] preserved");
+        assert!(body.contains("retry = 5"), "[net] preserved");
+        assert!(body.contains("cfg-if"), "our entry was added");
+        assert!(
+            stage_litter(&cargo_dir).await.is_empty(),
+            "in-place overwrite must not leave a stage file"
+        );
     }
 
     #[tokio::test]

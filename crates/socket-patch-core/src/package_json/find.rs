@@ -201,6 +201,14 @@ fn parse_yaml_list_value(raw: &str) -> String {
         }
     }
 
+    // A list item that is *only* a comment (`- # foo`) has no scalar value.
+    // The inline-comment scan below starts at index 1 (a `#` is a comment only
+    // when preceded by whitespace), so a leading `#` would otherwise survive as
+    // a bogus `"# foo"` pattern. Skip it here.
+    if s.starts_with('#') {
+        return String::new();
+    }
+
     // Unquoted scalar: a `#` preceded by whitespace begins an inline comment.
     let bytes = s.as_bytes();
     let comment_start =
@@ -316,11 +324,16 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
     };
 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
+        let path = entry.path();
+        // A single-level `dir/*` glob follows a symlinked direct member, the
+        // way npm/pnpm (and our cargo `glob_dir`) resolve a workspace member
+        // that is itself a symlink. `entry.file_type()` reports the *link's*
+        // own type — `is_dir() == false` — so it would silently drop such a
+        // member; stat the path instead so the link is followed. (The
+        // recursive `**` searchers below deliberately do NOT follow symlinks,
+        // to avoid loops/escapes — there a symlink's `is_dir() == false` is the
+        // desired skip.)
+        if !fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
             continue;
         }
         // A `dir/*` pattern must not pick up node_modules/hidden/output dirs as
@@ -328,7 +341,7 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
         if is_ignored_dir(&entry.file_name().to_string_lossy()) {
             continue;
         }
-        let pkg_json = entry.path().join("package.json");
+        let pkg_json = path.join("package.json");
         if fs::metadata(&pkg_json).await.is_ok() {
             results.push(pkg_json);
         }
@@ -757,12 +770,23 @@ mod tests {
             .iter()
             .map(|f| f.path.to_string_lossy().into_owned())
             .collect();
+        // `Path::ends_with` matches whole path components and treats `/` in the
+        // pattern as a separator on every platform (Windows accepts both `/`
+        // and `\`), so this is correct regardless of the OS path separator —
+        // unlike a byte-wise `str::ends_with` on a forward-slash literal, which
+        // fails on Windows' `\`-separated paths.
         assert!(
-            paths.iter().any(|p| p.ends_with("packages/inner/package.json")),
+            result
+                .files
+                .iter()
+                .any(|f| f.path.ends_with("packages/inner/package.json")),
             "first-level member must be found: {paths:?}"
         );
         assert!(
-            paths.iter().any(|p| p.ends_with("packages/inner/sub/leaf/package.json")),
+            result
+                .files
+                .iter()
+                .any(|f| f.path.ends_with("packages/inner/sub/leaf/package.json")),
             "nested-workspace leaf must be found via recursion: {paths:?}"
         );
         // root + inner + leaf, no duplicates.
@@ -795,6 +819,15 @@ mod tests {
             parse_pnpm_workspace_patterns(yaml),
             vec!["packages/*", "apps/*"]
         );
+    }
+
+    #[test]
+    fn test_parse_pnpm_comment_only_list_item_skipped() {
+        // A `- # comment` item is a YAML null (the value is just a comment) and
+        // must NOT become a literal `"# comment"` workspace pattern. Previously
+        // the inline-comment scan started at index 1, so a leading `#` survived.
+        let yaml = "packages:\n  - # only a comment\n  - real/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["real/*"]);
     }
 
     #[test]
@@ -922,6 +955,76 @@ mod tests {
         let result = find_package_json_files(dir.path()).await;
         let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
         assert_eq!(workspace_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_find_star_glob_follows_symlinked_member() {
+        // Regression: a single-level `packages/*` glob must follow a workspace
+        // member that is itself a symlink (npm/pnpm and our cargo `glob_dir`
+        // both resolve such members). `entry.file_type()` reports the link as a
+        // non-directory, so the old gate silently dropped it and `setup` never
+        // patched the package.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*"]}"#,
+        )
+        .await
+        .unwrap();
+        // The real member lives outside `packages/`; `packages/a` links to it.
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).await.unwrap();
+        fs::write(real.join("package.json"), r#"{"name":"a"}"#)
+            .await
+            .unwrap();
+        fs::create_dir_all(dir.path().join("packages")).await.unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("packages").join("a")).unwrap();
+
+        let result = find_package_json_files(dir.path()).await;
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert_eq!(
+            workspace_count, 1,
+            "symlinked workspace member must be discovered: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_find_double_glob_does_not_follow_symlinks() {
+        // The asymmetric counterpart: a recursive `apps/**` glob must NOT follow
+        // symlinks — a loop back to an ancestor would recurse forever and an
+        // escaping link would let `setup` edit an out-of-tree manifest. Only the
+        // real on-disk member is discovered.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/**"]}"#,
+        )
+        .await
+        .unwrap();
+        let real = dir.path().join("apps").join("web");
+        fs::create_dir_all(&real).await.unwrap();
+        fs::write(real.join("package.json"), r#"{"name":"web"}"#)
+            .await
+            .unwrap();
+        // A loop symlink back to the repo root and an escape symlink to an
+        // out-of-tree package — neither must be traversed.
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("apps").join("loop")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("package.json"), r#"{"name":"escape"}"#)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("apps").join("escape")).unwrap();
+
+        let result = find_package_json_files(dir.path()).await;
+        let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
+        assert_eq!(
+            workspace_count, 1,
+            "only the real member must be found; symlinks not followed: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
     }
 
     // ── detect_package_manager ──────────────────────────────────────

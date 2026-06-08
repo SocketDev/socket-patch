@@ -1235,6 +1235,25 @@ async fn apply_patches_inner(
                     // hash-mismatch and were skipped above), so this
                     // applies a single variant for them; Maven's coexisting
                     // classifier jars each get patched.
+                } else {
+                    // A variant that reached apply IS the installed
+                    // distribution, so a failure here is a real apply
+                    // failure — flag it even if a *sibling* variant of the
+                    // same base succeeds (Maven's coexisting classifier
+                    // jars, or any base where `--force` attempts every
+                    // variant). Mirrors the npm branch below and the
+                    // rollback loop, which mark `has_errors` on every failed
+                    // result; without this a partial multi-variant failure
+                    // would leave a `failed` event in the envelope while the
+                    // command still reported `success` / exit 0.
+                    has_errors = true;
+                    if !args.common.silent && !args.common.json {
+                        eprintln!(
+                            "Failed to patch {}: {}",
+                            variant_purl,
+                            result.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
                 }
                 results.push(result);
             }
@@ -1242,18 +1261,17 @@ async fn apply_patches_inner(
             if applied {
                 applied_base_purls.insert(base_purl.clone());
             } else {
+                // Nothing applied for this base. `has_errors` was already set
+                // per-variant above when a variant was attempted-but-failed;
+                // set it here too for the no-variant-attempted case so both
+                // paths fail the command.
                 has_errors = true;
-                if !args.common.silent && !args.common.json {
-                    if attempted {
-                        // The installed variant was found but its patch could
-                        // not be applied (e.g. a later file mismatched) — a
-                        // genuine apply failure, not a missing package.
-                        eprintln!(
-                            "Failed to patch {base_purl}: the installed variant could not be patched"
-                        );
-                    } else {
-                        eprintln!("Failed to patch {base_purl}: no matching variant found");
-                    }
+                if !attempted && !args.common.silent && !args.common.json {
+                    // No variant matched the installed distribution at all —
+                    // the package on disk isn't any known release variant.
+                    // (Attempted-but-failed variants already printed their own
+                    // per-variant failure line above.)
+                    eprintln!("Failed to patch {base_purl}: no matching variant found");
                 }
             }
         } else {

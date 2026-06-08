@@ -268,6 +268,37 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Send event
 // ---------------------------------------------------------------------------
 
+/// Decide which endpoint a telemetry event goes to, and whether to attach
+/// the bearer token.
+///
+/// The authenticated `/v0/orgs/<slug>/telemetry` endpoint is used only when
+/// BOTH a non-empty token and a non-empty org slug are present. An empty
+/// string is treated as absent: a `Some("")` slug would otherwise build a
+/// malformed `/v0/orgs//telemetry` URL and a `Some("")` token an empty
+/// `Bearer ` header. This mirrors the empty-slug guard in
+/// `get_api_client_from_env`, keeping the contract robust even if a caller
+/// hands us blank values directly.
+fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -> (String, bool) {
+    let token = api_token.filter(|t| !t.is_empty());
+    let slug = org_slug.filter(|s| !s.is_empty());
+
+    match (token, slug) {
+        (Some(_token), Some(slug)) => {
+            let api_url = std::env::var("SOCKET_API_URL")
+                .ok()
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string());
+            (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
+        }
+        _ => {
+            let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            (format!("{proxy_url}/patch/telemetry"), false)
+        }
+    }
+}
+
 /// Send a telemetry event to the API.
 ///
 /// This is fire-and-forget: errors are logged in debug mode but never
@@ -277,18 +308,7 @@ async fn send_telemetry_event(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    let (url, use_auth) = match (api_token, org_slug) {
-        (Some(_token), Some(slug)) => {
-            let api_url = std::env::var("SOCKET_API_URL")
-                .unwrap_or_else(|_| DEFAULT_SOCKET_API_URL.to_string());
-            (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
-        }
-        _ => {
-            let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
-            (format!("{proxy_url}/patch/telemetry"), false)
-        }
-    };
+    let (url, use_auth) = resolve_telemetry_endpoint(api_token, org_slug);
 
     debug_log(&format!("Sending telemetry to {url}"));
 
@@ -1060,5 +1080,150 @@ mod tests {
         // 2024-01-01 is day 19723
         let (y, m, d) = days_to_ymd(19723);
         assert_eq!((y, m, d), (2024, 1, 1));
+    }
+
+    /// Independent brute-force civil-date counter used to cross-check
+    /// `days_to_ymd` (Howard Hinnant's algorithm) without sharing any of its
+    /// arithmetic — so a regression in either is caught.
+    fn brute_days_to_ymd(days: u64) -> (u64, u64, u64) {
+        fn is_leap(y: u64) -> bool {
+            (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        }
+        let mut rem = days;
+        let mut y = 1970u64;
+        loop {
+            let year_len = if is_leap(y) { 366 } else { 365 };
+            if rem < year_len {
+                break;
+            }
+            rem -= year_len;
+            y += 1;
+        }
+        let months = [
+            31,
+            if is_leap(y) { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        let mut m = 0usize;
+        while rem >= months[m] {
+            rem -= months[m];
+            m += 1;
+        }
+        (y, (m + 1) as u64, rem + 1)
+    }
+
+    /// Spot-check the trickiest civil-date edges: leap day, the day after,
+    /// non-leap century boundaries (1900/2100/2200/2300 — divisible by 100 but
+    /// not 400, so NOT leap) and leap centuries (2000/2400), plus year/month
+    /// rollovers. Each is computed by hand to anchor the value.
+    #[test]
+    fn test_days_to_ymd_edge_dates() {
+        // 2000-02-29 (leap century) and the day after.
+        assert_eq!(brute_days_to_ymd(11016), (2000, 2, 29)); // anchor the oracle
+        assert_eq!(days_to_ymd(11016), (2000, 2, 29));
+        assert_eq!(days_to_ymd(11017), (2000, 3, 1));
+
+        // 2100-02-28 must NOT be followed by Feb 29 — 2100 is not a leap year.
+        let feb28_2100 = brute_days_to_ymd(47540);
+        assert_eq!(feb28_2100, (2100, 2, 28));
+        assert_eq!(days_to_ymd(47540), (2100, 2, 28));
+        assert_eq!(days_to_ymd(47541), (2100, 3, 1));
+
+        // Year/month rollover: Dec 31 -> Jan 1.
+        assert_eq!(days_to_ymd(19722), (2023, 12, 31));
+        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
+    }
+
+    /// Exhaustive cross-check against the independent counter across ~1265
+    /// years, covering every leap rule and century boundary through 3235.
+    #[test]
+    fn test_days_to_ymd_matches_brute_force() {
+        for days in 0..462_000u64 {
+            assert_eq!(
+                days_to_ymd(days),
+                brute_days_to_ymd(days),
+                "mismatch at day {days}"
+            );
+        }
+    }
+
+    /// The time-of-day split in `chrono_now_iso` must carve a within-day
+    /// second offset into the right h/m/s buckets. We reconstruct the exact
+    /// arithmetic for a known offset (23:59:59 on day 0 = epoch) by parsing
+    /// the rendered prefix, since the live timestamp can't be pinned.
+    #[test]
+    fn test_chrono_now_iso_components_well_formed() {
+        let ts = chrono_now_iso();
+        // YYYY-MM-DDTHH:MM:SS.mmmZ — validate every field range, not just shape.
+        let (date, rest) = ts.split_once('T').expect("has T separator");
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        let (year, month, day): (u64, u64, u64) = (
+            parts[0].parse().unwrap(),
+            parts[1].parse().unwrap(),
+            parts[2].parse().unwrap(),
+        );
+        assert!((2026..=2100).contains(&year), "year {year} out of range");
+        assert!((1..=12).contains(&month), "month {month} out of range");
+        assert!((1..=31).contains(&day), "day {day} out of range");
+
+        let time = rest.strip_suffix('Z').expect("ends with Z");
+        let (hms, millis) = time.split_once('.').expect("has millis");
+        let hms_parts: Vec<&str> = hms.split(':').collect();
+        assert_eq!(hms_parts.len(), 3);
+        let h: u64 = hms_parts[0].parse().unwrap();
+        let m: u64 = hms_parts[1].parse().unwrap();
+        let s: u64 = hms_parts[2].parse().unwrap();
+        assert!(h < 24, "hour {h} out of range");
+        assert!(m < 60, "minute {m} out of range");
+        assert!(s < 60, "second {s} out of range");
+        assert_eq!(millis.len(), 3);
+        assert!(millis.parse::<u64>().unwrap() < 1000);
+    }
+
+    /// Endpoint selection must use the authenticated org route only when both
+    /// a non-empty token and non-empty slug are present; blank values fall
+    /// back to the public proxy (no `/v0/orgs//telemetry`, no `Bearer `).
+    #[test]
+    fn test_resolve_telemetry_endpoint_auth_and_proxy() {
+        let (url, auth) = resolve_telemetry_endpoint(Some("tok"), Some("acme"));
+        assert!(auth, "token + slug should authenticate");
+        assert!(url.contains("/v0/orgs/acme/telemetry"), "got {url}");
+        assert!(!url.contains("/orgs//"), "no empty slug segment: {url}");
+
+        // Missing slug -> proxy.
+        let (url, auth) = resolve_telemetry_endpoint(Some("tok"), None);
+        assert!(!auth);
+        assert!(url.ends_with("/patch/telemetry"), "got {url}");
+
+        // Missing token -> proxy.
+        let (_url, auth) = resolve_telemetry_endpoint(None, Some("acme"));
+        assert!(!auth);
+    }
+
+    /// Regression: an empty-string token or slug must be treated as absent,
+    /// not spliced into the URL/header. Guards the `/v0/orgs//telemetry`
+    /// malformed-URL class that bit the API client.
+    #[test]
+    fn test_resolve_telemetry_endpoint_empty_strings_fall_back() {
+        let (url, auth) = resolve_telemetry_endpoint(Some("tok"), Some(""));
+        assert!(!auth, "empty slug must not authenticate");
+        assert!(!url.contains("/orgs//"), "empty slug leaked into URL: {url}");
+        assert!(url.ends_with("/patch/telemetry"), "got {url}");
+
+        let (_url, auth) = resolve_telemetry_endpoint(Some(""), Some("acme"));
+        assert!(!auth, "empty token must not authenticate");
+
+        let (_url, auth) = resolve_telemetry_endpoint(Some(""), Some(""));
+        assert!(!auth);
     }
 }

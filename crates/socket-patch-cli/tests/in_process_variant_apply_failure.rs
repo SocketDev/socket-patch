@@ -234,3 +234,144 @@ fn failed_installed_variant_is_not_also_reported_not_installed() {
          variant {purl}; the failed-apply variant was misreported as not installed: {out}"
     );
 }
+
+/// Regression: a multi-variant base PURL where ONE variant applies cleanly
+/// but a SIBLING variant fails must flip the command to a non-zero exit /
+/// `partialFailure` — not silently report success because one variant
+/// happened to apply.
+///
+/// The apply variant branch tracks an `applied` flag and only flagged
+/// `has_errors` when *no* variant applied. A successful sibling therefore
+/// masked a failed variant: the JSON envelope carried a `failed` event yet
+/// the command exited 0 with `status: success`. The npm branch and the
+/// rollback loop both set `has_errors` on *every* failed result; this pins
+/// the variant branch to the same contract.
+///
+/// `--force` is the lever that makes every variant of the base get
+/// attempted (it bypasses the per-variant first-file installed-distribution
+/// check), so both variants reach `apply_package_patch`: one with a valid
+/// `afterHash` blob (applies), one with a decoy blob that does not hash to
+/// its `afterHash` (fails the pre-write hash check).
+#[test]
+fn partial_multi_variant_failure_fails_the_command() {
+    if find_python().is_none() {
+        println!("SKIP: python3 not on PATH");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let six_path = install_six(tmp.path());
+    let original = std::fs::read(&six_path).expect("read six.py");
+    let before_hash = git_sha256(&original);
+
+    // Variant A: a genuine patch whose blob hashes to its declared
+    // `afterHash` → applies cleanly.
+    let mut patched_a = original.clone();
+    patched_a.extend_from_slice(b"\n# PATCH-A\n");
+    let after_hash_a = git_sha256(&patched_a);
+
+    // Variant B: declares an `afterHash` for content the blob will NOT
+    // contain (the blob holds the unpatched original), so the pre-write
+    // hash check inside `apply_file_patch` fails → this variant fails.
+    let mut intended_b = original.clone();
+    intended_b.extend_from_slice(b"\n# PATCH-B\n");
+    let after_hash_b = git_sha256(&intended_b);
+
+    let socket_dir = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket_dir.join("blobs")).expect("mk .socket/blobs");
+    // A's blob is valid; B's blob is a decoy (original bytes under B's hash).
+    std::fs::write(socket_dir.join("blobs").join(&after_hash_a), &patched_a)
+        .expect("write valid blob A");
+    std::fs::write(socket_dir.join("blobs").join(&after_hash_b), &original)
+        .expect("write decoy blob B");
+
+    let base = format!("pkg:pypi/{PYPI_PACKAGE}@{PYPI_VERSION}");
+    let variant_a = format!("{base}?artifact_id=six-{PYPI_VERSION}-py2.py3-none-any.whl");
+    let variant_b = format!("{base}?artifact_id=six-{PYPI_VERSION}.tar.gz");
+    let key_a = variant_a.clone();
+    let key_b = variant_b.clone();
+    let manifest = serde_json::json!({
+        "patches": {
+            key_a: {
+                "uuid": UUID,
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "six.py": { "beforeHash": before_hash, "afterHash": after_hash_a } },
+                "vulnerabilities": {},
+                "description": "variant A (applies)",
+                "license": "MIT",
+                "tier": "free"
+            },
+            key_b: {
+                "uuid": UUID,
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "six.py": { "beforeHash": before_hash, "afterHash": after_hash_b } },
+                "vulnerabilities": {},
+                "description": "variant B (fails)",
+                "license": "MIT",
+                "tier": "free"
+            }
+        }
+    });
+    std::fs::write(
+        socket_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .expect("write manifest");
+
+    let output = Command::new(binary())
+        .args([
+            "apply",
+            "--force",
+            "--offline",
+            "--ecosystems",
+            "pypi",
+            "--json",
+            "--cwd",
+            tmp.path().to_str().unwrap(),
+        ])
+        .env_remove("SOCKET_API_TOKEN")
+        .env_remove("SOCKET_OFFLINE")
+        .env_remove("SOCKET_ECOSYSTEMS")
+        .env_remove("SOCKET_JSON")
+        .env_remove("SOCKET_FORCE")
+        .env_remove("SOCKET_CWD")
+        .env_remove("SOCKET_MANIFEST_PATH")
+        .output()
+        .expect("run socket-patch apply");
+    let code = output.status.code().unwrap_or(-1);
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // The core regression: a failed sibling variant must fail the command.
+    assert_eq!(
+        code, 1,
+        "a partial multi-variant failure must exit 1, not be masked by the \
+         successful sibling; stdout: {out}"
+    );
+
+    let env: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("envelope not JSON ({e}): {out}"));
+    let events = env["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events array in envelope: {out}"));
+
+    // Prove the scenario was genuinely exercised: exactly one variant
+    // applied and exactly one failed (not a total failure).
+    let applied: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["action"] == "applied").collect();
+    let failed: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["action"] == "failed").collect();
+    assert_eq!(
+        applied.len(),
+        1,
+        "expected exactly one applied variant: {out}"
+    );
+    assert_eq!(failed.len(), 1, "expected exactly one failed variant: {out}");
+    assert_eq!(applied[0]["purl"], serde_json::Value::String(variant_a));
+    assert_eq!(failed[0]["purl"], serde_json::Value::String(variant_b));
+
+    // And the envelope itself must signal the partial failure.
+    assert_eq!(
+        env["status"], "partialFailure",
+        "envelope status must reflect the partial failure: {out}"
+    );
+}

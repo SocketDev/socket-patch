@@ -104,16 +104,35 @@ pub(crate) async fn fixup(pkg_path: &Path) -> Result<Option<SidecarPayload>, Sid
 /// junk left over from corrupt installs) without an implicit-else
 /// arm that coverage can never reach on filesystems that reject
 /// non-UTF-8 bytes at creation time (APFS).
+///
+/// The name match alone is not sufficient: a *directory* (or socket,
+/// FIFO, …) whose name happens to end in `.nupkg.sha512` is not a
+/// content-signing marker, and treating it as one emits a spurious
+/// "package may be flagged as tampered" advisory that misleads
+/// operators. We therefore require the entry to resolve to a regular
+/// file. The check follows symlinks (`fs::metadata`, not the
+/// non-following `DirEntry::file_type`) so a marker that ships as a
+/// symlink to a real `.sha512` still counts — fail-closed against the
+/// directory false-positive, not fail-open against a symlinked marker
+/// (the symlink-drop trap the npm/cargo crawlers were bitten by).
 async fn has_signed_marker(pkg_path: &Path) -> bool {
     let mut entries = match tokio::fs::read_dir(pkg_path).await {
         Ok(rd) => rd,
         Err(_) => return false,
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry
+        if !entry
             .file_name()
             .as_encoded_bytes()
             .ends_with(b".nupkg.sha512")
+        {
+            continue;
+        }
+        // Name matches — confirm it's a regular file before believing it.
+        if tokio::fs::metadata(entry.path())
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
         {
             return true;
         }
@@ -216,6 +235,103 @@ mod tests {
         assert_eq!(
             mode, 0o555,
             "package dir mode must be restored after the unlink"
+        );
+    }
+
+    /// Regression (directory false-positive): a *directory* whose name
+    /// ends in `.nupkg.sha512` is NOT a content-signing marker. Before
+    /// the `is_file` guard, `has_signed_marker` matched on name alone
+    /// and emitted a spurious "package may be flagged as tampered"
+    /// advisory for it — misleading an operator into thinking an
+    /// unsigned package was signed. There's no metadata here either, so
+    /// the correct outcome is a clean `None`.
+    #[tokio::test]
+    async fn directory_named_like_marker_is_not_a_signature() {
+        let d = tempfile::tempdir().unwrap();
+        // A directory — not a file — bearing the marker suffix.
+        tokio::fs::create_dir(d.path().join("weird.nupkg.sha512"))
+            .await
+            .unwrap();
+
+        let out = fixup(d.path()).await.unwrap();
+        assert!(
+            out.is_none(),
+            "a directory named *.nupkg.sha512 must not be treated as a signing marker"
+        );
+    }
+
+    /// A directory matching the marker name must not even flip the
+    /// advisory when there IS metadata to delete: the file entry is
+    /// present, but the advisory stays absent.
+    #[tokio::test]
+    async fn marker_dir_with_metadata_deletes_without_advisory() {
+        let d = tempfile::tempdir().unwrap();
+        tokio::fs::write(d.path().join(METADATA_FILE), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(d.path().join("pkg.1.0.0.nupkg.sha512"))
+            .await
+            .unwrap();
+
+        let payload = fixup(d.path()).await.unwrap().expect("metadata existed");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Deleted);
+        assert!(
+            payload.advisory.is_none(),
+            "a directory marker must not raise the signed-package advisory"
+        );
+    }
+
+    /// A marker shipped as a *symlink to a real `.sha512` file* must
+    /// still count — the `is_file` guard follows symlinks, so it does
+    /// not fail open the way the non-following `DirEntry::file_type`
+    /// would have (the symlink-drop trap the crawlers were bitten by).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_marker_still_counts_as_signed() {
+        let d = tempfile::tempdir().unwrap();
+        // The real sha512 lives elsewhere; the package dir only has a
+        // symlink to it.
+        let real = d.path().join("real.sha512");
+        tokio::fs::write(&real, b"hash").await.unwrap();
+        tokio::fs::symlink(&real, d.path().join("pkg.1.0.0.nupkg.sha512"))
+            .await
+            .unwrap();
+
+        let payload = fixup(d.path())
+            .await
+            .unwrap()
+            .expect("symlinked signature marker must surface an advisory");
+        assert!(payload.files.is_empty());
+        let adv = payload.advisory.expect("expected advisory");
+        assert_eq!(adv.code, SidecarAdvisoryCode::NugetSignedPackageTampered);
+    }
+
+    /// Deleting `.nupkg.metadata` must leave the `.nupkg.sha512`
+    /// signature sibling on disk — we only neutralize the recomputable
+    /// metadata hash, never the archive-level signature (which we
+    /// cannot honestly fix and only advise on). Pins that the unlink
+    /// targets exactly the metadata file and nothing else.
+    #[tokio::test]
+    async fn delete_does_not_remove_signature_sibling() {
+        let d = tempfile::tempdir().unwrap();
+        tokio::fs::write(d.path().join(METADATA_FILE), b"{}")
+            .await
+            .unwrap();
+        let sig = d.path().join("pkg.1.0.0.nupkg.sha512");
+        tokio::fs::write(&sig, b"hash").await.unwrap();
+
+        fixup(d.path()).await.unwrap();
+
+        assert!(
+            tokio::fs::metadata(d.path().join(METADATA_FILE))
+                .await
+                .is_err(),
+            "metadata must be gone"
+        );
+        assert!(
+            tokio::fs::metadata(&sig).await.is_ok(),
+            "the .nupkg.sha512 signature sibling must be left untouched"
         );
     }
 

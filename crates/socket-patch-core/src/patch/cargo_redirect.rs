@@ -161,6 +161,23 @@ fn copy_dir_for(project_root: &Path, name: &str, version: &str) -> PathBuf {
         .join(format!("{name}-{version}"))
 }
 
+/// A crate `name` / `version` keys the on-disk copy dir
+/// (`.socket/cargo-patches/<name>-<version>/`) and the `[patch]` path, so it
+/// must be a single safe path segment. A component containing a path separator
+/// or `..` would let a tampered manifest PURL escape `.socket/cargo-patches/`
+/// and make `apply` copy + write the patched tree (or `rollback` delete a tree)
+/// at an arbitrary filesystem location outside the project. Cargo crate names
+/// are `[A-Za-z0-9_-]` and versions are semver, so neither can legitimately
+/// contain any of these — reject them fail-closed before touching the disk.
+fn is_safe_redirect_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+}
+
 /// Materialise a project-local patched copy and wire up the `[patch]` redirect.
 ///
 /// * `pristine_src` — the pristine registry/vendor source dir (the crawler's
@@ -182,6 +199,23 @@ pub async fn apply_cargo_redirect(
     dry_run: bool,
     force: bool,
 ) -> ApplyResult {
+    // SECURITY: refuse coordinates that would escape `.socket/cargo-patches/`.
+    // A `..`/separator in `name` or `version` (a tampered manifest PURL) would
+    // otherwise make `fresh_copy` + the apply pipeline write the patched tree to
+    // an arbitrary location. Fail-closed before any disk access.
+    if !is_safe_redirect_component(name) || !is_safe_redirect_component(version) {
+        return synthesized_result(
+            purl,
+            Path::new(""),
+            Vec::new(),
+            false,
+            Some(format!(
+                "refusing cargo redirect for unsafe coordinates `{name}`/`{version}` \
+                 (a path separator or `..` would escape .socket/cargo-patches/)"
+            )),
+        );
+    }
+
     let copy_dir = copy_dir_for(project_root, name, version);
 
     // A redirect with no files to patch is meaningless: no-op success, no
@@ -266,6 +300,16 @@ pub async fn remove_cargo_redirect(
             format!("not a cargo purl: {purl}"),
         )
     })?;
+
+    // SECURITY: the copy dir is `.socket/cargo-patches/<name>-<version>/` and is
+    // about to be `remove_tree`d. An unsafe `name`/`version` (`..`/separator)
+    // would target a tree outside the project for deletion — refuse it.
+    if !is_safe_redirect_component(name) || !is_safe_redirect_component(version) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to remove cargo redirect for unsafe coordinates: {purl}"),
+        ));
+    }
 
     cargo_config::drop_patch_entry(project_root, name, dry_run)
         .await
@@ -362,6 +406,12 @@ pub async fn verify_cargo_redirect_state(
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };
+        // SECURITY: skip coordinates that would resolve the copy dir outside
+        // `.socket/cargo-patches/` (a tampered manifest); never stat/hash files
+        // outside the project tree during an audit. Mirrors the apply guard.
+        if !is_safe_redirect_component(name) || !is_safe_redirect_component(version) {
+            continue;
+        }
         // Vendored crates are patched in place, not redirected, so they have
         // no copy/entry by design — skip them. The crawler stores vendored
         // crates under `<root>/vendor/` in either `<name>-<version>/` or bare
@@ -1087,6 +1137,188 @@ mod tests {
         assert!(drifts
             .iter()
             .any(|d| matches!(d, Drift::OrphanEntry { .. })));
+    }
+
+    // ── filesystem-safety: coordinate traversal ──────────────────────────
+
+    /// SECURITY regression: a tampered manifest PURL with `..` in the crate name
+    /// must NOT let `apply` copy + write the patched tree outside
+    /// `.socket/cargo-patches/`. Before the guard this returned success and
+    /// materialised the copy at `<project>/../escape-1.0.0`.
+    #[tokio::test]
+    async fn test_apply_rejects_traversal_crate_name() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let escaped = root.parent().unwrap().join("escape-1.0.0");
+        // Make sure a stale copy from a prior run can't mask the assertion.
+        let _ = remove_tree(&escaped).await;
+
+        let result = apply_cargo_redirect(
+            "pkg:cargo/../../../escape@1.0.0",
+            "../../../escape",
+            "1.0.0",
+            &pristine,
+            root,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(!result.success, "traversal coordinates must be refused");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("unsafe"),
+            "error should explain the refusal: {:?}",
+            result.error
+        );
+        assert!(
+            !escaped.exists(),
+            "no copy may be written outside .socket/cargo-patches/ (found {})",
+            escaped.display()
+        );
+        // No config entry was written either.
+        assert!(cargo_config::read_patch_entries(root).await.is_empty());
+        let _ = remove_tree(&escaped).await; // belt-and-suspenders cleanup
+    }
+
+    /// A `version` carrying a separator is equally rejected (keys the copy dir).
+    #[tokio::test]
+    async fn test_apply_rejects_traversal_version() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let result = apply_cargo_redirect(
+            "pkg:cargo/cfg-if@../../../evil",
+            "cfg-if",
+            "../../../evil",
+            &pristine,
+            root,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert!(!result.success);
+        assert!(!root.join(".cargo/config.toml").exists());
+    }
+
+    /// SECURITY regression: `remove` must refuse unsafe coordinates rather than
+    /// `remove_tree` a directory outside the project.
+    #[tokio::test]
+    async fn test_remove_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A precious directory a sibling of the project root.
+        let precious = root.parent().unwrap().join("precious-1.0.0");
+        tokio::fs::create_dir_all(&precious).await.unwrap();
+        tokio::fs::write(precious.join("keep.txt"), b"keep")
+            .await
+            .unwrap();
+
+        let err = remove_cargo_redirect("pkg:cargo/../../../precious@1.0.0", root, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            precious.exists() && precious.join("keep.txt").exists(),
+            "remove must not delete a tree outside the project"
+        );
+        tokio::fs::remove_dir_all(&precious).await.unwrap();
+    }
+
+    // ── scenario coverage ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_reconcile_dry_run_does_not_mutate() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_cargo_redirect(
+            "pkg:cargo/cfg-if@1.0.0", "cfg-if", "1.0.0", &pristine, root, &files, &sources, None,
+            false, false,
+        )
+        .await;
+        let cfg_before = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+
+        let desired: HashSet<String> = HashSet::new();
+        let removed = reconcile_cargo_redirects(root, &desired, true).await;
+        assert!(removed.contains(&"pkg:cargo/cfg-if@1.0.0".to_string()));
+        // dry-run must NOT delete the copy or rewrite config.
+        assert!(root.join(".socket/cargo-patches/cfg-if-1.0.0").exists());
+        let cfg_after = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        assert_eq!(cfg_before, cfg_after, "dry-run reconcile must not edit config");
+    }
+
+    #[tokio::test]
+    async fn test_version_bump_refreshes_entry() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_cargo_redirect(
+            "pkg:cargo/cfg-if@1.0.0", "cfg-if", "1.0.0", &pristine, root, &files, &sources, None,
+            false, false,
+        )
+        .await;
+        // Apply a NEW version (same crate). Build a fresh pristine for 1.0.1.
+        let result = apply_cargo_redirect(
+            "pkg:cargo/cfg-if@1.0.1", "cfg-if", "1.0.1", &pristine, root, &files, &sources, None,
+            false, false,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        let entries = cargo_config::read_patch_entries(root).await;
+        assert_eq!(
+            entries["cfg-if"].path.as_deref(),
+            Some(".socket/cargo-patches/cfg-if-1.0.1"),
+            "entry must point at the bumped version"
+        );
+        assert!(root.join(".socket/cargo-patches/cfg-if-1.0.1").exists());
+    }
+
+    #[tokio::test]
+    async fn test_realistic_cargo_lock_with_header() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_cargo_redirect(
+            "pkg:cargo/cfg-if@1.0.0", "cfg-if", "1.0.0", &pristine, root, &files, &sources, None,
+            false, false,
+        )
+        .await;
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:cargo/cfg-if@1.0.0".to_string(),
+            crate::manifest::schema::PatchRecord {
+                uuid: "u".into(),
+                exported_at: "t".into(),
+                files: files.clone(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let desired: HashSet<String> = ["pkg:cargo/cfg-if@1.0.0".to_string()].into_iter().collect();
+        // Realistic lock: version header + source/checksum fields + dup version.
+        tokio::fs::write(
+            root.join("Cargo.lock"),
+            "version = 3\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"abc\"\n\n[[package]]\nname = \"cfg-if\"\nversion = \"0.1.10\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"def\"\n",
+        )
+        .await
+        .unwrap();
+        // patched 1.0.0 is among resolved versions → clean.
+        assert!(verify_cargo_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -369,6 +369,76 @@ mod host_guard {
             "after remove the project must report needs_configuration again:\n{v}"
         );
     }
+
+    /// Regression: classic-Poetry projects.
+    ///
+    /// `setup` writes the hook into a Poetry manifest as the *structural*
+    /// `socket-patch = { version = "*", extras = ["hook"] }` — which has NO
+    /// literal `socket-patch[hook]` substring. A `setup --check` that probes
+    /// the manifest *textually* would therefore report a freshly-and-correctly
+    /// configured Poetry project as `needs_configuration` (exit 1), breaking
+    /// the setup→check round-trip. This guard pins the structural detection by
+    /// running the real binary against a hand-authored Poetry manifest in each
+    /// state. Fully hermetic: `--check` neither writes nor refreshes a lockfile.
+    #[test]
+    fn poetry_check_recognizes_structural_hook_host() {
+        // ── configured: the exact structural form `setup` emits ─────────────
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_s = root.to_str().unwrap();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"x\"\nversion = \"0.1.0\"\n\n\
+             [tool.poetry.dependencies]\npython = \"^3.9\"\n\
+             socket-patch = {version = \"*\", extras = [\"hook\"]}\n",
+        )
+        .unwrap();
+
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(
+            code, 0,
+            "setup --check must PASS (exit 0) for a Poetry project carrying the \
+             structural hook extra.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        let v = parse_json(&out, "poetry check (configured)");
+        assert_eq!(
+            json_str(&v, "status", "poetry check (configured)"),
+            "configured",
+            "structurally-configured Poetry project must report configured:\n{v}"
+        );
+        assert_eq!(
+            json_str(
+                &pth_entry(&v, "poetry check (configured)"),
+                "status",
+                "poetry check (configured) pth"
+            ),
+            "configured",
+            "the pyproject pth entry must read configured:\n{v}"
+        );
+
+        // ── unconfigured: a plain socket-patch dep (no hook) is NOT enough ──
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path();
+        let root2_s = root2.to_str().unwrap();
+        std::fs::write(
+            root2.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"x\"\nversion = \"0.1.0\"\n\n\
+             [tool.poetry.dependencies]\npython = \"^3.9\"\nsocket-patch = \"^3.3.0\"\n",
+        )
+        .unwrap();
+        let (code, out, err) = run(root2, &["setup", "--check", "--cwd", root2_s, "--json"]);
+        assert_eq!(
+            code, 1,
+            "setup --check must FAIL (exit 1) for a Poetry project whose \
+             socket-patch dep carries no hook extra.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        let v = parse_json(&out, "poetry check (unconfigured)");
+        assert_eq!(
+            json_str(&v, "status", "poetry check (unconfigured)"),
+            "needs_configuration",
+            "a hook-less Poetry project must report needs_configuration:\n{v}"
+        );
+    }
 }
 
 // ── Nested-workspace layouts (EXPECTED BASELINE GAP) ──────────────────

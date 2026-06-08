@@ -69,6 +69,52 @@ mod tests {
             .any(|k| k == "cargo:rerun-if-changed=/proj/.socket/manifest.json"));
     }
 
+    /// The heal rewrites `cargo-patches/`, so the guard must NOT watch its own
+    /// output (that would re-run on every build); and it watches the resolved
+    /// `Cargo.lock`, not `Cargo.toml`. Pins these against an over-eager edit.
+    #[test]
+    fn rerun_keys_watch_inputs_not_outputs() {
+        let keys = rerun_keys("/proj");
+        assert!(
+            !keys.iter().any(|k| k.contains("cargo-patches")),
+            "must not watch the heal's own output dir (would loop): {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.ends_with("/Cargo.toml")),
+            "watches the resolved lockfile, not the manifest: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn rerun_keys_also_watches_bin_env_and_has_no_extras() {
+        // The guard reads SOCKET_PATCH_BIN too, so a change to it must re-run the
+        // probe. The original test only `any`-checked 3 of the 4 keys, so dropping
+        // this one would have slipped through — pin it explicitly + pin the count.
+        let keys = rerun_keys("/proj");
+        assert!(
+            keys.iter()
+                .any(|k| k == "cargo:rerun-if-env-changed=SOCKET_PATCH_BIN"),
+            "{keys:?}"
+        );
+        assert_eq!(keys.len(), 4, "unexpected rerun key set: {keys:?}");
+    }
+
+    #[test]
+    fn check_is_read_only_and_apply_heals() {
+        // The single safety-critical difference between the probe and the heal is
+        // `--check` (read-only audit) vs no `--check` (mutating regenerate). Pin
+        // that the probe carries it and the heal does NOT — swapping them would
+        // either never heal or mutate during the read-only verify.
+        assert!(check_args("/proj").iter().any(|a| a == "--check"));
+        assert!(!apply_args("/proj").iter().any(|a| a == "--check"));
+        // Both must stay cargo-scoped and offline regardless.
+        for args in [check_args("/proj"), apply_args("/proj")] {
+            assert!(args.iter().any(|a| a == "--offline"), "{args:?}");
+            assert!(args.windows(2).any(|w| w == ["--ecosystems", "cargo"]), "{args:?}");
+            assert!(args.windows(2).any(|w| w == ["--cwd", "/proj"]), "{args:?}");
+        }
+    }
+
     #[test]
     fn apply_args_are_offline_cargo_scoped() {
         assert_eq!(
@@ -98,6 +144,18 @@ mod tests {
                 "/proj"
             ]
         );
+    }
+
+    /// The probe and heal must differ by EXACTLY `--check` — same ecosystem
+    /// scope, offline flag, and cwd. Complements `check_is_read_only_and_apply_heals`
+    /// (which checks presence) by pinning that nothing else diverges.
+    #[test]
+    fn probe_and_heal_differ_only_by_check() {
+        let probe_without_check: Vec<String> = check_args("/proj")
+            .into_iter()
+            .filter(|a| a != "--check")
+            .collect();
+        assert_eq!(probe_without_check, apply_args("/proj"));
     }
 
     // ── single fail-closed mode: decide_initial ──────────────────────
@@ -138,5 +196,45 @@ mod tests {
     fn after_heal_probe_error_reports_cli() {
         let m = fail_message_after_heal(&Probe::ProbeError("boom".to_string()), "");
         assert!(m.contains("could not run") && m.contains("boom"), "{m}");
+    }
+
+    #[test]
+    fn probe_error_message_is_consistent_initial_and_after_heal() {
+        // A CLI that can't run must produce the SAME diagnostic whether it fails
+        // the initial probe or the re-probe after a heal — both route through the
+        // one helper. Guards against the two messages drifting apart.
+        let initial = match decide_initial(&Probe::ProbeError("zap".to_string())) {
+            Action::Fail(m) => m,
+            other => panic!("probe error must fail-closed, got {other:?}"),
+        };
+        let after_heal = fail_message_after_heal(&Probe::ProbeError("zap".to_string()), "");
+        assert_eq!(initial, after_heal);
+    }
+
+    #[test]
+    fn after_heal_drift_omits_detail_when_blank() {
+        // A blank / whitespace-only detail must not produce a dangling "detail:"
+        // line with nothing after it.
+        let m = fail_message_after_heal(&Probe::Drift, "   \n  ");
+        assert!(m.contains("could NOT be reconciled"), "{m}");
+        assert!(!m.contains("detail:"), "blank detail must be dropped: {m}");
+    }
+
+    #[test]
+    fn after_heal_in_sync_ignores_detail() {
+        // The "regenerated, re-run" path describes a successful heal; probe output
+        // (relevant only to the unrecoverable Drift case) must not leak into it.
+        let m = fail_message_after_heal(&Probe::InSync, "stale copy of foo@1.2.3");
+        assert!(!m.contains("stale copy of foo@1.2.3"), "{m}");
+    }
+
+    #[test]
+    fn after_heal_drift_trims_surrounding_whitespace_from_detail() {
+        // Non-blank detail is surfaced on its own line, trimmed — no trailing
+        // blank after "detail:" and no leading indentation from the CLI output.
+        let m = fail_message_after_heal(&Probe::Drift, "  cargo: drift on serde \n");
+        assert!(m.contains("\n  detail: cargo: drift on serde"), "{m}");
+        assert!(!m.contains("detail:  "), "leading whitespace must be trimmed: {m}");
+        assert!(!m.ends_with(' ') && !m.ends_with('\n'), "trailing whitespace: {m:?}");
     }
 }

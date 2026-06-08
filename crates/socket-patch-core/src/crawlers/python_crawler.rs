@@ -148,7 +148,12 @@ fn parse_dist_info_dir_name(dir_name: &str) -> Option<(String, String)> {
 /// Find directories matching a path pattern with wildcard segments.
 ///
 /// Supported wildcards:
-/// - `"python3.*"` — matches directory entries starting with `python3.`
+/// - `"python3.*"` — matches the minor-versioned interpreter dirs
+///   (`python3.11`, `python3.12`, …) AND the bare `python3` dir.
+///   The bare form is what Debian/Ubuntu use for apt-installed system
+///   modules (`/usr/lib/python3/dist-packages`); a `python3.`-prefix
+///   test (requiring the dot) would silently skip it, hiding every
+///   distro-packaged module from a crawler whose job is to patch them.
 /// - `"*"` — matches any directory entry
 ///
 /// All other segments are treated as literal path components.
@@ -170,14 +175,17 @@ pub async fn find_python_dirs(base_path: &Path, segments: &[&str]) -> Vec<PathBu
     let rest = &segments[1..];
 
     if first == "python3.*" {
-        // Wildcard: list directory and match python3.X entries
+        // Wildcard: list directory and match `python3.X` entries plus the
+        // bare `python3` dir (Debian/Ubuntu `dist-packages` layout). The
+        // exact-match arm avoids over-matching `python3foo` while still
+        // catching the dotless distro form.
         for entry in crate::utils::fs::list_dir_entries(base_path).await {
             if !crate::utils::fs::entry_is_dir(&entry).await {
                 continue;
             }
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("python3.") {
+            if name_str == "python3" || name_str.starts_with("python3.") {
                 let sub =
                     Box::pin(find_python_dirs(&base_path.join(entry.file_name()), rest)).await;
                 results.extend(sub);
@@ -291,14 +299,19 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "~".to_string());
 
-    // Helper closure to scan base/lib/python3.*/[dist|site]-packages
+    // Helper closure to scan base/{lib,lib64}/python3.*/[dist|site]-packages.
+    // `lib64` is the multilib dir on RHEL/Fedora/SUSE where compiled
+    // (C-extension) packages land — pure-Python ones go to `lib`, so both
+    // hold real, distinct packages. Scanning only `lib` would miss every
+    // native package on those distros.
     async fn scan_well_known(
         base: &Path,
         pkg_type: &str,
         seen: &mut HashSet<PathBuf>,
         results: &mut Vec<PathBuf>,
     ) {
-        let matches = find_python_dirs(base, &["lib", "python3.*", pkg_type]).await;
+        let mut matches = find_python_dirs(base, &["lib", "python3.*", pkg_type]).await;
+        matches.extend(find_python_dirs(base, &["lib64", "python3.*", pkg_type]).await);
         for m in matches {
             let resolved = if m.is_absolute() {
                 m
@@ -991,6 +1004,74 @@ mod tests {
         assert!(buggy.is_empty());
     }
 
+    /// Debian/Ubuntu apt-installed modules live in the BARE `python3`
+    /// interpreter dir (`/usr/lib/python3/dist-packages`), not a
+    /// minor-versioned one. The `python3.*` segment must match it; a
+    /// `python3.`-prefix test (requiring the dot) silently hid every
+    /// distro-packaged module — exactly the bug this guards.
+    #[tokio::test]
+    async fn test_find_python_dirs_matches_bare_python3() {
+        let dir = tempfile::tempdir().unwrap();
+        let dist = dir
+            .path()
+            .join("lib")
+            .join("python3")
+            .join("dist-packages");
+        tokio::fs::create_dir_all(&dist).await.unwrap();
+
+        let results = find_python_dirs(dir.path(), &["lib", "python3.*", "dist-packages"]).await;
+        assert_eq!(results, vec![dist]);
+    }
+
+    /// The bare-`python3` arm must be an EXACT match, not a loose prefix:
+    /// `python3` and `python3.12` are interpreters, but `python3foo` /
+    /// `python311` are not and must be ignored so the `python3.*` segment
+    /// never over-matches an unrelated directory.
+    #[tokio::test]
+    async fn test_find_python_dirs_bare_python3_exact_not_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        for v in ["python3", "python3.12", "python3foo", "python311"] {
+            tokio::fs::create_dir_all(lib.join(v).join("site-packages"))
+                .await
+                .unwrap();
+        }
+
+        let results = find_python_dirs(dir.path(), &["lib", "python3.*", "site-packages"]).await;
+        let mut got: Vec<String> = results
+            .iter()
+            .map(|p| {
+                p.parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        got.sort();
+        // Only the real interpreter dirs — `python3` and `python3.12`.
+        assert_eq!(got, vec!["python3", "python3.12"]);
+    }
+
+    /// `lib` and `lib64` coexist on RHEL/Fedora/SUSE and hold distinct
+    /// packages (pure-Python vs compiled). `scan_well_known` scans both;
+    /// the `lib64` segment is a plain literal, so this proves the matcher
+    /// reaches a `lib64/python3.X/site-packages` tree at all.
+    #[tokio::test]
+    async fn test_find_python_dirs_lib64_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sp = dir
+            .path()
+            .join("lib64")
+            .join("python3.11")
+            .join("site-packages");
+        tokio::fs::create_dir_all(&sp).await.unwrap();
+
+        let results = find_python_dirs(dir.path(), &["lib64", "python3.*", "site-packages"]).await;
+        assert_eq!(results, vec![sp]);
+    }
+
     #[tokio::test]
     async fn test_find_python_dirs_literal() {
         let dir = tempfile::tempdir().unwrap();
@@ -1171,3 +1252,4 @@ mod tests {
         assert!(!result.contains_key("pkg:pypi/flask@3.0.0"));
     }
 }
+
