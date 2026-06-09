@@ -189,10 +189,10 @@ still show up in VEX).
 #### Cargo and Go: apply-only, no setup
 
 Cargo and Go have **no `setup` hook** — a one-click, auto-repatch-on-build setup isn't possible for
-them, so `setup` skips both (it never writes a `socket-patch-guard` dependency, `[env]`,
-`internal/socketpatchguard/`, a `[patch]` entry, or a `go.mod` `replace` as a *setup* action). Patch
-them with `socket-patch apply` directly (manually or from a per-project install script), and declare
-them in `setup.manual` for VEX attestation.
+them, so `setup` skips both (it makes no manifest edits for either as a *setup* action; the `go.mod`
+`replace` that local-mode `apply` writes is an *apply*-time redirect, not setup state). Patch them
+with `socket-patch apply` directly (manually or from a per-project install script), and declare them
+in `setup.manual` for VEX attestation.
 
 - **cargo** — `apply` patches the crate **in place** wherever the crawler finds it: the project
   `vendor/` directory or the shared registry cache (`$CARGO_HOME/registry/src/...`). The

@@ -39,9 +39,8 @@ jobs:
 
   # Lint the out-of-workspace packaging artifacts for the ecosystems whose setup
   # / CLI-distribution we added: the RubyGems CLI launcher gem + the Bundler
-  # plugin gem (Ruby), the Composer CLI launcher (PHP), and the generated Go
-  # setup-guard templates. Ruby, PHP, Composer, and Go are all pre-installed on
-  # the ubuntu-latest runner.
+  # plugin gem (Ruby) and the Composer CLI launcher (PHP). Ruby, PHP, and
+  # Composer are all pre-installed on the ubuntu-latest runner.
   lint-ecosystems:
     runs-on: ubuntu-latest
     steps:
@@ -443,12 +442,6 @@ jobs:
             suite: e2e_composer
           - os: ubuntu-latest
             suite: e2e_nuget
-          # `socket-patch-guard` fail-closed build guard. `guard_build_integration`
-          # is hermetic (a shell stub + `cargo build --offline` against a zero-dep
-          # path dep), so it exercises the build.rs-panic-aborts-a-real-build seam
-          # with no network. `#[cfg(unix)]`.
-          - os: ubuntu-latest
-            suite: guard_build_integration
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at

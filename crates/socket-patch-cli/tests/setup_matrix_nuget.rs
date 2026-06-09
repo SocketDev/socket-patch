@@ -89,7 +89,7 @@ mod host_guard {
     /// this, an ambient `SOCKET_CWD` / `SOCKET_JSON` / `SOCKET_OFFLINE` in
     /// the shell or CI could satisfy an assertion via the environment rather
     /// than the flag under test. (Mirrors the scrub used by the
-    /// `cli_parse_*` and `setup_matrix_cargo`/`setup_matrix_gem` suites.)
+    /// `cli_parse_*` and `setup_matrix_gem` suites.)
     const SOCKET_ENV_VARS: &[&str] = &[
         "SOCKET_CWD",
         "SOCKET_MANIFEST_PATH",
@@ -114,8 +114,6 @@ mod host_guard {
         "SOCKET_SAVE_ONLY",
         "SOCKET_ONE_OFF",
         "SOCKET_ALL_RELEASES",
-        "SOCKET_PATCH_ROOT",
-        "SOCKET_PATCH_GUARD",
         "SOCKET_EXPERIMENTAL_NUGET",
     ];
 

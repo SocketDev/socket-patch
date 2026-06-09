@@ -94,7 +94,7 @@ mod host_guard {
     /// (`--cwd`, `--yes`, `--check`, `--remove`). Without this, an ambient
     /// `SOCKET_CWD` / `SOCKET_YES` in the shell or CI could satisfy an assertion
     /// via the environment rather than the flag under test. (Mirrors the scrub
-    /// used by the `cli_parse_*` and cargo host-guard suites.)
+    /// used by the `cli_parse_*` and gem host-guard suites.)
     const SOCKET_ENV_VARS: &[&str] = &[
         "SOCKET_CWD",
         "SOCKET_MANIFEST_PATH",

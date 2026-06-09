@@ -85,7 +85,7 @@ mod host_guard {
     /// / `SOCKET_MANIFEST_PATH` etc. in the shell or CI could stand in for a
     /// flag and mask a flag-handling regression (e.g. `--cwd` being ignored,
     /// or `--check` silently succeeding). Strip the full surface so behaviour
-    /// reflects the explicit flags alone. Mirrors `setup_matrix_cargo.rs`.
+    /// reflects the explicit flags alone. Mirrors `setup_matrix_pypi.rs`.
     const SOCKET_ENV_VARS: &[&str] = &[
         "SOCKET_CWD",
         "SOCKET_MANIFEST_PATH",
@@ -110,8 +110,6 @@ mod host_guard {
         "SOCKET_SAVE_ONLY",
         "SOCKET_ONE_OFF",
         "SOCKET_ALL_RELEASES",
-        "SOCKET_PATCH_ROOT",
-        "SOCKET_PATCH_GUARD",
     ];
 
     /// Absolute path to the binary under test, via cargo's `CARGO_BIN_EXE_*`.
