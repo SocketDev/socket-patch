@@ -1,8 +1,9 @@
 //! Project-local Go `replace`-redirect engine (local mode only).
 //!
-//! The Go analog of [`crate::patch::cargo_redirect`]. Instead of patching
-//! modules in place in the shared, read-only, checksum-verified module cache
-//! (the `--global` path), this materialises a project-local **patched copy** of
+//! Unlike cargo (which patches crates in place wherever the crawler finds
+//! them), the Go module cache is shared, read-only and checksum-verified, so
+//! in-place patching fails `go.sum` verification at build time. Instead, this
+//! materialises a project-local **patched copy** of
 //! each module under `<root>/.socket/go-patches/<module>@<version>/` and points
 //! the build at it with a `replace` directive in `<root>/go.mod`:
 //!
@@ -517,9 +518,9 @@ async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::io::Result<
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename. Mirrors the
-/// hardened writers in [`crate::patch::cargo_config`] /
-/// [`crate::patch::go_mod_edit`]: a reader/recovering process only ever sees the
-/// complete old or complete new bytes, never a truncated intermediate.
+/// hardened writer in [`crate::patch::go_mod_edit`]: a reader/recovering process
+/// only ever sees the complete old or complete new bytes, never a truncated
+/// intermediate.
 async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path

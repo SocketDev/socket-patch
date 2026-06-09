@@ -12,7 +12,7 @@
 //! path dependency, so `cargo build --offline` needs no downloads.
 //!
 //! These shell out to a real `cargo build`, but — like the crate's other cargo
-//! shell-out tests (`e2e_cargo.rs`, `docker_e2e_cargo.rs`, `setup_matrix_cargo.rs`)
+//! shell-out tests (`e2e_cargo.rs`, `docker_e2e_cargo.rs`)
 //! — they run as part of the normal suite and self-skip via `has_command("cargo")`
 //! when the toolchain is absent, rather than being `#[ignore]`d (an `#[ignore]`d
 //! guard test protects nothing in CI). `#[cfg(unix)]` for the shell stub.

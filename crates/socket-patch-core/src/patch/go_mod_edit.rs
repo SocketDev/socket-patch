@@ -1,9 +1,8 @@
 //! Read / write `<project_root>/go.mod` for the project-local Go
 //! `replace`-redirect backend.
 //!
-//! Mirrors the contract of [`crate::patch::cargo_config`] (the cargo
-//! `[patch.crates-io]` analog), but `go.mod` is **not** TOML, so there is no
-//! `toml_edit` to lean on. This is a small, line/block-aware editor that
+//! `go.mod` is **not** TOML, so there is no `toml_edit` to lean on. This is a
+//! small, line/block-aware editor that
 //! preserves the rest of the file (comments, `require`/`exclude`/`retract`
 //! directives, the user's own `replace`s) and only touches socket-owned
 //! `replace` directives.
@@ -143,7 +142,7 @@ async fn edit_go_mod(
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader/recovering process only ever sees the complete old
 /// or the complete new bytes. Mirrors the hardened writers in
-/// `patch/cargo_config.rs`, `patch/apply.rs`, and `package_json/update.rs`.
+/// `patch/apply.rs` and `package_json/update.rs`.
 async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
@@ -780,7 +779,7 @@ replace (
     /// A real write must rename its `.socket-stage-*` sibling over `go.mod` and
     /// leave nothing behind — a leftover stage file (or, worse, a half-written
     /// truncated `go.mod`) is exactly the corruption the atomic writer exists to
-    /// prevent. Mirrors the litter guard in `patch/cargo_config.rs`.
+    /// prevent. Mirrors the litter guard in `package_json/update.rs`.
     #[tokio::test]
     async fn test_ensure_leaves_no_stage_litter() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,11 +1,10 @@
 //! Add / remove the managed `plugin "socket-patch"` block in a Bundler
 //! `Gemfile`, and statically check whether it is present.
 //!
-//! A Gemfile is Ruby, not a structured config, so — unlike cargo's `toml_edit`
-//! edits — this appends/strips a clearly-marked, byte-exact block (mirrors the
-//! reversibility contract of [`crate::cargo_setup::update`]: idempotent,
+//! A Gemfile is Ruby, not a structured config, so this appends/strips a
+//! clearly-marked, byte-exact block under a reversibility contract: idempotent,
 //! `dry_run`-aware, `Updated`/`AlreadyConfigured`/`Error`, and a `--remove` that
-//! restores the file byte-for-byte).
+//! restores the file byte-for-byte.
 
 use std::path::Path;
 
@@ -13,7 +12,7 @@ use tokio::fs;
 
 use super::{add_plugin_files, remove_plugin_files, BundlerProject};
 
-/// Outcome of one setup edit. Mirrors `cargo_setup::CargoSetupStatus`.
+/// Outcome of one setup edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GemSetupStatus {
     Updated,
