@@ -9,10 +9,19 @@
 //!
 //! ## Ownership model (no sidecar manifest)
 //! A `replace` directive is *socket-owned* iff its right-hand side is a
-//! filesystem path under `.socket/go-patches/`. A module-to-module replacement
-//! (`=> example.com/fork v1.2.3`) or a path pointing anywhere else is
-//! user-authored and is never modified or removed. This is the entire
-//! ownership signal; there is no `managed.json`.
+//! filesystem path under one of the two socket-managed prefixes:
+//! `.socket/go-patches/` (the `apply` redirect backend, [`ReplaceOwner::GoPatches`])
+//! or `.socket/vendor/golang/` (the `vendor` backend, [`ReplaceOwner::Vendor`]).
+//! A module-to-module replacement (`=> example.com/fork v1.2.3`) or a path
+//! pointing anywhere else is user-authored and is never modified or removed.
+//! The path prefix is the entire ownership signal; there is no `managed.json`.
+//!
+//! At most one socket-owned `replace` exists per module: `ensure_replace_entry`
+//! rewrites an existing socket-owned line of EITHER owner in place (this
+//! cross-owner upsert is how `vendor` takes over an `apply` redirect), while
+//! `drop_replace_entry` removes only the requested owner's directives (so
+//! `apply`'s reconcile can never prune a vendored module and vice versa).
+//! Policy about *when* an owner may take over lives in the callers.
 //!
 //! ## Why `replace` (validated empirically — see project memory)
 //! A local-path `replace` target is **not** `go.sum` content-verified, so
@@ -26,17 +35,64 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
-/// Project-relative directory holding patched module copies. A `replace` whose
-/// target path is under this prefix is how socket ownership is recognised.
+/// Project-relative directory holding `apply`'s patched module copies. A
+/// `replace` whose target path is under this prefix is owned by
+/// [`ReplaceOwner::GoPatches`].
 pub const GO_PATCHES_DIR: &str = ".socket/go-patches";
 
-/// The expected (project-root-relative) `replace` target path for a module
-/// copy. Always `./`-prefixed and forward-slashed: Go treats a replacement
-/// target as a *filesystem path* only when it begins with `./`, `../`, or `/`
-/// (otherwise it is parsed as a module path), and accepts forward slashes on
-/// every platform.
+/// Project-relative directory holding `vendor`'s committed module copies
+/// (`<GO_VENDOR_DIR>/<patch-uuid>/<module>@<version>`). A `replace` whose
+/// target path is under this prefix is owned by [`ReplaceOwner::Vendor`].
+pub const GO_VENDOR_DIR: &str = ".socket/vendor/golang";
+
+/// Which socket-managed backend owns a `replace` directive, classified by the
+/// directive's target-path prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceOwner {
+    /// `apply`'s machine-local redirect copies under `.socket/go-patches/`.
+    GoPatches,
+    /// `vendor`'s committed copies under `.socket/vendor/golang/<uuid>/`.
+    Vendor,
+}
+
+impl ReplaceOwner {
+    /// The classifying path prefix (no trailing slash).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::GoPatches => GO_PATCHES_DIR,
+            Self::Vendor => GO_VENDOR_DIR,
+        }
+    }
+}
+
+/// Classify a `replace` target path: which socket backend owns it, or `None`
+/// for a user-authored path. The two prefixes don't overlap, but `Vendor` is
+/// tested first to keep the intent explicit (`.socket/vendor/golang/` is more
+/// specific than a hypothetical future `.socket/` catch-all).
+pub fn detect_owner(path: &str) -> Option<ReplaceOwner> {
+    for owner in [ReplaceOwner::Vendor, ReplaceOwner::GoPatches] {
+        let norm = path.replace('\\', "/");
+        let norm = norm.strip_prefix("./").unwrap_or(&norm);
+        let prefix = format!("{}/", owner.prefix());
+        if norm.starts_with(&prefix) || norm.contains(&format!("/{prefix}")) {
+            return Some(owner);
+        }
+    }
+    None
+}
+
+/// The (project-root-relative) `replace` target path for a copy that lives at
+/// `<base_rel>/<module>@<version>`. Always `./`-prefixed and forward-slashed:
+/// Go treats a replacement target as a *filesystem path* only when it begins
+/// with `./`, `../`, or `/` (otherwise it is parsed as a module path), and
+/// accepts forward slashes on every platform.
+pub fn replace_target_path(base_rel: &str, module: &str, version: &str) -> String {
+    format!("./{base_rel}/{module}@{version}")
+}
+
+/// The expected `replace` target for an `apply` (go-patches) redirect copy.
 pub fn expected_replace_path(module: &str, version: &str) -> String {
-    format!("./{GO_PATCHES_DIR}/{module}@{version}")
+    replace_target_path(GO_PATCHES_DIR, module, version)
 }
 
 /// One parsed `replace` directive.
@@ -49,8 +105,15 @@ pub struct ReplaceEntry {
     /// Right-hand-side path, iff the replacement is a filesystem path
     /// (`None` for a module-to-module `=> mod ver` replacement).
     pub path: Option<String>,
-    /// True iff `path` is under `.socket/go-patches/`.
-    pub socket_owned: bool,
+    /// Which socket backend owns this directive (`None` = user-authored).
+    pub owner: Option<ReplaceOwner>,
+}
+
+impl ReplaceEntry {
+    /// True iff the directive is socket-owned (either backend).
+    pub fn socket_owned(&self) -> bool {
+        self.owner.is_some()
+    }
 }
 
 // ── public async API ─────────────────────────────────────────────────────────
@@ -73,31 +136,42 @@ pub async fn read_required_versions(project_root: &Path) -> Option<HashMap<Strin
     Some(parse_required_versions(&content))
 }
 
-/// Upsert a socket-owned `replace <module> <version> => ./.socket/go-patches/<module>@<version>`.
-/// Idempotent. Returns whether the file changed. Errors (without writing) if a
-/// `go.mod` is absent, or if a *user-authored* `replace` already pins the same
-/// `module`+`version` (a duplicate would make `go.mod` invalid).
+/// Upsert a socket-owned `replace <module> <version> => ./<base_rel>/<module>@<version>`,
+/// where `base_rel` is the project-relative copy base (e.g. [`GO_PATCHES_DIR`],
+/// or `<GO_VENDOR_DIR>/<uuid>` for vendor). Idempotent. An existing
+/// socket-owned line for `module` — of EITHER owner — is rewritten in place
+/// (the cross-owner case is `vendor` taking over an `apply` redirect). Returns
+/// whether the file changed. Errors (without writing) if `go.mod` is absent,
+/// or if a *user-authored* `replace` already pins the same `module`+`version`
+/// (a duplicate would make `go.mod` invalid).
 pub async fn ensure_replace_entry(
     project_root: &Path,
     module: &str,
     version: &str,
+    base_rel: &str,
     dry_run: bool,
 ) -> Result<bool, String> {
     edit_go_mod(project_root, dry_run, |c| {
-        upsert_replace_entry(c, module, version)
+        upsert_replace_entry(c, module, version, base_rel)
     })
     .await
 }
 
-/// Remove the *socket-owned* `replace` directive(s) for `module` (pruning an
-/// emptied `replace ( … )` block). A user-authored or absent entry is a no-op.
-/// Returns whether the file changed.
+/// Remove the `replace` directive(s) for `module` owned by `owner` (pruning an
+/// emptied `replace ( … )` block). A user-authored entry, the OTHER owner's
+/// entry, or an absent entry is a no-op — so `apply`'s reconcile can never
+/// drop a vendored module's directive and vice versa. Returns whether the file
+/// changed.
 pub async fn drop_replace_entry(
     project_root: &Path,
     module: &str,
+    owner: ReplaceOwner,
     dry_run: bool,
 ) -> Result<bool, String> {
-    edit_go_mod(project_root, dry_run, |c| remove_replace_entry(c, module)).await
+    edit_go_mod(project_root, dry_run, |c| {
+        remove_replace_entry(c, module, owner)
+    })
+    .await
 }
 
 // ── file resolution + read/write ──────────────────────────────────────────────
@@ -135,54 +209,11 @@ async fn edit_go_mod(
 ///
 /// A `go.mod` is a *user-owned* file that **defines the module** and carries
 /// the user's own `require`/`exclude`/`retract`/`replace` directives and
-/// comments alongside our socket `replace`. A bare `fs::write` truncates the
-/// target before writing, so a crash, power loss, or `ENOSPC` mid-write would
-/// leave `go.mod` truncated or empty — a corrupted manifest that no longer
-/// builds, when we only meant to add or refresh one line. Instead we stage a
-/// sibling file, fsync it, then rename over the target (atomic on the same
-/// filesystem), so a reader/recovering process only ever sees the complete old
-/// or the complete new bytes. Mirrors the hardened writers in
-/// `patch/apply.rs` and `package_json/update.rs`.
+/// comments alongside our socket `replace` — a torn write would corrupt a
+/// manifest that no longer builds, when we only meant to add or refresh one
+/// line. Delegates to the crate-wide hardened writer.
 async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "go.mod".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content).await {
-        let _ = fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = fs::rename(&stage, path).await {
-        let _ = fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory
-    // so the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(path, content).await
 }
 
 // ── parsing ────────────────────────────────────────────────────────────────
@@ -207,14 +238,6 @@ fn rhs_is_path(tok: &str) -> bool {
         || (tok.len() >= 2 && tok.as_bytes()[1] == b':') // C:\…
 }
 
-/// True if a `replace` target path lies under `.socket/go-patches/`.
-fn path_is_socket_owned(path: &str) -> bool {
-    let norm = path.replace('\\', "/");
-    let norm = norm.strip_prefix("./").unwrap_or(&norm);
-    let prefix = format!("{GO_PATCHES_DIR}/");
-    norm.starts_with(&prefix) || norm.contains(&format!("/{prefix}"))
-}
-
 /// Parse the `module path => target [version]` body of a replace directive
 /// (the part after the `replace` keyword, or a line inside a `replace ( … )`
 /// block). Returns `None` if there is no `=>` (not a replace body).
@@ -225,18 +248,18 @@ fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
     let module = (*lhs.first()?).to_string();
     let version = lhs.get(1).map(|s| s.to_string());
     let first_rhs = rhs.first()?;
-    let (path, socket_owned) = if rhs_is_path(first_rhs) {
+    let (path, owner) = if rhs_is_path(first_rhs) {
         let p = (*first_rhs).to_string();
-        let owned = path_is_socket_owned(&p);
-        (Some(p), owned)
+        let owner = detect_owner(&p);
+        (Some(p), owner)
     } else {
-        (None, false) // module-to-module replacement
+        (None, None) // module-to-module replacement
     };
     Some(ReplaceEntry {
         module,
         version,
         path,
-        socket_owned,
+        owner,
     })
 }
 
@@ -332,13 +355,14 @@ fn directive_block_open(line: &str, keyword: &str) -> Option<bool> {
 
 // ── pure transforms ──────────────────────────────────────────────────────────
 
-/// Upsert a socket-owned `replace module version => ./…@version`.
+/// Upsert a socket-owned `replace module version => ./<base_rel>/…@version`.
 fn upsert_replace_entry(
     content: &str,
     module: &str,
     version: &str,
+    base_rel: &str,
 ) -> Result<Option<String>, String> {
-    let want_path = expected_replace_path(module, version);
+    let want_path = replace_target_path(base_rel, module, version);
     let want_line = format!("replace {module} {version} => {want_path}");
 
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -414,8 +438,11 @@ fn inspect_existing(
     if e.module != module {
         return Ok(());
     }
-    if e.socket_owned {
-        // Our entry (any version): refresh it. Prefer the first one found.
+    if e.socket_owned() {
+        // A socket-owned entry (any version, EITHER owner): refresh it in
+        // place. The cross-owner rewrite is the takeover mechanism — a single
+        // atomic go.mod write repoints e.g. a go-patches redirect at the
+        // vendor copy with no remove+add window.
         if socket_line.is_none() {
             *socket_line = Some(line_idx);
         }
@@ -438,9 +465,13 @@ fn inspect_existing(
     Ok(())
 }
 
-/// Remove socket-owned `replace` directive(s) for `module`, pruning an emptied
-/// `replace ( … )` block.
-fn remove_replace_entry(content: &str, module: &str) -> Result<Option<String>, String> {
+/// Remove `owner`'s `replace` directive(s) for `module`, pruning an emptied
+/// `replace ( … )` block. The other owner's directives are left untouched.
+fn remove_replace_entry(
+    content: &str,
+    module: &str,
+    owner: ReplaceOwner,
+) -> Result<Option<String>, String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut keep = vec![true; lines.len()];
 
@@ -465,7 +496,7 @@ fn remove_replace_entry(content: &str, module: &str) -> Result<Option<String>, S
                 if !inner.is_empty() {
                     members_total += 1;
                     if let Some(e) = parse_replace_body(inner) {
-                        if e.module == module && e.socket_owned {
+                        if e.module == module && e.owner == Some(owner) {
                             keep[j] = false;
                             members_removed += 1;
                             changed = true;
@@ -487,7 +518,7 @@ fn remove_replace_entry(content: &str, module: &str) -> Result<Option<String>, S
         }
         if let Some(body) = line.strip_prefix("replace ") {
             if let Some(e) = parse_replace_body(body) {
-                if e.module == module && e.socket_owned {
+                if e.module == module && e.owner == Some(owner) {
                     keep[i] = false;
                     changed = true;
                 }
@@ -524,13 +555,21 @@ mod tests {
 
     // ── path ownership ───────────────────────────────────────────────
     #[test]
-    fn test_is_socket_owned() {
-        assert!(path_is_socket_owned("./.socket/go-patches/github.com/x/y@v1.0.0"));
-        assert!(path_is_socket_owned(".socket/go-patches/x@v1.0.0"));
-        assert!(path_is_socket_owned("sub/.socket/go-patches/x@v1.0.0"));
-        assert!(!path_is_socket_owned("../fork"));
-        assert!(!path_is_socket_owned("./vendor/x"));
-        assert!(!path_is_socket_owned("/abs/.socketX/go-patches/x"));
+    fn test_detect_owner() {
+        use ReplaceOwner::*;
+        assert_eq!(detect_owner("./.socket/go-patches/github.com/x/y@v1.0.0"), Some(GoPatches));
+        assert_eq!(detect_owner(".socket/go-patches/x@v1.0.0"), Some(GoPatches));
+        assert_eq!(detect_owner("sub/.socket/go-patches/x@v1.0.0"), Some(GoPatches));
+        assert_eq!(
+            detect_owner("./.socket/vendor/golang/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/github.com/x/y@v1.0.0"),
+            Some(Vendor)
+        );
+        assert_eq!(detect_owner(".socket/vendor/golang/u/x@v1.0.0"), Some(Vendor));
+        assert_eq!(detect_owner("../fork"), None);
+        assert_eq!(detect_owner("./vendor/x"), None);
+        assert_eq!(detect_owner("/abs/.socketX/go-patches/x"), None);
+        // The npm/composer vendor dirs are NOT golang-owned replace targets.
+        assert_eq!(detect_owner(".socket/vendor/npm/u/x.tgz"), None);
     }
 
     #[test]
@@ -573,13 +612,13 @@ replace (
         let entries = parse_replace_entries(gomod);
         assert_eq!(entries.len(), 3);
         let bar = entries.iter().find(|e| e.module == "github.com/foo/bar").unwrap();
-        assert!(bar.socket_owned);
+        assert!(bar.socket_owned());
         assert_eq!(bar.version.as_deref(), Some("v1.4.2"));
         let baz = entries.iter().find(|e| e.module == "example.com/baz").unwrap();
-        assert!(!baz.socket_owned);
+        assert!(!baz.socket_owned());
         assert_eq!(baz.path.as_deref(), Some("../local-baz"));
         let qux = entries.iter().find(|e| e.module == "example.com/qux").unwrap();
-        assert!(!qux.socket_owned);
+        assert!(!qux.socket_owned());
         assert_eq!(qux.path, None, "module-to-module replacement has no path");
 
         let req = parse_required_versions(gomod);
@@ -598,7 +637,7 @@ replace (
     #[test]
     fn test_upsert_appends_single_line() {
         let gomod = "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n";
-        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2")
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
         assert!(out.contains(
@@ -608,7 +647,7 @@ replace (
         assert!(out.contains("require github.com/foo/bar v1.4.2"));
         assert!(out.ends_with('\n'));
         // Idempotent.
-        assert!(upsert_replace_entry(&out, "github.com/foo/bar", "v1.4.2")
+        assert!(upsert_replace_entry(&out, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
             .unwrap()
             .is_none());
     }
@@ -616,7 +655,7 @@ replace (
     #[test]
     fn test_upsert_refreshes_socket_owned_version_bump_single_line() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
-        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.5.0")
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.5.0", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
         assert!(out.contains(
@@ -630,7 +669,7 @@ replace (
     #[test]
     fn test_upsert_refreshes_socket_owned_inside_block() {
         let gomod = "module m\n\nreplace (\n\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n)\n";
-        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.5.0")
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.5.0", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
         // Still a block member (indented, no `replace ` keyword), version bumped.
@@ -641,14 +680,14 @@ replace (
     #[test]
     fn test_upsert_refuses_user_authored_same_version() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ../fork\n";
-        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2").is_err());
+        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err());
     }
 
     #[test]
     fn test_upsert_allows_user_replace_at_different_version() {
         // User pins a DIFFERENT version → no conflict; ours is added alongside.
         let gomod = "module m\n\nreplace github.com/foo/bar v1.0.0 => ../fork\n";
-        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2")
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
         assert!(out.contains("replace github.com/foo/bar v1.0.0 => ../fork"));
@@ -658,7 +697,7 @@ replace (
     #[test]
     fn test_upsert_refuses_versionless_user_catchall() {
         let gomod = "module m\n\nreplace github.com/foo/bar => ../fork\n";
-        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2").is_err());
+        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err());
     }
 
     #[test]
@@ -666,7 +705,7 @@ replace (
         // A user's version-less catch-all for a DIFFERENT module must not block
         // (or be touched by) our replace for github.com/foo/bar.
         let gomod = "module m\n\nreplace example.com/other => ../other-fork\n";
-        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2")
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
         assert!(out.contains("replace example.com/other => ../other-fork"), "user catch-all preserved");
@@ -674,15 +713,74 @@ replace (
             "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
         ));
         let entries = parse_replace_entries(&out);
-        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned));
-        assert!(entries.iter().any(|e| e.module == "github.com/foo/bar" && e.socket_owned));
+        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned()));
+        assert!(entries.iter().any(|e| e.module == "github.com/foo/bar" && e.socket_owned()));
+    }
+
+    // ── cross-owner takeover + owner filtering ───────────────────────
+    const VENDOR_BASE: &str =
+        ".socket/vendor/golang/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    /// Vendor takes over an apply (go-patches) redirect: the SAME socket-owned
+    /// line is rewritten in place to the vendor path — never a remove+add pair,
+    /// and never a second directive for the module.
+    #[test]
+    fn test_upsert_cross_owner_takeover() {
+        let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
+        let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", VENDOR_BASE)
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("go-patches"), "old owner's path gone");
+        assert!(out.contains(&format!(
+            "replace github.com/foo/bar v1.4.2 => ./{VENDOR_BASE}/github.com/foo/bar@v1.4.2"
+        )));
+        let entries = parse_replace_entries(&out);
+        assert_eq!(
+            entries.iter().filter(|e| e.module == "github.com/foo/bar").count(),
+            1,
+            "exactly one directive for the module"
+        );
+        assert_eq!(entries[0].owner, Some(ReplaceOwner::Vendor));
+    }
+
+    /// Dropping one owner's directive leaves the other owner's (and the
+    /// user's) directives untouched — reconcile non-interference.
+    #[test]
+    fn test_remove_is_owner_filtered() {
+        let gomod = format!(
+            "module m\n\n\
+             replace github.com/a/a v1.0.0 => ./.socket/go-patches/github.com/a/a@v1.0.0\n\
+             replace github.com/b/b v2.0.0 => ./{VENDOR_BASE}/github.com/b/b@v2.0.0\n\
+             replace github.com/c/c v3.0.0 => ../fork\n"
+        );
+        // GoPatches drop must not touch the vendor directive…
+        assert!(
+            remove_replace_entry(&gomod, "github.com/b/b", ReplaceOwner::GoPatches)
+                .unwrap()
+                .is_none(),
+            "go-patches drop of a vendor-owned module is a no-op"
+        );
+        // …and the vendor drop must not touch the go-patches directive.
+        assert!(
+            remove_replace_entry(&gomod, "github.com/a/a", ReplaceOwner::Vendor)
+                .unwrap()
+                .is_none(),
+            "vendor drop of a go-patches-owned module is a no-op"
+        );
+        // Matching owner removes exactly its own line.
+        let out = remove_replace_entry(&gomod, "github.com/b/b", ReplaceOwner::Vendor)
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("github.com/b/b"));
+        assert!(out.contains("go-patches/github.com/a/a@v1.0.0"));
+        assert!(out.contains("replace github.com/c/c v3.0.0 => ../fork"));
     }
 
     // ── remove ───────────────────────────────────────────────────────
     #[test]
     fn test_remove_single_line() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n";
-        let out = remove_replace_entry(gomod, "github.com/foo/bar")
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
             .unwrap()
             .unwrap();
         assert!(!out.contains("go-patches"));
@@ -692,7 +790,7 @@ replace (
     #[test]
     fn test_remove_block_member_prunes_empty_block() {
         let gomod = "module m\n\nreplace (\n\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n)\n";
-        let out = remove_replace_entry(gomod, "github.com/foo/bar")
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
             .unwrap()
             .unwrap();
         assert!(!out.contains("go-patches"));
@@ -702,7 +800,7 @@ replace (
     #[test]
     fn test_remove_block_keeps_other_members() {
         let gomod = "module m\n\nreplace (\n\tgithub.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2\n\texample.com/baz v2.0.0 => ../local-baz\n)\n";
-        let out = remove_replace_entry(gomod, "github.com/foo/bar")
+        let out = remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
             .unwrap()
             .unwrap();
         assert!(!out.contains("go-patches"));
@@ -713,12 +811,12 @@ replace (
     #[test]
     fn test_remove_leaves_user_replace() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ../fork\n";
-        assert!(remove_replace_entry(gomod, "github.com/foo/bar").unwrap().is_none());
+        assert!(remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches).unwrap().is_none());
     }
 
     #[test]
     fn test_remove_absent_is_noop() {
-        assert!(remove_replace_entry("module m\n\ngo 1.21\n", "github.com/foo/bar")
+        assert!(remove_replace_entry("module m\n\ngo 1.21\n", "github.com/foo/bar", ReplaceOwner::GoPatches)
             .unwrap()
             .is_none());
     }
@@ -734,12 +832,12 @@ replace (
         .await
         .unwrap();
 
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
             .await
             .unwrap());
         let entries = read_replace_entries(dir.path()).await;
         let bar = entries.iter().find(|e| e.module == "github.com/foo/bar").unwrap();
-        assert!(bar.socket_owned);
+        assert!(bar.socket_owned());
         assert_eq!(
             bar.path.as_deref(),
             Some("./.socket/go-patches/github.com/foo/bar@v1.4.2")
@@ -749,11 +847,11 @@ replace (
         assert_eq!(req.get("github.com/foo/bar").map(String::as_str), Some("v1.4.2"));
 
         // Idempotent on disk.
-        assert!(!ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+        assert!(!ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
             .await
             .unwrap());
         // Drop.
-        assert!(drop_replace_entry(dir.path(), "github.com/foo/bar", false)
+        assert!(drop_replace_entry(dir.path(), "github.com/foo/bar", ReplaceOwner::GoPatches, false)
             .await
             .unwrap());
         assert!(read_replace_entries(dir.path()).await.is_empty());
@@ -764,7 +862,7 @@ replace (
         let dir = tempfile::tempdir().unwrap();
         let body = "module m\n\ngo 1.21\n";
         fs::write(dir.path().join("go.mod"), body).await.unwrap();
-        let changed = ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", true)
+        let changed = ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, true)
             .await
             .unwrap();
         assert!(changed, "dry-run reports the change it would make");
@@ -790,7 +888,7 @@ replace (
         .await
         .unwrap();
 
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
             .await
             .unwrap());
 
@@ -817,7 +915,7 @@ replace (
         let original = "module example.com/app\n\ngo 1.21\n\n// keep me\nrequire github.com/foo/bar v1.4.2\n\nreplace example.com/other v2.0.0 => ../other-fork\n";
         fs::write(dir.path().join("go.mod"), original).await.unwrap();
 
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
             .await
             .unwrap());
 
@@ -837,7 +935,7 @@ replace (
     #[tokio::test]
     async fn test_ensure_missing_go_mod_errors() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", false)
+        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
             .await
             .is_err());
     }

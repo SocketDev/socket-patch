@@ -93,6 +93,7 @@ async fn try_rollback_local_go(
     patch: &PatchRecord,
     common: &GlobalArgs,
 ) -> Option<RollbackResult> {
+    use socket_patch_core::patch::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
     use socket_patch_core::patch::go_redirect::remove_go_redirect;
     if !is_local_go(purl, common) {
         return None;
@@ -105,7 +106,15 @@ async fn try_rollback_local_go(
         files_rolled_back: patch.files.keys().cloned().collect(),
         error: None,
     };
-    if let Err(e) = remove_go_redirect(purl, &common.cwd, common.dry_run).await {
+    if let Err(e) = remove_go_redirect(
+        purl,
+        &common.cwd,
+        GO_PATCHES_DIR,
+        ReplaceOwner::GoPatches,
+        common.dry_run,
+    )
+    .await
+    {
         result.success = false;
         result.files_rolled_back.clear();
         result.error = Some(e.to_string());
@@ -1070,7 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
         use socket_patch_core::patch::go_mod_edit::{
-            ensure_replace_entry, read_replace_entries,
+            ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
         const MODULE: &str = "github.com/foo/bar";
@@ -1088,7 +1097,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let changed = ensure_replace_entry(root, MODULE, VERSION, false)
+        let changed = ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
             .await
             .unwrap();
         assert!(changed, "fixture must install a socket-owned replace");
@@ -1104,7 +1113,7 @@ mod tests {
         assert!(read_replace_entries(root)
             .await
             .iter()
-            .any(|e| e.module == MODULE && e.socket_owned));
+            .any(|e| e.module == MODULE && e.socket_owned()));
 
         let patch = record_with_file("uuid-go", "errors.go", "go_before");
         let common = crate::args::GlobalArgs {
@@ -1129,7 +1138,7 @@ mod tests {
             read_replace_entries(root)
                 .await
                 .iter()
-                .all(|e| !(e.module == MODULE && e.socket_owned)),
+                .all(|e| !(e.module == MODULE && e.socket_owned())),
             "socket-owned replace directive must be dropped"
         );
         // ...the require directive (user-authored) survives...

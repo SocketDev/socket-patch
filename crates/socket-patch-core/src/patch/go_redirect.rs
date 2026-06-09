@@ -34,8 +34,10 @@ use crate::utils::purl::{build_golang_purl, parse_golang_purl};
 
 use super::copy_tree::{fresh_copy, remove_tree};
 use super::go_mod_edit::{
-    self, expected_replace_path, read_replace_entries, read_required_versions, GO_PATCHES_DIR,
+    self, expected_replace_path, read_replace_entries, read_required_versions, replace_target_path,
+    ReplaceOwner, GO_PATCHES_DIR,
 };
+use super::path_safety;
 
 /// A discrepancy between the committed redirect artifacts and the manifest,
 /// reported by [`verify_go_redirect_state`].
@@ -117,51 +119,29 @@ impl std::fmt::Display for Drift {
     }
 }
 
-/// The project-relative copy dir for a module. `module` carries the real
-/// (decoded) module path with `/`-separators, so the on-disk layout mirrors the
-/// module cache (`github.com/foo/bar@v1.4.2`).
-fn copy_dir_for(project_root: &Path, module: &str, version: &str) -> PathBuf {
+/// The project-relative copy dir for a module under `base_rel` (the copy base:
+/// [`GO_PATCHES_DIR`] for apply, `<GO_VENDOR_DIR>/<uuid>` for vendor).
+/// `module` carries the real (decoded) module path with `/`-separators, so the
+/// on-disk layout mirrors the module cache (`github.com/foo/bar@v1.4.2`).
+fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str) -> PathBuf {
     project_root
-        .join(GO_PATCHES_DIR)
+        .join(base_rel)
         .join(format!("{module}@{version}"))
 }
 
 /// SECURITY: the `module`+`version` key the on-disk copy dir
-/// (`.socket/go-patches/<module>@<version>/`) and the `replace` target path, so
-/// a tampered manifest PURL must not be able to make them escape
-/// `.socket/go-patches/`. A `..`/`.` segment, an absolute path, or a backslash/
-/// NUL would otherwise let `apply` copy + write the patched tree (or `rollback`
-/// delete a tree) at an arbitrary filesystem location outside the project.
+/// (`<base_rel>/<module>@<version>/`) and the `replace` target path, so a
+/// tampered manifest PURL must not be able to make them escape the copy base.
+/// A `..`/`.` segment, an absolute path, or a backslash/NUL would otherwise let
+/// `apply` copy + write the patched tree (or `rollback` delete a tree) at an
+/// arbitrary filesystem location outside the project.
 ///
 /// Unlike a cargo crate name, a Go module path legitimately contains `/`
-/// separators (`github.com/foo/bar`), so we validate it **per segment** rather
-/// than rejecting all separators. A real Go module path never contains a `..`/
-/// `.` segment or a backslash, so fail-closed rejection is safe.
-fn is_safe_redirect_module(module: &str) -> bool {
-    if module.is_empty() || module.starts_with('/') || module.contains('\\') || module.contains('\0')
-    {
-        return false;
-    }
-    module
-        .split('/')
-        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
-}
-
-/// A Go module version (e.g. `v1.4.2`, `v0.0.0-2006…-abcdef`) is a single path
-/// segment — no separators, no `..`. Mirrors the cargo redirect guard.
-fn is_safe_redirect_version(version: &str) -> bool {
-    !version.is_empty()
-        && version != "."
-        && version != ".."
-        && !version.contains('/')
-        && !version.contains('\\')
-        && !version.contains('\0')
-}
-
-/// True iff both coordinates are safe to key an on-disk copy dir / `replace`
-/// path. Reject fail-closed before any disk access.
-fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
-    is_safe_redirect_module(module) && is_safe_redirect_version(version)
+/// separators (`github.com/foo/bar`), so it is validated **per segment**
+/// (see [`path_safety::is_safe_multi_segment`]); a version is a single
+/// segment. Reject fail-closed before any disk access.
+pub(crate) fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
+    path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 
 /// Materialise a project-local patched copy and wire up the `replace` redirect.
@@ -170,6 +150,8 @@ fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
 ///   `pkg_path`, case-encoded on disk). It is copied, never mutated.
 /// * `module` / `version` — the **decoded** module path + version (from the
 ///   PURL); they key both the copy dir and the `replace` directive.
+/// * `base_rel` — the project-relative copy base ([`GO_PATCHES_DIR`] for
+///   apply's redirect, `<GO_VENDOR_DIR>/<uuid>` for the vendor backend).
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_go_redirect(
     purl: &str,
@@ -177,13 +159,14 @@ pub async fn apply_go_redirect(
     version: &str,
     pristine_src: &Path,
     project_root: &Path,
+    base_rel: &str,
     files: &HashMap<String, PatchFileInfo>,
     sources: &PatchSources<'_>,
     uuid: Option<&str>,
     dry_run: bool,
     force: bool,
 ) -> ApplyResult {
-    // SECURITY: refuse coordinates that would escape `.socket/go-patches/`.
+    // SECURITY: refuse coordinates that would escape the copy base.
     // A `..`/separator-laden `module`/`version` (a tampered manifest PURL) would
     // otherwise make `fresh_copy` + the apply pipeline write the patched tree to
     // an arbitrary location. Fail-closed before any disk access.
@@ -195,12 +178,12 @@ pub async fn apply_go_redirect(
             false,
             Some(format!(
                 "refusing go redirect for unsafe coordinates `{module}`/`{version}` \
-                 (a `..` segment, absolute path, or separator would escape .socket/go-patches/)"
+                 (a `..` segment, absolute path, or separator would escape {base_rel}/)"
             )),
         );
     }
 
-    let copy_dir = copy_dir_for(project_root, module, version);
+    let copy_dir = copy_dir_for(project_root, base_rel, module, version);
 
     // A redirect with no files to patch is meaningless: no-op success, no
     // go.mod edit.
@@ -221,7 +204,7 @@ pub async fn apply_go_redirect(
     // Hot path: already in sync → touch nothing, so the build's source
     // fingerprint stays stable across repeated applies (the guard re-runs apply
     // on most "deps changed" builds).
-    if redirect_in_sync(&copy_dir, files, project_root, module, version).await {
+    if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
         let verified = files.keys().map(|f| already_patched_verify(f)).collect();
         return synthesized_result(purl, &copy_dir, verified, true, None);
     }
@@ -267,7 +250,9 @@ pub async fn apply_go_redirect(
 
     // Wire up the `replace` directive. Load-bearing: without it the build won't
     // redirect to the copy, so a failure here fails the apply.
-    if let Err(e) = go_mod_edit::ensure_replace_entry(project_root, module, version, false).await {
+    if let Err(e) =
+        go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false).await
+    {
         result.success = false;
         result.error = Some(format!("failed to update go.mod: {e}"));
         return result;
@@ -276,10 +261,13 @@ pub async fn apply_go_redirect(
     result
 }
 
-/// Drop the managed `replace` directive + patched copy for a golang PURL.
+/// Drop `owner`'s managed `replace` directive + the patched copy under
+/// `base_rel` for a golang PURL.
 pub async fn remove_go_redirect(
     purl: &str,
     project_root: &Path,
+    base_rel: &str,
+    owner: ReplaceOwner,
     dry_run: bool,
 ) -> Result<(), std::io::Error> {
     let (module, version) = parse_golang_purl(purl).ok_or_else(|| {
@@ -289,8 +277,8 @@ pub async fn remove_go_redirect(
         )
     })?;
 
-    // SECURITY: the copy dir is `.socket/go-patches/<module>@<version>/` and is
-    // about to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
+    // SECURITY: the copy dir is `<base_rel>/<module>@<version>/` and is about
+    // to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
     // absolute) would target a tree outside the project for deletion — refuse.
     if !are_safe_redirect_coords(module, version) {
         return Err(std::io::Error::new(
@@ -299,19 +287,21 @@ pub async fn remove_go_redirect(
         ));
     }
 
-    go_mod_edit::drop_replace_entry(project_root, module, dry_run)
+    go_mod_edit::drop_replace_entry(project_root, module, owner, dry_run)
         .await
         .map_err(std::io::Error::other)?;
 
     if !dry_run {
-        let copy_dir = copy_dir_for(project_root, module, version);
+        let copy_dir = copy_dir_for(project_root, base_rel, module, version);
         let _ = remove_tree(&copy_dir).await; // ignore NotFound
     }
     Ok(())
 }
 
-/// Prune socket-owned `replace` directives + copy dirs no longer in `desired`
-/// (patches dropped from the manifest). Returns the removed PURLs.
+/// Prune **go-patches-owned** `replace` directives + copy dirs no longer in
+/// `desired` (patches dropped from the manifest). Returns the removed PURLs.
+/// Vendor-owned directives and `.socket/vendor/` copies are never touched —
+/// they are reconciled by the vendor command against its own state.
 pub async fn reconcile_go_redirects(
     project_root: &Path,
     desired: &HashSet<String>,
@@ -324,10 +314,18 @@ pub async fn reconcile_go_redirects(
 
     let mut removed: Vec<String> = Vec::new();
 
-    // (a) Orphan socket-owned `replace` directives (module no longer patched).
+    // (a) Orphan go-patches-owned `replace` directives (module no longer patched).
     for entry in read_replace_entries(project_root).await {
-        if entry.socket_owned && !desired_modules.contains(entry.module.as_str()) {
-            let _ = go_mod_edit::drop_replace_entry(project_root, &entry.module, dry_run).await;
+        if entry.owner == Some(ReplaceOwner::GoPatches)
+            && !desired_modules.contains(entry.module.as_str())
+        {
+            let _ = go_mod_edit::drop_replace_entry(
+                project_root,
+                &entry.module,
+                ReplaceOwner::GoPatches,
+                dry_run,
+            )
+            .await;
             if let Some(v) = &entry.version {
                 let purl = build_golang_purl(&entry.module, v);
                 if !removed.contains(&purl) {
@@ -395,6 +393,17 @@ pub async fn verify_go_redirect_state(
             continue;
         }
 
+        // A vendor-owned `replace` outranks the go-patches redirect: the module
+        // is managed by `socket-patch vendor`, so this audit must not demand a
+        // go-patches copy/directive for it (that would report MissingCopy/
+        // WrongReplacePath drift for every vendored module).
+        if entries
+            .iter()
+            .any(|e| e.module == module && e.owner == Some(ReplaceOwner::Vendor))
+        {
+            continue;
+        }
+
         // go.mod `require` cross-check: if the graph resolves this module to a
         // version that is NOT the patched one, the version-pinned `replace` is
         // unused and the build links the unpatched module — a silent-stale hole
@@ -411,7 +420,7 @@ pub async fn verify_go_redirect_state(
             }
         }
 
-        let copy_dir = copy_dir_for(project_root, module, version);
+        let copy_dir = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
         if tokio::fs::metadata(&copy_dir).await.is_err() {
             drifts.push(Drift::MissingCopy { purl: purl.clone() });
         } else {
@@ -442,7 +451,7 @@ pub async fn verify_go_redirect_state(
         let expected = expected_replace_path(module, version);
         let socket = entries
             .iter()
-            .find(|e| e.module == module && e.socket_owned);
+            .find(|e| e.module == module && e.owner == Some(ReplaceOwner::GoPatches));
         match socket {
             Some(e) if e.path.as_deref() == Some(expected.as_str())
                 && e.version.as_deref() == Some(version) => {}
@@ -456,7 +465,9 @@ pub async fn verify_go_redirect_state(
     }
 
     for entry in &entries {
-        if entry.socket_owned && !desired_modules.contains(entry.module.as_str()) {
+        if entry.owner == Some(ReplaceOwner::GoPatches)
+            && !desired_modules.contains(entry.module.as_str())
+        {
             drifts.push(Drift::OrphanReplace {
                 module: entry.module.clone(),
             });
@@ -480,6 +491,7 @@ async fn redirect_in_sync(
     project_root: &Path,
     module: &str,
     version: &str,
+    base_rel: &str,
 ) -> bool {
     if tokio::fs::metadata(copy_dir).await.is_err() {
         return false;
@@ -491,10 +503,10 @@ async fn redirect_in_sync(
             _ => return false,
         }
     }
-    let expected = expected_replace_path(module, version);
+    let expected = replace_target_path(base_rel, module, version);
     read_replace_entries(project_root).await.iter().any(|e| {
         e.module == module
-            && e.socket_owned
+            && e.socket_owned()
             && e.path.as_deref() == Some(expected.as_str())
             && e.version.as_deref() == Some(version)
     })
@@ -732,7 +744,8 @@ mod tests {
         let sources = PatchSources::blobs_only(&blobs);
 
         let result = apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false,
+            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None,
+            false, false,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -751,7 +764,7 @@ mod tests {
         // go.mod replace points at the copy.
         let entries = read_replace_entries(root).await;
         let e = entries.iter().find(|e| e.module == MODULE).unwrap();
-        assert!(e.socket_owned);
+        assert!(e.socket_owned());
         assert_eq!(
             e.path.as_deref(),
             Some("./.socket/go-patches/github.com/foo/bar@v1.4.2")
@@ -764,14 +777,14 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/bar.go");
         let gomod = root.join("go.mod");
         let body1 = tokio::fs::read(&copy).await.unwrap();
         let mod1 = tokio::fs::read_to_string(&gomod).await.unwrap();
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         assert!(result.success);
         assert!(result.files_patched.is_empty(), "in-sync resync patches nothing");
         assert_eq!(tokio::fs::read(&copy).await.unwrap(), body1, "copy unchanged");
@@ -783,12 +796,12 @@ mod tests {
         let (dir, blobs, pristine, files, after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/bar.go");
         tokio::fs::write(&copy, b"corrupted").await.unwrap();
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         assert!(result.success);
         assert_eq!(git_sha(&tokio::fs::read(&copy).await.unwrap()), after);
     }
@@ -799,7 +812,7 @@ mod tests {
         let root = dir.path();
         let pristine_gomod = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, true, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, true, false).await;
         assert!(result.success);
         assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
         // go.mod unchanged (no replace added).
@@ -814,7 +827,7 @@ mod tests {
         tokio::fs::create_dir_all(&empty).await.unwrap();
         let sources = PatchSources::blobs_only(&empty);
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         assert!(!result.success);
         assert!(
             !root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists(),
@@ -832,7 +845,7 @@ mod tests {
         tokio::fs::remove_file(pristine.join("go.mod")).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         assert!(result.success, "apply failed: {:?}", result.error);
         let synthesized = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/go.mod");
         assert_eq!(
@@ -854,7 +867,8 @@ mod tests {
         let sources = PatchSources::blobs_only(&blobs);
 
         let result = apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false,
+            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None,
+            false, false,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -881,9 +895,11 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
-        remove_go_redirect(PURL, root, false).await.unwrap();
+        remove_go_redirect(PURL, root, GO_PATCHES_DIR, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
         assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
         assert!(read_replace_entries(root).await.is_empty());
         // The require directive (not socket-owned) survives.
@@ -898,7 +914,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let desired: HashSet<String> = HashSet::new();
         let removed = reconcile_go_redirects(root, &desired, false).await;
@@ -912,7 +928,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         // Add a user-authored replace.
         let mut body = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
         body.push_str("replace example.com/other v1.0.0 => ../other-fork\n");
@@ -922,8 +938,8 @@ mod tests {
         let removed = reconcile_go_redirects(root, &desired, false).await;
         assert!(removed.is_empty());
         let entries = read_replace_entries(root).await;
-        assert!(entries.iter().any(|e| e.module == MODULE && e.socket_owned));
-        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned));
+        assert!(entries.iter().any(|e| e.module == MODULE && e.socket_owned()));
+        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned()));
     }
 
     #[tokio::test]
@@ -931,7 +947,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
@@ -958,9 +974,11 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         // Drop the directive but keep the copy.
-        go_mod_edit::drop_replace_entry(root, MODULE, false).await.unwrap();
+        go_mod_edit::drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
@@ -973,7 +991,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
@@ -982,7 +1000,9 @@ mod tests {
         // Repin the socket-owned replace at a DIFFERENT version while the copy
         // stays byte-correct. Go keys replace by module+version, so this
         // silently links the unpatched module — verify must flag it.
-        go_mod_edit::ensure_replace_entry(root, MODULE, "v9.9.9", false).await.unwrap();
+        go_mod_edit::ensure_replace_entry(root, MODULE, "v9.9.9", GO_PATCHES_DIR, false)
+            .await
+            .unwrap();
         // ensure_replace refreshed our entry to v9.9.9; the v1.4.2 copy is now orphaned by directive.
         let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
         assert!(
@@ -996,7 +1016,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
@@ -1018,7 +1038,7 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, &files, &sources, None, false, false).await;
+        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
 
         // Empty desired + empty manifest → the live directive is an orphan.
         let manifest = PatchManifest::new();
@@ -1036,7 +1056,7 @@ mod tests {
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
         let files = HashMap::new();
-        let result = apply_go_redirect(PURL, MODULE, VERSION, root, root, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(PURL, MODULE, VERSION, root, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
         assert!(result.success);
         assert!(read_replace_entries(root).await.is_empty());
     }
@@ -1086,6 +1106,7 @@ mod tests {
             "v1.0.0",
             &pristine,
             root,
+            GO_PATCHES_DIR,
             &files,
             &sources,
             None,
@@ -1124,6 +1145,7 @@ mod tests {
             "../../../evil",
             &pristine,
             root,
+            GO_PATCHES_DIR,
             &files,
             &sources,
             None,
@@ -1151,7 +1173,13 @@ mod tests {
         tokio::fs::create_dir_all(&precious).await.unwrap();
         tokio::fs::write(precious.join("keep.txt"), b"keep").await.unwrap();
 
-        let err = remove_go_redirect("pkg:golang/../../../precious@v1.0.0", root, false)
+        let err = remove_go_redirect(
+            "pkg:golang/../../../precious@v1.0.0",
+            root,
+            GO_PATCHES_DIR,
+            ReplaceOwner::GoPatches,
+            false,
+        )
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

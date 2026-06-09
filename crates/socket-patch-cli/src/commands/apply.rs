@@ -149,6 +149,7 @@ async fn try_local_go_apply(
             version,
             pkg_path,
             &common.cwd,
+            socket_patch_core::patch::go_mod_edit::GO_PATCHES_DIR,
             &patch.files,
             sources,
             Some(&patch.uuid),
