@@ -266,10 +266,11 @@ impl ApiClient {
 
     /// Search patches for multiple packages (batch).
     ///
-    /// For authenticated API, uses the POST `/patches/batch` endpoint.
-    /// For the public proxy (which cannot cache POST bodies on CDN), falls
-    /// back to individual GET requests per PURL with a concurrency limit of
-    /// 10.
+    /// For authenticated API, uses the POST `/v0/orgs/{slug}/patches/batch`
+    /// endpoint. For the public proxy, POSTs `/patch/batch` (served
+    /// `Cache-Control: no-store` — POST bodies are not CDN-cacheable) and
+    /// only degrades to individual GET requests per PURL (concurrency 10)
+    /// when the deployed proxy predates the batch endpoint.
     ///
     /// Maximum 500 PURLs per request.
     pub async fn search_patches_batch(
@@ -295,13 +296,107 @@ impl ApiClient {
             }));
         }
 
-        // Public proxy: fall back to individual per-package GET requests
-        self.search_patches_batch_via_individual_queries(purls)
+        // Public proxy: prefer the POST /patch/batch endpoint; degrade to
+        // individual per-package GET requests when the deployed proxy
+        // predates it or when batch validation rejects the chunk (see
+        // `proxy_batch_post` for the decision table).
+        match self.proxy_batch_post(purls).await? {
+            Some(response) => Ok(response),
+            None => {
+                self.search_patches_batch_via_individual_queries(purls)
+                    .await
+            }
+        }
+    }
+
+    /// Internal: POST the batch search to the public proxy's
+    /// `/patch/batch` endpoint.
+    ///
+    /// Returns `Ok(None)` when the caller should degrade to the legacy
+    /// per-package GET path, in two situations:
+    ///
+    /// 1. The deployed proxy predates the batch endpoint (see
+    ///    [`is_batch_unsupported`]).
+    /// 2. The batch endpoint rejected the chunk with a validation `400`.
+    ///    Batch validation is all-or-nothing, so a single crawled PURL of
+    ///    a type the server doesn't recognize (e.g. `pkg:jsr/…` from the
+    ///    Deno crawler) rejects every package in the chunk. The
+    ///    per-package GET path tolerates such PURLs individually — each
+    ///    failure is swallowed per-package — which is the scan semantic
+    ///    that predates the batch optimization and must be preserved: one
+    ///    exotic package must not turn a whole scan into an error.
+    ///
+    /// Auth / rate-limit statuses are classified via `classify_auth_error`
+    /// exactly like the JSON transport — 401/403 keep feeding
+    /// `is_fallback_candidate` and 429 stays visible — and any other
+    /// failure (including over-capacity 503s) surfaces as an error.
+    async fn proxy_batch_post(
+        &self,
+        purls: &[String],
+    ) -> Result<Option<BatchSearchResponse>, ApiError> {
+        let url = format!("{}/patch/batch", self.api_url);
+        debug_log(&format!("POST {}", url));
+
+        let body = BatchSearchBody {
+            components: purls
+                .iter()
+                .map(|p| BatchComponent { purl: p.clone() })
+                .collect(),
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
             .await
+            .map_err(|e| ApiError::Network(format!("Network error: {}", e)))?;
+
+        let status = resp.status();
+
+        if status == StatusCode::OK {
+            let parsed = resp
+                .json::<BatchSearchResponse>()
+                .await
+                .map_err(|e| ApiError::Parse(format!("Failed to parse response: {}", e)))?;
+            return Ok(Some(parsed));
+        }
+
+        if let Some(err) = classify_auth_error(status, true) {
+            return Err(err);
+        }
+
+        let text = resp.text().await.unwrap_or_default();
+        let fallback_reason = if is_batch_unsupported(status, &text) {
+            Some("proxy batch endpoint unavailable")
+        } else if status == StatusCode::BAD_REQUEST {
+            // All-or-nothing batch validation rejected the chunk; the
+            // per-package path resolves the valid subset (see doc above).
+            Some("proxy batch validation rejected the chunk")
+        } else {
+            None
+        };
+        if let Some(reason) = fallback_reason {
+            debug_log(&format!(
+                "{} (status {}: {}); falling back to individual queries",
+                reason,
+                status.as_u16(),
+                text
+            ));
+            return Ok(None);
+        }
+        Err(ApiError::Other(format!(
+            "API request failed with status {}: {}",
+            status.as_u16(),
+            text
+        )))
     }
 
     /// Internal: fall back to individual GET requests per PURL when the
-    /// batch endpoint is not available (public proxy mode).
+    /// batch endpoint is not available (public proxy mode). Since the
+    /// proxy gained `POST /patch/batch`, this is the legacy path for
+    /// deployments that predate it.
     ///
     /// Processes PURLs in batches of `CONCURRENCY_LIMIT` to avoid
     /// overwhelming the server while remaining efficient.
@@ -792,6 +887,31 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
             "Rate limit exceeded. Please try again later.".into(),
         )),
         _ => None,
+    }
+}
+
+/// Decide whether a public-proxy response to `POST /patch/batch` means the
+/// endpoint is unsupported on that deployment, in which case
+/// [`ApiClient::search_patches_batch`] degrades to per-package GETs (which
+/// every proxy supports and which are CDN-cacheable).
+///
+/// The `"Unsupported endpoint"` marker is a cross-repo contract with the
+/// depscan firewall-api-proxy: its catch-all answers unknown routes with
+/// `400 {"error":"Unsupported endpoint",...}`. Batch validation failures
+/// use different wording and are deliberately NOT matched here — the
+/// caller (`proxy_batch_post`) still degrades them to the per-package
+/// path, but logs them as a chunk-validation rejection rather than a
+/// missing endpoint. For 503, only the "Patch API is not configured"
+/// body (patch endpoints disabled) degrades — an over-capacity 503
+/// ("Service temporarily over capacity") surfaces rather than amplifying
+/// load tenfold via the per-package fallback.
+fn is_batch_unsupported(status: StatusCode, body: &str) -> bool {
+    match status {
+        StatusCode::BAD_REQUEST => body.contains("Unsupported endpoint"),
+        StatusCode::SERVICE_UNAVAILABLE => body.contains("Patch API is not configured"),
+        // A deployment / CDN layer with no route for POST /patch/batch.
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => true,
+        _ => false,
     }
 }
 
@@ -1504,6 +1624,86 @@ mod tests {
         assert!(classify_auth_error(StatusCode::NOT_FOUND, false).is_none());
         assert!(classify_auth_error(StatusCode::INTERNAL_SERVER_ERROR, false).is_none());
         assert!(classify_auth_error(StatusCode::BAD_GATEWAY, true).is_none());
+    }
+
+    // ── is_batch_unsupported: legacy-proxy detection for POST /patch/batch ──
+    //
+    // The proxy-mode batch POST degrades to per-package GETs only when the
+    // deployed proxy predates the endpoint. These pin the exact decision
+    // table — the 400/503 body markers are a cross-repo contract with the
+    // depscan firewall-api-proxy (see `is_batch_unsupported` docs).
+
+    #[test]
+    fn is_batch_unsupported_falls_back_on_legacy_catch_all_400() {
+        assert!(is_batch_unsupported(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"Unsupported endpoint","message":"Endpoint POST /patch/batch is not supported."}"#,
+        ));
+    }
+
+    #[test]
+    fn is_batch_unsupported_does_not_match_validation_400() {
+        // Validation 400s are not "endpoint missing" — the caller still
+        // degrades them to the per-package path (all-or-nothing batch
+        // validation must not fail a whole scan over one exotic PURL),
+        // but via the chunk-validation branch with its own log line.
+        assert!(!is_batch_unsupported(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"Invalid PURL format"}"#,
+        ));
+        assert!(!is_batch_unsupported(StatusCode::BAD_REQUEST, ""));
+    }
+
+    #[test]
+    fn is_batch_unsupported_falls_back_on_patch_api_disabled_503() {
+        assert!(is_batch_unsupported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service Unavailable","message":"Patch API is not configured on this server"}"#,
+        ));
+        // Over-capacity 503s surface instead of amplifying load via the
+        // 10-concurrent per-package fallback.
+        assert!(!is_batch_unsupported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service temporarily over capacity",
+        ));
+    }
+
+    #[test]
+    fn is_batch_unsupported_falls_back_on_missing_route_statuses() {
+        assert!(is_batch_unsupported(StatusCode::NOT_FOUND, ""));
+        assert!(is_batch_unsupported(StatusCode::METHOD_NOT_ALLOWED, ""));
+    }
+
+    #[test]
+    fn is_batch_unsupported_never_matches_other_statuses() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(
+                !is_batch_unsupported(status, "Unsupported endpoint"),
+                "{status} must never trigger the legacy fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_search_body_serializes_to_components_shape() {
+        // Wire-contract pin: both the authenticated batch endpoint and the
+        // proxy's POST /patch/batch expect the CycloneDX-style shape.
+        let body = BatchSearchBody {
+            components: vec![BatchComponent {
+                purl: "pkg:npm/a@1".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"components":[{"purl":"pkg:npm/a@1"}]}"#
+        );
     }
 
     #[test]
