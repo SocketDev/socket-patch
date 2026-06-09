@@ -297,12 +297,12 @@ impl ApiClient {
         }
 
         // Public proxy: prefer the POST /patch/batch endpoint; degrade to
-        // individual per-package GET requests against proxies that predate
-        // it (see `is_batch_unsupported`).
+        // individual per-package GET requests when the deployed proxy
+        // predates it or when batch validation rejects the chunk (see
+        // `proxy_batch_post` for the decision table).
         match self.proxy_batch_post(purls).await? {
             Some(response) => Ok(response),
             None => {
-                debug_log("proxy batch endpoint unavailable; falling back to individual queries");
                 self.search_patches_batch_via_individual_queries(purls)
                     .await
             }
@@ -312,12 +312,24 @@ impl ApiClient {
     /// Internal: POST the batch search to the public proxy's
     /// `/patch/batch` endpoint.
     ///
-    /// Returns `Ok(None)` when the deployed proxy predates the batch
-    /// endpoint (see [`is_batch_unsupported`]) so the caller can degrade to
-    /// the legacy per-package GET path. Auth / rate-limit statuses are
-    /// classified via `classify_auth_error` exactly like the JSON
-    /// transport — 401/403 keep feeding `is_fallback_candidate` and 429
-    /// stays visible — and any other failure surfaces as an error.
+    /// Returns `Ok(None)` when the caller should degrade to the legacy
+    /// per-package GET path, in two situations:
+    ///
+    /// 1. The deployed proxy predates the batch endpoint (see
+    ///    [`is_batch_unsupported`]).
+    /// 2. The batch endpoint rejected the chunk with a validation `400`.
+    ///    Batch validation is all-or-nothing, so a single crawled PURL of
+    ///    a type the server doesn't recognize (e.g. `pkg:jsr/…` from the
+    ///    Deno crawler) rejects every package in the chunk. The
+    ///    per-package GET path tolerates such PURLs individually — each
+    ///    failure is swallowed per-package — which is the scan semantic
+    ///    that predates the batch optimization and must be preserved: one
+    ///    exotic package must not turn a whole scan into an error.
+    ///
+    /// Auth / rate-limit statuses are classified via `classify_auth_error`
+    /// exactly like the JSON transport — 401/403 keep feeding
+    /// `is_fallback_candidate` and 429 stays visible — and any other
+    /// failure (including over-capacity 503s) surfaces as an error.
     async fn proxy_batch_post(
         &self,
         purls: &[String],
@@ -356,7 +368,22 @@ impl ApiClient {
         }
 
         let text = resp.text().await.unwrap_or_default();
-        if is_batch_unsupported(status, &text) {
+        let fallback_reason = if is_batch_unsupported(status, &text) {
+            Some("proxy batch endpoint unavailable")
+        } else if status == StatusCode::BAD_REQUEST {
+            // All-or-nothing batch validation rejected the chunk; the
+            // per-package path resolves the valid subset (see doc above).
+            Some("proxy batch validation rejected the chunk")
+        } else {
+            None
+        };
+        if let Some(reason) = fallback_reason {
+            debug_log(&format!(
+                "{} (status {}: {}); falling back to individual queries",
+                reason,
+                status.as_u16(),
+                text
+            ));
             return Ok(None);
         }
         Err(ApiError::Other(format!(
@@ -870,12 +897,14 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
 ///
 /// The `"Unsupported endpoint"` marker is a cross-repo contract with the
 /// depscan firewall-api-proxy: its catch-all answers unknown routes with
-/// `400 {"error":"Unsupported endpoint",...}`, while genuine batch
-/// validation failures use different wording and must surface to the
-/// operator instead of silently degrading. Likewise for 503, only the
-/// "Patch API is not configured" body (patch endpoints disabled) degrades —
-/// an over-capacity 503 ("Service temporarily over capacity") surfaces
-/// rather than amplifying load tenfold via the per-package fallback.
+/// `400 {"error":"Unsupported endpoint",...}`. Batch validation failures
+/// use different wording and are deliberately NOT matched here — the
+/// caller (`proxy_batch_post`) still degrades them to the per-package
+/// path, but logs them as a chunk-validation rejection rather than a
+/// missing endpoint. For 503, only the "Patch API is not configured"
+/// body (patch endpoints disabled) degrades — an over-capacity 503
+/// ("Service temporarily over capacity") surfaces rather than amplifying
+/// load tenfold via the per-package fallback.
 fn is_batch_unsupported(status: StatusCode, body: &str) -> bool {
     match status {
         StatusCode::BAD_REQUEST => body.contains("Unsupported endpoint"),
@@ -1613,7 +1642,11 @@ mod tests {
     }
 
     #[test]
-    fn is_batch_unsupported_surfaces_genuine_validation_400() {
+    fn is_batch_unsupported_does_not_match_validation_400() {
+        // Validation 400s are not "endpoint missing" — the caller still
+        // degrades them to the per-package path (all-or-nothing batch
+        // validation must not fail a whole scan over one exotic PURL),
+        // but via the chunk-validation branch with its own log line.
         assert!(!is_batch_unsupported(
             StatusCode::BAD_REQUEST,
             r#"{"error":"Invalid PURL format"}"#,

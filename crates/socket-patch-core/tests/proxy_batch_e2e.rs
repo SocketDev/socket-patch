@@ -143,34 +143,78 @@ async fn proxy_batch_degrades_when_patch_api_unconfigured_503() {
 }
 
 #[tokio::test]
-async fn proxy_batch_validation_400_surfaces_without_fallback() {
+async fn proxy_batch_validation_400_degrades_to_per_package_gets() {
+    // The batch endpoint validates the component list all-or-nothing, so a
+    // chunk mixing a supported PURL with one the server doesn't recognize
+    // (e.g. pkg:jsr/… from the Deno crawler) is rejected wholesale. The
+    // valid subset must still resolve via the per-package path instead of
+    // failing the scan.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/patch/batch"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(json!({ "error": "Invalid PURL format" })),
-        )
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "Invalid PURL format. Must include ecosystem type and package name.",
+                "details": null
+            }
+        })))
         .expect(1)
         .mount(&server)
         .await;
-    mount_by_package(&server, by_package_response_body(), 0).await;
+    mount_by_package(&server, by_package_response_body(), 1).await;
 
     let client = proxy_client(&server.uri());
-    let err = client
+    let resp = client
         .search_patches_batch(None, &[PURL.to_string()])
         .await
-        .expect_err("a genuine validation 400 must surface, not silently degrade");
+        .expect("validation 400 must degrade to per-package GETs, not error");
 
-    match &err {
-        ApiError::Other(msg) => {
-            assert!(msg.contains("400"), "must embed the status; got: {msg}");
-            assert!(
-                msg.contains("Invalid PURL format"),
-                "must embed the body; got: {msg}"
-            );
-        }
-        other => panic!("validation 400 must be Other; got: {other:?}"),
-    }
+    assert_eq!(resp.packages.len(), 1, "fallback results must be assembled");
+    assert_eq!(resp.packages[0].purl, PURL);
+}
+
+#[tokio::test]
+async fn proxy_batch_validation_400_with_failing_gets_yields_empty_ok() {
+    // Regression shape of the Deno JSR docker e2e: every crawled PURL is a
+    // type the server rejects (pkg:jsr/…), so the batch 400s AND each
+    // per-package GET 400s. The per-package path swallows those individual
+    // failures, so the scan-level result is an empty success — not an
+    // error that flips the whole scan's exit code.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "Invalid PURL format. Must include ecosystem type and package name.",
+                "details": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "message": "Invalid PURL format. Must include ecosystem type and package name.",
+                "details": null
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = proxy_client(&server.uri());
+    let resp = client
+        .search_patches_batch(None, &["pkg:jsr/@std/path@0.220.0".to_string()])
+        .await
+        .expect("per-purl failures are swallowed; the batch call must not error");
+
+    assert!(
+        resp.packages.is_empty(),
+        "an unresolvable PURL yields no packages, not an error"
+    );
+    assert!(!resp.can_access_paid_patches);
 }
 
 #[tokio::test]

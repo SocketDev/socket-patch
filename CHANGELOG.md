@@ -51,10 +51,13 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 - **Token-less `scan` now batch-queries the public proxy.** Proxy-mode scans
   POST `{proxy}/patch/batch` (one request per `--batch-size` chunk, mirroring
   the authenticated `/v0/orgs/{slug}/patches/batch` endpoint) instead of
-  issuing one `GET /patch/by-package/:purl` per package. Against proxies that
-  predate the batch endpoint, the client transparently degrades to the legacy
-  per-package GET path; rate limits and over-capacity 503s still surface
-  instead of silently degrading. (MINOR)
+  issuing one `GET /patch/by-package/:purl` per package. The client
+  transparently degrades to the legacy per-package GET path against proxies
+  that predate the batch endpoint, and when the all-or-nothing batch
+  validation rejects a chunk (e.g. a crawled PURL type the server doesn't
+  recognize, such as `pkg:jsr/…` — per-package queries tolerate those
+  individually, so one exotic package can't fail a whole scan). Rate limits
+  and over-capacity 503s still surface instead of silently degrading. (MINOR)
 
 ## [3.2.0] — 2026-05-29
 
