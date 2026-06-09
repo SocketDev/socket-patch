@@ -1,10 +1,6 @@
 pub mod apply;
 pub mod apply_lock;
-#[cfg(feature = "cargo")]
-pub mod cargo_config;
-#[cfg(feature = "cargo")]
-pub mod cargo_redirect;
-#[cfg(any(feature = "cargo", feature = "golang"))]
+#[cfg(feature = "golang")]
 pub mod copy_tree;
 pub mod cow;
 pub mod diff;

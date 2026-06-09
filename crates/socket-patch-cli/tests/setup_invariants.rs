@@ -77,8 +77,7 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_BREAK_LOCK",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
-    // Legacy / cargo-backend knobs that also steer setup behaviour.
-    "SOCKET_PATCH_ROOT",
+    // Other SOCKET_PATCH_* knobs that could steer setup behaviour.
     "SOCKET_PATCH_BIN",
     "SOCKET_PATCH_DEBUG",
     "SOCKET_PATCH_PROXY_URL",
