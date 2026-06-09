@@ -14,3 +14,4 @@ pub mod package;
 pub(crate) mod path_safety;
 pub mod rollback;
 pub mod sidecars;
+pub mod vendor;
