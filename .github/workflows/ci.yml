@@ -63,19 +63,6 @@ jobs:
           php -l composer/socket-patch/bin/socket-patch
           ( cd composer/socket-patch && composer validate --no-check-publish )
 
-      - name: Go — gofmt + vet the setup-guard templates
-        run: |
-          tmp="$(mktemp -d)"
-          cp crates/socket-patch-core/src/go_setup/templates/guard.go.tmpl "$tmp/guard.go"
-          cp crates/socket-patch-core/src/go_setup/templates/guard_test.go.tmpl "$tmp/guard_test.go"
-          unformatted="$(gofmt -l "$tmp")"
-          if [ -n "$unformatted" ]; then
-            echo "::error::Go setup-guard templates are not gofmt-clean:"
-            gofmt -d "$tmp"
-            exit 1
-          fi
-          ( cd "$tmp" && go mod init socketpatchguardlint >/dev/null && go vet ./... )
-
   test:
     strategy:
       fail-fast: false
@@ -456,16 +443,12 @@ jobs:
             suite: e2e_composer
           - os: ubuntu-latest
             suite: e2e_nuget
-          # Cargo project-local [patch]-redirect backend + fail-closed guard.
-          # `guard_build_integration` is hermetic (a shell stub + `cargo build
-          # --offline` against a zero-dep path dep), so it exercises the
-          # build.rs-panic-aborts-a-real-build seam with no network.
-          # `e2e_cargo_coexist`'s real-cargo proofs fetch a crate (cached) and
-          # skip on fetch failure. Both suites are `#[cfg(unix)]`.
+          # `socket-patch-guard` fail-closed build guard. `guard_build_integration`
+          # is hermetic (a shell stub + `cargo build --offline` against a zero-dep
+          # path dep), so it exercises the build.rs-panic-aborts-a-real-build seam
+          # with no network. `#[cfg(unix)]`.
           - os: ubuntu-latest
             suite: guard_build_integration
-          - os: ubuntu-latest
-            suite: e2e_cargo_coexist
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
