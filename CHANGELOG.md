@@ -73,6 +73,13 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Changed
 
+- **Token-less `scan` now batch-queries the public proxy.** Proxy-mode scans
+  POST `{proxy}/patch/batch` (one request per `--batch-size` chunk, mirroring
+  the authenticated `/v0/orgs/{slug}/patches/batch` endpoint) instead of
+  issuing one `GET /patch/by-package/:purl` per package. Against proxies that
+  predate the batch endpoint, the client transparently degrades to the legacy
+  per-package GET path; genuine validation errors, rate limits, and
+  over-capacity 503s still surface instead of silently degrading. (MINOR)
 - **Local cargo `apply` now redirects instead of patching in place.** Registry
   crates patched by a previous (in-place) version leave a mutated shared
   registry + rewritten `.cargo-checksum.json` behind; the new local backend
