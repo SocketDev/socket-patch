@@ -16,49 +16,24 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
-- **Project-local cargo `[patch]`-redirect backend (local mode).** Patching a
-  Rust dependency from the registry cache no longer mutates the shared
-  `$CARGO_HOME` registry in place. Instead `apply` writes a project-local
-  patched **copy** under `.socket/cargo-patches/<name>-<version>/` and a managed
-  `[patch.crates-io]` entry (+ `[env] SOCKET_PATCH_ROOT`) into
-  `.cargo/config.toml`, so patches are project-scoped and the registry stays
-  pristine for sibling projects. `rollback` cleanly drops the entry + copy
-  (leaving `setup` state — the guard dependency + `[env]` — intact).
-  `apply --check` is a new read-only, lock-free, offline auditor that verifies
-  the committed copies/config match the manifest **and** cross-checks
-  `Cargo.lock` (flagging a patched dependency that silently resolved to an
-  unpatched version); it exits non-zero on drift (for CI / GitHub-App use).
-  Vendored crates (`vendor/`) and `--global` cargo keep the existing in-place
-  `.cargo-checksum.json` rewrite path unchanged. **`cargo` is now a default
-  feature** (alongside the always-on npm + PyPI support), so released binaries and
-  a plain `cargo install socket-patch-cli` patch Rust dependencies and run the
-  guard out of the box; `golang`/`maven`/`composer`/`nuget`/`deno` remain opt-in.
-  A binary built `--no-default-features` (no cargo) now fails `apply --check`
-  closed rather than reporting "in sync", so it can never make the guard pass
-  vacuously.
-- **`socket-patch-guard` crate + `setup` cargo support.** `socket-patch setup`
-  now also configures Rust projects: it adds a tiny `socket-patch-guard`
-  dependency (a normal `[dependencies]` entry, not a `[build-dependencies]` one,
-  so cargo always compiles it and runs its build script) to every workspace
-  member and writes `[env] SOCKET_PATCH_ROOT`. The guard's build script runs `socket-patch apply --check`
-  on every relevant `cargo build` and is **fail-closed**: if the committed
-  patched copies are out of sync with `.socket/manifest.json` (a stale copy, or
-  a patched dependency that resolved to an unpatched version), the build
-  **fails** rather than silently compiling stale/unpatched sources — closing the
-  CI footgun where a one-shot build could ship an unpatched binary. The fix is
-  run-order-independent (it checks the static committed state, not when the
-  build script happens to run). It is a single fail-closed mode with no
-  `warn`/`off` escape: on drift it regenerates the copies then fails the build
-  with a "re-run" message (the retry is clean), and an unrecoverable state or a
-  missing `socket-patch` CLI also fails the build. In normal use the guard never
-  fires, since changing a patch goes through `get`/`apply` (which regenerate the
-  copies). The user's own `build.rs` is never touched. For CI, run
-  `socket-patch apply --check --ecosystems cargo` as an explicit pipeline gate.
-  `setup --check` / `setup --remove` cover the
-  round-trip. *(A guarded repo requires `socket-patch` on the build machine —
-  wire it into apps/workspaces you control, not a published library. Pre-GA:
-  `socket-patch-guard` will be published to crates.io; airgapped users vendor
-  it.)*
+- **Cargo support (`cargo` is now a default feature).** `apply` patches a Rust
+  dependency **in place** wherever the crawler finds it — the project `vendor/`
+  directory or the shared `$CARGO_HOME` registry cache — rewriting the crate's
+  `.cargo-checksum.json` sidecar so `cargo build` accepts the modified files.
+  `rollback` restores the original bytes from the `beforeHash` blobs, like
+  npm/PyPI/gem. `cargo` ships on by default (alongside the always-on npm + PyPI
+  + Ruby gems support), so released binaries and a plain `cargo install
+  socket-patch-cli` patch Rust dependencies out of the box;
+  `maven`/`composer`/`nuget`/`deno` remain opt-in.
+- **Project-local Go `replace`-redirect backend (`golang`, default feature).**
+  The Go module cache is shared, read-only and checksum-verified, so in-place
+  patching would fail `go.sum` at build time. Instead `apply` writes a
+  project-local patched **copy** under `.socket/go-patches/<module>@<version>/`
+  and a managed `replace` directive in the project `go.mod`, so the patch is
+  project-scoped and the cache stays pristine for sibling projects. `rollback`
+  cleanly drops the `replace` directive + copy. `apply --check` is a read-only,
+  lock-free, offline auditor that verifies the committed redirects match the
+  manifest, exiting non-zero on drift (for CI / GitHub-App use).
 - **Inline OpenVEX generation on `apply` and `scan` via `--vex <path>`.** A
   single successful `apply`/`scan` can now both patch and emit the OpenVEX
   0.2.0 attestation, instead of requiring a separate `socket-patch vex` step.
@@ -78,15 +53,8 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   the authenticated `/v0/orgs/{slug}/patches/batch` endpoint) instead of
   issuing one `GET /patch/by-package/:purl` per package. Against proxies that
   predate the batch endpoint, the client transparently degrades to the legacy
-  per-package GET path; genuine validation errors, rate limits, and
-  over-capacity 503s still surface instead of silently degrading. (MINOR)
-- **Local cargo `apply` now redirects instead of patching in place.** Registry
-  crates patched by a previous (in-place) version leave a mutated shared
-  registry + rewritten `.cargo-checksum.json` behind; the new local backend
-  never touches the registry, so those stay dirty until cargo re-fetches.
-  `apply` now prints a one-line **warning** when it detects such a crate
-  (suppressed under `--offline`, so the build-time guard stays quiet) and points
-  at restoring the pristine copy. No automatic registry cleanup is performed.
+  per-package GET path; rate limits and over-capacity 503s still surface
+  instead of silently degrading. (MINOR)
 
 ## [3.2.0] — 2026-05-29
 

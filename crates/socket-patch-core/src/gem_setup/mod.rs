@@ -2,10 +2,9 @@
 //!
 //! Bundler has no after-each-install hook that survives a cached/no-op
 //! `bundle install`, but it loads any declared **plugin** during the Gemfile
-//! pass on every `bundle` invocation. So — like [`crate::go_setup`], which
-//! ships committed source the user's toolchain runs — setup delivers the gate
-//! as a generated, git-committed Bundler plugin plus a `plugin` directive in
-//! the Gemfile:
+//! pass on every `bundle` invocation. So setup delivers the gate as a
+//! generated, git-committed Bundler plugin plus a `plugin` directive in the
+//! Gemfile:
 //!
 //!   * `.socket/bundler-plugin/{plugins.rb, socket-patch.gemspec}` — a generated
 //!     plugin whose `plugins.rb` re-runs `socket-patch apply --ecosystems gem`
@@ -54,8 +53,7 @@ pub struct BundlerProject {
 
 /// Find the Bundler project that `cwd` belongs to by walking up to the nearest
 /// directory holding a `Gemfile` (or Bundler's alternate `gems.rb`) — exactly
-/// how `bundle` itself resolves the manifest, and matching the upward search in
-/// [`crate::cargo_setup::discover`] / [`crate::go_setup`]. The discovered
+/// how `bundle` itself resolves the manifest. The discovered
 /// directory (not `cwd`) becomes the project `root`, so `.socket/` and the
 /// plugin dir land next to the Gemfile even when `setup` is run from a
 /// subdirectory. Returns `None` when no ancestor has one — a `Gemfile.lock`

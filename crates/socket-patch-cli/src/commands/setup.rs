@@ -1,11 +1,4 @@
 use clap::Args;
-#[cfg(feature = "cargo")]
-use socket_patch_core::cargo_setup::{
-    add_guard_dep, discover_cargo_project, is_guard_dep_present, remove_guard_dep, CargoEditResult,
-    CargoSetupStatus,
-};
-#[cfg(feature = "golang")]
-use socket_patch_core::go_setup::{self, GoSetupStatus};
 use socket_patch_core::gem_setup::{self, GemSetupStatus};
 #[cfg(feature = "composer")]
 use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
@@ -43,13 +36,10 @@ fn manager_name(pm: PackageManager) -> &'static str {
 }
 
 /// Compose the `+`-joined telemetry manager tag across the ecosystems in scope
-/// (e.g. `npm+pypi+cargo`), or `none`.
-#[allow(clippy::too_many_arguments)]
+/// (e.g. `npm+pypi+gem`), or `none`.
 fn telemetry_manager_str(
     npm: bool,
     py: bool,
-    cargo: bool,
-    go: bool,
     gem: bool,
     composer: bool,
     npm_pm: PackageManager,
@@ -60,12 +50,6 @@ fn telemetry_manager_str(
     }
     if py {
         parts.push("pypi");
-    }
-    if cargo {
-        parts.push("cargo");
-    }
-    if go {
-        parts.push("golang");
     }
     if gem {
         parts.push("gem");
@@ -93,9 +77,8 @@ pub struct SetupArgs {
     pub check: bool,
 
     /// Revert the install hooks that `setup` added: npm `package.json` scripts,
-    /// the Python `socket-patch[hook]` dependency, the cargo `socket-patch-guard`
-    /// dependency + `[env]`, the Go guard package + blank imports, and the gem
-    /// Bundler plugin wiring.
+    /// the Python `socket-patch[hook]` dependency, and the gem Bundler plugin
+    /// wiring.
     #[arg(
         long = "remove",
         default_value_t = false,
@@ -176,7 +159,7 @@ fn report_no_files(args: &SetupArgs, status: &str, counts: &[(&str, i64)]) -> i3
             serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
         );
     } else {
-        println!("No package.json, Python, Cargo, Go, Bundler, or Composer project found");
+        println!("No package.json, Python, Bundler, or Composer project found");
     }
     0
 }
@@ -192,9 +175,9 @@ fn pathdiff(path: &str, base: &Path) -> String {
 /// `--ecosystems` filter (`CLI_CONTRACT.md` → "Setup command contract",
 /// property 2). With no filter (or an empty one) every ecosystem is in scope.
 /// `names` lists the accepted tokens for the ecosystem — its canonical
-/// `Ecosystem::cli_name()` plus any friendly alias (e.g. `golang`/`go`,
-/// `pypi`/`python`, `gem`/`ruby`) — matched case-insensitively, mirroring the
-/// semantics `apply` already uses (`cargo_in_local_scope`/`go_in_local_scope`).
+/// `Ecosystem::cli_name()` plus any friendly alias (e.g. `pypi`/`python`,
+/// `gem`/`ruby`) — matched case-insensitively, mirroring the scoping semantics
+/// `apply` uses for the in-place ecosystems.
 fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
     match &common.ecosystems {
         None => true,
@@ -350,25 +333,6 @@ pub(crate) async fn configured_ecosystems(
         }
     }
 
-    #[cfg(feature = "cargo")]
-    if let Some(project) = discover_cargo_project(&common.cwd).await {
-        for member in &project.members {
-            if let Ok(content) = tokio::fs::read_to_string(member).await {
-                if is_guard_dep_present(&content) {
-                    set.insert(Ecosystem::Cargo);
-                    break;
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "golang")]
-    if let Some(module) = go_setup::discover_go_module(&common.cwd).await {
-        if go_setup::guard_files_present(&module.root).await {
-            set.insert(Ecosystem::Golang);
-        }
-    }
-
     #[cfg(feature = "composer")]
     if let Some(project) = composer_setup::discover_composer_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&project.composer_json).await {
@@ -384,8 +348,6 @@ pub(crate) async fn configured_ecosystems(
 // Canonical `--ecosystems` token sets per setup branch (see `eco_in_scope`).
 const ECO_NPM: &[&str] = &["npm"];
 const ECO_PYPI: &[&str] = &["pypi", "python"];
-const ECO_CARGO: &[&str] = &["cargo"];
-const ECO_GOLANG: &[&str] = &["golang", "go"];
 const ECO_GEM: &[&str] = &["gem", "ruby"];
 #[cfg(feature = "composer")]
 const ECO_COMPOSER: &[&str] = &["composer", "php"];
@@ -548,242 +510,24 @@ fn update_status_str(s: &UpdateStatus) -> &'static str {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Cargo (project-local [patch]-redirect guard) helpers
+// Shared per-ecosystem setup outcome
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Feature-agnostic summary of the cargo branch's contribution to a
-/// setup/remove run. Built by [`build_cargo_outcome`] (a no-op `Default` when
-/// the `cargo` feature is off), so the shared reporting code never has to name
-/// the cargo-only types.
+/// Feature-agnostic summary of one ecosystem branch's contribution to a
+/// setup/remove run. Each `build_*_outcome` returns one of these and the shared
+/// reporting code merges + renders them without naming ecosystem-specific types.
 #[derive(Default)]
 struct SetupOutcome {
-    /// A cargo project was discovered (gates the `no_files` decision).
+    /// A project for this ecosystem was discovered (gates the `no_files` decision).
     present: bool,
-    /// Items changed (guard dep added/removed + `[env]` written/removed).
+    /// Items changed (hook added/removed).
     changed: usize,
     already: usize,
     errors: usize,
-    /// Envelope `files[]` entries (kind = `cargo` / `cargo_env`).
+    /// Envelope `files[]` entries (kind = `package_json` / `pth` / `gemfile` / …).
     json_files: Vec<serde_json::Value>,
     /// Human-readable preview lines (already formatted).
     preview: Vec<String>,
-}
-
-/// Build the cargo outcome for a setup (`remove=false`) or remove
-/// (`remove=true`) run at the given `dry_run` setting.
-#[cfg(feature = "cargo")]
-async fn build_cargo_outcome(
-    common: &GlobalArgs,
-    remove: bool,
-    dry_run: bool,
-    excludes: &[String],
-) -> SetupOutcome {
-    use socket_patch_core::patch::cargo_config;
-
-    if !eco_in_scope(common, ECO_CARGO) {
-        return SetupOutcome::default();
-    }
-    let project = match discover_cargo_project(&common.cwd).await {
-        Some(p) => p,
-        None => return SetupOutcome::default(),
-    };
-
-    let mut out = SetupOutcome {
-        present: true,
-        ..Default::default()
-    };
-
-    // Per-member guard dependency edits, skipping excluded members (property 9).
-    let version = guard_version();
-    let mut results: Vec<(String, CargoEditResult)> = Vec::new();
-    for member in project
-        .members
-        .iter()
-        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
-    {
-        let res = if remove {
-            remove_guard_dep(member, dry_run).await
-        } else {
-            add_guard_dep(member, &version, dry_run).await
-        };
-        results.push(("cargo".to_string(), res));
-    }
-
-    // The shared `[env] SOCKET_PATCH_ROOT` at the workspace root.
-    let config_path = project.root.join(".cargo/config.toml");
-    let env_change = if remove {
-        cargo_config::drop_env_root(&project.root, dry_run).await
-    } else {
-        cargo_config::ensure_env_root(&project.root, dry_run).await
-    };
-    results.push(("cargo_env".to_string(), env_result(&config_path, env_change)));
-
-    // Aggregate counts + render envelope entries / preview lines.
-    let mut added_paths: Vec<String> = Vec::new();
-    for (kind, r) in &results {
-        match r.status {
-            CargoSetupStatus::Updated => {
-                out.changed += 1;
-                added_paths.push(r.path.clone());
-            }
-            CargoSetupStatus::AlreadyConfigured => out.already += 1,
-            CargoSetupStatus::Error => out.errors += 1,
-        }
-        out.json_files.push(serde_json::json!({
-            "kind": kind,
-            "path": r.path,
-            "status": cargo_status_str(&r.status, remove),
-            "error": r.error,
-        }));
-    }
-
-    if !added_paths.is_empty() {
-        let header = if remove {
-            "Cargo: remove socket-patch-guard + [env] SOCKET_PATCH_ROOT from:"
-        } else {
-            "Cargo: add socket-patch-guard + [env] SOCKET_PATCH_ROOT to:"
-        };
-        out.preview.push(header.to_string());
-        for p in &added_paths {
-            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
-        }
-    }
-
-    out
-}
-
-#[cfg(not(feature = "cargo"))]
-async fn build_cargo_outcome(
-    _common: &GlobalArgs,
-    _remove: bool,
-    _dry_run: bool,
-    _excludes: &[String],
-) -> SetupOutcome {
-    SetupOutcome::default()
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Go (project-local go.mod `replace`-redirect guard) helpers
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Build the Go branch's contribution to a setup/remove run: write (or remove)
-/// the `internal/socketpatchguard` package + the per-`main` blank-import files.
-/// A no-op `Default` when the `golang` feature is off.
-#[cfg(feature = "golang")]
-async fn build_go_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
-    if !eco_in_scope(common, ECO_GOLANG) {
-        return SetupOutcome::default();
-    }
-    let module = match go_setup::discover_go_module(&common.cwd).await {
-        Some(m) => m,
-        None => return SetupOutcome::default(),
-    };
-
-    let mut out = SetupOutcome {
-        present: true,
-        ..Default::default()
-    };
-
-    let mut results: Vec<go_setup::GoEditResult> = Vec::new();
-    if remove {
-        results.push(go_setup::remove_guard(&module.root, dry_run).await);
-        results.extend(go_setup::remove_main_imports(&module.root, dry_run).await);
-    } else {
-        results.push(go_setup::add_guard(&module.root, dry_run).await);
-        results.extend(
-            go_setup::add_main_imports(&module.root, &module.module_path, dry_run).await,
-        );
-    }
-
-    let mut added_paths: Vec<String> = Vec::new();
-    for r in &results {
-        match r.status {
-            GoSetupStatus::Updated => {
-                out.changed += 1;
-                added_paths.push(r.path.clone());
-            }
-            GoSetupStatus::AlreadyConfigured => out.already += 1,
-            GoSetupStatus::Error => out.errors += 1,
-        }
-        out.json_files.push(serde_json::json!({
-            "kind": r.kind,
-            "path": r.path,
-            "status": go_status_str(&r.status, remove),
-            "error": r.error,
-        }));
-    }
-
-    if !added_paths.is_empty() {
-        let header = if remove {
-            "Go: remove socket-patch guard wiring from:"
-        } else {
-            "Go: add socket-patch guard wiring to:"
-        };
-        out.preview.push(header.to_string());
-        for p in &added_paths {
-            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
-        }
-    }
-
-    out
-}
-
-#[cfg(not(feature = "golang"))]
-async fn build_go_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
-    SetupOutcome::default()
-}
-
-#[cfg(feature = "golang")]
-fn go_status_str(s: &GoSetupStatus, for_remove: bool) -> &'static str {
-    match (s, for_remove) {
-        (GoSetupStatus::Updated, false) => "updated",
-        (GoSetupStatus::Updated, true) => "removed",
-        (GoSetupStatus::AlreadyConfigured, false) => "already_configured",
-        (GoSetupStatus::AlreadyConfigured, true) => "not_configured",
-        (GoSetupStatus::Error, _) => "error",
-    }
-}
-
-/// Materialise the Go `replace` redirects right after wiring the guard (the
-/// "automatic" step) so the first `go test`/`go run` finds patches already in
-/// sync instead of self-healing on first run. Best-effort and offline: runs the
-/// same `apply` the guard would, capturing output so it never corrupts setup's
-/// (possibly JSON) stdout. A non-zero exit becomes a warning — the guard heals
-/// it on first run. No-op without the `golang` feature.
-#[cfg(feature = "golang")]
-async fn finalize_go(common: &GlobalArgs) -> Vec<String> {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            return vec![format!(
-                "could not locate socket-patch to materialize go patches ({e}); \
-                 run `socket-patch apply --ecosystems golang`"
-            )]
-        }
-    };
-    let root = common.cwd.display().to_string();
-    match tokio::process::Command::new(&exe)
-        .args(["apply", "--offline", "--ecosystems", "golang", "--cwd", &root, "--silent"])
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => Vec::new(),
-        Ok(o) => vec![format!(
-            "materializing go patches exited with {}; the guard will heal on first `go test`/run",
-            o.status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into())
-        )],
-        Err(e) => vec![format!(
-            "could not run apply to materialize go patches ({e}); the guard will heal on first run"
-        )],
-    }
-}
-
-#[cfg(not(feature = "golang"))]
-async fn finalize_go(_common: &GlobalArgs) -> Vec<String> {
-    Vec::new()
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -793,7 +537,7 @@ async fn finalize_go(_common: &GlobalArgs) -> Vec<String> {
 /// Build the gem branch's contribution to a setup/remove run: add (or remove)
 /// the managed `plugin "socket-patch"` block in the Gemfile + the generated
 /// `.socket/bundler-plugin/` plugin files. Gem is an unconditional ecosystem,
-/// so (unlike cargo/go) this is never feature-gated.
+/// so this is never feature-gated.
 async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_GEM) {
         return SetupOutcome::default();
@@ -864,9 +608,8 @@ fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
 /// Build the composer branch's contribution to a setup/remove run: add (or
 /// remove) the `socket-patch apply` command in `composer.json`'s
 /// `post-install-cmd` / `post-update-cmd` script events. Feature-gated behind
-/// `composer` (a no-op `Default` when off), exactly like the cargo/go branches —
-/// composer apply itself only exists with the feature, so wiring a hook without
-/// it would be incoherent.
+/// `composer` (a no-op `Default` when off) — composer apply itself only exists
+/// with the feature, so wiring a hook without it would be incoherent.
 #[cfg(feature = "composer")]
 async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_COMPOSER) {
@@ -981,7 +724,7 @@ async fn append_composer_check_entries(
 /// Materialise gem patches right after wiring the plugin (the "automatic" step)
 /// so the first `bundle install` finds them already applied. Best-effort and
 /// offline; a non-zero exit becomes a warning — the plugin heals on the next
-/// `bundle install`. Mirrors [`finalize_go`].
+/// `bundle install`.
 async fn finalize_gem(common: &GlobalArgs) -> Vec<String> {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -1114,153 +857,6 @@ fn merge_outcomes(mut a: SetupOutcome, b: SetupOutcome) -> SetupOutcome {
     a
 }
 
-/// The guard version string `setup` writes — major.minor of this CLI, so the
-/// committed dep tracks the installed `socket-patch`.
-#[cfg(feature = "cargo")]
-fn guard_version() -> String {
-    let v = env!("CARGO_PKG_VERSION");
-    let mut parts = v.split('.');
-    match (parts.next(), parts.next()) {
-        (Some(major), Some(minor)) => format!("{major}.{minor}"),
-        _ => v.to_string(),
-    }
-}
-
-#[cfg(feature = "cargo")]
-fn cargo_status_str(s: &CargoSetupStatus, for_remove: bool) -> &'static str {
-    match (s, for_remove) {
-        (CargoSetupStatus::Updated, false) => "updated",
-        (CargoSetupStatus::Updated, true) => "removed",
-        (CargoSetupStatus::AlreadyConfigured, false) => "already_configured",
-        (CargoSetupStatus::AlreadyConfigured, true) => "not_configured",
-        (CargoSetupStatus::Error, _) => "error",
-    }
-}
-
-#[cfg(feature = "cargo")]
-fn env_result(config_path: &Path, change: Result<bool, String>) -> CargoEditResult {
-    match change {
-        Ok(true) => CargoEditResult {
-            path: config_path.display().to_string(),
-            status: CargoSetupStatus::Updated,
-            error: None,
-        },
-        Ok(false) => CargoEditResult {
-            path: config_path.display().to_string(),
-            status: CargoSetupStatus::AlreadyConfigured,
-            error: None,
-        },
-        Err(e) => CargoEditResult {
-            path: config_path.display().to_string(),
-            status: CargoSetupStatus::Error,
-            error: Some(e),
-        },
-    }
-}
-
-/// Append cargo check entries (one per member + one for `[env]`) to the shared
-/// `run_check` entries list. Returns whether a cargo project was found.
-#[cfg(feature = "cargo")]
-async fn append_cargo_check_entries(
-    common: &GlobalArgs,
-    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-    excludes: &[String],
-) -> bool {
-    use socket_patch_core::patch::cargo_config;
-
-    if !eco_in_scope(common, ECO_CARGO) {
-        return false;
-    }
-    let project = match discover_cargo_project(&common.cwd).await {
-        Some(p) => p,
-        None => return false,
-    };
-    for member in project
-        .members
-        .iter()
-        .filter(|m| !is_member_excluded(m, &common.cwd, excludes))
-    {
-        let (state, err) = match tokio::fs::read_to_string(member).await {
-            Ok(content) => {
-                if is_guard_dep_present(&content) {
-                    (CheckState::Configured, None)
-                } else {
-                    (CheckState::NeedsConfiguration, None)
-                }
-            }
-            Err(e) => (CheckState::Error, Some(e.to_string())),
-        };
-        entries.push(("cargo", member.display().to_string(), state, err));
-    }
-    let env_ok = cargo_config::env_root_present(&project.root).await;
-    entries.push((
-        "cargo_env",
-        project.root.join(".cargo/config.toml").display().to_string(),
-        if env_ok {
-            CheckState::Configured
-        } else {
-            CheckState::NeedsConfiguration
-        },
-        None,
-    ));
-    true
-}
-
-#[cfg(not(feature = "cargo"))]
-async fn append_cargo_check_entries(
-    _common: &GlobalArgs,
-    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-    _excludes: &[String],
-) -> bool {
-    false
-}
-
-/// Append Go check entries (the guard package + one per `package main` blank
-/// import) to the shared `run_check` entries list. Returns whether a Go module
-/// was found. Checks the SETUP wiring only — redirect sync is `apply --check`.
-#[cfg(feature = "golang")]
-async fn append_go_check_entries(
-    common: &GlobalArgs,
-    entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-) -> bool {
-    if !eco_in_scope(common, ECO_GOLANG) {
-        return false;
-    }
-    let module = match go_setup::discover_go_module(&common.cwd).await {
-        Some(m) => m,
-        None => return false,
-    };
-    let guard_state = if go_setup::guard_files_present(&module.root).await {
-        CheckState::Configured
-    } else {
-        CheckState::NeedsConfiguration
-    };
-    entries.push((
-        "go_guard",
-        module.root.join(go_setup::GUARD_DIR).display().to_string(),
-        guard_state,
-        None,
-    ));
-    for dir in go_setup::find_main_package_dirs(&module.root).await {
-        let path = go_setup::import_file_path(&dir);
-        let state = if tokio::fs::metadata(&path).await.is_ok() {
-            CheckState::Configured
-        } else {
-            CheckState::NeedsConfiguration
-        };
-        entries.push(("go_import", path.display().to_string(), state, None));
-    }
-    true
-}
-
-#[cfg(not(feature = "golang"))]
-async fn append_go_check_entries(
-    _common: &GlobalArgs,
-    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-) -> bool {
-    false
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // check
 // ─────────────────────────────────────────────────────────────────────────
@@ -1278,12 +874,11 @@ enum CheckState {
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
     if !args.common.json {
-        println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
+        println!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
     // Excluded members (persisted in the manifest + any passed via `--exclude`)
-    // are skipped by both discovery and the cargo check. Read-only: `--check`
-    // never persists.
+    // are skipped by discovery. Read-only: `--check` never persists.
     let excludes = effective_excludes(&args.common, &args.exclude).await;
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(&args.common).await;
@@ -1329,8 +924,6 @@ async fn run_check(args: &SetupArgs) -> i32 {
         }
     }
 
-    append_cargo_check_entries(&args.common, &mut entries, &excludes).await;
-    append_go_check_entries(&args.common, &mut entries).await;
     append_gem_check_entries(&args.common, &mut entries).await;
     append_composer_check_entries(&args.common, &mut entries).await;
 
@@ -1429,7 +1022,7 @@ fn render_removed(new: &Option<String>) -> String {
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     if !common.json {
-        println!("Searching for package.json / Python / Cargo / Go / Bundler / Composer manifests...");
+        println!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
     // Honor the persisted/`--exclude` member set so we never touch a member that
@@ -1437,14 +1030,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     let excludes = effective_excludes(common, &args.exclude).await;
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    let cargo_preview = build_cargo_outcome(common, true, true, &excludes).await;
-    let go_preview = build_go_outcome(common, true, true).await;
     let gem_preview = build_gem_outcome(common, true, true).await;
     let composer_preview = build_composer_outcome(common, true, true).await;
     if npm_files.is_empty()
         && py_plan.is_none()
-        && !cargo_preview.present
-        && !go_preview.present
         && !gem_preview.present
         && !composer_preview.present
     {
@@ -1454,13 +1043,8 @@ async fn run_remove(args: &SetupArgs) -> i32 {
             &[("removed", 0), ("notConfigured", 0), ("errors", 0)],
         );
     }
-    let cargo_present = cargo_preview.present;
-    let go_present = go_preview.present;
     let gem_present = gem_preview.present;
-    let cargo_preview = merge_outcomes(
-        merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview),
-        composer_preview,
-    );
+    let extra_preview = merge_outcomes(gem_preview, composer_preview);
 
     // Preview (dry_run=true never writes).
     let mut npm_preview = Vec::new();
@@ -1473,15 +1057,15 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     };
 
     if !common.json {
-        print_remove_preview(&npm_preview, &py_preview, &cargo_preview, common);
+        print_remove_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
     let n_remove = npm_preview.iter().filter(|r| r.status == RemoveStatus::Removed).count()
         + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
-        + cargo_preview.changed;
+        + extra_preview.changed;
     let preview_errs = npm_preview.iter().filter(|r| r.status == RemoveStatus::Error).count()
         + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo_preview.errors;
+        + extra_preview.errors;
 
     // Nothing to remove: clean (exit 0) or some file errored (exit 1).
     if n_remove == 0 {
@@ -1490,7 +1074,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 if preview_errs > 0 { "error" } else { "not_configured" },
                 &npm_preview,
                 &py_preview,
-                &cargo_preview,
+                &extra_preview,
                 &[],
             );
         } else if preview_errs > 0 {
@@ -1504,7 +1088,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // Dry-run: preview already shown; report and exit without writing.
     if common.dry_run {
         if common.json {
-            print_remove_envelope("dry_run", &npm_preview, &py_preview, &cargo_preview, &[]);
+            print_remove_envelope("dry_run", &npm_preview, &py_preview, &extra_preview, &[]);
         } else {
             println!("\nSummary:");
             println!("  {n_remove} item(s) would have socket-patch removed");
@@ -1542,36 +1126,29 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, true, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go + gem + composer removal (guard dep/[env] root; go guard
-    // package + imports; gem Gemfile `plugin` block + generated plugin dir;
-    // composer.json script-event command).
-    let cargo_results = merge_outcomes(
-        merge_outcomes(
-            merge_outcomes(
-                build_cargo_outcome(common, true, false, &excludes).await,
-                build_go_outcome(common, true, false).await,
-            ),
-            build_gem_outcome(common, true, false).await,
-        ),
+    // Real gem + composer removal (gem Gemfile `plugin` block + generated plugin
+    // dir; composer.json script-event command).
+    let extra_results = merge_outcomes(
+        build_gem_outcome(common, true, false).await,
         build_composer_outcome(common, true, false).await,
     );
 
     let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
         + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo_results.errors;
+        + extra_results.errors;
 
     if common.json {
         print_remove_envelope(
             if errs > 0 { "partial_failure" } else { "success" },
             &npm_results,
             &py_results,
-            &cargo_results,
+            &extra_results,
             &warnings,
         );
     } else {
         let removed = npm_results.iter().filter(|r| r.status == RemoveStatus::Removed).count()
             + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
-            + cargo_results.changed;
+            + extra_results.changed;
         println!("\nSummary:");
         println!("  {removed} item(s) had socket-patch removed");
         if errs > 0 {
@@ -1582,19 +1159,6 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         }
         if py_plan.is_some() {
             println!("\nAlso run `pip uninstall socket-patch-hook` to remove the installed .pth.");
-        }
-        if cargo_present {
-            println!(
-                "\nNote: existing patched-crate copies under .socket/cargo-patches/ and any \
-                 managed [patch.crates-io] entries are removed on `socket-patch rollback`."
-            );
-        }
-        if go_present {
-            println!(
-                "\nNote: the Go guard wiring was removed; existing patched-module copies under \
-                 .socket/go-patches/ and managed go.mod `replace` directives are removed on \
-                 `socket-patch rollback`."
-            );
         }
         if gem_present {
             println!(
@@ -1611,10 +1175,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     }
 }
 
-/// Error messages from a cargo/go/gem [`SetupOutcome`]'s rendered `files[]`
+/// Error messages from a gem/composer [`SetupOutcome`]'s rendered `files[]`
 /// entries — the only place per-edit errors for those ecosystems are retained.
 /// The setup/remove previews use this so their human-mode "Errors:" sections
-/// actually list cargo/go/gem failures, honoring the "(see errors above)" line
+/// actually list gem/composer failures, honoring the "(see errors above)" line
 /// both flows print when `preview_errors > 0`.
 fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
     o.json_files
@@ -1627,7 +1191,7 @@ fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
 fn print_remove_preview(
     npm: &[RemoveResult],
     py: &[PthEditResult],
-    cargo: &SetupOutcome,
+    extra: &SetupOutcome,
     common: &GlobalArgs,
 ) {
     let to_remove: Vec<_> = npm.iter().filter(|r| r.status == RemoveStatus::Removed).collect();
@@ -1652,8 +1216,8 @@ fn print_remove_preview(
         }
         println!();
     }
-    if !cargo.preview.is_empty() {
-        for line in &cargo.preview {
+    if !extra.preview.is_empty() {
+        for line in &extra.preview {
             println!("{line}");
         }
         println!();
@@ -1671,7 +1235,7 @@ fn print_remove_preview(
                 .filter_map(|r| r.error.clone()),
         )
         .collect();
-    errs.extend(outcome_error_messages(cargo));
+    errs.extend(outcome_error_messages(extra));
     if !errs.is_empty() {
         println!("Errors:");
         for e in &errs {
@@ -1685,18 +1249,18 @@ fn print_remove_envelope(
     status: &str,
     npm: &[RemoveResult],
     py: &[PthEditResult],
-    cargo: &SetupOutcome,
+    extra: &SetupOutcome,
     warnings: &[String],
 ) {
     let removed = npm.iter().filter(|r| r.status == RemoveStatus::Removed).count()
         + py.iter().filter(|r| r.status == PthStatus::Updated).count()
-        + cargo.changed;
+        + extra.changed;
     let not_cfg = npm.iter().filter(|r| r.status == RemoveStatus::NotConfigured).count()
         + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
-        + cargo.already;
+        + extra.already;
     let errors = npm.iter().filter(|r| r.status == RemoveStatus::Error).count()
         + py.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo.errors;
+        + extra.errors;
 
     let mut files: Vec<serde_json::Value> = npm
         .iter()
@@ -1725,9 +1289,9 @@ fn print_remove_envelope(
             "error": r.error,
         })
     }));
-    // cargo.json_files already use the remove vocabulary
-    // (removed/not_configured/error), built by `build_cargo_outcome`.
-    files.extend(cargo.json_files.iter().cloned());
+    // extra.json_files already use the remove vocabulary
+    // (removed/not_configured/error), built by the gem/composer outcomes.
+    files.extend(extra.json_files.iter().cloned());
 
     let mut obj = serde_json::json!({
         "status": status,
@@ -1759,23 +1323,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Resolve the effective exclude set (persisted + `--exclude`) and, on a real
     // run, persist it so `--check` and a fresh clone honor it without the flag.
     // Dry-run never writes the manifest. Excluded members are then skipped by
-    // discovery and the cargo branch.
+    // discovery.
     let excludes = effective_excludes(common, &args.exclude).await;
     if !common.dry_run {
         persist_setup_excludes(common, &excludes).await;
     }
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    // Cargo + Go + Gem + Composer previews (dry-run); `.present` also tells us each project exists.
-    let cargo_preview = build_cargo_outcome(common, false, true, &excludes).await;
-    let go_preview = build_go_outcome(common, false, true).await;
+    // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
     let gem_preview = build_gem_outcome(common, false, true).await;
     let composer_preview = build_composer_outcome(common, false, true).await;
 
     if npm_files.is_empty()
         && py_plan.is_none()
-        && !cargo_preview.present
-        && !go_preview.present
         && !gem_preview.present
         && !composer_preview.present
     {
@@ -1792,27 +1352,20 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            println!("No package.json, Python, Cargo, Go, Bundler, or Composer project found");
+            println!("No package.json, Python, Bundler, or Composer project found");
         }
         return 0;
     }
 
-    let cargo_present = cargo_preview.present;
-    let go_present = go_preview.present;
     let gem_present = gem_preview.present;
     let composer_present = composer_preview.present;
-    let cargo_preview = merge_outcomes(
-        merge_outcomes(merge_outcomes(cargo_preview, go_preview), gem_preview),
-        composer_preview,
-    );
+    let extra_preview = merge_outcomes(gem_preview, composer_preview);
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
     let telemetry_manager = telemetry_manager_str(
         !npm_files.is_empty(),
         py_plan.is_some(),
-        cargo_present,
-        go_present,
         gem_present,
         composer_present,
         npm_pm,
@@ -1835,15 +1388,15 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     };
 
     if !common.json {
-        print_setup_preview(&npm_preview, &py_preview, &cargo_preview, common);
+        print_setup_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
     let n_changes = npm_preview.iter().filter(|r| r.status == UpdateStatus::Updated).count()
         + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
-        + cargo_preview.changed;
+        + extra_preview.changed;
     let preview_errors = npm_preview.iter().filter(|r| r.status == UpdateStatus::Error).count()
         + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo_preview.errors;
+        + extra_preview.errors;
 
     if n_changes == 0 {
         if common.json {
@@ -1851,7 +1404,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 if preview_errors > 0 { "error" } else { "already_configured" },
                 &npm_preview,
                 &py_preview,
-                &cargo_preview,
+                &extra_preview,
                 npm_pm,
                 py_plan.as_ref(),
                 &[],
@@ -1870,7 +1423,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 "dry_run",
                 &npm_preview,
                 &py_preview,
-                &cargo_preview,
+                &extra_preview,
                 npm_pm,
                 py_plan.as_ref(),
                 &[],
@@ -1912,25 +1465,13 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         py_results = edit_python_manifests(plan, false, false).await;
         warnings = finalize_python(plan, &py_results, &common.cwd).await;
     }
-    // Real cargo + go + gem + composer edits (cargo guard dep/[env] root; go guard
-    // package + per-main blank imports; gem Gemfile `plugin` block + generated
-    // plugin dir; composer.json script-event command).
-    let cargo_results = merge_outcomes(
-        merge_outcomes(
-            merge_outcomes(
-                build_cargo_outcome(common, false, false, &excludes).await,
-                build_go_outcome(common, false, false).await,
-            ),
-            build_gem_outcome(common, false, false).await,
-        ),
+    // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
+    // dir; composer.json script-event command).
+    let extra_results = merge_outcomes(
+        build_gem_outcome(common, false, false).await,
         build_composer_outcome(common, false, false).await,
     );
 
-    // Materialise the go.mod `replace` redirects now so the first `go test`/run
-    // is already in sync (the "automatic" step). Best-effort → warnings only.
-    if go_present {
-        warnings.extend(finalize_go(common).await);
-    }
     // Materialise gem patches now so the first `bundle install` finds them
     // applied. Best-effort → warnings only.
     if gem_present {
@@ -1939,14 +1480,14 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 
     let errors = npm_results.iter().filter(|r| r.status == UpdateStatus::Error).count()
         + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo_results.errors;
+        + extra_results.errors;
 
     if common.json {
         print_setup_envelope(
             if errors > 0 { "partial_failure" } else { "success" },
             &npm_results,
             &py_results,
-            &cargo_results,
+            &extra_results,
             npm_pm,
             py_plan.as_ref(),
             &warnings,
@@ -1954,7 +1495,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     } else {
         let updated = npm_results.iter().filter(|r| r.status == UpdateStatus::Updated).count()
             + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
-            + cargo_results.changed;
+            + extra_results.changed;
         println!("\nSummary:");
         println!("  {updated} item(s) updated");
         if errors > 0 {
@@ -1968,21 +1509,6 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 "\nCommit the {} dependency change (and your .socket/ patches) so \
                  the hook re-applies in CI after install.",
                 plan.pm.as_str()
-            );
-        }
-        if cargo_present {
-            println!(
-                "\nCommit Cargo.toml (socket-patch-guard), .cargo/config.toml, and your \
-                 .socket/ patches so the guard re-applies cargo patches in CI."
-            );
-        }
-        if go_present {
-            println!(
-                "\nCommit go.mod (the `replace` directives), internal/socketpatchguard/, the \
-                 generated socket_patch_guard_import.go files, .socket/go-patches/, and your \
-                 .socket/ patches. Enforcement: `go test ./...` gates at CI time (the guard \
-                 reads the patch state in-process, so the test cache re-runs it on any drift), \
-                 and the init() guard gates every `go run`/binary launch."
             );
         }
         if gem_present {
@@ -2005,7 +1531,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 fn print_setup_preview(
     npm: &[UpdateResult],
     py: &[PthEditResult],
-    cargo: &SetupOutcome,
+    extra: &SetupOutcome,
     common: &GlobalArgs,
 ) {
     let npm_changes: Vec<_> = npm.iter().filter(|r| r.status == UpdateStatus::Updated).collect();
@@ -2024,19 +1550,19 @@ fn print_setup_preview(
             println!("  + {}", pathdiff(&r.path, &common.cwd));
         }
     }
-    if !cargo.preview.is_empty() {
+    if !extra.preview.is_empty() {
         println!();
-        for line in &cargo.preview {
+        for line in &extra.preview {
             println!("{line}");
         }
     }
 
     let npm_already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count();
     let py_already = py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count();
-    if npm_already + py_already + cargo.already > 0 {
+    if npm_already + py_already + extra.already > 0 {
         println!(
             "\nAlready configured (will skip): {}",
-            npm_already + py_already + cargo.already
+            npm_already + py_already + extra.already
         );
     }
 
@@ -2050,7 +1576,7 @@ fn print_setup_preview(
                 .filter_map(|r| r.error.clone()),
         )
         .collect();
-    errs.extend(outcome_error_messages(cargo));
+    errs.extend(outcome_error_messages(extra));
     if !errs.is_empty() {
         println!("\nErrors:");
         for e in &errs {
@@ -2064,20 +1590,20 @@ fn print_setup_envelope(
     status: &str,
     npm: &[UpdateResult],
     py: &[PthEditResult],
-    cargo: &SetupOutcome,
+    extra: &SetupOutcome,
     npm_pm: PackageManager,
     py_plan: Option<&PythonPlan>,
     warnings: &[String],
 ) {
     let updated = npm.iter().filter(|r| r.status == UpdateStatus::Updated).count()
         + py.iter().filter(|r| r.status == PthStatus::Updated).count()
-        + cargo.changed;
+        + extra.changed;
     let already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count()
         + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
-        + cargo.already;
+        + extra.already;
     let errors = npm.iter().filter(|r| r.status == UpdateStatus::Error).count()
         + py.iter().filter(|r| r.status == PthStatus::Error).count()
-        + cargo.errors;
+        + extra.errors;
 
     let mut files: Vec<serde_json::Value> = npm
         .iter()
@@ -2098,7 +1624,7 @@ fn print_setup_envelope(
             "error": r.error,
         })
     }));
-    files.extend(cargo.json_files.iter().cloned());
+    files.extend(extra.json_files.iter().cloned());
 
     let mut obj = serde_json::json!({
         "status": status,

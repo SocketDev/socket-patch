@@ -40,7 +40,6 @@ const SOCKET_ENV_VARS: &[&str] = &[
     "SOCKET_VEX_PRODUCT",
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_PATCH_ROOT",
     "SOCKET_PATCH_BIN",
     "SOCKET_PATCH_DEBUG",
 ];
@@ -247,48 +246,6 @@ fn vex_omits_patches_for_unconfigured_ecosystem() {
         code, 1,
         "with the only patch belonging to an un-set-up ecosystem, vex must report \
          no-applicable-patches (exit 1); stdout=\n{stdout}"
-    );
-}
-
-// ===========================================================================
-// Property 8 (residue) — graceful, exact remove. A `.cargo/config.toml` that
-// `setup` *created* should be cleaned up on `--remove`, restoring the exact
-// pre-setup tree.
-//
-// SHIPPED: `edit_config` (cargo_config.rs) now deletes an emptied socket-created
-// `.cargo/config.toml` and prunes the now-empty `.cargo/` dir, so a repo that had
-// no `.cargo/` before setup is restored exactly. This pin is now an active
-// (non-ignored) regression guard.
-// ===========================================================================
-
-#[cfg(feature = "cargo")]
-#[test]
-fn setup_remove_cleans_up_cargo_config_it_created() {
-    let proj = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    write(
-        &proj.path().join("Cargo.toml"),
-        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n",
-    );
-    // Precondition: no .cargo/ before setup.
-    assert!(!proj.path().join(".cargo").exists());
-
-    let (c1, _) = run(proj.path(), home.path(), &["setup", "--json", "--yes"]);
-    assert_eq!(c1, 0);
-    assert!(
-        proj.path().join(".cargo/config.toml").exists(),
-        "precondition: setup created .cargo/config.toml"
-    );
-
-    let (c2, _) = run(proj.path(), home.path(), &["setup", "--remove", "--json", "--yes"]);
-    assert_eq!(c2, 0);
-
-    // Exact restoration: the .cargo/config.toml setup created must be gone, not
-    // lingering empty.
-    assert!(
-        !proj.path().join(".cargo/config.toml").exists(),
-        "remove must delete the .cargo/config.toml it created, restoring the exact \
-         pre-setup tree (property 8); an empty file is being left behind"
     );
 }
 

@@ -1,12 +1,10 @@
-//! Shared tree-copy helpers for the project-local redirect backends — the
-//! cargo `[patch]`-redirect ([`crate::patch::cargo_redirect`]) and the Go
-//! `replace`-redirect ([`crate::patch::go_redirect`]). Both materialise a
-//! project-local **patched copy** of a package by copying its pristine source
-//! out of a read-only registry/module cache into a writable dir under
-//! `.socket/`, then patching the copy in place.
+//! Shared tree-copy helpers for the project-local Go `replace`-redirect backend
+//! ([`crate::patch::go_redirect`]). It materialises a project-local **patched
+//! copy** of a module by copying its pristine source out of the read-only,
+//! checksum-verified module cache into a writable dir under `.socket/`, then
+//! patching the copy in place.
 //!
-//! Only compiled when a redirect backend is enabled.
-#![cfg(any(feature = "cargo", feature = "golang"))]
+//! Only compiled when the Go redirect backend is enabled (gated in `mod.rs`).
 
 use std::path::Path;
 

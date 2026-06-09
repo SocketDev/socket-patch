@@ -1,7 +1,13 @@
 #![cfg(all(unix, feature = "golang"))]
-//! Full go-toolchain capstone for the Go `replace`-redirect guard: proves the
-//! patched bytes are actually LINKED by `go build`, and that the committed guard
-//! enforces drift at runtime (`init()`) and self-heals.
+//! Full go-toolchain capstone for the Go `replace`-redirect: proves the patched
+//! bytes are actually LINKED by `go build`, and that the read-only
+//! `apply --check` redirect auditor detects drift in the committed copy.
+//!
+//! Go is the one ecosystem that still uses the project-local `replace`-redirect
+//! (the module cache is `go.sum`-verified, so in-place patching can't build).
+//! There is no longer a build-time guard or `setup` step for Go — the committed
+//! `go.mod` `replace` + `.socket/go-patches/` copy is the whole mechanism, and
+//! `go build` links it with no extra wiring.
 //!
 //! Hermetic + offline: a tiny upstream module is served from a local file
 //! GOPROXY into a temp GOMODCACHE, so no network and no pre-cached module are
@@ -13,7 +19,7 @@ use std::process::Command;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{binary, git_sha256, has_command, run_with_env};
+use common::{git_sha256, has_command, run_with_env};
 
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
@@ -124,7 +130,7 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
-fn go_build_links_patch_and_guard_enforces_drift() {
+fn go_build_links_patch_via_replace_redirect() {
     if !has_command("go") || !has_command("zip") {
         eprintln!("skipping e2e_golang_build: `go`/`zip` not installed");
         return;
@@ -134,15 +140,14 @@ fn go_build_links_patch_and_guard_enforces_drift() {
     let cs = consumer.to_str().unwrap();
     let mc = modcache.to_str().unwrap();
     let goenv = go_env(mc, &proxy_url);
-    let bin = binary();
-    let bin_s = bin.to_str().unwrap();
 
     // Baseline build links PRISTINE.
     let base = go(&consumer, &["run", "."], &goenv);
     assert!(base.status.success(), "baseline run failed: {}", String::from_utf8_lossy(&base.stderr));
     assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
 
-    // Patch + apply (socket-patch reads only the cache; no `go`).
+    // Patch + apply (socket-patch reads only the cache; no `go`). This writes the
+    // project-local copy under `.socket/go-patches/` and the `go.mod` `replace`.
     write_patch(&consumer);
     let (code, so, se) = run_with_env(
         &consumer,
@@ -151,7 +156,7 @@ fn go_build_links_patch_and_guard_enforces_drift() {
     );
     assert_eq!(code, 0, "apply failed.\n{so}\n{se}");
 
-    // The patched bytes are now LINKED by go build.
+    // The patched bytes are now LINKED by `go build` via the `replace` redirect.
     let patched = go(&consumer, &["run", "."], &goenv);
     assert!(patched.status.success(), "patched run failed: {}", String::from_utf8_lossy(&patched.stderr));
     assert!(
@@ -160,46 +165,16 @@ fn go_build_links_patch_and_guard_enforces_drift() {
         String::from_utf8_lossy(&patched.stdout)
     );
 
-    // ── setup wires the guard; go test (cold) passes in sync ─────────
-    let (code, so, se) = run_with_env(
+    // `apply --check` (read-only redirect auditor) reports the committed
+    // redirect as in sync.
+    let (code, _so, _se) = run_with_env(
         &consumer,
-        &["setup", "--cwd", cs, "--yes"],
-        &[("GOMODCACHE", mc), ("SOCKET_PATCH_BIN", bin_s)],
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &[("GOMODCACHE", mc)],
     );
-    assert_eq!(code, 0, "setup failed.\n{so}\n{se}");
-    assert!(consumer.join("internal/socketpatchguard/guard.go").exists());
-    assert!(consumer.join("socket_patch_guard_import.go").exists());
+    assert_eq!(code, 0, "apply --check should be in sync after apply");
 
-    let test_env: Vec<(&str, &str)> = goenv.iter().cloned().chain([("SOCKET_PATCH_BIN", bin_s)]).collect();
-    let t = go(&consumer, &["test", "-count=1", "./..."], &test_env);
-    assert!(
-        t.status.success(),
-        "guard test should pass in sync:\n{}\n{}",
-        String::from_utf8_lossy(&t.stdout),
-        String::from_utf8_lossy(&t.stderr)
-    );
-
-    // ── warm-cache drift: `go test` (NO -count=1) must NOT serve a stale PASS ──
-    // Prime the cache with a passing run, then corrupt the copy and run again
-    // WITHOUT -count=1. The guard reads the patch state in-process, so the test
-    // cache must re-run the gate and FAIL (this is the test-cache-masking fix).
-    let warm = consumer.join(".socket/go-patches/example.com").join(format!("upstream@{UVER}")).join("lib.go");
-    let _ = go(&consumer, &["test", "./internal/socketpatchguard/"], &test_env); // prime cache (no -count=1)
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&warm, std::fs::Permissions::from_mode(0o644));
-    }
-    std::fs::write(&warm, "package upstream\n\nfunc Greeting() string { return \"WARM-DRIFT\" }\n").unwrap();
-    let warm_test = go(&consumer, &["test", "./internal/socketpatchguard/"], &test_env); // NO -count=1
-    assert!(
-        !warm_test.status.success(),
-        "WARM-CACHE go test must catch drift (not serve a cached PASS):\n{}\n{}",
-        String::from_utf8_lossy(&warm_test.stdout),
-        String::from_utf8_lossy(&warm_test.stderr)
-    );
-    // (heal happened during that run; restore is verified by the -count=1 block below)
-
-    // ── drift: corrupt the committed copy → guard test fails closed ──
+    // Corrupt the committed copy → `apply --check` must detect drift (exit !=0).
     let copy_file = consumer
         .join(".socket/go-patches/example.com")
         .join(format!("upstream@{UVER}"))
@@ -209,85 +184,27 @@ fn go_build_links_patch_and_guard_enforces_drift() {
         let _ = std::fs::set_permissions(&copy_file, std::fs::Permissions::from_mode(0o644));
     }
     std::fs::write(&copy_file, "package upstream\n\nfunc Greeting() string { return \"DRIFT\" }\n").unwrap();
-
-    let t2 = go(&consumer, &["test", "-count=1", "./internal/socketpatchguard/"], &test_env);
-    assert!(
-        !t2.status.success(),
-        "guard test must FAIL on drift (it self-heals + fails):\n{}\n{}",
-        String::from_utf8_lossy(&t2.stdout),
-        String::from_utf8_lossy(&t2.stderr)
+    let (code, _so, _se) = run_with_env(
+        &consumer,
+        &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
+        &[("GOMODCACHE", mc)],
     );
+    assert_ne!(code, 0, "apply --check must detect drift in the committed copy");
 
-    // The heal restored the patched bytes; a re-run passes.
-    let t3 = go(&consumer, &["test", "-count=1", "./internal/socketpatchguard/"], &test_env);
+    // A fresh `apply` re-materialises the copy and `go build` links PATCHED again.
+    let (code, _so, _se) = run_with_env(
+        &consumer,
+        &["apply", "--offline", "--ecosystems", "golang", "--cwd", cs],
+        &[("GOMODCACHE", mc)],
+    );
+    assert_eq!(code, 0, "re-apply should heal the drifted copy");
+    let healed = go(&consumer, &["run", "."], &goenv);
     assert!(
-        t3.status.success(),
-        "guard test should pass after self-heal:\n{}\n{}",
-        String::from_utf8_lossy(&t3.stdout),
-        String::from_utf8_lossy(&t3.stderr)
+        String::from_utf8_lossy(&healed.stdout).contains("OUT: PATCHED"),
+        "re-apply should restore the patched bytes: {}",
+        String::from_utf8_lossy(&healed.stdout)
     );
 
     // Best-effort: relax perms so the temp cache cleans up.
-    chmod_writable(tmp.path());
-}
-
-#[test]
-fn guard_is_noop_outside_module_tree() {
-    if !has_command("go") || !has_command("zip") {
-        eprintln!("skipping e2e_golang_build: `go`/`zip` not installed");
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let (consumer, modcache, proxy_url) = stage(tmp.path());
-    let cs = consumer.to_str().unwrap();
-    let mc = modcache.to_str().unwrap();
-    let goenv = go_env(mc, &proxy_url);
-    let bin = binary();
-
-    // Patch + apply + wire the guard, then build a real binary.
-    write_patch(&consumer);
-    assert_eq!(
-        run_with_env(&consumer, &["apply", "--offline", "--ecosystems", "golang", "--cwd", cs], &[("GOMODCACHE", mc)]).0,
-        0
-    );
-    run_with_env(
-        &consumer,
-        &["setup", "--cwd", cs, "--yes"],
-        &[("GOMODCACHE", mc), ("SOCKET_PATCH_BIN", bin.to_str().unwrap())],
-    );
-    let build = go(&consumer, &["build", "-o", "app", "."], &goenv);
-    assert!(build.status.success(), "go build failed: {}", String::from_utf8_lossy(&build.stderr));
-
-    // Copy the binary OUT of the module tree (simulating a shipped binary with
-    // no .socket/ alongside it) and run it from a dir with no go.mod ancestor.
-    let outside = tmp.path().join("shipped");
-    std::fs::create_dir_all(&outside).unwrap();
-    let app = outside.join("app");
-    std::fs::copy(consumer.join("app"), &app).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // The guard's init() must be a SILENT no-op here: the binary runs normally
-    // even though socket-patch isn't on PATH and there is no .socket/manifest.
-    let out = Command::new(&app)
-        .current_dir(&outside)
-        .env_remove("SOCKET_PATCH_BIN")
-        .env("PATH", "/usr/bin:/bin") // ensure no socket-patch on PATH
-        .output()
-        .expect("run shipped binary");
-    assert!(
-        out.status.success(),
-        "shipped binary outside the module tree must NOT be bricked by the guard:\nstdout:{}\nstderr:{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("OUT: PATCHED"),
-        "the binary should still run its (patched) code: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-
     chmod_writable(tmp.path());
 }

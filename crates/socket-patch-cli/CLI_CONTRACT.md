@@ -14,7 +14,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `scan` | — | Crawl installed packages for available patches |
 | `list` | — | Print patches in the local manifest |
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
-| `setup` | — | Wire automatic-patching install hooks (npm/pypi/cargo/gem/golang) |
+| `setup` | — | Wire automatic-patching install hooks (npm/pypi/gem) |
 | `repair` | `gc` | Download missing blobs + clean up unused ones |
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
@@ -111,15 +111,15 @@ in particular, are behavior changes that gate a version bump when implemented).
 2. **Ecosystem-scoped.** `setup`, `setup --check`, and `setup --remove` honor the global
    `--ecosystems` filter and act on only the named ecosystems; with no filter they act on every
    detected ecosystem. *(Intended; **not yet implemented** — `setup` currently ignores `--ecosystems`
-   and always processes every detected ecosystem (npm + python + cargo + golang + gem). RED-guarded.)*
+   and always processes every detected ecosystem (npm + python + gem). RED-guarded.)*
 
 3. **Consistency after install.** Once an ecosystem is set up, its locally-installed dependencies are
    re-patched to match the manifest after **any** of: a dependency added, updated, or removed; **or** a
-   new patch added to the manifest. The re-patch is carried by the ecosystem's install/build hook (npm
-   `postinstall`/`dependencies`, the Python `.pth` startup hook, the cargo guard build script, the gem
-   Bundler plugin, the golang guard package) which runs `socket-patch apply` after the ecosystem's
-   installer finishes, so patch state always reconverges with the manifest. *(Implemented for
-   npm/pypi/cargo/gem/golang via the support matrix.)*
+   new patch added to the manifest. The re-patch is carried by the ecosystem's install hook (npm
+   `postinstall`/`dependencies`, the Python `.pth` startup hook, the gem Bundler plugin) which runs
+   `socket-patch apply` after the ecosystem's installer finishes, so patch state always reconverges with
+   the manifest. *(Implemented for npm/pypi/gem via the support matrix. Cargo and Go have no `setup`
+   hook — see "Cargo and Go: apply-only, no setup" below.)*
 
 4. **`check` proves a correctly-patched state.** `setup --check` reports `configured` only when the
    in-scope ecosystems are *actually in a correctly patched state* — install hooks present **and**
@@ -128,8 +128,8 @@ in particular, are behavior changes that gate a version bump when implemented).
    on-disk patch consistency. RED-guarded.)*
 
 5. **In-repo and committable.** `setup` writes only inside the working tree: `package.json`,
-   `pyproject.toml`/`requirements.txt`, member `Cargo.toml`s, `.cargo/config.toml`, the `Gemfile` +
-   generated `.socket/bundler-plugin/`. Every artifact is git-committable. It never writes outside
+   `pyproject.toml`/`requirements.txt`, the `Gemfile` + generated `.socket/bundler-plugin/`. Every
+   artifact is git-committable. It never writes outside
    `--cwd` — no `$HOME`, no global `site-packages` (the Python `.pth` wheel is installed later by the
    user's package manager, not by `setup`; the gem patch stamp is written under `Bundler.bundle_path`
    by the plugin at `bundle install` time, not by `setup`). *(Implemented.)*
@@ -146,63 +146,77 @@ in particular, are behavior changes that gate a version bump when implemented).
    filter and on-disk verification. Applies in both verify and `--no-verify` modes.)*
    - **Manual declaration.** Users who run `socket-patch apply` by hand (e.g. in a CI step) declare an
      ecosystem as `manual` so VEX still attests its patches even though the auto-install hook is
-     intentionally not wired. Home: the `setup.manual` array (a list of ecosystem `cli_name`s — `pypi`,
-     `cargo`, …) in `.socket/manifest.json`. *(Implemented for the read/attest path; a `setup` flag to
+     intentionally not wired. This is the normal path for **cargo** and **golang** (apply-only, no
+     `setup` hook). Home: the `setup.manual` array (a list of ecosystem `cli_name`s — `pypi`, `cargo`,
+     `golang`, …) in `.socket/manifest.json`. *(Implemented for the read/attest path; a `setup` flag to
      populate it is a future nicety — today it's hand-authored in the manifest.)*
 
 8. **Graceful, exact remove.** `setup --remove` (optionally per-ecosystem via `--ecosystems`) restores
    the repo to its exact pre-setup state: manifests byte-for-byte, sibling scripts/dependencies
    preserved, keys that became empty dropped. Afterward `setup --check` reports needs-configuration
-   again. *(Implemented for the manifest edits — npm `package.json`, Python deps, and member
-   `Cargo.toml`s all round-trip byte-for-byte. **Known residue:** a `.cargo/config.toml` (and its
-   `.cargo/` dir) that `setup` created is left behind empty rather than deleted on `--remove`;
-   RED-guarded.)*
+   again. *(Implemented for the manifest edits — npm `package.json` and Python deps round-trip
+   byte-for-byte.)*
 
 9. **Nested workspaces, with exclude.** Setup applies to every subproject below the repo root: npm /
-   yarn / pnpm / bun workspace members and cargo workspace members are all discovered and configured
-   (pnpm is root-package-only by design, because workspace-member `postinstall` scripts fail under
-   pnpm's strict module isolation). Selected paths may be **excluded**, and the exclusion is **persisted
-   in `.socket/manifest.json`** so `check`, `apply`, and any clone all honor it. *(Implemented —
-   nested-workspace discovery plus the `--exclude` flag, persisted as the `setup.exclude` array in
-   `.socket/manifest.json` and honored by discovery + `check` (a fresh clone inherits it without
-   re-passing the flag). Excludes apply to npm + cargo workspace members; the repo root is never
-   excludable.)*
-   - **Nested workspaces (implemented).** A workspace member that is itself a workspace root — or, for
-     cargo, members matched by a recursive `members = ["crates/**"]` glob — is recursed into and has its
-     own members configured. `find_workspace_packages` re-reads each discovered member's own
-     `workspaces` field (bounded depth), and `discover_cargo_project`'s `expand_member` expands the
-     recursive `crates/**` glob (`glob_dir_recursive`, skipping `target/` + hidden dirs). Guarded by
-     `setup_recurses_into_nested_npm_workspace` / `setup_expands_recursive_cargo_member_glob` in
-     `tests/setup_monorepo_invariants.rs`.
+   yarn / pnpm / bun workspace members are all discovered and configured (pnpm is root-package-only by
+   design, because workspace-member `postinstall` scripts fail under pnpm's strict module isolation).
+   Selected paths may be **excluded**, and the exclusion is **persisted in `.socket/manifest.json`** so
+   `check`, `apply`, and any clone all honor it. *(Implemented — nested-workspace discovery plus the
+   `--exclude` flag, persisted as the `setup.exclude` array in `.socket/manifest.json` and honored by
+   discovery + `check` (a fresh clone inherits it without re-passing the flag). Excludes apply to npm
+   workspace members; the repo root is never excludable.)*
+   - **Nested workspaces (implemented).** A workspace member that is itself a workspace root is recursed
+     into and has its own members configured. `find_workspace_packages` re-reads each discovered
+     member's own `workspaces` field (bounded depth). Guarded by the nested-workspace pins in
+     `tests/setup_invariants.rs`.
 
 ### Per-ecosystem setup support
 
-`setup` installs an automatic-repatch hook for the five ecosystems with a usable post-install / build /
-startup hook (npm, pypi, cargo, gem, golang) — plus **composer** when the binary is built with the
-opt-in `composer` feature. The remaining ecosystems are **apply-only**: `socket-patch apply` patches
-them on demand, but there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them.
-These are exactly the ecosystems for which property 7's **manual** declaration is intended (so their
-hand-applied patches still show up in VEX).
+`setup` installs an automatic-repatch hook for the three ecosystems with a usable post-install /
+startup hook (npm, pypi, gem) — plus **composer** when the binary is built with the opt-in `composer`
+feature. The remaining ecosystems are **apply-only**: `socket-patch apply` patches them on demand, but
+there is no hook for `setup` to install, so `setup` is a `no_files` no-op for them. These are exactly
+the ecosystems for which property 7's **manual** declaration is intended (so their hand-applied patches
+still show up in VEX).
 
 | Ecosystem | Hook `setup` installs | Repatch trigger | Notes |
 |---|---|---|---|
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
-| cargo | `socket-patch-guard` dependency + `[env] SOCKET_PATCH_ROOT` in `.cargo/config.toml` | every `cargo build` (fail-closed guard) | per-member dep + one workspace-root `[env]`; the guard crate is published to crates.io each release |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
-| golang | generated `internal/socketpatchguard/` guard package (`guard.go` + `guard_test.go`) + a blank import in each `main` package | every `go test ./...` (CI gate) **and** every `go run` / binary launch (`init()` guard) — fail-closed | self-contained: committed Go source, no published artifact; CLI must be on `PATH` |
 | composer *(opt-in `composer` feature)* | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH`; only compiled in with `--features composer` (apply support is likewise feature-gated). Without the feature, composer is a `no_files` no-op |
+| cargo · golang | **none** (apply-only) | — | see "Cargo and Go: apply-only, no setup" below; candidates for the **manual** declaration |
 | nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
+
+#### Cargo and Go: apply-only, no setup
+
+Cargo and Go have **no `setup` hook** — a one-click, auto-repatch-on-build setup isn't possible for
+them, so `setup` skips both (it makes no manifest edits for either as a *setup* action; the `go.mod`
+`replace` that local-mode `apply` writes is an *apply*-time redirect, not setup state). Patch them
+with `socket-patch apply` directly (manually or from a per-project install script), and declare them
+in `setup.manual` for VEX attestation.
+
+- **cargo** — `apply` patches the crate **in place** wherever the crawler finds it: the project
+  `vendor/` directory or the shared registry cache (`$CARGO_HOME/registry/src/...`). The
+  `.cargo-checksum.json` sidecar is rewritten so `cargo build` accepts the modified files. Rollback
+  restores the original bytes from the `beforeHash` blobs. *(Note: a non-vendored crate patches the
+  **shared** registry cache, which affects other projects on the machine and is reset by `cargo clean`
+  / a cache prune. Vendor the dependency for a project-local, committable patch.)*
+- **golang** — `apply` writes a project-local **patched copy** under `.socket/go-patches/<module>@<ver>/`
+  and a `go.mod` `replace` directive pointing at it; `go build` links the copy (the module cache is
+  `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` + your
+  `.socket/` patches so a clone builds the patched bytes with no further setup. `socket-patch apply
+  --check` is a read-only audit of the committed redirect.
 
 ### Monorepo / multi-project discovery model
 
 How `setup` (and the underlying `scan`/`apply` crawlers) find subprojects differs by ecosystem, and
 the model is **not uniform** today:
 
-- **Workspace-aware (walk members):** npm / yarn / pnpm / bun (`workspaces` / `pnpm-workspace.yaml`)
-  and cargo (`[workspace] members`). One repo-root invocation discovers and configures every member.
-  *Single level only* — see property 9's nested-workspace gap.
-- **cwd-only (single project):** gem, pypi, golang, composer. The crawler inspects only the project
+- **Workspace-aware (walk members):** npm / yarn / pnpm / bun (`workspaces` / `pnpm-workspace.yaml`).
+  One repo-root invocation discovers and configures every member. *Single level only* — see property
+  9's nested-workspace gap.
+- **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
   rooted at `--cwd` (e.g. gem looks at `<cwd>/vendor/bundle/...`; pypi at `<cwd>/.venv`); it does **not**
   descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories
   (`backend/Gemfile.lock` + `frontend/Gemfile.lock`, multiple `.venv`, multiple `go.mod` /
@@ -210,7 +224,7 @@ the model is **not uniform** today:
   per-directory install hook would.
 
 **Intended (gap):** the cwd-only ecosystems *should* also auto-discover per-subproject lockfiles when
-run from the repo root, matching the npm/cargo workspace model. The npm-vs-others asymmetry is a known
+run from the repo root, matching the npm workspace model. The npm-vs-others asymmetry is a known
 defect, guarded by the `#[ignore]`d gap pin
 `gem_crawl_from_repo_root_discovers_all_subproject_lockfiles` in
 `crates/socket-patch-core/tests/crawler_monorepo_gaps.rs` (gem is the representative; python/go/composer
@@ -227,8 +241,7 @@ is patched identically to a direct one. Pinned by
 
 `setup` predates the v3.0 unified envelope and emits its own three shapes. They are stable as of v3.0;
 consumers may rely on these keys. All three share a `files[*]` entry shape; `kind` is one of
-`package_json`, `pth`, `cargo`, `cargo_env`, `go_guard`, `go_import`, `gemfile`, `gem_plugin`,
-`composer`.
+`package_json`, `pth`, `gemfile`, `gem_plugin`, `composer`.
 
 **`setup`:**
 

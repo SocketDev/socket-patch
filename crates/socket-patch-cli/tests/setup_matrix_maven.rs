@@ -97,7 +97,7 @@ mod host_guard {
     /// an ambient `SOCKET_CWD` could retarget the run away from our maven
     /// fixture, and `SOCKET_EXPERIMENTAL_MAVEN` is scrubbed too so an enabled
     /// gate in the shell/CI can never quietly turn maven into a configurable
-    /// surface behind the test's back. Mirrors `setup_matrix_cargo.rs` /
+    /// surface behind the test's back. Mirrors `setup_matrix_pypi.rs` /
     /// `setup_matrix_deno.rs`.
     const SOCKET_ENV_VARS: &[&str] = &[
         "SOCKET_CWD",
@@ -123,8 +123,6 @@ mod host_guard {
         "SOCKET_SAVE_ONLY",
         "SOCKET_ONE_OFF",
         "SOCKET_ALL_RELEASES",
-        "SOCKET_PATCH_ROOT",
-        "SOCKET_PATCH_GUARD",
         "SOCKET_EXPERIMENTAL_MAVEN",
     ];
 

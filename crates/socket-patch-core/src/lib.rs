@@ -1,13 +1,9 @@
 pub mod api;
-#[cfg(feature = "cargo")]
-pub mod cargo_setup;
 #[cfg(feature = "composer")]
 pub mod composer_setup;
 pub mod constants;
 pub mod crawlers;
 pub mod gem_setup;
-#[cfg(feature = "golang")]
-pub mod go_setup;
 pub mod hash;
 pub mod manifest;
 pub mod package_json;
