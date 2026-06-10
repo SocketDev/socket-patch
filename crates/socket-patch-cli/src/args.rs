@@ -60,7 +60,7 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
 /// clap abort the whole command with `invalid value '' for '--offline': value
 /// was not a boolean`. Every bool flag here reads such an env var, so a single
 /// stray empty var crashed every subcommand before it could do any work.
-fn parse_bool_flag(s: &str) -> Result<bool, String> {
+pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "" | "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
         "y" | "yes" | "t" | "true" | "on" | "1" => Ok(true),

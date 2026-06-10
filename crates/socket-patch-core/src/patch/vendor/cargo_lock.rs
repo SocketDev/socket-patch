@@ -354,6 +354,43 @@ mod tests {
         assert!(matches!(err, LockEditError::Parse(_)));
     }
 
+    /// Drift pin: a lock that GAINED a `[[patch.unused]]` table after vendor
+    /// (a user added a dep whose resolution left an unused patch entry, or
+    /// hand-edits) must still restore the detached entry cleanly — the extra
+    /// table is untouched and the round trip stays byte-faithful for the
+    /// edited entry.
+    #[tokio::test]
+    async fn restore_tolerates_patch_unused_table_gained_post_vendor() {
+        let dir = fixture().await;
+        let orig = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", false)
+            .await
+            .unwrap();
+
+        // Post-vendor drift: cargo appended a [[patch.unused]] section.
+        let mut body = tokio::fs::read_to_string(dir.path().join("Cargo.lock"))
+            .await
+            .unwrap();
+        body.push_str("\n[[patch.unused]]\nname = \"other\"\nversion = \"2.0.0\"\n");
+        tokio::fs::write(dir.path().join("Cargo.lock"), &body)
+            .await
+            .unwrap();
+
+        let restored = restore_lock_entry(dir.path(), "cfg-if", "1.0.4", &orig, false)
+            .await
+            .unwrap();
+        assert!(restored, "detached entry must restore despite the extra table");
+
+        let after = tokio::fs::read_to_string(dir.path().join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert!(after.contains(&format!("source = \"{SOURCE}\"")));
+        assert!(after.contains(&format!("checksum = \"{CHECKSUM}\"")));
+        assert!(
+            after.contains("[[patch.unused]]") && after.contains("name = \"other\""),
+            "the drift table must be left untouched: {after}"
+        );
+    }
+
     #[tokio::test]
     async fn restore_skips_re_resolved_and_absent_entries() {
         let dir = fixture().await;

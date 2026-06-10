@@ -351,6 +351,22 @@ refuse per-purl with stable reason codes pointing at the native alternative (`ya
 the `.pth` setup hook, …). PURLs of **compiled-out** ecosystems are invisible to `vendor` exactly
 as they are to `apply` (the binary cannot parse them).
 
+### Checksum coverage
+
+Every checksum-like field a lockfile carries for a vendored package is updated coherently —
+never inherited from the registry entry (a stale checksum either hard-fails the install or,
+worse, lets a warm cache silently serve unpatched bytes):
+
+| eco / flavor | checksum/reference fields | vendor behavior |
+|---|---|---|
+| npm (lock v2/v3) | `packages[].integrity` + `resolved`; v2 legacy `dependencies` mirror; `dependencies`/`peerDependencies`/`optionalDependencies`/`bin` mirrors | integrity recomputed (sha512 of the packed tarball); `resolved` → relative `file:`; legacy mirror rewritten; dep mirrors recomputed when the patch touches the package's package.json |
+| cargo | `[[package]].source` + `checksum`; `.cargo-checksum.json` in the copy | both lock keys removed (the canonical path-dep form); checksum sidecar excluded from the copy; originals kept verbatim in the ledger for `--revert` |
+| golang | `go.sum` | untouched **by design** — directory `replace` targets are never sum-verified. Caveat: a user `go mod tidy` may prune the replaced module's go.sum lines; revert does not restore them (the next online build re-adds them) |
+| composer | `dist.{url,reference,shasum}`, `source.reference`, `content-hash` | `dist` → `{type: path, url, reference: "<patch-uuid>"}` (the uuid is preserved verbatim into `installed.json` — in-tree traceability); `source` removed; `content-hash` untouched (covers composer.json only) |
+| gem | `CHECKSUMS` section (bundler ≥ 2.6 opt-in) | the vendored gem's entry rewritten to bundler's own path-gem form so re-locks stay byte-stable; original line in the ledger |
+| pypi / uv | `wheels[].hash`, `sdist.hash`, requires-dist specifiers | single `{filename, hash: sha256-of-our-wheel}`; sdist dropped; dropped specifiers ledgered for revert |
+| pypi / requirements | `--hash=sha256:` | fresh hash of the rebuilt wheel always emitted (turns on pip's hash-checking for the line) |
+
 ### Ownership, state, and reversal
 
 * `.socket/vendor/state.json` (committed) is the revert ledger: every wiring edit records the

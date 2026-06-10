@@ -240,7 +240,7 @@ pub async fn vendor_composer(
         result.error = Some("composer.lock entry is not a JSON object".to_string());
         return VendorOutcome::Done { result, entry: None, warnings: Vec::new() };
     };
-    let rewritten = rewrite_lock_entry(original_obj, &copy_rel);
+    let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
     let write_result = match composer_json_bytes(&lock) {
         Ok(bytes) => atomic_write_bytes(&lock_path, &bytes).await,
@@ -438,8 +438,17 @@ fn entry_is_wired(entry: &Value, dist_url: &str) -> bool {
 /// original slot with `transport-options` inserted right after it. A
 /// pre-existing `transport-options` is superseded by ours (never duplicated).
 /// A source-only entry without `dist` gets both appended at the end.
-fn rewrite_lock_entry(original: &Map<String, Value>, dist_url: &str) -> Map<String, Value> {
-    let dist = json!({ "type": "path", "url": dist_url, "reference": null });
+fn rewrite_lock_entry(
+    original: &Map<String, Value>,
+    dist_url: &str,
+    patch_uuid: &str,
+) -> Map<String, Value> {
+    // `reference` carries the patch uuid: composer preserves it verbatim into
+    // vendor/composer/installed.json (spike-proven for arbitrary strings), so
+    // SBOM/audit tooling can recover the patch from deployed artifacts even
+    // when `.socket/` is stripped from the image. The uuid was already
+    // canonical-validated by vendor_uuid_dir_rel before reaching here.
+    let dist = json!({ "type": "path", "url": dist_url, "reference": patch_uuid });
     let transport = json!({ "symlink": false });
     let mut out = Map::new();
     let mut replaced_dist = false;
@@ -795,7 +804,10 @@ mod tests {
         );
         assert_eq!(e["dist"]["type"], "path");
         assert_eq!(e["dist"]["url"], copy_rel());
-        assert!(e["dist"]["reference"].is_null());
+        assert_eq!(
+            e["dist"]["reference"], UUID,
+            "reference carries the patch uuid for in-tree traceability"
+        );
         assert_eq!(e["transport-options"]["symlink"], json!(false));
         // content-hash untouched (it covers composer.json only).
         assert_eq!(new_lock["content-hash"], "7a59d114f58e9b02546b21d7e57430d3");

@@ -470,31 +470,8 @@ fn env_socket_force_numeric_one_should_set_force() {
     assert_eq!(snapshot(&a), want);
 }
 
-/// PINNED CURRENT BEHAVIOR: an exported-but-empty `SOCKET_FORCE=` (which
-/// shells and CI routinely use to mean "unset") aborts the parse with
-/// `a value is required for '--force' but none was supplied`. This is the
-/// exact bug class `GlobalArgs::parse_bool_flag` was introduced to fix for
-/// the global bools (empty ⇒ false); vendor's own bools were left out.
 #[test]
 #[serial_test::serial]
-fn env_socket_force_empty_currently_rejected() {
-    let err = match parse_vendor_with_env(&[("SOCKET_FORCE", "")], &[]) {
-        Err(e) => e,
-        Ok(_) => panic!("SOCKET_FORCE= (empty) currently aborts the parse"),
-    };
-    // Don't over-pin the exact kind (clap renders this particular failure as
-    // a missing-value error); the contract being pinned is "the parse dies".
-    assert!(
-        err.use_stderr(),
-        "an empty SOCKET_FORCE must currently be a hard parse failure, got: {err}"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-#[ignore = "BUG: SOCKET_FORCE= (exported-but-empty) crashes every `vendor` invocation with a \
-            clap value error — the same empty-env-var crash fixed for all GlobalArgs bools via \
-            parse_bool_flag (empty must mean false), but --force was left on clap's strict parser"]
 fn env_socket_force_empty_should_parse_as_false() {
     let a = parse_vendor_with_env(&[("SOCKET_FORCE", "")], &[])
         .expect("an exported-but-empty bool env var must not abort the parse");
@@ -525,25 +502,8 @@ fn env_socket_vendor_revert_falsey_tokens_keep_revert_off() {
     }
 }
 
-/// PINNED CURRENT BEHAVIOR: `BoolishValueParser` has no empty-string
-/// special case, so `SOCKET_VENDOR_REVERT=` (exported-but-empty) aborts the
-/// whole command with `value was not a boolean` (ErrorKind::ValueValidation)
-/// instead of meaning "unset". Same gap as `SOCKET_FORCE=` above.
 #[test]
 #[serial_test::serial]
-fn env_socket_vendor_revert_empty_currently_rejected() {
-    let err = match parse_vendor_with_env(&[("SOCKET_VENDOR_REVERT", "")], &[]) {
-        Err(e) => e,
-        Ok(_) => panic!("SOCKET_VENDOR_REVERT= (empty) currently aborts the parse"),
-    };
-    assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-}
-
-#[test]
-#[serial_test::serial]
-#[ignore = "BUG: SOCKET_VENDOR_REVERT= (exported-but-empty) crashes every `vendor` invocation \
-            via ValueValidation — BoolishValueParser rejects empty; should parse as false like \
-            the GlobalArgs bools (parse_bool_flag treats empty as unset/false)"]
 fn env_socket_vendor_revert_empty_should_parse_as_false() {
     let a = parse_vendor_with_env(&[("SOCKET_VENDOR_REVERT", "")], &[])
         .expect("an exported-but-empty bool env var must not abort the parse");

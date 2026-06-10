@@ -49,7 +49,7 @@ pub struct VendorArgs {
         long,
         env = "SOCKET_FORCE",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub force: bool,
 
@@ -59,7 +59,7 @@ pub struct VendorArgs {
         long = "revert",
         env = "SOCKET_VENDOR_REVERT",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub revert: bool,
 
