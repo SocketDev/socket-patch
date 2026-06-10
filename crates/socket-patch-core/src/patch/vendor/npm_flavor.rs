@@ -31,6 +31,8 @@ pub enum NpmLockFlavor {
     PackageLock,
     /// `yarn.lock` with the `# yarn lockfile v1` header (yarn classic).
     YarnClassic,
+    /// `yarn.lock` with a `__metadata:` key (yarn berry, node-modules linker).
+    YarnBerry,
     /// `pnpm-lock.yaml`, lockfileVersion 9.0 (pnpm >= 9).
     Pnpm,
     /// `bun.lock` (bun's text lockfile).
@@ -43,6 +45,7 @@ impl NpmLockFlavor {
         match self {
             NpmLockFlavor::PackageLock => "package-lock",
             NpmLockFlavor::YarnClassic => "yarn-classic",
+            NpmLockFlavor::YarnBerry => "yarn-berry",
             NpmLockFlavor::Pnpm => "pnpm",
             NpmLockFlavor::Bun => "bun",
         }
@@ -136,10 +139,9 @@ pub async fn detect_npm_lock_flavor(
             break 'flavor NpmLockFlavor::Pnpm;
         }
 
-        // 4. yarn: classic v1 vs berry, decided by content.
+        // 4. yarn: classic v1 vs berry (node-modules linker), decided by content.
         if exists("yarn.lock").await {
-            sniff_yarn_lock(project_root).await?;
-            break 'flavor NpmLockFlavor::YarnClassic;
+            break 'flavor sniff_yarn_lock(project_root).await?;
         }
 
         // 5. npm (npm_lock itself prefers the shrinkwrap when both exist).
@@ -224,7 +226,7 @@ async fn sniff_pnpm_lock(project_root: &Path) -> Result<(), (&'static str, Strin
 /// `__metadata:` key; classic v1 locks carry the `# yarn lockfile v1`
 /// comment header. Berry wins the check — a berry lock must never be
 /// mistaken for classic.
-async fn sniff_yarn_lock(project_root: &Path) -> Result<(), (&'static str, String)> {
+async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
     let text = tokio::fs::read_to_string(project_root.join("yarn.lock"))
         .await
         .map_err(|e| {
@@ -234,18 +236,16 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<(), (&'static str, Strin
             )
         })?;
     let head: Vec<&str> = text.lines().take(YARN_SNIFF_HEAD_LINES).collect();
+    // Berry wins the check (it must never be mistaken for classic). The
+    // node-modules linker keeps packages on disk for staging, and berry's
+    // cache-zip checksum is reproducible from our tarball (berry_zip), so the
+    // backend can wire it; PnP (caught earlier by the `.pnp.*` markers) is the
+    // only berry layout vendor refuses.
     if head.iter().any(|l| l.starts_with("__metadata:")) {
-        return Err((
-            "vendor_yarn_berry_unsupported",
-            "yarn.lock is a yarn berry (v2+) lockfile (top-level `__metadata:` key); even \
-             with the node-modules linker, berry verifies installs against its cache zips' \
-             checksums, so a rewired tarball would fail validation — use `yarn patch <pkg>` \
-             instead"
-                .to_string(),
-        ));
+        return Ok(NpmLockFlavor::YarnBerry);
     }
     if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {
-        return Ok(());
+        return Ok(NpmLockFlavor::YarnClassic);
     }
     Err((
         "vendor_lockfile_version_unsupported",
@@ -255,10 +255,11 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<(), (&'static str, Strin
     ))
 }
 
-/// Vendor one npm package through whichever flavor backend serves this
-/// project. Probe refusals surface verbatim; flavors without a backend yet
-/// refuse with the manager's native patch flow (behavior-equivalent to the
-/// CLI's former layout gate).
+/// Vendor one npm package through whichever lockfile-flavor backend serves
+/// this project (package-lock / yarn classic / yarn berry node-modules /
+/// pnpm / bun). Probe refusals (PnP, bun.lockb, unsupported lock versions)
+/// surface verbatim; the detected flavor is stamped onto the ledger entry so
+/// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_npm_any(
     purl: &str,
@@ -274,53 +275,54 @@ pub async fn vendor_npm_any(
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
-    match flavor {
+    let mut outcome = match flavor {
         NpmLockFlavor::PackageLock => {
-            let mut outcome = npm_lock::vendor_npm(
-                purl,
-                installed_dir,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
+            npm_lock::vendor_npm(
+                purl, installed_dir, project_root, record, sources, vendored_at, dry_run, force,
             )
-            .await;
-            if let VendorOutcome::Done { entry, warnings, .. } = &mut outcome {
-                // Probe warnings precede the backend's own (the probe ran
-                // first); the ledger records which flavor wired the entry so
-                // revert can route — and fail closed on builds without the
-                // matching backend.
-                let mut merged = probe_warnings;
-                merged.append(warnings);
-                *warnings = merged;
-                if let Some(entry) = entry {
-                    entry.flavor = Some(flavor.as_str().to_string());
-                }
-            }
-            outcome
+            .await
         }
-        NpmLockFlavor::YarnClassic | NpmLockFlavor::Pnpm | NpmLockFlavor::Bun => {
-            // No wiring backend yet: refuse pointing at the manager's native
-            // patch flow. These arms are the seams the yarn-classic / pnpm /
-            // bun backends will replace.
-            let native = match flavor {
-                NpmLockFlavor::YarnClassic => "yarn patch <pkg>",
-                NpmLockFlavor::Pnpm => "pnpm patch <pkg>",
-                NpmLockFlavor::Bun => "bun patch <pkg>",
-                NpmLockFlavor::PackageLock => unreachable!("handled above"),
-            };
-            VendorOutcome::Refused {
-                code: "vendor_pkg_manager_unsupported",
-                detail: format!(
-                    "this project's installs are driven by a {} lockfile; socket-patch \
-                     vendor only rewrites package-lock.json — use `{native}` instead",
-                    flavor.as_str()
-                ),
-            }
+        NpmLockFlavor::YarnClassic => {
+            super::yarn_classic_lock::vendor_yarn_classic(
+                purl, installed_dir, project_root, record, sources, vendored_at, dry_run, force,
+            )
+            .await
+        }
+        NpmLockFlavor::YarnBerry => {
+            super::yarn_berry_lock::vendor_yarn_berry(
+                purl, installed_dir, project_root, record, sources, vendored_at, dry_run, force,
+            )
+            .await
+        }
+        NpmLockFlavor::Pnpm => {
+            super::pnpm_lock::vendor_pnpm(
+                purl, installed_dir, project_root, record, sources, vendored_at, dry_run, force,
+            )
+            .await
+        }
+        NpmLockFlavor::Bun => {
+            super::bun_lock::vendor_bun(
+                purl, installed_dir, project_root, record, sources, vendored_at, dry_run, force,
+            )
+            .await
+        }
+    };
+    // Probe warnings (e.g. a sibling lockfile that will install UNPATCHED
+    // bytes) precede the backend's own; the ledger records which flavor wired
+    // the entry so revert routes — and fails closed on a build lacking the
+    // backend. Each backend already self-stamps `flavor`; we re-assert it from
+    // the probe for belt-and-braces (the values are identical).
+    if let VendorOutcome::Done { entry, warnings, .. } = &mut outcome {
+        if !probe_warnings.is_empty() {
+            let mut merged = probe_warnings;
+            merged.append(warnings);
+            *warnings = merged;
+        }
+        if let Some(entry) = entry {
+            entry.flavor = Some(flavor.as_str().to_string());
         }
     }
+    outcome
 }
 
 /// Revert one recorded npm vendor entry through the flavor that wired it.
@@ -334,6 +336,14 @@ pub async fn revert_npm_any(
 ) -> RevertOutcome {
     match entry.flavor.as_deref() {
         None | Some("package-lock") => npm_lock::revert_npm(entry, project_root, dry_run).await,
+        Some("yarn-classic") => {
+            super::yarn_classic_lock::revert_yarn_classic(entry, project_root, dry_run).await
+        }
+        Some("yarn-berry") => {
+            super::yarn_berry_lock::revert_yarn_berry(entry, project_root, dry_run).await
+        }
+        Some("pnpm") => super::pnpm_lock::revert_pnpm(entry, project_root, dry_run).await,
+        Some("bun") => super::bun_lock::revert_bun(entry, project_root, dry_run).await,
         Some(other) => RevertOutcome::failed(format!(
             "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
              socket-patch and re-run"
@@ -442,12 +452,13 @@ mod tests {
         let (flavor, _) = detect(tmp.path()).await.unwrap();
         assert_eq!(flavor, NpmLockFlavor::YarnClassic);
 
+        // A berry (node-modules) lock now routes to the YarnBerry backend
+        // (cache-zip checksum is reproducible from our tarball — berry_zip).
+        // Only PnP (`.pnp.*` markers, caught earlier) stays refused.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "yarn.lock", YARN_BERRY).await;
-        let (code, detail) = detect(tmp.path()).await.unwrap_err();
-        assert_eq!(code, "vendor_yarn_berry_unsupported");
-        assert!(detail.contains("yarn patch"), "{detail}");
-        assert!(detail.contains("checksum"), "must explain the cache-zip checksum problem: {detail}");
+        let (flavor, _) = detect(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry);
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "yarn.lock", "garbage: true\n").await;
@@ -599,21 +610,25 @@ mod tests {
         assert!(lock.contains(&format!("file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")));
     }
 
-    /// The unwired-flavor arms refuse with the old CLI gate's stable code,
-    /// naming the manager's native patch flow, and write nothing.
+    /// A yarn.lock now ROUTES to the yarn-classic backend (no longer the old
+    /// `vendor_pkg_manager_unsupported` gate). With a header-only lock that
+    /// has no matching block, the backend's own `vendor_lock_entry_not_found`
+    /// proves the dispatch reached it — and nothing is written.
     #[tokio::test]
-    async fn unwired_flavor_arm_refuses_with_native_pointer() {
+    async fn yarn_lock_routes_to_the_backend_not_the_old_gate() {
         let (tmp, record) = npm_project().await;
         tokio::fs::remove_file(tmp.path().join("package-lock.json")).await.unwrap();
         touch(tmp.path(), "yarn.lock", YARN_V1).await;
 
         let outcome = vendor_any(tmp.path(), &record).await;
-        let VendorOutcome::Refused { code, detail } = outcome else {
-            panic!("expected Refused, got {outcome:?}");
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("expected the backend's Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_pkg_manager_unsupported");
-        assert!(detail.contains("yarn-classic"), "{detail}");
-        assert!(detail.contains("yarn patch <pkg>"), "{detail}");
+        assert_eq!(
+            code, "vendor_lock_entry_not_found",
+            "yarn.lock must reach the yarn-classic backend, not the removed gate"
+        );
+        assert_ne!(code, "vendor_pkg_manager_unsupported");
         assert!(!tmp.path().join(".socket/vendor").exists(), "refusal writes nothing");
     }
 
@@ -633,7 +648,7 @@ mod tests {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
-            flavor: Some("yarn-classic".into()),
+            flavor: Some("future-pm".into()),
             uv: None,
             pnpm: None,
             poetry: None,
@@ -641,17 +656,24 @@ mod tests {
             pipenv: None,
         };
 
-        // Unknown-to-this-build flavor: fail closed, name the flavor.
+        // A flavor this build has no backend for: fail closed, name it.
         let outcome = revert_npm_any(&entry, tmp.path(), false).await;
         assert!(!outcome.success);
-        assert!(outcome.error.as_deref().unwrap().contains("yarn-classic"));
+        assert!(outcome.error.as_deref().unwrap().contains("future-pm"));
 
-        // None and "package-lock" both route to npm_lock::revert_npm (which
-        // succeeds trivially here: no wiring records, nothing on disk).
-        for flavor in [None, Some("package-lock".to_string())] {
-            entry.flavor = flavor;
+        // Every known flavor routes to its backend; with no wiring records and
+        // nothing on disk each reverts trivially (None = a pre-flavor ledger).
+        for flavor in [
+            None,
+            Some("package-lock".to_string()),
+            Some("yarn-classic".to_string()),
+            Some("yarn-berry".to_string()),
+            Some("pnpm".to_string()),
+            Some("bun".to_string()),
+        ] {
+            entry.flavor = flavor.clone();
             let outcome = revert_npm_any(&entry, tmp.path(), false).await;
-            assert!(outcome.success, "{:?}", outcome.error);
+            assert!(outcome.success, "flavor {flavor:?}: {:?}", outcome.error);
         }
     }
 }

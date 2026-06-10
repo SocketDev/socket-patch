@@ -10,17 +10,23 @@ use std::path::Path;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::PatchSources;
+use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 
 use super::path::vendor_uuid_dir_rel;
+use super::pypi_pdm::{PdmProject, PdmTarget};
+use super::pypi_pipenv::{PipenvProject, PipenvTarget};
+use super::pypi_poetry::{PoetryProject, PoetryTarget};
 use super::pypi_requirements::{preflight_requirements, revert_requirements, wire_requirements};
 use super::pypi_uv::{
     check_target_guards, classify_dependency, load_uv_project, revert_uv, wire_uv, UvDepClass,
     UvProject,
 };
 use super::pypi_wheel::{build_patched_wheel, locate_installed_dist, wheel_file_name};
-use super::state::{write_marker, VendorArtifact, VendorEntry, VendorMarker};
+use super::state::{
+    write_marker, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
+    VendorMarker,
+};
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
 /// Which wiring backend serves this project.
@@ -207,10 +213,60 @@ fn has_table(content: &str, prefix: &str) -> bool {
     })
 }
 
-/// Per-flavor pre-flight result carried into the wiring step.
+/// Per-flavor pre-flight result carried into the wiring step (the loaded
+/// project is reused so the lock is parsed once).
 enum WiringPlan {
     Uv(Box<UvProject>, UvDepClass),
     Requirements,
+    Poetry(Box<PoetryProject>),
+    Pdm(Box<PdmProject>),
+    Pipenv(Box<PipenvProject>),
+}
+
+/// Which `VendorEntry` meta slot a flavor's wiring produced.
+enum MetaSlot {
+    Uv(Option<UvMeta>),
+    Poetry(PoetryMeta),
+    Pdm(PdmMeta),
+    Pipenv(PipenvMeta),
+    None,
+}
+
+/// Build the synthesized AlreadyPatched outcome for an in-sync re-run: the
+/// artifact + lockfile already point at THIS patch uuid, so nothing is built
+/// or recorded (the first run's ledger entry holds the only copy of the
+/// originals). Mirrors the npm flavors' in-sync hot path.
+fn in_sync_outcome(
+    base_purl: &str,
+    record: &PatchRecord,
+    warnings: Vec<VendorWarning>,
+) -> VendorOutcome {
+    let files_verified = record
+        .files
+        .keys()
+        .map(|f| VerifyResult {
+            file: f.clone(),
+            status: VerifyStatus::AlreadyPatched,
+            message: None,
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        })
+        .collect();
+    VendorOutcome::Done {
+        result: ApplyResult {
+            package_key: base_purl.to_string(),
+            package_path: String::new(),
+            success: true,
+            files_verified,
+            files_patched: Vec::new(),
+            applied_via: std::collections::HashMap::new(),
+            error: None,
+            sidecar: None,
+        },
+        entry: None,
+        warnings,
+    }
 }
 
 /// Vendor one pypi package: route the flavor, pre-flight every guard, build
@@ -282,31 +338,50 @@ pub async fn vendor_pypi(
             }
             WiringPlan::Requirements
         }
-        // Detected but not yet wired: the backends land behind these arms
-        // (spike-verified GO — see spikes/PHASE0-V2-FINDINGS.txt).
         PypiFlavor::Poetry => {
-            return VendorOutcome::Refused {
-                code: "pypi_poetry_unsupported",
-                detail: format!(
-                    "Poetry projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
-                ),
+            let project = match super::pypi_poetry::load_poetry_project(project_root).await {
+                Ok(p) => p,
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
+            };
+            match super::pypi_poetry::check_target_guards(
+                &project,
+                &canon_name,
+                version,
+                &record.uuid,
+            ) {
+                Ok(PoetryTarget::Fresh) => {}
+                Ok(PoetryTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
+            warnings.extend(project.warnings.iter().cloned());
+            WiringPlan::Poetry(Box::new(project))
         }
         PypiFlavor::Pdm => {
-            return VendorOutcome::Refused {
-                code: "pypi_pdm_unsupported",
-                detail: format!(
-                    "PDM projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
-                ),
+            let project = match super::pypi_pdm::load_pdm_project(project_root).await {
+                Ok(p) => p,
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
+            };
+            match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
+            {
+                Ok(PdmTarget::Fresh) => {}
+                Ok(PdmTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
+            warnings.extend(project.warnings.iter().cloned());
+            WiringPlan::Pdm(Box::new(project))
         }
         PypiFlavor::Pipenv => {
-            return VendorOutcome::Refused {
-                code: "pypi_pipenv_unsupported",
-                detail: format!(
-                    "Pipenv projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
-                ),
+            let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
+                Ok(p) => p,
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
+            };
+            match super::pypi_pipenv::check_target_guards(&project, &canon_name, &record.uuid) {
+                Ok(PipenvTarget::Fresh) => {}
+                Ok(PipenvTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
+            warnings.extend(project.warnings.iter().cloned());
+            WiringPlan::Pipenv(Box::new(project))
         }
     };
 
@@ -409,7 +484,7 @@ pub async fn vendor_pypi(
 
     // Wiring LAST. On failure the wheel artifact is swept back out so a
     // failed vendor leaves no committed residue.
-    let wired = match plan {
+    let wired: Result<(Vec<_>, MetaSlot), (&'static str, String)> = match plan {
         WiringPlan::Uv(project, class) => wire_uv(
             &project,
             project_root,
@@ -421,7 +496,7 @@ pub async fn vendor_pypi(
             class,
         )
         .await
-        .map(|(wiring, meta)| (wiring, Some(meta))),
+        .map(|(wiring, meta)| (wiring, MetaSlot::Uv(Some(meta)))),
         WiringPlan::Requirements => wire_requirements(
             project_root,
             &canon_name,
@@ -430,9 +505,43 @@ pub async fn vendor_pypi(
             &artifact.sha256_hex,
         )
         .await
-        .map(|wiring| (wiring, None)),
+        .map(|wiring| (wiring, MetaSlot::None)),
+        WiringPlan::Poetry(project) => super::pypi_poetry::wire_poetry(
+            &project,
+            project_root,
+            &canon_name,
+            version,
+            &rel_wheel,
+            &wheel_name,
+            &artifact.sha256_hex,
+            &record.uuid,
+        )
+        .await
+        .map(|(wiring, meta)| (wiring, MetaSlot::Poetry(meta))),
+        WiringPlan::Pdm(project) => super::pypi_pdm::wire_pdm(
+            &project,
+            project_root,
+            &canon_name,
+            version,
+            &rel_wheel,
+            &wheel_name,
+            &artifact.sha256_hex,
+            &record.uuid,
+        )
+        .await
+        .map(|(wiring, meta)| (wiring, MetaSlot::Pdm(meta))),
+        WiringPlan::Pipenv(project) => super::pypi_pipenv::wire_pipenv(
+            &project,
+            project_root,
+            &canon_name,
+            &rel_wheel,
+            &artifact.sha256_hex,
+            &record.uuid,
+        )
+        .await
+        .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
     };
-    let (wiring, uv_meta) = match wired {
+    let (wiring, meta) = match wired {
         Ok(pair) => pair,
         Err((code, detail)) => {
             let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
@@ -447,7 +556,7 @@ pub async fn vendor_pypi(
         }
     };
 
-    let entry = VendorEntry {
+    let mut entry = VendorEntry {
         ecosystem: "pypi".to_string(),
         base_purl: base.to_string(),
         uuid: record.uuid.clone(),
@@ -461,12 +570,19 @@ pub async fn vendor_pypi(
         lock: None,
         took_over_go_patches: false,
         flavor: Some(flavor.as_str().to_string()),
-        uv: uv_meta,
+        uv: None,
         pnpm: None,
         poetry: None,
         pdm: None,
         pipenv: None,
     };
+    match meta {
+        MetaSlot::Uv(m) => entry.uv = m,
+        MetaSlot::Poetry(m) => entry.poetry = Some(m),
+        MetaSlot::Pdm(m) => entry.pdm = Some(m),
+        MetaSlot::Pipenv(m) => entry.pipenv = Some(m),
+        MetaSlot::None => {}
+    }
     VendorOutcome::Done {
         result,
         entry: Some(entry),
@@ -481,6 +597,9 @@ pub async fn revert_pypi(entry: &VendorEntry, project_root: &Path, dry_run: bool
     let mut outcome = match entry.flavor.as_deref() {
         Some("uv") => revert_uv(entry, project_root, dry_run).await,
         Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
+        Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
+        Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
+        Some("pipenv") => super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await,
         other => {
             return RevertOutcome::failed(format!(
                 "unknown pypi vendor flavor {other:?}; cannot revert"
