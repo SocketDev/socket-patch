@@ -171,7 +171,11 @@ pub async fn vendor_pnpm(
     };
     let Some(staged) = staged else {
         // Failed patch or dry run: wiring never ran, project byte-untouched.
-        return VendorOutcome::Done { result, entry: None, warnings };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
     };
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
@@ -223,7 +227,11 @@ pub async fn vendor_pnpm(
         // project is in sync. The tarball re-pack above was byte-identical
         // by determinism; synthesize AlreadyPatched and record nothing (the
         // existing ledger entry stays authoritative).
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return VendorOutcome::Done {
             result: synthesized_result(purl, &project_root.join(&rel_tgz), verified, true, None),
             entry: None,
@@ -282,12 +290,19 @@ pub async fn vendor_pnpm(
         took_over_go_patches: false,
         flavor: Some("pnpm".to_string()),
         uv: None,
-        pnpm: Some(PnpmMeta { created_overrides_table, created_pnpm_table }),
+        pnpm: Some(PnpmMeta {
+            created_overrides_table,
+            created_pnpm_table,
+        }),
         poetry: None,
         pdm: None,
         pipenv: None,
     };
-    VendorOutcome::Done { result, entry: Some(entry), warnings }
+    VendorOutcome::Done {
+        result,
+        entry: Some(entry),
+        warnings,
+    }
 }
 
 /// Undo one pnpm-vendored package: restore the recorded pair fragments and
@@ -316,7 +331,10 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         if !REVERT_ALLOWLIST.contains(&rec.file.as_str()) {
             outcome.warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("ignoring wiring record for non-allowlisted file `{}`", rec.file),
+                format!(
+                    "ignoring wiring record for non-allowlisted file `{}`",
+                    rec.file
+                ),
             ));
             continue;
         }
@@ -374,7 +392,13 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         match rec.file.as_str() {
             PNPM_LOCK => {
                 if let Some(lines) = lock_lines.as_mut() {
-                    revert_lock_record(lines, rec, &entry.uuid, &mut lock_dirty, &mut outcome.warnings);
+                    revert_lock_record(
+                        lines,
+                        rec,
+                        &entry.uuid,
+                        &mut lock_dirty,
+                        &mut outcome.warnings,
+                    );
                 }
             }
             PACKAGE_JSON => {
@@ -396,16 +420,20 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
         if let Some(obj) = doc.as_object_mut() {
             if let Some(pnpm_tbl) = obj.get_mut("pnpm").and_then(Value::as_object_mut) {
                 if created_overrides
-                    && pnpm_tbl.get("overrides").and_then(Value::as_object).is_some_and(
-                        serde_json::Map::is_empty,
-                    )
+                    && pnpm_tbl
+                        .get("overrides")
+                        .and_then(Value::as_object)
+                        .is_some_and(serde_json::Map::is_empty)
                 {
                     pnpm_tbl.shift_remove("overrides");
                     pkg_dirty = true;
                 }
             }
             if created_pnpm
-                && obj.get("pnpm").and_then(Value::as_object).is_some_and(serde_json::Map::is_empty)
+                && obj
+                    .get("pnpm")
+                    .and_then(Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
             {
                 obj.shift_remove("pnpm");
                 pkg_dirty = true;
@@ -480,7 +508,11 @@ impl EditCtx<'_> {
         if importer == "." {
             self.spec.to_string()
         } else {
-            format!("file:{}{}", "../".repeat(importer.split('/').count()), self.rel_tgz)
+            format!(
+                "file:{}{}",
+                "../".repeat(importer.split('/').count()),
+                self.rel_tgz
+            )
         }
     }
 }
@@ -559,11 +591,7 @@ fn check_pkg_override_conflict(pkg: &Value, name: &str, our_key: &str) -> Result
 
 /// Same conflict check against the lock's own `overrides:` section (a
 /// desynced lock-side override would be silently clobbered otherwise).
-fn check_lock_override_conflict(
-    lines: &[String],
-    name: &str,
-    our_key: &str,
-) -> Result<(), String> {
+fn check_lock_override_conflict(lines: &[String], name: &str, our_key: &str) -> Result<(), String> {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
         return Ok(());
     };
@@ -584,7 +612,9 @@ fn check_lock_override_conflict(
 /// the registry `name@version` key, or our own rekeyed `name@file:` key
 /// (the in-sync / stale-uuid re-run)?
 fn lock_has_target_package(lines: &[String], name: &str, version: &str) -> bool {
-    let Some((start, end)) = section_bounds(lines, "packages") else { return false };
+    let Some((start, end)) = section_bounds(lines, "packages") else {
+        return false;
+    };
     let reg_key = format!("{name}@{version}");
     let ours_prefix = format!("{name}@file:");
     let mut i = start + 1;
@@ -613,7 +643,9 @@ fn apply_pkg_override(
     spec: &str,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<(bool, bool, bool), String> {
-    let obj = pkg.as_object_mut().ok_or("package.json root is not an object")?;
+    let obj = pkg
+        .as_object_mut()
+        .ok_or("package.json root is not an object")?;
     let created_pnpm_table = !obj.contains_key("pnpm");
     let pnpm_tbl = obj
         .entry("pnpm")
@@ -638,7 +670,11 @@ fn apply_pkg_override(
     wiring.push(WiringRecord {
         file: PACKAGE_JSON.to_string(),
         kind: KIND_PKG_OVERRIDE.to_string(),
-        action: if was_ours { WiringAction::Rewritten } else { WiringAction::Added },
+        action: if was_ours {
+            WiringAction::Rewritten
+        } else {
+            WiringAction::Added
+        },
         key: Some(our_key.to_string()),
         original: None, // Added has none; Rewritten-over-ours records none by design
         new: Some(Value::String(spec.to_string())),
@@ -678,7 +714,11 @@ fn edit_overrides(
             }
             // Ours with a stale uuid (conflict pre-flight proved it).
             lines[i] = entry_line;
-            wiring.push(overrides_record(&our_key, ctx.spec, WiringAction::Rewritten));
+            wiring.push(overrides_record(
+                &our_key,
+                ctx.spec,
+                WiringAction::Rewritten,
+            ));
             return Ok(true);
         }
         lines.insert(last_entry + 1, entry_line);
@@ -743,7 +783,9 @@ fn edit_importers(
             let mut ver_idx = None;
             let mut f = k + 1;
             while f < importer.end {
-                let Some((field, _frepr, fval)) = parse_key_line(&lines[f], 8) else { break };
+                let Some((field, _frepr, fval)) = parse_key_line(&lines[f], 8) else {
+                    break;
+                };
                 match field.as_str() {
                     "specifier" => spec_idx = Some((f, fval)),
                     "version" => ver_idx = Some((f, fval)),
@@ -752,8 +794,8 @@ fn edit_importers(
                 f += 1;
             }
             if let (Some((si, old_spec)), Some((vi, old_ver))) = (spec_idx, ver_idx) {
-                let target = old_ver == ctx.version
-                    || (old_ver != ctx.spec && ctx.is_ours(&old_ver));
+                let target =
+                    old_ver == ctx.version || (old_ver != ctx.spec && ctx.is_ours(&old_ver));
                 if target {
                     let was_ours = ctx.is_ours(&old_ver);
                     let importer_spec = ctx.spec_for_importer(&importer_key);
@@ -812,16 +854,20 @@ fn edit_packages(
             continue;
         }
         let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
-        let expected_resolution =
-            format!("    resolution: {{integrity: {}, tarball: {}}}", ctx.integrity, ctx.spec);
-        if block.key == new_key
-            && original_lines.iter().any(|l| l == &expected_resolution)
-        {
+        let expected_resolution = format!(
+            "    resolution: {{integrity: {}, tarball: {}}}",
+            ctx.integrity, ctx.spec
+        );
+        if block.key == new_key && original_lines.iter().any(|l| l == &expected_resolution) {
             return Ok(false); // in sync (only the exact version moves: done)
         }
         // Rebuild the block (registry → ours, or stale-ours → current).
         let mut new_lines = Vec::with_capacity(original_lines.len() + 1);
-        new_lines.push(format!("  {}:{}", yaml_key_like(&new_key, &block.repr), block.rest_suffix()));
+        new_lines.push(format!(
+            "  {}:{}",
+            yaml_key_like(&new_key, &block.repr),
+            block.rest_suffix()
+        ));
         let mut replaced_resolution = false;
         for line in &original_lines[1..] {
             if line.trim_start().starts_with("resolution:") {
@@ -838,7 +884,10 @@ fn edit_packages(
             }
         }
         if !replaced_resolution {
-            return Err(format!("packages entry `{}` has no resolution line", block.key));
+            return Err(format!(
+                "packages entry `{}` has no resolution line",
+                block.key
+            ));
         }
         let header = block.header;
         let block_end = block.end;
@@ -848,7 +897,11 @@ fn edit_packages(
             kind: KIND_LOCK_PACKAGE.to_string(),
             action: WiringAction::Rewritten,
             key: Some(block.key.clone()),
-            original: if is_ours_key { None } else { Some(lines_value(&original_lines)) },
+            original: if is_ours_key {
+                None
+            } else {
+                Some(lines_value(&original_lines))
+            },
             new: Some(lines_value(&new_lines)),
         });
         return Ok(true);
@@ -887,7 +940,11 @@ fn edit_snapshot_rekey(
         }
         let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
         let mut new_lines = original_lines.clone();
-        new_lines[0] = format!("  {}:{}", yaml_key_like(&new_key, &block.repr), block.rest_suffix());
+        new_lines[0] = format!(
+            "  {}:{}",
+            yaml_key_like(&new_key, &block.repr),
+            block.rest_suffix()
+        );
         let header = block.header;
         let block_end = block.end;
         lines.splice(header..block_end, new_lines.clone());
@@ -896,7 +953,11 @@ fn edit_snapshot_rekey(
             kind: KIND_LOCK_SNAPSHOT.to_string(),
             action: WiringAction::Rewritten,
             key: Some(block.key.clone()),
-            original: if is_ours_key { None } else { Some(lines_value(&original_lines)) },
+            original: if is_ours_key {
+                None
+            } else {
+                Some(lines_value(&original_lines))
+            },
             new: Some(lines_value(&new_lines)),
         });
         return Ok(true);
@@ -922,12 +983,13 @@ fn edit_snapshot_refs(
     let mut i = start + 1;
     while let Some(block) = next_block(lines, i, end) {
         for line in lines[block.header + 1..block.end].iter_mut() {
-            let Some((dep, _repr, rest)) = parse_key_line(line, 6) else { continue };
+            let Some((dep, _repr, rest)) = parse_key_line(line, 6) else {
+                continue;
+            };
             if dep != ctx.name {
                 continue;
             }
-            let target =
-                rest == ctx.version || (rest != ctx.spec && ctx.is_ours(&rest));
+            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(&rest));
             if !target {
                 continue;
             }
@@ -938,7 +1000,11 @@ fn edit_snapshot_refs(
                 kind: KIND_LOCK_SNAPSHOT_REF.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{}|{dep}", block.key)),
-                original: if was_ours { None } else { Some(Value::String(rest.clone())) },
+                original: if was_ours {
+                    None
+                } else {
+                    Some(Value::String(rest.clone()))
+                },
                 new: Some(Value::String(ctx.spec.to_string())),
             });
             changed = true;
@@ -960,12 +1026,17 @@ fn revert_pkg_record(
     if rec.kind != KIND_PKG_OVERRIDE {
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
-            format!("unknown wiring kind `{}` for {PACKAGE_JSON}; left alone", rec.kind),
+            format!(
+                "unknown wiring kind `{}` for {PACKAGE_JSON}; left alone",
+                rec.kind
+            ),
         ));
         return;
     }
     let Some(key) = rec.key.as_deref() else {
-        warnings.push(drifted("package.json override record has no key; left alone"));
+        warnings.push(drifted(
+            "package.json override record has no key; left alone",
+        ));
         return;
     };
     let overrides = doc
@@ -973,7 +1044,9 @@ fn revert_pkg_record(
         .and_then(|p| p.get_mut("overrides"))
         .and_then(Value::as_object_mut);
     let Some(overrides) = overrides else {
-        warnings.push(drifted(format!("pnpm.overrides is gone; `{key}` not removed")));
+        warnings.push(drifted(format!(
+            "pnpm.overrides is gone; `{key}` not removed"
+        )));
         return;
     };
     let live = overrides.get(key).and_then(Value::as_str);
@@ -999,23 +1072,19 @@ fn revert_lock_record(
     warnings: &mut Vec<VendorWarning>,
 ) {
     let Some(key) = rec.key.as_deref() else {
-        warnings.push(drifted(format!("wiring record in {PNPM_LOCK} has no key; left alone")));
+        warnings.push(drifted(format!(
+            "wiring record in {PNPM_LOCK} has no key; left alone"
+        )));
         return;
     };
     match rec.kind.as_str() {
         KIND_LOCK_OVERRIDES => revert_overrides_line(lines, rec, key, entry_uuid, dirty, warnings),
-        KIND_LOCK_IMPORTER_DEP => {
-            revert_importer_dep(lines, rec, key, entry_uuid, dirty, warnings)
-        }
-        KIND_LOCK_PACKAGE => {
-            revert_block(lines, rec, key, "packages", entry_uuid, dirty, warnings)
-        }
+        KIND_LOCK_IMPORTER_DEP => revert_importer_dep(lines, rec, key, entry_uuid, dirty, warnings),
+        KIND_LOCK_PACKAGE => revert_block(lines, rec, key, "packages", entry_uuid, dirty, warnings),
         KIND_LOCK_SNAPSHOT => {
             revert_block(lines, rec, key, "snapshots", entry_uuid, dirty, warnings)
         }
-        KIND_LOCK_SNAPSHOT_REF => {
-            revert_snapshot_ref(lines, rec, key, entry_uuid, dirty, warnings)
-        }
+        KIND_LOCK_SNAPSHOT_REF => revert_snapshot_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
         ))),
@@ -1031,7 +1100,9 @@ fn revert_overrides_line(
     warnings: &mut Vec<VendorWarning>,
 ) {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
-        warnings.push(drifted(format!("overrides section is gone; `{key}` not removed")));
+        warnings.push(drifted(format!(
+            "overrides section is gone; `{key}` not removed"
+        )));
         return;
     };
     // First pass: locate our line + count the other entries (the section is
@@ -1080,11 +1151,15 @@ fn revert_importer_dep(
     warnings: &mut Vec<VendorWarning>,
 ) {
     let Some((importer_key, dep)) = key.rsplit_once('|') else {
-        warnings.push(drifted(format!("malformed importer-dep key `{key}`; left alone")));
+        warnings.push(drifted(format!(
+            "malformed importer-dep key `{key}`; left alone"
+        )));
         return;
     };
     let Some((start, end)) = section_bounds(lines, "importers") else {
-        warnings.push(drifted("importers section is gone; nothing to restore".to_string()));
+        warnings.push(drifted(
+            "importers section is gone; nothing to restore".to_string(),
+        ));
         return;
     };
     let mut i = start + 1;
@@ -1107,7 +1182,9 @@ fn revert_importer_dep(
             let mut ver_idx = None;
             let mut f = k + 1;
             while f < importer.end {
-                let Some((field, _fr, fval)) = parse_key_line(&lines[f], 8) else { break };
+                let Some((field, _fr, fval)) = parse_key_line(&lines[f], 8) else {
+                    break;
+                };
                 match field.as_str() {
                     "specifier" => spec_idx = Some(f),
                     "version" => ver_idx = Some((f, fval)),
@@ -1115,7 +1192,9 @@ fn revert_importer_dep(
                 }
                 f += 1;
             }
-            let (Some(si), Some((vi, live_ver))) = (spec_idx, ver_idx) else { break };
+            let (Some(si), Some((vi, live_ver))) = (spec_idx, ver_idx) else {
+                break;
+            };
             let new_ver = rec
                 .new
                 .as_ref()
@@ -1141,7 +1220,9 @@ fn revert_importer_dep(
                 original.get("specifier").and_then(Value::as_str),
                 original.get("version").and_then(Value::as_str),
             ) else {
-                warnings.push(drifted(format!("importer dep `{key}` original is malformed")));
+                warnings.push(drifted(format!(
+                    "importer dep `{key}` original is malformed"
+                )));
                 return;
             };
             lines[si] = format!("        specifier: {orig_spec}");
@@ -1151,7 +1232,9 @@ fn revert_importer_dep(
         }
         break;
     }
-    warnings.push(drifted(format!("importer dep `{key}` no longer exists; nothing to restore")));
+    warnings.push(drifted(format!(
+        "importer dep `{key}` no longer exists; nothing to restore"
+    )));
 }
 
 /// Restore a rekeyed packages/snapshots block: locate the block by the NEW
@@ -1168,17 +1251,21 @@ fn revert_block(
 ) {
     let new_lines = rec.new.as_ref().and_then(value_lines);
     let Some(new_lines) = new_lines else {
-        warnings.push(drifted(format!("record for `{key}` has no `new` fragment; left alone")));
+        warnings.push(drifted(format!(
+            "record for `{key}` has no `new` fragment; left alone"
+        )));
         return;
     };
-    let Some((new_key, _repr, _rest)) =
-        new_lines.first().and_then(|l| parse_key_line(l, 2))
-    else {
-        warnings.push(drifted(format!("record for `{key}` has a malformed fragment")));
+    let Some((new_key, _repr, _rest)) = new_lines.first().and_then(|l| parse_key_line(l, 2)) else {
+        warnings.push(drifted(format!(
+            "record for `{key}` has a malformed fragment"
+        )));
         return;
     };
     let Some((start, end)) = section_bounds(lines, section) else {
-        warnings.push(drifted(format!("{section} section is gone; `{key}` not restored")));
+        warnings.push(drifted(format!(
+            "{section} section is gone; `{key}` not restored"
+        )));
         return;
     };
     let mut i = start + 1;
@@ -1190,11 +1277,9 @@ fn revert_block(
         // Ours iff the live block is exactly what we wrote, or its key still
         // points into OUR uuid dir (a re-serialized but unmoved entry).
         let live: Vec<String> = lines[block.header..block.end].to_vec();
-        let key_is_ours = new_key
-            .rsplit_once("@file:")
-            .is_some_and(|(_, p)| {
-                parse_vendor_path(p).is_some_and(|v| v.eco == "npm" && v.uuid == entry_uuid)
-            });
+        let key_is_ours = new_key.rsplit_once("@file:").is_some_and(|(_, p)| {
+            parse_vendor_path(p).is_some_and(|v| v.eco == "npm" && v.uuid == entry_uuid)
+        });
         if live != new_lines && !key_is_ours {
             warnings.push(drifted(format!(
                 "{section} entry `{new_key}` was changed since vendoring; left alone"
@@ -1228,11 +1313,15 @@ fn revert_snapshot_ref(
     warnings: &mut Vec<VendorWarning>,
 ) {
     let Some((snapshot_key, dep)) = key.rsplit_once('|') else {
-        warnings.push(drifted(format!("malformed snapshot-ref key `{key}`; left alone")));
+        warnings.push(drifted(format!(
+            "malformed snapshot-ref key `{key}`; left alone"
+        )));
         return;
     };
     let Some((start, end)) = section_bounds(lines, "snapshots") else {
-        warnings.push(drifted("snapshots section is gone; nothing to restore".to_string()));
+        warnings.push(drifted(
+            "snapshots section is gone; nothing to restore".to_string(),
+        ));
         return;
     };
     let mut i = start + 1;
@@ -1242,13 +1331,14 @@ fn revert_snapshot_ref(
             continue;
         }
         for line in lines[block.header + 1..block.end].iter_mut() {
-            let Some((d, _repr, rest)) = parse_key_line(line, 6) else { continue };
+            let Some((d, _repr, rest)) = parse_key_line(line, 6) else {
+                continue;
+            };
             if d != dep {
                 continue;
             }
             let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
-                || parse_vendor_path(&rest)
-                    .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+                || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
             if !ours {
                 warnings.push(drifted(format!(
                     "snapshot ref `{key}` was re-resolved since vendoring ({rest}); left alone"
@@ -1267,7 +1357,9 @@ fn revert_snapshot_ref(
         }
         break;
     }
-    warnings.push(drifted(format!("snapshot ref `{key}` no longer exists; nothing to restore")));
+    warnings.push(drifted(format!(
+        "snapshot ref `{key}` no longer exists; nothing to restore"
+    )));
 }
 
 fn drifted(detail: impl Into<String>) -> VendorWarning {
@@ -1296,8 +1388,7 @@ async fn commit_pair(
                 // Unwind (best effort): a failure here leaves the desync pair
                 // anyway, but the lock write failing usually means the
                 // restore fails identically loudly.
-                let _ =
-                    atomic_write_bytes(&project_root.join(PACKAGE_JSON), original_pkg).await;
+                let _ = atomic_write_bytes(&project_root.join(PACKAGE_JSON), original_pkg).await;
             }
             return Err(format!(
                 "cannot write {PNPM_LOCK}: {e} ({PACKAGE_JSON} restored to its original bytes)"
@@ -1352,7 +1443,11 @@ struct YamlBlock {
 impl YamlBlock {
     /// The inline-rest suffix to re-emit after the (re)written key.
     fn rest_suffix(&self) -> String {
-        if self.rest.is_empty() { String::new() } else { format!(" {}", self.rest) }
+        if self.rest.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.rest)
+        }
     }
 }
 
@@ -1364,7 +1459,13 @@ fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
             while j < end && !lines[j].is_empty() && indent_of(&lines[j]) >= 4 {
                 j += 1;
             }
-            return Some(YamlBlock { header: i, end: j, key, repr, rest });
+            return Some(YamlBlock {
+                header: i,
+                end: j,
+                key,
+                repr,
+                rest,
+            });
         }
         i += 1;
     }
@@ -1417,7 +1518,11 @@ fn parse_key_line(line: &str, indent: usize) -> Option<(String, String, String)>
 /// pnpm quotes `@`-leading keys with single quotes; everything we write is
 /// otherwise bare.
 fn yaml_key(key: &str) -> String {
-    if key.starts_with('@') { format!("'{key}'") } else { key.to_string() }
+    if key.starts_with('@') {
+        format!("'{key}'")
+    } else {
+        key.to_string()
+    }
 }
 
 /// Re-spell `key` in the same quoting style as the original `repr`.
@@ -1434,8 +1539,12 @@ fn lines_value(lines: &[String]) -> Value {
 }
 
 fn value_lines(v: &Value) -> Option<Vec<String>> {
-    v.as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+    v.as_array().map(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 // ───────────────────────── small shared helpers ───────────────────────────
@@ -1729,12 +1838,16 @@ snapshots:
         }
 
         async fn read(&self, name: &str) -> String {
-            tokio::fs::read_to_string(self.root().join(name)).await.unwrap()
+            tokio::fs::read_to_string(self.root().join(name))
+                .await
+                .unwrap()
         }
 
         /// The actual SRI of the tarball our pack produced.
         async fn actual_integrity(&self) -> String {
-            let tgz = tokio::fs::read(self.root().join(self.rel_tgz())).await.unwrap();
+            let tgz = tokio::fs::read(self.root().join(self.rel_tgz()))
+                .await
+                .unwrap();
             format!(
                 "sha512-{}",
                 base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tgz))
@@ -1770,14 +1883,20 @@ snapshots:
         )
         .await
         .unwrap();
-        tokio::fs::write(installed.join("index.js"), ORIG_INDEX).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
 
         let blobs = root.join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX).await.unwrap();
+        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX)
+            .await
+            .unwrap();
 
-        tokio::fs::write(root.join(PACKAGE_JSON), pkg_json).await.unwrap();
+        tokio::fs::write(root.join(PACKAGE_JSON), pkg_json)
+            .await
+            .unwrap();
         tokio::fs::write(root.join(PNPM_LOCK), lock).await.unwrap();
 
         let mut files = HashMap::new();
@@ -1804,7 +1923,11 @@ snapshots:
         outcome: VendorOutcome,
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
-            VendorOutcome::Done { result, entry, warnings } => (result, entry, warnings),
+            VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } => (result, entry, warnings),
             VendorOutcome::Refused { code, detail } => {
                 panic!("expected Done, got Refused {code}: {detail}")
             }
@@ -1818,7 +1941,10 @@ snapshots:
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused {want_code}, got Done (success={})", result.success)
+                panic!(
+                    "expected Refused {want_code}, got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -1836,7 +1962,10 @@ snapshots:
         // Lock: byte-identical modulo the integrity (ours is recomputed from
         // the deterministic tarball we packed — never the spike's bytes).
         let actual = fx.actual_integrity().await;
-        assert_ne!(actual, SPIKE_INTEGRITY, "different tarballs, different hashes");
+        assert_ne!(
+            actual, SPIKE_INTEGRITY,
+            "different tarballs, different hashes"
+        );
         let expected_lock = P1_AFTER_LOCK.replace(SPIKE_INTEGRITY, &actual);
         assert_eq!(fx.read(PNPM_LOCK).await, expected_lock);
 
@@ -1844,7 +1973,10 @@ snapshots:
         assert_eq!(entry.flavor.as_deref(), Some("pnpm"));
         assert_eq!(
             entry.pnpm,
-            Some(PnpmMeta { created_overrides_table: true, created_pnpm_table: true })
+            Some(PnpmMeta {
+                created_overrides_table: true,
+                created_pnpm_table: true
+            })
         );
         assert_eq!(entry.artifact.path, fx.rel_tgz());
         let kinds: Vec<&str> = entry.wiring.iter().map(|r| r.kind.as_str()).collect();
@@ -1862,15 +1994,25 @@ snapshots:
             entry.wiring
         );
         // The transitive consumer snapshot-ref is keyed snapshot|dep.
-        let snap_ref = entry.wiring.iter().find(|r| r.kind == KIND_LOCK_SNAPSHOT_REF).unwrap();
-        assert_eq!(snap_ref.key.as_deref(), Some("consumer@file:consumer|left-pad"));
+        let snap_ref = entry
+            .wiring
+            .iter()
+            .find(|r| r.kind == KIND_LOCK_SNAPSHOT_REF)
+            .unwrap();
+        assert_eq!(
+            snap_ref.key.as_deref(),
+            Some("consumer@file:consumer|left-pad")
+        );
         assert_eq!(snap_ref.original, Some(Value::String("1.3.0".into())));
 
         // Scoping: the 1.2.0 sibling stayed registry (asserted by the byte
         // oracle above, re-asserted explicitly here).
         let lock = fx.read(PNPM_LOCK).await;
         assert!(lock.contains("  left-pad@1.2.0:\n    resolution: {integrity: sha512-OQadpCyF"));
-        assert!(lock.contains("        version: left-pad@1.2.0\n"), "aliased 1.2.0 importer untouched");
+        assert!(
+            lock.contains("        version: left-pad@1.2.0\n"),
+            "aliased 1.2.0 importer untouched"
+        );
     }
 
     #[tokio::test]
@@ -1881,11 +2023,14 @@ snapshots:
         let entry = entry.unwrap();
 
         assert_eq!(fx.read(PACKAGE_JSON).await, P7_AFTER_PKG);
-        let expected_lock =
-            P7_AFTER_LOCK.replace(SPIKE_INTEGRITY, &fx.actual_integrity().await);
+        let expected_lock = P7_AFTER_LOCK.replace(SPIKE_INTEGRITY, &fx.actual_integrity().await);
         assert_eq!(fx.read(PNPM_LOCK).await, expected_lock);
 
-        let dep = entry.wiring.iter().find(|r| r.kind == KIND_LOCK_IMPORTER_DEP).unwrap();
+        let dep = entry
+            .wiring
+            .iter()
+            .find(|r| r.kind == KIND_LOCK_IMPORTER_DEP)
+            .unwrap();
         assert_eq!(dep.key.as_deref(), Some("packages/app|left-pad"));
         assert_eq!(
             dep.new.as_ref().unwrap()["specifier"],
@@ -1910,15 +2055,16 @@ snapshots:
             let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
             let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
             assert!(detail.contains(key), "{detail}");
-            assert!(!fx.root().join(".socket/vendor").exists(), "refusal writes nothing");
+            assert!(
+                !fx.root().join(".socket/vendor").exists(),
+                "refusal writes nothing"
+            );
             assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
         }
 
         // Lock-side desynced override conflicts too.
-        let lock = P1_BEFORE_LOCK.replace(
-            "importers:",
-            "overrides:\n  left-pad: 1.2.0\n\nimporters:",
-        );
+        let lock =
+            P1_BEFORE_LOCK.replace("importers:", "overrides:\n  left-pad: 1.2.0\n\nimporters:");
         let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
         expect_refused(fx.vendor(false).await, "vendor_override_conflict");
 
@@ -1933,17 +2079,18 @@ snapshots:
   }
 }
 "#;
-        let lock = P1_BEFORE_LOCK.replace(
-            "importers:",
-            "overrides:\n  other-pkg: 2.0.0\n\nimporters:",
-        );
+        let lock =
+            P1_BEFORE_LOCK.replace("importers:", "overrides:\n  other-pkg: 2.0.0\n\nimporters:");
         let fx = fixture_with(pkg, &lock).await;
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
         assert_eq!(
             entry.pnpm,
-            Some(PnpmMeta { created_overrides_table: false, created_pnpm_table: false })
+            Some(PnpmMeta {
+                created_overrides_table: false,
+                created_pnpm_table: false
+            })
         );
         // Our entry extends the existing overrides section, theirs intact.
         let live = fx.read(PNPM_LOCK).await;
@@ -1952,9 +2099,11 @@ snapshots:
         // Revert removes only ours, keeping the user's table + section.
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        let live: Value =
-            serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
-        assert_eq!(live["pnpm"]["overrides"]["other-pkg"], Value::String("2.0.0".into()));
+        let live: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        assert_eq!(
+            live["pnpm"]["overrides"]["other-pkg"],
+            Value::String("2.0.0".into())
+        );
         assert!(live["pnpm"]["overrides"].get("left-pad@1.3.0").is_none());
         let live_lock = fx.read(PNPM_LOCK).await;
         assert!(live_lock.contains("overrides:\n  other-pkg: 2.0.0\n\nimporters:"));
@@ -1977,13 +2126,19 @@ snapshots:
         let entry = entry.unwrap();
         assert_eq!(
             entry.pnpm,
-            Some(PnpmMeta { created_overrides_table: true, created_pnpm_table: false })
+            Some(PnpmMeta {
+                created_overrides_table: true,
+                created_pnpm_table: false
+            })
         );
 
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         let live: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
-        assert!(live["pnpm"].get("overrides").is_none(), "created overrides table pruned");
+        assert!(
+            live["pnpm"].get("overrides").is_none(),
+            "created overrides table pruned"
+        );
         assert!(
             live["pnpm"].get("onlyBuiltDependencies").is_some(),
             "pre-existing pnpm table kept: {live}"
@@ -2001,7 +2156,9 @@ snapshots:
     async fn commit_pair_unwinds_package_json_on_lock_write_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        tokio::fs::write(root.join(PACKAGE_JSON), P1_BEFORE_PKG).await.unwrap();
+        tokio::fs::write(root.join(PACKAGE_JSON), P1_BEFORE_PKG)
+            .await
+            .unwrap();
         // A directory where the lock should be makes the atomic rename fail
         // AFTER package.json was already written.
         tokio::fs::create_dir(root.join(PNPM_LOCK)).await.unwrap();
@@ -2016,7 +2173,9 @@ snapshots:
         .unwrap_err();
         assert!(err.contains(PNPM_LOCK), "{err}");
         assert_eq!(
-            tokio::fs::read_to_string(root.join(PACKAGE_JSON)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(PACKAGE_JSON))
+                .await
+                .unwrap(),
             P1_BEFORE_PKG,
             "package.json restored byte-for-byte after the lock failure"
         );
@@ -2035,7 +2194,10 @@ snapshots:
         assert!(result.success);
         assert!(entry.is_none(), "in-sync re-run records nothing");
         assert!(
-            result.files_verified.iter().all(|v| v.status == VerifyStatus::AlreadyPatched),
+            result
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
             "{:?}",
             result.files_verified
         );
@@ -2060,7 +2222,9 @@ snapshots:
         assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK);
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(
-            tokio::fs::read(fx.installed().join("index.js")).await.unwrap(),
+            tokio::fs::read(fx.installed().join("index.js"))
+                .await
+                .unwrap(),
             ORIG_INDEX,
             "vendor never patches in place"
         );
@@ -2083,10 +2247,21 @@ snapshots:
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
-        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "package.json byte-restored");
-        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "package.json byte-restored"
+        );
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            P1_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert!(!tgz_path.exists());
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
@@ -2095,7 +2270,9 @@ snapshots:
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let mut entry = entry.unwrap();
         // A poisoned ledger names a file outside the pair.
-        tokio::fs::write(fx.root().join("Cargo.toml"), b"[package]\n").await.unwrap();
+        tokio::fs::write(fx.root().join("Cargo.toml"), b"[package]\n")
+            .await
+            .unwrap();
         entry.wiring.push(WiringRecord {
             file: "Cargo.toml".to_string(),
             kind: KIND_LOCK_OVERRIDES.to_string(),
@@ -2139,14 +2316,21 @@ snapshots:
             ),
             "      left-pad:\n        specifier: 1.3.1\n        version: 1.3.1\n",
         );
-        assert_ne!(drifted_lock, live, "test setup must actually drift the entry");
-        tokio::fs::write(fx.root().join(PNPM_LOCK), &drifted_lock).await.unwrap();
+        assert_ne!(
+            drifted_lock, live,
+            "test setup must actually drift the entry"
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &drifted_lock)
+            .await
+            .unwrap();
 
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains(".|left-pad")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted" && w.detail.contains(".|left-pad")),
             "{:?}",
             outcome.warnings
         );
@@ -2157,26 +2341,35 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
     async fn preflight_refusals_fire_before_any_write() {
         // Missing lock.
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
-        tokio::fs::remove_file(fx.root().join(PNPM_LOCK)).await.unwrap();
+        tokio::fs::remove_file(fx.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("pnpm install"), "{detail}");
 
         // Unsupported lockfileVersion.
         let fx = fixture_with(P1_BEFORE_PKG, &P1_BEFORE_LOCK.replace("'9.0'", "'6.0'")).await;
-        let detail =
-            expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains("6.0"), "{detail}");
 
         // Missing package.json (the PAIR requirement).
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
-        tokio::fs::remove_file(fx.root().join(PACKAGE_JSON)).await.unwrap();
+        tokio::fs::remove_file(fx.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
         expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
 
         // Lock knows only another version of the package.
@@ -2184,7 +2377,10 @@ snapshots:
         let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
         assert!(detail.contains("left-pad@1.3.0"), "{detail}");
-        assert!(!fx.root().join(".socket/vendor").exists(), "refusals write nothing");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusals write nothing"
+        );
     }
 
     #[test]
@@ -2201,29 +2397,53 @@ snapshots:
     fn key_line_parser_handles_both_quote_styles_and_file_specs() {
         assert_eq!(
             parse_key_line("  left-pad@1.3.0:", 2),
-            Some(("left-pad@1.3.0".into(), "left-pad@1.3.0".into(), String::new()))
+            Some((
+                "left-pad@1.3.0".into(),
+                "left-pad@1.3.0".into(),
+                String::new()
+            ))
         );
         assert_eq!(
             parse_key_line("  left-pad@1.3.0: {}", 2),
-            Some(("left-pad@1.3.0".into(), "left-pad@1.3.0".into(), "{}".into()))
+            Some((
+                "left-pad@1.3.0".into(),
+                "left-pad@1.3.0".into(),
+                "{}".into()
+            ))
         );
         // Keys containing `:` (file: specs) split at the colon+space/EOL.
         assert_eq!(
             parse_key_line("  left-pad@file:x/y.tgz:", 2),
-            Some(("left-pad@file:x/y.tgz".into(), "left-pad@file:x/y.tgz".into(), String::new()))
+            Some((
+                "left-pad@file:x/y.tgz".into(),
+                "left-pad@file:x/y.tgz".into(),
+                String::new()
+            ))
         );
         // pnpm's quoted @-keys (both majors single-quote them).
         assert_eq!(
             parse_key_line("  '@scope/a@1.0.0':", 2),
-            Some(("@scope/a@1.0.0".into(), "'@scope/a@1.0.0'".into(), String::new()))
+            Some((
+                "@scope/a@1.0.0".into(),
+                "'@scope/a@1.0.0'".into(),
+                String::new()
+            ))
         );
         assert_eq!(
             parse_key_line("  \"@scope/a@1.0.0\": {}", 2),
-            Some(("@scope/a@1.0.0".into(), "\"@scope/a@1.0.0\"".into(), "{}".into()))
+            Some((
+                "@scope/a@1.0.0".into(),
+                "\"@scope/a@1.0.0\"".into(),
+                "{}".into()
+            ))
         );
         // Wrong indent / deeper lines are not keys at this level.
         assert_eq!(parse_key_line("    resolution: {}", 2), None);
-        assert_eq!(parse_key_line("      - left-pad", 6), None, "list items are not keys");
+        assert_eq!(
+            parse_key_line("      - left-pad", 6),
+            None,
+            "list items are not keys"
+        );
 
         assert_eq!(yaml_key("@scope/a@file:x"), "'@scope/a@file:x'");
         assert_eq!(yaml_key("left-pad@1.3.0"), "left-pad@1.3.0");

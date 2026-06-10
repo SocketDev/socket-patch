@@ -379,7 +379,9 @@ async fn find_by_purls_finds_package_in_m2_layout() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    let pkg = result.get(purl).expect("requested purl must be the map key");
+    let pkg = result
+        .get(purl)
+        .expect("requested purl must be the map key");
     assert_eq!(pkg.path, pkg_dir, "path must point at the version dir");
     assert_eq!(pkg.name, "commons-lang3", "name = artifactId");
     assert_eq!(pkg.version, "3.12.0");
@@ -434,8 +436,7 @@ async fn crawl_all_discovers_packages_in_repo() {
     let result = crawler.crawl_all(&opts).await;
     // `>= 2` would pass on garbage/duplicate packages — assert the exact
     // coordinates were discovered and nothing extra leaked in.
-    let purls: std::collections::HashSet<&str> =
-        result.iter().map(|p| p.purl.as_str()).collect();
+    let purls: std::collections::HashSet<&str> = result.iter().map(|p| p.purl.as_str()).collect();
     assert!(
         purls.contains("pkg:maven/org.apache.commons/commons-lang3@3.12.0"),
         "commons-lang3 must be discovered; got {result:?}"

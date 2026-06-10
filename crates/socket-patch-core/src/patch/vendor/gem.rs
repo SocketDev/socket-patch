@@ -196,7 +196,10 @@ pub async fn vendor_gem(
         Err(_) => {
             return refused(
                 "vendor_lockfile_missing",
-                format!("no Gemfile.lock at {} (the pair edit needs the lock)", lock_path.display()),
+                format!(
+                    "no Gemfile.lock at {} (the pair edit needs the lock)",
+                    lock_path.display()
+                ),
             );
         }
     };
@@ -242,12 +245,18 @@ pub async fn vendor_gem(
     // originals.
     let remote_line = format!("  remote: {copy_rel}");
     let wired = copy_matches_after_hashes(&copy_dir, &record.files).await
-        && tokio::fs::metadata(copy_dir.join(format!("{name}.gemspec"))).await.is_ok()
+        && tokio::fs::metadata(copy_dir.join(format!("{name}.gemspec")))
+            .await
+            .is_ok()
         && lock_text.split('\n').any(|l| l == remote_line)
         && gemfile_text.contains(&copy_rel);
     if wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
-            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
             return VendorOutcome::Done {
                 result: synthesized_result(purl, &copy_dir, verified, true, None),
                 entry: None,
@@ -273,9 +282,16 @@ pub async fn vendor_gem(
 
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut result =
-            apply_package_patch(purl, installed_dir, &record.files, sources, Some(&record.uuid), true, force)
-                .await;
+        let mut result = apply_package_patch(
+            purl,
+            installed_dir,
+            &record.files,
+            sources,
+            Some(&record.uuid),
+            true,
+            force,
+        )
+        .await;
         result.package_path = copy_dir.display().to_string();
         return VendorOutcome::Done {
             result,
@@ -314,15 +330,24 @@ pub async fn vendor_gem(
                 &copy_dir,
                 Vec::new(),
                 false,
-                Some(format!("failed to copy the stub gemspec into the vendored dir: {e}")),
+                Some(format!(
+                    "failed to copy the stub gemspec into the vendored dir: {e}"
+                )),
             ),
             entry: None,
             warnings: Vec::new(),
         };
     }
-    let mut result =
-        apply_package_patch(purl, &copy_dir, &record.files, sources, Some(&record.uuid), false, force)
-            .await;
+    let mut result = apply_package_patch(
+        purl,
+        &copy_dir,
+        &record.files,
+        sources,
+        Some(&record.uuid),
+        false,
+        force,
+    )
+    .await;
     result.package_path = copy_dir.display().to_string();
     if !result.success {
         // Don't leave a half-built copy; neither file was touched.
@@ -340,7 +365,11 @@ pub async fn vendor_gem(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
-        return VendorOutcome::Done { result, entry: None, warnings: Vec::new() };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings: Vec::new(),
+        };
     }
 
     // ── Gemfile.lock edit (a failure here unwinds the Gemfile) ───────────
@@ -363,7 +392,11 @@ pub async fn vendor_gem(
             let _ = remove_tree(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
-            return VendorOutcome::Done { result, entry: None, warnings: Vec::new() };
+            return VendorOutcome::Done {
+                result,
+                entry: None,
+                warnings: Vec::new(),
+            };
         }
     };
 
@@ -390,7 +423,10 @@ pub async fn vendor_gem(
     }
 
     let gemfile_record = match &plan {
-        GemfilePlan::Rewrite { original_line, new_line } => WiringRecord {
+        GemfilePlan::Rewrite {
+            original_line,
+            new_line,
+        } => WiringRecord {
             file: GEMFILE.to_string(),
             kind: GEMFILE_WIRING_KIND.to_string(),
             action: WiringAction::Rewritten,
@@ -497,11 +533,15 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // last (the mirror image of vendor's Gemfile-then-lock).
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
-            LOCK_WIRING_KIND => revert_lock_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await,
+            LOCK_WIRING_KIND => {
+                revert_lock_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await
+            }
             LOCK_CHECKSUM_WIRING_KIND => {
                 revert_lock_checksum_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await
             }
-            GEMFILE_WIRING_KIND => revert_gemfile_record(&project_root.join(GEMFILE), w, dry_run).await,
+            GEMFILE_WIRING_KIND => {
+                revert_gemfile_record(&project_root.join(GEMFILE), w, dry_run).await
+            }
             _ => {
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
@@ -553,7 +593,10 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
 enum GemfilePlan {
     /// The gem is declared on a safe single top-level line: rewrite it in
     /// place (quote style preserved).
-    Rewrite { original_line: String, new_line: String },
+    Rewrite {
+        original_line: String,
+        new_line: String,
+    },
     /// The gem is transitive (not declared): append a fenced managed block.
     Append { block: String },
 }
@@ -592,7 +635,9 @@ fn plan_gemfile_edit(
         });
     }
     if found.len() > 1 {
-        return Err(format!("`gem \"{name}\"` is declared more than once in the Gemfile"));
+        return Err(format!(
+            "`gem \"{name}\"` is declared more than once in the Gemfile"
+        ));
     }
     let (idx, top_level, paren, q, rest) = found.remove(0);
     if !top_level {
@@ -601,10 +646,14 @@ fn plan_gemfile_edit(
         ));
     }
     if paren {
-        return Err(format!("the `gem \"{name}\"` declaration uses a parenthesized call"));
+        return Err(format!(
+            "the `gem \"{name}\"` declaration uses a parenthesized call"
+        ));
     }
     if let Some(reason) = rest_blocks_edit(&rest) {
-        return Err(format!("the `gem \"{name}\"` declaration is not editable: {reason}"));
+        return Err(format!(
+            "the `gem \"{name}\"` declaration is not editable: {reason}"
+        ));
     }
     Ok(GemfilePlan::Rewrite {
         original_line: lines[idx].to_string(),
@@ -664,7 +713,10 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
 
 fn apply_gemfile_plan(text: &str, plan: &GemfilePlan) -> String {
     match plan {
-        GemfilePlan::Rewrite { original_line, new_line } => {
+        GemfilePlan::Rewrite {
+            original_line,
+            new_line,
+        } => {
             let mut lines: Vec<&str> = text.split('\n').collect();
             if let Some(i) = lines.iter().position(|l| *l == original_line) {
                 lines[i] = new_line;
@@ -1069,7 +1121,10 @@ fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String])
     if !remote_line.starts_with("  remote: ") {
         return None;
     }
-    let spec_block: Vec<&String> = original_lines.iter().filter(|l| l.starts_with("    ")).collect();
+    let spec_block: Vec<&String> = original_lines
+        .iter()
+        .filter(|l| l.starts_with("    "))
+        .collect();
     let old_dep_line = original_lines
         .iter()
         .find(|l| l.starts_with("  ") && !l[2..].starts_with(' '));
@@ -1113,7 +1168,10 @@ fn revert_lock_text(text: &str, original_lines: &[String], new_lines: &[String])
             None => i += 1,
         }
     }
-    lines.splice(insert_at..insert_at, spec_block.iter().map(|l| (*l).clone()));
+    lines.splice(
+        insert_at..insert_at,
+        spec_block.iter().map(|l| (*l).clone()),
+    );
 
     // 3. DEPENDENCIES entry: restore the original line, or delete the one we
     // added for a transitive gem.
@@ -1261,7 +1319,8 @@ mod tests {
 
     const GEMSPEC: &str = "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.2.6\"\n  s.summary = \"a modular Ruby web server interface\"\n  s.require_paths = [\"lib\"]\nend\n";
 
-    const GEMFILE_DIRECT: &str = "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n";
+    const GEMFILE_DIRECT: &str =
+        "source \"https://rubygems.org\"\n\ngem \"puma\"\ngem \"rack\", \"~> 3.1\"\n";
     const GEMFILE_TRANSITIVE: &str = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
 
     const LOCK_DIRECT: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.2.6)\n      base64 (>= 0.1.0)\n\nPLATFORMS\n  arm64-darwin-23\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (~> 3.1)\n\nBUNDLED WITH\n   2.5.22\n";
@@ -1282,16 +1341,24 @@ mod tests {
         let base = dir.path();
 
         let installed = base.join("gem_home/gems/rack-3.2.6");
-        tokio::fs::create_dir_all(installed.join("lib")).await.unwrap();
-        tokio::fs::write(installed.join("lib/rack.rb"), PRISTINE).await.unwrap();
+        tokio::fs::create_dir_all(installed.join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join("lib/rack.rb"), PRISTINE)
+            .await
+            .unwrap();
         let specs = base.join("gem_home/specifications");
         tokio::fs::create_dir_all(&specs).await.unwrap();
-        tokio::fs::write(specs.join("rack-3.2.6.gemspec"), GEMSPEC).await.unwrap();
+        tokio::fs::write(specs.join("rack-3.2.6.gemspec"), GEMSPEC)
+            .await
+            .unwrap();
 
         let root = base.join("project");
         tokio::fs::create_dir_all(&root).await.unwrap();
         tokio::fs::write(root.join(GEMFILE), gemfile).await.unwrap();
-        tokio::fs::write(root.join(GEMFILE_LOCK), lock).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), lock)
+            .await
+            .unwrap();
 
         let before = compute_git_sha256_from_bytes(PRISTINE);
         let after = compute_git_sha256_from_bytes(PATCHED);
@@ -1369,18 +1436,29 @@ mod tests {
     async fn test_direct_dep_happy_path() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "vendor failed: {:?}", result.error);
 
         // Copy patched + gemspec materialized; installed dir untouched.
         let copy = root.join(copy_rel());
-        assert_eq!(tokio::fs::read(copy.join("lib/rack.rb")).await.unwrap(), PATCHED);
         assert_eq!(
-            tokio::fs::read_to_string(copy.join("rack.gemspec")).await.unwrap(),
+            tokio::fs::read(copy.join("lib/rack.rb")).await.unwrap(),
+            PATCHED
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(copy.join("rack.gemspec"))
+                .await
+                .unwrap(),
             GEMSPEC,
             "stub gemspec copied in as <name>.gemspec"
         );
-        assert_eq!(tokio::fs::read(installed.join("lib/rack.rb")).await.unwrap(), PRISTINE);
+        assert_eq!(
+            tokio::fs::read(installed.join("lib/rack.rb"))
+                .await
+                .unwrap(),
+            PRISTINE
+        );
 
         // Gemfile: line rewritten in place, double quotes preserved.
         let gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
@@ -1395,7 +1473,9 @@ mod tests {
         // Lock: the exact bundler-canonical pair-edit form (PATH before GEM,
         // bare relative remote, spec block moved with its sublines, exact-pin
         // `!` dependency, PLATFORMS/BUNDLED WITH byte-preserved).
-        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         assert_eq!(lock, expected_lock_direct());
 
         // Marker present in the uuid dir.
@@ -1446,10 +1526,13 @@ mod tests {
     #[tokio::test]
     async fn test_single_quote_style_preserved() {
         let gemfile = "source 'https://rubygems.org'\n\ngem 'rack', '~> 3.1'\n";
-        let lock = LOCK_DIRECT.replace("  puma\n", "").replace("    puma (6.4.2)\n      nio4r (~> 2.0)\n", "");
+        let lock = LOCK_DIRECT
+            .replace("  puma\n", "")
+            .replace("    puma (6.4.2)\n      nio4r (~> 2.0)\n", "");
         let (_tmp, root, installed, blobs, record) = fixture(gemfile, &lock).await;
 
-        let (result, _e, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
         let new_gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
         assert!(
@@ -1463,7 +1546,8 @@ mod tests {
         let (_tmp, root, installed, blobs, record) =
             fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
 
         let gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
@@ -1476,7 +1560,9 @@ mod tests {
         );
 
         // DEPENDENCIES gains the pin in sorted position (after puma).
-        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         assert!(
             lock.contains("DEPENDENCIES\n  puma\n  rack (= 3.2.6)!\n"),
             "sorted insert: {lock}"
@@ -1486,7 +1572,12 @@ mod tests {
         assert_eq!(entry.wiring[0].action, WiringAction::Added);
         assert!(entry.wiring[0].original.is_none());
         // No old DEPENDENCIES line recorded → revert deletes the added one.
-        let orig = entry.wiring[1].original.as_ref().unwrap().as_array().unwrap();
+        let orig = entry.wiring[1]
+            .original
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert!(
             orig.iter().all(|l| l.as_str().unwrap().starts_with("    ")),
             "transitive: only the spec block is recorded: {orig:?}"
@@ -1498,7 +1589,8 @@ mod tests {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         tokio::fs::remove_file(root.join(GEMFILE)).await.unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (code, _d) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "gemfile_missing");
         assert!(!root.join(".socket").exists(), "refusal must write nothing");
     }
@@ -1506,9 +1598,12 @@ mod tests {
     #[tokio::test]
     async fn test_refuses_missing_lock() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
-        tokio::fs::remove_file(root.join(GEMFILE_LOCK)).await.unwrap();
+        tokio::fs::remove_file(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (code, _d) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "vendor_lockfile_missing");
         assert!(!root.join(".socket").exists());
     }
@@ -1529,7 +1624,8 @@ mod tests {
         .await
         .unwrap();
 
-        let (code, detail) = unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "native_extensions_unsupported");
         assert!(detail.contains("native extensions"));
         assert!(!root.join(".socket").exists());
@@ -1539,7 +1635,9 @@ mod tests {
             GEMFILE_DIRECT
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT
         );
     }
@@ -1551,7 +1649,8 @@ mod tests {
         let platform_dir = installed.parent().unwrap().join("rack-3.2.6-x86_64-linux");
         tokio::fs::rename(&installed, &platform_dir).await.unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &platform_dir, &record, false).await);
+        let (code, _d) =
+            unwrap_refused(run_vendor(&root, &blobs, &platform_dir, &record, false).await);
         assert_eq!(code, "platform_gem_unsupported");
         assert!(!root.join(".socket").exists());
     }
@@ -1559,25 +1658,32 @@ mod tests {
     #[tokio::test]
     async fn test_refuses_unparseable_declaration() {
         // (a) indented inside a group block
-        let grouped = "source \"https://rubygems.org\"\n\ngroup :test do\n  gem \"rack\", \"~> 3.1\"\nend\n";
+        let grouped =
+            "source \"https://rubygems.org\"\n\ngroup :test do\n  gem \"rack\", \"~> 3.1\"\nend\n";
         let (_tmp, root, installed, blobs, record) = fixture(grouped, LOCK_DIRECT).await;
-        let (code, detail) = unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("indented"), "{detail}");
         assert!(!root.join(".socket").exists());
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), grouped);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            grouped
+        );
 
         // (b) multi-line declaration (trailing comma continuation)
         let multiline = "source \"https://rubygems.org\"\n\ngem \"rack\",\n  \"~> 3.1\"\n";
         let (_tmp2, root2, installed2, blobs2, record2) = fixture(multiline, LOCK_DIRECT).await;
-        let (code, detail) = unwrap_refused(run_vendor(&root2, &blobs2, &installed2, &record2, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root2, &blobs2, &installed2, &record2, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("continues"), "{detail}");
 
         // (c) already path-sourced (a previous run / a user fork)
         let pathed = "source \"https://rubygems.org\"\n\ngem \"rack\", path: \"../rack-fork\"\n";
         let (_tmp3, root3, installed3, blobs3, record3) = fixture(pathed, LOCK_DIRECT).await;
-        let (code, detail) = unwrap_refused(run_vendor(&root3, &blobs3, &installed3, &record3, false).await);
+        let (code, detail) =
+            unwrap_refused(run_vendor(&root3, &blobs3, &installed3, &record3, false).await);
         assert_eq!(code, "gemfile_declaration_not_editable");
         assert!(detail.contains("path:"), "{detail}");
     }
@@ -1596,7 +1702,8 @@ mod tests {
         .await
         .unwrap();
 
-        let (code, _d) = unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (code, _d) =
+            unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert_eq!(code, "gem_spec_missing");
         assert!(!root.join(".socket").exists());
     }
@@ -1613,9 +1720,14 @@ mod tests {
         assert_eq!(code, "unsafe_coordinates");
         assert!(!root.join(".socket").exists());
         assert!(!root.parent().unwrap().join("escape").exists());
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), GEMFILE_DIRECT);
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT
         );
     }
@@ -1628,9 +1740,12 @@ mod tests {
         let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.2.6)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (~> 3.1)\n\nBUNDLED WITH\n   2.5.22\n";
         let (_tmp, root, installed, blobs, record) = fixture(gemfile, lock).await;
 
-        let (result, _e, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, _e, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
-        let new_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let new_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         assert_eq!(
             new_lock,
             format!(
@@ -1654,7 +1769,9 @@ mod tests {
         assert!(r2.success);
         assert!(r2.files_patched.is_empty(), "in-sync rerun patches nothing");
         assert!(
-            r2.files_verified.iter().all(|v| v.status == VerifyStatus::AlreadyPatched),
+            r2.files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
             "synthesized AlreadyPatched: {:?}",
             r2.files_verified
         );
@@ -1663,14 +1780,18 @@ mod tests {
             "hot path must not re-record (would clobber the originals in the ledger)"
         );
         assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
-        assert_eq!(tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(), lock1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
     }
 
     #[tokio::test]
     async fn test_dry_run_writes_nothing() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, true).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, true).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_none(), "dry run records nothing");
         assert!(!root.join(".socket").exists(), "no copy created");
@@ -1679,7 +1800,9 @@ mod tests {
             GEMFILE_DIRECT
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT
         );
     }
@@ -1692,9 +1815,14 @@ mod tests {
         let lock = LOCK_DIRECT.replace("    rack (3.2.6)", "    rack (3.1.0)");
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, &lock).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Gemfile.lock"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Gemfile.lock"));
         assert!(entry.is_none());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -1702,7 +1830,9 @@ mod tests {
             "Gemfile unwound to its original bytes"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             lock,
             "lock untouched"
         );
@@ -1716,14 +1846,18 @@ mod tests {
     async fn test_revert_round_trip_direct() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "clean revert must not report drift: {:?}",
             outcome.warnings
         );
@@ -1733,11 +1867,16 @@ mod tests {
             "Gemfile byte-identical to the fixture"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT,
             "lock byte-identical to the fixture"
         );
-        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists(), "uuid dir removed");
+        assert!(
+            !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "uuid dir removed"
+        );
     }
 
     #[tokio::test]
@@ -1745,7 +1884,8 @@ mod tests {
         let (_tmp, root, installed, blobs, record) =
             fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
 
@@ -1757,7 +1897,9 @@ mod tests {
             "managed block deleted, Gemfile byte-identical"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_TRANSITIVE,
             "spec block moved back, added DEPENDENCIES entry deleted"
         );
@@ -1768,15 +1910,20 @@ mod tests {
     async fn test_revert_drift_warnings() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
 
-        let (result, entry, _w) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
 
         // Third-party drift: a `bundle update` regenerated both files back to
         // registry form. Revert must leave them alone, warn per file, and
         // still remove the artifact dir.
-        tokio::fs::write(root.join(GEMFILE), GEMFILE_DIRECT).await.unwrap();
-        tokio::fs::write(root.join(GEMFILE_LOCK), LOCK_DIRECT).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE), GEMFILE_DIRECT)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), LOCK_DIRECT)
+            .await
+            .unwrap();
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -1785,13 +1932,19 @@ mod tests {
             .iter()
             .filter(|w| w.code == "vendor_lock_entry_drifted")
             .count();
-        assert_eq!(drift_count, 2, "one drift warning per file: {:?}", outcome.warnings);
+        assert_eq!(
+            drift_count, 2,
+            "one drift warning per file: {:?}",
+            outcome.warnings
+        );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             LOCK_DIRECT
         );
         assert!(
@@ -1804,7 +1957,8 @@ mod tests {
 
     const PURL_318: &str = "pkg:gem/rack@3.1.8";
     const PRISTINE_318: &[u8] = b"module Rack\n  VERSION = \"3.1.8\"\nend\n";
-    const PATCHED_318: &[u8] = b"module Rack\n  SOCKET_PATCHED = true\n  VERSION = \"3.1.8\"\nend\n";
+    const PATCHED_318: &[u8] =
+        b"module Rack\n  SOCKET_PATCHED = true\n  VERSION = \"3.1.8\"\nend\n";
     const GEMSPEC_318: &str = "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.1.8\"\n  s.require_paths = [\"lib\"]\nend\n";
 
     // Embedded VERBATIM from the spike pair
@@ -1846,22 +2000,32 @@ mod tests {
         let base = dir.path();
 
         let installed = base.join("gem_home/gems/rack-3.1.8");
-        tokio::fs::create_dir_all(installed.join("lib")).await.unwrap();
-        tokio::fs::write(installed.join("lib/rack.rb"), PRISTINE_318).await.unwrap();
+        tokio::fs::create_dir_all(installed.join("lib"))
+            .await
+            .unwrap();
+        tokio::fs::write(installed.join("lib/rack.rb"), PRISTINE_318)
+            .await
+            .unwrap();
         let specs = base.join("gem_home/specifications");
         tokio::fs::create_dir_all(&specs).await.unwrap();
-        tokio::fs::write(specs.join("rack-3.1.8.gemspec"), GEMSPEC_318).await.unwrap();
+        tokio::fs::write(specs.join("rack-3.1.8.gemspec"), GEMSPEC_318)
+            .await
+            .unwrap();
 
         let root = base.join("project");
         tokio::fs::create_dir_all(&root).await.unwrap();
         tokio::fs::write(root.join(GEMFILE), gemfile).await.unwrap();
-        tokio::fs::write(root.join(GEMFILE_LOCK), lock).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), lock)
+            .await
+            .unwrap();
 
         let before = compute_git_sha256_from_bytes(PRISTINE_318);
         let after = compute_git_sha256_from_bytes(PATCHED_318);
         let blobs = base.join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
-        tokio::fs::write(blobs.join(&after), PATCHED_318).await.unwrap();
+        tokio::fs::write(blobs.join(&after), PATCHED_318)
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -1915,7 +2079,9 @@ mod tests {
 
         // Lock: bundler's own path-gem output (spike G3 pair) byte-for-byte,
         // modulo the PATH remote value.
-        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         assert_eq!(lock, expected_lock_checksums());
 
         // Ledger: the checksum rewrite is its own third record with the
@@ -1968,7 +2134,9 @@ mod tests {
 
         // Full oracle: rack moved to PATH + sorted `!` dep + bare CHECKSUMS
         // entry; puma's checksum line is byte-untouched.
-        let new_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let new_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         assert_eq!(
             new_lock,
             format!(
@@ -1984,12 +2152,23 @@ mod tests {
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "clean revert must not report drift: {:?}",
             outcome.warnings
         );
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), gemfile);
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), lock);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
     }
 
     #[tokio::test]
@@ -2005,7 +2184,10 @@ mod tests {
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "clean revert must not report drift: {:?}",
             outcome.warnings
         );
@@ -2016,7 +2198,9 @@ mod tests {
             SPIKE_GEMFILE_CHECKSUMS
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             SPIKE_LOCK_CHECKSUMS_BEFORE
         );
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
@@ -2027,7 +2211,8 @@ mod tests {
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
 
-        let (r1, e1, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
         assert!(e1.is_some());
         let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
@@ -2035,11 +2220,15 @@ mod tests {
 
         // The bare CHECKSUMS entry counts as in-sync: the rerun takes the hot
         // path and records nothing.
-        let (r2, e2, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(r2.success);
         assert!(e2.is_none(), "hot path must not re-record");
         assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
-        assert_eq!(tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(), lock1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
     }
 
     #[tokio::test]
@@ -2064,7 +2253,9 @@ mod tests {
             entry.wiring
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             expected_lock_checksums(),
             "the bare line is kept verbatim"
         );
@@ -2083,10 +2274,19 @@ mod tests {
         let (result, entry, _w) =
             unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(entry.unwrap().wiring.len(), 2, "no checksum record for an absent entry");
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
-            expected_lock_checksums().replace("  rack (3.1.8)\n\nBUNDLED", &format!("{other_line}\n\nBUNDLED")),
+            entry.unwrap().wiring.len(),
+            2,
+            "no checksum record for an absent entry"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_checksums().replace(
+                "  rack (3.1.8)\n\nBUNDLED",
+                &format!("{other_line}\n\nBUNDLED")
+            ),
             "the foreign entry is byte-untouched"
         );
     }
@@ -2096,7 +2296,8 @@ mod tests {
         // A CHECKSUMS line that names our gem but breaks the entry grammar
         // (lost closing paren) fails closed AFTER the Gemfile was rewritten:
         // the pair-edit unwind must restore the Gemfile bytes.
-        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, "  rack (3.1.8 sha256=deadbeef");
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE
+            .replace(SPIKE_RACK_SHA_LINE, "  rack (3.1.8 sha256=deadbeef");
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
 
@@ -2104,7 +2305,10 @@ mod tests {
             unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or("");
-        assert!(err.contains("CHECKSUMS") && err.contains("not parseable"), "{err}");
+        assert!(
+            err.contains("CHECKSUMS") && err.contains("not parseable"),
+            "{err}"
+        );
         assert!(entry.is_none());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
@@ -2112,7 +2316,9 @@ mod tests {
             "Gemfile unwound to its original bytes"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             lock,
             "lock untouched"
         );
@@ -2136,7 +2342,11 @@ mod tests {
             unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(!result.success);
         assert!(
-            result.error.as_deref().unwrap_or("").contains("platform-suffixed"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("platform-suffixed"),
             "{:?}",
             result.error
         );
@@ -2146,7 +2356,12 @@ mod tests {
             SPIKE_GEMFILE_CHECKSUMS,
             "Gemfile unwound"
         );
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), lock);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            lock
+        );
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
@@ -2186,10 +2401,17 @@ mod tests {
         // a token): revert must leave that line alone with a warning, never
         // clobber it, while the other records still restore cleanly.
         let drifted_line = "  rack (3.1.8) sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
-        let edited = wired.replace("\nCHECKSUMS\n  rack (3.1.8)\n", &format!("\nCHECKSUMS\n{drifted_line}\n"));
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
+        let edited = wired.replace(
+            "\nCHECKSUMS\n  rack (3.1.8)\n",
+            &format!("\nCHECKSUMS\n{drifted_line}\n"),
+        );
         assert_ne!(edited, wired, "fixture edit must hit the bare line");
-        tokio::fs::write(root.join(GEMFILE_LOCK), &edited).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), &edited)
+            .await
+            .unwrap();
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -2198,9 +2420,15 @@ mod tests {
             .iter()
             .filter(|w| w.code == "vendor_lock_entry_drifted")
             .count();
-        assert_eq!(drift_count, 1, "exactly the checksum record drifts: {:?}", outcome.warnings);
         assert_eq!(
-            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            drift_count, 1,
+            "exactly the checksum record drifts: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
             SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, drifted_line),
             "everything else restored; the drifted checksum line preserved verbatim"
         );
@@ -2220,15 +2448,20 @@ mod tests {
         // a lock it has no ledger entry for.
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
-        let (r1, _e1, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        let (r1, _e1, _) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
         assert!(r1.success);
-        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+            .await
+            .unwrap();
         let v1 = wired.replace(
             "\nCHECKSUMS\n  rack (3.1.8)\n",
             &format!("\nCHECKSUMS\n{SPIKE_RACK_SHA_LINE}\n"),
         );
         assert_ne!(v1, wired, "fixture edit must hit the bare line");
-        tokio::fs::write(root.join(GEMFILE_LOCK), &v1).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), &v1)
+            .await
+            .unwrap();
         let gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
 
         let (code, detail) =
@@ -2236,7 +2469,15 @@ mod tests {
         assert_eq!(code, "vendor_stale_lock_checksum");
         assert!(detail.contains("vendor --revert"), "{detail}");
         // The refusal mutates nothing.
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), gemfile);
-        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), v1);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            gemfile
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            v1
+        );
     }
 }

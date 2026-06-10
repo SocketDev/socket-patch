@@ -606,7 +606,8 @@ mod tests {
     async fn test_remove_dry_run_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("package.json");
-        let original = r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
+        let original =
+            r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
         fs::write(&pkg, original).await.unwrap();
         let result = remove_package_json(&pkg, true).await;
         assert_eq!(result.status, RemoveStatus::Removed);

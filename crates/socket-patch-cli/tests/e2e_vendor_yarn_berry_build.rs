@@ -228,9 +228,18 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
     // 3. Vendor (offline).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
@@ -241,7 +250,10 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
         .iter()
         .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
         .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
-    assert!(applied.get("errorCode").is_none(), "clean apply event: {applied}");
+    assert!(
+        applied.get("errorCode").is_none(),
+        "clean apply event: {applied}"
+    );
 
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
     assert!(
@@ -249,8 +261,10 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
         "vendored tarball missing at {tgz_rel}"
     );
     assert!(
-        proj.join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"))
-            .is_file(),
+        proj.join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
+        .is_file(),
         "informational vendor marker missing"
     );
     assert!(
@@ -284,9 +298,15 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
         .lines()
         .map(str::trim)
         .find(|l| l.starts_with("checksum: 10c0/"))
-        .unwrap_or_else(|| panic!("yarn.lock must carry a `checksum: 10c0/<hex>` line:\n{lock_after}"));
+        .unwrap_or_else(|| {
+            panic!("yarn.lock must carry a `checksum: 10c0/<hex>` line:\n{lock_after}")
+        });
     let checksum_hex = checksum_line.trim_start_matches("checksum: 10c0/");
-    assert_eq!(checksum_hex.len(), 128, "sha512 hex is 128 chars: {checksum_line}");
+    assert_eq!(
+        checksum_hex.len(),
+        128,
+        "sha512 hex is 128 chars: {checksum_line}"
+    );
     assert!(
         checksum_hex.bytes().all(|b| b.is_ascii_hexdigit()),
         "checksum body must be hex: {checksum_line}"
@@ -348,9 +368,18 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
     let pkg_wired = std::fs::read(&pkg_path).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env2 = parse_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
@@ -367,9 +396,19 @@ fn yarn_berry_vendor_fresh_checkout_immutable_check_cache_and_revert() {
     // 6. REVERT PROOF: package.json AND yarn.lock restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");

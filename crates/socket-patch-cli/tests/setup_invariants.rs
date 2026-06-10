@@ -237,7 +237,10 @@ fn setup_detects_pnpm_from_lockfile() {
         r#"{ "name": "test-proj", "version": "1.0.0" }
 "#,
     );
-    write(&tmp.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+    write(
+        &tmp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    );
 
     let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
     assert_eq!(code, 0, "setup should succeed; stdout=\n{stdout}");
@@ -396,7 +399,10 @@ fn setup_malformed_package_json_reports_error_and_exits_nonzero() {
     write(&tmp.path().join("package.json"), "not valid json!!!");
 
     let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
-    assert_eq!(code, 1, "a malformed package.json must exit non-zero; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "a malformed package.json must exit non-zero; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(
         v["status"], "error",
@@ -421,7 +427,11 @@ fn setup_malformed_does_not_claim_already_configured_in_human_mode() {
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "human mode must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "human mode must exit 1; stdout=\n{stdout}"
+    );
     assert!(
         !stdout.contains("already configured with socket-patch"),
         "must not falsely claim everything is already configured; stdout=\n{stdout}"
@@ -449,7 +459,10 @@ fn setup_dry_run_with_error_exits_nonzero() {
     write(&tmp.path().join("packages/a/package.json"), "{bad json");
 
     let (code, stdout) = run_setup(tmp.path(), &["--dry-run"]);
-    assert_eq!(code, 1, "dry-run with an error must exit non-zero; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "dry-run with an error must exit non-zero; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "dry_run");
     assert_eq!(v["errors"], 1);
@@ -457,7 +470,10 @@ fn setup_dry_run_with_error_exits_nonzero() {
 
     // dry-run must not have written anything.
     let root = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
-    assert!(!root.contains("socket-patch"), "dry-run must not modify files");
+    assert!(
+        !root.contains("socket-patch"),
+        "dry-run must not modify files"
+    );
 }
 
 #[test]
@@ -473,7 +489,10 @@ fn setup_partial_failure_exits_nonzero_when_applying() {
     write(&tmp.path().join("packages/a/package.json"), "{bad json");
 
     let (code, stdout) = run_setup(tmp.path(), &["--yes"]);
-    assert_eq!(code, 1, "partial failure must exit non-zero; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "partial failure must exit non-zero; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "partial_failure");
     assert_eq!(v["updated"], 1);
@@ -481,7 +500,10 @@ fn setup_partial_failure_exits_nonzero_when_applying() {
 
     // The valid root file should have been written.
     let root = std::fs::read_to_string(tmp.path().join("package.json")).unwrap();
-    assert!(root.contains("socket-patch"), "valid file should still be updated");
+    assert!(
+        root.contains("socket-patch"),
+        "valid file should still be updated"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -498,13 +520,19 @@ fn setup_check_configured_project_exits_zero() {
     assert_eq!(c, 0);
 
     let (code, stdout) = run_setup(tmp.path(), &["--check"]);
-    assert_eq!(code, 0, "configured project should pass --check; stdout=\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "configured project should pass --check; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "configured");
     assert_eq!(v["needsConfiguration"], 0);
     assert_eq!(v["errors"], 0);
     // The package.json must be counted as configured, not silently absent.
-    assert_eq!(v["configured"], 1, "the lone manifest must be counted; stdout=\n{stdout}");
+    assert_eq!(
+        v["configured"], 1,
+        "the lone manifest must be counted; stdout=\n{stdout}"
+    );
     let files = v["files"].as_array().expect("files array");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0]["status"], "configured");
@@ -513,10 +541,16 @@ fn setup_check_configured_project_exits_zero() {
 #[test]
 fn setup_check_unconfigured_project_exits_nonzero() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    write(&tmp.path().join("package.json"), r#"{ "name": "x", "scripts": { "build": "tsc" } }"#);
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "x", "scripts": { "build": "tsc" } }"#,
+    );
 
     let (code, stdout) = run_setup(tmp.path(), &["--check"]);
-    assert_eq!(code, 1, "unconfigured project must fail --check; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "unconfigured project must fail --check; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "needs_configuration");
     assert_eq!(v["needsConfiguration"], 1);
@@ -533,7 +567,10 @@ fn setup_check_no_files_exits_zero() {
     // (CLI_CONTRACT "Setup command contract") — the summary counts are
     // always-present, zero-valued fields, NOT dropped. A consumer reading
     // `.needsConfiguration` must see 0, not null.
-    assert_eq!(v["configured"], 0, "missing/`null` configured; stdout=\n{stdout}");
+    assert_eq!(
+        v["configured"], 0,
+        "missing/`null` configured; stdout=\n{stdout}"
+    );
     assert_eq!(
         v["needsConfiguration"], 0,
         "missing/`null` needsConfiguration; stdout=\n{stdout}"
@@ -572,7 +609,10 @@ fn setup_check_does_not_modify_file() {
     // 1) — discarding the outcome would let a no-op binary pass the
     // "didn't write" assertion vacuously.
     let (code, stdout) = run_setup(tmp.path(), &["--check"]);
-    assert_eq!(code, 1, "unconfigured --check must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "unconfigured --check must exit 1; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "needs_configuration");
     assert_eq!(
@@ -605,7 +645,10 @@ fn setup_remove_round_trips_and_preserves_other_scripts() {
     assert_eq!(v["removed"], 1);
 
     let after = std::fs::read_to_string(&pkg).unwrap();
-    assert!(!after.contains("socket-patch"), "socket-patch must be gone; got:\n{after}");
+    assert!(
+        !after.contains("socket-patch"),
+        "socket-patch must be gone; got:\n{after}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&after).expect("valid JSON");
     // Full revert: lifecycle keys gone, sibling script preserved.
     assert_eq!(parsed["scripts"]["build"], "tsc");
@@ -643,10 +686,16 @@ fn setup_remove_dry_run_does_not_modify_file() {
 #[test]
 fn setup_remove_nothing_to_remove_exits_zero() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    write(&tmp.path().join("package.json"), r#"{ "name": "x", "scripts": { "build": "tsc" } }"#);
+    write(
+        &tmp.path().join("package.json"),
+        r#"{ "name": "x", "scripts": { "build": "tsc" } }"#,
+    );
 
     let (code, stdout) = run_setup(tmp.path(), &["--remove", "--yes"]);
-    assert_eq!(code, 0, "nothing to remove should exit 0; stdout=\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "nothing to remove should exit 0; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "not_configured");
     assert_eq!(v["removed"], 0);
@@ -669,7 +718,11 @@ fn remove_human_mode_surfaces_unprocessable_file_error() {
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(1), "a malformed manifest must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a malformed manifest must exit 1; stdout=\n{stdout}"
+    );
 
     // The "(see errors above)" trailer is only honest if the error was actually
     // printed above it.
@@ -740,10 +793,14 @@ fn setup_writes_only_inside_repo() {
     write(&pkg, r#"{ "name": "x", "version": "1.0.0" }"#);
 
     // Sentinel HOME starts empty; setup must leave it empty.
-    assert!(files_under(home.path()).is_empty(), "sentinel HOME must start empty");
+    assert!(
+        files_under(home.path()).is_empty(),
+        "sentinel HOME must start empty"
+    );
 
     let mut cmd = Command::new(binary());
-    cmd.args(["setup", "--json", "--yes"]).current_dir(proj.path());
+    cmd.args(["setup", "--json", "--yes"])
+        .current_dir(proj.path());
     for var in SOCKET_ENV_VARS {
         cmd.env_remove(var);
     }
@@ -753,7 +810,11 @@ fn setup_writes_only_inside_repo() {
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "setup should succeed; stderr=\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "setup should succeed; stderr=\n{stderr}"
+    );
 
     // Nothing was written outside the repo.
     assert!(
@@ -770,7 +831,9 @@ fn setup_writes_only_inside_repo() {
     );
     // Not vacuous: it really did wire the hook into that in-repo file.
     assert!(
-        std::fs::read_to_string(&pkg).unwrap().contains("socket-patch"),
+        std::fs::read_to_string(&pkg)
+            .unwrap()
+            .contains("socket-patch"),
         "setup must have edited the in-repo package.json"
     );
 }
@@ -784,7 +847,10 @@ fn setup_writes_only_inside_repo() {
 #[test]
 fn setup_state_is_clone_portable() {
     let a = tempfile::tempdir().expect("a");
-    write(&a.path().join("package.json"), r#"{ "name": "x", "version": "1.0.0" }"#);
+    write(
+        &a.path().join("package.json"),
+        r#"{ "name": "x", "version": "1.0.0" }"#,
+    );
     let (c, _) = run_setup(a.path(), &["--yes"]);
     assert_eq!(c, 0, "initial setup must succeed");
 
@@ -795,7 +861,10 @@ fn setup_state_is_clone_portable() {
 
     let before = std::fs::read_to_string(b.path().join("package.json")).unwrap();
     let (code, stdout) = run_setup(b.path(), &["--check"]);
-    assert_eq!(code, 0, "the clone must already be configured; stdout=\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "the clone must already be configured; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "configured");
     assert_eq!(v["needsConfiguration"], 0);
@@ -907,9 +976,18 @@ fn setup_configures_gem_alongside_npm() {
         .iter()
         .filter_map(|f| f["kind"].as_str())
         .collect();
-    assert!(kinds.contains("package_json"), "npm entry missing; kinds={kinds:?}");
-    assert!(kinds.contains("gemfile"), "gem Gemfile entry missing; kinds={kinds:?}");
-    assert!(kinds.contains("gem_plugin"), "gem plugin entry missing; kinds={kinds:?}");
+    assert!(
+        kinds.contains("package_json"),
+        "npm entry missing; kinds={kinds:?}"
+    );
+    assert!(
+        kinds.contains("gemfile"),
+        "gem Gemfile entry missing; kinds={kinds:?}"
+    );
+    assert!(
+        kinds.contains("gem_plugin"),
+        "gem plugin entry missing; kinds={kinds:?}"
+    );
 
     // On disk: both manifests are wired.
     assert!(std::fs::read_to_string(tmp.path().join("Gemfile"))

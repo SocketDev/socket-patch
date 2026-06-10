@@ -28,9 +28,7 @@ use socket_patch_core::vex::{
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
-use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent,
-};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 #[derive(Args)]
 pub struct VexArgs {
@@ -57,7 +55,11 @@ pub struct VexArgs {
     /// emitted; this flag flips that off — useful when generating a
     /// VEX doc on a build machine that doesn't have the patched files
     /// laid out yet.
-    #[arg(long = "no-verify", env = "SOCKET_VEX_NO_VERIFY", default_value_t = false)]
+    #[arg(
+        long = "no-verify",
+        env = "SOCKET_VEX_NO_VERIFY",
+        default_value_t = false
+    )]
     pub no_verify: bool,
 
     /// Override the document `@id`. Default is `urn:uuid:<random v4>`,
@@ -94,7 +96,11 @@ pub struct VexEmbedArgs {
 
     /// Skip the on-disk file-hash check when building the VEX document and
     /// trust the manifest. See `socket-patch vex --no-verify`.
-    #[arg(long = "vex-no-verify", env = "SOCKET_VEX_NO_VERIFY", default_value_t = false)]
+    #[arg(
+        long = "vex-no-verify",
+        env = "SOCKET_VEX_NO_VERIFY",
+        default_value_t = false
+    )]
     pub vex_no_verify: bool,
 
     /// Pin the VEX document `@id`. See `socket-patch vex --doc-id`.
@@ -102,7 +108,11 @@ pub struct VexEmbedArgs {
     pub vex_doc_id: Option<String>,
 
     /// Emit compact (non-pretty) JSON for the VEX document.
-    #[arg(long = "vex-compact", env = "SOCKET_VEX_COMPACT", default_value_t = false)]
+    #[arg(
+        long = "vex-compact",
+        env = "SOCKET_VEX_COMPACT",
+        default_value_t = false
+    )]
     pub vex_compact: bool,
 }
 
@@ -355,23 +365,24 @@ pub(crate) async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document_with_vendored(manifest, &outcome.applied, &outcome.vendored, &opts)
-    {
-        Some(doc) => doc,
-        None => {
-            track_vex_failed(
-                "no_applicable_patches",
-                common.api_token.as_deref(),
-                common.org.as_deref(),
-            )
-            .await;
-            return Err(VexGenError {
-                code: "no_applicable_patches",
-                message: "No applied patches with vulnerability metadata to attest.".to_string(),
-                failed: outcome.failed,
-            });
-        }
-    };
+    let doc =
+        match build_document_with_vendored(manifest, &outcome.applied, &outcome.vendored, &opts) {
+            Some(doc) => doc,
+            None => {
+                track_vex_failed(
+                    "no_applicable_patches",
+                    common.api_token.as_deref(),
+                    common.org.as_deref(),
+                )
+                .await;
+                return Err(VexGenError {
+                    code: "no_applicable_patches",
+                    message: "No applied patches with vulnerability metadata to attest."
+                        .to_string(),
+                    failed: outcome.failed,
+                });
+            }
+        };
 
     // Serialize.
     let serialized = if params.compact {
@@ -689,12 +700,13 @@ fn emit_envelope_success(doc: &Document, failures: &[FailedPatch]) {
         for prod in &st.products {
             for sub in &prod.subcomponents {
                 env.record(
-                    PatchEvent::new(PatchAction::Verified, sub.id.clone())
-                        .with_details(serde_json::json!({
+                    PatchEvent::new(PatchAction::Verified, sub.id.clone()).with_details(
+                        serde_json::json!({
                             "vulnerability": st.vulnerability.name,
                             "aliases": st.vulnerability.aliases,
                             "status": "not_affected",
-                        })),
+                        }),
+                    ),
                 );
             }
         }
@@ -733,7 +745,10 @@ mod tests {
         #[cfg(feature = "golang")]
         assert_eq!(ecosystem_from_manual_name("go"), Some(Ecosystem::Golang));
         #[cfg(feature = "composer")]
-        assert_eq!(ecosystem_from_manual_name("composer"), Some(Ecosystem::Composer));
+        assert_eq!(
+            ecosystem_from_manual_name("composer"),
+            Some(Ecosystem::Composer)
+        );
         #[cfg(feature = "maven")]
         assert_eq!(ecosystem_from_manual_name("maven"), Some(Ecosystem::Maven));
         #[cfg(feature = "nuget")]
@@ -778,13 +793,19 @@ mod tests {
             "v2.0.0-20210101000000-abcdef123456"
         ));
         assert!(!are_safe_go_redirect_coords("../../../etc", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("github.com/../../../etc", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords(
+            "github.com/../../../etc",
+            "v1.0.0"
+        ));
         assert!(!are_safe_go_redirect_coords("/abs/path", "v1.0.0"));
         assert!(!are_safe_go_redirect_coords("github.com//bar", "v1.0.0"));
         assert!(!are_safe_go_redirect_coords("foo/./bar", "v1.0.0"));
         assert!(!are_safe_go_redirect_coords("foo\\bar", "v1.0.0"));
         assert!(!are_safe_go_redirect_coords("", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", "../../../evil"));
+        assert!(!are_safe_go_redirect_coords(
+            "github.com/foo/bar",
+            "../../../evil"
+        ));
         assert!(!are_safe_go_redirect_coords("github.com/foo/bar", "v1/0/0"));
         assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ".."));
         assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ""));

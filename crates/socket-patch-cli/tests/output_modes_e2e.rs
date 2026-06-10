@@ -110,16 +110,11 @@ fn apply_non_json_prints_human_readable_summary() {
         "non-JSON apply should print the patch-count summary; got: {stdout}"
     );
     assert!(
-        stdout.contains("Patched packages:")
-            && stdout.contains("pkg:npm/non-json-target@1.0.0"),
+        stdout.contains("Patched packages:") && stdout.contains("pkg:npm/non-json-target@1.0.0"),
         "non-JSON apply should list the patched PURL; got: {stdout}"
     );
     // The summary is only honest if the file was actually rewritten.
-    let patched = std::fs::read(
-        tmp.path()
-            .join("node_modules/non-json-target/index.js"),
-    )
-    .unwrap();
+    let patched = std::fs::read(tmp.path().join("node_modules/non-json-target/index.js")).unwrap();
     assert_eq!(
         patched, after,
         "apply must rewrite the target file to the patched content"
@@ -163,8 +158,7 @@ fn apply_verbose_prints_per_file_details() {
     );
     // The verbose block must describe real work: confirm the file was
     // actually rewritten, so a no-op apply that merely prints the block fails.
-    let patched =
-        std::fs::read(tmp.path().join("node_modules/verbose-target/index.js")).unwrap();
+    let patched = std::fs::read(tmp.path().join("node_modules/verbose-target/index.js")).unwrap();
     assert_eq!(
         patched, after,
         "--verbose apply must still rewrite the target file"
@@ -294,11 +288,7 @@ fn list_empty_manifest_non_json() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{"patches":{}}"#,
-    )
-    .unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
 
     let out = Command::new(binary())
         .args(["list"])
@@ -383,7 +373,10 @@ fn repair_non_json_no_orphans_prints_summary() {
     let before_blob = blobs.join(git_sha256(b"a"));
     let after_blob = blobs.join(git_sha256(b"b"));
     std::fs::remove_file(&before_blob).unwrap();
-    assert!(after_blob.exists(), "fixture precondition: afterHash blob present");
+    assert!(
+        after_blob.exists(),
+        "fixture precondition: afterHash blob present"
+    );
 
     let out = Command::new(binary())
         .args(["repair", "--offline"])
@@ -424,7 +417,10 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
     std::fs::write(&orphan, b"orphan").unwrap();
     // The in-use blob that MUST survive the cleanup: the afterHash content.
     let after_blob = blobs.join(git_sha256(b"b"));
-    assert!(after_blob.exists(), "fixture precondition: afterHash blob present");
+    assert!(
+        after_blob.exists(),
+        "fixture precondition: afterHash blob present"
+    );
 
     let out = Command::new(binary())
         .args(["repair", "--offline"])
@@ -470,7 +466,12 @@ fn remove_non_json_prints_what_will_be_removed() {
     write_manifest(tmp.path(), "pkg:npm/remove-target@1.0.0", b"a", b"b");
 
     let out = Command::new(binary())
-        .args(["remove", "pkg:npm/remove-target@1.0.0", "--yes", "--skip-rollback"])
+        .args([
+            "remove",
+            "pkg:npm/remove-target@1.0.0",
+            "--yes",
+            "--skip-rollback",
+        ])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .output()
@@ -484,8 +485,7 @@ fn remove_non_json_prints_what_will_be_removed() {
     );
     // The confirmation is only meaningful if the manifest was actually
     // rewritten to drop the patch.
-    let manifest =
-        std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    let manifest = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     assert!(
         !manifest.contains("pkg:npm/remove-target@1.0.0"),
         "remove must delete the patch from the manifest; got: {manifest}"
@@ -554,8 +554,7 @@ fn rollback_verbose_prints_per_file_details() {
     // The detail block must reflect real work: the file must actually be
     // restored to its pre-patch ("before") content, so a no-op rollback that
     // only prints the block fails here.
-    let restored =
-        std::fs::read(tmp.path().join("node_modules/rb-verbose/index.js")).unwrap();
+    let restored = std::fs::read(tmp.path().join("node_modules/rb-verbose/index.js")).unwrap();
     assert_eq!(
         restored, before,
         "verbose rollback must restore the file to its pre-patch content"
@@ -596,7 +595,10 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
     // including the binary mis-routing to a vuln lookup. Assert the
     // fall-through actually happened: with no installed packages it
     // short-circuits cleanly (exit 0) after announcing the search.
-    assert_eq!(code, 0, "package-name fall-through should exit cleanly; stdout={stdout}");
+    assert_eq!(
+        code, 0,
+        "package-name fall-through should exit cleanly; stdout={stdout}"
+    );
     assert!(
         stdout.contains("as a package name search"),
         "get with a bare identifier must fall through to package-name search; got: {stdout}"
@@ -634,7 +636,10 @@ fn get_with_explicit_cve_flag_works() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
-    assert_eq!(v["status"], "error", "must report a structured error; got: {stdout}");
+    assert_eq!(
+        v["status"], "error",
+        "must report a structured error; got: {stdout}"
+    );
     let err = v["error"].as_str().unwrap_or_default();
     assert!(
         err.contains("by-cve/CVE-2099-99999"),
@@ -704,7 +709,10 @@ fn get_with_explicit_package_flag_works() {
     // emits the structured "no_packages" JSON. The old `0 || 1` would have
     // accepted a crash or a misrouted vuln lookup.
     let code = out.status.code().unwrap_or(-1);
-    assert_eq!(code, 0, "package search with no packages should exit cleanly");
+    assert_eq!(
+        code, 0,
+        "package search with no packages should exit cleanly"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must emit parseable JSON");
@@ -830,11 +838,19 @@ fn each_subcommand_help_prints_usage() {
 
 #[test]
 fn top_level_help_prints_all_subcommands() {
-    let out = Command::new(binary()).args(["--help"]).output().expect("run");
+    let out = Command::new(binary())
+        .args(["--help"])
+        .output()
+        .expect("run");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in ["apply", "rollback", "get", "scan", "list", "remove", "setup", "repair"] {
-        assert!(stdout.contains(sub), "top-level help missing {sub}; got: {stdout}");
+    for sub in [
+        "apply", "rollback", "get", "scan", "list", "remove", "setup", "repair",
+    ] {
+        assert!(
+            stdout.contains(sub),
+            "top-level help missing {sub}; got: {stdout}"
+        );
     }
     // `gc` is the visible alias.
     assert!(stdout.contains("gc"), "top-level help missing `gc` alias");
@@ -842,7 +858,10 @@ fn top_level_help_prints_all_subcommands() {
 
 #[test]
 fn version_flag_prints_version() {
-    let out = Command::new(binary()).args(["--version"]).output().expect("run");
+    let out = Command::new(binary())
+        .args(["--version"])
+        .output()
+        .expect("run");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Derive the expected version from the crate metadata at compile time

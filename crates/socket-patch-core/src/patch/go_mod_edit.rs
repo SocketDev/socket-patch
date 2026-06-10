@@ -557,14 +557,23 @@ mod tests {
     #[test]
     fn test_detect_owner() {
         use ReplaceOwner::*;
-        assert_eq!(detect_owner("./.socket/go-patches/github.com/x/y@v1.0.0"), Some(GoPatches));
+        assert_eq!(
+            detect_owner("./.socket/go-patches/github.com/x/y@v1.0.0"),
+            Some(GoPatches)
+        );
         assert_eq!(detect_owner(".socket/go-patches/x@v1.0.0"), Some(GoPatches));
-        assert_eq!(detect_owner("sub/.socket/go-patches/x@v1.0.0"), Some(GoPatches));
+        assert_eq!(
+            detect_owner("sub/.socket/go-patches/x@v1.0.0"),
+            Some(GoPatches)
+        );
         assert_eq!(
             detect_owner("./.socket/vendor/golang/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/github.com/x/y@v1.0.0"),
             Some(Vendor)
         );
-        assert_eq!(detect_owner(".socket/vendor/golang/u/x@v1.0.0"), Some(Vendor));
+        assert_eq!(
+            detect_owner(".socket/vendor/golang/u/x@v1.0.0"),
+            Some(Vendor)
+        );
         assert_eq!(detect_owner("../fork"), None);
         assert_eq!(detect_owner("./vendor/x"), None);
         assert_eq!(detect_owner("/abs/.socketX/go-patches/x"), None);
@@ -611,26 +620,44 @@ replace (
 ";
         let entries = parse_replace_entries(gomod);
         assert_eq!(entries.len(), 3);
-        let bar = entries.iter().find(|e| e.module == "github.com/foo/bar").unwrap();
+        let bar = entries
+            .iter()
+            .find(|e| e.module == "github.com/foo/bar")
+            .unwrap();
         assert!(bar.socket_owned());
         assert_eq!(bar.version.as_deref(), Some("v1.4.2"));
-        let baz = entries.iter().find(|e| e.module == "example.com/baz").unwrap();
+        let baz = entries
+            .iter()
+            .find(|e| e.module == "example.com/baz")
+            .unwrap();
         assert!(!baz.socket_owned());
         assert_eq!(baz.path.as_deref(), Some("../local-baz"));
-        let qux = entries.iter().find(|e| e.module == "example.com/qux").unwrap();
+        let qux = entries
+            .iter()
+            .find(|e| e.module == "example.com/qux")
+            .unwrap();
         assert!(!qux.socket_owned());
         assert_eq!(qux.path, None, "module-to-module replacement has no path");
 
         let req = parse_required_versions(gomod);
-        assert_eq!(req.get("github.com/foo/bar").map(String::as_str), Some("v1.4.2"));
-        assert_eq!(req.get("example.com/baz").map(String::as_str), Some("v2.0.0"));
+        assert_eq!(
+            req.get("github.com/foo/bar").map(String::as_str),
+            Some("v1.4.2")
+        );
+        assert_eq!(
+            req.get("example.com/baz").map(String::as_str),
+            Some("v2.0.0")
+        );
     }
 
     #[test]
     fn test_parse_require_single() {
         let gomod = "module m\n\ngo 1.21\n\nrequire github.com/x/y v1.0.0\n";
         let req = parse_required_versions(gomod);
-        assert_eq!(req.get("github.com/x/y").map(String::as_str), Some("v1.0.0"));
+        assert_eq!(
+            req.get("github.com/x/y").map(String::as_str),
+            Some("v1.0.0")
+        );
     }
 
     // ── upsert ───────────────────────────────────────────────────────
@@ -647,9 +674,11 @@ replace (
         assert!(out.contains("require github.com/foo/bar v1.4.2"));
         assert!(out.ends_with('\n'));
         // Idempotent.
-        assert!(upsert_replace_entry(&out, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
-            .unwrap()
-            .is_none());
+        assert!(
+            upsert_replace_entry(&out, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -663,7 +692,13 @@ replace (
         ));
         assert!(!out.contains("bar@v1.4.2"), "old version line gone");
         // Exactly one replace for the module.
-        assert_eq!(parse_replace_entries(&out).iter().filter(|e| e.module == "github.com/foo/bar").count(), 1);
+        assert_eq!(
+            parse_replace_entries(&out)
+                .iter()
+                .filter(|e| e.module == "github.com/foo/bar")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -673,14 +708,18 @@ replace (
             .unwrap()
             .unwrap();
         // Still a block member (indented, no `replace ` keyword), version bumped.
-        assert!(out.contains("\tgithub.com/foo/bar v1.5.0 => ./.socket/go-patches/github.com/foo/bar@v1.5.0"));
+        assert!(out.contains(
+            "\tgithub.com/foo/bar v1.5.0 => ./.socket/go-patches/github.com/foo/bar@v1.5.0"
+        ));
         assert!(out.contains("replace ("));
     }
 
     #[test]
     fn test_upsert_refuses_user_authored_same_version() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ../fork\n";
-        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err());
+        assert!(
+            upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err()
+        );
     }
 
     #[test]
@@ -691,13 +730,17 @@ replace (
             .unwrap()
             .unwrap();
         assert!(out.contains("replace github.com/foo/bar v1.0.0 => ../fork"));
-        assert!(out.contains("replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"));
+        assert!(out.contains(
+            "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
+        ));
     }
 
     #[test]
     fn test_upsert_refuses_versionless_user_catchall() {
         let gomod = "module m\n\nreplace github.com/foo/bar => ../fork\n";
-        assert!(upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err());
+        assert!(
+            upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR).is_err()
+        );
     }
 
     #[test]
@@ -708,18 +751,24 @@ replace (
         let out = upsert_replace_entry(gomod, "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR)
             .unwrap()
             .unwrap();
-        assert!(out.contains("replace example.com/other => ../other-fork"), "user catch-all preserved");
+        assert!(
+            out.contains("replace example.com/other => ../other-fork"),
+            "user catch-all preserved"
+        );
         assert!(out.contains(
             "replace github.com/foo/bar v1.4.2 => ./.socket/go-patches/github.com/foo/bar@v1.4.2"
         ));
         let entries = parse_replace_entries(&out);
-        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned()));
-        assert!(entries.iter().any(|e| e.module == "github.com/foo/bar" && e.socket_owned()));
+        assert!(entries
+            .iter()
+            .any(|e| e.module == "example.com/other" && !e.socket_owned()));
+        assert!(entries
+            .iter()
+            .any(|e| e.module == "github.com/foo/bar" && e.socket_owned()));
     }
 
     // ── cross-owner takeover + owner filtering ───────────────────────
-    const VENDOR_BASE: &str =
-        ".socket/vendor/golang/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const VENDOR_BASE: &str = ".socket/vendor/golang/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 
     /// Vendor takes over an apply (go-patches) redirect: the SAME socket-owned
     /// line is rewritten in place to the vendor path — never a remove+add pair,
@@ -736,7 +785,10 @@ replace (
         )));
         let entries = parse_replace_entries(&out);
         assert_eq!(
-            entries.iter().filter(|e| e.module == "github.com/foo/bar").count(),
+            entries
+                .iter()
+                .filter(|e| e.module == "github.com/foo/bar")
+                .count(),
             1,
             "exactly one directive for the module"
         );
@@ -811,14 +863,22 @@ replace (
     #[test]
     fn test_remove_leaves_user_replace() {
         let gomod = "module m\n\nreplace github.com/foo/bar v1.4.2 => ../fork\n";
-        assert!(remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches).unwrap().is_none());
+        assert!(
+            remove_replace_entry(gomod, "github.com/foo/bar", ReplaceOwner::GoPatches)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn test_remove_absent_is_noop() {
-        assert!(remove_replace_entry("module m\n\ngo 1.21\n", "github.com/foo/bar", ReplaceOwner::GoPatches)
-            .unwrap()
-            .is_none());
+        assert!(remove_replace_entry(
+            "module m\n\ngo 1.21\n",
+            "github.com/foo/bar",
+            ReplaceOwner::GoPatches
+        )
+        .unwrap()
+        .is_none());
     }
 
     // ── async round-trip ─────────────────────────────────────────────
@@ -832,11 +892,20 @@ replace (
         .await
         .unwrap();
 
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
-            .await
-            .unwrap());
+        assert!(ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .unwrap());
         let entries = read_replace_entries(dir.path()).await;
-        let bar = entries.iter().find(|e| e.module == "github.com/foo/bar").unwrap();
+        let bar = entries
+            .iter()
+            .find(|e| e.module == "github.com/foo/bar")
+            .unwrap();
         assert!(bar.socket_owned());
         assert_eq!(
             bar.path.as_deref(),
@@ -844,16 +913,30 @@ replace (
         );
         // Required-version cross-check source.
         let req = read_required_versions(dir.path()).await.unwrap();
-        assert_eq!(req.get("github.com/foo/bar").map(String::as_str), Some("v1.4.2"));
+        assert_eq!(
+            req.get("github.com/foo/bar").map(String::as_str),
+            Some("v1.4.2")
+        );
 
         // Idempotent on disk.
-        assert!(!ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
-            .await
-            .unwrap());
+        assert!(!ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .unwrap());
         // Drop.
-        assert!(drop_replace_entry(dir.path(), "github.com/foo/bar", ReplaceOwner::GoPatches, false)
-            .await
-            .unwrap());
+        assert!(drop_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            ReplaceOwner::GoPatches,
+            false
+        )
+        .await
+        .unwrap());
         assert!(read_replace_entries(dir.path()).await.is_empty());
     }
 
@@ -862,9 +945,15 @@ replace (
         let dir = tempfile::tempdir().unwrap();
         let body = "module m\n\ngo 1.21\n";
         fs::write(dir.path().join("go.mod"), body).await.unwrap();
-        let changed = ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, true)
-            .await
-            .unwrap();
+        let changed = ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            true,
+        )
+        .await
+        .unwrap();
         assert!(changed, "dry-run reports the change it would make");
         assert_eq!(
             fs::read_to_string(dir.path().join("go.mod")).await.unwrap(),
@@ -888,9 +977,15 @@ replace (
         .await
         .unwrap();
 
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
-            .await
-            .unwrap());
+        assert!(ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .unwrap());
 
         // Only go.mod should remain in the project root.
         let mut names: Vec<String> = std::fs::read_dir(dir.path())
@@ -913,11 +1008,19 @@ replace (
     async fn test_ensure_overwrite_preserves_unrelated_content_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let original = "module example.com/app\n\ngo 1.21\n\n// keep me\nrequire github.com/foo/bar v1.4.2\n\nreplace example.com/other v2.0.0 => ../other-fork\n";
-        fs::write(dir.path().join("go.mod"), original).await.unwrap();
-
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
+        fs::write(dir.path().join("go.mod"), original)
             .await
-            .unwrap());
+            .unwrap();
+
+        assert!(ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .unwrap());
 
         let on_disk = fs::read_to_string(dir.path().join("go.mod")).await.unwrap();
         // Our directive landed…
@@ -929,14 +1032,23 @@ replace (
         assert!(on_disk.contains("// keep me"));
         assert!(on_disk.contains("require github.com/foo/bar v1.4.2"));
         assert!(on_disk.contains("replace example.com/other v2.0.0 => ../other-fork"));
-        assert!(on_disk.starts_with(original), "original content kept verbatim as a prefix");
+        assert!(
+            on_disk.starts_with(original),
+            "original content kept verbatim as a prefix"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_missing_go_mod_errors() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(ensure_replace_entry(dir.path(), "github.com/foo/bar", "v1.4.2", GO_PATCHES_DIR, false)
-            .await
-            .is_err());
+        assert!(ensure_replace_entry(
+            dir.path(),
+            "github.com/foo/bar",
+            "v1.4.2",
+            GO_PATCHES_DIR,
+            false
+        )
+        .await
+        .is_err());
     }
 }

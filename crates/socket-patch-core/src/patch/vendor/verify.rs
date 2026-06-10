@@ -264,21 +264,31 @@ mod tests {
         let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
         let dir = root.join(&rel);
         tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
-        tokio::fs::write(dir.join("src/lib.rs"), PATCHED).await.unwrap();
+        tokio::fs::write(dir.join("src/lib.rs"), PATCHED)
+            .await
+            .unwrap();
 
         let rec = record(UUID, "src/lib.rs");
         let ent = entry("cargo", UUID, &rel);
         assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
 
-        tokio::fs::write(dir.join("src/lib.rs"), b"tampered").await.unwrap();
+        tokio::fs::write(dir.join("src/lib.rs"), b"tampered")
+            .await
+            .unwrap();
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "vendor_hash_mismatch"
         );
 
-        tokio::fs::remove_file(dir.join("src/lib.rs")).await.unwrap();
+        tokio::fs::remove_file(dir.join("src/lib.rs"))
+            .await
+            .unwrap();
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "file_not_found"
         );
     }
@@ -301,21 +311,29 @@ mod tests {
         // One tampered byte inside the archive flips the verdict.
         write_tgz(&root.join(&rel), "package/index.js", b"tampered");
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "vendor_hash_mismatch"
         );
 
         // Member missing entirely.
         write_tgz(&root.join(&rel), "package/other.js", PATCHED);
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "file_not_found"
         );
 
         // Truncated/corrupt gzip is unreadable, not a crash.
-        tokio::fs::write(root.join(&rel), b"\x1f\x8b00garbage").await.unwrap();
+        tokio::fs::write(root.join(&rel), b"\x1f\x8b00garbage")
+            .await
+            .unwrap();
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "vendor_artifact_unreadable"
         );
     }
@@ -336,7 +354,9 @@ mod tests {
 
         write_whl(&root.join(&rel), "six.py", b"tampered");
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "vendor_hash_mismatch"
         );
     }
@@ -352,7 +372,9 @@ mod tests {
         rec.files.clear();
         let ent = entry("npm", UUID, &rel);
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "no_files"
         );
 
@@ -368,7 +390,9 @@ mod tests {
         ] {
             let ent = entry("npm", UUID, bad);
             assert_eq!(
-                verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+                verify_vendored_patch_record(root, &ent, &rec)
+                    .await
+                    .unwrap_err(),
                 "vendor_path_unsafe",
                 "path {bad} must be rejected"
             );
@@ -389,7 +413,9 @@ mod tests {
         let ent = entry("npm", UUID, &rel);
         let rec = record(UUID, "package/index.js");
         assert_eq!(
-            verify_vendored_patch_record(root, &ent, &rec).await.unwrap_err(),
+            verify_vendored_patch_record(root, &ent, &rec)
+                .await
+                .unwrap_err(),
             "vendor_artifact_missing"
         );
     }

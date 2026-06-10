@@ -99,7 +99,9 @@ async fn assert_api_path_exercised(server: &MockServer) {
     let batch = received
         .iter()
         .find(|r| format!("{}", r.method) == "POST" && r.url.path().contains("/patches/batch"))
-        .unwrap_or_else(|| panic!("scan should have POSTed /patches/batch; received={received:#?}"));
+        .unwrap_or_else(|| {
+            panic!("scan should have POSTed /patches/batch; received={received:#?}")
+        });
     let batch_body = String::from_utf8_lossy(&batch.body);
     assert!(
         batch_body.contains(PURL),
@@ -119,8 +121,7 @@ async fn assert_api_path_exercised(server: &MockServer) {
 }
 
 async fn make_mock_server(after_hash: &str) -> MockServer {
-    let listener =
-        std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
     let server = MockServer::builder().listener(listener).start().await;
 
     // 1. Batch search reports a patch for the installed PURL.

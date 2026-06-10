@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use socket_patch_core::patch::apply_lock::{acquire, LockError, LockGuard};
 
-use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent,
-};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 /// Stable `errorCode` tag emitted as a `Skipped` warning event when
 /// `--break-lock` actually deletes a pre-existing lock file. Exposed
@@ -112,12 +110,19 @@ pub fn acquire_or_emit(
                 // `break_probe_held_message` takes no timeout precisely so
                 // the wrong value can't be passed back in.
                 let msg = break_probe_held_message();
-                emit(command, json, silent, dry_run, "lock_held", &msg, Some(socket_dir));
+                emit(
+                    command,
+                    json,
+                    silent,
+                    dry_run,
+                    "lock_held",
+                    &msg,
+                    Some(socket_dir),
+                );
                 return Err(1);
             }
             Err(LockError::Io { path, source }) => {
-                let msg =
-                    format!("failed to open lock file at {}: {}", path.display(), source);
+                let msg = format!("failed to open lock file at {}: {}", path.display(), source);
                 emit(command, json, silent, dry_run, "lock_io", &msg, None);
                 return Err(1);
             }
@@ -149,7 +154,15 @@ pub fn acquire_or_emit(
                     path.display(),
                     source
                 );
-                emit(command, json, silent, dry_run, "lock_break_failed", &msg, None);
+                emit(
+                    command,
+                    json,
+                    silent,
+                    dry_run,
+                    "lock_break_failed",
+                    &msg,
+                    None,
+                );
                 return Err(1);
             }
         }
@@ -256,7 +269,10 @@ fn emit(
     hint_dir: Option<&Path>,
 ) {
     if json {
-        println!("{}", error_envelope(command, dry_run, code, message).to_pretty_json());
+        println!(
+            "{}",
+            error_envelope(command, dry_run, code, message).to_pretty_json()
+        );
     } else if !silent {
         eprintln!("Error: {message}.");
         if hint_dir.is_some() {
@@ -440,7 +456,10 @@ mod tests {
             true, // break_lock
         )
         .unwrap_err();
-        assert_eq!(code, 1, "break-lock must refuse a live holder, not steal it");
+        assert_eq!(
+            code, 1,
+            "break-lock must refuse a live holder, not steal it"
+        );
         // The original holder's lock file is untouched.
         assert!(dir.path().join("apply.lock").is_file());
     }
@@ -506,7 +525,10 @@ mod tests {
     #[test]
     fn held_message_zero_timeout_omits_waited_clause() {
         let msg = held_message(Duration::ZERO);
-        assert!(!msg.contains("waited"), "zero budget should not claim a wait: {msg}");
+        assert!(
+            !msg.contains("waited"),
+            "zero budget should not claim a wait: {msg}"
+        );
     }
 
     /// Regression: the `--break-lock` pre-acquire probe is a non-blocking

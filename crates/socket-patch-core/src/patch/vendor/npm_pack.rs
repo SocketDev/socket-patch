@@ -144,10 +144,16 @@ fn collect_regular_files(staged_dir: &Path) -> std::io::Result<Vec<(String, Path
                 }
             }
         }
-        let executable = is_executable(&entry.metadata().map_err(|e| {
-            std::io::Error::other(e.to_string())
-        })?);
-        files.push((format!("package/{}", parts.join("/")), entry.into_path(), executable));
+        let executable = is_executable(
+            &entry
+                .metadata()
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        );
+        files.push((
+            format!("package/{}", parts.join("/")),
+            entry.into_path(),
+            executable,
+        ));
     }
     Ok(files)
 }
@@ -173,21 +179,30 @@ mod tests {
     /// Build a small staged tree with nested dirs, an executable, and an
     /// empty directory (which must NOT produce a tar entry).
     async fn build_stage(root: &Path) {
-        tokio::fs::create_dir_all(root.join("lib/nested")).await.unwrap();
-        tokio::fs::create_dir_all(root.join("empty-dir")).await.unwrap();
-        tokio::fs::write(root.join("package.json"), b"{\"name\":\"x\"}\n").await.unwrap();
-        tokio::fs::write(root.join("index.js"), b"module.exports = 1;\n").await.unwrap();
-        tokio::fs::write(root.join("lib/nested/deep.js"), b"deep\n").await.unwrap();
-        tokio::fs::write(root.join("cli.sh"), b"#!/bin/sh\n").await.unwrap();
+        tokio::fs::create_dir_all(root.join("lib/nested"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("empty-dir"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("package.json"), b"{\"name\":\"x\"}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("index.js"), b"module.exports = 1;\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("lib/nested/deep.js"), b"deep\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("cli.sh"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(
-                root.join("cli.sh"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .await
-            .unwrap();
+            tokio::fs::set_permissions(root.join("cli.sh"), std::fs::Permissions::from_mode(0o755))
+                .await
+                .unwrap();
         }
     }
 
@@ -224,9 +239,15 @@ mod tests {
 
         let bytes1 = tokio::fs::read(&dest1).await.unwrap();
         let bytes2 = tokio::fs::read(&dest2).await.unwrap();
-        assert_eq!(bytes1, bytes2, "two packs of the same tree must be byte-identical");
+        assert_eq!(
+            bytes1, bytes2,
+            "two packs of the same tree must be byte-identical"
+        );
         assert_eq!(packed1.sha256_hex, packed2.sha256_hex);
-        assert_eq!(packed1.sha1_hex, packed2.sha1_hex, "sha1 stable across packs");
+        assert_eq!(
+            packed1.sha1_hex, packed2.sha1_hex,
+            "sha1 stable across packs"
+        );
         assert_eq!(packed1.integrity, packed2.integrity);
 
         // The reported facts describe the final on-disk bytes.
@@ -275,7 +296,11 @@ mod tests {
         for (path, mtime, uid, gid, mode, data) in &entries {
             assert_eq!(*mtime, NPM_PACK_MTIME, "{path}: npm's fixed 1985 mtime");
             assert_eq!((*uid, *gid), (0, 0), "{path}: uid/gid must be 0");
-            let expected_mode = if path == "package/cli.sh" && cfg!(unix) { 0o755 } else { 0o644 };
+            let expected_mode = if path == "package/cli.sh" && cfg!(unix) {
+                0o755
+            } else {
+                0o644
+            };
             assert_eq!(*mode, expected_mode, "{path}: normalized mode");
             assert!(!data.is_empty(), "{path}: content must round-trip");
         }
@@ -291,16 +316,19 @@ mod tests {
         let stage = tmp.path().join("stage");
         build_stage(&stage).await;
         // An out-of-tree symlink: must neither appear nor be followed.
-        tokio::fs::write(tmp.path().join("outside.txt"), b"outside").await.unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("outside.txt"), stage.join("link.txt"))
+        tokio::fs::write(tmp.path().join("outside.txt"), b"outside")
+            .await
             .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside.txt"), stage.join("link.txt")).unwrap();
 
         let dest = tmp.path().join("pkg.tgz");
         pack_deterministic(&stage, &dest).await.unwrap();
 
         let entries = read_entries(&tokio::fs::read(&dest).await.unwrap());
         assert!(
-            entries.iter().all(|e| !e.0.contains("link.txt") && !e.0.contains("outside")),
+            entries
+                .iter()
+                .all(|e| !e.0.contains("link.txt") && !e.0.contains("outside")),
             "symlink leaked into the tarball: {:?}",
             entries.iter().map(|e| &e.0).collect::<Vec<_>>()
         );
@@ -313,7 +341,9 @@ mod tests {
         build_stage(&stage).await;
         let dest_dir = tmp.path().join("out");
         tokio::fs::create_dir_all(&dest_dir).await.unwrap();
-        pack_deterministic(&stage, &dest_dir.join("pkg.tgz")).await.unwrap();
+        pack_deterministic(&stage, &dest_dir.join("pkg.tgz"))
+            .await
+            .unwrap();
 
         for entry in std::fs::read_dir(&dest_dir).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();

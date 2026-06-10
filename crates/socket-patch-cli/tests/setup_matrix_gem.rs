@@ -133,8 +133,9 @@ mod host_guard {
     /// promises — a non-JSON / multi-line dump means the command did not
     /// run the path we think it did.
     fn parse_json(stdout: &str, who: &str) -> serde_json::Value {
-        serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}"))
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}")
+        })
     }
 
     fn json_str(v: &serde_json::Value, key: &str, who: &str) -> String {
@@ -179,14 +180,22 @@ mod host_guard {
 
         // ── check (pristine): plugin not wired → needs_configuration, exit 1 ─
         let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
-        assert_eq!(code, 1, "check on an unconfigured bundler project must exit 1.\n{out}\n{err}");
+        assert_eq!(
+            code, 1,
+            "check on an unconfigured bundler project must exit 1.\n{out}\n{err}"
+        );
         let v = parse_json(&out, "check (pristine)");
-        assert_eq!(json_str(&v, "status", "check (pristine)"), "needs_configuration");
+        assert_eq!(
+            json_str(&v, "status", "check (pristine)"),
+            "needs_configuration"
+        );
         // The Gemfile must be among the manifests reported as needing setup.
         let files = v.get("files").and_then(|f| f.as_array()).expect("files[]");
         assert!(
-            files.iter().any(|f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile")
-                && f.get("status").and_then(|s| s.as_str()) == Some("needs_configuration")),
+            files.iter().any(
+                |f| f.get("kind").and_then(|k| k.as_str()) == Some("gemfile")
+                    && f.get("status").and_then(|s| s.as_str()) == Some("needs_configuration")
+            ),
             "check must report the Gemfile as needs_configuration:\n{v}"
         );
 
@@ -195,14 +204,23 @@ mod host_guard {
         assert_eq!(code, 0, "setup must exit 0.\n{out}\n{err}");
         let v = parse_json(&out, "setup");
         assert_eq!(json_str(&v, "status", "setup"), "success");
-        assert!(json_i64(&v, "updated", "setup") >= 2, "Gemfile + plugin dir updated:\n{v}");
+        assert!(
+            json_i64(&v, "updated", "setup") >= 2,
+            "Gemfile + plugin dir updated:\n{v}"
+        );
         assert_eq!(json_i64(&v, "errors", "setup"), 0, "setup errors:\n{v}");
 
         // On-disk, via independent probes (NOT a copy of the writer output):
         // the managed block is appended (original bytes preserved as a prefix),
         let body = gemfile_body(root);
-        assert!(body.starts_with(GEMFILE), "setup must only APPEND to the Gemfile:\n{body}");
-        assert!(body.contains(MANAGED_MARKER), "managed block marker missing:\n{body}");
+        assert!(
+            body.starts_with(GEMFILE),
+            "setup must only APPEND to the Gemfile:\n{body}"
+        );
+        assert!(
+            body.contains(MANAGED_MARKER),
+            "managed block marker missing:\n{body}"
+        );
         assert!(
             body.contains("plugin 'socket-patch'"),
             "Gemfile must reference the socket-patch plugin:\n{body}"
@@ -230,9 +248,16 @@ mod host_guard {
 
         // ── check (after setup): configured, exit 0 ─────────────────────────
         let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
-        assert_eq!(code, 0, "check on a configured project must exit 0.\n{out}\n{err}");
         assert_eq!(
-            json_str(&parse_json(&out, "check (configured)"), "status", "check (configured)"),
+            code, 0,
+            "check on a configured project must exit 0.\n{out}\n{err}"
+        );
+        assert_eq!(
+            json_str(
+                &parse_json(&out, "check (configured)"),
+                "status",
+                "check (configured)"
+            ),
             "configured"
         );
 
@@ -241,14 +266,24 @@ mod host_guard {
         assert_eq!(code, 0, "idempotent re-setup must exit 0");
         let v = parse_json(&out, "re-setup");
         assert_eq!(json_str(&v, "status", "re-setup"), "already_configured");
-        assert_eq!(json_i64(&v, "updated", "re-setup"), 0, "re-setup must update nothing:\n{v}");
+        assert_eq!(
+            json_i64(&v, "updated", "re-setup"),
+            0,
+            "re-setup must update nothing:\n{v}"
+        );
 
         // ── remove: byte-for-byte restore + plugin dir gone ─────────────────
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
         assert_eq!(code, 0, "remove must exit 0.\n{out}\n{err}");
         let v = parse_json(&out, "remove");
         assert_eq!(json_str(&v, "status", "remove"), "success");
-        assert!(json_i64(&v, "removed", "remove") >= 2, "Gemfile + plugin dir removed:\n{v}");
+        assert!(
+            json_i64(&v, "removed", "remove") >= 2,
+            "Gemfile + plugin dir removed:\n{v}"
+        );
         assert_eq!(
             gemfile_body(root),
             GEMFILE,
@@ -263,7 +298,11 @@ mod host_guard {
         let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(code, 1, "check after remove must exit 1 again");
         assert_eq!(
-            json_str(&parse_json(&out, "check (removed)"), "status", "check (removed)"),
+            json_str(
+                &parse_json(&out, "check (removed)"),
+                "status",
+                "check (removed)"
+            ),
             "needs_configuration"
         );
     }

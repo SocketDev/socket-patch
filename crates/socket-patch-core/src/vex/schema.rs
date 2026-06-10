@@ -775,7 +775,10 @@ mod tests {
             ]
         }"#;
         let r: Result<Document, _> = serde_json::from_str(bad);
-        assert!(r.is_err(), "unknown nested status literal must fail to parse");
+        assert!(
+            r.is_err(),
+            "unknown nested status literal must fail to parse"
+        );
     }
 
     /// A document `version` supplied as a JSON string (`"1"`) must be

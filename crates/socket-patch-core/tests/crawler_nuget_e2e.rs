@@ -185,7 +185,10 @@ async fn crawl_all_discovers_global_cache_layout() {
     // matching would accept a wrong version or a malformed PURL.
     let mut purls: Vec<String> = result.iter().map(|p| p.purl.clone()).collect();
     purls.sort_unstable();
-    let mut expected = vec![ORG_PURL_A.to_ascii_lowercase(), ORG_PURL_B.to_ascii_lowercase()];
+    let mut expected = vec![
+        ORG_PURL_A.to_ascii_lowercase(),
+        ORG_PURL_B.to_ascii_lowercase(),
+    ];
     expected.sort_unstable();
     assert_eq!(
         purls, expected,
@@ -517,7 +520,9 @@ async fn crawl_all_handles_unreadable_version_dir() {
     // `pkg:nuget/blocked-name@1.0.0`, proving the chmod — not an empty dir — is
     // what suppresses it. Otherwise the assertion would be vacuous.
     let ver_dir = pkg_name_dir.join("1.0.0");
-    tokio::fs::create_dir_all(ver_dir.join("lib")).await.unwrap();
+    tokio::fs::create_dir_all(ver_dir.join("lib"))
+        .await
+        .unwrap();
     common::chmod_unreadable(&pkg_name_dir);
     // Stage a readable sibling package so we prove the top-level scan actually
     // ran and only the blocked name dir was dropped — not that scanning bailed

@@ -44,7 +44,10 @@ fn format_severity_low_wraps_in_cyan() {
 fn format_severity_unknown_passes_through_unwrapped() {
     // The `_` arm returns the input verbatim — no ANSI wrapper.
     let out = format_severity("nonsense", true);
-    assert!(!out.contains("\x1b["), "unknown severity must not wrap: {out:?}");
+    assert!(
+        !out.contains("\x1b["),
+        "unknown severity must not wrap: {out:?}"
+    );
     assert_eq!(out, "nonsense");
 }
 
@@ -112,7 +115,10 @@ fn select_one_empty_options_does_not_yield_out_of_bounds_index() {
     // any stdin read, so this is safe under both TTY and non-TTY.
     let empty: Vec<String> = Vec::new();
     assert!(
-        matches!(select_one("pick", &empty, false), Err(SelectError::Cancelled)),
+        matches!(
+            select_one("pick", &empty, false),
+            Err(SelectError::Cancelled)
+        ),
         "empty non-JSON select must be Cancelled"
     );
     // JSON mode is still decided first.

@@ -527,7 +527,8 @@ fn assert_rollback_restored(cwd: &Path, ecosystem: &str, fixture: &RollbackFixtu
         )
     });
     assert_eq!(
-        restored, ORIGINAL,
+        restored,
+        ORIGINAL,
         "rollback --ecosystems={ecosystem}: file at {} was not restored to its original bytes",
         fixture.verify_file.display()
     );
@@ -608,7 +609,8 @@ fn fixture_pypi(root: &Path) -> RollbackFixture {
     };
     std::fs::create_dir_all(sp.join("__rollback_dispatch__-1.0.0.dist-info")).unwrap();
     std::fs::write(
-        sp.join("__rollback_dispatch__-1.0.0.dist-info").join("METADATA"),
+        sp.join("__rollback_dispatch__-1.0.0.dist-info")
+            .join("METADATA"),
         "Name: __rollback_dispatch__\nVersion: 1.0.0\n\n",
     )
     .unwrap();
@@ -704,7 +706,11 @@ fn rollback_dispatch_branch_cargo() {
         "[package]\nname = \"__rollback_dispatch__\"\nversion = \"1.0.0\"\n",
     )
     .unwrap();
-    std::fs::write(crate_dir.join(".cargo-checksum.json"), r#"{"files":{},"package":"x"}"#).unwrap();
+    std::fs::write(
+        crate_dir.join(".cargo-checksum.json"),
+        r#"{"files":{},"package":"x"}"#,
+    )
+    .unwrap();
     let verify_file = crate_dir.join("src").join("lib.rs");
     std::fs::write(&verify_file, PATCHED).unwrap();
     write_rollback_manifest(root, purl, "src/lib.rs");
@@ -755,11 +761,7 @@ fn rollback_dispatch_branch_maven() {
     write_root_package_json(root);
     std::fs::write(root.join("pom.xml"), "<project></project>\n").unwrap();
     let repo = root.join("m2repo");
-    let artifact_dir = repo
-        .join("org")
-        .join("example")
-        .join("foo")
-        .join("1.0.0");
+    let artifact_dir = repo.join("org").join("example").join("foo").join("1.0.0");
     std::fs::create_dir_all(&artifact_dir).unwrap();
     // The Maven crawler verifies a coordinate dir by the presence of a .pom.
     std::fs::write(artifact_dir.join("foo-1.0.0.pom"), "<project/>").unwrap();

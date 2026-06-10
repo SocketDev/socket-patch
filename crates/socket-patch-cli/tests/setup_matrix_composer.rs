@@ -90,8 +90,9 @@ mod host_guard {
     /// non-JSON / multi-line dump means the command did not run the path we
     /// think it did.
     fn parse_obj(stdout: &str, who: &str) -> serde_json::Value {
-        serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}"))
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}")
+        })
     }
 
     /// Assert the parsed result is a genuine clean no-op for an unsupported
@@ -218,7 +219,10 @@ mod host_guard {
         assert_manifest_pristine(root, "after check (post-setup)");
 
         // ── remove: also a clean no-op, manifest still pristine ───────────────
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
         assert_eq!(
             code, 0,
             "setup --remove on a composer-only project must exit 0.\nstdout:\n{out}\nstderr:\n{err}"
@@ -241,19 +245,34 @@ mod host_guard {
         std::fs::write(root.join("composer.json"), COMPOSER_JSON).unwrap();
         let root_s = root.to_str().unwrap();
 
-        let status = |v: &serde_json::Value| v.get("status").and_then(|s| s.as_str()).map(str::to_string);
+        let status =
+            |v: &serde_json::Value| v.get("status").and_then(|s| s.as_str()).map(str::to_string);
 
         // ── check (pristine): not wired yet → needs_configuration / exit 1 ──
         let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(code, 1, "pre-setup check must fail:\n{out}");
-        assert_eq!(status(&parse_obj(&out, "check (pristine)")).as_deref(), Some("needs_configuration"));
+        assert_eq!(
+            status(&parse_obj(&out, "check (pristine)")).as_deref(),
+            Some("needs_configuration")
+        );
 
         // ── setup: wires the hook into composer.json → success / updated=1 ──
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "composer setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "composer setup must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_obj(&out, "setup");
-        assert_eq!(status(&v).as_deref(), Some("success"), "setup must report success:\n{out}");
-        assert_eq!(v.get("updated").and_then(|n| n.as_i64()), Some(1), "exactly the composer.json updated:\n{out}");
+        assert_eq!(
+            status(&v).as_deref(),
+            Some("success"),
+            "setup must report success:\n{out}"
+        );
+        assert_eq!(
+            v.get("updated").and_then(|n| n.as_i64()),
+            Some(1),
+            "exactly the composer.json updated:\n{out}"
+        );
         // Exactly one `composer`-kind file entry, status `updated`.
         let files = v["files"].as_array().expect("files array");
         assert_eq!(files.len(), 1, "one composer file entry:\n{out}");
@@ -263,34 +282,59 @@ mod host_guard {
         let on_disk = std::fs::read_to_string(root.join("composer.json")).unwrap();
         let cj: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         for event in ["post-install-cmd", "post-update-cmd"] {
-            let arr = cj["scripts"][event].as_array().unwrap_or_else(|| panic!("{event} missing:\n{on_disk}"));
+            let arr = cj["scripts"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("{event} missing:\n{on_disk}"));
             assert!(
-                arr.iter().any(|c| c.as_str().is_some_and(|s| s.contains("socket-patch apply"))),
+                arr.iter()
+                    .any(|c| c.as_str().is_some_and(|s| s.contains("socket-patch apply"))),
                 "{event} must carry the re-apply command:\n{on_disk}"
             );
         }
-        assert!(cj["require"]["monolog/monolog"] == "3.5.0", "user require preserved:\n{on_disk}");
+        assert!(
+            cj["require"]["monolog/monolog"] == "3.5.0",
+            "user require preserved:\n{on_disk}"
+        );
 
         // ── idempotent re-setup: already_configured, no change ──
         let (code, out, _) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
         assert_eq!(code, 0);
-        assert_eq!(status(&parse_obj(&out, "re-setup")).as_deref(), Some("already_configured"), "{out}");
+        assert_eq!(
+            status(&parse_obj(&out, "re-setup")).as_deref(),
+            Some("already_configured"),
+            "{out}"
+        );
 
         // ── check (post-setup): configured / exit 0 ──
         let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(code, 0, "post-setup check must pass:\n{out}");
-        assert_eq!(status(&parse_obj(&out, "check (post-setup)")).as_deref(), Some("configured"));
+        assert_eq!(
+            status(&parse_obj(&out, "check (post-setup)")).as_deref(),
+            Some("configured")
+        );
 
         // ── remove: strips the hook, restoring composer.json byte-for-byte ──
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "composer remove must succeed.\nstdout:\n{out}\nstderr:\n{err}");
-        assert_eq!(status(&parse_obj(&out, "remove")).as_deref(), Some("success"));
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
+        assert_eq!(
+            code, 0,
+            "composer remove must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        assert_eq!(
+            status(&parse_obj(&out, "remove")).as_deref(),
+            Some("success")
+        );
         // The `scripts` object we created is gone and the dir holds only composer.json.
         assert_manifest_pristine(root, "after remove");
 
         // ── check (post-remove): back to needs_configuration / exit 1 ──
         let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
         assert_eq!(code, 1, "post-remove check must fail again:\n{out}");
-        assert_eq!(status(&parse_obj(&out, "check (post-remove)")).as_deref(), Some("needs_configuration"));
+        assert_eq!(
+            status(&parse_obj(&out, "check (post-remove)")).as_deref(),
+            Some("needs_configuration")
+        );
     }
 }

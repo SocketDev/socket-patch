@@ -174,7 +174,13 @@ fn vendored_purl_attested_with_no_installed_tree() {
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         purl.to_string(),
-        make_record(UUID, "src/lib.rs", &after_hash, "GHSA-vend-aaaa", &["CVE-2024-1"]),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-vend-aaaa",
+            &["CVE-2024-1"],
+        ),
     );
     write_manifest(cwd, &manifest, true);
 
@@ -227,7 +233,13 @@ fn tampered_vendored_artifact_omitted_with_vendor_hash_mismatch() {
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         purl.to_string(),
-        make_record(UUID, "src/lib.rs", &after_hash, "GHSA-vend-bbbb", &["CVE-2024-2"]),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-vend-bbbb",
+            &["CVE-2024-2"],
+        ),
     );
     write_manifest(cwd, &manifest, true);
 
@@ -267,7 +279,10 @@ fn tampered_vendored_artifact_omitted_with_vendor_hash_mismatch() {
         skipped["errorCode"], "vendor_hash_mismatch",
         "the vendor verification reason must land in errorCode. event:\n{skipped}"
     );
-    assert!(!vex_path.exists(), "no VEX doc may be written when nothing attests");
+    assert!(
+        !vex_path.exists(),
+        "no VEX doc may be written when nothing attests"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -303,7 +318,13 @@ fn property7_vendored_purl_bypasses_setup_manual_filter() {
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         vendored_purl.to_string(),
-        make_record(UUID, "src/lib.rs", &after_hash, "GHSA-vend-cccc", &["CVE-2024-3"]),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &after_hash,
+            "GHSA-vend-cccc",
+            &["CVE-2024-3"],
+        ),
     );
     manifest.patches.insert(
         "pkg:npm/applied-pkg@1.0.0".to_string(),

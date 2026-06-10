@@ -642,12 +642,16 @@ mod tests {
 
     async fn write_lock(lock: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("Pipfile.lock"), lock).await.unwrap();
+        tokio::fs::write(tmp.path().join("Pipfile.lock"), lock)
+            .await
+            .unwrap();
         tmp
     }
 
     async fn read_lock(root: &Path) -> String {
-        tokio::fs::read_to_string(root.join("Pipfile.lock")).await.unwrap()
+        tokio::fs::read_to_string(root.join("Pipfile.lock"))
+            .await
+            .unwrap()
     }
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: PipenvMeta) -> VendorEntry {
@@ -674,7 +678,9 @@ mod tests {
     }
 
     async fn wire_default(p: &PipenvProject, root: &Path) -> (Vec<WiringRecord>, PipenvMeta) {
-        wire_pipenv(p, root, "six", REL_WHEEL, WHEEL_SHA, UUID).await.unwrap()
+        wire_pipenv(p, root, "six", REL_WHEEL, WHEEL_SHA, UUID)
+            .await
+            .unwrap()
     }
 
     /// The load-bearing oracle: wiring the registry lock must produce the
@@ -684,7 +690,11 @@ mod tests {
     async fn wiring_matches_fixtures_byte_identically() {
         let cases = [
             (LOCK_DIRECT_REGISTRY, LOCK_DIRECT_VENDORED, "direct"),
-            (LOCK_TRANSITIVE_REGISTRY, LOCK_TRANSITIVE_VENDORED, "transitive"),
+            (
+                LOCK_TRANSITIVE_REGISTRY,
+                LOCK_TRANSITIVE_VENDORED,
+                "transitive",
+            ),
         ];
         for (before, after, label) in cases {
             let tmp = write_lock(before).await;
@@ -741,7 +751,10 @@ mod tests {
         assert_eq!(wiring.len(), 2);
         let keys: Vec<&str> = wiring.iter().filter_map(|w| w.key.as_deref()).collect();
         assert_eq!(keys, vec!["default:six", "develop:six"]);
-        assert_eq!(meta.sections, vec!["default".to_string(), "develop".to_string()]);
+        assert_eq!(
+            meta.sections,
+            vec!["default".to_string(), "develop".to_string()]
+        );
 
         // Round trip: both entries restored byte-identically.
         let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
@@ -759,7 +772,9 @@ mod tests {
         assert_eq!(p.warnings.len(), 1);
         assert_eq!(p.warnings[0].code, "vendor_integrity_unverified");
         assert!(
-            p.warnings[0].detail.contains("protected only by the committed wheel itself"),
+            p.warnings[0]
+                .detail
+                .contains("protected only by the committed wheel itself"),
             "{}",
             p.warnings[0].detail
         );
@@ -808,7 +823,9 @@ mod tests {
         assert_eq!(err.0, "pypi_pipenv_lock_parse_failed");
 
         // pipfile-spec != 6 (and missing entirely)
-        let tmp = write_lock(&LOCK_DIRECT_REGISTRY.replace("\"pipfile-spec\": 6", "\"pipfile-spec\": 7")).await;
+        let tmp =
+            write_lock(&LOCK_DIRECT_REGISTRY.replace("\"pipfile-spec\": 6", "\"pipfile-spec\": 7"))
+                .await;
         let err = load_pipenv_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_spec_unsupported");
         let tmp = write_lock("{\"default\": {}}").await;
@@ -849,7 +866,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
-        assert_eq!(read_lock(tmp.path()).await, before, "refusal writes nothing");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            before,
+            "refusal writes nothing"
+        );
     }
 
     /// Re-running vendor on an already-wired lock with the SAME uuid is the
@@ -920,7 +941,9 @@ mod tests {
             .await
             .unwrap();
         let precious = outer.path().join("precious.txt");
-        tokio::fs::write(&precious, "keep me intact\n").await.unwrap();
+        tokio::fs::write(&precious, "keep me intact\n")
+            .await
+            .unwrap();
 
         let bad_records = [
             ("Pipfile", "default:six"),
@@ -938,11 +961,19 @@ mod tests {
                 original: Some(serde_json::json!({"malicious": true})),
                 new: Some(serde_json::json!("keep me intact")),
             }];
-            let meta = PipenvMeta { sections: vec!["default".into()] };
+            let meta = PipenvMeta {
+                sections: vec!["default".into()],
+            };
             let outcome = revert_pipenv(&entry_for(wiring, meta), &root, false).await;
-            assert!(outcome.success, "skipped fail-closed, not a hard error: {file}/{key}");
             assert!(
-                outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+                outcome.success,
+                "skipped fail-closed, not a hard error: {file}/{key}"
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
                 "skip surfaced for {file}/{key}: {:?}",
                 outcome.warnings
             );
@@ -953,7 +984,9 @@ mod tests {
             "out-of-tree file byte-untouched"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Pipfile.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
             LOCK_DIRECT_REGISTRY,
             "no record matched: the lock is not even re-serialized"
         );
@@ -977,8 +1010,12 @@ mod tests {
         });
 
         // Drift: someone replaced our hash in the vendored entry.
-        let drifted = read_lock(tmp.path()).await.replace(WHEEL_SHA, &"0".repeat(64));
-        tokio::fs::write(tmp.path().join("Pipfile.lock"), &drifted).await.unwrap();
+        let drifted = read_lock(tmp.path())
+            .await
+            .replace(WHEEL_SHA, &"0".repeat(64));
+        tokio::fs::write(tmp.path().join("Pipfile.lock"), &drifted)
+            .await
+            .unwrap();
 
         let outcome = revert_pipenv(&entry_for(wiring, meta), tmp.path(), false).await;
         assert!(outcome.success);
@@ -992,6 +1029,10 @@ mod tests {
             "drifted entry + unknown kind: {:?}",
             outcome.warnings
         );
-        assert_eq!(read_lock(tmp.path()).await, drifted, "drifted lock left alone");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            drifted,
+            "drifted lock left alone"
+        );
     }
 }

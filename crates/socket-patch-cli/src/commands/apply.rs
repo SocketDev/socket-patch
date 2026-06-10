@@ -171,7 +171,11 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
         .collect();
     let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await;
     if !removed.is_empty() && !common.silent && !common.json {
-        let verb = if common.dry_run { "Would remove" } else { "Removed" };
+        let verb = if common.dry_run {
+            "Would remove"
+        } else {
+            "Removed"
+        };
         println!("{verb} {} stale go patch redirect(s):", removed.len());
         for purl in &removed {
             println!("  {purl}");
@@ -341,9 +345,7 @@ fn all_files_already_patched(result: &ApplyResult) -> bool {
 pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
     match first_file_status {
         None => true,
-        Some(status) => {
-            *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched
-        }
+        Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
 }
 
@@ -391,9 +393,7 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         let files = result
             .files_verified
             .iter()
-            .filter(|f| {
-                f.status == VerifyStatus::Ready || f.status == VerifyStatus::AlreadyPatched
-            })
+            .filter(|f| f.status == VerifyStatus::Ready || f.status == VerifyStatus::AlreadyPatched)
             .map(|f| PatchEventFile {
                 path: f.file.clone(),
                 verified: true,
@@ -537,10 +537,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // fail-the-command contract). `None` => not requested.
             let vex_result = if success && args.vex.vex.is_some() {
                 let params = args.vex.to_build_params();
-                Some(
-                    generate_vex_from_manifest_path(&args.common, &params, &manifest_path)
-                        .await,
-                )
+                Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
             };
@@ -616,11 +613,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             // package: if everything came from the same
                             // source, show just that tag; otherwise list
                             // distinct sources.
-                            let mut tags: Vec<&'static str> = result
-                                .applied_via
-                                .values()
-                                .map(|v| v.as_tag())
-                                .collect();
+                            let mut tags: Vec<&'static str> =
+                                result.applied_via.values().map(|v| v.as_tag()).collect();
                             tags.sort_unstable();
                             tags.dedup();
                             let suffix = if tags.is_empty() {
@@ -686,9 +680,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
             // Track telemetry
             if success {
-                track_patch_applied(patched_count, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_applied(
+                    patched_count,
+                    args.common.dry_run,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             } else {
-                track_patch_apply_failed("One or more patches failed to apply", args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_apply_failed(
+                    "One or more patches failed to apply",
+                    args.common.dry_run,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             }
 
             // A requested-but-failed VEX flips an otherwise-successful
@@ -700,7 +706,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_apply_failed(&e, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_apply_failed(
+                &e,
+                args.common.dry_run,
+                api_token.as_deref(),
+                org_slug.as_deref(),
+            )
+            .await;
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
@@ -744,8 +756,7 @@ async fn apply_patches_inner(
 
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned =
-        partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
+    let partitioned = partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
 
     let target_manifest_purls: HashSet<String> = partitioned
         .values()
@@ -766,8 +777,12 @@ async fn apply_patches_inner(
         batch_size: 100,
     };
 
-    let all_packages =
-        find_packages_for_purls(&partitioned, &crawler_options, args.common.silent || args.common.json).await;
+    let all_packages = find_packages_for_purls(
+        &partitioned,
+        &crawler_options,
+        args.common.silent || args.common.json,
+    )
+    .await;
 
     let has_any_purls = !partitioned.is_empty();
 
@@ -791,7 +806,9 @@ async fn apply_patches_inner(
                 "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
                 target_manifest_purls.len()
             );
-            eprintln!("  Check that packages are installed and --cwd points to the right directory.");
+            eprintln!(
+                "  Check that packages are installed and --cwd points to the right directory."
+            );
         }
         let unmatched: Vec<String> = target_manifest_purls.iter().cloned().collect();
         return Ok((false, Vec::new(), unmatched));
@@ -855,9 +872,11 @@ async fn apply_patches_inner(
                 // Mirrors `select_installed_variants`, used by rollback/get.
                 if !args.force {
                     let first_status = match patch.files.iter().next() {
-                        Some((file_name, file_info)) => {
-                            Some(verify_file_patch(pkg_path, file_name, file_info).await.status)
-                        }
+                        Some((file_name, file_info)) => Some(
+                            verify_file_patch(pkg_path, file_name, file_info)
+                                .await
+                                .status,
+                        ),
                         None => None,
                     };
                     if !variant_matches_installed(first_status.as_ref()) {
@@ -955,30 +974,24 @@ async fn apply_patches_inner(
             // Everything else — npm/pypi/gem and cargo (vendored or registry
             // cache) — patches in place via `apply_package_patch`. Without the
             // `golang` feature `try_local_go_apply` is an inert `None`.
-            let result = match try_local_go_apply(
-                purl,
-                pkg_path,
-                patch,
-                &sources,
-                &args.common,
-                args.force,
-            )
-            .await
-            {
-                Some(r) => r,
-                None => {
-                    apply_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &sources,
-                        Some(&patch.uuid),
-                        args.common.dry_run,
-                        args.force,
-                    )
+            let result =
+                match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, args.force)
                     .await
-                }
-            };
+                {
+                    Some(r) => r,
+                    None => {
+                        apply_package_patch(
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            Some(&patch.uuid),
+                            args.common.dry_run,
+                            args.force,
+                        )
+                        .await
+                    }
+                };
 
             if !result.success {
                 has_errors = true;
@@ -1003,13 +1016,19 @@ async fn apply_patches_inner(
         .collect();
 
     if !unmatched.is_empty() && !args.common.silent && !args.common.json {
-        eprintln!("\nWarning: {} manifest patch(es) had no matching installed package:", unmatched.len());
+        eprintln!(
+            "\nWarning: {} manifest patch(es) had no matching installed package:",
+            unmatched.len()
+        );
         for purl in &unmatched {
             eprintln!("  - {}", purl);
         }
     }
 
-    if !target_manifest_purls.is_empty() && matched_manifest_purls.is_empty() && !all_packages.is_empty() {
+    if !target_manifest_purls.is_empty()
+        && matched_manifest_purls.is_empty()
+        && !all_packages.is_empty()
+    {
         if !args.common.silent && !args.common.json {
             eprintln!("Warning: None of the targeted manifest patches matched installed packages.");
         }
@@ -1018,8 +1037,14 @@ async fn apply_patches_inner(
 
     // Post-apply summary
     if !args.common.silent && !args.common.json {
-        let applied_count = results.iter().filter(|r| r.success && !r.files_patched.is_empty()).count();
-        let already_count = results.iter().filter(|r| all_files_already_patched(r)).count();
+        let applied_count = results
+            .iter()
+            .filter(|r| r.success && !r.files_patched.is_empty())
+            .count();
+        let already_count = results
+            .iter()
+            .filter(|r| all_files_already_patched(r))
+            .count();
         println!(
             "\nSummary: {}/{} targeted patches applied, {} already patched, {} not found on disk",
             applied_count,
@@ -1107,7 +1132,11 @@ mod tests {
         // Dry-run events list verified files but never an `appliedVia`
         // — nothing was actually written.
         assert_eq!(v["files"][0]["path"], "package/index.js");
-        assert!(v["files"][0].as_object().unwrap().get("appliedVia").is_none());
+        assert!(v["files"][0]
+            .as_object()
+            .unwrap()
+            .get("appliedVia")
+            .is_none());
     }
 
     #[test]
@@ -1191,19 +1220,13 @@ mod tests {
 
     #[test]
     fn all_files_already_patched_true_when_every_file_matches() {
-        let result = sample_verified(&[
-            VerifyStatus::AlreadyPatched,
-            VerifyStatus::AlreadyPatched,
-        ]);
+        let result = sample_verified(&[VerifyStatus::AlreadyPatched, VerifyStatus::AlreadyPatched]);
         assert!(all_files_already_patched(&result));
     }
 
     #[test]
     fn all_files_already_patched_false_when_any_file_differs() {
-        let result = sample_verified(&[
-            VerifyStatus::AlreadyPatched,
-            VerifyStatus::Ready,
-        ]);
+        let result = sample_verified(&[VerifyStatus::AlreadyPatched, VerifyStatus::Ready]);
         assert!(!all_files_already_patched(&result));
     }
 
@@ -1236,11 +1259,15 @@ mod tests {
         // Installed distribution: first file applies cleanly, or is
         // already at afterHash → this variant is the one on disk.
         assert!(variant_matches_installed(Some(&VerifyStatus::Ready)));
-        assert!(variant_matches_installed(Some(&VerifyStatus::AlreadyPatched)));
+        assert!(variant_matches_installed(Some(
+            &VerifyStatus::AlreadyPatched
+        )));
 
         // Not the installed distribution → must be skipped. The NotFound
         // case is the specific regression this guards.
-        assert!(!variant_matches_installed(Some(&VerifyStatus::HashMismatch)));
+        assert!(!variant_matches_installed(Some(
+            &VerifyStatus::HashMismatch
+        )));
         assert!(!variant_matches_installed(Some(&VerifyStatus::NotFound)));
 
         // A variant with no files has nothing to disqualify it — match,

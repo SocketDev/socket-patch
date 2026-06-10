@@ -71,7 +71,9 @@ async fn get_with_id_flag_selects_specific_patch() {
     let encoded = "pkg%3Anpm%2Fmulti%401.0.0";
 
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [
                 {
@@ -143,9 +145,16 @@ async fn get_with_id_flag_selects_specific_patch() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "stdout={stdout}");
     assert_eq!(v["found"], 1, "exactly one patch fetched; stdout={stdout}");
-    assert_eq!(v["downloaded"], 1, "the patch must be downloaded; stdout={stdout}");
+    assert_eq!(
+        v["downloaded"], 1,
+        "the patch must be downloaded; stdout={stdout}"
+    );
     let patches = v["patches"].as_array().expect("patches array");
-    assert_eq!(patches.len(), 1, "exactly one patch record; stdout={stdout}");
+    assert_eq!(
+        patches.len(),
+        1,
+        "exactly one patch record; stdout={stdout}"
+    );
     // The crux: --id <UUID_B> must select UUID_B specifically, not the
     // first patch (UUID_A) that the by-package listing would surface.
     assert_eq!(
@@ -165,7 +174,9 @@ async fn get_with_id_flag_selects_specific_patch() {
     // dedup/sort to UUID_B; the request log is what makes this airtight.
     let paths = received_paths(&mock).await;
     assert!(
-        paths.iter().any(|p| p.ends_with(&format!("/patches/view/{UUID_B}"))),
+        paths
+            .iter()
+            .any(|p| p.ends_with(&format!("/patches/view/{UUID_B}"))),
         "--id must fetch view/{UUID_B} directly; recorded paths={paths:?}"
     );
     assert!(
@@ -173,7 +184,9 @@ async fn get_with_id_flag_selects_specific_patch() {
         "--id must NOT consult the by-package listing; recorded paths={paths:?}"
     );
     assert!(
-        !paths.iter().any(|p| p.ends_with(&format!("/patches/view/{UUID_A}"))),
+        !paths
+            .iter()
+            .any(|p| p.ends_with(&format!("/patches/view/{UUID_A}"))),
         "--id must not fetch the non-selected UUID_A; recorded paths={paths:?}"
     );
 }
@@ -185,7 +198,9 @@ async fn get_with_no_matching_purl_emits_not_found() {
     let encoded = "pkg%3Anpm%2Fempty-result%401.0.0";
 
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [],
             "canAccessPaidPatches": false,
@@ -230,7 +245,9 @@ async fn get_with_no_matching_purl_emits_not_found() {
     // short-circuit that never queried the API at all.
     let paths = received_paths(&mock).await;
     assert!(
-        paths.iter().any(|p| p.contains(&format!("/by-package/{encoded}"))),
+        paths
+            .iter()
+            .any(|p| p.contains(&format!("/by-package/{encoded}"))),
         "the by-package endpoint must actually be queried; recorded paths={paths:?}"
     );
 }
@@ -284,8 +301,14 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
     // but success". The patch must NOT have been downloaded.
     assert_eq!(v["status"], "paid_required", "stdout={stdout}");
     assert_eq!(v["found"], 1, "the paid patch was found; stdout={stdout}");
-    assert_eq!(v["downloaded"], 0, "must not download a paid patch; stdout={stdout}");
-    assert_eq!(v["applied"], 0, "must not apply a paid patch; stdout={stdout}");
+    assert_eq!(
+        v["downloaded"], 0,
+        "must not download a paid patch; stdout={stdout}"
+    );
+    assert_eq!(
+        v["applied"], 0,
+        "must not apply a paid patch; stdout={stdout}"
+    );
     let patches = v["patches"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1, "stdout={stdout}");
     assert_eq!(patches[0]["uuid"], UUID_A, "stdout={stdout}");
@@ -294,7 +317,9 @@ async fn get_by_package_with_single_paid_patch_emits_paid_required() {
     // must NOT have attempted to download the paid blob via any view endpoint.
     let paths = received_paths(&mock).await;
     assert!(
-        paths.iter().any(|p| p.contains(&format!("/patch/by-package/{encoded}"))),
+        paths
+            .iter()
+            .any(|p| p.contains(&format!("/patch/by-package/{encoded}"))),
         "the public proxy by-package endpoint must be queried; recorded paths={paths:?}"
     );
     assert!(
@@ -359,7 +384,10 @@ async fn get_with_invalid_search_purl_falls_through() {
     assert_ne!(v["status"], "success", "stdout={stdout}");
     // The mock returns 500; if the binary had queried it the run would have
     // surfaced an error status instead of no_packages.
-    assert_ne!(v["status"], "error", "should not have reached the API; stdout={stdout}");
+    assert_ne!(
+        v["status"], "error",
+        "should not have reached the API; stdout={stdout}"
+    );
     // The strongest guarantee: the binary must short-circuit BEFORE any
     // network call on an empty workspace. Inspecting the status alone is a
     // disjoint-outcome loophole (a broken impl could hit the 500 mock and
@@ -435,7 +463,9 @@ async fn get_uuid_returns_paid_patch_with_token_succeeds() {
     // (bypassing the public proxy), proving the download was a real fetch.
     let paths = received_paths(&mock).await;
     assert!(
-        paths.iter().any(|p| p.ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_A}"))),
+        paths
+            .iter()
+            .any(|p| p.ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_A}"))),
         "authenticated paid fetch must hit the org-scoped view endpoint; recorded paths={paths:?}"
     );
 }
@@ -448,7 +478,14 @@ fn get_help_lists_all_identifier_flags() {
         .expect("run");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for flag in ["--id", "--cve", "--ghsa", "--package", "--save-only", "--one-off"] {
+    for flag in [
+        "--id",
+        "--cve",
+        "--ghsa",
+        "--package",
+        "--save-only",
+        "--one-off",
+    ] {
         assert!(
             stdout.contains(flag),
             "get --help missing flag {flag}; got: {stdout}"

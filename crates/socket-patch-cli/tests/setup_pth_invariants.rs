@@ -82,9 +82,10 @@ fn copy_tree(src: &Path, dst: &Path) {
 /// is not exactly one. Stops a regression from hiding a wrong/extra entry
 /// behind a positional `files[0]`.
 fn file_entry<'a>(v: &'a serde_json::Value, kind: &str) -> &'a serde_json::Value {
-    let arr = v["files"].as_array().unwrap_or_else(|| panic!("files must be an array: {v}"));
-    let matches: Vec<&serde_json::Value> =
-        arr.iter().filter(|f| f["kind"] == kind).collect();
+    let arr = v["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("files must be an array: {v}"));
+    let matches: Vec<&serde_json::Value> = arr.iter().filter(|f| f["kind"] == kind).collect();
     assert_eq!(
         matches.len(),
         1,
@@ -134,14 +135,20 @@ fn pip_requirements_gets_hook_dep() {
     assert_eq!(code, 0, "setup should succeed; payload={v}");
     assert_eq!(v["status"], "success");
     assert_eq!(v["updated"], 1);
-    assert_eq!(v["alreadyConfigured"], 0, "fresh file is not already-configured");
+    assert_eq!(
+        v["alreadyConfigured"], 0,
+        "fresh file is not already-configured"
+    );
     assert_eq!(v["errors"], 0);
     assert_eq!(v["pythonPackageManager"], "pip");
 
     let entry = file_entry(&v, "pth");
     assert_eq!(entry["status"], "updated");
     assert!(
-        entry["path"].as_str().unwrap().ends_with("requirements.txt"),
+        entry["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("requirements.txt"),
         "pth entry must point at requirements.txt: {entry}"
     );
     assert!(entry["error"].is_null(), "no error expected: {entry}");
@@ -205,7 +212,10 @@ fn uv_pyproject_array_edited_and_format_preserved() {
     // user's 4-space array indentation is kept, and the file is still parseable
     // by the same edit path (idempotent re-run reports already-configured, which
     // proves the array is well-formed enough to be re-detected).
-    assert!(py.contains("[tool.uv]"), "unrelated tables preserved:\n{py}");
+    assert!(
+        py.contains("[tool.uv]"),
+        "unrelated tables preserved:\n{py}"
+    );
     assert!(py.contains("name = \"x\""), "scalar keys preserved:\n{py}");
     assert!(
         py.contains("    \"requests\""),
@@ -228,13 +238,19 @@ fn idempotent_second_run_reports_already_configured() {
     let (code1, v1) = run_setup(tmp.path(), &[]);
     assert_eq!(code1, 0, "first run must succeed: {v1}");
     assert_eq!(v1["status"], "success", "first run must configure: {v1}");
-    assert_eq!(v1["updated"], 1, "first run updates exactly one manifest: {v1}");
+    assert_eq!(
+        v1["updated"], 1,
+        "first run updates exactly one manifest: {v1}"
+    );
 
     let (code, v) = run_setup(tmp.path(), &[]);
     assert_eq!(code, 0);
     assert_eq!(v["status"], "already_configured");
     assert_eq!(v["updated"], 0, "second run must not re-edit: {v}");
-    assert_eq!(v["alreadyConfigured"], 1, "second run sees it configured: {v}");
+    assert_eq!(
+        v["alreadyConfigured"], 1,
+        "second run sees it configured: {v}"
+    );
     let req = read(&tmp.path().join("requirements.txt"));
     assert_eq!(
         req.matches("socket-patch[hook]").count(),
@@ -312,7 +328,10 @@ fn polyglot_configures_both_npm_and_python() {
     assert_eq!(code, 0, "payload={v}");
     assert_eq!(v["status"], "success", "payload={v}");
     assert_eq!(v["updated"], 2);
-    assert_eq!(v["alreadyConfigured"], 0, "both manifests start unconfigured: {v}");
+    assert_eq!(
+        v["alreadyConfigured"], 0,
+        "both manifests start unconfigured: {v}"
+    );
     assert_eq!(v["errors"], 0);
 
     let files = v["files"].as_array().unwrap();
@@ -325,8 +344,14 @@ fn polyglot_configures_both_npm_and_python() {
 
     // The npm side injects the postinstall hook into package.json.
     let pkg = read(&tmp.path().join("package.json"));
-    assert!(pkg.contains("socket-patch"), "package.json must gain the hook:\n{pkg}");
-    assert!(pkg.contains("postinstall"), "npm hook is a postinstall script:\n{pkg}");
+    assert!(
+        pkg.contains("socket-patch"),
+        "package.json must gain the hook:\n{pkg}"
+    );
+    assert!(
+        pkg.contains("postinstall"),
+        "npm hook is a postinstall script:\n{pkg}"
+    );
 
     // The python side adds the dep inside the dependencies array.
     let py = read(&tmp.path().join("pyproject.toml"));
@@ -374,7 +399,10 @@ fn setup_python_writes_only_inside_repo() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     write(&proj.path().join("requirements.txt"), "requests\n");
-    assert!(files_under(home.path()).is_empty(), "sentinel HOME must start empty");
+    assert!(
+        files_under(home.path()).is_empty(),
+        "sentinel HOME must start empty"
+    );
 
     let out = Command::new(binary())
         .args(["setup", "--json", "--yes"])

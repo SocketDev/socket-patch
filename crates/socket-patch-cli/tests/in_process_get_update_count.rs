@@ -101,7 +101,10 @@ async fn failed_update_fetch_is_not_counted_as_updated() {
 
     assert_eq!(code, 1, "a failed detail fetch must exit 1; json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
-    assert_eq!(json["failed"], 1, "the fetch failure must be counted; json={json}");
+    assert_eq!(
+        json["failed"], 1,
+        "the fetch failure must be counted; json={json}"
+    );
     assert_eq!(
         json["updated"], 0,
         "a patch that never downloaded must not be counted as updated; json={json}"
@@ -152,7 +155,10 @@ async fn successful_update_is_counted_once() {
     // save_only => no apply step => clean success.
     assert_eq!(code, 0, "save-only update should succeed; json={json}");
     assert_eq!(json["status"], "success", "json={json}");
-    assert_eq!(json["updated"], 1, "the replacement must be counted once; json={json}");
+    assert_eq!(
+        json["updated"], 1,
+        "the replacement must be counted once; json={json}"
+    );
     assert_eq!(json["downloaded"], 1, "json={json}");
     assert_eq!(json["failed"], 0, "json={json}");
 
@@ -165,5 +171,8 @@ async fn successful_update_is_counted_once() {
     // The manifest record was actually replaced with the new uuid.
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(manifest["patches"][PURL]["uuid"], NEW_UUID, "manifest={manifest}");
+    assert_eq!(
+        manifest["patches"][PURL]["uuid"], NEW_UUID,
+        "manifest={manifest}"
+    );
 }

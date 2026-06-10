@@ -200,7 +200,8 @@ pub async fn stage_patch_sources(
         packages_path: Some(&stage_packages),
         diffs_path: Some(&stage_diffs),
     };
-    let fetch_result = fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
+    let fetch_result =
+        fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
 
     if !common.silent && !common.json {
         println!("{}", format_fetch_result(&fetch_result));

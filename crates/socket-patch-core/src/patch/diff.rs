@@ -251,8 +251,7 @@ mod tests {
         // ...and short / bad-magic inputs are deferred to Bspatch::new, so the
         // guard returns Ok for them rather than masking the canonical error.
         validate_bsdiff_header(b"too short").expect("short input deferred");
-        validate_bsdiff_header(b"NOTBSDIFF.........................")
-            .expect("bad magic deferred");
+        validate_bsdiff_header(b"NOTBSDIFF.........................").expect("bad magic deferred");
     }
 
     #[test]

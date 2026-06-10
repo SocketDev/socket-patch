@@ -100,12 +100,21 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
 
     // mkdirp: emit every missing ancestor of `dirpath` (no trailing slash),
     // shallowest first, exactly once.
-    fn mkdirp(dirpath: &str, seen: &mut std::collections::HashSet<String>, out: &mut Vec<ZipEntry>) {
+    fn mkdirp(
+        dirpath: &str,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<ZipEntry>,
+    ) {
         let parts: Vec<&str> = dirpath.split('/').collect();
         for i in 1..=parts.len() {
             let d = format!("{}/", parts[..i].join("/"));
             if seen.insert(d.clone()) {
-                out.push(ZipEntry { name: d, is_dir: true, mode: MODE_DIR, data: Vec::new() });
+                out.push(ZipEntry {
+                    name: d,
+                    is_dir: true,
+                    mode: MODE_DIR,
+                    data: Vec::new(),
+                });
             }
         }
     }
@@ -124,11 +133,7 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
             return Err(format!("tar entry name `{raw_name}` is not ASCII"));
         }
         // Strip the first path component (`package/` for npm packs).
-        let stripped = raw_name
-            .split('/')
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("/");
+        let stripped = raw_name.split('/').skip(1).collect::<Vec<_>>().join("/");
         let stripped = stripped.trim_end_matches('/');
 
         let entry_type = entry.header().entry_type();
@@ -158,8 +163,17 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
                     .header()
                     .mode()
                     .map_err(|e| format!("cannot read mode of `{raw_name}`: {e}"))?;
-                let mode = if tar_mode & 0o111 != 0 { MODE_FILE_EXEC } else { MODE_FILE };
-                entries.push(ZipEntry { name: target, is_dir: false, mode, data });
+                let mode = if tar_mode & 0o111 != 0 {
+                    MODE_FILE_EXEC
+                } else {
+                    MODE_FILE
+                };
+                entries.push(ZipEntry {
+                    name: target,
+                    is_dir: false,
+                    mode,
+                    data,
+                });
             }
             // Symlinks/hardlinks/devices never appear in `npm pack` output and
             // yarn's conversion of them is unverified — fail closed rather
@@ -189,8 +203,8 @@ fn as_u32(n: usize, what: &str) -> Result<u32, String> {
 
 /// Serialize the entries per the pinned recipe: LFHs+data, central dir, EOCD.
 fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
-    let count =
-        u16::try_from(entries.len()).map_err(|_| "too many entries for a zip32 EOCD".to_string())?;
+    let count = u16::try_from(entries.len())
+        .map_err(|_| "too many entries for a zip32 EOCD".to_string())?;
 
     let mut blob: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
@@ -206,7 +220,11 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
             crc.sum()
         };
         let size = as_u32(e.data.len(), "entry size")?;
-        let vneed = if e.is_dir { VERSION_NEEDED_DIR } else { VERSION_NEEDED_FILE };
+        let vneed = if e.is_dir {
+            VERSION_NEEDED_DIR
+        } else {
+            VERSION_NEEDED_FILE
+        };
 
         blob.extend_from_slice(b"PK\x03\x04");
         w16(&mut blob, vneed);
@@ -217,7 +235,10 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
         w32(&mut blob, crc);
         w32(&mut blob, size); // compressed == uncompressed (stored)
         w32(&mut blob, size);
-        w16(&mut blob, u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?);
+        w16(
+            &mut blob,
+            u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?,
+        );
         w16(&mut blob, 0); // extra len
         blob.extend_from_slice(e.name.as_bytes());
         blob.extend_from_slice(&e.data);
@@ -416,8 +437,9 @@ mod tests {
 
         let zip_bytes = rebuild_cache_zip(&tgz, "@scope/pkg").unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).unwrap();
-        let names: Vec<String> =
-            (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -452,7 +474,8 @@ mod tests {
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Symlink);
         h.set_size(0);
-        tar.append_link(&mut h, "package/evil", "/etc/passwd").unwrap();
+        tar.append_link(&mut h, "package/evil", "/etc/passwd")
+            .unwrap();
         let tgz = tar.into_inner().unwrap().finish().unwrap();
         let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
         assert!(err.contains("unsupported tar entry type"), "{err}");
@@ -465,7 +488,8 @@ mod tests {
         h.set_size(1);
         h.set_mode(0o644);
         h.set_cksum();
-        tar.append_data(&mut h, "package/na\u{ef}ve.js", &b"x"[..]).unwrap();
+        tar.append_data(&mut h, "package/na\u{ef}ve.js", &b"x"[..])
+            .unwrap();
         let tgz = tar.into_inner().unwrap().finish().unwrap();
         let err = berry_cache_checksum_10c0(&tgz, "x").unwrap_err();
         assert!(err.contains("not ASCII"), "{err}");

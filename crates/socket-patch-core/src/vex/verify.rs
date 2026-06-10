@@ -569,9 +569,8 @@ mod tests {
             "new.js".to_string(),
             PatchFileInfo {
                 before_hash: String::new(), // new file, not yet created
-                after_hash:
-                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                        .to_string(),
+                after_hash: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                    .to_string(),
             },
         );
 
@@ -651,17 +650,27 @@ mod tests {
         let b = b"patched-b";
         let hash_a = compute_git_sha256_from_bytes(a);
         let hash_b = compute_git_sha256_from_bytes(b);
-        tokio::fs::write(pkg_dir.path().join("a.js"), a).await.unwrap();
-        tokio::fs::write(pkg_dir.path().join("b.js"), b).await.unwrap();
+        tokio::fs::write(pkg_dir.path().join("a.js"), a)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg_dir.path().join("b.js"), b)
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
             "a.js".to_string(),
-            PatchFileInfo { before_hash: "aaaa".to_string(), after_hash: hash_a },
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: hash_a,
+            },
         );
         files.insert(
             "b.js".to_string(),
-            PatchFileInfo { before_hash: "bbbb".to_string(), after_hash: hash_b },
+            PatchFileInfo {
+                before_hash: "bbbb".to_string(),
+                after_hash: hash_b,
+            },
         );
 
         let mut manifest = PatchManifest::new();
@@ -717,7 +726,10 @@ mod tests {
 
         let mut paths = HashMap::new();
         paths.insert("pkg:npm/ok@1.0.0".to_string(), ok_dir.path().to_path_buf());
-        paths.insert("pkg:npm/bad@1.0.0".to_string(), bad_dir.path().to_path_buf());
+        paths.insert(
+            "pkg:npm/bad@1.0.0".to_string(),
+            bad_dir.path().to_path_buf(),
+        );
 
         let out = applied_patches(&manifest, &paths).await;
         assert_eq!(out.applied, vec!["pkg:npm/ok@1.0.0".to_string()]);
@@ -865,11 +877,17 @@ mod tests {
         let mut files = HashMap::new();
         files.insert(
             "a.js".to_string(),
-            PatchFileInfo { before_hash: "aaaa".to_string(), after_hash: "deadbeef".to_string() },
+            PatchFileInfo {
+                before_hash: "aaaa".to_string(),
+                after_hash: "deadbeef".to_string(),
+            },
         );
         files.insert(
             "b.js".to_string(),
-            PatchFileInfo { before_hash: "bbbb".to_string(), after_hash: "deadbeef".to_string() },
+            PatchFileInfo {
+                before_hash: "bbbb".to_string(),
+                after_hash: "deadbeef".to_string(),
+            },
         );
 
         let mut manifest = PatchManifest::new();
@@ -891,9 +909,16 @@ mod tests {
 
         let out = applied_patches(&manifest, &paths).await;
         assert!(out.applied.is_empty());
-        assert_eq!(out.failed.len(), 1, "one FailedPatch per PURL, not per file");
+        assert_eq!(
+            out.failed.len(),
+            1,
+            "one FailedPatch per PURL, not per file"
+        );
         assert!(
-            matches!(out.failed[0].reason.as_str(), "hash_mismatch" | "file_not_found"),
+            matches!(
+                out.failed[0].reason.as_str(),
+                "hash_mismatch" | "file_not_found"
+            ),
             "unexpected reason: {}",
             out.failed[0].reason
         );
@@ -976,7 +1001,9 @@ mod tests {
         let hash = compute_git_sha256_from_bytes(patched);
         let dir = root.path().join(&rel);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("index.js"), patched).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), patched)
+            .await
+            .unwrap();
 
         let mut rec = record_with_one_file(&hash);
         rec.uuid = VUUID.to_string();
@@ -1010,7 +1037,9 @@ mod tests {
         let hash = compute_git_sha256_from_bytes(patched);
         let dir = root.path().join(&rel);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("index.js"), patched).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), patched)
+            .await
+            .unwrap();
 
         let mut rec = record_with_one_file(&hash);
         rec.uuid = VUUID.to_string();
@@ -1029,8 +1058,7 @@ mod tests {
             go_patches: HashMap::new(),
         };
 
-        let out =
-            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert_eq!(out.vendored, vec![purl.to_string()]);
     }
@@ -1052,7 +1080,9 @@ mod tests {
         // Vendored copy: patched.
         let vdir = root.path().join(&rel);
         tokio::fs::create_dir_all(&vdir).await.unwrap();
-        tokio::fs::write(vdir.join("index.js"), patched).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), patched)
+            .await
+            .unwrap();
         // Installed tree: still original.
         let installed = root.path().join("installed");
         tokio::fs::create_dir_all(&installed).await.unwrap();
@@ -1115,7 +1145,9 @@ mod tests {
         // Vendored copy: tampered.
         let vdir = root.path().join(&rel);
         tokio::fs::create_dir_all(&vdir).await.unwrap();
-        tokio::fs::write(vdir.join("index.js"), b"tampered").await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), b"tampered")
+            .await
+            .unwrap();
         // Installed tree: at afterHash (would verify if consulted).
         let installed = root.path().join("installed");
         tokio::fs::create_dir_all(&installed).await.unwrap();
@@ -1180,8 +1212,7 @@ mod tests {
 
         // No installed tree (module cache absent) — the redirect copy is
         // the consumed bytes.
-        let out =
-            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
         assert_eq!(out.applied, vec![purl.to_string()]);
         assert!(
             out.vendored.is_empty(),
@@ -1194,8 +1225,7 @@ mod tests {
         tokio::fs::write(copy_dir.join("index.js"), b"tampered")
             .await
             .unwrap();
-        let out =
-            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
         assert!(out.applied.is_empty());
         assert_eq!(out.failed.len(), 1);
         assert_eq!(out.failed[0].reason, "hash_mismatch");

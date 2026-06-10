@@ -223,10 +223,18 @@ mod host_guard {
         // `--check` returning exit 1 here would be wrong (there is nothing to
         // configure); returning `needs_configuration`/`configured` would mean
         // the .csproj was mis-detected as an npm/python/cargo manifest.
-        assert_no_files(root, &["setup", "--check", "--cwd", root_s, "--json"], "check (pristine)");
+        assert_no_files(
+            root,
+            &["setup", "--check", "--cwd", root_s, "--json"],
+            "check (pristine)",
+        );
 
         // ── setup: must be a true no-op (no .csproj mutation, nothing wired) ─
-        let v = assert_no_files(root, &["setup", "--cwd", root_s, "--yes", "--json"], "setup");
+        let v = assert_no_files(
+            root,
+            &["setup", "--cwd", root_s, "--yes", "--json"],
+            "setup",
+        );
         assert_eq!(
             v.get("updated").and_then(|n| n.as_i64()),
             Some(0),
@@ -259,7 +267,11 @@ mod host_guard {
         );
 
         // ── remove: also a no-op on an unsupported project ──────────────────
-        assert_no_files(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"], "remove");
+        assert_no_files(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+            "remove",
+        );
 
         // ── final: directory still holds exactly the one file we created ────
         // A stray sidecar/hook artifact left behind by any stage would betray

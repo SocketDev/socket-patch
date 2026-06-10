@@ -285,9 +285,18 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     // Vendor (offline; blob staged locally).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert_vendored_applied(&parse_envelope(&stdout));
 
     // Artifact + PAIRED wiring (pyproject AND lock — either half alone is a
@@ -336,8 +345,16 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 
     let fresh_cache = tmp.path().join("fresh-uv-cache");
     let fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
-    let frozen = tool(&uv, &fresh, &["sync", "--frozen", "--offline", "-q"], &fresh_env);
-    assert_tool_ok(&frozen, "fresh-checkout `uv sync --frozen --offline` (empty cache)");
+    let frozen = tool(
+        &uv,
+        &fresh,
+        &["sync", "--frozen", "--offline", "-q"],
+        &fresh_env,
+    );
+    assert_tool_ok(
+        &frozen,
+        "fresh-checkout `uv sync --frozen --offline` (empty cache)",
+    );
     assert_eq!(
         python_oracle(&fresh.join(".venv"), &fresh),
         "1",
@@ -352,9 +369,18 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     // REVERT PROOF: both halves of the pair restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
@@ -421,9 +447,18 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     // Vendor (offline; blob staged locally).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert_vendored_applied(&parse_envelope(&stdout));
 
     // Artifact + the rewritten pin line (the exact spike-tested shape:
@@ -449,7 +484,9 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         "the path line must pin the wheel hash (hardens every install): {vendor_line}"
     );
     assert!(
-        !requirements.lines().any(|l| l.trim_start().starts_with("six==")),
+        !requirements
+            .lines()
+            .any(|l| l.trim_start().starts_with("six==")),
         "the original registry pin must be gone:\n{requirements}"
     );
 
@@ -458,7 +495,11 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     // against the CWD in both pip and uv — spike claim 3).
     let fresh = tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("requirements.txt"), fresh.join("requirements.txt")).unwrap();
+    std::fs::copy(
+        proj.join("requirements.txt"),
+        fresh.join("requirements.txt"),
+    )
+    .unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_venv = fresh.join(".venv");
@@ -499,7 +540,14 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         let uv_install = tool(
             &uv,
             &fresh,
-            &["pip", "install", "-q", "--no-index", "-r", "requirements.txt"],
+            &[
+                "pip",
+                "install",
+                "-q",
+                "--no-index",
+                "-r",
+                "requirements.txt",
+            ],
             &envs2,
         );
         assert_tool_ok(
@@ -521,9 +569,18 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     // REVERT PROOF.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");

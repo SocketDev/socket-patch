@@ -74,7 +74,12 @@ pub async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static str, St
         })?;
     let lock_text = tokio::fs::read_to_string(root.join("uv.lock"))
         .await
-        .map_err(|e| ("pypi_uv_lock_parse_failed", format!("cannot read uv.lock: {e}")))?;
+        .map_err(|e| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("cannot read uv.lock: {e}"),
+            )
+        })?;
     let pyproject: DocumentMut = pyproject_text.parse().map_err(|e| {
         (
             "pypi_uv_lock_parse_failed",
@@ -158,7 +163,11 @@ pub async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static str, St
         .get("project")
         .and_then(|p| item_get(p, "dynamic"))
         .and_then(Item::as_array)
-        .is_some_and(|d| d.iter().filter_map(Value::as_str).any(|x| x == "dependencies"))
+        .is_some_and(|d| {
+            d.iter()
+                .filter_map(Value::as_str)
+                .any(|x| x == "dependencies")
+        })
     {
         return Err((
             "pypi_uv_dynamic_dependencies",
@@ -223,7 +232,11 @@ pub fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
             }
         }
     }
-    if let Some(groups) = p.pyproject.get("dependency-groups").and_then(Item::as_table_like) {
+    if let Some(groups) = p
+        .pyproject
+        .get("dependency-groups")
+        .and_then(Item::as_table_like)
+    {
         for (_, item) in groups.iter() {
             if let Some(arr) = item.as_array() {
                 // Non-string members are `{include-group = "..."}` includes;
@@ -355,10 +368,7 @@ pub async fn wire_uv(
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
     let mut doc = p.pyproject.clone();
-    let had_uv_table = doc
-        .get("tool")
-        .and_then(|t| item_get(t, "uv"))
-        .is_some();
+    let had_uv_table = doc.get("tool").and_then(|t| item_get(t, "uv")).is_some();
     let created_sources_table = doc
         .get("tool")
         .and_then(|t| item_get(t, "uv"))
@@ -380,7 +390,10 @@ pub async fn wire_uv(
                         format!("cannot build override value: {e}"),
                     )
                 })?;
-                uv_table.insert("override-dependencies", Item::Value(value.decorated(" ", "")));
+                uv_table.insert(
+                    "override-dependencies",
+                    Item::Value(value.decorated(" ", "")),
+                );
                 wiring.push(record(
                     "pyproject.toml",
                     "uv_override",
@@ -434,12 +447,14 @@ pub async fn wire_uv(
         sources_table.set_implicit(false);
         sources_table.decor_mut().set_prefix("\n");
     }
-    let sources_value: Value = format!("{{ path = \"{rel_wheel}\" }}").parse().map_err(|e| {
-        (
-            "pypi_uv_lock_parse_failed",
-            format!("cannot build sources value: {e}"),
-        )
-    })?;
+    let sources_value: Value = format!("{{ path = \"{rel_wheel}\" }}")
+        .parse()
+        .map_err(|e| {
+            (
+                "pypi_uv_lock_parse_failed",
+                format!("cannot build sources value: {e}"),
+            )
+        })?;
     sources_table.insert(canon_name, Item::Value(sources_value.decorated(" ", "")));
     wiring.push(record(
         "pyproject.toml",
@@ -555,7 +570,10 @@ pub async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -> Rever
         let drifted = |what: &str| {
             VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("{what} fragment for {:?} changed since vendoring; left untouched", rec.key),
+                format!(
+                    "{what} fragment for {:?} changed since vendoring; left untouched",
+                    rec.key
+                ),
             )
         };
         match rec.kind.as_str() {
@@ -729,7 +747,10 @@ fn ensure_table<'a>(
             .ok_or_else(|| {
                 (
                     "pypi_uv_lock_parse_failed",
-                    format!("pyproject.toml [{}] is not a standard table", path.join(".")),
+                    format!(
+                        "pyproject.toml [{}] is not a standard table",
+                        path.join(".")
+                    ),
                 )
             })?;
     }
@@ -789,7 +810,9 @@ fn rewrite_target_package_unit(
     let unit: Vec<&str> = old_unit.lines().collect();
     let wheels_lines = [
         "wheels = [".to_string(),
-        format!("    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"),
+        format!(
+            "    {{ filename = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\" }},"
+        ),
         "]".to_string(),
     ];
 
@@ -930,9 +953,7 @@ fn add_manifest_override(
 ) -> Result<(WiringRecord, String), (&'static str, String)> {
     let element = format!("{{ name = \"{canon}\", path = \"{rel_wheel}\" }}");
     let index = line_index(lock_text);
-    let manifest_line = index
-        .iter()
-        .position(|(_, l)| l.trim_end() == "[manifest]");
+    let manifest_line = index.iter().position(|(_, l)| l.trim_end() == "[manifest]");
 
     let Some(h) = manifest_line else {
         // No [manifest] yet: create it between the lock header and the first
@@ -1215,14 +1236,20 @@ wheels = [
         tokio::fs::write(tmp.path().join("pyproject.toml"), pyproject)
             .await
             .unwrap();
-        tokio::fs::write(tmp.path().join("uv.lock"), lock).await.unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), lock)
+            .await
+            .unwrap();
         tmp
     }
 
     async fn read_pair(root: &Path) -> (String, String) {
         (
-            tokio::fs::read_to_string(root.join("pyproject.toml")).await.unwrap(),
-            tokio::fs::read_to_string(root.join("uv.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("pyproject.toml"))
+                .await
+                .unwrap(),
+            tokio::fs::read_to_string(root.join("uv.lock"))
+                .await
+                .unwrap(),
         )
     }
 
@@ -1272,8 +1299,14 @@ wheels = [
         .unwrap();
 
         let (pyproject, lock) = read_pair(tmp.path()).await;
-        assert_eq!(pyproject, DIRECT_PATH_PYPROJECT, "pyproject.toml must byte-match uv's own output");
-        assert_eq!(lock, DIRECT_PATH_LOCK, "uv.lock must byte-match uv's own output");
+        assert_eq!(
+            pyproject, DIRECT_PATH_PYPROJECT,
+            "pyproject.toml must byte-match uv's own output"
+        );
+        assert_eq!(
+            lock, DIRECT_PATH_LOCK,
+            "uv.lock must byte-match uv's own output"
+        );
 
         assert_eq!(meta.dep_class, "direct");
         assert_eq!(meta.original_specifier.as_deref(), Some("==1.16.0"));
@@ -1282,7 +1315,11 @@ wheels = [
         let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dist"]
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dist"
+            ]
         );
     }
 
@@ -1367,7 +1404,10 @@ wheels = [
         // missing root [[package]]
         let tmp = write_pair(
             DIRECT_REGISTRY_PYPROJECT,
-            &DIRECT_REGISTRY_LOCK.replace("source = { virtual = \".\" }", "source = { registry = \"x\" }"),
+            &DIRECT_REGISTRY_LOCK.replace(
+                "source = { virtual = \".\" }",
+                "source = { registry = \"x\" }",
+            ),
         )
         .await;
         let err = load_uv_project(tmp.path()).await.unwrap_err();
@@ -1391,17 +1431,35 @@ wheels = [
         );
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, &fork).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let err = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap_err();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_forked_package");
 
         // target absent from the lock entirely
         let tmp2 = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p2 = load_uv_project(tmp2.path()).await.unwrap();
-        let err = wire_uv(&p2, tmp2.path(), "absent-pkg", "1.0.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Transitive)
-            .await
-            .unwrap_err();
+        let err = wire_uv(
+            &p2,
+            tmp2.path(),
+            "absent-pkg",
+            "1.0.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Transitive,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_package_missing");
 
         // user-authored sources entry for the package
@@ -1411,9 +1469,18 @@ wheels = [
         )
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let err = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap_err();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("user-authored"), "{}", err.1);
 
@@ -1424,9 +1491,18 @@ wheels = [
         )
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let err = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap_err();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
 
@@ -1437,9 +1513,18 @@ wheels = [
         )
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let err = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Transitive)
-            .await
-            .unwrap_err();
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Transitive,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
     }
 
@@ -1464,33 +1549,61 @@ wheels = [
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         // Make the lock unwritable: a directory can't be renamed over.
-        tokio::fs::remove_file(tmp.path().join("uv.lock")).await.unwrap();
-        tokio::fs::create_dir(tmp.path().join("uv.lock")).await.unwrap();
-
-        let err = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
+        tokio::fs::remove_file(tmp.path().join("uv.lock"))
             .await
-            .unwrap_err();
+            .unwrap();
+        tokio::fs::create_dir(tmp.path().join("uv.lock"))
+            .await
+            .unwrap();
+
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_uv_write_failed");
         let pyproject = tokio::fs::read_to_string(tmp.path().join("pyproject.toml"))
             .await
             .unwrap();
-        assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT, "pyproject must be unwound");
+        assert_eq!(
+            pyproject, DIRECT_REGISTRY_PYPROJECT,
+            "pyproject must be unwound"
+        );
     }
 
     #[tokio::test]
     async fn revert_direct_restores_originals_byte_identically() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap();
         let entry = entry_for(wiring, meta);
 
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         let (pyproject, lock) = read_pair(tmp.path()).await;
-        assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT, "requires-dist specifier restored");
+        assert_eq!(
+            pyproject, DIRECT_REGISTRY_PYPROJECT,
+            "requires-dist specifier restored"
+        );
         assert_eq!(lock, DIRECT_REGISTRY_LOCK);
     }
 
@@ -1498,26 +1611,50 @@ wheels = [
     async fn revert_override_restores_originals_byte_identically() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Transitive)
-            .await
-            .unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Transitive,
+        )
+        .await
+        .unwrap();
         let entry = entry_for(wiring, meta);
 
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         let (pyproject, lock) = read_pair(tmp.path()).await;
-        assert_eq!(pyproject, TRANSITIVE_REGISTRY_PYPROJECT, "[tool.uv] removed when created by vendor");
-        assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK, "[manifest] removed when created by vendor");
+        assert_eq!(
+            pyproject, TRANSITIVE_REGISTRY_PYPROJECT,
+            "[tool.uv] removed when created by vendor"
+        );
+        assert_eq!(
+            lock, TRANSITIVE_REGISTRY_LOCK,
+            "[manifest] removed when created by vendor"
+        );
     }
 
     #[tokio::test]
     async fn revert_dry_run_changes_nothing() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap();
         let entry = entry_for(wiring, meta);
         let (before_py, before_lock) = read_pair(tmp.path()).await;
 
@@ -1534,20 +1671,36 @@ wheels = [
     async fn revert_warns_and_skips_on_drifted_lock_fragment() {
         let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
-        let (wiring, meta) = wire_uv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UvDepClass::Direct)
-            .await
-            .unwrap();
+        let (wiring, meta) = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UvDepClass::Direct,
+        )
+        .await
+        .unwrap();
         let entry = entry_for(wiring, meta);
 
         // Drift: someone re-hashed the vendored wheel entry.
-        let lock = tokio::fs::read_to_string(tmp.path().join("uv.lock")).await.unwrap();
+        let lock = tokio::fs::read_to_string(tmp.path().join("uv.lock"))
+            .await
+            .unwrap();
         let drifted = lock.replace(WHEEL_SHA, &"0".repeat(64));
-        tokio::fs::write(tmp.path().join("uv.lock"), &drifted).await.unwrap();
+        tokio::fs::write(tmp.path().join("uv.lock"), &drifted)
+            .await
+            .unwrap();
 
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "{:?}",
             outcome.warnings
         );

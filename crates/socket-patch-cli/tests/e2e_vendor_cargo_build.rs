@@ -192,7 +192,11 @@ fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
         ),
     )
     .unwrap();
-    std::fs::write(proj.join("src/main.rs"), "fn main() { println!(\"baseline\"); }\n").unwrap();
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"baseline\"); }\n",
+    )
+    .unwrap();
 
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
@@ -207,9 +211,11 @@ fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let version = locked_version(&lock_text, DEP)
         .unwrap_or_else(|| panic!("Cargo.lock must lock {DEP}:\n{lock_text}"));
-    let crate_dir = find_registry_crate(&cargo_home, &format!("{DEP}-{version}"))
-        .unwrap_or_else(|| {
-            panic!("{DEP}-{version} must be extracted under <CARGO_HOME>/registry/src after the build")
+    let crate_dir =
+        find_registry_crate(&cargo_home, &format!("{DEP}-{version}")).unwrap_or_else(|| {
+            panic!(
+                "{DEP}-{version} must be extracted under <CARGO_HOME>/registry/src after the build"
+            )
         });
     Some((proj, cargo_home, version, crate_dir))
 }
@@ -240,10 +246,19 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     // Vendor (offline; blob staged locally).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
         &cargo_home,
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
@@ -271,8 +286,10 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         "registry source must stay pristine"
     );
     assert!(
-        proj.join(format!(".socket/vendor/cargo/{UUID}/socket-patch.vendor.json"))
-            .is_file(),
+        proj.join(format!(
+            ".socket/vendor/cargo/{UUID}/socket-patch.vendor.json"
+        ))
+        .is_file(),
         "informational vendor marker missing"
     );
 
@@ -332,7 +349,11 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 
     let fresh_home = tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
-    let build = cargo(&fresh, &["build", "-q", "--locked", "--offline"], &fresh_home);
+    let build = cargo(
+        &fresh,
+        &["build", "-q", "--locked", "--offline"],
+        &fresh_home,
+    );
     assert!(
         build.status.success(),
         "fresh-checkout `cargo build --locked --offline` (empty CARGO_HOME) must succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -359,10 +380,19 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
         &cargo_home,
     );
-    assert_eq!(code, 0, "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
@@ -372,10 +402,19 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     // REVERT PROOF.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
         &cargo_home,
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
@@ -427,10 +466,19 @@ fn cargo_vendor_reports_applied_event() {
 
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
         &cargo_home,
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(
         env["summary"]["applied"], 1,

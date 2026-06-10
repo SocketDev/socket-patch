@@ -143,7 +143,11 @@ pub async fn vendor_yarn_classic(
     };
     let Some(staged) = staged else {
         // Failed patch (no lock writes — wiring is last) or a dry run.
-        return VendorOutcome::Done { result, entry: None, warnings };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
     };
     let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
@@ -184,7 +188,11 @@ pub async fn vendor_yarn_classic(
                     kind: KIND_LOCK_BLOCK.to_string(),
                     action: WiringAction::Rewritten,
                     key: Some(key.clone()),
-                    original: if was_vendored { None } else { Some(lines_to_json(&block.lines)) },
+                    original: if was_vendored {
+                        None
+                    } else {
+                        Some(lines_to_json(&block.lines))
+                    },
                     new: Some(lines_to_json(&new_lines)),
                 };
                 Some((replace_block(&new_text, block, &new_lines, eol), rec))
@@ -213,7 +221,11 @@ pub async fn vendor_yarn_classic(
         // Every block already points at this uuid with the packed hashes:
         // in sync. Touch nothing (the tarball re-pack above was
         // byte-identical by determinism) and synthesize AlreadyPatched.
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return VendorOutcome::Done {
             result: synthesized_result(purl, &dest, verified, true, None),
             entry: None,
@@ -263,7 +275,11 @@ pub async fn vendor_yarn_classic(
         pdm: None,
         pipenv: None,
     };
-    VendorOutcome::Done { result, entry: Some(entry), warnings }
+    VendorOutcome::Done {
+        result,
+        entry: Some(entry),
+        warnings,
+    }
 }
 
 /// Undo one yarn-classic vendored package: restore the recorded lock blocks
@@ -324,7 +340,13 @@ pub async fn revert_yarn_classic(
     if let Some(mut text) = text {
         let mut changed = false;
         for rec in records {
-            revert_one_block(&mut text, rec, &entry.uuid, &mut changed, &mut outcome.warnings);
+            revert_one_block(
+                &mut text,
+                rec,
+                &entry.uuid,
+                &mut changed,
+                &mut outcome.warnings,
+            );
         }
         if changed {
             if let Err(e) = atomic_write_bytes(&lock_path, text.as_bytes()).await {
@@ -509,7 +531,9 @@ fn rewrite_classic_block(
     }
     if let Some(pkg) = staged_pkg {
         for field in ["dependencies", "optionalDependencies"] {
-            let Some(map) = pkg.get(field).and_then(Value::as_object) else { continue };
+            let Some(map) = pkg.get(field).and_then(Value::as_object) else {
+                continue;
+            };
             if map.is_empty() {
                 continue;
             }
@@ -630,7 +654,12 @@ pub(super) fn replace_block(
     if block.terminated {
         replacement.push_str(eol);
     }
-    format!("{}{}{}", &text[..block.start], replacement, &text[block.end..])
+    format!(
+        "{}{}{}",
+        &text[..block.start],
+        replacement,
+        &text[block.end..]
+    )
 }
 
 /// A 2-space body field line (`version "1.3.0"` / `resolution: "..."`),
@@ -646,9 +675,15 @@ pub(super) fn body_field_line(line: &str) -> Option<&str> {
 /// Read a classic scalar field (`<name> "<value>"`, integrity unquoted).
 pub(super) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
-        let Some(rest) = body_field_line(line) else { continue };
-        let Some(value) = rest.strip_prefix(field) else { continue };
-        let Some(value) = value.strip_prefix(' ') else { continue };
+        let Some(rest) = body_field_line(line) else {
+            continue;
+        };
+        let Some(value) = rest.strip_prefix(field) else {
+            continue;
+        };
+        let Some(value) = value.strip_prefix(' ') else {
+            continue;
+        };
         return Some(value.trim().trim_matches('"'));
     }
     None
@@ -932,14 +967,20 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         )
         .await
         .unwrap();
-        tokio::fs::write(installed.join("index.js"), ORIG_INDEX).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
 
         let blobs = root.join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX).await.unwrap();
+        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX)
+            .await
+            .unwrap();
 
-        tokio::fs::write(root.join(YARN_LOCK), lock_text.as_bytes()).await.unwrap();
+        tokio::fs::write(root.join(YARN_LOCK), lock_text.as_bytes())
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -959,14 +1000,22 @@ left-pad@^1.3.0, left-pad@~1.3.0:
             tier: "free".to_string(),
         };
 
-        Fixture { tmp, record, lock_bytes: lock_text.as_bytes().to_vec() }
+        Fixture {
+            tmp,
+            record,
+            lock_bytes: lock_text.as_bytes().to_vec(),
+        }
     }
 
     fn expect_done(
         outcome: VendorOutcome,
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
-            VendorOutcome::Done { result, entry, warnings } => (result, entry, warnings),
+            VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } => (result, entry, warnings),
             VendorOutcome::Refused { code, detail } => {
                 panic!("expected Done, got Refused {code}: {detail}")
             }
@@ -980,7 +1029,10 @@ left-pad@^1.3.0, left-pad@~1.3.0:
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused {want_code}, got Done (success={})", result.success)
+                panic!(
+                    "expected Refused {want_code}, got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -1006,7 +1058,10 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         );
         let tgz = tokio::fs::read(fx.tgz_path()).await.unwrap();
         assert_eq!(entry.artifact.size, Some(tgz.len() as u64));
-        assert_eq!(entry.artifact.sha256, hex::encode(sha2::Sha256::digest(&tgz)));
+        assert_eq!(
+            entry.artifact.sha256,
+            hex::encode(sha2::Sha256::digest(&tgz))
+        );
         assert_eq!(entry.wiring.len(), 1);
         let rec = &entry.wiring[0];
         assert_eq!(rec.file, YARN_LOCK);
@@ -1024,12 +1079,15 @@ left-pad@^1.3.0, left-pad@~1.3.0:
             "original must be the verbatim pre-vendor block"
         );
         let new_lines = rec.new.as_ref().unwrap().as_array().unwrap();
-        assert!(new_lines[2].as_str().unwrap().contains("file:./.socket/vendor/npm/"));
+        assert!(new_lines[2]
+            .as_str()
+            .unwrap()
+            .contains("file:./.socket/vendor/npm/"));
 
         // The marker sits next to the artifact.
-        let marker = tokio::fs::read_to_string(
-            fx.root().join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json")),
-        )
+        let marker = tokio::fs::read_to_string(fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        )))
         .await
         .unwrap();
         assert!(marker.contains("pkg:npm/left-pad@1.3.0"));
@@ -1049,12 +1107,18 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         assert_eq!(fx.lock_text().await, spike_after(Y5_AFTER, &sha1, &sri));
 
         // One record per block: the alias block AND the merged block.
-        let mut keys: Vec<&str> =
-            entry.wiring.iter().map(|r| r.key.as_deref().unwrap()).collect();
+        let mut keys: Vec<&str> = entry
+            .wiring
+            .iter()
+            .map(|r| r.key.as_deref().unwrap())
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["\"alias@npm:left-pad@^1.3.0\"", "left-pad@^1.3.0, left-pad@~1.3.0"],
+            vec![
+                "\"alias@npm:left-pad@^1.3.0\"",
+                "left-pad@^1.3.0, left-pad@~1.3.0"
+            ],
             "verbatim key lines (no colon), quotes preserved"
         );
     }
@@ -1078,11 +1142,13 @@ left-pad@^1.3.0:
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[4],
-            format!(
-                "  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""
-            )
+            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\"")
         );
-        assert_eq!(lines[5], format!("  integrity {sri}"), "integrity line gained");
+        assert_eq!(
+            lines[5],
+            format!("  integrity {sri}"),
+            "integrity line gained"
+        );
 
         // The record's original is the 3-line block, new is the 4-line one.
         let rec = &entry.unwrap().wiring[0];
@@ -1112,20 +1178,28 @@ left-pad@^1.3.0:
             .unwrap();
         fx.record.files.insert(
             "package/package.json".to_string(),
-            PatchFileInfo { before_hash: compute_git_sha256_from_bytes(before), after_hash },
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
         );
 
         let (result, _, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_dep_manifest_rewritten"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_rewritten"),
             "{warnings:?}"
         );
 
         let text = fx.lock_text().await;
         assert!(!text.contains("old-dep"), "stale sub-map dropped: {text}");
         let want = "  dependencies:\n    wow \"^1.0.0\"\n  optionalDependencies:\n    \"@scope/opt\" \"^2.0.0\"\n";
-        assert!(text.contains(want), "recomputed sub-maps (scoped key quoted): {text}");
+        assert!(
+            text.contains(want),
+            "recomputed sub-maps (scoped key quoted): {text}"
+        );
     }
 
     #[tokio::test]
@@ -1138,7 +1212,10 @@ left-pad@^1.3.0:
 
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success);
-        assert!(entry.is_none(), "in-sync re-run must not produce a new ledger entry");
+        assert!(
+            entry.is_none(),
+            "in-sync re-run must not produce a new ledger entry"
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(
             result
@@ -1168,10 +1245,15 @@ left-pad@^1.3.0:
         assert!(entry.is_none());
         assert!(result.files_patched.is_empty());
 
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(
-            tokio::fs::read(fx.installed().join("index.js")).await.unwrap(),
+            tokio::fs::read(fx.installed().join("index.js"))
+                .await
+                .unwrap(),
             ORIG_INDEX,
             "vendor never patches the installed copy in place"
         );
@@ -1190,10 +1272,16 @@ left-pad@^1.3.0:
         let fx = fixture_with_lock(&lock).await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
-        assert_eq!(entry.unwrap().wiring.len(), 1, "only the registry block rewritten");
+        assert_eq!(
+            entry.unwrap().wiring.len(),
+            1,
+            "only the registry block rewritten"
+        );
 
-        let link_warnings: Vec<&VendorWarning> =
-            warnings.iter().filter(|w| w.code == "vendor_link_entry_skipped").collect();
+        let link_warnings: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == "vendor_link_entry_skipped")
+            .collect();
         assert_eq!(link_warnings.len(), 2, "{warnings:?}");
 
         // Skipped blocks byte-untouched.
@@ -1208,15 +1296,27 @@ left-pad@^1.3.0:
         let lock = Y2_BEFORE.replace("1.3.0", "1.2.0");
         let fx = fixture_with_lock(&lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
-        assert!(detail.contains("yarn install"), "actionable detail: {detail}");
-        assert!(!fx.root().join(".socket/vendor").exists(), "refusal writes nothing");
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert!(
+            detail.contains("yarn install"),
+            "actionable detail: {detail}"
+        );
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
     }
 
     #[tokio::test]
     async fn berry_lock_and_missing_lock_are_refused() {
         let fx = fixture_with_lock("__metadata:\n  version: 8\n  cacheKey: 10c0\n").await;
-        expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
 
         let fx = fixture_with_lock(Y2_BEFORE).await;
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
@@ -1235,7 +1335,10 @@ left-pad@^1.3.0:
         let outcome = revert_yarn_classic(&entry, fx.root(), true).await;
         assert!(outcome.success);
         assert!(fx.tgz_path().exists());
-        assert_ne!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_ne!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
 
         let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -1245,7 +1348,10 @@ left-pad@^1.3.0:
             fx.lock_bytes,
             "lock restored byte-for-byte"
         );
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
@@ -1257,9 +1363,8 @@ left-pad@^1.3.0:
         // The user re-resolved the ALIAS block (first occurrence of our
         // resolved line) behind our back.
         let (sha1, _) = fx.packed_hashes().await;
-        let ours = format!(
-            "  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""
-        );
+        let ours =
+            format!("  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\"");
         let theirs = "  resolved \"https://example.com/their-fork.tgz#0000000000000000000000000000000000000000\"";
         let text = fx.lock_text().await.replacen(&ours, theirs, 1);
         tokio::fs::write(fx.lock_path(), text).await.unwrap();
@@ -1267,7 +1372,10 @@ left-pad@^1.3.0:
         let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "{:?}",
             outcome.warnings
         );
@@ -1278,7 +1386,10 @@ left-pad@^1.3.0:
             after.contains("left-pad@^1.3.0, left-pad@~1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/"),
             "non-drifted block restored: {after}"
         );
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
@@ -1305,10 +1416,17 @@ left-pad@^1.3.0:
             .iter()
             .filter(|w| w.detail.contains("allowlist"))
             .count();
-        assert_eq!(allow, 2, "every foreign file warned: {:?}", outcome.warnings);
+        assert_eq!(
+            allow, 2,
+            "every foreign file warned: {:?}",
+            outcome.warnings
+        );
         // The legitimate record still restored the lock; nothing was written
         // to (or read from) the foreign paths.
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
         assert!(!fx.root().join("package.json").exists());
         assert!(!fx.root().parent().unwrap().join("x").exists());
     }
@@ -1333,7 +1451,10 @@ left-pad@^1.3.0:
         let (sha1, sri) = fx.packed_hashes().await;
         let expected = spike_after(Y2_AFTER, &sha1, &sri).replace('\n', "\r\n");
         let text = fx.lock_text().await;
-        assert_eq!(text, expected, "every line (edited and untouched) stays CRLF");
+        assert_eq!(
+            text, expected,
+            "every line (edited and untouched) stays CRLF"
+        );
         assert_eq!(
             text.matches('\n').count(),
             text.matches("\r\n").count(),
@@ -1368,8 +1489,14 @@ left-pad@^1.3.0:
         // Real-name extraction, incl. the alias-range and scoped forms.
         assert_eq!(pattern_real_name("left-pad@^1.3.0"), Some("left-pad"));
         assert_eq!(pattern_real_name("@scope/pkg@^1.0.0"), Some("@scope/pkg"));
-        assert_eq!(pattern_real_name("alias@npm:left-pad@^1.3.0"), Some("left-pad"));
-        assert_eq!(pattern_real_name("alias@npm:@scope/pkg@^1.0.0"), Some("@scope/pkg"));
+        assert_eq!(
+            pattern_real_name("alias@npm:left-pad@^1.3.0"),
+            Some("left-pad")
+        );
+        assert_eq!(
+            pattern_real_name("alias@npm:@scope/pkg@^1.0.0"),
+            Some("@scope/pkg")
+        );
         assert_eq!(pattern_real_name("alias@npm:left-pad"), Some("left-pad"));
         assert_eq!(pattern_real_name("no-at-sign"), None);
 

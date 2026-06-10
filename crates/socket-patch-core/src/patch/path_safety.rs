@@ -27,7 +27,8 @@ pub(crate) fn is_safe_multi_segment(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains('\0') {
         return false;
     }
-    s.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    s.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 /// The canonical lowercase hyphenated UUID grammar

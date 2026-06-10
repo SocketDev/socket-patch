@@ -334,10 +334,10 @@ fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
         return None;
     }
     let rhs = rhs[1..].trim(); // drop the leading '=' and surrounding ws
-    // The value must open with a string delimiter; match it to its twin.
-    // `'` is a literal string (no escapes), `"` a basic string — for our
-    // purposes (names/versions, which never contain escaped quotes) the
-    // first matching delimiter terminates the value in both cases.
+                               // The value must open with a string delimiter; match it to its twin.
+                               // `'` is a literal string (no escapes), `"` a basic string — for our
+                               // purposes (names/versions, which never contain escaped quotes) the
+                               // first matching delimiter terminates the value in both cases.
     let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
     let stripped = &rhs[quote.len_utf8()..];
     let end = stripped.find(quote)?;
@@ -555,7 +555,8 @@ mod tests {
     /// the real `url = ...` line that follows it is read.
     #[test]
     fn scan_origin_url_ignores_url_prefixed_key_and_keeps_scanning() {
-        let cfg = "[remote \"origin\"]\n\turlsuffix = nonsense\n\turl = git@github.com:foo/bar.git\n";
+        let cfg =
+            "[remote \"origin\"]\n\turlsuffix = nonsense\n\turl = git@github.com:foo/bar.git\n";
         assert_eq!(
             scan_remote_origin_url(cfg).as_deref(),
             Some("git@github.com:foo/bar.git")

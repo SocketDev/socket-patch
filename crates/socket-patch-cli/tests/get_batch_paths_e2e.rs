@@ -60,7 +60,12 @@ const SOCKET_ENV_VARS: &[&str] = &[
 
 /// Run `socket-patch get <identifier>` with `--json --save-only --yes`
 /// against `api_url` (authenticated mode). Returns (code, stdout, stderr).
-fn run_get_auth(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> (i32, String, String) {
+fn run_get_auth(
+    cwd: &Path,
+    api_url: &str,
+    identifier: &str,
+    extra: &[&str],
+) -> (i32, String, String) {
     let mut args = vec![
         "get",
         identifier,
@@ -80,9 +85,7 @@ fn run_get_auth(cwd: &Path, api_url: &str, identifier: &str, extra: &[&str]) -> 
     for var in SOCKET_ENV_VARS {
         cmd.env_remove(var);
     }
-    let out = cmd
-        .output()
-        .expect("run socket-patch");
+    let out = cmd.output().expect("run socket-patch");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -109,7 +112,9 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     let encoded = "pkg%3Anpm%2Fmultipatch%401.0.0";
 
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [
                 {
@@ -140,8 +145,7 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
         code, 1,
         "multi free-patch in JSON mode must exit 1; stdout={stdout}"
     );
-    let v: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON envelope");
     assert_eq!(
         v["status"], "selection_required",
         "must surface selection_required; got {}",
@@ -162,8 +166,10 @@ async fn get_by_purl_with_multiple_patches_emits_selection_required() {
     // Each option must carry the full disambiguation payload — tier, the
     // human description, and the publish timestamp — so a degenerate
     // "just the uuid" shape (which would make the prompt useless) fails.
-    let descriptions: HashSet<&str> =
-        opts.iter().filter_map(|o| o["description"].as_str()).collect();
+    let descriptions: HashSet<&str> = opts
+        .iter()
+        .filter_map(|o| o["description"].as_str())
+        .collect();
     assert!(
         descriptions.contains("Patch A") && descriptions.contains("Patch B"),
         "options must echo each patch description; got {descriptions:?}"
@@ -290,7 +296,9 @@ async fn get_uuid_returning_500_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "5xx must surface as error");
-    let err = v["error"].as_str().expect("error envelope must carry an error string");
+    let err = v["error"]
+        .as_str()
+        .expect("error envelope must carry an error string");
     assert!(
         err.contains("500"),
         "error must surface the HTTP status code; got {err:?}"
@@ -305,9 +313,7 @@ async fn get_uuid_returning_malformed_json_emits_error() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_A}")))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string("{ this is not json"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string("{ this is not json"))
         .expect(1)
         .mount(&mock)
         .await;
@@ -318,7 +324,9 @@ async fn get_uuid_returning_malformed_json_emits_error() {
     let v: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("valid JSON error envelope");
     assert_eq!(v["status"], "error", "parse failure must surface as error");
-    let err = v["error"].as_str().expect("error envelope must carry an error string");
+    let err = v["error"]
+        .as_str()
+        .expect("error envelope must carry an error string");
     assert!(
         err.to_lowercase().contains("parse"),
         "error must describe a parse failure; got {err:?}"
@@ -346,9 +354,11 @@ async fn get_by_cve_with_no_patches_emits_no_match() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (code, stdout, _stderr) =
-        run_get_auth(tmp.path(), &mock.uri(), "CVE-2099-9999", &[]);
-    assert_eq!(code, 0, "empty CVE search is a clean no-op; stdout={stdout}");
+    let (code, stdout, _stderr) = run_get_auth(tmp.path(), &mock.uri(), "CVE-2099-9999", &[]);
+    assert_eq!(
+        code, 0,
+        "empty CVE search is a clean no-op; stdout={stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         v["status"], "not_found",
@@ -379,9 +389,11 @@ async fn get_by_ghsa_with_no_patches_emits_no_match() {
         .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (code, stdout, _stderr) =
-        run_get_auth(tmp.path(), &mock.uri(), "GHSA-xxxx-xxxx-xxxx", &[]);
-    assert_eq!(code, 0, "empty GHSA search is a clean no-op; stdout={stdout}");
+    let (code, stdout, _stderr) = run_get_auth(tmp.path(), &mock.uri(), "GHSA-xxxx-xxxx-xxxx", &[]);
+    assert_eq!(
+        code, 0,
+        "empty GHSA search is a clean no-op; stdout={stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(
         v["status"], "not_found",

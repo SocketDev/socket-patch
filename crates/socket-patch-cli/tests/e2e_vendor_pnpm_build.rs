@@ -225,9 +225,18 @@ fn run_pnpm_capstone(pm: &str) {
     // 3. Vendor (offline).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
@@ -238,13 +247,21 @@ fn run_pnpm_capstone(pm: &str) {
         .iter()
         .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
         .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
-    assert!(applied.get("errorCode").is_none(), "clean apply event: {applied}");
+    assert!(
+        applied.get("errorCode").is_none(),
+        "clean apply event: {applied}"
+    );
 
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
-    assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing at {tgz_rel}");
     assert!(
-        proj.join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"))
-            .is_file(),
+        proj.join(&tgz_rel).is_file(),
+        "vendored tarball missing at {tgz_rel}"
+    );
+    assert!(
+        proj.join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
+        .is_file(),
         "informational vendor marker missing"
     );
     assert!(
@@ -333,9 +350,18 @@ fn run_pnpm_capstone(pm: &str) {
     let pkg_wired = std::fs::read(&pkg_path).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "re-vendor failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "re-vendor failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env2 = parse_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
@@ -352,9 +378,19 @@ fn run_pnpm_capstone(pm: &str) {
     // 6. REVERT PROOF: package.json AND pnpm-lock.yaml restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "revert failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");

@@ -14,7 +14,11 @@ pub const HOOK_DEP: &str = "socket-patch[hook]";
 /// declared — the `socket-patch[hook]` extra, the standalone wheel, or the
 /// underscore spelling. (The Poetry `extras = ["hook"]` form is detected
 /// structurally by [`super::edit`], not by this textual check.)
-const HOOK_MARKERS: &[&str] = &["socket-patch[hook]", "socket-patch-hook", "socket_patch_hook"];
+const HOOK_MARKERS: &[&str] = &[
+    "socket-patch[hook]",
+    "socket-patch-hook",
+    "socket_patch_hook",
+];
 
 /// Which Python dependency-management style a project uses. Drives both which
 /// manifest/table `setup` edits and which lockfile (if any) to refresh.
@@ -171,8 +175,7 @@ mod tests {
         // still detected (intra-line spaces tolerated).
         let requirements = "requests==2.31.0\nsocket-patch [hook]\nflask\n";
         assert!(deps_contain_hook(requirements));
-        let pyproject =
-            "dependencies = [\n  \"requests\",\n  \"socket-patch[hook]>=3.3.0\",\n]\n";
+        let pyproject = "dependencies = [\n  \"requests\",\n  \"socket-patch[hook]>=3.3.0\",\n]\n";
         assert!(deps_contain_hook(pyproject));
     }
 
@@ -204,7 +207,9 @@ mod tests {
     #[tokio::test]
     async fn test_detect_uv_by_lock() {
         let dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(dir.path().join("uv.lock"), "").await.unwrap();
+        tokio::fs::write(dir.path().join("uv.lock"), "")
+            .await
+            .unwrap();
         assert_eq!(detect_python_pm(dir.path()).await, PythonPackageManager::Uv);
     }
 
@@ -229,12 +234,18 @@ mod tests {
         tokio::fs::write(dir.path().join("requirements.txt"), "requests\n")
             .await
             .unwrap();
-        assert_eq!(detect_python_pm(dir.path()).await, PythonPackageManager::Pip);
+        assert_eq!(
+            detect_python_pm(dir.path()).await,
+            PythonPackageManager::Pip
+        );
     }
 
     #[test]
     fn test_lock_command() {
-        assert_eq!(PythonPackageManager::Uv.lock_command(), Some(("uv", &["lock"][..])));
+        assert_eq!(
+            PythonPackageManager::Uv.lock_command(),
+            Some(("uv", &["lock"][..]))
+        );
         assert_eq!(PythonPackageManager::Pip.lock_command(), None);
         assert_eq!(PythonPackageManager::Hatch.lock_command(), None);
     }

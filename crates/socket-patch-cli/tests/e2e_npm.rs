@@ -133,7 +133,10 @@ fn test_npm_full_lifecycle() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
     let index_js = cwd.join("node_modules/minimist/index.js");
-    assert!(index_js.exists(), "minimist/index.js must exist after npm install");
+    assert!(
+        index_js.exists(),
+        "minimist/index.js must exist after npm install"
+    );
 
     // Confirm the original file matches the expected before-hash.
     assert_eq!(
@@ -147,7 +150,10 @@ fn test_npm_full_lifecycle() {
 
     // Manifest should exist and contain the patch.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), ".socket/manifest.json should exist after get");
+    assert!(
+        manifest_path.exists(),
+        ".socket/manifest.json should exist after get"
+    );
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -180,7 +186,10 @@ fn test_npm_full_lifecycle() {
     let vulns = patches[0]["details"]["vulnerabilities"]
         .as_array()
         .expect("vulnerabilities array");
-    assert!(!vulns.is_empty(), "patch should report at least one vulnerability");
+    assert!(
+        !vulns.is_empty(),
+        "patch should report at least one vulnerability"
+    );
 
     // Verify the vulnerability details match CVE-2021-44906
     let has_cve = vulns.iter().any(|v| {
@@ -265,16 +274,19 @@ fn test_npm_dry_run() {
         &["apply", "--dry-run", "--json"],
         "apply --dry-run --json",
     );
-    let env: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("apply --dry-run --json should emit JSON: {e}\nstdout:\n{stdout}"));
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --dry-run --json should emit JSON: {e}\nstdout:\n{stdout}")
+    });
     assert_eq!(
         env["dryRun"],
         serde_json::Value::Bool(true),
         "envelope should be flagged dryRun"
     );
     let events = env["events"].as_array().expect("envelope events array");
-    let verified: Vec<&serde_json::Value> =
-        events.iter().filter(|e| e["action"] == "verified").collect();
+    let verified: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["action"] == "verified")
+        .collect();
     assert_eq!(
         verified.len(),
         1,
@@ -313,7 +325,13 @@ fn test_npm_global_lifecycle() {
 
     // -- Setup: install minimist@1.2.2 globally into a temp prefix ----------
     let out = Command::new("npm")
-        .args(["install", "-g", "--prefix", global_dir.path().to_str().unwrap(), "minimist@1.2.2"])
+        .args([
+            "install",
+            "-g",
+            "--prefix",
+            global_dir.path().to_str().unwrap(),
+            "minimist@1.2.2",
+        ])
         .output()
         .expect("failed to run npm install -g");
     assert!(
@@ -359,7 +377,10 @@ fn test_npm_global_lifecycle() {
     let scanned = scan["scannedPackages"]
         .as_u64()
         .expect("scannedPackages should be a number");
-    assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+    assert!(
+        scanned >= 1,
+        "scan should find at least 1 package, got {scanned}"
+    );
 
     // A bare count is a loophole: scan could enumerate *some* package while
     // failing to discover minimist or match its patch, and `scanned >= 1`
@@ -424,11 +445,7 @@ fn test_npm_global_lifecycle() {
     );
 
     // -- APPLY: re-apply from manifest globally ------------------------------
-    assert_run_ok(
-        cwd,
-        &["apply", "-g", "--global-prefix", nm_str],
-        "apply -g",
-    );
+    assert_run_ok(cwd, &["apply", "-g", "--global-prefix", nm_str], "apply -g");
     assert_eq!(
         git_sha256_file(&index_js),
         AFTER_HASH,
@@ -485,7 +502,10 @@ fn test_npm_save_only() {
 
     // Manifest should exist with the patch.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest should exist after get --save-only");
+    assert!(
+        manifest_path.exists(),
+        "manifest should exist after get --save-only"
+    );
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -605,12 +625,18 @@ fn test_npm_macos_global_auto_discovery() {
         scan["status"], "success",
         "scan -g envelope should report success, got: {scan:#?}"
     );
-    let scanned = scan["scannedPackages"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("scannedPackages should be a number, got: {}", scan["scannedPackages"]));
-    let with_patches = scan["packagesWithPatches"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("packagesWithPatches should be a number, got: {}", scan["packagesWithPatches"]));
+    let scanned = scan["scannedPackages"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "scannedPackages should be a number, got: {}",
+            scan["scannedPackages"]
+        )
+    });
+    let with_patches = scan["packagesWithPatches"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "packagesWithPatches should be a number, got: {}",
+            scan["packagesWithPatches"]
+        )
+    });
     let packages = scan["packages"]
         .as_array()
         .expect("scan -g should emit a packages array");
@@ -658,10 +684,16 @@ fn test_npm_uuid_shortcut() {
     // The shortcut must behave like `get`: the manifest must actually record
     // our patch, not merely exist as an empty stub.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
+    assert!(
+        manifest_path.exists(),
+        "manifest should exist after UUID shortcut"
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     let patch = &manifest["patches"][NPM_PURL];
-    assert!(patch.is_object(), "manifest should contain {NPM_PURL} after UUID shortcut");
+    assert!(
+        patch.is_object(),
+        "manifest should contain {NPM_PURL} after UUID shortcut"
+    );
     assert_eq!(patch["uuid"].as_str().unwrap(), NPM_UUID);
 }

@@ -134,7 +134,9 @@ async fn setup_mock(
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [
                 { "uuid": UUID_INSTALLED, "purl": qualified(PLATFORM_INSTALLED),
@@ -259,9 +261,12 @@ fn manifest_record(cwd: &Path, purl: &str) -> serde_json::Value {
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!("manifest not found at {}", path.display()));
     let v: serde_json::Value = serde_json::from_str(&raw).expect("manifest json");
-    let rec = v["patches"]
-        .get(purl)
-        .unwrap_or_else(|| panic!("no manifest record for {purl}; have {:?}", manifest_keys(cwd)));
+    let rec = v["patches"].get(purl).unwrap_or_else(|| {
+        panic!(
+            "no manifest record for {purl}; have {:?}",
+            manifest_keys(cwd)
+        )
+    });
     rec.clone()
 }
 
@@ -393,7 +398,10 @@ async fn broad_scan_keeps_all_platforms() {
     keys.sort();
     let mut expected = vec![qualified(PLATFORM_INSTALLED), qualified(PLATFORM_OTHER)];
     expected.sort();
-    assert_eq!(keys, expected, "broad scan must store every platform variant");
+    assert_eq!(
+        keys, expected,
+        "broad scan must store every platform variant"
+    );
 
     // Each stored variant must carry its OWN distribution's patch data —
     // proving broad scan genuinely fetched and stored both variants, not just

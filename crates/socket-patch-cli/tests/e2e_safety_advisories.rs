@@ -32,8 +32,7 @@ use std::path::Path;
 mod common;
 
 use common::{
-    git_sha256, parse_json_envelope, run_with_env, write_blob, write_minimal_manifest,
-    PatchEntry,
+    git_sha256, parse_json_envelope, run_with_env, write_blob, write_minimal_manifest, PatchEntry,
 };
 // Only the cargo sidecar test needs the bare (un-framed) digest used in
 // `.cargo-checksum.json`; gate the import so a `--no-default-features`
@@ -71,9 +70,7 @@ fn apply_and_parse(
         extra_env,
     );
     if stdout.trim().is_empty() {
-        panic!(
-            "socket-patch apply emitted no JSON.\nstderr:\n{stderr}"
-        );
+        panic!("socket-patch apply emitted no JSON.\nstderr:\n{stderr}");
     }
     let env = parse_json_envelope(&stdout);
 
@@ -160,10 +157,7 @@ fn assert_sidecar_joins_applied_event(env: &serde_json::Value, record: &serde_js
 /// ecosystem tag, or panic with the full envelope on miss. Tests use
 /// this to drill into the per-ecosystem record without re-implementing
 /// the lookup five times.
-fn find_sidecar_record<'a>(
-    env: &'a serde_json::Value,
-    ecosystem: &str,
-) -> &'a serde_json::Value {
+fn find_sidecar_record<'a>(env: &'a serde_json::Value, ecosystem: &str) -> &'a serde_json::Value {
     let sidecars = env["sidecars"]
         .as_array()
         .unwrap_or_else(|| panic!("envelope.sidecars must be an array.\nenv: {env}"));
@@ -354,7 +348,10 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
     // GOMODCACHE layout: <encoded-module>@<version>/. For
     // `github.com/gin-gonic/gin` there are no uppercase letters,
     // so the encoded form equals the path verbatim.
-    let module_dir = cache.join("github.com").join("gin-gonic").join("gin@v1.9.1");
+    let module_dir = cache
+        .join("github.com")
+        .join("gin-gonic")
+        .join("gin@v1.9.1");
     std::fs::create_dir_all(&module_dir).unwrap();
 
     let target = module_dir.join("gin.go");
@@ -378,20 +375,13 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
     );
     write_blob(&socket_dir, &after, patched);
 
-    let env = apply_and_parse(
-        cwd,
-        &cache,
-        &[("GOMODCACHE", cache.to_str().unwrap())],
-    );
+    let env = apply_and_parse(cwd, &cache, &[("GOMODCACHE", cache.to_str().unwrap())]);
 
     assert_eq!(std::fs::read(&target).unwrap(), patched);
 
     let record = find_sidecar_record(&env, "golang");
     assert_sidecar_joins_applied_event(&env, record);
-    assert_eq!(
-        record["purl"],
-        "pkg:golang/github.com/gin-gonic/gin@v1.9.1"
-    );
+    assert_eq!(record["purl"], "pkg:golang/github.com/gin-gonic/gin@v1.9.1");
     let files = record["files"].as_array().expect("files array");
     assert!(
         files.is_empty(),
@@ -777,9 +767,7 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
 
     // AND the signed-package advisory rides alongside.
     let advisory = record.get("advisory").unwrap_or_else(|| {
-        panic!(
-            "signed package must emit an advisory alongside files[].\nrecord: {record}"
-        )
+        panic!("signed package must emit an advisory alongside files[].\nrecord: {record}")
     });
     assert_eq!(
         advisory["code"], "nuget_signed_package_tampered",

@@ -328,7 +328,9 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
 #[tokio::test]
 async fn get_crate_source_paths_vendor_without_cargo_manifest_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::create_dir(tmp.path().join("vendor")).await.unwrap();
+    tokio::fs::create_dir(tmp.path().join("vendor"))
+        .await
+        .unwrap();
 
     let crawler = CargoCrawler;
     let paths = crawler

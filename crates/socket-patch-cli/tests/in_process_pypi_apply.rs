@@ -154,7 +154,9 @@ async fn setup_pypi_apply_mock(
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": purl,
@@ -350,7 +352,10 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         vex: Default::default(),
     };
     let apply_code = apply_run(apply_args).await;
-    assert_eq!(apply_code, 0, "apply --offline --force should succeed (exit 0)");
+    assert_eq!(
+        apply_code, 0,
+        "apply --offline --force should succeed (exit 0)"
+    );
 
     // The apply step (not scan) must have re-patched the reverted file
     // to exactly the served blob.
@@ -415,7 +420,10 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     // is ever reached) would leave the file untouched and let this test
     // pass without ever exercising the dry-run apply logic it guards.
     let dry_code = scan_run(scan_args).await;
-    assert_eq!(dry_code, 0, "scan --apply --dry-run should succeed (exit 0)");
+    assert_eq!(
+        dry_code, 0,
+        "scan --apply --dry-run should succeed (exit 0)"
+    );
 
     let after = std::fs::read(&six_path).expect("read after dry-run");
     assert_eq!(
@@ -435,10 +443,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
     // six and queried the batch endpoint with its PURL — the same
     // observable proof of discovery used by the crawler sanity test.
     let purl = format!("pkg:pypi/{PYPI_PACKAGE}@{PYPI_VERSION}");
-    let requests = server
-        .received_requests()
-        .await
-        .expect("recording enabled");
+    let requests = server.received_requests().await.expect("recording enabled");
     let batch_bodies: Vec<String> = requests
         .iter()
         .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))
@@ -476,11 +481,7 @@ async fn pypi_crawler_finds_real_installed_six() {
     let has_dist_info = std::fs::read_dir(&site_packages)
         .expect("site-packages")
         .flatten()
-        .any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("six-1.16.0")
-        });
+        .any(|e| e.file_name().to_string_lossy().starts_with("six-1.16.0"));
     assert!(has_dist_info, "six-1.16.0.dist-info should be present");
 
     // Now run scan and assert discovery via mock.
@@ -530,10 +531,7 @@ async fn pypi_crawler_finds_real_installed_six() {
     // alone does not prove the crawler found six. Verify the crawler
     // actually sent six's PURL to the batch endpoint — that is the
     // observable proof of discovery.
-    let requests = server
-        .received_requests()
-        .await
-        .expect("recording enabled");
+    let requests = server.received_requests().await.expect("recording enabled");
     let batch_bodies: Vec<String> = requests
         .iter()
         .filter(|r| r.url.path() == format!("/v0/orgs/{ORG}/patches/batch"))

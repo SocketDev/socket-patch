@@ -81,7 +81,10 @@ edition = "2021"
 
     // Find the crate's src/lib.rs under CARGO_HOME/registry/src/<index>/cfg-if-1.0.0/src/lib.rs
     let src_root = cargo_home.join("registry/src");
-    for entry in std::fs::read_dir(&src_root).expect("registry/src").flatten() {
+    for entry in std::fs::read_dir(&src_root)
+        .expect("registry/src")
+        .flatten()
+    {
         let candidate = entry
             .path()
             .join(format!("{CRATE_NAME}-{CRATE_VERSION}"))
@@ -122,7 +125,9 @@ async fn setup_cargo_apply_mock(
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": purl,
@@ -194,7 +199,10 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
 
     // Sanity: the fixture must actually change the file, otherwise the
     // "marker present" assertion below would be vacuously satisfiable.
-    assert_ne!(original, patched, "patched fixture must differ from original");
+    assert_ne!(
+        original, patched,
+        "patched fixture must differ from original"
+    );
     assert_ne!(before_hash, after_hash, "before/after hashes must differ");
     // Pristine pre-check: the marker must NOT already be on disk, so its
     // later presence can only come from a real apply writing `patched`.
@@ -254,8 +262,7 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
         .expect("wiremock should record requests");
     let purl = format!("pkg:cargo/{CRATE_NAME}@{CRATE_VERSION}");
     let hit_batch = requests.iter().any(|r| {
-        r.url.path().ends_with("/patches/batch")
-            && String::from_utf8_lossy(&r.body).contains(&purl)
+        r.url.path().ends_with("/patches/batch") && String::from_utf8_lossy(&r.body).contains(&purl)
     });
     let hit_view = requests
         .iter()
@@ -360,8 +367,7 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
         .expect("wiremock should record requests");
     let purl = format!("pkg:cargo/{CRATE_NAME}@{CRATE_VERSION}");
     let hit_batch = requests.iter().any(|r| {
-        r.url.path().ends_with("/patches/batch")
-            && String::from_utf8_lossy(&r.body).contains(&purl)
+        r.url.path().ends_with("/patches/batch") && String::from_utf8_lossy(&r.body).contains(&purl)
     });
     assert!(hit_batch, "crawler never sent cfg-if to the batch endpoint");
 

@@ -317,7 +317,7 @@ mod tests {
         assert!(path_is_socket_owned("./.socket/vendor/cargo/u/x-1.0.0")); // contains "/.socket/…"
         assert!(path_is_socket_owned("sub/.socket/vendor/cargo/u/x-1.0.0"));
         assert!(path_is_socket_owned(r".socket\vendor\cargo\u\x-1.0.0")); // backslash normalised
-        // Legacy redirect copies are recognised as ours (takeover / cleanup).
+                                                                          // Legacy redirect copies are recognised as ours (takeover / cleanup).
         assert!(path_is_socket_owned(".socket/cargo-patches/cfg-if-1.0.0"));
         assert!(path_is_socket_owned("./.socket/cargo-patches/x-1.0.0"));
         // User paths are not.
@@ -499,9 +499,10 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_dry_run_does_not_create() {
         let dir = tempfile::tempdir().unwrap();
-        let changed = ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), true)
-            .await
-            .unwrap();
+        let changed =
+            ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), true)
+                .await
+                .unwrap();
         assert!(changed, "dry-run reports the change it would make");
         assert!(
             !dir.path().join(".cargo/config.toml").exists(),
@@ -589,7 +590,9 @@ mod tests {
         .unwrap();
         assert!(drop_patch_entry(dir.path(), "cfg-if", false).await.unwrap());
         // The file survives (user content remains); only our entry is gone.
-        let body = fs::read_to_string(cargo_dir.join("config.toml")).await.unwrap();
+        let body = fs::read_to_string(cargo_dir.join("config.toml"))
+            .await
+            .unwrap();
         assert!(body.contains("jobs = 4"), "user [build] table preserved");
         assert!(!body.contains("cfg-if"));
     }
@@ -601,9 +604,12 @@ mod tests {
         fs::create_dir_all(&cargo_dir).await.unwrap();
         // A sibling file (e.g. credentials) means `.cargo/` must survive even
         // though our config is emptied + deleted.
-        fs::write(cargo_dir.join("credentials.toml"), "[registry]\ntoken = \"x\"\n")
-            .await
-            .unwrap();
+        fs::write(
+            cargo_dir.join("credentials.toml"),
+            "[registry]\ntoken = \"x\"\n",
+        )
+        .await
+        .unwrap();
         assert!(
             ensure_patch_entry(dir.path(), "cfg-if", &vendor_path("cfg-if", "1.0.4"), false)
                 .await
@@ -651,7 +657,8 @@ mod tests {
             "create-path commit must rename the stage file away, not leave it"
         );
         // A second, mutating upsert (uuid bump) must also clean up.
-        let bumped = format!("{CARGO_VENDOR_DIR}/11111111-2222-3333-4444-555555555555/cfg-if-1.0.4");
+        let bumped =
+            format!("{CARGO_VENDOR_DIR}/11111111-2222-3333-4444-555555555555/cfg-if-1.0.4");
         assert!(ensure_patch_entry(dir.path(), "cfg-if", &bumped, false)
             .await
             .unwrap());

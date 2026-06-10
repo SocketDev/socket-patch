@@ -118,10 +118,7 @@ fn parse_vendor(extra: &[&str]) -> VendorArgs {
 /// result so env-wiring tests can assert both the success and the failure
 /// shapes. The injected vars are removed before the scrub guard restores
 /// the ambient values.
-fn parse_vendor_with_env(
-    env: &[(&str, &str)],
-    extra: &[&str],
-) -> Result<VendorArgs, clap::Error> {
+fn parse_vendor_with_env(env: &[(&str, &str)], extra: &[&str]) -> Result<VendorArgs, clap::Error> {
     let _scrub = EnvScrub::new();
     for (k, v) in env {
         std::env::set_var(k, v);
@@ -498,7 +495,11 @@ fn env_socket_vendor_revert_falsey_tokens_keep_revert_off() {
     for token in ["0", "false", "no", "off"] {
         let a = parse_vendor_with_env(&[("SOCKET_VENDOR_REVERT", token)], &[])
             .unwrap_or_else(|e| panic!("SOCKET_VENDOR_REVERT={token} must parse: {e}"));
-        assert_eq!(snapshot(&a), expected_defaults(), "SOCKET_VENDOR_REVERT={token}");
+        assert_eq!(
+            snapshot(&a),
+            expected_defaults(),
+            "SOCKET_VENDOR_REVERT={token}"
+        );
     }
 }
 
@@ -526,8 +527,8 @@ fn env_socket_vendor_revert_garbage_is_rejected() {
 fn cli_revert_flag_wins_over_falsey_env() {
     // Precedence contract: CLI arg > env var. A falsey env value must not
     // override an explicit `--revert` on the argv.
-    let a = parse_vendor_with_env(&[("SOCKET_VENDOR_REVERT", "false")], &["--revert"])
-        .expect("parse");
+    let a =
+        parse_vendor_with_env(&[("SOCKET_VENDOR_REVERT", "false")], &["--revert"]).expect("parse");
     let mut want = expected_defaults();
     want.revert = true;
     assert_eq!(snapshot(&a), want);
@@ -553,7 +554,9 @@ fn vendor_appears_in_subcommand_list() {
     assert!(
         cmd.get_subcommands().any(|c| c.get_name() == "vendor"),
         "`vendor` must be a registered subcommand; found: {:?}",
-        cmd.get_subcommands().map(|c| c.get_name()).collect::<Vec<_>>()
+        cmd.get_subcommands()
+            .map(|c| c.get_name())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -567,9 +570,8 @@ fn vendor_appears_in_top_level_help() {
     };
     let help = format!("{err}");
     assert!(
-        help.lines().any(|l| {
-            l.trim_start().starts_with("vendor ") || l.trim_start() == "vendor"
-        }),
+        help.lines()
+            .any(|l| { l.trim_start().starts_with("vendor ") || l.trim_start() == "vendor" }),
         "`vendor` must be listed in --help output:\n{help}"
     );
 }

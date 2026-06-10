@@ -566,12 +566,18 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&manifest).unwrap();
-        assert!(json.contains("\"setup\""), "populated setup must be emitted");
+        assert!(
+            json.contains("\"setup\""),
+            "populated setup must be emitted"
+        );
         assert!(json.contains("crates/member-a"));
         assert!(json.contains("pypi"));
 
         let reparsed: PatchManifest = serde_json::from_str(&json).unwrap();
-        assert_eq!(manifest, reparsed, "populated setup must round-trip exactly");
+        assert_eq!(
+            manifest, reparsed,
+            "populated setup must round-trip exactly"
+        );
         let setup = reparsed.setup.unwrap();
         assert_eq!(setup.exclude, vec!["crates/member-a".to_string()]);
         assert_eq!(setup.manual, vec!["pypi".to_string()]);

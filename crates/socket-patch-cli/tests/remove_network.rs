@@ -188,7 +188,9 @@ async fn remove_online_downloads_missing_before_blob_then_removes() {
         fetched >= 1,
         "online remove must fetch the missing beforeHash blob ({blob_path}); \
          observed request paths={:?}",
-        reqs.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        reqs.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 }
 

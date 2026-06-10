@@ -333,7 +333,11 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
         // recursive `**` searchers below deliberately do NOT follow symlinks,
         // to avoid loops/escapes — there a symlink's `is_dir() == false` is the
         // desired skip.)
-        if !fs::metadata(&path).await.map(|m| m.is_dir()).unwrap_or(false) {
+        if !fs::metadata(&path)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         // A `dir/*` pattern must not pick up node_modules/hidden/output dirs as
@@ -790,7 +794,11 @@ mod tests {
             "nested-workspace leaf must be found via recursion: {paths:?}"
         );
         // root + inner + leaf, no duplicates.
-        assert_eq!(result.files.len(), 3, "exactly root + inner + leaf: {paths:?}");
+        assert_eq!(
+            result.files.len(),
+            3,
+            "exactly root + inner + leaf: {paths:?}"
+        );
     }
 
     #[tokio::test]
@@ -978,13 +986,16 @@ mod tests {
         fs::write(real.join("package.json"), r#"{"name":"a"}"#)
             .await
             .unwrap();
-        fs::create_dir_all(dir.path().join("packages")).await.unwrap();
+        fs::create_dir_all(dir.path().join("packages"))
+            .await
+            .unwrap();
         std::os::unix::fs::symlink(&real, dir.path().join("packages").join("a")).unwrap();
 
         let result = find_package_json_files(dir.path()).await;
         let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
         assert_eq!(
-            workspace_count, 1,
+            workspace_count,
+            1,
             "symlinked workspace member must be discovered: {:?}",
             result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
@@ -1021,7 +1032,8 @@ mod tests {
         let result = find_package_json_files(dir.path()).await;
         let workspace_count = result.files.iter().filter(|f| f.is_workspace).count();
         assert_eq!(
-            workspace_count, 1,
+            workspace_count,
+            1,
             "only the real member must be found; symlinks not followed: {:?}",
             result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );

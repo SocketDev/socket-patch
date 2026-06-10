@@ -29,9 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::patch::path_safety::{
-    is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment,
-};
+use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::list_dir_entries;
 
 /// Project-relative root of all vendored artifacts.
@@ -276,9 +274,7 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
             // Keep descending through structural levels (go module path
             // segments, composer vendor dirs, npm @scope dirs) up to a sane
             // depth bound.
-            if crate::utils::fs::entry_is_dir(&entry).await
-                && leaf.matches('/').count() < 8
-            {
+            if crate::utils::fs::entry_is_dir(&entry).await && leaf.matches('/').count() < 8 {
                 stack.push((entry.path(), leaf));
             }
         }
@@ -302,7 +298,10 @@ mod tests {
         );
         assert!(vendor_uuid_dir_rel("npm", "../../escape").is_none());
         assert!(vendor_uuid_dir_rel("npm", "9F6B2C4E-1D3A-4F6B-8C2D-7E5A9B1C3D5F").is_none());
-        assert!(vendor_uuid_dir_rel("maven", UUID).is_none(), "unknown eco dir");
+        assert!(
+            vendor_uuid_dir_rel("maven", UUID).is_none(),
+            "unknown eco dir"
+        );
     }
 
     #[test]
@@ -331,11 +330,12 @@ mod tests {
         assert_eq!(p.leaf, "monolog/monolog@2.9.1");
 
         // cargo config path, backslashes (Windows spelling)
-        let p = parse_vendor_path(&format!(
-            ".socket\\vendor\\cargo\\{UUID}\\serde-1.0.190"
-        ))
-        .unwrap();
-        assert_eq!((p.eco.as_str(), p.leaf.as_str()), ("cargo", "serde-1.0.190"));
+        let p =
+            parse_vendor_path(&format!(".socket\\vendor\\cargo\\{UUID}\\serde-1.0.190")).unwrap();
+        assert_eq!(
+            (p.eco.as_str(), p.leaf.as_str()),
+            ("cargo", "serde-1.0.190")
+        );
 
         // anchored mid-string (workspace-relative)
         assert!(parse_vendor_path(&format!(
@@ -395,7 +395,10 @@ mod tests {
         // Unparseable leaves are None, not garbage.
         assert!(leaf_to_purl("npm", "noversion.tgz").is_none());
         assert!(leaf_to_purl("golang", "no-version-here").is_none());
-        assert!(leaf_to_purl("pypi", "six-1.16.0.whl").is_none(), "tags required");
+        assert!(
+            leaf_to_purl("pypi", "six-1.16.0.whl").is_none(),
+            "tags required"
+        );
     }
 
     #[tokio::test]
@@ -417,14 +420,19 @@ mod tests {
         )))
         .await
         .unwrap();
-        tokio::fs::create_dir_all(root.join(".socket/vendor/npm/not-a-uuid")).await.unwrap();
+        tokio::fs::create_dir_all(root.join(".socket/vendor/npm/not-a-uuid"))
+            .await
+            .unwrap();
 
         let swept = sweep_vendor_dirs(root).await;
         assert_eq!(swept.len(), 2, "junk dir skipped: {swept:?}");
         let npm = swept.iter().find(|s| s.eco == "npm").unwrap();
         assert_eq!(npm.purls, vec!["pkg:npm/lodash@4.17.21".to_string()]);
         let go = swept.iter().find(|s| s.eco == "golang").unwrap();
-        assert_eq!(go.purls, vec!["pkg:golang/github.com/foo/bar@v1.4.2".to_string()]);
+        assert_eq!(
+            go.purls,
+            vec!["pkg:golang/github.com/foo/bar@v1.4.2".to_string()]
+        );
         assert_eq!(go.uuid, UUID);
     }
 }

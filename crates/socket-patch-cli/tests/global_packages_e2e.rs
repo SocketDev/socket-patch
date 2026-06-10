@@ -156,7 +156,10 @@ fn assert_rollback_noop(stdout: &str) {
     assert_eq!(v["failed"], 0, "envelope={v}");
     assert_eq!(v["dryRun"], false, "envelope={v}");
     assert_eq!(
-        v["results"].as_array().expect("results must be an array").len(),
+        v["results"]
+            .as_array()
+            .expect("results must be an array")
+            .len(),
         0,
         "no package was patched, so results must be empty; envelope={v}"
     );
@@ -192,13 +195,7 @@ fn rollback_global_resolves_real_npm_prefix() {
     write_manifest(&tmp.path(), "pkg:npm/__rollback_global__@1.0.0");
 
     let out = Command::new(binary())
-        .args([
-            "rollback",
-            "--global",
-            "--offline",
-            "--json",
-            "--silent",
-        ])
+        .args(["rollback", "--global", "--offline", "--json", "--silent"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .output()
@@ -249,7 +246,10 @@ fn apply_global_prefix_uses_explicit_path() {
             .env_remove("SOCKET_API_TOKEN")
             .output()
             .expect("run socket-patch");
-        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string())
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
     };
 
     // Negative: empty prefix → nothing to patch.
@@ -295,7 +295,10 @@ fn rollback_global_prefix_uses_explicit_path() {
             .env_remove("SOCKET_API_TOKEN")
             .output()
             .expect("run socket-patch");
-        (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).to_string())
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
     };
 
     // Negative: empty prefix → no package, empty results.
@@ -363,7 +366,10 @@ fn apply_global_with_empty_path_handles_missing_npm() {
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 1, "missing npm → exit 1, not a crash; stdout={stdout}");
+    assert_eq!(
+        code, 1,
+        "missing npm → exit 1, not a crash; stdout={stdout}"
+    );
     assert_apply_not_installed(&stdout, "pkg:npm/__missing_npm__@1.0.0");
 }
 
@@ -373,13 +379,7 @@ fn rollback_global_with_empty_path_handles_missing_npm() {
     write_manifest(&tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
 
     let out = Command::new(binary())
-        .args([
-            "rollback",
-            "--global",
-            "--offline",
-            "--json",
-            "--silent",
-        ])
+        .args(["rollback", "--global", "--offline", "--json", "--silent"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .env("PATH", "/nonexistent-dir-for-test")
@@ -452,7 +452,10 @@ fn apply_global_with_stub_npm_root_resolves_path() {
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 0, "stubbed npm root resolves seeded pkg → exit 0; stdout={stdout}");
+    assert_eq!(
+        code, 0,
+        "stubbed npm root resolves seeded pkg → exit 0; stdout={stdout}"
+    );
     assert_apply_applied(&stdout, "pkg:npm/__stubbed_npm__@1.0.0");
     assert!(
         marker.exists(),
@@ -475,7 +478,10 @@ fn apply_global_with_empty_npm_root_output_handles_error() {
     write_stub(
         &stub_dir,
         "npm",
-        &format!("#!/bin/sh\necho invoked > \"{}\"\nexit 0\n", marker.display()),
+        &format!(
+            "#!/bin/sh\necho invoked > \"{}\"\nexit 0\n",
+            marker.display()
+        ),
     );
 
     write_manifest(tmp.path(), "pkg:npm/__empty_npm__@1.0.0");
@@ -505,7 +511,10 @@ fn apply_global_with_failing_npm_handles_error() {
     write_stub(
         &stub_dir,
         "npm",
-        &format!("#!/bin/sh\necho invoked > \"{}\"\nexit 1\n", marker.display()),
+        &format!(
+            "#!/bin/sh\necho invoked > \"{}\"\nexit 1\n",
+            marker.display()
+        ),
     );
 
     write_manifest(tmp.path(), "pkg:npm/__failing_npm__@1.0.0");

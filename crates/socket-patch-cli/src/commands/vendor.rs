@@ -248,7 +248,10 @@ pub async fn run(args: VendorArgs) -> i32 {
     let org_slug = telemetry_client.org_slug().cloned();
 
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let socket_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     // `--revert` derives everything from state.json + the vendor tree; it
     // must work after the manifest was deleted. Plain vendor needs the
@@ -411,7 +414,10 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         .map(|(eco, purls)| {
             (
                 eco,
-                purls.into_iter().filter(|p| vendor::is_vendorable(p)).collect(),
+                purls
+                    .into_iter()
+                    .filter(|p| vendor::is_vendorable(p))
+                    .collect(),
             )
         })
         .collect();
@@ -462,7 +468,10 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
             if !handled_bases.insert(base.clone()) {
                 continue;
             }
-            variant_groups.get(&base).cloned().unwrap_or_else(|| vec![base])
+            variant_groups
+                .get(&base)
+                .cloned()
+                .unwrap_or_else(|| vec![base])
         } else {
             vec![purl.clone()]
         };
@@ -608,13 +617,19 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
     }
 
     if !common.json && !common.silent {
-        let verb = if common.dry_run { "Would vendor" } else { "Vendored" };
+        let verb = if common.dry_run {
+            "Would vendor"
+        } else {
+            "Vendored"
+        };
         println!(
             "{verb} {} package(s); {} skipped; {} failed.",
             env.summary.applied, env.summary.skipped, env.summary.failed
         );
         if env.summary.applied > 0 && !common.dry_run {
-            println!("Commit .socket/vendor/ and the updated lockfiles to make the patches portable.");
+            println!(
+                "Commit .socket/vendor/ and the updated lockfiles to make the patches portable."
+            );
         }
     }
 
@@ -726,10 +741,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             }
         } else {
             has_errors = true;
-            env.record(PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
-                "revert_failed",
-                outcome.error.unwrap_or_else(|| "unknown error".into()),
-            ));
+            env.record(
+                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
+                    "revert_failed",
+                    outcome.error.unwrap_or_else(|| "unknown error".into()),
+                ),
+            );
             if !common.silent && !common.json {
                 eprintln!("Failed to revert {purl}");
             }
@@ -772,7 +789,11 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     }
 
     if !common.json && !common.silent {
-        let verb = if common.dry_run { "Would revert" } else { "Reverted" };
+        let verb = if common.dry_run {
+            "Would revert"
+        } else {
+            "Reverted"
+        };
         println!(
             "{verb} {} vendored package(s); {} failed.",
             env.summary.removed, env.summary.failed

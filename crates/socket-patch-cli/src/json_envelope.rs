@@ -255,21 +255,13 @@ impl PatchEvent {
         self
     }
 
-    pub fn with_reason(
-        mut self,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn with_reason(mut self, code: impl Into<String>, message: impl Into<String>) -> Self {
         self.error_code = Some(code.into());
         self.reason = Some(message.into());
         self
     }
 
-    pub fn with_error(
-        mut self,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn with_error(mut self, code: impl Into<String>, message: impl Into<String>) -> Self {
         self.error_code = Some(code.into());
         self.error = Some(message.into());
         self
@@ -376,7 +368,6 @@ pub enum Command {
     Vex,
 }
 
-
 /// Top-level status. Serializes camelCase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,7 +473,10 @@ mod tests {
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         keys.sort();
         // `error` is skipped when None, so it shouldn't appear.
-        assert_eq!(keys, vec!["command", "dryRun", "events", "status", "summary"]);
+        assert_eq!(
+            keys,
+            vec!["command", "dryRun", "events", "status", "summary"]
+        );
         assert_eq!(v["command"], "scan");
         assert_eq!(v["status"], "success");
         assert_eq!(v["dryRun"], false);
@@ -493,7 +487,10 @@ mod tests {
     fn record_keeps_summary_in_sync() {
         let mut env = Envelope::new(Command::Apply);
         env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/foo@1.0.0"));
-        env.record(PatchEvent::new(PatchAction::Downloaded, "pkg:npm/foo@1.0.0"));
+        env.record(PatchEvent::new(
+            PatchAction::Downloaded,
+            "pkg:npm/foo@1.0.0",
+        ));
         env.record(
             PatchEvent::new(PatchAction::Skipped, "pkg:npm/bar@2.0.0")
                 .with_reason("already_patched", "Files match afterHash"),
@@ -563,14 +560,21 @@ mod tests {
     fn skipped_event_omits_uuid_and_files() {
         let event = PatchEvent::new(PatchAction::Skipped, "pkg:npm/foo@1.0.0")
             .with_reason("package_not_installed", "no matching package on disk");
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("uuid"));
         assert!(!obj.contains_key("files"));
         assert!(!obj.contains_key("oldUuid"));
         assert!(!obj.contains_key("error"));
-        assert_eq!(obj.get("errorCode").and_then(|v| v.as_str()), Some("package_not_installed"));
-        assert_eq!(obj.get("reason").and_then(|v| v.as_str()), Some("no matching package on disk"));
+        assert_eq!(
+            obj.get("errorCode").and_then(|v| v.as_str()),
+            Some("package_not_installed")
+        );
+        assert_eq!(
+            obj.get("reason").and_then(|v| v.as_str()),
+            Some("no matching package on disk")
+        );
     }
 
     #[test]
@@ -589,7 +593,8 @@ mod tests {
                     applied_via: Some(AppliedVia::Blob),
                 },
             ]);
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         let files = v["files"].as_array().unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0]["path"], "package/index.js");
@@ -611,7 +616,10 @@ mod tests {
     #[test]
     fn top_level_error_serializes_inline() {
         let mut env = Envelope::new(Command::Get);
-        env.mark_error(EnvelopeError::new("paid_required", "Patch requires paid plan"));
+        env.mark_error(EnvelopeError::new(
+            "paid_required",
+            "Patch requires paid plan",
+        ));
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "error");
         assert_eq!(v["error"]["code"], "paid_required");
@@ -632,7 +640,8 @@ mod tests {
         // GC sweep events aren't scoped to a single PURL.
         let event = PatchEvent::artifact(PatchAction::Removed)
             .with_reason("orphan_blob", "Blob not referenced by any manifest entry");
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         let obj = v.as_object().unwrap();
         assert!(!obj.contains_key("purl"));
         assert_eq!(obj["action"], "removed");
@@ -710,7 +719,9 @@ mod tests {
         });
         assert_eq!(env.sidecars.len(), 1);
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
-        let sidecars = v["sidecars"].as_array().expect("sidecars present once recorded");
+        let sidecars = v["sidecars"]
+            .as_array()
+            .expect("sidecars present once recorded");
         assert_eq!(sidecars.len(), 1);
         assert_eq!(sidecars[0]["purl"], "pkg:cargo/foo@1.0.0");
         assert_eq!(sidecars[0]["ecosystem"], "cargo");
@@ -788,7 +799,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["dryRun"], true);
         assert_eq!(v["events"][0]["details"]["tier"], "free");
-        assert_eq!(v["events"][0]["details"]["vulns"], serde_json::json!([1, 2]));
+        assert_eq!(
+            v["events"][0]["details"]["vulns"],
+            serde_json::json!([1, 2])
+        );
     }
 
     #[test]

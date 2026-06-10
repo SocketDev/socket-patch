@@ -68,7 +68,11 @@ pub fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
             found_extras = true;
             continue;
         }
-        let spec_no_ws: String = req.specifier.chars().filter(|c| !c.is_whitespace()).collect();
+        let spec_no_ws: String = req
+            .specifier
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         if spec_no_ws == format!("=={version}") {
             if exact.is_none() {
                 exact = Some(PinSearch::Exact {
@@ -99,7 +103,9 @@ pub(super) async fn preflight_requirements(
     canon_name: &str,
     version: &str,
 ) -> Result<(), (&'static str, String)> {
-    plan_requirements(root, canon_name, version, "", "").await.map(|_| ())
+    plan_requirements(root, canon_name, version, "", "")
+        .await
+        .map(|_| ())
 }
 
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
@@ -133,11 +139,7 @@ pub async fn wire_requirements(
 /// what vendor wrote are left alone with `vendor_revert_line_drifted`; any
 /// surviving reference to the vendored uuid dir afterwards raises
 /// `vendor_revert_residual_reference`.
-pub async fn revert_requirements(
-    entry: &VendorEntry,
-    root: &Path,
-    dry_run: bool,
-) -> RevertOutcome {
+pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // Group records per file, preserving application order within each.
@@ -348,7 +350,11 @@ async fn plan_requirements(
             if canonicalize_pypi_name(&req.name) != canon_name || req.extras.is_some() {
                 continue;
             }
-            let spec: String = req.specifier.chars().filter(|c| !c.is_whitespace()).collect();
+            let spec: String = req
+                .specifier
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             if spec == format!("=={version}") {
                 spans.push((ll.start, ll.physical.len(), req.marker));
             }
@@ -361,7 +367,14 @@ async fn plan_requirements(
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
         for (start, count, marker) in spans.iter().rev() {
-            let line = vendor_line(rel_wheel, wheel_sha256_hex, canon_name, version, marker, false);
+            let line = vendor_line(
+                rel_wheel,
+                wheel_sha256_hex,
+                canon_name,
+                version,
+                marker,
+                false,
+            );
             let replaced: Vec<String> = original_lines[*start..*start + *count].to_vec();
             lines.splice(*start..*start + *count, [line.clone()]);
             records.push(WiringRecord {
@@ -370,7 +383,10 @@ async fn plan_requirements(
                 action: WiringAction::Rewritten,
                 key: Some(format!("{}:{}", file.rel, start + 1)),
                 original: Some(serde_json::Value::Array(
-                    replaced.into_iter().map(serde_json::Value::String).collect(),
+                    replaced
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 )),
                 new: Some(serde_json::Value::String(line)),
             });
@@ -395,7 +411,14 @@ async fn plan_requirements(
         let root_file = files
             .first()
             .expect("collect_requirements_files always yields the root file first");
-        let line = vendor_line(rel_wheel, wheel_sha256_hex, canon_name, version, &None, true);
+        let line = vendor_line(
+            rel_wheel,
+            wheel_sha256_hex,
+            canon_name,
+            version,
+            &None,
+            true,
+        );
         let nl = newline_of(&root_file.content);
         let mut new_content = root_file.content.clone();
         if !new_content.is_empty() && !new_content.ends_with('\n') {
@@ -444,9 +467,7 @@ fn vendor_line(
 /// cycle guard). `-c` constraints files are never followed — they may not
 /// introduce requirements, so a pin there is pip's problem, not ours, and we
 /// must never edit them. The root file is always element 0.
-async fn collect_requirements_files(
-    root: &Path,
-) -> Result<Vec<ReqFile>, (&'static str, String)> {
+async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'static str, String)> {
     let mut out: Vec<ReqFile> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<(String, PathBuf)> = vec![(
@@ -761,16 +782,28 @@ mod tests {
             find_pin("Six_Pkg==1.0\n", "six-pkg", "1.0"),
             PinSearch::Exact { .. }
         ));
-        assert_eq!(find_pin("six[socks]==1.16.0\n", "six", "1.16.0"), PinSearch::Extras);
+        assert_eq!(
+            find_pin("six[socks]==1.16.0\n", "six", "1.16.0"),
+            PinSearch::Extras
+        );
         assert_eq!(find_pin("six>=1.0\n", "six", "1.16.0"), PinSearch::Range);
         assert_eq!(find_pin("six\n", "six", "1.16.0"), PinSearch::Range);
         // Pinned, but to a different version than the one being vendored.
         assert_eq!(find_pin("six==1.15.0\n", "six", "1.16.0"), PinSearch::Range);
-        assert_eq!(find_pin("requests==2.31.0\n", "six", "1.16.0"), PinSearch::Absent);
+        assert_eq!(
+            find_pin("requests==2.31.0\n", "six", "1.16.0"),
+            PinSearch::Absent
+        );
         // `sixty` must not match `six` (name boundary).
-        assert_eq!(find_pin("sixty==1.16.0\n", "six", "1.16.0"), PinSearch::Absent);
+        assert_eq!(
+            find_pin("sixty==1.16.0\n", "six", "1.16.0"),
+            PinSearch::Absent
+        );
         // Comment-only and option lines are not requirements.
-        assert_eq!(find_pin("# six==1.16.0\n-r other.txt\n", "six", "1.16.0"), PinSearch::Absent);
+        assert_eq!(
+            find_pin("# six==1.16.0\n-r other.txt\n", "six", "1.16.0"),
+            PinSearch::Absent
+        );
     }
 
     // ── wiring ───────────────────────────────────────────────────────────
@@ -793,7 +826,11 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.success);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
-        assert_eq!(read_root(tmp.path()).await, original, "byte-identical revert");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            original,
+            "byte-identical revert"
+        );
     }
 
     #[tokio::test]
@@ -856,7 +893,9 @@ mod tests {
     #[tokio::test]
     async fn follows_dash_r_includes_and_rewrites_pin_in_place() {
         let tmp = write_root("-r deps/pinned.txt\nrequests==2.31.0\n").await;
-        tokio::fs::create_dir_all(tmp.path().join("deps")).await.unwrap();
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join("deps/pinned.txt"), "six==1.16.0\n")
             .await
             .unwrap();
@@ -865,9 +904,14 @@ mod tests {
             .unwrap();
         // The pin is rewritten where it lives; the root stays untouched (no
         // duplicate appended).
-        assert_eq!(read_root(tmp.path()).await, "-r deps/pinned.txt\nrequests==2.31.0\n");
         assert_eq!(
-            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt")).await.unwrap(),
+            read_root(tmp.path()).await,
+            "-r deps/pinned.txt\nrequests==2.31.0\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+                .await
+                .unwrap(),
             format!("{}\n", expected_line())
         );
         assert_eq!(wiring.len(), 1);
@@ -876,7 +920,9 @@ mod tests {
         let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
         assert!(outcome.success);
         assert_eq!(
-            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt")).await.unwrap(),
+            tokio::fs::read_to_string(tmp.path().join("deps/pinned.txt"))
+                .await
+                .unwrap(),
             "six==1.16.0\n"
         );
     }
@@ -890,7 +936,11 @@ mod tests {
         let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
             .await
             .unwrap();
-        assert_eq!(wiring.len(), 1, "cycle guard must not duplicate the rewrite");
+        assert_eq!(
+            wiring.len(),
+            1,
+            "cycle guard must not duplicate the rewrite"
+        );
     }
 
     #[tokio::test]
@@ -927,7 +977,9 @@ mod tests {
         assert_eq!(err.0, "pypi_requirements_outside_root");
         // The out-of-root file is never edited.
         assert_eq!(
-            tokio::fs::read_to_string(outer.path().join("shared.txt")).await.unwrap(),
+            tokio::fs::read_to_string(outer.path().join("shared.txt"))
+                .await
+                .unwrap(),
             "six==1.16.0\n"
         );
     }
@@ -947,7 +999,9 @@ mod tests {
         tokio::fs::create_dir_all(&root).await.unwrap();
         // A precious sibling OUTSIDE the project root.
         let precious = outer.path().join("precious.txt");
-        tokio::fs::write(&precious, "keep me intact\n").await.unwrap();
+        tokio::fs::write(&precious, "keep me intact\n")
+            .await
+            .unwrap();
 
         for bad in ["../precious.txt", "/etc/hosts", "a/../../precious.txt"] {
             let wiring = vec![WiringRecord {
@@ -1002,7 +1056,11 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "vendor_revert_residual_reference"));
-        assert_eq!(read_root(tmp.path()).await, drifted, "drifted line left alone");
+        assert_eq!(
+            read_root(tmp.path()).await,
+            drifted,
+            "drifted line left alone"
+        );
     }
 
     #[tokio::test]

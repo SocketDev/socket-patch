@@ -90,7 +90,7 @@ fn default_rollback_args(cwd: &Path, eco: &str) -> RollbackArgs {
             global: false,
             global_prefix: None,
             org: None,
-                        api_token: None,
+            api_token: None,
             ecosystems: Some(vec![eco.to_string()]),
             json: true,
             verbose: false,
@@ -234,10 +234,7 @@ async fn rollback_pypi_restores_original_content() {
     let code = rollback_run(default_rollback_args(tmp.path(), "pypi")).await;
     assert_eq!(code, 0, "pypi rollback must report success (exit 0)");
     let after = std::fs::read(pkg_dir.join("__init__.py")).unwrap();
-    assert_eq!(
-        after, original,
-        "pypi rollback must restore original bytes"
-    );
+    assert_eq!(after, original, "pypi rollback must restore original bytes");
 }
 
 // ---------------------------------------------------------------------------

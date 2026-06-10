@@ -48,8 +48,7 @@ const BEFORE_HASH: &str = "311f1e893e6eac502693fad8617dcf5353a043ccc0f7b4ba9fe38
 /// 64-hex-char placeholder used for orphan-blob fixtures. Not a real
 /// blob hash — picked so it can't accidentally collide with anything
 /// the API would return.
-const FAKE_ORPHAN_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const FAKE_ORPHAN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Fake UUID we plant in the manifest to force `scan --apply` into the
 /// `"updated"` branch.
@@ -153,8 +152,8 @@ fn parse_scan_json(stdout: &str) -> serde_json::Value {
 /// message if it doesn't exist or is malformed.
 fn read_manifest_file(cwd: &Path) -> serde_json::Value {
     let path = cwd.join(".socket/manifest.json");
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&content)
         .unwrap_or_else(|e| panic!("manifest is not valid JSON: {e}\n{content}"))
 }
@@ -232,7 +231,9 @@ fn test_scan_apply_json_adds_new_patch() {
         "API must have returned at least one free patch; got {}",
         v["freePatches"]
     );
-    let patches = v["apply"]["patches"].as_array().expect("apply.patches array");
+    let patches = v["apply"]["patches"]
+        .as_array()
+        .expect("apply.patches array");
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
@@ -283,14 +284,12 @@ fn test_scan_apply_json_skips_existing() {
         "first run should have patched the file",
     );
 
-    let (stdout, _) = assert_run_ok(
-        cwd,
-        &["scan", "--json", "--apply", "--yes"],
-        "second run",
-    );
+    let (stdout, _) = assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "second run");
     let v = parse_scan_json(&stdout);
 
-    let patches = v["apply"]["patches"].as_array().expect("apply.patches array");
+    let patches = v["apply"]["patches"]
+        .as_array()
+        .expect("apply.patches array");
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
@@ -325,7 +324,9 @@ fn test_scan_apply_json_updates_existing() {
     );
     let v = parse_scan_json(&stdout);
 
-    let patches = v["apply"]["patches"].as_array().expect("apply.patches array");
+    let patches = v["apply"]["patches"]
+        .as_array()
+        .expect("apply.patches array");
     let minimist = patches
         .iter()
         .find(|p| p["purl"] == NPM_PURL)
@@ -450,7 +451,11 @@ fn test_scan_apply_prune_prunes_uninstalled_package() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
     // First run — patch is added (no --prune needed for the apply step).
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--apply", "--yes"],
+        "initial apply",
+    );
     assert!(cwd.join(".socket/manifest.json").exists());
 
     npm_run(cwd, &["uninstall", "minimist"]);
@@ -492,7 +497,11 @@ fn test_scan_apply_default_keeps_uninstalled_entries() {
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
 
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--apply", "--yes"],
+        "initial apply",
+    );
     npm_run(cwd, &["uninstall", "minimist"]);
     npm_run(cwd, &["install", "left-pad@1.3.0"]);
 
@@ -543,7 +552,11 @@ fn test_scan_apply_prune_cleans_orphan_blobs() {
     let cwd = dir.path();
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--apply", "--yes"],
+        "initial apply",
+    );
 
     let index_js = cwd.join("node_modules/minimist/index.js");
     let patched_hash = git_sha256_file(&index_js);
@@ -622,7 +635,11 @@ fn test_scan_dry_run_sync_previews_apply_and_gc() {
     npm_run(cwd, &["install", "minimist@1.2.2"]);
     // Set up: apply once to create a manifest, then uninstall + plant
     // an orphan so there's prune + cleanup work to preview.
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--apply", "--yes"],
+        "initial apply",
+    );
 
     npm_run(cwd, &["uninstall", "minimist"]);
     npm_run(cwd, &["install", "left-pad@1.3.0"]);
@@ -682,7 +699,11 @@ fn test_scan_json_no_gc_field_without_prune() {
     let cwd = dir.path();
     write_package_json(cwd);
     npm_run(cwd, &["install", "minimist@1.2.2"]);
-    assert_run_ok(cwd, &["scan", "--json", "--apply", "--yes"], "initial apply");
+    assert_run_ok(
+        cwd,
+        &["scan", "--json", "--apply", "--yes"],
+        "initial apply",
+    );
 
     npm_run(cwd, &["uninstall", "minimist"]);
     npm_run(cwd, &["install", "left-pad@1.3.0"]);
@@ -735,7 +756,9 @@ fn test_scan_sync_yes_full_lifecycle() {
         .as_array()
         .expect("first sync should populate apply.patches");
     assert!(
-        patches.iter().any(|p| p["purl"] == NPM_PURL && p["action"] == "added"),
+        patches
+            .iter()
+            .any(|p| p["purl"] == NPM_PURL && p["action"] == "added"),
         "first sync should add the minimist patch"
     );
     assert_eq!(v1["status"], "success");
@@ -743,7 +766,9 @@ fn test_scan_sync_yes_full_lifecycle() {
     // result, not the `{"skipped": true}` short-circuit (which `is_object()`
     // would also accept), and on this first run there is nothing installed-then-
     // uninstalled, so it must prune nothing.
-    let gc1 = v1["gc"].as_object().expect("gc must be emitted under --sync");
+    let gc1 = v1["gc"]
+        .as_object()
+        .expect("gc must be emitted under --sync");
     assert!(
         gc1.get("skipped") != Some(&serde_json::Value::Bool(true)),
         "GC must not be skipped on a --sync run that scanned packages; got {:?}",

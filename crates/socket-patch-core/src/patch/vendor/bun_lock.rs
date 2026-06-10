@@ -114,9 +114,9 @@ pub async fn vendor_bun(
 
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
     let target_spec = format!("{name}@{version}");
-    let has_match = entries.iter().any(|e| {
-        classify(e, &target_spec, name).is_some()
-    });
+    let has_match = entries
+        .iter()
+        .any(|e| classify(e, &target_spec, name).is_some());
     if !has_match {
         return refused(
             "vendor_lock_entry_not_found",
@@ -144,7 +144,11 @@ pub async fn vendor_bun(
     };
     let Some(staged) = staged else {
         // Failed patch or dry run: wiring never ran, project byte-untouched.
-        return VendorOutcome::Done { result, entry: None, warnings };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
     };
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
@@ -166,7 +170,9 @@ pub async fn vendor_bun(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
     for entry in &entries {
-        let Some(shape) = classify(entry, &target_spec, name) else { continue };
+        let Some(shape) = classify(entry, &target_spec, name) else {
+            continue;
+        };
         let (deps_verbatim, was_ours) = match shape {
             TupleShape::Registry => (entry.elems[2].clone(), false),
             TupleShape::Ours { path } => {
@@ -196,7 +202,11 @@ pub async fn vendor_bun(
             // Never record one of our own (stale) edits as the "original" —
             // revert must restore the pre-vendor registry tuple, not a
             // dangling `.socket/vendor/` pointer from an earlier uuid.
-            original: if was_ours { None } else { Some(Value::String(original_line)) },
+            original: if was_ours {
+                None
+            } else {
+                Some(Value::String(original_line))
+            },
             new: Some(Value::String(new_line)),
         });
         changed = true;
@@ -206,7 +216,11 @@ pub async fn vendor_bun(
         // Every instance already points at this uuid with the packed
         // integrity: in sync. The tarball re-pack above was byte-identical
         // by determinism; synthesize AlreadyPatched and record nothing.
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return VendorOutcome::Done {
             result: synthesized_result(purl, &project_root.join(&rel_tgz), verified, true, None),
             entry: None,
@@ -258,7 +272,11 @@ pub async fn vendor_bun(
         pdm: None,
         pipenv: None,
     };
-    VendorOutcome::Done { result, entry: Some(entry), warnings }
+    VendorOutcome::Done {
+        result,
+        entry: Some(entry),
+        warnings,
+    }
 }
 
 /// Undo one bun-vendored package: restore the recorded entry lines and
@@ -284,7 +302,10 @@ pub async fn revert_bun(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         if !REVERT_ALLOWLIST.contains(&rec.file.as_str()) {
             outcome.warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("ignoring wiring record for non-allowlisted file `{}`", rec.file),
+                format!(
+                    "ignoring wiring record for non-allowlisted file `{}`",
+                    rec.file
+                ),
             ));
             continue;
         }
@@ -312,8 +333,7 @@ pub async fn revert_bun(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         }
         if dirty {
             if let Err(e) =
-                atomic_write_bytes(&project_root.join(BUN_LOCK), lines.join("\n").as_bytes())
-                    .await
+                atomic_write_bytes(&project_root.join(BUN_LOCK), lines.join("\n").as_bytes()).await
             {
                 return RevertOutcome::failed(format!("cannot write {BUN_LOCK}: {e}"));
             }
@@ -335,7 +355,10 @@ fn revert_one_record(
 ) {
     let drifted = |detail: String| VendorWarning::new("vendor_lock_entry_drifted", detail);
     if rec.kind != KIND_LOCK_PACKAGE {
-        warnings.push(drifted(format!("unknown wiring kind `{}`; left alone", rec.kind)));
+        warnings.push(drifted(format!(
+            "unknown wiring kind `{}`; left alone",
+            rec.kind
+        )));
         return;
     }
     let Some(key) = rec.key.as_deref() else {
@@ -350,10 +373,13 @@ fn revert_one_record(
         )));
         return;
     };
-    let located = lines[start + 1..end].iter().enumerate().find_map(|(off, line)| {
-        let parsed = parse_entry_line(line).ok()?;
-        (parsed.key == key).then_some((start + 1 + off, parsed))
-    });
+    let located = lines[start + 1..end]
+        .iter()
+        .enumerate()
+        .find_map(|(off, line)| {
+            let parsed = parse_entry_line(line).ok()?;
+            (parsed.key == key).then_some((start + 1 + off, parsed))
+        });
     if let Some((idx, parsed)) = located {
         // Ours iff the line is exactly what we wrote, or its tuple still
         // points into OUR uuid dir (a re-serialized but unmoved entry).
@@ -386,7 +412,9 @@ fn revert_one_record(
         }
         return;
     }
-    warnings.push(drifted(format!("lock entry `{key}` no longer exists; nothing to restore")));
+    warnings.push(drifted(format!(
+        "lock entry `{key}` no longer exists; nothing to restore"
+    )));
 }
 
 // ───────────────────────── conservative line grammar ──────────────────────
@@ -432,7 +460,9 @@ fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShap
                 return None;
             }
             let parts = parse_vendor_path(path)?;
-            (parts.eco == "npm").then(|| TupleShape::Ours { path: path.to_string() })
+            (parts.eco == "npm").then(|| TupleShape::Ours {
+                path: path.to_string(),
+            })
         }
         _ => None,
     }
@@ -467,7 +497,9 @@ fn check_lock_version(text: &str) -> Result<(), String> {
 
 /// `(header_idx, close_idx)` of the `"packages": {` section.
 fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
-    let start = lines.iter().position(|l| l.trim_end() == "  \"packages\": {")?;
+    let start = lines
+        .iter()
+        .position(|l| l.trim_end() == "  \"packages\": {")?;
     let end = lines
         .iter()
         .enumerate()
@@ -790,12 +822,16 @@ mod tests {
         }
 
         async fn read_lock(&self) -> String {
-            tokio::fs::read_to_string(self.root().join(BUN_LOCK)).await.unwrap()
+            tokio::fs::read_to_string(self.root().join(BUN_LOCK))
+                .await
+                .unwrap()
         }
 
         /// The actual SRI of the tarball our pack produced.
         async fn actual_integrity(&self) -> String {
-            let tgz = tokio::fs::read(self.root().join(self.rel_tgz())).await.unwrap();
+            let tgz = tokio::fs::read(self.root().join(self.rel_tgz()))
+                .await
+                .unwrap();
             format!(
                 "sha512-{}",
                 base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&tgz))
@@ -831,14 +867,20 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::fs::write(installed.join("index.js"), ORIG_INDEX).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
 
         let blobs = root.join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX).await.unwrap();
+        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX)
+            .await
+            .unwrap();
 
-        tokio::fs::write(root.join("package.json"), BN3_PKG).await.unwrap();
+        tokio::fs::write(root.join("package.json"), BN3_PKG)
+            .await
+            .unwrap();
         tokio::fs::write(root.join(BUN_LOCK), lock).await.unwrap();
 
         let mut files = HashMap::new();
@@ -858,14 +900,22 @@ mod tests {
             license: "MIT".to_string(),
             tier: "free".to_string(),
         };
-        Fixture { tmp, record, installed }
+        Fixture {
+            tmp,
+            record,
+            installed,
+        }
     }
 
     fn expect_done(
         outcome: VendorOutcome,
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
-            VendorOutcome::Done { result, entry, warnings } => (result, entry, warnings),
+            VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } => (result, entry, warnings),
             VendorOutcome::Refused { code, detail } => {
                 panic!("expected Done, got Refused {code}: {detail}")
             }
@@ -879,7 +929,10 @@ mod tests {
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused {want_code}, got Done (success={})", result.success)
+                panic!(
+                    "expected Refused {want_code}, got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -892,7 +945,10 @@ mod tests {
         let entry = entry.expect("success carries a ledger entry");
 
         let actual = fx.actual_integrity().await;
-        assert_ne!(actual, SPIKE_INTEGRITY, "different tarballs, different hashes");
+        assert_ne!(
+            actual, SPIKE_INTEGRITY,
+            "different tarballs, different hashes"
+        );
         assert_eq!(
             fx.read_lock().await,
             BN3_AFTER_LOCK.replace(SPIKE_INTEGRITY, &actual),
@@ -900,7 +956,9 @@ mod tests {
         );
         // LOCK-ONLY: package.json byte-untouched.
         assert_eq!(
-            tokio::fs::read_to_string(fx.root().join("package.json")).await.unwrap(),
+            tokio::fs::read_to_string(fx.root().join("package.json"))
+                .await
+                .unwrap(),
             BN3_PKG
         );
 
@@ -923,8 +981,11 @@ mod tests {
 
     #[tokio::test]
     async fn bn4c_nested_key_is_rewritten_and_the_other_version_stays_registry() {
-        let fx =
-            fixture_with(BN4C_BEFORE_LOCK, "node_modules/haspad/node_modules/left-pad").await;
+        let fx = fixture_with(
+            BN4C_BEFORE_LOCK,
+            "node_modules/haspad/node_modules/left-pad",
+        )
+        .await;
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
@@ -956,7 +1017,10 @@ mod tests {
             "lock must carry the recomputed tarball hash, never an inherited one: {live}"
         );
         assert!(!live.contains("sha512-XI5MPzVN"), "registry integrity gone");
-        assert_eq!(entry.artifact.sha256, hex::encode(sha2::Sha256::digest(&tgz)));
+        assert_eq!(
+            entry.artifact.sha256,
+            hex::encode(sha2::Sha256::digest(&tgz))
+        );
         assert_eq!(entry.artifact.size, Some(tgz.len() as u64));
     }
 
@@ -972,7 +1036,8 @@ mod tests {
 
         // The patch ALSO rewrites the package's own package.json.
         let before = br#"{"name":"left-pad","version":"1.3.0"}"#;
-        let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^2.0.0"}}"#;
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^2.0.0"}}"#;
         let after_hash = compute_git_sha256_from_bytes(after);
         tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
             .await
@@ -996,8 +1061,9 @@ mod tests {
             "deps object carried verbatim into the 3-tuple: {live}"
         );
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_dep_manifest_stale"
-                && w.detail.contains("bun install")),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_stale" && w.detail.contains("bun install")),
             "loud note that the deps mirror was NOT recomputed: {warnings:?}"
         );
     }
@@ -1009,7 +1075,10 @@ mod tests {
         let lock = BN3_BEFORE_LOCK.replace("left-pad@1.3.0", "left-pad@1.2.0");
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
-        assert!(detail.contains("bun install"), "actionable detail: {detail}");
+        assert!(
+            detail.contains("bun install"),
+            "actionable detail: {detail}"
+        );
         assert_eq!(fx.read_lock().await, lock, "refusal writes nothing");
         assert!(!fx.root().join(".socket/vendor").exists());
     }
@@ -1027,25 +1096,34 @@ mod tests {
             );
             assert_ne!(lock, BN3_BEFORE_LOCK, "replacement must hit");
             let fx = fixture_with(&lock, "node_modules/left-pad").await;
-            let detail =
-                expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+            let detail = expect_refused(
+                fx.vendor(false).await,
+                "vendor_lockfile_version_unsupported",
+            );
             assert!(detail.contains("packages section"), "{detail}");
             assert_eq!(fx.read_lock().await, lock, "fail-closed: lock untouched");
-            assert!(!fx.root().join(".socket/vendor").exists(), "nothing staged/packed");
+            assert!(
+                !fx.root().join(".socket/vendor").exists(),
+                "nothing staged/packed"
+            );
         }
     }
 
     #[tokio::test]
     async fn missing_lock_and_unsupported_version_are_refused() {
         let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
-        tokio::fs::remove_file(fx.root().join(BUN_LOCK)).await.unwrap();
+        tokio::fs::remove_file(fx.root().join(BUN_LOCK))
+            .await
+            .unwrap();
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains("bun install"), "{detail}");
 
         let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 2,");
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
-        let detail =
-            expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains('2'), "{detail}");
     }
 
@@ -1061,7 +1139,10 @@ mod tests {
         assert!(result.success);
         assert!(entry.is_none(), "in-sync re-run records nothing");
         assert!(
-            result.files_verified.iter().all(|v| v.status == VerifyStatus::AlreadyPatched),
+            result
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
             "{:?}",
             result.files_verified
         );
@@ -1084,7 +1165,9 @@ mod tests {
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(
-            tokio::fs::read(fx.installed.join("index.js")).await.unwrap(),
+            tokio::fs::read(fx.installed.join("index.js"))
+                .await
+                .unwrap(),
             ORIG_INDEX,
             "vendor never patches in place"
         );
@@ -1109,7 +1192,10 @@ mod tests {
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "lock byte-restored");
         assert!(!tgz_path.exists());
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
@@ -1118,7 +1204,9 @@ mod tests {
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let mut entry = entry.unwrap();
         // A poisoned ledger names a file outside the allowlist.
-        tokio::fs::write(fx.root().join("package.json.bak"), b"precious").await.unwrap();
+        tokio::fs::write(fx.root().join("package.json.bak"), b"precious")
+            .await
+            .unwrap();
         entry.wiring.push(WiringRecord {
             file: "package.json.bak".to_string(),
             kind: KIND_LOCK_PACKAGE.to_string(),
@@ -1131,17 +1219,26 @@ mod tests {
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("package.json.bak")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("package.json.bak")),
             "{:?}",
             outcome.warnings
         );
         assert_eq!(
-            tokio::fs::read(fx.root().join("package.json.bak")).await.unwrap(),
+            tokio::fs::read(fx.root().join("package.json.bak"))
+                .await
+                .unwrap(),
             b"precious",
             "non-allowlisted file never touched"
         );
-        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK, "real record still restored");
+        assert_eq!(
+            fx.read_lock().await,
+            BN3_BEFORE_LOCK,
+            "real record still restored"
+        );
     }
 
     #[tokio::test]
@@ -1153,16 +1250,27 @@ mod tests {
         // The user re-resolved the entry behind our back (`bun update`).
         let drifted_line = "    \"left-pad\": [\"left-pad@1.3.1\", \"\", {}, \"sha512-other==\"],";
         let live = fx.read_lock().await;
-        let new_line = entry.wiring[0].new.as_ref().and_then(Value::as_str).unwrap();
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap();
         let drifted_lock = live.replace(new_line, drifted_line);
-        assert_ne!(drifted_lock, live, "test setup must actually drift the entry");
-        tokio::fs::write(fx.root().join(BUN_LOCK), &drifted_lock).await.unwrap();
+        assert_ne!(
+            drifted_lock, live,
+            "test setup must actually drift the entry"
+        );
+        tokio::fs::write(fx.root().join(BUN_LOCK), &drifted_lock)
+            .await
+            .unwrap();
 
         let outcome = revert_bun(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("left-pad")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("left-pad")),
             "{:?}",
             outcome.warnings
         );
@@ -1171,7 +1279,9 @@ mod tests {
             "drifted entry left alone"
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "artifact still removed"
         );
     }
@@ -1208,18 +1318,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.elems.len(), 3);
-        assert_eq!(e.elems[1], r#"{ "dependencies": { "a": "^1", "b": "[2]" } }"#);
+        assert_eq!(
+            e.elems[1],
+            r#"{ "dependencies": { "a": "^1", "b": "[2]" } }"#
+        );
         assert!(!e.trailing_comma);
 
         // split at the LAST @ (scoped names).
-        assert_eq!(split_name_spec("@scope/pkg@1.0.0"), Some(("@scope/pkg", "1.0.0")));
-        assert_eq!(split_name_spec("left-pad@.socket/x.tgz"), Some(("left-pad", ".socket/x.tgz")));
-        assert_eq!(split_name_spec("@scope/pkg"), None, "a scope @ alone is not a version sep");
+        assert_eq!(
+            split_name_spec("@scope/pkg@1.0.0"),
+            Some(("@scope/pkg", "1.0.0"))
+        );
+        assert_eq!(
+            split_name_spec("left-pad@.socket/x.tgz"),
+            Some(("left-pad", ".socket/x.tgz"))
+        );
+        assert_eq!(
+            split_name_spec("@scope/pkg"),
+            None,
+            "a scope @ alone is not a version sep"
+        );
 
         // Fail-closed grammar.
-        assert!(parse_entry_line("    \"k\": [\"a\", ").is_err(), "unterminated");
+        assert!(
+            parse_entry_line("    \"k\": [\"a\", ").is_err(),
+            "unterminated"
+        );
         assert!(parse_entry_line("    k: [\"a\"]").is_err(), "unquoted key");
         assert!(parse_entry_line("    \"k\": \"not an array\"").is_err());
-        assert!(parse_entry_line("    \"k\": [\"a\"], junk").is_err(), "trailing junk");
+        assert!(
+            parse_entry_line("    \"k\": [\"a\"], junk").is_err(),
+            "trailing junk"
+        );
     }
 }

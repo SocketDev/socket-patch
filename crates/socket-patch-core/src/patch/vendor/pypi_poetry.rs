@@ -116,7 +116,9 @@ pub async fn load_poetry_project(root: &Path) -> Result<PoetryProject, (&'static
         }
     }
 
-    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml")).await.ok();
+    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml"))
+        .await
+        .ok();
     Ok(PoetryProject {
         lock_text,
         lock,
@@ -216,7 +218,9 @@ pub(super) fn check_target_guards(
     if units.is_empty() {
         return Err((
             "pypi_poetry_lock_package_missing",
-            format!("{LOCK_FILE} has no [[package]] entry for {canon_name}; run `poetry lock` first"),
+            format!(
+                "{LOCK_FILE} has no [[package]] entry for {canon_name}; run `poetry lock` first"
+            ),
         ));
     }
     // Marker-forked resolutions list the same name at multiple versions; one
@@ -486,14 +490,13 @@ fn rewrite_target_package_unit(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
 ) -> Result<(String, String), (&'static str, String)> {
-    let span = find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(
-        || {
+    let span =
+        find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(|| {
             (
                 "pypi_poetry_lock_package_missing",
                 format!("{LOCK_FILE} has no [[package]] entry for {canon}"),
             )
-        },
-    )?;
+        })?;
     // `find_unit_span` ends a unit at the NEXT `[[package]]` or EOF, but
     // poetry's `[metadata]` section trails the LAST unit — truncate at the
     // first top-level header that is not a `[package.*]` subtable so the
@@ -845,7 +848,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
 
     async fn write_project(lock: &str, pyproject: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("poetry.lock"), lock).await.unwrap();
+        tokio::fs::write(tmp.path().join("poetry.lock"), lock)
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join("pyproject.toml"), pyproject)
             .await
             .unwrap();
@@ -853,7 +858,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
     }
 
     async fn read_lock(root: &Path) -> String {
-        tokio::fs::read_to_string(root.join("poetry.lock")).await.unwrap()
+        tokio::fs::read_to_string(root.join("poetry.lock"))
+            .await
+            .unwrap()
     }
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: PoetryMeta) -> VendorEntry {
@@ -880,9 +887,11 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
     }
 
     async fn wire_default(p: &PoetryProject, root: &Path) -> (Vec<WiringRecord>, PoetryMeta) {
-        wire_poetry(p, root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-            .await
-            .unwrap()
+        wire_poetry(
+            p, root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+        )
+        .await
+        .unwrap()
     }
 
     /// The load-bearing oracle: wiring the registry lock must produce the
@@ -891,7 +900,13 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
     #[tokio::test]
     async fn wiring_matches_fixtures_byte_identically_both_lock_versions() {
         let cases = [
-            ("2.1", LOCK21_DIRECT_REGISTRY, LOCK21_DIRECT_VENDORED, PYPROJECT_DIRECT, "direct"),
+            (
+                "2.1",
+                LOCK21_DIRECT_REGISTRY,
+                LOCK21_DIRECT_VENDORED,
+                PYPROJECT_DIRECT,
+                "direct",
+            ),
             (
                 "2.1",
                 LOCK21_TRANSITIVE_REGISTRY,
@@ -899,7 +914,13 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
                 PYPROJECT_TRANSITIVE,
                 "transitive",
             ),
-            ("2.0", LOCK20_DIRECT_REGISTRY, LOCK20_DIRECT_VENDORED, PYPROJECT_DIRECT, "direct"),
+            (
+                "2.0",
+                LOCK20_DIRECT_REGISTRY,
+                LOCK20_DIRECT_VENDORED,
+                PYPROJECT_DIRECT,
+                "direct",
+            ),
             (
                 "2.0",
                 LOCK20_TRANSITIVE_REGISTRY,
@@ -927,7 +948,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             );
             // pyproject + content-hash are NEVER touched (lock-only splice).
             assert_eq!(
-                tokio::fs::read_to_string(tmp.path().join("pyproject.toml")).await.unwrap(),
+                tokio::fs::read_to_string(tmp.path().join("pyproject.toml"))
+                    .await
+                    .unwrap(),
                 pyproject
             );
 
@@ -956,8 +979,10 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
         let err = load_poetry_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_poetry_lock_version_unsupported");
         for bad in ["1.1", "3.0"] {
-            let lock = LOCK21_DIRECT_REGISTRY
-                .replace("lock-version = \"2.1\"", &format!("lock-version = \"{bad}\""));
+            let lock = LOCK21_DIRECT_REGISTRY.replace(
+                "lock-version = \"2.1\"",
+                &format!("lock-version = \"{bad}\""),
+            );
             let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
             let err = load_poetry_project(tmp.path()).await.unwrap_err();
             assert_eq!(err.0, "pypi_poetry_lock_version_unsupported", "{bad}");
@@ -998,17 +1023,30 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
 
         // wire re-runs the guards itself (refusal before any write)
         let before = read_lock(tmp.path()).await;
-        let err =
-            wire_poetry(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-                .await
-                .unwrap_err();
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_poetry_source_already_exists");
-        assert_eq!(read_lock(tmp.path()).await, before, "refusal writes nothing");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            before,
+            "refusal writes nothing"
+        );
     }
 
     #[tokio::test]
     async fn newer_2x_lock_version_warns_not_refuses() {
-        let lock = LOCK21_DIRECT_REGISTRY.replace("lock-version = \"2.1\"", "lock-version = \"2.5\"");
+        let lock =
+            LOCK21_DIRECT_REGISTRY.replace("lock-version = \"2.1\"", "lock-version = \"2.5\"");
         let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
         let p = load_poetry_project(tmp.path()).await.unwrap();
         assert_eq!(p.warnings.len(), 1);
@@ -1050,7 +1088,10 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             warnings: Vec::new(),
         };
         // [tool.poetry.dependencies] key (with PEP 503 canonicalization).
-        assert_eq!(classify_dependency(&p(Some(PYPROJECT_DIRECT)), "six"), "direct");
+        assert_eq!(
+            classify_dependency(&p(Some(PYPROJECT_DIRECT)), "six"),
+            "direct"
+        );
         assert_eq!(
             classify_dependency(
                 &p(Some("[tool.poetry.dependencies]\nPyYAML = \"6.0.1\"\n")),
@@ -1061,29 +1102,42 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
         // group + dev-dependencies keys.
         assert_eq!(
             classify_dependency(
-                &p(Some("[tool.poetry.group.dev.dependencies]\nsix = \"1.16.0\"\n")),
+                &p(Some(
+                    "[tool.poetry.group.dev.dependencies]\nsix = \"1.16.0\"\n"
+                )),
                 "six"
             ),
             "direct"
         );
         assert_eq!(
-            classify_dependency(&p(Some("[tool.poetry.dev-dependencies]\nsix = \"*\"\n")), "six"),
+            classify_dependency(
+                &p(Some("[tool.poetry.dev-dependencies]\nsix = \"*\"\n")),
+                "six"
+            ),
             "direct"
         );
         // PEP 621 dependency specs.
         assert_eq!(
-            classify_dependency(&p(Some("[project]\ndependencies = [\"six==1.16.0\"]\n")), "six"),
+            classify_dependency(
+                &p(Some("[project]\ndependencies = [\"six==1.16.0\"]\n")),
+                "six"
+            ),
             "direct"
         );
         assert_eq!(
             classify_dependency(
-                &p(Some("[project.optional-dependencies]\nextra = [\"Six_Pkg>=1\"]\n")),
+                &p(Some(
+                    "[project.optional-dependencies]\nextra = [\"Six_Pkg>=1\"]\n"
+                )),
                 "six-pkg"
             ),
             "direct"
         );
         // Not declared / no pyproject → transitive (diagnostics-only).
-        assert_eq!(classify_dependency(&p(Some(PYPROJECT_TRANSITIVE)), "six"), "transitive");
+        assert_eq!(
+            classify_dependency(&p(Some(PYPROJECT_TRANSITIVE)), "six"),
+            "transitive"
+        );
         assert_eq!(classify_dependency(&p(None), "six"), "transitive");
     }
 
@@ -1098,7 +1152,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
         let _ = check_target_guards(&p, "six", "1.16.0", UUID).unwrap();
         assert_eq!(read_lock(tmp.path()).await, LOCK21_DIRECT_REGISTRY);
         assert_eq!(
-            tokio::fs::read_to_string(tmp.path().join("pyproject.toml")).await.unwrap(),
+            tokio::fs::read_to_string(tmp.path().join("pyproject.toml"))
+                .await
+                .unwrap(),
             PYPROJECT_DIRECT
         );
     }
@@ -1145,7 +1201,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             .await
             .unwrap();
         let precious = outer.path().join("precious.txt");
-        tokio::fs::write(&precious, "keep me intact\n").await.unwrap();
+        tokio::fs::write(&precious, "keep me intact\n")
+            .await
+            .unwrap();
 
         for bad in ["pyproject.toml", "../precious.txt", "/etc/hosts"] {
             let wiring = vec![WiringRecord {
@@ -1156,11 +1214,20 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
                 original: Some(serde_json::json!("malicious payload")),
                 new: Some(serde_json::json!("keep me intact")),
             }];
-            let meta = PoetryMeta { dep_class: "direct".into(), lock_version: "2.1".into() };
+            let meta = PoetryMeta {
+                dep_class: "direct".into(),
+                lock_version: "2.1".into(),
+            };
             let outcome = revert_poetry(&entry_for(wiring, meta), &root, false).await;
-            assert!(outcome.success, "skipped fail-closed, not a hard error: {bad}");
             assert!(
-                outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+                outcome.success,
+                "skipped fail-closed, not a hard error: {bad}"
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
                 "skip surfaced for {bad}: {:?}",
                 outcome.warnings
             );
@@ -1171,7 +1238,9 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             "out-of-tree file byte-untouched"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join("poetry.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("poetry.lock"))
+                .await
+                .unwrap(),
             LOCK21_DIRECT_REGISTRY,
             "the lock itself is untouched too (no record matched it)"
         );
@@ -1195,8 +1264,12 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
         });
 
         // Drift: someone re-hashed the vendored files entry.
-        let drifted = read_lock(tmp.path()).await.replace(WHEEL_SHA, &"0".repeat(64));
-        tokio::fs::write(tmp.path().join("poetry.lock"), &drifted).await.unwrap();
+        let drifted = read_lock(tmp.path())
+            .await
+            .replace(WHEEL_SHA, &"0".repeat(64));
+        tokio::fs::write(tmp.path().join("poetry.lock"), &drifted)
+            .await
+            .unwrap();
 
         let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
         assert!(outcome.success);
@@ -1210,7 +1283,11 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             "drifted fragment + unknown kind: {:?}",
             outcome.warnings
         );
-        assert_eq!(read_lock(tmp.path()).await, drifted, "drifted lock left alone");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            drifted,
+            "drifted lock left alone"
+        );
     }
 
     #[test]

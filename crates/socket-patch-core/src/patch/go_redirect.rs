@@ -453,8 +453,9 @@ pub async fn verify_go_redirect_state(
             .iter()
             .find(|e| e.module == module && e.owner == Some(ReplaceOwner::GoPatches));
         match socket {
-            Some(e) if e.path.as_deref() == Some(expected.as_str())
-                && e.version.as_deref() == Some(version) => {}
+            Some(e)
+                if e.path.as_deref() == Some(expected.as_str())
+                    && e.version.as_deref() == Some(version) => {}
             Some(e) => drifts.push(Drift::WrongReplacePath {
                 purl: purl.clone(),
                 expected,
@@ -685,7 +686,9 @@ mod tests {
 
         let pristine = root.join("cache/github.com/foo/bar@v1.4.2");
         tokio::fs::create_dir_all(&pristine).await.unwrap();
-        tokio::fs::write(pristine.join("bar.go"), PRISTINE).await.unwrap();
+        tokio::fs::write(pristine.join("bar.go"), PRISTINE)
+            .await
+            .unwrap();
         tokio::fs::write(
             pristine.join("go.mod"),
             "module github.com/foo/bar\n\ngo 1.21\n",
@@ -744,12 +747,24 @@ mod tests {
         let sources = PatchSources::blobs_only(&blobs);
 
         let result = apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None,
-            false, false,
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
-        assert!(result.sidecar.is_none(), "replace copy must not emit a sidecar");
+        assert!(
+            result.sidecar.is_none(),
+            "replace copy must not emit a sidecar"
+        );
 
         // Copy exists with patched bytes + a go.mod.
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
@@ -759,7 +774,10 @@ mod tests {
         assert!(copy.join("go.mod").exists());
 
         // Module cache pristine untouched.
-        assert_eq!(tokio::fs::read(pristine.join("bar.go")).await.unwrap(), PRISTINE);
+        assert_eq!(
+            tokio::fs::read(pristine.join("bar.go")).await.unwrap(),
+            PRISTINE
+        );
 
         // go.mod replace points at the copy.
         let entries = read_replace_entries(root).await;
@@ -777,18 +795,55 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/bar.go");
         let gomod = root.join("go.mod");
         let body1 = tokio::fs::read(&copy).await.unwrap();
         let mod1 = tokio::fs::read_to_string(&gomod).await.unwrap();
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(result.success);
-        assert!(result.files_patched.is_empty(), "in-sync resync patches nothing");
-        assert_eq!(tokio::fs::read(&copy).await.unwrap(), body1, "copy unchanged");
-        assert_eq!(tokio::fs::read_to_string(&gomod).await.unwrap(), mod1, "go.mod unchanged");
+        assert!(
+            result.files_patched.is_empty(),
+            "in-sync resync patches nothing"
+        );
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            body1,
+            "copy unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&gomod).await.unwrap(),
+            mod1,
+            "go.mod unchanged"
+        );
     }
 
     #[tokio::test]
@@ -796,12 +851,38 @@ mod tests {
         let (dir, blobs, pristine, files, after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/bar.go");
         tokio::fs::write(&copy, b"corrupted").await.unwrap();
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(result.success);
         assert_eq!(git_sha(&tokio::fs::read(&copy).await.unwrap()), after);
     }
@@ -810,13 +891,35 @@ mod tests {
     async fn test_dry_run_writes_nothing() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
-        let pristine_gomod = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let pristine_gomod = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
         let sources = PatchSources::blobs_only(&blobs);
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, true, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            true,
+            false,
+        )
+        .await;
         assert!(result.success);
-        assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
         // go.mod unchanged (no replace added).
-        assert_eq!(tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(), pristine_gomod);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            pristine_gomod
+        );
     }
 
     #[tokio::test]
@@ -827,10 +930,25 @@ mod tests {
         tokio::fs::create_dir_all(&empty).await.unwrap();
         let sources = PatchSources::blobs_only(&empty);
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(!result.success);
         assert!(
-            !root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists(),
+            !root
+                .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+                .exists(),
             "half-built copy must be rolled back"
         );
         // No replace directive written.
@@ -842,10 +960,25 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         // Simulate a pre-modules package: remove the go.mod from the pristine src.
-        tokio::fs::remove_file(pristine.join("go.mod")).await.unwrap();
+        tokio::fs::remove_file(pristine.join("go.mod"))
+            .await
+            .unwrap();
         let sources = PatchSources::blobs_only(&blobs);
 
-        let result = apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(result.success, "apply failed: {:?}", result.error);
         let synthesized = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/go.mod");
         assert_eq!(
@@ -863,19 +996,32 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         // Pre-modules package → synthesis path is exercised.
-        tokio::fs::remove_file(pristine.join("go.mod")).await.unwrap();
+        tokio::fs::remove_file(pristine.join("go.mod"))
+            .await
+            .unwrap();
         let sources = PatchSources::blobs_only(&blobs);
 
         let result = apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None,
-            false, false,
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
 
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
         assert_eq!(
-            tokio::fs::read_to_string(copy.join("go.mod")).await.unwrap(),
+            tokio::fs::read_to_string(copy.join("go.mod"))
+                .await
+                .unwrap(),
             "module github.com/foo/bar\n",
             "synthesized go.mod must be the complete module line, never torn/empty"
         );
@@ -895,12 +1041,27 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         remove_go_redirect(PURL, root, GO_PATCHES_DIR, ReplaceOwner::GoPatches, false)
             .await
             .unwrap();
-        assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
         assert!(read_replace_entries(root).await.is_empty());
         // The require directive (not socket-owned) survives.
         assert!(tokio::fs::read_to_string(root.join("go.mod"))
@@ -914,12 +1075,27 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let desired: HashSet<String> = HashSet::new();
         let removed = reconcile_go_redirects(root, &desired, false).await;
         assert!(removed.contains(&PURL.to_string()));
-        assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
         assert!(read_replace_entries(root).await.is_empty());
     }
 
@@ -928,9 +1104,24 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         // Add a user-authored replace.
-        let mut body = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let mut body = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
         body.push_str("replace example.com/other v1.0.0 => ../other-fork\n");
         tokio::fs::write(root.join("go.mod"), body).await.unwrap();
 
@@ -938,8 +1129,12 @@ mod tests {
         let removed = reconcile_go_redirects(root, &desired, false).await;
         assert!(removed.is_empty());
         let entries = read_replace_entries(root).await;
-        assert!(entries.iter().any(|e| e.module == MODULE && e.socket_owned()));
-        assert!(entries.iter().any(|e| e.module == "example.com/other" && !e.socket_owned()));
+        assert!(entries
+            .iter()
+            .any(|e| e.module == MODULE && e.socket_owned()));
+        assert!(entries
+            .iter()
+            .any(|e| e.module == "example.com/other" && !e.socket_owned()));
     }
 
     #[tokio::test]
@@ -947,26 +1142,51 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
 
         // Clean → Ok. Registry-independence: delete the pristine source first.
         tokio::fs::remove_dir_all(&pristine).await.unwrap();
-        assert!(verify_go_redirect_state(root, &manifest, &desired).await.is_ok());
+        assert!(verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
 
         // Corrupt a file → StaleCopy.
         let copy = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2/bar.go");
         tokio::fs::write(&copy, b"x").await.unwrap();
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
         assert!(drifts.iter().any(|d| matches!(d, Drift::StaleCopy { .. })));
 
         // Delete the copy → MissingCopy (directive still present).
-        tokio::fs::remove_dir_all(root.join(".socket/go-patches/github.com/foo/bar@v1.4.2")).await.unwrap();
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
-        assert!(drifts.iter().any(|d| matches!(d, Drift::MissingCopy { .. })));
-        assert!(!drifts.iter().any(|d| matches!(d, Drift::MissingReplace { .. })));
+        tokio::fs::remove_dir_all(root.join(".socket/go-patches/github.com/foo/bar@v1.4.2"))
+            .await
+            .unwrap();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingCopy { .. })));
+        assert!(!drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingReplace { .. })));
     }
 
     #[tokio::test]
@@ -974,7 +1194,20 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         // Drop the directive but keep the copy.
         go_mod_edit::drop_replace_entry(root, MODULE, ReplaceOwner::GoPatches, false)
             .await
@@ -982,8 +1215,12 @@ mod tests {
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
-        assert!(drifts.iter().any(|d| matches!(d, Drift::MissingReplace { .. })));
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::MissingReplace { .. })));
     }
 
     #[tokio::test]
@@ -991,11 +1228,26 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
-        assert!(verify_go_redirect_state(root, &manifest, &desired).await.is_ok());
+        assert!(verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
 
         // Repin the socket-owned replace at a DIFFERENT version while the copy
         // stays byte-correct. Go keys replace by module+version, so this
@@ -1004,9 +1256,13 @@ mod tests {
             .await
             .unwrap();
         // ensure_replace refreshed our entry to v9.9.9; the v1.4.2 copy is now orphaned by directive.
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
         assert!(
-            drifts.iter().any(|d| matches!(d, Drift::WrongReplacePath { .. })),
+            drifts
+                .iter()
+                .any(|d| matches!(d, Drift::WrongReplacePath { .. })),
             "stale replace version must be flagged: {drifts:?}"
         );
     }
@@ -1016,11 +1272,26 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let manifest = manifest_with(&files);
         let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
-        assert!(verify_go_redirect_state(root, &manifest, &desired).await.is_ok());
+        assert!(verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
 
         // go.mod requires a DIFFERENT version → the v1.4.2 patch is unused.
         tokio::fs::write(
@@ -1029,8 +1300,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
-        assert!(drifts.iter().any(|d| matches!(d, Drift::ResolvedVersionMismatch { .. })));
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::ResolvedVersionMismatch { .. })));
     }
 
     #[tokio::test]
@@ -1038,25 +1313,57 @@ mod tests {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
         let sources = PatchSources::blobs_only(&blobs);
-        apply_go_redirect(PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         // Empty desired + empty manifest → the live directive is an orphan.
         let manifest = PatchManifest::new();
         let desired: HashSet<String> = HashSet::new();
-        let drifts = verify_go_redirect_state(root, &manifest, &desired).await.unwrap_err();
-        assert!(drifts.iter().any(|d| matches!(d, Drift::OrphanReplace { .. })));
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        assert!(drifts
+            .iter()
+            .any(|d| matches!(d, Drift::OrphanReplace { .. })));
     }
 
     #[tokio::test]
     async fn test_empty_files_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n").await.unwrap();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n")
+            .await
+            .unwrap();
         let blobs = root.join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
         let files = HashMap::new();
-        let result = apply_go_redirect(PURL, MODULE, VERSION, root, root, GO_PATCHES_DIR, &files, &sources, None, false, false).await;
+        let result = apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            root,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
         assert!(result.success);
         assert!(read_replace_entries(root).await.is_empty());
     }
@@ -1074,14 +1381,20 @@ mod tests {
         ));
         // Traversal / escape attempts in the module.
         assert!(!are_safe_redirect_coords("../../../etc", "v1.0.0"));
-        assert!(!are_safe_redirect_coords("github.com/../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords(
+            "github.com/../../../etc",
+            "v1.0.0"
+        ));
         assert!(!are_safe_redirect_coords("/abs/path", "v1.0.0"));
         assert!(!are_safe_redirect_coords("github.com//bar", "v1.0.0")); // empty segment
         assert!(!are_safe_redirect_coords("foo/./bar", "v1.0.0"));
         assert!(!are_safe_redirect_coords("foo\\bar", "v1.0.0"));
         assert!(!are_safe_redirect_coords("", "v1.0.0"));
         // Traversal / separators in the version.
-        assert!(!are_safe_redirect_coords("github.com/foo/bar", "../../../evil"));
+        assert!(!are_safe_redirect_coords(
+            "github.com/foo/bar",
+            "../../../evil"
+        ));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", "v1/0/0"));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ".."));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ""));
@@ -1137,7 +1450,9 @@ mod tests {
     async fn test_apply_rejects_traversal_version() {
         let (dir, blobs, pristine, files, _after) = fixture().await;
         let root = dir.path();
-        let gomod_before = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
         let sources = PatchSources::blobs_only(&blobs);
         let result = apply_go_redirect(
             "pkg:golang/github.com/foo/bar@../../../evil",
@@ -1156,7 +1471,9 @@ mod tests {
         assert!(!result.success);
         // go.mod is byte-unchanged.
         assert_eq!(
-            tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
             gomod_before
         );
     }
@@ -1167,11 +1484,15 @@ mod tests {
     async fn test_remove_rejects_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n").await.unwrap();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n")
+            .await
+            .unwrap();
         // A precious directory that is a sibling of the project root.
         let precious = root.parent().unwrap().join("precious@v1.0.0");
         tokio::fs::create_dir_all(&precious).await.unwrap();
-        tokio::fs::write(precious.join("keep.txt"), b"keep").await.unwrap();
+        tokio::fs::write(precious.join("keep.txt"), b"keep")
+            .await
+            .unwrap();
 
         let err = remove_go_redirect(
             "pkg:golang/../../../precious@v1.0.0",
@@ -1180,8 +1501,8 @@ mod tests {
             ReplaceOwner::GoPatches,
             false,
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
             precious.exists() && precious.join("keep.txt").exists(),
@@ -1196,14 +1517,19 @@ mod tests {
     async fn test_verify_skips_unsafe_coords() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n").await.unwrap();
+        tokio::fs::write(root.join("go.mod"), "module m\n\ngo 1.21\n")
+            .await
+            .unwrap();
 
         let unsafe_purl = "pkg:golang/../../../escape@v1.0.0";
         let mut manifest = PatchManifest::new();
         let mut files = HashMap::new();
         files.insert(
             "package/x.go".to_string(),
-            PatchFileInfo { before_hash: "b".into(), after_hash: "a".into() },
+            PatchFileInfo {
+                before_hash: "b".into(),
+                after_hash: "a".into(),
+            },
         );
         manifest.patches.insert(
             unsafe_purl.to_string(),
@@ -1219,7 +1545,9 @@ mod tests {
         );
         let desired: HashSet<String> = [unsafe_purl.to_string()].into_iter().collect();
         // The unsafe coord is silently skipped → no drift (and no escape-stat).
-        assert!(verify_go_redirect_state(root, &manifest, &desired).await.is_ok());
+        assert!(verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .is_ok());
     }
 
     #[test]

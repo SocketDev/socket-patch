@@ -58,7 +58,10 @@ fn manifest_with_after_hashes(after: &[&str]) -> PatchManifest {
             tier: "free".to_string(),
         },
     );
-    PatchManifest { patches, setup: None }
+    PatchManifest {
+        patches,
+        setup: None,
+    }
 }
 
 /// Count the directory entries under `dir` (used to prove a short-circuit
@@ -104,7 +107,10 @@ async fn fetch_missing_blobs_nonempty_manifest_attempts_download() {
     let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
     assert_eq!(result.total, 1, "one missing afterHash blob");
     assert_eq!(result.downloaded, 0, "closed-port client cannot download");
-    assert_eq!(result.failed, 1, "the download attempt must be recorded as failed");
+    assert_eq!(
+        result.failed, 1,
+        "the download attempt must be recorded as failed"
+    );
     assert_eq!(result.results.len(), 1);
     assert!(!result.results[0].success);
 }
@@ -194,13 +200,20 @@ async fn fetch_missing_sources_package_mode_with_no_packages_path() {
 
     let result =
         fetch_missing_sources(&manifest, &sources, DownloadMode::Package, &client, None).await;
-    assert_eq!(result.total, 0, "Package mode w/o packages_path must short-circuit");
+    assert_eq!(
+        result.total, 0,
+        "Package mode w/o packages_path must short-circuit"
+    );
     assert_eq!(result.downloaded, 0);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 0);
     assert!(result.results.is_empty());
     // The short-circuit must not have written any blob.
-    assert_eq!(dir_entry_count(&blobs), 0, "Package-mode short-circuit did zero I/O");
+    assert_eq!(
+        dir_entry_count(&blobs),
+        0,
+        "Package-mode short-circuit did zero I/O"
+    );
 }
 
 /// Same with `DownloadMode::Diff` and no diffs_path.
@@ -225,12 +238,19 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
 
     let result =
         fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
-    assert_eq!(result.total, 0, "Diff mode w/o diffs_path must short-circuit");
+    assert_eq!(
+        result.total, 0,
+        "Diff mode w/o diffs_path must short-circuit"
+    );
     assert_eq!(result.downloaded, 0);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 0);
     assert!(result.results.is_empty());
-    assert_eq!(dir_entry_count(&blobs), 0, "Diff-mode short-circuit did zero I/O");
+    assert_eq!(
+        dir_entry_count(&blobs),
+        0,
+        "Diff-mode short-circuit did zero I/O"
+    );
 }
 
 /// `DownloadMode::parse` accepts all documented values plus the
@@ -238,17 +258,26 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
 #[test]
 fn download_mode_parse_covers_all_branches() {
     assert_eq!(DownloadMode::parse("diff").unwrap(), DownloadMode::Diff);
-    assert_eq!(DownloadMode::parse("package").unwrap(), DownloadMode::Package);
+    assert_eq!(
+        DownloadMode::parse("package").unwrap(),
+        DownloadMode::Package
+    );
     assert_eq!(DownloadMode::parse("file").unwrap(), DownloadMode::File);
     assert_eq!(DownloadMode::parse("blob").unwrap(), DownloadMode::File);
     // Case-insensitive.
     assert_eq!(DownloadMode::parse("DIFF").unwrap(), DownloadMode::Diff);
-    assert_eq!(DownloadMode::parse("Package").unwrap(), DownloadMode::Package);
+    assert_eq!(
+        DownloadMode::parse("Package").unwrap(),
+        DownloadMode::Package
+    );
     assert_eq!(DownloadMode::parse("FILE").unwrap(), DownloadMode::File);
     assert_eq!(DownloadMode::parse("Blob").unwrap(), DownloadMode::File);
     // Unknown value → Err, and the message names the offending input.
     let err = DownloadMode::parse("invalid").unwrap_err();
-    assert!(err.contains("invalid"), "error should echo the bad value: {err}");
+    assert!(
+        err.contains("invalid"),
+        "error should echo the bad value: {err}"
+    );
     assert!(DownloadMode::parse("").is_err());
     // A near-miss must not be silently coerced to a valid mode.
     assert!(DownloadMode::parse("diffs").is_err());
@@ -259,11 +288,18 @@ fn download_mode_parse_covers_all_branches() {
 /// each variant maps to a *distinct* tag.
 #[test]
 fn download_mode_as_tag_round_trips_with_parse() {
-    let variants = [DownloadMode::Diff, DownloadMode::Package, DownloadMode::File];
+    let variants = [
+        DownloadMode::Diff,
+        DownloadMode::Package,
+        DownloadMode::File,
+    ];
     let mut seen_tags = HashSet::new();
     for mode in variants {
         let tag = mode.as_tag();
-        assert!(seen_tags.insert(tag), "tag {tag:?} must be unique per variant");
+        assert!(
+            seen_tags.insert(tag),
+            "tag {tag:?} must be unique per variant"
+        );
         assert_eq!(DownloadMode::parse(tag).unwrap(), mode);
     }
     // Pin the exact tag strings so a silent rename is caught.
@@ -346,7 +382,10 @@ async fn fetch_blobs_by_hash_mixes_skip_and_download_attempt() {
 
     // The absent blob was never written (download failed); the present one
     // is untouched.
-    assert!(!blobs.join(absent).exists(), "failed download must not leave a file");
+    assert!(
+        !blobs.join(absent).exists(),
+        "failed download must not leave a file"
+    );
     assert_eq!(std::fs::read(blobs.join(present)).unwrap(), b"present");
 }
 
@@ -406,7 +445,11 @@ async fn fetch_missing_blobs_accepts_and_writes_matching_content() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, vec![hash], "exactly the blob, no temp files: {names:?}");
+    assert_eq!(
+        names,
+        vec![hash],
+        "exactly the blob, no temp files: {names:?}"
+    );
 }
 
 /// A server that returns bytes NOT matching the requested hash must be
@@ -442,7 +485,11 @@ async fn fetch_missing_blobs_rejects_content_hash_mismatch_and_writes_nothing() 
     assert_eq!(result.total, 1);
     assert_eq!(result.downloaded, 0, "mismatched content must be refused");
     assert_eq!(result.failed, 1);
-    assert!(result.results[0].error.as_deref().unwrap().contains("mismatch"));
+    assert!(result.results[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("mismatch"));
 
     // The integrity invariant: nothing — not even a partial/tampered file —
     // may sit at the content-addressed path, or a subsequent run's presence
@@ -502,7 +549,10 @@ async fn fetch_missing_blobs_accepts_uppercase_manifest_hash() {
     let content = b"content addressed by an uppercase manifest hash";
     let hash_lower = compute_git_sha256_from_bytes(content);
     let hash_upper = hash_lower.to_ascii_uppercase();
-    assert_ne!(hash_lower, hash_upper, "fixture: hash must have hex letters");
+    assert_ne!(
+        hash_lower, hash_upper,
+        "fixture: hash must have hex letters"
+    );
 
     let server = MockServer::start().await;
     // The request path carries the manifest's (uppercase) hash verbatim.
@@ -520,7 +570,10 @@ async fn fetch_missing_blobs_accepts_uppercase_manifest_hash() {
     let client = proxy_client(&server.uri());
 
     let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
-    assert_eq!(result.downloaded, 1, "uppercase-hash content must be accepted");
+    assert_eq!(
+        result.downloaded, 1,
+        "uppercase-hash content must be accepted"
+    );
     assert_eq!(result.failed, 0);
     assert_eq!(std::fs::read(blobs.join(&hash_upper)).unwrap(), content);
 }
@@ -551,7 +604,10 @@ fn manifest_with_uuids(uuids: &[&str]) -> PatchManifest {
             },
         );
     }
-    PatchManifest { patches, setup: None }
+    PatchManifest {
+        patches,
+        setup: None,
+    }
 }
 
 #[tokio::test]
@@ -596,11 +652,14 @@ async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, vec![format!("{uuid}.tar.gz")], "no temp files: {names:?}");
+    assert_eq!(
+        names,
+        vec![format!("{uuid}.tar.gz")],
+        "no temp files: {names:?}"
+    );
     // A re-run finds the archive present and short-circuits (no second GET;
     // the mock's `.expect(1)` would trip on a second request).
-    let again =
-        fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
+    let again = fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
     assert_eq!(again.total, 0, "already-present archive → nothing to do");
 }
 
@@ -675,7 +734,10 @@ async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
     assert_eq!(result.failed, 1);
     let err = result.results[0].error.as_deref().unwrap();
     assert!(err.contains("Diff"), "message should name the kind: {err}");
-    assert!(err.contains("not found"), "message should say not found: {err}");
+    assert!(
+        err.contains("not found"),
+        "message should say not found: {err}"
+    );
     // Nothing written for a 404.
     assert_eq!(dir_entry_count(&diffs), 0);
 }
@@ -754,5 +816,8 @@ async fn get_missing_blobs_reports_missing_afterhash() {
 
     std::fs::write(blobs.join(&hash), b"data").unwrap();
     let missing = get_missing_blobs(&manifest, &blobs).await;
-    assert!(missing.is_empty(), "staged blob must not be reported missing");
+    assert!(
+        missing.is_empty(),
+        "staged blob must not be reported missing"
+    );
 }

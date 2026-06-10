@@ -116,7 +116,10 @@ fn telemetry_disabled_when_vitest_env_is_true() {
     with_clean_env(|| {
         assert!(!is_telemetry_disabled(), "baseline must be enabled");
         std::env::set_var("VITEST", "true");
-        assert!(is_telemetry_disabled(), "VITEST=true must disable telemetry");
+        assert!(
+            is_telemetry_disabled(),
+            "VITEST=true must disable telemetry"
+        );
         std::env::remove_var("VITEST");
         assert!(
             !is_telemetry_disabled(),
@@ -278,7 +281,10 @@ fn sanitize_error_message_replaces_home_with_tilde() {
 
         // Every occurrence is redacted, not just the first.
         let multi = format!("read {home}/a failed; wrote {home}/b ok");
-        assert_eq!(sanitize_error_message(&multi), "read ~/a failed; wrote ~/b ok");
+        assert_eq!(
+            sanitize_error_message(&multi),
+            "read ~/a failed; wrote ~/b ok"
+        );
 
         // The bare home path with nothing after it is also redacted.
         assert_eq!(sanitize_error_message(home), "~");

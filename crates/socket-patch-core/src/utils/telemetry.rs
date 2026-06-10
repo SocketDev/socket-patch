@@ -1258,7 +1258,10 @@ mod tests {
     fn test_resolve_telemetry_endpoint_empty_strings_fall_back() {
         let (url, auth) = resolve_telemetry_endpoint(Some("tok"), Some(""));
         assert!(!auth, "empty slug must not authenticate");
-        assert!(!url.contains("/orgs//"), "empty slug leaked into URL: {url}");
+        assert!(
+            !url.contains("/orgs//"),
+            "empty slug leaked into URL: {url}"
+        );
         assert!(url.ends_with("/patch/telemetry"), "got {url}");
 
         let (_url, auth) = resolve_telemetry_endpoint(Some(""), Some("acme"));

@@ -137,7 +137,9 @@ mod tests {
         fs::write(src.path().join("sub/.cargo-checksum.json"), b"{}").unwrap();
         fs::write(src.path().join("sub/keep.rs"), b"code").unwrap();
 
-        fresh_copy(src.path(), &d, Some(".cargo-checksum.json")).await.unwrap();
+        fresh_copy(src.path(), &d, Some(".cargo-checksum.json"))
+            .await
+            .unwrap();
 
         assert!(!d.join(".cargo-checksum.json").exists());
         assert!(!d.join("sub/.cargo-checksum.json").exists());
@@ -159,7 +161,10 @@ mod tests {
 
         assert!(d.join("real.txt").exists());
         assert!(!d.join("link.txt").exists(), "symlink should be skipped");
-        assert!(!d.join("escape").exists(), "escaping symlink should be skipped");
+        assert!(
+            !d.join("escape").exists(),
+            "escaping symlink should be skipped"
+        );
     }
 
     #[cfg(unix)]
@@ -171,7 +176,11 @@ mod tests {
         fs::write(root.join("ro_dir/inner/f.txt"), b"x").unwrap();
         fs::write(root.join("ro_dir/g.txt"), b"y").unwrap();
         // Make files read-only then dirs read-only (bottom-up).
-        fs::set_permissions(root.join("ro_dir/inner/f.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(
+            root.join("ro_dir/inner/f.txt"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
         fs::set_permissions(root.join("ro_dir/g.txt"), fs::Permissions::from_mode(0o444)).unwrap();
         fs::set_permissions(root.join("ro_dir/inner"), fs::Permissions::from_mode(0o555)).unwrap();
         fs::set_permissions(root.join("ro_dir"), fs::Permissions::from_mode(0o555)).unwrap();
@@ -217,13 +226,21 @@ mod tests {
         let d = dst.path().join("copy");
         fs::create_dir_all(src.path().join("ro")).unwrap();
         fs::write(src.path().join("ro/f.txt"), b"x").unwrap();
-        fs::set_permissions(src.path().join("ro/f.txt"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(
+            src.path().join("ro/f.txt"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
         fs::set_permissions(src.path().join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
 
         fresh_copy(src.path(), &d, None).await.unwrap();
 
         let dir_mode = fs::metadata(d.join("ro")).unwrap().permissions().mode() & 0o777;
-        assert!(dir_mode & 0o200 != 0, "copied dir should be writable, got {:o}", dir_mode);
+        assert!(
+            dir_mode & 0o200 != 0,
+            "copied dir should be writable, got {:o}",
+            dir_mode
+        );
         // cleanup readonly src
         fs::set_permissions(src.path().join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -272,8 +289,11 @@ mod tests {
         remove_tree(&root).await.unwrap();
 
         let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "external symlink target perms were changed to {:o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "external symlink target perms were changed to {:o}",
+            mode
+        );
         assert!(outside.exists());
     }
 }
-

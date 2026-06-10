@@ -211,7 +211,10 @@ fn test_pypi_full_lifecycle() {
     assert_run_ok(cwd, &["get", PYPI_UUID], "get");
 
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), ".socket/manifest.json should exist after get");
+    assert!(
+        manifest_path.exists(),
+        ".socket/manifest.json should exist after get"
+    );
 
     // Parse the manifest to get file hashes from the API.
     let (purl, files_value) = read_patch_files(&manifest_path);
@@ -426,7 +429,11 @@ fn test_pypi_dry_run() {
         .keys()
         .map(|rel| {
             let p = site_packages.join(rel);
-            let h = if p.exists() { Some(git_sha256_file(&p)) } else { None };
+            let h = if p.exists() {
+                Some(git_sha256_file(&p))
+            } else {
+                None
+            };
             (rel.clone(), h)
         })
         .collect();
@@ -441,10 +448,7 @@ fn test_pypi_dry_run() {
                 h,
                 "{rel} must be unchanged after apply --dry-run"
             ),
-            None => assert!(
-                !p.exists(),
-                "{rel} must not be created by apply --dry-run"
-            ),
+            None => assert!(!p.exists(), "{rel} must not be created by apply --dry-run"),
         }
     }
 
@@ -526,7 +530,10 @@ fn test_pypi_global_lifecycle() {
     let scanned = scan["scannedPackages"]
         .as_u64()
         .expect("scannedPackages should be a number");
-    assert!(scanned >= 1, "scan should find at least 1 package, got {scanned}");
+    assert!(
+        scanned >= 1,
+        "scan should find at least 1 package, got {scanned}"
+    );
 
     // -- GET: download + apply patch globally --------------------------------
     assert_run_ok(
@@ -553,7 +560,11 @@ fn test_pypi_global_lifecycle() {
     for (rel_path, info) in files {
         let after_hash = info["afterHash"].as_str().expect("afterHash");
         let full_path = global_dir.path().join(rel_path);
-        assert!(full_path.exists(), "patched file should exist: {}", full_path.display());
+        assert!(
+            full_path.exists(),
+            "patched file should exist: {}",
+            full_path.display()
+        );
         assert_eq!(
             git_sha256_file(&full_path),
             after_hash,
@@ -586,11 +597,7 @@ fn test_pypi_global_lifecycle() {
     }
 
     // -- APPLY: re-apply from manifest globally ------------------------------
-    assert_run_ok(
-        cwd,
-        &["apply", "-g", "--global-prefix", gp_str],
-        "apply -g",
-    );
+    assert_run_ok(cwd, &["apply", "-g", "--global-prefix", gp_str], "apply -g");
 
     for (rel_path, info) in files {
         let after_hash = info["afterHash"].as_str().expect("afterHash");
@@ -666,7 +673,10 @@ fn test_pypi_save_only() {
 
     // Manifest should exist with the patch.
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest should exist after get --save-only");
+    assert!(
+        manifest_path.exists(),
+        "manifest should exist after get --save-only"
+    );
 
     let (purl, files_value) = read_patch_files(&manifest_path);
     assert!(
@@ -764,9 +774,12 @@ fn test_pypi_macos_global_auto_discovery() {
         scan["status"]
     );
 
-    let scanned = scan["scannedPackages"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("scannedPackages should be a number, got: {}", scan["scannedPackages"]));
+    let scanned = scan["scannedPackages"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "scannedPackages should be a number, got: {}",
+            scan["scannedPackages"]
+        )
+    });
 
     // The whole point of this test is that auto-discovery (no --global-prefix)
     // actually probes the real macOS framework/global site-packages. A working
@@ -837,7 +850,10 @@ fn test_pypi_uuid_shortcut() {
     assert_run_ok(cwd, &[PYPI_UUID], "uuid shortcut");
 
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "manifest should exist after UUID shortcut");
+    assert!(
+        manifest_path.exists(),
+        "manifest should exist after UUID shortcut"
+    );
 
     let (purl, files_value) = read_patch_files(&manifest_path);
     assert!(

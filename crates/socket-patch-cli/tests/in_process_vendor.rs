@@ -79,8 +79,9 @@ impl NpmFixture {
         self.root().join(rel_tgz())
     }
     fn marker_path(&self) -> PathBuf {
-        self.root()
-            .join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"))
+        self.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
     }
     fn state_path(&self) -> PathBuf {
         self.root().join(".socket/vendor/state.json")
@@ -228,7 +229,13 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
 /// `vendor --json --offline --cwd <cwd> <extra...>` through the binary,
 /// returning `(exit_code, parsed envelope)`.
 fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
-    let mut args = vec!["vendor", "--json", "--offline", "--cwd", cwd.to_str().unwrap()];
+    let mut args = vec![
+        "vendor",
+        "--json",
+        "--offline",
+        "--cwd",
+        cwd.to_str().unwrap(),
+    ];
     args.extend_from_slice(extra);
     let (code, stdout, stderr) = run_cli(cwd, &args, &[]);
     let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
@@ -246,10 +253,7 @@ fn events(envelope: &Value) -> &Vec<Value> {
 fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str>) -> &'a Value {
     events(envelope)
         .iter()
-        .find(|e| {
-            e["action"] == action
-                && error_code.is_none_or(|c| e["errorCode"] == c)
-        })
+        .find(|e| e["action"] == action && error_code.is_none_or(|c| e["errorCode"] == c))
         .unwrap_or_else(|| {
             panic!("expected a `{action}` event (errorCode={error_code:?}) in:\n{envelope:#}")
         })
@@ -347,7 +351,10 @@ async fn rerun_is_idempotent() {
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 0, "re-run must exit 0: {env:#}");
     assert_eq!(env["status"], "success");
-    assert_eq!(env["summary"]["applied"], 0, "nothing newly applied: {env:#}");
+    assert_eq!(
+        env["summary"]["applied"], 0,
+        "nothing newly applied: {env:#}"
+    );
     assert_eq!(env["summary"]["failed"], 0);
     assert_eq!(env["summary"]["skipped"], 1);
     // The in-sync re-run synthesizes its result against the vendored
@@ -485,14 +492,13 @@ async fn unsupported_ecosystem_purl_is_currently_dropped_silently() {
     assert_eq!(env["summary"]["applied"], 1);
     // The compiled-out purl vanishes without a trace (the gap being pinned).
     assert!(
-        !events(&env).iter().any(|e| {
-            e["purl"].as_str().is_some_and(|p| p.contains("nuget"))
-        }),
+        !events(&env)
+            .iter()
+            .any(|e| { e["purl"].as_str().is_some_and(|p| p.contains("nuget")) }),
         "current behavior: no event for the compiled-out nuget purl: {env:#}"
     );
     assert!(fx.tgz_path().is_file(), "the npm patch still vendors");
 }
-
 
 // ─────────────────────────────────────────────────────────────────────
 // 7. package not installed
@@ -505,7 +511,10 @@ async fn package_not_installed_fails() {
     // failure (exit 1), surfaced as a skipped event with the stable code.
     let fx = npm_fixture_with_purls(&["pkg:npm/ghost-pkg@9.9.9"]);
     let (code, env) = vendor_cli(fx.root(), &[]);
-    assert_eq!(code, 1, "an unsatisfiable manifest entry must exit 1: {env:#}");
+    assert_eq!(
+        code, 1,
+        "an unsatisfiable manifest entry must exit 1: {env:#}"
+    );
     assert_eq!(env["status"], "partialFailure");
     let skipped = find_event(&env, "skipped", Some("package_not_installed"));
     assert_eq!(skipped["purl"], "pkg:npm/ghost-pkg@9.9.9");
@@ -771,7 +780,10 @@ fn lock_contention_exits_lock_held() {
 
     let (code, env) = vendor_cli(fx.root(), &["--lock-timeout", "1"]);
     assert_eq!(code, 1, "contended vendor must exit 1: {env:#}");
-    assert_eq!(env["command"], "vendor", "the failure envelope is vendor's own");
+    assert_eq!(
+        env["command"], "vendor",
+        "the failure envelope is vendor's own"
+    );
     assert_eq!(env["status"], "error");
     assert_eq!(env["error"]["code"], "lock_held");
     assert!(
@@ -780,7 +792,10 @@ fn lock_contention_exits_lock_held() {
     );
 
     // Nothing happened while contended.
-    assert!(!fx.vendor_dir().exists(), "no vendor writes under contention");
+    assert!(
+        !fx.vendor_dir().exists(),
+        "no vendor writes under contention"
+    );
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
 }
 
@@ -815,7 +830,10 @@ fn json_envelope_shape() {
         "removed",
         "verified",
     ] {
-        assert!(summary.contains_key(field), "summary.{field} present: {env:#}");
+        assert!(
+            summary.contains_key(field),
+            "summary.{field} present: {env:#}"
+        );
     }
     assert_eq!(env["summary"]["applied"], 1);
     assert_eq!(env["summary"]["failed"], 0);

@@ -305,7 +305,7 @@ mod tests {
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             drop(held); // releases the OS lock
-            // Keep the tempdir alive until the waiter has acquired.
+                        // Keep the tempdir alive until the waiter has acquired.
             std::thread::sleep(Duration::from_millis(200));
             drop(dir2);
         });

@@ -25,9 +25,7 @@ const ORG_SLUG: &str = "test-org";
 fn write_npm_package(root: &Path, name: &str, version: &str) {
     let pkg_dir = root.join("node_modules").join(name);
     std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    let pkg_json = format!(
-        r#"{{ "name": "{name}", "version": "{version}" }}"#
-    );
+    let pkg_json = format!(r#"{{ "name": "{name}", "version": "{version}" }}"#);
     std::fs::write(pkg_dir.join("package.json"), pkg_json).expect("write pkg json");
 }
 
@@ -367,7 +365,10 @@ async fn scan_without_prune_omits_gc_field() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     let (code, stdout, stderr) = run_scan(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "scan must succeed; stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "scan must succeed; stdout={stdout}; stderr={stderr}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert!(
@@ -434,11 +435,8 @@ async fn scan_apply_dry_run_with_empty_manifest_emits_added_action() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
 
-    let (code, stdout, stderr) = run_scan(
-        tmp.path(),
-        &mock.uri(),
-        &["--apply", "--dry-run", "--yes"],
-    );
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
     assert_eq!(
         code, 0,
         "scan --apply --dry-run must succeed; stdout={stdout}; stderr={stderr}"
@@ -548,11 +546,7 @@ async fn scan_apply_dry_run_with_existing_uuid_emits_skipped_action() {
     )
     .unwrap();
 
-    let (code, stdout, _) = run_scan(
-        tmp.path(),
-        &mock.uri(),
-        &["--apply", "--dry-run", "--yes"],
-    );
+    let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let apply = &v["apply"];
@@ -641,11 +635,7 @@ async fn scan_apply_dry_run_with_different_uuid_emits_updated_action() {
     )
     .unwrap();
 
-    let (code, stdout, _) = run_scan(
-        tmp.path(),
-        &mock.uri(),
-        &["--apply", "--dry-run", "--yes"],
-    );
+    let (code, stdout, _) = run_scan(tmp.path(), &mock.uri(), &["--apply", "--dry-run", "--yes"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let apply = &v["apply"];
@@ -709,16 +699,13 @@ async fn scan_prune_dry_run_reports_prunable_manifest_entries() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_scan(
-        tmp.path(),
-        &mock.uri(),
-        &["--prune", "--dry-run", "--yes"],
-    );
+    let (code, stdout, stderr) =
+        run_scan(tmp.path(), &mock.uri(), &["--prune", "--dry-run", "--yes"]);
     assert_eq!(code, 0, "expected exit 0; stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let gc = v["gc"].as_object().unwrap_or_else(|| {
-        panic!("--prune must emit gc field; full envelope was: {v}")
-    });
+    let gc = v["gc"]
+        .as_object()
+        .unwrap_or_else(|| panic!("--prune must emit gc field; full envelope was: {v}"));
     // Dry-run uses the *prunable*/* orphan* preview field names per the
     // CLI contract.
     let prunable = gc["prunableManifestEntries"]
@@ -976,10 +963,9 @@ async fn scan_prune_removes_withdrawn_patch_entry() {
     let (code, _stdout, _stderr) = run_scan(tmp.path(), &mock.uri(), &["--prune", "--yes"]);
     assert_eq!(code, 0);
 
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(
         manifest["patches"].as_object().unwrap().len(),
         0,
@@ -1063,10 +1049,9 @@ async fn scan_detects_update_without_touching_existing_blobs() {
 
     // Critical: scan is read-only. The manifest still records the OLD
     // UUID and the marker blob is byte-for-byte unchanged.
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(
         manifest["patches"]["pkg:npm/lodash@4.17.20"]["uuid"], OLD_UUID,
         "scan without --apply must not rewrite the manifest"

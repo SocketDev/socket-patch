@@ -192,8 +192,8 @@ async fn pnpm_install_then_apply_patches_file() {
     // — if pnpm ever produced a hoisted (non-symlinked) layout instead,
     // we would not be exercising the symlink-following path and must know.
     let ms_dir = tmp.path().join("node_modules/ms");
-    let ms_meta = std::fs::symlink_metadata(&ms_dir)
-        .expect("node_modules/ms must exist after pnpm install");
+    let ms_meta =
+        std::fs::symlink_metadata(&ms_dir).expect("node_modules/ms must exist after pnpm install");
     assert!(
         ms_meta.file_type().is_symlink(),
         "pnpm test premise broken: node_modules/ms is not a symlink ({:?}); \

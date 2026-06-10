@@ -38,6 +38,8 @@
 pub mod path;
 pub mod state;
 
+mod berry_zip;
+pub mod bun_lock;
 #[cfg(feature = "cargo")]
 pub mod cargo;
 #[cfg(feature = "cargo")]
@@ -49,8 +51,6 @@ pub mod composer_lock;
 pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
-mod berry_zip;
-pub mod bun_lock;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
@@ -142,8 +142,7 @@ pub fn is_vendorable(purl: &str) -> bool {
 pub async fn is_purl_vendored(project_root: &std::path::Path, purl: &str) -> bool {
     match load_state(project_root).await {
         Ok(state) => {
-            state.entries.contains_key(purl)
-                || state.entries.values().any(|e| e.base_purl == purl)
+            state.entries.contains_key(purl) || state.entries.values().any(|e| e.base_purl == purl)
         }
         Err(_) => false,
     }

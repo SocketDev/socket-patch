@@ -407,7 +407,10 @@ mod tests {
         assert!(!text.contains("tookOverGoPatches"));
         assert!(!text.contains("\"flavor\""));
         for absent in ["\"uv\"", "\"pnpm\"", "\"poetry\"", "\"pdm\"", "\"pipenv\""] {
-            assert!(!text.contains(absent), "{absent} must not serialize when None");
+            assert!(
+                !text.contains(absent),
+                "{absent} must not serialize when None"
+            );
         }
         assert!(text.contains("\"basePurl\""), "camelCase keys: {text}");
     }
@@ -441,7 +444,9 @@ mod tests {
         let loaded = load_state(root).await.unwrap();
         assert_eq!(loaded, state, "every meta survives the round trip");
 
-        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL)).await.unwrap();
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
+            .await
+            .unwrap();
         // camelCase keys on the wire.
         for key in [
             "\"createdOverridesTable\"",
@@ -453,7 +458,10 @@ mod tests {
             assert!(text.contains(key), "{key} missing: {text}");
         }
         // Skip-empty inner fields: the false bool and any empty vec vanish.
-        assert!(!text.contains("createdPnpmTable"), "false bool omitted: {text}");
+        assert!(
+            !text.contains("createdPnpmTable"),
+            "false bool omitted: {text}"
+        );
     }
 
     #[test]
@@ -465,7 +473,10 @@ mod tests {
         .unwrap();
         assert_eq!(pnpm, "{}", "all-default PnpmMeta serializes empty");
 
-        let pipenv = serde_json::to_string(&PipenvMeta { sections: Vec::new() }).unwrap();
+        let pipenv = serde_json::to_string(&PipenvMeta {
+            sections: Vec::new(),
+        })
+        .unwrap();
         assert_eq!(pipenv, "{}", "empty sections omitted");
 
         let pdm = serde_json::to_string(&PdmMeta {
@@ -480,7 +491,10 @@ mod tests {
         let back: PnpmMeta = serde_json::from_str("{}").unwrap();
         assert_eq!(
             back,
-            PnpmMeta { created_overrides_table: false, created_pnpm_table: false }
+            PnpmMeta {
+                created_overrides_table: false,
+                created_pnpm_table: false
+            }
         );
         let back: PipenvMeta = serde_json::from_str("{}").unwrap();
         assert!(back.sections.is_empty());
@@ -492,8 +506,12 @@ mod tests {
         let root = tmp.path();
         assert!(load_state(root).await.unwrap().is_empty());
 
-        tokio::fs::create_dir_all(root.join(".socket/vendor")).await.unwrap();
-        tokio::fs::write(root.join(VENDOR_STATE_REL), b"{not json").await.unwrap();
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(VENDOR_STATE_REL), b"{not json")
+            .await
+            .unwrap();
         let err = load_state(root).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
@@ -523,13 +541,18 @@ mod tests {
             .entries
             .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
         save_state(root, &state).await.unwrap();
-        tokio::fs::create_dir_all(root.join(".socket/vendor/npm")).await.unwrap();
+        tokio::fs::create_dir_all(root.join(".socket/vendor/npm"))
+            .await
+            .unwrap();
         tokio::fs::write(root.join(".socket/vendor/npm/stray.tgz"), b"x")
             .await
             .unwrap();
         state.entries.clear();
         save_state(root, &state).await.unwrap();
-        assert!(root.join(".socket/vendor/npm").exists(), "non-empty dir kept");
+        assert!(
+            root.join(".socket/vendor/npm").exists(),
+            "non-empty dir kept"
+        );
     }
 
     #[tokio::test]

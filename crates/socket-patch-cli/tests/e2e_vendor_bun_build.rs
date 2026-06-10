@@ -162,11 +162,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     //    `--save-text-lockfile` guarantees the text bun.lock vendor wires
     //    (bun 1.3.x already defaults to it; the flag future-proofs the test).
     let cache = tmp.path().join("bun-cache");
-    let install = bun(
-        &proj,
-        &["install", "--save-text-lockfile"],
-        &cache,
-    );
+    let install = bun(&proj, &["install", "--save-text-lockfile"], &cache);
     if !install.status.success() {
         println!(
             "SKIP e2e_vendor_bun_build: fixture `bun install` failed (registry \
@@ -212,9 +208,18 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     // 3. Vendor (offline).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
@@ -225,13 +230,21 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         .iter()
         .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
         .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
-    assert!(applied.get("errorCode").is_none(), "clean apply event: {applied}");
+    assert!(
+        applied.get("errorCode").is_none(),
+        "clean apply event: {applied}"
+    );
 
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
-    assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing at {tgz_rel}");
     assert!(
-        proj.join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"))
-            .is_file(),
+        proj.join(&tgz_rel).is_file(),
+        "vendored tarball missing at {tgz_rel}"
+    );
+    assert!(
+        proj.join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
+        .is_file(),
         "informational vendor marker missing"
     );
     assert!(
@@ -306,9 +319,18 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env2 = parse_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
     assert_eq!(
@@ -320,9 +342,19 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     // 6. REVERT PROOF: bun.lock restored byte-for-byte, artifacts gone.
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--revert", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");

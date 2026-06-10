@@ -44,14 +44,9 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 #[tokio::test]
 async fn dispatch_fixup_empty_patched_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = dispatch_fixup(
-        "pkg:pypi/requests@2.28.0",
-        tmp.path(),
-        &[],
-        &HashMap::new(),
-    )
-    .await
-    .unwrap();
+    let out = dispatch_fixup("pkg:pypi/requests@2.28.0", tmp.path(), &[], &HashMap::new())
+        .await
+        .unwrap();
     assert!(
         out.is_none(),
         "empty patched must short-circuit to None *before* the pypi advisory arm; \
@@ -72,7 +67,10 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
     )
     .await
     .unwrap();
-    assert!(out.is_none(), "unknown ecosystem must short-circuit to None");
+    assert!(
+        out.is_none(),
+        "unknown ecosystem must short-circuit to None"
+    );
 }
 
 /// `dispatch_fixup` cargo path with a `patched` entry that points
@@ -176,10 +174,9 @@ async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
 #[tokio::test]
 async fn cow_missing_path_yields_no_file() {
     let tmp = tempfile::tempdir().unwrap();
-    let action =
-        break_hardlink_if_needed(&tmp.path().join("does-not-exist.txt"))
-            .await
-            .expect("lstat NotFound is the explicit early-return arm");
+    let action = break_hardlink_if_needed(&tmp.path().join("does-not-exist.txt"))
+        .await
+        .expect("lstat NotFound is the explicit early-return arm");
     assert!(matches!(action, CowAction::NoFile));
 }
 
@@ -262,8 +259,8 @@ async fn cow_symlink_to_missing_target_propagates_read_error() {
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     // The dangling link itself must still exist — read-fail-fast must
     // never enter the remove/rewrite dance that could destroy it.
-    let meta = std::fs::symlink_metadata(&link)
-        .expect("dangling symlink must survive a read-fail-fast");
+    let meta =
+        std::fs::symlink_metadata(&link).expect("dangling symlink must survive a read-fail-fast");
     assert!(
         meta.file_type().is_symlink(),
         "read-through failure must leave the symlink untouched, got {meta:?}"
@@ -317,7 +314,11 @@ async fn cow_symlink_unremovable_propagates_remove_error() {
     let result = break_hardlink_if_needed(&link).await;
 
     // Clear so tempdir cleanup can recurse.
-    let _ = Command::new("chflags").arg("-h").arg("nouchg").arg(&link).status();
+    let _ = Command::new("chflags")
+        .arg("-h")
+        .arg("nouchg")
+        .arg(&link)
+        .status();
 
     let err = result.expect_err("rename over immutable symlink must propagate EPERM");
     assert_eq!(
@@ -347,7 +348,10 @@ async fn cow_symlink_unremovable_propagates_remove_error() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
         .collect();
-    assert!(leftover.is_empty(), "stage litter left behind: {leftover:?}");
+    assert!(
+        leftover.is_empty(),
+        "stage litter left behind: {leftover:?}"
+    );
 }
 
 /// Hardlink branch read-fails arm (cow.rs:84): a hardlinked file
@@ -489,7 +493,10 @@ async fn cow_stage_write_failure_propagates() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
         .collect();
-    assert!(leftover.is_empty(), "stage litter left behind: {leftover:?}");
+    assert!(
+        leftover.is_empty(),
+        "stage litter left behind: {leftover:?}"
+    );
 }
 
 /// Symlink-branch `write_via_stage_rename` stage-create failure arm:
@@ -694,11 +701,7 @@ async fn cow_rename_failure_runs_stage_cleanup() {
     let leftover_stages: Vec<_> = std::fs::read_dir(tmp.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".socket-cow-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".socket-cow-"))
         .collect();
     assert!(
         leftover_stages.is_empty(),

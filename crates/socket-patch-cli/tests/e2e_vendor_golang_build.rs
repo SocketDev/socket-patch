@@ -97,11 +97,24 @@ fn stage(tmp: &Path) -> (PathBuf, PathBuf, String) {
 
     let pxv = tmp.join("proxy").join(UMOD).join("@v");
     std::fs::create_dir_all(&pxv).unwrap();
-    std::fs::write(pxv.join(format!("{UVER}.info")), format!("{{\"Version\":\"{UVER}\"}}")).unwrap();
-    std::fs::write(pxv.join(format!("{UVER}.mod")), format!("module {UMOD}\n\ngo 1.21\n")).unwrap();
+    std::fs::write(
+        pxv.join(format!("{UVER}.info")),
+        format!("{{\"Version\":\"{UVER}\"}}"),
+    )
+    .unwrap();
+    std::fs::write(
+        pxv.join(format!("{UVER}.mod")),
+        format!("module {UMOD}\n\ngo 1.21\n"),
+    )
+    .unwrap();
     let zip_out = pxv.join(format!("{UVER}.zip"));
     let zip_status = Command::new("zip")
-        .args(["-q", "-r", zip_out.to_str().unwrap(), &format!("{UMOD}@{UVER}")])
+        .args([
+            "-q",
+            "-r",
+            zip_out.to_str().unwrap(),
+            &format!("{UMOD}@{UVER}"),
+        ])
         .current_dir(tmp.join("stage"))
         .status()
         .expect("run zip");
@@ -127,7 +140,11 @@ fn stage(tmp: &Path) -> (PathBuf, PathBuf, String) {
     .unwrap();
 
     let env = go_env(modcache.to_str().unwrap(), &proxy_url);
-    let dl = go(&consumer, &["mod", "download", &format!("{UMOD}@{UVER}")], &env);
+    let dl = go(
+        &consumer,
+        &["mod", "download", &format!("{UMOD}@{UVER}")],
+        &env,
+    );
     assert!(
         dl.status.success(),
         "go mod download (file proxy) failed: {}",
@@ -159,7 +176,9 @@ fn write_patch(consumer: &Path) {
     )
     .unwrap();
     std::fs::write(
-        socket.join("blobs").join(git_sha256(PATCHED_LIB.as_bytes())),
+        socket
+            .join("blobs")
+            .join(git_sha256(PATCHED_LIB.as_bytes())),
         PATCHED_LIB,
     )
     .unwrap();
@@ -239,10 +258,19 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     write_patch(&consumer);
     let (code, stdout, stderr) = run_socket(
         &consumer,
-        &["vendor", "--json", "--offline", "--cwd", consumer.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
         &modcache,
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
@@ -253,9 +281,8 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
 
     // The replace directive points at the uuid copy, with the mandatory
     // `./` prefix (a bare path fails go.mod parsing — spike claim 6).
-    let expected_replace = format!(
-        "replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID}/{UMOD}@{UVER}"
-    );
+    let expected_replace =
+        format!("replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID}/{UMOD}@{UVER}");
     let gomod = std::fs::read_to_string(&gomod_path).unwrap();
     assert!(
         gomod.lines().any(|l| l.trim() == expected_replace),
@@ -271,7 +298,9 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     );
     assert!(
         consumer
-            .join(format!(".socket/vendor/golang/{UUID}/socket-patch.vendor.json"))
+            .join(format!(
+                ".socket/vendor/golang/{UUID}/socket-patch.vendor.json"
+            ))
             .is_file(),
         "informational vendor marker missing"
     );
@@ -316,7 +345,9 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         "fresh-checkout `go build` (GOPROXY=off, empty GOMODCACHE) must succeed.\nstderr:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    let app = Command::new(fresh.join("app")).output().expect("run fresh app");
+    let app = Command::new(fresh.join("app"))
+        .output()
+        .expect("run fresh app");
     assert!(
         String::from_utf8_lossy(&app.stdout).contains("OUT: PATCHED"),
         "fresh build must link the PATCHED module: {}",
@@ -332,10 +363,19 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     // REVERT PROOF.
     let (code, stdout, stderr) = run_socket(
         &consumer,
-        &["vendor", "--revert", "--json", "--cwd", consumer.to_str().unwrap()],
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
         &modcache,
     );
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert_eq!(renv["status"], "success", "revert envelope: {renv}");
     assert_eq!(renv["summary"]["removed"], 1, "one entry reverted: {renv}");
@@ -381,7 +421,10 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         &["apply", "--offline", "--ecosystems", "golang", "--cwd", cs],
         &modcache,
     );
-    assert_eq!(code, 0, "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let go_patches_copy = consumer.join(format!(".socket/go-patches/{UMOD}@{UVER}"));
     assert_eq!(
         std::fs::read(go_patches_copy.join("lib.go")).unwrap(),
@@ -400,7 +443,10 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         &["vendor", "--json", "--offline", "--cwd", cs],
         &modcache,
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "takeover is a success: {env}");
     assert!(
@@ -409,9 +455,8 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
     );
 
     let gomod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
-    let expected_replace = format!(
-        "replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID}/{UMOD}@{UVER}"
-    );
+    let expected_replace =
+        format!("replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID}/{UMOD}@{UVER}");
     assert!(
         gomod.lines().any(|l| l.trim() == expected_replace),
         "takeover must repoint the replace at the vendor copy:\n{gomod}"
@@ -426,10 +471,9 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
     );
 
     // The ledger records the takeover so revert can warn about the handoff.
-    let state: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(consumer.join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(consumer.join(".socket/vendor/state.json")).unwrap())
+            .unwrap();
     assert_eq!(
         state["entries"][UPURL]["tookOverGoPatches"], true,
         "state.json must record tookOverGoPatches: {state}"
@@ -447,31 +491,57 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
     //    never repointing the replace back at go-patches.
     let (code, stdout, stderr) = run_socket(
         &consumer,
-        &["apply", "--json", "--offline", "--ecosystems", "golang", "--cwd", cs],
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--cwd",
+            cs,
+        ],
         &modcache,
     );
-    assert_eq!(code, 0, "apply on a vendored module must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "apply on a vendored module must exit 0.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let aenv = parse_envelope(&stdout);
     assert_eq!(aenv["status"], "success", "apply envelope: {aenv}");
-    let yielded = find_event(&aenv, "skipped", "vendored")
-        .unwrap_or_else(|| panic!("apply must skip the vendored purl with errorCode `vendored`: {aenv}"));
-    assert_eq!(yielded["purl"], UPURL, "the vendored purl is the one skipped: {aenv}");
+    let yielded = find_event(&aenv, "skipped", "vendored").unwrap_or_else(|| {
+        panic!("apply must skip the vendored purl with errorCode `vendored`: {aenv}")
+    });
+    assert_eq!(
+        yielded["purl"], UPURL,
+        "the vendored purl is the one skipped: {aenv}"
+    );
     let gomod_after_apply = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
     assert!(
-        gomod_after_apply.lines().any(|l| l.trim() == expected_replace),
+        gomod_after_apply
+            .lines()
+            .any(|l| l.trim() == expected_replace),
         "apply must leave the vendor replace untouched:\n{gomod_after_apply}"
     );
     assert!(
-        !consumer.join(".socket/go-patches").join(format!("{UMOD}@{UVER}")).exists()
+        !consumer
+            .join(".socket/go-patches")
+            .join(format!("{UMOD}@{UVER}"))
+            .exists()
             && !gomod_after_apply.contains("go-patches"),
         "apply must not re-create the go-patches redirect for a vendored module"
     );
 
     // 4. Revert: the taken-over redirect is NOT restored — surfaced via
     //    `takeover_not_restored` — and a fresh `apply` restores it.
-    let (code, stdout, stderr) =
-        run_socket(&consumer, &["vendor", "--revert", "--json", "--cwd", cs], &modcache);
-    assert_eq!(code, 0, "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (code, stdout, stderr) = run_socket(
+        &consumer,
+        &["vendor", "--revert", "--json", "--cwd", cs],
+        &modcache,
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let renv = parse_envelope(&stdout);
     assert!(
         find_event(&renv, "skipped", "takeover_not_restored").is_some(),
@@ -524,10 +594,19 @@ fn go_vendor_reports_applied_event() {
 
     let (code, stdout, stderr) = run_socket(
         &consumer,
-        &["vendor", "--json", "--offline", "--cwd", consumer.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
         &modcache,
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let env = parse_envelope(&stdout);
     assert_eq!(
         env["summary"]["applied"], 1,

@@ -275,12 +275,11 @@ pub async fn build_patched_wheel(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let script_names = match tokio::fs::read_to_string(dist.dist_info_dir.join("entry_points.txt"))
-        .await
-    {
-        Ok(text) => console_script_names(&text),
-        Err(_) => HashSet::new(),
-    };
+    let script_names =
+        match tokio::fs::read_to_string(dist.dist_info_dir.join("entry_points.txt")).await {
+            Ok(text) => console_script_names(&text),
+            Err(_) => HashSet::new(),
+        };
 
     // Select the wheel members from the installed RECORD.
     let mut members: Vec<String> = Vec::new();
@@ -435,21 +434,20 @@ pub async fn build_patched_wheel(
         executable: false,
     });
 
-    let zip_bytes = match tokio::task::spawn_blocking(move || build_deterministic_zip(&entries))
-        .await
-    {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            result.success = false;
-            result.error = Some(format!("wheel zip assembly failed: {e}"));
-            return Ok((result, None));
-        }
-        Err(e) => {
-            result.success = false;
-            result.error = Some(format!("wheel zip task failed: {e}"));
-            return Ok((result, None));
-        }
-    };
+    let zip_bytes =
+        match tokio::task::spawn_blocking(move || build_deterministic_zip(&entries)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                result.success = false;
+                result.error = Some(format!("wheel zip assembly failed: {e}"));
+                return Ok((result, None));
+            }
+            Err(e) => {
+                result.success = false;
+                result.error = Some(format!("wheel zip task failed: {e}"));
+                return Ok((result, None));
+            }
+        };
 
     if let Some(parent) = dest.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -715,16 +713,18 @@ mod tests {
         );
         tokio::fs::write(di.join("RECORD"), record).await.unwrap();
         if let Some(ep) = entry_points {
-            tokio::fs::write(di.join("entry_points.txt"), ep).await.unwrap();
+            tokio::fs::write(di.join("entry_points.txt"), ep)
+                .await
+                .unwrap();
         }
         let blobs = tmp.path().join("blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         tokio::fs::write(blobs.join(compute_git_sha256_from_bytes(PATCHED)), PATCHED)
             .await
             .unwrap();
-        let dest = tmp
-            .path()
-            .join(format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl"));
+        let dest = tmp.path().join(format!(
+            ".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+        ));
         Fixture {
             _tmp: tmp,
             site_packages: sp,
@@ -805,12 +805,16 @@ mod tests {
             record: vec![],
             wheel_tags: vec!["py2-none-any".into(), "py3-none-any".into()],
         };
-        assert_eq!(wheel_file_name(&dist).unwrap(), "six-1.16.0-py2.py3-none-any.whl");
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "six-1.16.0-py2.py3-none-any.whl"
+        );
 
         // A tag set that is NOT a cross product of its components must refuse
         // rather than fabricate compatibility.
-        let err = compress_wheel_tags(&["py2-none-any".into(), "py3-abi3-manylinux1_x86_64".into()])
-            .unwrap_err();
+        let err =
+            compress_wheel_tags(&["py2-none-any".into(), "py3-abi3-manylinux1_x86_64".into()])
+                .unwrap_err();
         assert_eq!(err.0, "pypi_wheel_tags_unrecoverable");
         // Malformed (non-triple) tag.
         let err = compress_wheel_tags(&["py3".into()]).unwrap_err();
@@ -861,7 +865,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, "pypi_missing_wheel_metadata");
-        tokio::fs::write(di.join("WHEEL"), wheel_backup).await.unwrap();
+        tokio::fs::write(di.join("WHEEL"), wheel_backup)
+            .await
+            .unwrap();
 
         tokio::fs::remove_file(di.join("RECORD")).await.unwrap();
         let err = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
@@ -914,7 +920,10 @@ mod tests {
             "__pycache__/six.cpython-314.pyc",
             "../../../bin/six-cmd",
         ] {
-            assert!(!names.contains(&forbidden.to_string()), "{forbidden} leaked");
+            assert!(
+                !names.contains(&forbidden.to_string()),
+                "{forbidden} leaked"
+            );
         }
         // Patched bytes actually landed in the wheel.
         assert_eq!(zip_file(&bytes, "six.py"), PATCHED);
@@ -995,8 +1004,12 @@ mod tests {
 
         // RECORD is the final zip entry and self-describes with `path,,`.
         let names = zip_names(&bytes1);
-        assert_eq!(names.last().map(String::as_str), Some("six-1.16.0.dist-info/RECORD"));
-        let record_text = String::from_utf8(zip_file(&bytes1, "six-1.16.0.dist-info/RECORD")).unwrap();
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("six-1.16.0.dist-info/RECORD")
+        );
+        let record_text =
+            String::from_utf8(zip_file(&bytes1, "six-1.16.0.dist-info/RECORD")).unwrap();
         assert!(record_text.ends_with("six-1.16.0.dist-info/RECORD,,\n"));
         // RECORD hash of six.py matches the patched bytes.
         let digest = sha2::Sha256::digest(PATCHED);
@@ -1038,7 +1051,8 @@ mod tests {
         let bytes = tokio::fs::read(&fx.dest).await.unwrap();
         assert!(zip_names(&bytes).contains(&"six_extra.py".to_string()));
         assert_eq!(zip_file(&bytes, "six_extra.py"), created);
-        let record_text = String::from_utf8(zip_file(&bytes, "six-1.16.0.dist-info/RECORD")).unwrap();
+        let record_text =
+            String::from_utf8(zip_file(&bytes, "six-1.16.0.dist-info/RECORD")).unwrap();
         assert!(record_text.contains("six_extra.py,sha256="));
         // The created file must NOT exist in the real site-packages.
         assert!(!fx.site_packages.join("six_extra.py").exists());
@@ -1099,7 +1113,9 @@ mod tests {
         assert!(!fx.dest.exists());
         // Installed tree untouched.
         assert_eq!(
-            tokio::fs::read(fx.site_packages.join("six.py")).await.unwrap(),
+            tokio::fs::read(fx.site_packages.join("six.py"))
+                .await
+                .unwrap(),
             ORIG
         );
     }

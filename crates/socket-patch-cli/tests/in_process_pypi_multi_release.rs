@@ -175,7 +175,9 @@ async fn setup_multi_release_mock(server: &MockServer, installed_before_hash: &s
 
     // --- by-package: all three qualified variants -------------------------
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             // Same deliberate ordering: installed variant LAST (see batch).
             "patches": [

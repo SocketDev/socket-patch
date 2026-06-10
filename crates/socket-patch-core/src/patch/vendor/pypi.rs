@@ -435,10 +435,10 @@ pub async fn vendor_pypi(
     let platform_locked = dist.wheel_tags.iter().any(|t| tag_is_platform_specific(t));
     if platform_locked {
         let per_flavor = match flavor {
-            PypiFlavor::UvProject => {
-                "uv.lock now resolves it from this single-platform wheel only"
+            PypiFlavor::UvProject => "uv.lock now resolves it from this single-platform wheel only",
+            PypiFlavor::Poetry => {
+                "poetry.lock now resolves it from this single-platform wheel only"
             }
-            PypiFlavor::Poetry => "poetry.lock now resolves it from this single-platform wheel only",
             PypiFlavor::Pdm => "pdm.lock now resolves it from this single-platform wheel only",
             PypiFlavor::Pipenv => {
                 "Pipfile.lock now resolves it from this single-platform wheel only"
@@ -699,18 +699,32 @@ mod tests {
         assert_eq!(f, PypiFlavor::Poetry);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "pypi_multiple_lockfiles");
-        assert!(warnings[0].detail.contains("Pipfile.lock"), "{}", warnings[0].detail);
+        assert!(
+            warnings[0].detail.contains("Pipfile.lock"),
+            "{}",
+            warnings[0].detail
+        );
 
         // 5. Lock-less tool markers refuse with the per-tool pointer...
         let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n\n[tool.uv]\ndev = true\n").await;
+        touch(
+            tmp.path(),
+            "pyproject.toml",
+            "[project]\nname = \"x\"\n\n[tool.uv]\ndev = true\n",
+        )
+        .await;
         let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_uv_no_lockfile");
         assert!(err.1.contains("uv lock"));
         assert!(err.1.contains("socket-patch setup"));
 
         let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "pyproject.toml", "[tool.poetry]\nname = \"x\"\n").await;
+        touch(
+            tmp.path(),
+            "pyproject.toml",
+            "[tool.poetry]\nname = \"x\"\n",
+        )
+        .await;
         let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_poetry_no_lockfile");
         assert!(err.1.contains("poetry lock"));
@@ -918,7 +932,9 @@ mod tests {
 
         // The installed site-packages tree was never touched.
         assert_eq!(
-            tokio::fs::read(fx.site_packages.join("six.py")).await.unwrap(),
+            tokio::fs::read(fx.site_packages.join("six.py"))
+                .await
+                .unwrap(),
             ORIG
         );
 
@@ -927,7 +943,9 @@ mod tests {
         assert!(reverted.success, "{:?}", reverted.error);
         assert!(reverted.warnings.is_empty(), "{:?}", reverted.warnings);
         assert_eq!(
-            tokio::fs::read_to_string(fx.root.join("requirements.txt")).await.unwrap(),
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
             "six==1.16.0\n"
         );
         assert!(!fx.root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
@@ -956,7 +974,9 @@ mod tests {
         assert_eq!(code, "vendor_unsafe_uuid");
         assert!(!fx.root.join(".socket").exists(), "nothing may be written");
         assert_eq!(
-            tokio::fs::read_to_string(fx.root.join("requirements.txt")).await.unwrap(),
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
             "six==1.16.0\n"
         );
     }
@@ -983,7 +1003,9 @@ mod tests {
         assert!(entry.is_none(), "dry run yields no entry to persist");
         assert!(!fx.root.join(".socket").exists());
         assert_eq!(
-            tokio::fs::read_to_string(fx.root.join("requirements.txt")).await.unwrap(),
+            tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                .await
+                .unwrap(),
             "six==1.16.0\n"
         );
     }
@@ -1061,7 +1083,9 @@ mod tests {
     fn platform_specific_tag_detection() {
         assert!(!tag_is_platform_specific("py3-none-any"));
         assert!(!tag_is_platform_specific("cp311-none-any"));
-        assert!(tag_is_platform_specific("cp311-cp311-manylinux_2_17_x86_64"));
+        assert!(tag_is_platform_specific(
+            "cp311-cp311-manylinux_2_17_x86_64"
+        ));
         assert!(tag_is_platform_specific("py3-none-macosx_11_0_arm64"));
         assert!(tag_is_platform_specific("py3-abi3-any"));
         assert!(tag_is_platform_specific("garbage"));

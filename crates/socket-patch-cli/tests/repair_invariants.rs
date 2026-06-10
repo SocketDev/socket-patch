@@ -100,8 +100,7 @@ const MANIFEST_JSON: &str = r#"{
   }
 }"#;
 
-const REFERENCED_HASH: &str =
-    "1111111111111111111111111111111111111111111111111111111111111111";
+const REFERENCED_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
 fn make_socket_dir(root: &Path) -> PathBuf {
     let socket = root.join(".socket");
@@ -138,8 +137,7 @@ fn repair_with_no_manifest_emits_manifest_not_found_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (code, stdout) = run_repair(tmp.path(), &[]);
     assert_eq!(code, 1, "expected exit 1; stdout=\n{stdout}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("envelope must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope must be valid JSON");
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "manifest_not_found");
@@ -196,8 +194,7 @@ fn repair_offline_and_download_only_are_mutually_exclusive() {
         "expected exit 2 for invalid flag combo; stdout=\n{}",
         String::from_utf8_lossy(&out.stdout),
     );
-    let v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "invalid_args");
     assert!(
@@ -365,7 +362,13 @@ fn repair_download_only_skips_cleanup() {
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--json", "--download-only", "--download-mode", "file"])
+        .args([
+            "repair",
+            "--json",
+            "--download-only",
+            "--download-mode",
+            "file",
+        ])
         .output()
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
@@ -416,8 +419,7 @@ fn gc_alias_behaves_identically_to_repair() {
         .output()
         .expect("run socket-patch");
     assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     // The envelope's `command` field reports the canonical name, not the alias.
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "success");
@@ -532,7 +534,10 @@ async fn repair_online_downloads_missing_blob() {
         1,
         "repair must issue exactly one GET to {blob_endpoint}; saw {} request(s): {:?}",
         requests.len(),
-        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>(),
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>(),
     );
     assert_eq!(format!("{}", blob_hits[0].method), "GET");
 }
@@ -556,8 +561,7 @@ fn repair_honors_manifest_path_override() {
         ctrl_code, 1,
         "control: repair without override must fail; stdout=\n{ctrl_stdout}"
     );
-    let cv: serde_json::Value =
-        serde_json::from_str(&ctrl_stdout).expect("control envelope JSON");
+    let cv: serde_json::Value = serde_json::from_str(&ctrl_stdout).expect("control envelope JSON");
     assert_eq!(cv["error"]["code"], "manifest_not_found");
 
     let out = socket_cmd(tmp.path())
@@ -577,8 +581,7 @@ fn repair_honors_manifest_path_override() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let v: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "success");
     // The override manifest references one blob with no blob on disk, but

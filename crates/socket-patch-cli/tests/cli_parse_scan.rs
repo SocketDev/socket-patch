@@ -121,8 +121,14 @@ fn defaults_match_contract() {
     assert_eq!(args.common.api_url, "https://api.socket.dev");
     assert_eq!(args.common.api_token, None);
     assert_eq!(args.common.ecosystems, None);
-    assert!(!args.apply, "--apply default is false (scan --json stays read-only)");
-    assert!(!args.prune, "--prune default is false (GC is opt-in in v3.0)");
+    assert!(
+        !args.apply,
+        "--apply default is false (scan --json stays read-only)"
+    );
+    assert!(
+        !args.prune,
+        "--prune default is false (GC is opt-in in v3.0)"
+    );
     assert!(!args.sync, "--sync default is false");
     assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
@@ -226,7 +232,10 @@ fn json_flag() {
 #[serial_test::serial]
 fn global_prefix_flag() {
     let args = parse_scan(&["--global-prefix", "/foo"]);
-    assert_eq!(args.common.global_prefix, Some(std::path::PathBuf::from("/foo")));
+    assert_eq!(
+        args.common.global_prefix,
+        Some(std::path::PathBuf::from("/foo"))
+    );
 }
 
 #[test]
@@ -521,7 +530,8 @@ fn scan_json_empty_cwd_emits_updates_key() {
         "updates": [],
     });
     assert_eq!(
-        v, expected,
+        v,
+        expected,
         "empty-scan JSON contract drifted.\nexpected:\n{}\ngot:\n{}",
         serde_json::to_string_pretty(&expected).unwrap(),
         serde_json::to_string_pretty(&v).unwrap(),
@@ -530,7 +540,10 @@ fn scan_json_empty_cwd_emits_updates_key() {
     // Belt-and-suspenders on the two type invariants the contract names,
     // in case the object above is ever loosened during maintenance.
     assert!(v["packages"].is_array(), "packages must be an array");
-    assert!(v["updates"].is_array(), "updates must be present and an array");
+    assert!(
+        v["updates"].is_array(),
+        "updates must be present and an array"
+    );
     assert!(
         v.get("gc").is_none(),
         "no `gc` sub-object may appear when --prune was not passed"

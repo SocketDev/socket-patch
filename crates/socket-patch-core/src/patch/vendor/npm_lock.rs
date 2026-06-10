@@ -184,11 +184,18 @@ pub async fn vendor_npm(
     let Some(staged) = staged else {
         // Failed patch (no lock writes — wiring is last, so the project is
         // byte-untouched) or a dry run (stops after the verify).
-        return VendorOutcome::Done { result, entry: None, warnings };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
     };
     // `staged.name`/`staged.version` echo the validated coords (the wiring
     // below keeps using the borrowed `name`/`version`).
-    debug_assert_eq!((staged.name.as_str(), staged.version.as_str()), (name, version));
+    debug_assert_eq!(
+        (staged.name.as_str(), staged.version.as_str()),
+        (name, version)
+    );
     let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
     let staged_pkg_json = staged.staged_pkg_json;
@@ -205,7 +212,10 @@ pub async fn vendor_npm(
     let mut recomputed_deps = false;
     {
         let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
-            return done_failure(purl, "lock `packages` object vanished mid-rewrite".to_string());
+            return done_failure(
+                purl,
+                "lock `packages` object vanished mid-rewrite".to_string(),
+            );
         };
         for m in &matches {
             let Some(live) = packages.get_mut(&m.key).and_then(Value::as_object_mut) else {
@@ -221,7 +231,10 @@ pub async fn vendor_npm(
             // dangling `.socket/vendor/` pointer from an earlier uuid.
             let was_vendored = entry_points_into_vendor(live);
             live.insert("resolved".to_string(), Value::String(resolved.clone()));
-            live.insert("integrity".to_string(), Value::String(packed.integrity.clone()));
+            live.insert(
+                "integrity".to_string(),
+                Value::String(packed.integrity.clone()),
+            );
             if let Some(pkg) = &staged_pkg_json {
                 recompute_dep_fields(live, pkg);
                 recomputed_deps = true;
@@ -231,7 +244,11 @@ pub async fn vendor_npm(
                 kind: KIND_LOCK_ENTRY.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(m.key.clone()),
-                original: if was_vendored { None } else { Some(m.original.clone()) },
+                original: if was_vendored {
+                    None
+                } else {
+                    Some(m.original.clone())
+                },
                 new: Some(Value::Object(live.clone())),
             });
             changed = true;
@@ -270,7 +287,11 @@ pub async fn vendor_npm(
         // integrity: the project is in sync. Touch nothing (the tarball
         // rewrite above was byte-identical by determinism) and synthesize an
         // AlreadyPatched-style success, mirroring the go_redirect hot path.
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return VendorOutcome::Done {
             result: synthesized_result(purl, &dest, verified, true, None),
             entry: None,
@@ -328,7 +349,11 @@ pub async fn vendor_npm(
         pdm: None,
         pipenv: None,
     };
-    VendorOutcome::Done { result, entry: Some(entry), warnings }
+    VendorOutcome::Done {
+        result,
+        entry: Some(entry),
+        warnings,
+    }
 }
 
 /// Undo one vendored npm package: restore the recorded lock fragments and
@@ -397,7 +422,13 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
         let mut changed = false;
         // Reverse application order, like every backend's revert.
         for rec in entry.wiring.iter().rev().filter(|r| r.file == lock_name) {
-            revert_one_record(&mut lock, rec, &entry.uuid, &mut changed, &mut outcome.warnings);
+            revert_one_record(
+                &mut lock,
+                rec,
+                &entry.uuid,
+                &mut changed,
+                &mut outcome.warnings,
+            );
         }
 
         if changed {
@@ -438,7 +469,9 @@ struct LockMatch {
 enum LockScan {
     Matches(Vec<LockMatch>),
     /// A matching key outside `node_modules/` — the caller refuses.
-    WorkspaceMember { key: String },
+    WorkspaceMember {
+        key: String,
+    },
 }
 
 /// Scan `packages` for instances of `name@version`, pushing skip warnings
@@ -458,7 +491,9 @@ fn scan_lock_matches(
         if key.is_empty() {
             continue;
         }
-        let Some(obj) = entry.as_object() else { continue };
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
         if entry_name(key, obj) != name {
             continue;
         }
@@ -560,7 +595,9 @@ fn rewrite_legacy_tree(
     changed: &mut bool,
 ) {
     for (dep_name, node) in deps.iter_mut() {
-        let Some(obj) = node.as_object_mut() else { continue };
+        let Some(obj) = node.as_object_mut() else {
+            continue;
+        };
         let pointer = format!("{pointer_base}/{}", escape_json_pointer_token(dep_name));
         if dep_name == name
             && obj.get("version").and_then(Value::as_str) == Some(version)
@@ -569,7 +606,10 @@ fn rewrite_legacy_tree(
             let was_vendored = entry_points_into_vendor(obj);
             let original = Value::Object(obj.clone());
             obj.insert("resolved".to_string(), Value::String(resolved.to_string()));
-            obj.insert("integrity".to_string(), Value::String(integrity.to_string()));
+            obj.insert(
+                "integrity".to_string(),
+                Value::String(integrity.to_string()),
+            );
             wiring.push(WiringRecord {
                 file: lock_name.to_string(),
                 kind: KIND_LOCK_LEGACY_ENTRY.to_string(),
@@ -875,18 +915,27 @@ mod tests {
 
         let installed = root.join("node_modules").join(name);
         tokio::fs::create_dir_all(&installed).await.unwrap();
-        tokio::fs::write(installed.join("package.json"), installed_pkg_json(name, version))
+        tokio::fs::write(
+            installed.join("package.json"),
+            installed_pkg_json(name, version),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed.join("index.js"), ORIG_INDEX)
             .await
             .unwrap();
-        tokio::fs::write(installed.join("index.js"), ORIG_INDEX).await.unwrap();
 
         let blobs = root.join(".socket/blobs");
         tokio::fs::create_dir_all(&blobs).await.unwrap();
         let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
-        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX).await.unwrap();
+        tokio::fs::write(blobs.join(&after_hash), PATCHED_INDEX)
+            .await
+            .unwrap();
 
         let lock_bytes = serialize_lock(&lock, "  ").unwrap();
-        tokio::fs::write(root.join(PACKAGE_LOCK), &lock_bytes).await.unwrap();
+        tokio::fs::write(root.join(PACKAGE_LOCK), &lock_bytes)
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -915,9 +964,15 @@ mod tests {
         }
     }
 
-    fn expect_done(outcome: VendorOutcome) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+    fn expect_done(
+        outcome: VendorOutcome,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
-            VendorOutcome::Done { result, entry, warnings } => (result, entry, warnings),
+            VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } => (result, entry, warnings),
             VendorOutcome::Refused { code, detail } => {
                 panic!("expected Done, got Refused {code}: {detail}")
             }
@@ -931,7 +986,10 @@ mod tests {
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused {want_code}, got Done (success={})", result.success)
+                panic!(
+                    "expected Refused {want_code}, got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -956,19 +1014,32 @@ mod tests {
         let tgz = tokio::fs::read(fx.root().join(&rel_tgz)).await.unwrap();
         assert_eq!(entry.artifact.path, rel_tgz);
         assert_eq!(entry.artifact.size, Some(tgz.len() as u64));
-        assert_eq!(entry.artifact.sha256, hex::encode(sha2::Sha256::digest(&tgz)));
+        assert_eq!(
+            entry.artifact.sha256,
+            hex::encode(sha2::Sha256::digest(&tgz))
+        );
         let expected_integrity = sri_sha512(&tgz);
 
         // BOTH instances (direct + nested) rewritten; everything else intact.
         let lock = fx.read_lock().await;
         let expected_resolved = format!("file:{rel_tgz}");
-        for key in ["node_modules/left-pad", "node_modules/foo/node_modules/left-pad"] {
+        for key in [
+            "node_modules/left-pad",
+            "node_modules/foo/node_modules/left-pad",
+        ] {
             let e = &lock["packages"][key];
             assert_eq!(e["resolved"], json!(expected_resolved), "{key}");
-            assert_eq!(e["integrity"], json!(expected_integrity), "{key}: integrity MUST be the recomputed tarball hash");
+            assert_eq!(
+                e["integrity"],
+                json!(expected_integrity),
+                "{key}: integrity MUST be the recomputed tarball hash"
+            );
             assert_eq!(e["version"], json!("1.3.0"), "{key}: version untouched");
         }
-        assert_eq!(lock["packages"]["node_modules/left-pad"]["license"], json!("WTFPL"));
+        assert_eq!(
+            lock["packages"]["node_modules/left-pad"]["license"],
+            json!("WTFPL")
+        );
         assert_eq!(
             lock["packages"]["node_modules/foo"],
             default_lock()["packages"]["node_modules/foo"],
@@ -987,13 +1058,16 @@ mod tests {
                 &default_lock()["packages"][key],
                 "original must be the verbatim pre-vendor entry for {key}"
             );
-            assert_eq!(rec.new.as_ref().unwrap()["resolved"], json!(expected_resolved));
+            assert_eq!(
+                rec.new.as_ref().unwrap()["resolved"],
+                json!(expected_resolved)
+            );
         }
 
         // Marker sits next to the artifact.
-        let marker = tokio::fs::read_to_string(
-            fx.root().join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json")),
-        )
+        let marker = tokio::fs::read_to_string(fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        )))
         .await
         .unwrap();
         assert!(marker.contains(UUID));
@@ -1025,7 +1099,10 @@ mod tests {
 
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success);
-        assert!(entry.is_none(), "in-sync re-run must not produce a new ledger entry");
+        assert!(
+            entry.is_none(),
+            "in-sync re-run must not produce a new ledger entry"
+        );
         assert!(
             result
                 .files_verified
@@ -1091,12 +1168,23 @@ mod tests {
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success);
         let entry = entry.unwrap();
-        assert_eq!(entry.wiring.len(), 3, "direct + nested + alias all rewritten");
+        assert_eq!(
+            entry.wiring.len(),
+            3,
+            "direct + nested + alias all rewritten"
+        );
 
         let lock = fx.read_lock().await;
         let alias = &lock["packages"]["node_modules/aliased"];
-        assert_eq!(alias["resolved"], json!(format!("file:{}", fx.expected_rel_tgz())));
-        assert_eq!(alias["name"], json!("left-pad"), "alias name field preserved");
+        assert_eq!(
+            alias["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+        assert_eq!(
+            alias["name"],
+            json!("left-pad"),
+            "alias name field preserved"
+        );
     }
 
     #[tokio::test]
@@ -1117,13 +1205,27 @@ mod tests {
         let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success);
-        assert_eq!(entry.unwrap().wiring.len(), 2, "only the rewritable instances");
+        assert_eq!(
+            entry.unwrap().wiring.len(),
+            2,
+            "only the rewritable instances"
+        );
 
         let codes: Vec<&str> = warnings.iter().map(|w| w.code).collect();
         assert!(codes.contains(&"vendor_link_entry_skipped"), "{codes:?}");
-        assert!(codes.contains(&"vendor_bundled_instance_skipped"), "{codes:?}");
-        let bundled = warnings.iter().find(|w| w.code == "vendor_bundled_instance_skipped").unwrap();
-        assert!(bundled.detail.contains("UNPATCHED"), "loud warning: {}", bundled.detail);
+        assert!(
+            codes.contains(&"vendor_bundled_instance_skipped"),
+            "{codes:?}"
+        );
+        let bundled = warnings
+            .iter()
+            .find(|w| w.code == "vendor_bundled_instance_skipped")
+            .unwrap();
+        assert!(
+            bundled.detail.contains("UNPATCHED"),
+            "loud warning: {}",
+            bundled.detail
+        );
 
         // Skipped entries are byte-untouched.
         let live = fx.read_lock().await;
@@ -1151,7 +1253,10 @@ mod tests {
         let fx = fixture_with("left-pad", "1.3.0", lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_workspace_member");
         assert!(detail.contains("packages/left-pad"));
-        assert!(!fx.root().join(".socket/vendor").exists(), "refusal writes nothing");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "refusal writes nothing"
+        );
     }
 
     #[tokio::test]
@@ -1183,7 +1288,10 @@ mod tests {
             }
         });
         let fx = fixture_with("left-pad", "1.3.0", lock).await;
-        expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
     }
 
     #[tokio::test]
@@ -1191,7 +1299,10 @@ mod tests {
         let fx = fixture().await;
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
-        assert!(detail.contains("npm install"), "actionable detail: {detail}");
+        assert!(
+            detail.contains("npm install"),
+            "actionable detail: {detail}"
+        );
     }
 
     #[tokio::test]
@@ -1202,14 +1313,19 @@ mod tests {
         lock["packages"]["node_modules/foo/node_modules/left-pad"]["version"] = json!("1.2.0");
         let fx = fixture_with("left-pad", "1.3.0", lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_found");
-        assert!(detail.contains("npm install"), "actionable detail: {detail}");
+        assert!(
+            detail.contains("npm install"),
+            "actionable detail: {detail}"
+        );
     }
 
     #[tokio::test]
     async fn shrinkwrap_wins_over_package_lock() {
         let fx = fixture().await;
         // Same content as the package-lock, but under the shrinkwrap name.
-        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes).await.unwrap();
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
 
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success);
@@ -1217,7 +1333,10 @@ mod tests {
         assert!(entry.wiring.iter().all(|r| r.file == SHRINKWRAP));
 
         // package-lock.json byte-untouched; shrinkwrap rewritten.
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
         let shrink: Value =
             serde_json::from_slice(&tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap())
                 .unwrap();
@@ -1278,12 +1397,23 @@ mod tests {
         assert!(result.success);
         let entry = entry.unwrap();
 
-        let legacy: Vec<&WiringRecord> =
-            entry.wiring.iter().filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY).collect();
-        assert_eq!(legacy.len(), 2, "top-level + nested legacy nodes: {:?}", entry.wiring);
+        let legacy: Vec<&WiringRecord> = entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .collect();
+        assert_eq!(
+            legacy.len(),
+            2,
+            "top-level + nested legacy nodes: {:?}",
+            entry.wiring
+        );
         let keys: Vec<&str> = legacy.iter().map(|r| r.key.as_deref().unwrap()).collect();
         assert!(keys.contains(&"/dependencies/left-pad"), "{keys:?}");
-        assert!(keys.contains(&"/dependencies/foo/dependencies/left-pad"), "{keys:?}");
+        assert!(
+            keys.contains(&"/dependencies/foo/dependencies/left-pad"),
+            "{keys:?}"
+        );
 
         let resolved = json!(format!("file:{}", fx.expected_rel_tgz()));
         let live = fx.read_lock().await;
@@ -1301,7 +1431,10 @@ mod tests {
         // Pointer-addressed revert restores the v2 lock byte-for-byte.
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
     }
 
     #[tokio::test]
@@ -1317,10 +1450,15 @@ mod tests {
             fx.lock_bytes,
             "lock byte-untouched"
         );
-        assert!(!fx.root().join(".socket/vendor").exists(), ".socket/vendor absent");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            ".socket/vendor absent"
+        );
         // The installed package is never patched in place by vendor.
         assert_eq!(
-            tokio::fs::read(fx.installed().join("index.js")).await.unwrap(),
+            tokio::fs::read(fx.installed().join("index.js"))
+                .await
+                .unwrap(),
             ORIG_INDEX
         );
     }
@@ -1355,7 +1493,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_dep_manifest_rewritten"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_rewritten"),
             "{warnings:?}"
         );
 
@@ -1381,7 +1521,10 @@ mod tests {
         // Dry-run revert: success, nothing removed/restored.
         let outcome = revert_npm(&entry, fx.root(), true).await;
         assert!(outcome.success);
-        assert!(tgz_path.exists(), "dry-run revert must not delete the artifact");
+        assert!(
+            tgz_path.exists(),
+            "dry-run revert must not delete the artifact"
+        );
         assert_ne!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes,
@@ -1398,7 +1541,9 @@ mod tests {
         );
         assert!(!tgz_path.exists(), "tarball removed");
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "uuid dir pruned"
         );
     }
@@ -1420,7 +1565,10 @@ mod tests {
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(outcome.success);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "{:?}",
             outcome.warnings
         );
@@ -1436,7 +1584,10 @@ mod tests {
             default_lock()["packages"]["node_modules/foo/node_modules/left-pad"],
             "non-drifted instance restored"
         );
-        assert!(!fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 
     #[tokio::test]
@@ -1445,7 +1596,10 @@ mod tests {
         fx.record.uuid = "../../x".to_string();
         expect_refused(fx.vendor(false).await, "unsafe_coordinates");
         assert!(!fx.root().join(".socket/vendor").exists());
-        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), fx.lock_bytes);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
         // And revert refuses to delete through a tampered uuid too.
         let entry = VendorEntry {
             ecosystem: "npm".into(),
@@ -1473,13 +1627,20 @@ mod tests {
 
     #[test]
     fn purl_and_name_helpers() {
-        assert_eq!(parse_npm_purl("pkg:npm/left-pad@1.3.0"), Some(("left-pad", "1.3.0")));
+        assert_eq!(
+            parse_npm_purl("pkg:npm/left-pad@1.3.0"),
+            Some(("left-pad", "1.3.0"))
+        );
         assert_eq!(
             parse_npm_purl("pkg:npm/@scope/pkg@1.0.0?foo=bar"),
             Some(("@scope/pkg", "1.0.0"))
         );
         assert_eq!(parse_npm_purl("pkg:npm/@scope/pkg"), None, "no version");
-        assert_eq!(parse_npm_purl("pkg:pypi/six@1.16.0"), None, "wrong ecosystem");
+        assert_eq!(
+            parse_npm_purl("pkg:pypi/six@1.16.0"),
+            None,
+            "wrong ecosystem"
+        );
 
         assert!(is_safe_npm_name("left-pad"));
         assert!(is_safe_npm_name("@scope/pkg"));

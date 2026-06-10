@@ -102,7 +102,10 @@ async fn find_by_purls_accepts_gem_with_gemspec_only() {
         .unwrap();
     assert_eq!(result.len(), 1);
     let pkg = result.get(ORG_PURL).unwrap();
-    assert_eq!(pkg.path, pkg_dir, "gemspec-only dir must be the resolved path");
+    assert_eq!(
+        pkg.path, pkg_dir,
+        "gemspec-only dir must be the resolved path"
+    );
     assert_eq!(pkg.name, "rails");
     assert_eq!(pkg.version, "7.1.0");
 }

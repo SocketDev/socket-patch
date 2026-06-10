@@ -59,10 +59,7 @@ fn exact_name_match_wins_over_prefix() {
         2,
         "both the exact and the prefix sibling match query 'node'"
     );
-    assert_eq!(
-        results[0].name, "node",
-        "ExactName must outrank PrefixName"
-    );
+    assert_eq!(results[0].name, "node", "ExactName must outrank PrefixName");
     assert_eq!(results[0].namespace.as_deref(), Some("@types"));
     assert_eq!(
         results[1].name, "node-fetch",
@@ -103,7 +100,11 @@ fn contains_match_returns_partial() {
         pkg("lodash", "4.17.21", None),
     ];
     let results = fuzzy_match_packages("width", &packages, 20);
-    assert_eq!(results.len(), 1, "only the contains match survives filtering");
+    assert_eq!(
+        results.len(),
+        1,
+        "only the contains match survives filtering"
+    );
     assert_eq!(results[0].name, "string-width");
 }
 
@@ -128,12 +129,13 @@ fn case_insensitive_match() {
     // The query case differs from the stored name; a non-matching decoy ensures
     // we're asserting the case-folded match actually fires, not that "any single
     // package is returned".
-    let packages = vec![
-        pkg("React", "18.0.0", None),
-        pkg("lodash", "4.17.21", None),
-    ];
+    let packages = vec![pkg("React", "18.0.0", None), pkg("lodash", "4.17.21", None)];
     let results = fuzzy_match_packages("react", &packages, 20);
-    assert_eq!(results.len(), 1, "case-insensitive match selects exactly React");
+    assert_eq!(
+        results.len(),
+        1,
+        "case-insensitive match selects exactly React"
+    );
     assert_eq!(results[0].name, "React");
     // Uppercased query must resolve to the same package.
     let upper = fuzzy_match_packages("REACT", &packages, 20);

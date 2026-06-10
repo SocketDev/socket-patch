@@ -147,8 +147,9 @@ mod host_guard {
     /// script, if present and a string.
     fn lifecycle_script(root: &Path, key: &str) -> Option<String> {
         let text = std::fs::read_to_string(root.join("package.json")).unwrap();
-        let val: serde_json::Value = serde_json::from_str(&text)
-            .unwrap_or_else(|e| panic!("package.json is not valid JSON after CLI ran: {e}\n{text}"));
+        let val: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("package.json is not valid JSON after CLI ran: {e}\n{text}")
+        });
         val.get("scripts")
             .and_then(|s| s.get(key))
             .and_then(|v| v.as_str())
@@ -211,7 +212,10 @@ mod host_guard {
 
         // ── setup ──────────────────────────────────────────────────────────
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes"]);
-        assert_eq!(code, 0, "setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "setup must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
 
         // The postinstall hook must now carry the apply command AND the npm
         // ecosystem filter, run FIRST, and PRESERVE the user's original step.
@@ -248,7 +252,10 @@ mod host_guard {
 
         // ── remove ──────────────────────────────────────────────────────────
         let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes"]);
-        assert_eq!(code, 0, "setup --remove must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "setup --remove must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
 
         // The apply command must be gone everywhere, and the user's original
         // postinstall step restored intact (not left mangled by the removal).

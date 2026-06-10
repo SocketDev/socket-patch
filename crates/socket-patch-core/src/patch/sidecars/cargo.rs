@@ -497,7 +497,9 @@ mod tests {
 
         // A secret living OUTSIDE the package dir, reachable only via `..`.
         let secret = d.path().join("secret.txt");
-        tokio::fs::write(&secret, b"top secret bytes").await.unwrap();
+        tokio::fs::write(&secret, b"top secret bytes")
+            .await
+            .unwrap();
 
         let starting = serde_json::json!({
             "files": { "Cargo.toml": "ff".repeat(32) },

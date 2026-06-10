@@ -605,7 +605,10 @@ mod tests {
             },
         );
 
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[tokio::test]
@@ -831,7 +834,10 @@ mod tests {
                 },
             );
         }
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[tokio::test]
@@ -996,7 +1002,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(entries.len(), 1, "only the final entry should remain: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the final entry should remain: {entries:?}"
+        );
         assert!(
             !entries[0].starts_with(".socket-dl-"),
             "no staging turd should survive: {entries:?}"

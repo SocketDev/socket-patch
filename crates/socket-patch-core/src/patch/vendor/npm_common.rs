@@ -288,11 +288,13 @@ pub(super) fn tgz_rel_leaf(name: &str, version: &str) -> String {
 /// `true` means "all deps", an array names them; either makes the package
 /// unvendorable (see the refusal site).
 fn declares_bundled_deps(pkg: &Value) -> bool {
-    ["bundleDependencies", "bundledDependencies"].iter().any(|k| match pkg.get(*k) {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Array(a)) => !a.is_empty(),
-        _ => false,
-    })
+    ["bundleDependencies", "bundledDependencies"]
+        .iter()
+        .any(|k| match pkg.get(*k) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Array(a)) => !a.is_empty(),
+            _ => false,
+        })
 }
 
 async fn read_staged_package_json(stage: &Path) -> Result<Value, String> {
@@ -371,10 +373,12 @@ mod tests {
         assert_eq!(coords.uuid_dir_rel, format!(".socket/vendor/npm/{UUID}"));
         assert_eq!(coords.base_purl, "pkg:npm/left-pad@1.3.0");
 
-        let coords =
-            guard_coordinates("pkg:npm/@scope/pkg@1.0.0?artifact_id=x", &record).unwrap();
+        let coords = guard_coordinates("pkg:npm/@scope/pkg@1.0.0?artifact_id=x", &record).unwrap();
         assert_eq!((coords.name, coords.version), ("@scope/pkg", "1.0.0"));
-        assert_eq!(coords.base_purl, "pkg:npm/@scope/pkg@1.0.0", "qualifiers stripped");
+        assert_eq!(
+            coords.base_purl, "pkg:npm/@scope/pkg@1.0.0",
+            "qualifiers stripped"
+        );
     }
 
     #[test]
@@ -406,7 +410,12 @@ mod tests {
     #[tokio::test]
     async fn done_failure_shape_matches_contract() {
         let outcome = done_failure("pkg:npm/x@1.0.0", "boom".to_string());
-        let VendorOutcome::Done { result, entry, warnings } = outcome else {
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
             panic!("done_failure must be Done");
         };
         assert!(!result.success);

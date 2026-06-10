@@ -4,16 +4,14 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::purl::purl_matches_identifier;
-use socket_patch_core::utils::telemetry::{track_patch_removed, track_patch_remove_failed};
+use socket_patch_core::utils::telemetry::{track_patch_remove_failed, track_patch_removed};
 use std::path::Path;
 use std::time::Duration;
 
 use super::rollback::{all_files_already_original, rollback_patches};
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
-use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status,
-};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
 
 /// Emit a `remove` error envelope and return. Used by the many error
@@ -37,7 +35,11 @@ pub struct RemoveArgs {
     pub common: GlobalArgs,
 
     /// Skip rolling back files before removing (only update manifest).
-    #[arg(long = "skip-rollback", env = "SOCKET_SKIP_ROLLBACK", default_value_t = false)]
+    #[arg(
+        long = "skip-rollback",
+        env = "SOCKET_SKIP_ROLLBACK",
+        default_value_t = false
+    )]
     pub skip_rollback: bool,
 }
 
@@ -84,7 +86,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            emit_error_envelope(args.common.json, "manifest_invalid", "Invalid manifest".to_string());
+            emit_error_envelope(
+                args.common.json,
+                "manifest_invalid",
+                "Invalid manifest".to_string(),
+            );
             return 1;
         }
         Err(e) => {
@@ -120,10 +126,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             env.error = Some(EnvelopeError::new("not_found", msg));
             println!("{}", env.to_pretty_json());
         } else {
-            eprintln!(
-                "No patch found matching identifier: {}",
-                args.identifier
-            );
+            eprintln!("No patch found matching identifier: {}", args.identifier);
         }
         return 1;
     }
@@ -151,15 +154,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
             // tolerate UUIDs shorter than 8 chars — a malformed manifest
             // must not panic the whole command in the display path.
             let short_uuid = patch.uuid.get(..8).unwrap_or(patch.uuid.as_str());
-            eprintln!("  - {} (UUID: {}, {} file(s))", purl, short_uuid, file_count);
+            eprintln!(
+                "  - {} (UUID: {}, {} file(s))",
+                purl, short_uuid, file_count
+            );
         }
         eprintln!();
     }
 
-    let prompt = format!(
-        "Remove {} patch(es) and rollback files?",
-        matching.len()
-    );
+    let prompt = format!("Remove {} patch(es) and rollback files?", matching.len());
     if !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json {
             println!("Removal cancelled.");
@@ -254,10 +257,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     env.error = Some(EnvelopeError::new("not_found", msg));
                     println!("{}", env.to_pretty_json());
                 } else {
-                    eprintln!(
-                        "No patch found matching identifier: {}",
-                        args.identifier
-                    );
+                    eprintln!("No patch found matching identifier: {}", args.identifier);
                 }
                 return 1;
             }
@@ -306,12 +306,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 // to sweep an orphan blob. Consumers read the blob/rollback
                 // totals from `details`, never from `summary.removed`.
                 if blobs_removed > 0 || rollback_count > 0 {
-                    env.events.push(
-                        PatchEvent::artifact(PatchAction::Removed).with_details(serde_json::json!({
-                            "blobsRemoved": blobs_removed,
-                            "rolledBack": rollback_count,
-                        })),
-                    );
+                    env.events
+                        .push(PatchEvent::artifact(PatchAction::Removed).with_details(
+                            serde_json::json!({
+                                "blobsRemoved": blobs_removed,
+                                "rolledBack": rollback_count,
+                            }),
+                        ));
                 }
                 println!("{}", env.to_pretty_json());
             }
@@ -405,7 +406,10 @@ mod tests {
             make_record("uuid-cp312"),
         );
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
-        let manifest = PatchManifest { patches, setup: None };
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
         write_manifest(&dir.join("manifest.json"), &manifest)
             .await
             .expect("write manifest");
@@ -417,10 +421,9 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+            .await
+            .expect("remove ok");
 
         // All three release variants removed; the npm package untouched.
         assert_eq!(removed.len(), 3);
@@ -435,12 +438,10 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) = remove_patch_from_manifest(
-            "pkg:pypi/six@1.16.0?artifact_id=sdist",
-            &manifest_path,
-        )
-        .await
-        .expect("remove ok");
+        let (removed, manifest) =
+            remove_patch_from_manifest("pkg:pypi/six@1.16.0?artifact_id=sdist", &manifest_path)
+                .await
+                .expect("remove ok");
 
         // Only the sdist variant removed; the two wheels + npm remain.
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
@@ -456,10 +457,9 @@ mod tests {
         write_multi_variant(tmp.path()).await;
         let manifest_path = tmp.path().join("manifest.json");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("uuid-cp312", &manifest_path)
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest("uuid-cp312", &manifest_path)
+            .await
+            .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=wheel-cp312"]);
         assert_eq!(manifest.patches.len(), 3);
@@ -475,16 +475,18 @@ mod tests {
         let mut patches = HashMap::new();
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
         patches.insert("pkg:npm/foobar@1.0".to_string(), make_record("uuid-foobar"));
-        let manifest = PatchManifest { patches, setup: None };
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
         let manifest_path = tmp.path().join("manifest.json");
         write_manifest(&manifest_path, &manifest)
             .await
             .expect("write manifest");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path)
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest("pkg:npm/foo@1.0", &manifest_path)
+            .await
+            .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:npm/foo@1.0"]);
         assert_eq!(manifest.patches.len(), 1);
@@ -530,16 +532,18 @@ mod tests {
             "pkg:pypi/six@1.17.0?artifact_id=sdist".to_string(),
             make_record("uuid-17-sdist"),
         );
-        let manifest = PatchManifest { patches, setup: None };
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
         let manifest_path = tmp.path().join("manifest.json");
         write_manifest(&manifest_path, &manifest)
             .await
             .expect("write manifest");
 
-        let (removed, manifest) =
-            remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
-                .await
-                .expect("remove ok");
+        let (removed, manifest) = remove_patch_from_manifest("pkg:pypi/six@1.16.0", &manifest_path)
+            .await
+            .expect("remove ok");
 
         assert_eq!(removed, vec!["pkg:pypi/six@1.16.0?artifact_id=sdist"]);
         assert_eq!(manifest.patches.len(), 1);

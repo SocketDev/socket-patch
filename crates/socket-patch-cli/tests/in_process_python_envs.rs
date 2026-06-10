@@ -155,10 +155,7 @@ async fn pypi_venv_python312_layout_discovered() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
-    assert_discovered(
-        &batch_bodies(&server).await,
-        "pkg:pypi/venv-pkg-312@1.0.0",
-    );
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg-312@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +173,7 @@ async fn pypi_venv_python313_layout_discovered() {
     let server = MockServer::start().await;
     mock_batch_empty(&server).await;
     assert_eq!(scan_run(default_args(tmp.path(), server.uri())).await, 0);
-    assert_discovered(
-        &batch_bodies(&server).await,
-        "pkg:pypi/venv-pkg-313@1.0.0",
-    );
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-pkg-313@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -258,10 +252,7 @@ async fn pypi_virtual_env_env_var_override() {
     // `custom-venv` is not one of the standard scanned dir names, so the
     // package can only be found by honoring $VIRTUAL_ENV. Discovery of its
     // PURL is the proof that the override path actually ran.
-    assert_discovered(
-        &batch_bodies(&server).await,
-        "pkg:pypi/venv-override@1.0.0",
-    );
+    assert_discovered(&batch_bodies(&server).await, "pkg:pypi/venv-override@1.0.0");
 }
 
 // ---------------------------------------------------------------------------
@@ -375,10 +366,7 @@ async fn pypi_empty_site_packages_safe() {
     // ...and it must be the ONLY pypi PURL shipped. An empty site-packages
     // must invent no phantom packages; the exact-count check fails if the
     // crawler conjures anything from the empty `.venv`.
-    let total_pypi_purls: usize = bodies
-        .iter()
-        .map(|b| b.matches("pkg:pypi/").count())
-        .sum();
+    let total_pypi_purls: usize = bodies.iter().map(|b| b.matches("pkg:pypi/").count()).sum();
     assert_eq!(
         total_pypi_purls, 1,
         "exactly one pypi PURL (the control) expected; empty site-packages \

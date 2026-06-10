@@ -285,9 +285,9 @@ pub async fn revert_go_vendor(
     if !dry_run {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-        // Best-effort: prune the now-empty `.socket/vendor/golang/` level so a
-        // fully-reverted project carries no vendor residue (`save_state` then
-        // prunes `.socket/vendor/` itself). `remove_dir` fails on non-empty.
+                                              // Best-effort: prune the now-empty `.socket/vendor/golang/` level so a
+                                              // fully-reverted project carries no vendor residue (`save_state` then
+                                              // prunes `.socket/vendor/` itself). `remove_dir` fails on non-empty.
         if let Some(eco_dir) = uuid_dir.parent() {
             let _ = tokio::fs::remove_dir(eco_dir).await;
         }
@@ -362,7 +362,9 @@ mod tests {
 
         let pristine = root.join("cache/github.com/foo/bar@v1.4.2");
         tokio::fs::create_dir_all(&pristine).await.unwrap();
-        tokio::fs::write(pristine.join("bar.go"), PRISTINE).await.unwrap();
+        tokio::fs::write(pristine.join("bar.go"), PRISTINE)
+            .await
+            .unwrap();
         tokio::fs::write(
             pristine.join("go.mod"),
             "module github.com/foo/bar\n\ngo 1.21\n",
@@ -416,7 +418,9 @@ mod tests {
         .await
     }
 
-    fn expect_done(outcome: VendorOutcome) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+    fn expect_done(
+        outcome: VendorOutcome,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
             VendorOutcome::Done {
                 result,
@@ -436,7 +440,10 @@ mod tests {
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused({want_code}), got Done (success={})", result.success)
+                panic!(
+                    "expected Refused({want_code}), got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -457,13 +464,19 @@ mod tests {
         assert_eq!(tokio::fs::read(copy.join("bar.go")).await.unwrap(), PATCHED);
         assert!(copy.join("go.mod").exists());
         // The module cache pristine is untouched.
-        assert_eq!(tokio::fs::read(pristine.join("bar.go")).await.unwrap(), PRISTINE);
+        assert_eq!(
+            tokio::fs::read(pristine.join("bar.go")).await.unwrap(),
+            PRISTINE
+        );
 
         // The replace directive is vendor-owned and points at the uuid path.
         let entries = read_replace_entries(root).await;
         let e = entries.iter().find(|e| e.module == MODULE).unwrap();
         assert_eq!(e.owner, Some(ReplaceOwner::Vendor));
-        assert_eq!(e.path.as_deref(), Some(format!("./{}", copy_rel()).as_str()));
+        assert_eq!(
+            e.path.as_deref(),
+            Some(format!("./{}", copy_rel()).as_str())
+        );
         assert_eq!(e.version.as_deref(), Some(VERSION));
 
         // Marker sits in the uuid dir, carrying the vuln + uuid + base purl.
@@ -474,7 +487,10 @@ mod tests {
         .unwrap();
         assert!(marker.contains(UUID));
         assert!(marker.contains("GHSA-xxxx-yyyy-zzzz"));
-        assert!(marker.contains(&format!("\"purl\": \"{PURL}\"")), "{marker}");
+        assert!(
+            marker.contains(&format!("\"purl\": \"{PURL}\"")),
+            "{marker}"
+        );
 
         // Ledger entry shape.
         let entry = entry.expect("entry on success");
@@ -491,7 +507,10 @@ mod tests {
         assert_eq!(w.action, WiringAction::Added);
         assert_eq!(w.key.as_deref(), Some(MODULE));
         assert_eq!(w.original, None);
-        assert_eq!(w.new, Some(serde_json::Value::from(format!("./{}", copy_rel()))));
+        assert_eq!(
+            w.new,
+            Some(serde_json::Value::from(format!("./{}", copy_rel())))
+        );
     }
 
     #[tokio::test]
@@ -501,8 +520,17 @@ mod tests {
         // Pre-seed an `apply` redirect through the engine itself.
         let sources = PatchSources::blobs_only(&blobs);
         let pre = apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &record.files, &sources,
-            Some(UUID), false, false,
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &record.files,
+            &sources,
+            Some(UUID),
+            false,
+            false,
         )
         .await;
         assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
@@ -521,7 +549,11 @@ mod tests {
         // Exactly ONE directive for the module, now vendor-owned.
         let entries = read_replace_entries(root).await;
         let mine: Vec<_> = entries.iter().filter(|e| e.module == MODULE).collect();
-        assert_eq!(mine.len(), 1, "single directive after takeover: {entries:?}");
+        assert_eq!(
+            mine.len(),
+            1,
+            "single directive after takeover: {entries:?}"
+        );
         assert_eq!(mine[0].owner, Some(ReplaceOwner::Vendor));
 
         let entry = entry.unwrap();
@@ -551,19 +583,32 @@ mod tests {
         let (result, entry, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         assert!(result.success);
-        assert!(result.files_patched.is_empty(), "in-sync re-run patches nothing");
+        assert!(
+            result.files_patched.is_empty(),
+            "in-sync re-run patches nothing"
+        );
         assert!(entry.is_some(), "re-run still reports the ledger entry");
         assert!(!entry.unwrap().took_over_go_patches);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(tokio::fs::read(&copy).await.unwrap(), copy1, "copy unchanged");
-        assert_eq!(tokio::fs::read(&gomod).await.unwrap(), mod1, "go.mod byte-stable");
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "copy unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read(&gomod).await.unwrap(),
+            mod1,
+            "go.mod byte-stable"
+        );
     }
 
     #[tokio::test]
     async fn test_dry_run_writes_nothing() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        let gomod_before = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
 
         let (result, entry, _warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, true).await);
@@ -571,7 +616,9 @@ mod tests {
         assert!(entry.is_none(), "dry-run emits no entry");
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
             gomod_before,
             "go.mod untouched"
         );
@@ -589,7 +636,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let gomod_before = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
 
         let (result, entry, _warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
@@ -597,7 +646,9 @@ mod tests {
         assert!(entry.is_none());
         // go.mod untouched and the failed copy fully unwound (no uuid husks).
         assert_eq!(
-            tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
             gomod_before
         );
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
@@ -633,8 +684,17 @@ mod tests {
         // Vendor takes over an apply redirect, then is reverted.
         let sources = PatchSources::blobs_only(&blobs);
         apply_go_redirect(
-            PURL, MODULE, VERSION, &pristine, root, GO_PATCHES_DIR, &record.files, &sources,
-            Some(UUID), false, false,
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &record.files,
+            &sources,
+            Some(UUID),
+            false,
+            false,
         )
         .await;
         let (_result, entry, _warnings) =
@@ -645,14 +705,18 @@ mod tests {
         let out = revert_go_vendor(&entry, root, false).await;
         assert!(out.success, "{:?}", out.error);
         assert!(
-            out.warnings.iter().any(|w| w.code == "takeover_not_restored"),
+            out.warnings
+                .iter()
+                .any(|w| w.code == "takeover_not_restored"),
             "{:?}",
             out.warnings
         );
         // Neither the vendor directive nor the go-patches one remains: the
         // module is back on the pristine cache until `apply` is re-run.
         assert!(read_replace_entries(root).await.is_empty());
-        assert!(!root.join(".socket/go-patches/github.com/foo/bar@v1.4.2").exists());
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
     }
 
     // ── filesystem-safety: coordinate traversal ──────────────────────────
@@ -664,7 +728,9 @@ mod tests {
     async fn test_refuses_traversal_coordinates() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        let gomod_before = tokio::fs::read_to_string(root.join("go.mod")).await.unwrap();
+        let gomod_before = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
         let escaped = root.parent().unwrap().join("escape@v1.0.0");
         let _ = remove_tree(&escaped).await;
 
@@ -693,13 +759,22 @@ mod tests {
             "unsafe_coordinates",
         );
         expect_refused(
-            run_vendor("pkg:cargo/not-golang@1.0.0", root, &blobs, &pristine, &record, false)
-                .await,
+            run_vendor(
+                "pkg:cargo/not-golang@1.0.0",
+                root,
+                &blobs,
+                &pristine,
+                &record,
+                false,
+            )
+            .await,
             "unsafe_coordinates",
         );
         assert!(!escaped.exists(), "no copy outside the project");
         assert_eq!(
-            tokio::fs::read_to_string(root.join("go.mod")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
             gomod_before,
             "go.mod untouched"
         );
@@ -721,7 +796,10 @@ mod tests {
             );
             assert!(detail.contains("uuid"), "{detail}");
         }
-        assert!(read_replace_entries(root).await.is_empty(), "go.mod untouched");
+        assert!(
+            read_replace_entries(root).await.is_empty(),
+            "go.mod untouched"
+        );
     }
 
     /// SECURITY regression: revert re-validates the (tamper-able) ledger entry
@@ -760,7 +838,10 @@ mod tests {
         assert!(result.success);
         assert!(entry.is_none(), "nothing vendored, nothing recorded");
         assert!(warnings.is_empty());
-        assert!(read_replace_entries(root).await.is_empty(), "no replace written");
+        assert!(
+            read_replace_entries(root).await.is_empty(),
+            "no replace written"
+        );
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
     }
 }

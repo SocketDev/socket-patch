@@ -119,8 +119,7 @@ fn apply_subcommand_parses() {
 #[test]
 fn rollback_subcommand_parses_without_identifier() {
     // rollback's identifier is optional — bare `rollback` must succeed.
-    let cli =
-        parse(&["socket-patch", "rollback"]).expect("rollback must parse with no positional");
+    let cli = parse(&["socket-patch", "rollback"]).expect("rollback must parse with no positional");
     assert!(matches!(cli.command, Commands::Rollback(_)));
 }
 

@@ -28,9 +28,9 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use socket_patch_core::api::blob_fetcher::DownloadMode;
 use socket_patch_cli::commands::repair::RepairArgs;
 use socket_patch_cli::{Cli, Commands};
+use socket_patch_core::api::blob_fetcher::DownloadMode;
 
 /// Every `SOCKET_*` env var that clap consults while parsing `repair` (its own
 /// `--download-only` flag plus the flattened `GlobalArgs`). If any leaks in
@@ -413,8 +413,9 @@ fn top_level_help() -> String {
 fn repair_appears_in_top_level_help() {
     let help = top_level_help();
     assert!(
-        help.lines().any(|l| l.trim_start().starts_with("repair ")
-            || l.trim_start().starts_with("repair\t")),
+        help.lines().any(
+            |l| l.trim_start().starts_with("repair ") || l.trim_start().starts_with("repair\t")
+        ),
         "`repair` must be listed in --help output:\n{help}"
     );
 }

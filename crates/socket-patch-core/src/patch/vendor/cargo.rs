@@ -132,7 +132,11 @@ fn already_patched_verify(file: &str) -> VerifyResult {
     }
 }
 
-fn done(result: ApplyResult, entry: Option<VendorEntry>, warnings: Vec<VendorWarning>) -> VendorOutcome {
+fn done(
+    result: ApplyResult,
+    entry: Option<VendorEntry>,
+    warnings: Vec<VendorWarning>,
+) -> VendorOutcome {
     VendorOutcome::Done {
         result,
         entry,
@@ -268,8 +272,16 @@ pub async fn vendor_cargo_crate(
         // Verify (read-only) against the pristine source — apply_package_patch
         // never writes when dry_run — for an accurate "would patch" report,
         // without creating the copy or editing config/lock.
-        let mut result =
-            apply_package_patch(purl, pristine_src, &record.files, sources, Some(&record.uuid), true, force).await;
+        let mut result = apply_package_patch(
+            purl,
+            pristine_src,
+            &record.files,
+            sources,
+            Some(&record.uuid),
+            true,
+            force,
+        )
+        .await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None;
         return done(result, None, Vec::new());
@@ -277,8 +289,21 @@ pub async fn vendor_cargo_crate(
 
     // Hot path: already in sync → touch nothing (entry stays with the caller's
     // existing ledger record, which holds the unrecoverable lock originals).
-    if vendor_in_sync(&copy_dir, &record.files, project_root, name, version, &copy_rel).await {
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+    if vendor_in_sync(
+        &copy_dir,
+        &record.files,
+        project_root,
+        name,
+        version,
+        &copy_rel,
+    )
+    .await
+    {
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return done(
             synthesized_result(purl, &copy_dir, verified, true, None),
             None,
@@ -309,8 +334,16 @@ pub async fn vendor_cargo_crate(
     }
 
     // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result =
-        apply_package_patch(purl, &copy_dir, &record.files, sources, Some(&record.uuid), false, force).await;
+    let mut result = apply_package_patch(
+        purl,
+        &copy_dir,
+        &record.files,
+        sources,
+        Some(&record.uuid),
+        false,
+        force,
+    )
+    .await;
     result.package_path = copy_dir.display().to_string();
 
     if !result.success {
@@ -345,9 +378,7 @@ pub async fn vendor_cargo_crate(
     if prior_path.as_deref().is_some_and(is_legacy_redirect_path) {
         warnings.push(VendorWarning::new(
             "vendor_takeover",
-            format!(
-                "took over the legacy `.socket/cargo-patches/` [patch] entry for `{name}`"
-            ),
+            format!("took over the legacy `.socket/cargo-patches/` [patch] entry for `{name}`"),
         ));
     }
 
@@ -524,9 +555,9 @@ pub async fn revert_cargo_vendor(
     if !dry_run {
         let uuid_dir: PathBuf = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-        // Best-effort: prune the now-empty `.socket/vendor/cargo/` level so a
-        // fully-reverted project carries no vendor residue (`save_state` then
-        // prunes `.socket/vendor/` itself). `remove_dir` fails on non-empty.
+                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` level so a
+                                              // fully-reverted project carries no vendor residue (`save_state` then
+                                              // prunes `.socket/vendor/` itself). `remove_dir` fails on non-empty.
         if let Some(eco_dir) = uuid_dir.parent() {
             let _ = tokio::fs::remove_dir(eco_dir).await;
         }
@@ -607,8 +638,12 @@ mod tests {
         let root = dir.path().to_path_buf();
 
         let pristine = root.join("registry/cfg-if-1.0.4");
-        tokio::fs::create_dir_all(pristine.join("src")).await.unwrap();
-        tokio::fs::write(pristine.join("src/lib.rs"), PRISTINE).await.unwrap();
+        tokio::fs::create_dir_all(pristine.join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(pristine.join("src/lib.rs"), PRISTINE)
+            .await
+            .unwrap();
         tokio::fs::write(
             pristine.join("Cargo.toml"),
             "[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
@@ -640,7 +675,9 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::fs::write(root.join("Cargo.lock"), lock_body()).await.unwrap();
+        tokio::fs::write(root.join("Cargo.lock"), lock_body())
+            .await
+            .unwrap();
 
         (dir, blobs, pristine, record_with(files))
     }
@@ -667,7 +704,9 @@ mod tests {
         .await
     }
 
-    fn expect_done(outcome: VendorOutcome) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+    fn expect_done(
+        outcome: VendorOutcome,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
         match outcome {
             VendorOutcome::Done {
                 result,
@@ -687,7 +726,10 @@ mod tests {
                 detail
             }
             VendorOutcome::Done { result, .. } => {
-                panic!("expected Refused({want_code}), got Done (success={})", result.success)
+                panic!(
+                    "expected Refused({want_code}), got Done (success={})",
+                    result.success
+                )
             }
         }
     }
@@ -705,17 +747,25 @@ mod tests {
 
         // Copy holds the patched bytes and NO checksum sidecar.
         let copy = root.join(copy_rel());
-        assert_eq!(tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(), PATCHED);
+        assert_eq!(
+            tokio::fs::read(copy.join("src/lib.rs")).await.unwrap(),
+            PATCHED
+        );
         assert!(!copy.join(".cargo-checksum.json").exists());
         // The registry pristine is untouched.
-        assert_eq!(tokio::fs::read(pristine.join("src/lib.rs")).await.unwrap(), PRISTINE);
+        assert_eq!(
+            tokio::fs::read(pristine.join("src/lib.rs")).await.unwrap(),
+            PRISTINE
+        );
 
         // Config entry points at the uuid-level copy.
         let entries = cargo_config::read_patch_entries(root).await;
         assert_eq!(entries["cfg-if"].path.as_deref(), Some(copy_rel().as_str()));
 
         // The lock entry is detached (source+checksum gone), rest preserved.
-        let lock = tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap();
+        let lock = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
         assert!(!lock.contains("source ="));
         assert!(!lock.contains("checksum ="));
         assert!(lock.contains("name = \"cfg-if\"\nversion = \"1.0.4\"\n"));
@@ -728,7 +778,10 @@ mod tests {
         .unwrap();
         assert!(marker.contains(UUID));
         assert!(marker.contains("GHSA-xxxx-yyyy-zzzz"));
-        assert!(marker.contains(&format!("\"purl\": \"{PURL}\"")), "{marker}");
+        assert!(
+            marker.contains(&format!("\"purl\": \"{PURL}\"")),
+            "{marker}"
+        );
 
         // Ledger entry shape.
         let entry = entry.expect("entry on success");
@@ -747,12 +800,18 @@ mod tests {
         assert!(!entry.took_over_go_patches);
         assert_eq!(entry.wiring.len(), 2);
         let cfg = &entry.wiring[0];
-        assert_eq!((cfg.file.as_str(), cfg.kind.as_str()), (".cargo/config.toml", "cargo_patch_entry"));
+        assert_eq!(
+            (cfg.file.as_str(), cfg.kind.as_str()),
+            (".cargo/config.toml", "cargo_patch_entry")
+        );
         assert_eq!(cfg.action, WiringAction::Added);
         assert_eq!(cfg.key.as_deref(), Some("cfg-if"));
         assert_eq!(cfg.new, Some(serde_json::Value::from(copy_rel())));
         let lockw = &entry.wiring[1];
-        assert_eq!((lockw.file.as_str(), lockw.kind.as_str()), ("Cargo.lock", "cargo_lock_entry"));
+        assert_eq!(
+            (lockw.file.as_str(), lockw.kind.as_str()),
+            ("Cargo.lock", "cargo_lock_entry")
+        );
         assert_eq!(lockw.action, WiringAction::Rewritten);
         assert_eq!(lockw.key.as_deref(), Some("cfg-if@1.0.4"));
         assert_eq!(
@@ -776,7 +835,10 @@ mod tests {
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "locked_version_mismatch",
         );
-        assert!(detail.contains("1.0.5") && detail.contains("1.0.4"), "{detail}");
+        assert!(
+            detail.contains("1.0.5") && detail.contains("1.0.4"),
+            "{detail}"
+        );
         // Refused before any write.
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
         assert!(!root.join(".cargo").exists());
@@ -800,9 +862,13 @@ mod tests {
     async fn test_refuses_user_authored_patch_entry() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join(".cargo")).await.unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
         let user_cfg = "[patch.crates-io]\ncfg-if = { path = \"../my-fork\" }\n";
-        tokio::fs::write(root.join(".cargo/config.toml"), user_cfg).await.unwrap();
+        tokio::fs::write(root.join(".cargo/config.toml"), user_cfg)
+            .await
+            .unwrap();
 
         expect_refused(
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
@@ -810,12 +876,16 @@ mod tests {
         );
         // Nothing written: config byte-identical, no copy, lock untouched.
         assert_eq!(
-            tokio::fs::read_to_string(root.join(".cargo/config.toml")).await.unwrap(),
+            tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
             user_cfg
         );
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
     }
@@ -824,7 +894,9 @@ mod tests {
     async fn test_refuses_cargo_vendor_tree() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join("vendor/cfg-if-1.0.4")).await.unwrap();
+        tokio::fs::create_dir_all(root.join("vendor/cfg-if-1.0.4"))
+            .await
+            .unwrap();
         expect_refused(
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "already_vendored_in_tree",
@@ -836,7 +908,9 @@ mod tests {
     async fn test_no_lockfile_proceeds_with_warning() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::remove_file(root.join("Cargo.lock")).await.unwrap();
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
 
         let (result, entry, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
@@ -866,13 +940,18 @@ mod tests {
         assert!(!result.success);
         assert!(entry.is_none());
         assert!(
-            !root.join(format!(".socket/vendor/cargo/{UUID}")).join("cfg-if-1.0.4").exists(),
+            !root
+                .join(format!(".socket/vendor/cargo/{UUID}"))
+                .join("cfg-if-1.0.4")
+                .exists(),
             "half-built copy must be rolled back"
         );
         // No config entry, lock untouched.
         assert!(cargo_config::read_patch_entries(root).await.is_empty());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
     }
@@ -904,7 +983,9 @@ mod tests {
         assert!(cargo_config::read_patch_entries(root).await.is_empty());
         assert!(!root.join(copy_rel()).exists());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n"
         );
     }
@@ -925,15 +1006,30 @@ mod tests {
         let (result, entry, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         assert!(result.success);
-        assert!(result.files_patched.is_empty(), "in-sync re-run patches nothing");
+        assert!(
+            result.files_patched.is_empty(),
+            "in-sync re-run patches nothing"
+        );
         assert!(
             entry.is_none(),
             "hot path must not emit a fresh entry (it would clobber the ledger's lock originals)"
         );
         assert!(warnings.is_empty());
-        assert_eq!(tokio::fs::read(&copy).await.unwrap(), copy1, "copy unchanged");
-        assert_eq!(tokio::fs::read(&cfg).await.unwrap(), cfg1, "config unchanged");
-        assert_eq!(tokio::fs::read(&lock).await.unwrap(), lock1, "lock unchanged");
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "copy unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read(&cfg).await.unwrap(),
+            cfg1,
+            "config unchanged"
+        );
+        assert_eq!(
+            tokio::fs::read(&lock).await.unwrap(),
+            lock1,
+            "lock unchanged"
+        );
     }
 
     #[tokio::test]
@@ -947,7 +1043,9 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
         assert!(!root.join(".cargo").exists());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
     }
@@ -966,7 +1064,9 @@ mod tests {
 
         // Lock byte-identical to the pristine fixture.
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
         // Config entry gone — and the socket-created file + .cargo/ pruned.
@@ -985,18 +1085,24 @@ mod tests {
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
         let entry = entry.unwrap();
         // A third party re-resolved the lock (source back) after vendoring.
-        tokio::fs::write(root.join("Cargo.lock"), lock_body()).await.unwrap();
+        tokio::fs::write(root.join("Cargo.lock"), lock_body())
+            .await
+            .unwrap();
 
         let out = revert_cargo_vendor(&entry, root, false).await;
         assert!(out.success, "{:?}", out.error);
         assert!(
-            out.warnings.iter().any(|w| w.code == "lock_restore_skipped"),
+            out.warnings
+                .iter()
+                .any(|w| w.code == "lock_restore_skipped"),
             "{:?}",
             out.warnings
         );
         // The re-resolved lock is left alone, the rest still reverted.
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
@@ -1007,7 +1113,9 @@ mod tests {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         // Residue from the retired redirect backend: a legacy-path entry.
-        tokio::fs::create_dir_all(root.join(".cargo")).await.unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join(".cargo/config.toml"),
             "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n",
@@ -1027,11 +1135,15 @@ mod tests {
         assert_eq!(cfg.action, WiringAction::Rewritten);
         assert_eq!(
             cfg.original,
-            Some(serde_json::Value::from(".socket/cargo-patches/cfg-if-1.0.4"))
+            Some(serde_json::Value::from(
+                ".socket/cargo-patches/cfg-if-1.0.4"
+            ))
         );
         // The live entry now points at the vendor copy.
         assert_eq!(
-            cargo_config::read_patch_entries(root).await["cfg-if"].path.as_deref(),
+            cargo_config::read_patch_entries(root).await["cfg-if"]
+                .path
+                .as_deref(),
             Some(copy_rel().as_str())
         );
     }
@@ -1049,17 +1161,39 @@ mod tests {
         let _ = remove_tree(&escaped).await;
 
         expect_refused(
-            run_vendor("pkg:cargo/../../../escape@1.0.0", root, &blobs, &pristine, &record, false)
-                .await,
+            run_vendor(
+                "pkg:cargo/../../../escape@1.0.0",
+                root,
+                &blobs,
+                &pristine,
+                &record,
+                false,
+            )
+            .await,
             "unsafe_coordinates",
         );
         expect_refused(
-            run_vendor("pkg:cargo/cfg-if@../../../evil", root, &blobs, &pristine, &record, false)
-                .await,
+            run_vendor(
+                "pkg:cargo/cfg-if@../../../evil",
+                root,
+                &blobs,
+                &pristine,
+                &record,
+                false,
+            )
+            .await,
             "unsafe_coordinates",
         );
         expect_refused(
-            run_vendor("pkg:npm/not-cargo@1.0.0", root, &blobs, &pristine, &record, false).await,
+            run_vendor(
+                "pkg:npm/not-cargo@1.0.0",
+                root,
+                &blobs,
+                &pristine,
+                &record,
+                false,
+            )
+            .await,
             "unsafe_coordinates",
         );
         assert!(!escaped.exists(), "no copy outside the project");
@@ -1119,7 +1253,9 @@ mod tests {
         assert!(warnings.is_empty());
         assert!(!root.join(".cargo").exists());
         assert_eq!(
-            tokio::fs::read_to_string(root.join("Cargo.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
             lock_body()
         );
     }

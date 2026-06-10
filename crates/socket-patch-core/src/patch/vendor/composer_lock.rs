@@ -98,10 +98,7 @@ pub async fn vendor_composer(
 ) -> VendorOutcome {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("not a composer purl: {purl}"),
-        );
+        return refused("unsafe_coordinates", format!("not a composer purl: {purl}"));
     };
     // Canonical (packagist) lowercase form keys the on-disk copy dir and the
     // dist URL; the lock's own pretty casing is preserved untouched.
@@ -182,7 +179,11 @@ pub async fn vendor_composer(
     if entry_is_wired(&lock[section][idx], &copy_rel)
         && copy_matches_after_hashes(&copy_dir, &record.files).await
     {
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+        let verified = record
+            .files
+            .keys()
+            .map(|f| already_patched_verify(f))
+            .collect();
         return VendorOutcome::Done {
             result: synthesized_result(purl, &copy_dir, verified, true, None),
             entry: None,
@@ -192,9 +193,16 @@ pub async fn vendor_composer(
 
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut result =
-            apply_package_patch(purl, installed_dir, &record.files, sources, Some(&record.uuid), true, force)
-                .await;
+        let mut result = apply_package_patch(
+            purl,
+            installed_dir,
+            &record.files,
+            sources,
+            Some(&record.uuid),
+            true,
+            force,
+        )
+        .await;
         result.package_path = copy_dir.display().to_string();
         return VendorOutcome::Done {
             result,
@@ -217,9 +225,16 @@ pub async fn vendor_composer(
             warnings: Vec::new(),
         };
     }
-    let mut result =
-        apply_package_patch(purl, &copy_dir, &record.files, sources, Some(&record.uuid), false, force)
-            .await;
+    let mut result = apply_package_patch(
+        purl,
+        &copy_dir,
+        &record.files,
+        sources,
+        Some(&record.uuid),
+        false,
+        force,
+    )
+    .await;
     result.package_path = copy_dir.display().to_string();
     if !result.success {
         // Don't leave a half-built copy; the lock was never touched.
@@ -238,7 +253,11 @@ pub async fn vendor_composer(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some("composer.lock entry is not a JSON object".to_string());
-        return VendorOutcome::Done { result, entry: None, warnings: Vec::new() };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings: Vec::new(),
+        };
     };
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
@@ -250,7 +269,11 @@ pub async fn vendor_composer(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write composer.lock: {e}"));
-        return VendorOutcome::Done { result, entry: None, warnings: Vec::new() };
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings: Vec::new(),
+        };
     }
 
     // ── marker + ledger entry ────────────────────────────────────────────
@@ -541,8 +564,8 @@ async fn restore_lock_entry(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable composer.lock: {e}")),
     };
-    let mut lock: Value = serde_json::from_str(&lock_text)
-        .map_err(|e| format!("unparseable composer.lock: {e}"))?;
+    let mut lock: Value =
+        serde_json::from_str(&lock_text).map_err(|e| format!("unparseable composer.lock: {e}"))?;
 
     let Some(arr) = lock.get(section).and_then(Value::as_array) else {
         return Ok(false);
@@ -681,10 +704,15 @@ mod tests {
             .unwrap();
 
         let installed = root.join("vendor/psr/log");
-        tokio::fs::create_dir_all(installed.join("src")).await.unwrap();
-        tokio::fs::write(installed.join("composer.json"), b"{\"name\": \"psr/log\"}\n")
+        tokio::fs::create_dir_all(installed.join("src"))
             .await
             .unwrap();
+        tokio::fs::write(
+            installed.join("composer.json"),
+            b"{\"name\": \"psr/log\"}\n",
+        )
+        .await
+        .unwrap();
         tokio::fs::write(installed.join("src/LoggerInterface.php"), PRISTINE)
             .await
             .unwrap();
@@ -778,18 +806,22 @@ mod tests {
         // Copy patched at the uuid path; installed dir untouched.
         let copy = root.join(copy_rel());
         assert_eq!(
-            tokio::fs::read(copy.join("src/LoggerInterface.php")).await.unwrap(),
+            tokio::fs::read(copy.join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
             PATCHED
         );
         assert_eq!(
-            tokio::fs::read(installed.join("src/LoggerInterface.php")).await.unwrap(),
+            tokio::fs::read(installed.join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
             PRISTINE
         );
 
         // Marker present in the uuid dir.
-        let marker = tokio::fs::read_to_string(
-            root.join(format!(".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}")),
-        )
+        let marker = tokio::fs::read_to_string(root.join(format!(
+            ".socket/vendor/composer/{UUID}/{VENDOR_MARKER_FILE}"
+        )))
         .await
         .unwrap();
         assert!(marker.contains(UUID));
@@ -797,13 +829,22 @@ mod tests {
 
         // Lock surgery: source gone, dist replaced in slot, transport-options
         // right after, all other keys in their original order.
-        let text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap();
+        let text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
         let new_lock: Value = serde_json::from_str(&text).unwrap();
         let e = &new_lock["packages"][0];
         let keys: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            vec!["name", "version", "dist", "transport-options", "require", "type"],
+            vec![
+                "name",
+                "version",
+                "dist",
+                "transport-options",
+                "require",
+                "type"
+            ],
             "dist replaced in its original slot, source dropped, transport-options after dist"
         );
         assert_eq!(e["dist"]["type"], "path");
@@ -853,7 +894,9 @@ mod tests {
         assert_eq!(entry.wiring[0].key.as_deref(), Some("packages-dev:psr/log"));
 
         let new_lock: Value = serde_json::from_str(
-            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap(),
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(new_lock["packages-dev"][0]["dist"]["type"], "path");
@@ -873,7 +916,9 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
         assert!(result.success, "{:?}", result.error);
         let new_lock: Value = serde_json::from_str(
-            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap(),
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(new_lock["packages"][0]["version"], "v3.0.2");
@@ -892,12 +937,24 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
         assert!(result.success, "{:?}", result.error);
         let new_lock: Value = serde_json::from_str(
-            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap(),
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
         )
         .unwrap();
-        assert_eq!(new_lock["packages"][0]["name"], "Psr/Log", "pretty casing kept");
-        assert_eq!(new_lock["packages"][0]["dist"]["url"], copy_rel(), "dist url lowercase");
-        assert!(dir.path().join(copy_rel()).exists(), "copy at the lowercase path");
+        assert_eq!(
+            new_lock["packages"][0]["name"], "Psr/Log",
+            "pretty casing kept"
+        );
+        assert_eq!(
+            new_lock["packages"][0]["dist"]["url"],
+            copy_rel(),
+            "dist url lowercase"
+        );
+        assert!(
+            dir.path().join(copy_rel()).exists(),
+            "copy at the lowercase path"
+        );
     }
 
     #[tokio::test]
@@ -905,7 +962,9 @@ mod tests {
         let lock = lock_value("psr/log", "3.0.2", false);
         let (dir, blobs, installed, record) = fixture(&lock).await;
         let root = dir.path();
-        tokio::fs::remove_file(root.join(COMPOSER_LOCK)).await.unwrap();
+        tokio::fs::remove_file(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
 
         let (code, _d) =
             unwrap_refused(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
@@ -950,14 +1009,24 @@ mod tests {
 
         // (b) traversal in the package name
         let (code, _d) = unwrap_refused(
-            run_vendor(root, &blobs, &installed, &record, "pkg:composer/../evil@1.0.0", false)
-                .await,
+            run_vendor(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                "pkg:composer/../evil@1.0.0",
+                false,
+            )
+            .await,
         );
         assert_eq!(code, "unsafe_coordinates");
 
         assert!(!root.join(".socket").exists(), "nothing written");
         assert!(!root.parent().unwrap().join("escape").exists());
-        assert_eq!(tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(), before);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -980,7 +1049,9 @@ mod tests {
         assert!(r2.success);
         assert!(r2.files_patched.is_empty(), "in-sync rerun patches nothing");
         assert!(
-            r2.files_verified.iter().all(|v| v.status == VerifyStatus::AlreadyPatched),
+            r2.files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
             "synthesized AlreadyPatched: {:?}",
             r2.files_verified
         );
@@ -988,9 +1059,14 @@ mod tests {
             e2.is_none(),
             "hot path must not re-record (would clobber the original in the ledger)"
         );
-        assert_eq!(tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(), lock_bytes);
         assert_eq!(
-            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php")).await.unwrap(),
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
             copy_bytes
         );
     }
@@ -1007,7 +1083,10 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_none(), "dry run records nothing");
         assert!(!root.join(".socket").exists(), "no copy created");
-        assert_eq!(tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(), before);
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            before
+        );
     }
 
     #[tokio::test]
@@ -1025,7 +1104,9 @@ mod tests {
         assert!(!result.success);
         assert!(entry.is_none());
         assert!(
-            !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            !root
+                .join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "half-built copy must be removed"
         );
         assert_eq!(
@@ -1055,12 +1136,18 @@ mod tests {
         let outcome = revert_composer(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            !outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "clean revert must not report drift: {:?}",
             outcome.warnings
         );
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_installed_copy_stale"),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_installed_copy_stale"),
             "revert advises about the stale installed copy"
         );
         assert_eq!(
@@ -1069,7 +1156,9 @@ mod tests {
             "lock restored byte-identically"
         );
         assert!(
-            !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            !root
+                .join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "uuid dir removed"
         );
     }
@@ -1099,7 +1188,10 @@ mod tests {
         let outcome = revert_composer(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
             "drift must be reported: {:?}",
             outcome.warnings
         );
@@ -1109,7 +1201,9 @@ mod tests {
             "drifted lock left alone"
         );
         assert!(
-            !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            !root
+                .join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "uuid dir still removed"
         );
     }

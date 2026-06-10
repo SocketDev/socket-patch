@@ -288,8 +288,8 @@ mod tests {
         // Every arg after the program name (UUID included) must be forwarded
         // after the synthesized `get`, preserving order, so multiple flags
         // all reach the rewritten command.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--id", "--json"]))
-            .unwrap();
+        let cli =
+            parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--id", "--json"])).unwrap();
         match cli.command {
             Commands::Get(args) => {
                 assert_eq!(args.identifier, UUID);

@@ -146,7 +146,10 @@ fn scan_discovers_maven_artifacts() {
         &m2_repo,
     );
     let json = String::from_utf8_lossy(&json_out.stdout);
-    assert!(json_out.status.success(), "scan --json should exit 0:\n{json}");
+    assert!(
+        json_out.status.success(),
+        "scan --json should exit 0:\n{json}"
+    );
     // Anchor on the trailing comma so this matches *exactly* 2, not any
     // number that merely starts with "2" (20, 25, 200, ...). Without the
     // comma, `contains("scannedPackages\": 2")` is satisfied by an
@@ -192,11 +195,7 @@ fn scan_discovers_gradle_project_artifacts() {
     // Create a build.gradle in the project directory (Gradle project)
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    std::fs::write(
-        project_dir.join("build.gradle"),
-        "plugins { id 'java' }\n",
-    )
-    .unwrap();
+    std::fs::write(project_dir.join("build.gradle"), "plugins { id 'java' }\n").unwrap();
 
     // --- JSON run: the `scannedPackages` count is the contract field -----
     // A single artifact lives in the repo. We assert the *value* (1), not
@@ -213,8 +212,8 @@ fn scan_discovers_gradle_project_artifacts() {
 
     assert!(
         output.status.success(),
-        "scan --json should exit 0; got {:?}\n{stdout}{stderr}"
-        , output.status.code()
+        "scan --json should exit 0; got {:?}\n{stdout}{stderr}",
+        output.status.code()
     );
     // Anchor on the trailing comma: a bare `contains("scannedPackages\": 1")`
     // is also satisfied by 10..=19, 100, etc., so an over-counting crawler

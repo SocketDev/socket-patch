@@ -153,7 +153,9 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
         ));
     }
 
-    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml")).await.ok();
+    let pyproject_text = tokio::fs::read_to_string(root.join("pyproject.toml"))
+        .await
+        .ok();
     Ok(PdmProject {
         lock_text,
         lock,
@@ -279,7 +281,9 @@ pub(super) fn check_target_guards(
     if let Some(path) = unit.get("path").and_then(Item::as_str) {
         return match parse_vendor_path(path) {
             // Ours, same patch generation: the in-sync hot path.
-            Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => Ok(PdmTarget::InSync),
+            Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
+                Ok(PdmTarget::InSync)
+            }
             // Ours, but a STALE patch generation: wiring over it would lose
             // the only recorded registry original — refuse with the repair
             // path (mirrors gem's stale-checksum refusal).
@@ -321,9 +325,9 @@ pub(super) fn check_target_guards(
         .and_then(Item::as_array)
         .map(|arr| {
             !arr.is_empty()
-                && arr.iter().all(|v| {
-                    v.as_inline_table().is_some_and(|t| t.contains_key("hash"))
-                })
+                && arr
+                    .iter()
+                    .all(|v| v.as_inline_table().is_some_and(|t| t.contains_key("hash")))
         })
         .unwrap_or(false);
     if !hashed_entries {
@@ -566,14 +570,13 @@ fn rewrite_target_package_unit(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
 ) -> Result<(String, String), (&'static str, String)> {
-    let span = find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(
-        || {
+    let span =
+        find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(|| {
             (
                 "pypi_pdm_lock_package_missing",
                 format!("{LOCK_FILE} has no [[package]] entry for {canon}"),
             )
-        },
-    )?;
+        })?;
     // `find_unit_span` ends a unit at the NEXT `[[package]]` or EOF; truncate
     // defensively at any foreign top-level header so the splice never
     // swallows a trailing section (pdm's [metadata] leads the file today, but
@@ -849,7 +852,9 @@ distribution = false
 
     async fn write_project(lock: &str, pyproject: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("pdm.lock"), lock).await.unwrap();
+        tokio::fs::write(tmp.path().join("pdm.lock"), lock)
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join("pyproject.toml"), pyproject)
             .await
             .unwrap();
@@ -857,7 +862,9 @@ distribution = false
     }
 
     async fn read_lock(root: &Path) -> String {
-        tokio::fs::read_to_string(root.join("pdm.lock")).await.unwrap()
+        tokio::fs::read_to_string(root.join("pdm.lock"))
+            .await
+            .unwrap()
     }
 
     fn entry_for(wiring: Vec<WiringRecord>, meta: PdmMeta) -> VendorEntry {
@@ -884,9 +891,11 @@ distribution = false
     }
 
     async fn wire_default(p: &PdmProject, root: &Path) -> (Vec<WiringRecord>, PdmMeta) {
-        wire_pdm(p, root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-            .await
-            .unwrap()
+        wire_pdm(
+            p, root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+        )
+        .await
+        .unwrap()
     }
 
     /// The load-bearing oracle: wiring the registry lock must produce the
@@ -895,7 +904,12 @@ distribution = false
     #[tokio::test]
     async fn wiring_matches_fixtures_byte_identically() {
         let cases = [
-            (LOCK_DIRECT_REGISTRY, LOCK_DIRECT_VENDORED, PYPROJECT_DIRECT, "direct"),
+            (
+                LOCK_DIRECT_REGISTRY,
+                LOCK_DIRECT_VENDORED,
+                PYPROJECT_DIRECT,
+                "direct",
+            ),
             (
                 LOCK_TRANSITIVE_REGISTRY,
                 LOCK_TRANSITIVE_VENDORED,
@@ -923,7 +937,9 @@ distribution = false
             );
             // pyproject + content_hash are NEVER touched (lock-only splice).
             assert_eq!(
-                tokio::fs::read_to_string(tmp.path().join("pyproject.toml")).await.unwrap(),
+                tokio::fs::read_to_string(tmp.path().join("pyproject.toml"))
+                    .await
+                    .unwrap(),
                 pyproject
             );
 
@@ -1016,8 +1032,10 @@ distribution = false
         let err = load_pdm_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_pdm_lock_version_unsupported");
         for bad in ["4.4.1", "3.0", "5.0.0", "garbage"] {
-            let lock = LOCK_DIRECT_REGISTRY
-                .replace("lock_version = \"4.5.0\"", &format!("lock_version = \"{bad}\""));
+            let lock = LOCK_DIRECT_REGISTRY.replace(
+                "lock_version = \"4.5.0\"",
+                &format!("lock_version = \"{bad}\""),
+            );
             let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
             let err = load_pdm_project(tmp.path()).await.unwrap_err();
             assert_eq!(err.0, "pypi_pdm_lock_version_unsupported", "{bad}");
@@ -1068,11 +1086,24 @@ distribution = false
 
         // wire re-runs the guards itself (refusal before any write)
         let before = read_lock(tmp.path()).await;
-        let err = wire_pdm(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pdm_source_already_exists");
-        assert_eq!(read_lock(tmp.path()).await, before, "refusal writes nothing");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            before,
+            "refusal writes nothing"
+        );
     }
 
     #[tokio::test]
@@ -1120,14 +1151,22 @@ distribution = false
             warnings: Vec::new(),
         };
         // PEP 621 dependency specs (with PEP 503 canonicalization).
-        assert_eq!(classify_dependency(&p(Some(PYPROJECT_DIRECT)), "six"), "direct");
         assert_eq!(
-            classify_dependency(&p(Some("[project]\ndependencies = [\"Six_Pkg>=1\"]\n")), "six-pkg"),
+            classify_dependency(&p(Some(PYPROJECT_DIRECT)), "six"),
             "direct"
         );
         assert_eq!(
             classify_dependency(
-                &p(Some("[project.optional-dependencies]\nextra = [\"six==1.16.0\"]\n")),
+                &p(Some("[project]\ndependencies = [\"Six_Pkg>=1\"]\n")),
+                "six-pkg"
+            ),
+            "direct"
+        );
+        assert_eq!(
+            classify_dependency(
+                &p(Some(
+                    "[project.optional-dependencies]\nextra = [\"six==1.16.0\"]\n"
+                )),
                 "six"
             ),
             "direct"
@@ -1145,7 +1184,10 @@ distribution = false
             "direct"
         );
         // Not declared / no pyproject → transitive (diagnostics-only).
-        assert_eq!(classify_dependency(&p(Some(PYPROJECT_TRANSITIVE)), "six"), "transitive");
+        assert_eq!(
+            classify_dependency(&p(Some(PYPROJECT_TRANSITIVE)), "six"),
+            "transitive"
+        );
         assert_eq!(classify_dependency(&p(None), "six"), "transitive");
     }
 
@@ -1160,7 +1202,9 @@ distribution = false
         let _ = check_target_guards(&p, "six", "1.16.0", UUID).unwrap();
         assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
         assert_eq!(
-            tokio::fs::read_to_string(tmp.path().join("pyproject.toml")).await.unwrap(),
+            tokio::fs::read_to_string(tmp.path().join("pyproject.toml"))
+                .await
+                .unwrap(),
             PYPROJECT_DIRECT
         );
     }
@@ -1203,9 +1247,13 @@ distribution = false
         let outer = tempfile::tempdir().unwrap();
         let root = outer.path().join("project");
         tokio::fs::create_dir_all(&root).await.unwrap();
-        tokio::fs::write(root.join("pdm.lock"), LOCK_DIRECT_REGISTRY).await.unwrap();
+        tokio::fs::write(root.join("pdm.lock"), LOCK_DIRECT_REGISTRY)
+            .await
+            .unwrap();
         let precious = outer.path().join("precious.txt");
-        tokio::fs::write(&precious, "keep me intact\n").await.unwrap();
+        tokio::fs::write(&precious, "keep me intact\n")
+            .await
+            .unwrap();
 
         for bad in ["pyproject.toml", "../precious.txt", "/etc/hosts"] {
             let wiring = vec![WiringRecord {
@@ -1222,9 +1270,15 @@ distribution = false
                 strategy: vec!["inherit_metadata".into()],
             };
             let outcome = revert_pdm(&entry_for(wiring, meta), &root, false).await;
-            assert!(outcome.success, "skipped fail-closed, not a hard error: {bad}");
             assert!(
-                outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+                outcome.success,
+                "skipped fail-closed, not a hard error: {bad}"
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"),
                 "skip surfaced for {bad}: {:?}",
                 outcome.warnings
             );
@@ -1235,7 +1289,9 @@ distribution = false
             "out-of-tree file byte-untouched"
         );
         assert_eq!(
-            tokio::fs::read_to_string(root.join("pdm.lock")).await.unwrap(),
+            tokio::fs::read_to_string(root.join("pdm.lock"))
+                .await
+                .unwrap(),
             LOCK_DIRECT_REGISTRY,
             "the lock itself is untouched too (no record matched it)"
         );
@@ -1259,8 +1315,12 @@ distribution = false
         });
 
         // Drift: someone re-hashed the vendored files entry.
-        let drifted = read_lock(tmp.path()).await.replace(WHEEL_SHA, &"0".repeat(64));
-        tokio::fs::write(tmp.path().join("pdm.lock"), &drifted).await.unwrap();
+        let drifted = read_lock(tmp.path())
+            .await
+            .replace(WHEEL_SHA, &"0".repeat(64));
+        tokio::fs::write(tmp.path().join("pdm.lock"), &drifted)
+            .await
+            .unwrap();
 
         let outcome = revert_pdm(&entry_for(wiring, meta), tmp.path(), false).await;
         assert!(outcome.success);
@@ -1274,17 +1334,42 @@ distribution = false
             "drifted fragment + unknown kind: {:?}",
             outcome.warnings
         );
-        assert_eq!(read_lock(tmp.path()).await, drifted, "drifted lock left alone");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            drifted,
+            "drifted lock left alone"
+        );
     }
 
     #[test]
     fn lock_version_series_classifier() {
-        assert!(matches!(lock_version_series("4.5.0"), LockVersionSeries::Supported));
-        assert!(matches!(lock_version_series("4.5.1"), LockVersionSeries::Supported));
-        assert!(matches!(lock_version_series("4.6.0"), LockVersionSeries::NewerMinor));
-        assert!(matches!(lock_version_series("4.10.2"), LockVersionSeries::NewerMinor));
-        assert!(matches!(lock_version_series("4.4.1"), LockVersionSeries::Unsupported));
-        assert!(matches!(lock_version_series("5.0.0"), LockVersionSeries::Unsupported));
-        assert!(matches!(lock_version_series("garbage"), LockVersionSeries::Unsupported));
+        assert!(matches!(
+            lock_version_series("4.5.0"),
+            LockVersionSeries::Supported
+        ));
+        assert!(matches!(
+            lock_version_series("4.5.1"),
+            LockVersionSeries::Supported
+        ));
+        assert!(matches!(
+            lock_version_series("4.6.0"),
+            LockVersionSeries::NewerMinor
+        ));
+        assert!(matches!(
+            lock_version_series("4.10.2"),
+            LockVersionSeries::NewerMinor
+        ));
+        assert!(matches!(
+            lock_version_series("4.4.1"),
+            LockVersionSeries::Unsupported
+        ));
+        assert!(matches!(
+            lock_version_series("5.0.0"),
+            LockVersionSeries::Unsupported
+        ));
+        assert!(matches!(
+            lock_version_series("garbage"),
+            LockVersionSeries::Unsupported
+        ));
     }
 }

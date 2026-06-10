@@ -70,7 +70,9 @@ fn write_archive_with_regular_and_symlink(
     fhdr.set_size(file_data.len() as u64);
     fhdr.set_mode(0o644);
     fhdr.set_cksum();
-    builder.append_data(&mut fhdr, file_name, file_data).unwrap();
+    builder
+        .append_data(&mut fhdr, file_name, file_data)
+        .unwrap();
 
     let mut lhdr = tar::Header::new_gnu();
     lhdr.set_entry_type(tar::EntryType::Symlink);
@@ -309,7 +311,11 @@ fn read_archive_filtered_keeps_only_listed_entries() {
     );
 
     let filtered = read_archive_filtered(&archive, &make_file_info()).unwrap();
-    assert_eq!(filtered.len(), 2, "exactly the two listed entries survive: {filtered:?}");
+    assert_eq!(
+        filtered.len(),
+        2,
+        "exactly the two listed entries survive: {filtered:?}"
+    );
     // The listed `package/index.js` key must match the normalized
     // `index.js` entry, carrying its exact bytes through the filter.
     assert_eq!(

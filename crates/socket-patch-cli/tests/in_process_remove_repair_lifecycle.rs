@@ -25,7 +25,11 @@ fn git_sha256(content: &[u8]) -> String {
 }
 
 fn write_root(cwd: &Path) {
-    std::fs::write(cwd.join("package.json"), r#"{"name":"r","version":"0.0.0"}"#).unwrap();
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"r","version":"0.0.0"}"#,
+    )
+    .unwrap();
 }
 
 fn write_npm_pkg(cwd: &Path, name: &str, version: &str, file: &str, content: &[u8]) {
@@ -174,7 +178,11 @@ async fn remove_by_uuid_finds_correct_purl() {
             .unwrap();
     let patches = m["patches"].as_object().unwrap();
     // Exactly the uuid-matched purl is gone; the decoy survives intact.
-    assert_eq!(patches.len(), 1, "only the uuid-matched entry must be removed");
+    assert_eq!(
+        patches.len(),
+        1,
+        "only the uuid-matched entry must be removed"
+    );
     assert!(
         !patches.contains_key("pkg:npm/uuid-remove@1.0.0"),
         "the entry whose uuid matched the identifier must be removed"
@@ -226,7 +234,11 @@ async fn remove_no_matching_purl_exits_not_found() {
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
     let patches = m["patches"].as_object().unwrap();
-    assert_eq!(patches.len(), 1, "a non-matching identifier must remove nothing");
+    assert_eq!(
+        patches.len(),
+        1,
+        "a non-matching identifier must remove nothing"
+    );
     assert!(patches.contains_key("pkg:npm/bystander@1.0.0"));
 }
 
@@ -502,7 +514,10 @@ async fn repair_file_mode_downloads_individual_blobs() {
     // Content-addressed: the stored blob must contain exactly the served
     // bytes, and re-hashing it must reproduce the manifest's afterHash.
     let stored = std::fs::read(&blob_path).unwrap();
-    assert_eq!(stored, blob_content, "stored blob bytes must match served body");
+    assert_eq!(
+        stored, blob_content,
+        "stored blob bytes must match served body"
+    );
     assert_eq!(
         git_sha256(&stored),
         after_hash,
@@ -589,7 +604,11 @@ async fn repair_dry_run_does_not_download() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|r| r.url.path().starts_with(&format!("/v0/orgs/{ORG}/patches/")))
+        .filter(|r| {
+            r.url
+                .path()
+                .starts_with(&format!("/v0/orgs/{ORG}/patches/"))
+        })
         .count();
     assert_eq!(
         hits, 0,

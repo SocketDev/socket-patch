@@ -15,11 +15,7 @@ fn binary() -> PathBuf {
 fn make_socket_with_empty_manifest(root: &std::path::Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{"patches":{}}"#,
-    )
-    .unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
 }
 
@@ -117,7 +113,11 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
     // known, separately-tracked production bug (it breaks the npm
     // postinstall hook, which runs `apply` on every install) — NOT a test
     // defect. Do not relax these to match the buggy output; fix the bug.
-    assert_eq!(out.status.code(), Some(0), "empty-manifest dry-run should exit 0: {v}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "empty-manifest dry-run should exit 0: {v}"
+    );
     assert_eq!(v["status"], "success", "expected success status: {v}");
     // A dry-run must never mutate anything: every "did work" counter is 0.
     // NOTE: with an *empty* manifest this is vacuously true regardless of
@@ -130,7 +130,10 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
     assert_eq!(summary["updated"], 0, "dry-run updated a patch: {v}");
     assert_eq!(summary["removed"], 0, "dry-run removed a patch: {v}");
     assert_eq!(summary["downloaded"], 0, "dry-run downloaded a blob: {v}");
-    assert_eq!(summary["verified"], 0, "empty manifest verified nothing: {v}");
+    assert_eq!(
+        summary["verified"], 0,
+        "empty manifest verified nothing: {v}"
+    );
     // Empty manifest → nothing to do; events stay empty.
     assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
@@ -147,7 +150,11 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
 fn apply_dry_run_with_real_patch_verifies_without_mutating() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_applicable_npm_patch(tmp.path());
-    let target = tmp.path().join("node_modules").join("dryrunpkg").join("index.js");
+    let target = tmp
+        .path()
+        .join("node_modules")
+        .join("dryrunpkg")
+        .join("index.js");
 
     // Sanity: fixture starts at the unpatched bytes.
     assert_eq!(
@@ -172,31 +179,57 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
     });
     assert_eq!(v["command"], "apply");
     assert_eq!(v["dryRun"], true);
-    assert_eq!(out.status.code(), Some(0), "clean applicable dry-run must exit 0: {v}");
-    assert_eq!(v["status"], "success", "dry-run of an applicable patch should succeed: {v}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean applicable dry-run must exit 0: {v}"
+    );
+    assert_eq!(
+        v["status"], "success",
+        "dry-run of an applicable patch should succeed: {v}"
+    );
 
     // The dry-run must REPORT that it would patch this package...
     let summary = &v["summary"];
-    assert_eq!(summary["verified"], 1, "dry-run must verify the applicable patch: {v}");
+    assert_eq!(
+        summary["verified"], 1,
+        "dry-run must verify the applicable patch: {v}"
+    );
     // ...while doing zero actual mutation work.
     assert_eq!(summary["applied"], 0, "dry-run must not apply: {v}");
     assert_eq!(summary["updated"], 0, "dry-run must not update: {v}");
     assert_eq!(summary["downloaded"], 0, "dry-run must not download: {v}");
-    assert_eq!(summary["failed"], 0, "dry-run should not fail on a clean patch: {v}");
+    assert_eq!(
+        summary["failed"], 0,
+        "dry-run should not fail on a clean patch: {v}"
+    );
 
     // The per-patch event must be a `verified` event for our exact PURL —
     // not a generic skip, and not an `applied` event.
-    let events = v["events"].as_array().expect("envelope must carry an events array");
+    let events = v["events"]
+        .as_array()
+        .expect("envelope must carry an events array");
     let ev = events
         .iter()
         .find(|e| e["purl"] == DRYRUN_PURL)
         .unwrap_or_else(|| panic!("dry-run must emit an event for {DRYRUN_PURL}: {v}"));
-    assert_eq!(ev["action"], "verified", "dry-run event must be `verified`: {v}");
+    assert_eq!(
+        ev["action"], "verified",
+        "dry-run event must be `verified`: {v}"
+    );
     // Dry-run events expose verified files but NEVER an appliedVia strategy.
-    let files = ev["files"].as_array().expect("verified event must list files");
-    assert!(!files.is_empty(), "verified event must name the file it checked: {v}");
+    let files = ev["files"]
+        .as_array()
+        .expect("verified event must list files");
+    assert!(
+        !files.is_empty(),
+        "verified event must name the file it checked: {v}"
+    );
     for f in files {
-        assert_eq!(f["verified"], true, "dry-run file must be marked verified: {v}");
+        assert_eq!(
+            f["verified"], true,
+            "dry-run file must be marked verified: {v}"
+        );
         assert!(
             f.get("appliedVia").map(|x| x.is_null()).unwrap_or(true),
             "dry-run must not record an appliedVia strategy: {v}"
@@ -228,8 +261,14 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
         )
     });
     assert_eq!(out2.status.code(), Some(0), "real apply must succeed: {v2}");
-    assert_eq!(v2["dryRun"], false, "control run must not be a dry-run: {v2}");
-    assert_eq!(v2["summary"]["applied"], 1, "real apply must patch the package: {v2}");
+    assert_eq!(
+        v2["dryRun"], false,
+        "control run must not be a dry-run: {v2}"
+    );
+    assert_eq!(
+        v2["summary"]["applied"], 1,
+        "real apply must patch the package: {v2}"
+    );
     assert_eq!(
         std::fs::read(&target).unwrap(),
         DRYRUN_PATCHED,
@@ -277,16 +316,23 @@ fn rollback_with_empty_manifest_emits_envelope() {
         .output()
         .expect("run rollback");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("invalid JSON: {e}\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)));
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON: {e}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
     // Empty-but-valid manifest: rollback is a clean success that touches nothing.
     assert_eq!(out.status.code(), Some(0), "rollback should exit 0: {v}");
     assert_eq!(v["status"], "success", "expected success status: {v}");
     assert_eq!(v["rolledBack"], 0, "nothing should roll back: {v}");
     assert_eq!(v["alreadyOriginal"], 0, "no files to inspect: {v}");
     assert_eq!(v["failed"], 0, "no rollback should fail: {v}");
-    assert_eq!(v["results"], serde_json::json!([]), "unexpected results: {v}");
+    assert_eq!(
+        v["results"],
+        serde_json::json!([]),
+        "unexpected results: {v}"
+    );
 }
 
 /// `remove --json` with no manifest at all: the early-exit
@@ -311,7 +357,10 @@ fn remove_with_no_socket_dir_emits_manifest_not_found() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "remove");
-    assert_eq!(v["status"], "error", "missing manifest must be an error: {v}");
+    assert_eq!(
+        v["status"], "error",
+        "missing manifest must be an error: {v}"
+    );
     assert_eq!(out.status.code(), Some(1), "error must exit nonzero: {v}");
     // Must be the *specific* missing-manifest code, not a generic not_found.
     assert_eq!(
@@ -341,7 +390,10 @@ fn list_with_empty_manifest_emits_empty_envelope() {
     // Empty manifest: nothing discovered, no events emitted.
     let summary = &v["summary"];
     assert!(summary.is_object(), "expected summary object; got {v}");
-    assert_eq!(summary["discovered"], 0, "empty manifest discovered patches: {v}");
+    assert_eq!(
+        summary["discovered"], 0,
+        "empty manifest discovered patches: {v}"
+    );
     assert_eq!(v["events"], serde_json::json!([]), "unexpected events: {v}");
 }
 
@@ -358,5 +410,8 @@ fn apply_silent_no_manifest_produces_no_output() {
         .expect("run apply");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.trim().is_empty(), "silent mode should produce no stdout");
+    assert!(
+        stdout.trim().is_empty(),
+        "silent mode should produce no stdout"
+    );
 }

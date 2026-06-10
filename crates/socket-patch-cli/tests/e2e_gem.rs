@@ -287,14 +287,7 @@ async fn scan_via_proxy(project_dir: &Path) -> (serde_json::Value, Vec<String>) 
         let cwd = dir.to_str().unwrap().to_string();
         run(
             &dir,
-            &[
-                "scan",
-                "--json",
-                "--cwd",
-                &cwd,
-                "--proxy-url",
-                &proxy_uri,
-            ],
+            &["scan", "--json", "--cwd", &cwd, "--proxy-url", &proxy_uri],
         )
     })
     .await
@@ -329,7 +322,11 @@ async fn scan_discovers_vendored_gems() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     // Create Gemfile so local mode activates
-    std::fs::write(project_dir.join("Gemfile"), "source 'https://rubygems.org'\n").unwrap();
+    std::fs::write(
+        project_dir.join("Gemfile"),
+        "source 'https://rubygems.org'\n",
+    )
+    .unwrap();
 
     // Set up vendor/bundle/ruby/<version>/gems/ layout
     let gems_dir = project_dir
@@ -444,7 +441,10 @@ fn test_gem_full_lifecycle() {
     assert_run_ok(cwd, &["get", GEM_UUID], "get");
 
     let manifest_path = cwd.join(".socket/manifest.json");
-    assert!(manifest_path.exists(), ".socket/manifest.json should exist after get");
+    assert!(
+        manifest_path.exists(),
+        ".socket/manifest.json should exist after get"
+    );
 
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -479,7 +479,10 @@ fn test_gem_full_lifecycle() {
     let vulns = patches[0]["details"]["vulnerabilities"]
         .as_array()
         .expect("vulnerabilities array");
-    assert!(!vulns.is_empty(), "patch should report at least one vulnerability");
+    assert!(
+        !vulns.is_empty(),
+        "patch should report at least one vulnerability"
+    );
 
     let has_cve = vulns.iter().any(|v| {
         v["cves"]

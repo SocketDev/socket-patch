@@ -204,9 +204,7 @@ mod tests {
     //! Inline tests for `list` JSON output. Pin the new envelope shape
     //! so downstream consumers (PR bots, dashboards) can rely on it.
     use super::*;
-    use socket_patch_core::manifest::schema::{
-        PatchFileInfo, PatchRecord, VulnerabilityInfo,
-    };
+    use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
     use std::collections::HashMap;
 
     fn sample_manifest() -> PatchManifest {
@@ -244,7 +242,10 @@ mod tests {
             },
         );
 
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     /// A manifest with several patches, each carrying multiple
@@ -289,7 +290,11 @@ mod tests {
         let mut patches = HashMap::new();
         patches.insert(
             "pkg:npm/zeta@1.0.0".to_string(),
-            record("uuid-z", &["GHSA-zzzz-2222-3333", "GHSA-aaaa-2222-3333"], &["z/b.js", "z/a.js"]),
+            record(
+                "uuid-z",
+                &["GHSA-zzzz-2222-3333", "GHSA-aaaa-2222-3333"],
+                &["z/b.js", "z/a.js"],
+            ),
         );
         patches.insert(
             "pkg:npm/alpha@1.0.0".to_string(),
@@ -299,7 +304,10 @@ mod tests {
             "pkg:npm/mid@1.0.0".to_string(),
             record("uuid-m", &["GHSA-cccc-2222-3333"], &["m/x.js"]),
         );
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[test]

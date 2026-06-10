@@ -51,8 +51,7 @@ fn git_sha256(content: &[u8]) -> String {
 }
 
 async fn make_mock_server(after_hash: &str) -> MockServer {
-    let listener =
-        std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
     let server = MockServer::builder().listener(listener).start().await;
 
     Mock::given(method("POST"))
@@ -72,7 +71,9 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": PURL,
@@ -331,8 +332,7 @@ async fn golang_download_full_apply_chain() {
     // this test is named after). The body is
     // `{"components":[{"purl":"pkg:golang/.../gin@v1.9.1"}]}`.
     let batch_with_purl = received.iter().any(|r| {
-        r.url.path().contains("/patches/batch")
-            && String::from_utf8_lossy(&r.body).contains(PURL)
+        r.url.path().contains("/patches/batch") && String::from_utf8_lossy(&r.body).contains(PURL)
     });
     assert!(
         batch_with_purl,
