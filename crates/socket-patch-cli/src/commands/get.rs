@@ -929,6 +929,42 @@ pub async fn download_and_apply_patches(
         return (1, err_json);
     }
 
+    // Vendored-uuid drift: an explicit `get` is allowed to move the
+    // manifest past the patch uuid the vendor ledger still wires (the user
+    // asked for that patch by name). Verification then fails closed
+    // (`vendor_uuid_mismatch`) until a `vendor` run re-vendors at the new
+    // uuid — tell the operator now instead of letting VEX surprise them
+    // later. (`scan` never hits this: it filters vendored purls before
+    // download.) The nested apply below skips the vendored purl either way.
+    if let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(&params.cwd).await {
+        if !vendor_state.entries.is_empty() {
+            for rec in &downloaded_patches {
+                let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str())
+                else {
+                    continue;
+                };
+                if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
+                    continue;
+                }
+                let entry = vendor_state
+                    .entries
+                    .get(purl)
+                    .or_else(|| vendor_state.entries.values().find(|e| e.base_purl == purl));
+                if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
+                    let w = format!(
+                        "{purl} is vendored at patch {} but the manifest now records {uuid}; \
+                         run `socket-patch vendor` to refresh the committed artifact",
+                        entry.uuid
+                    );
+                    if !params.json && !params.silent {
+                        eprintln!("  [note] {w}");
+                    }
+                    narrow_warnings.push(w);
+                }
+            }
+        }
+    }
+
     if !params.json && !params.silent {
         eprintln!("\nPatches saved to {}", manifest_path.display());
         eprintln!("  Added: {patches_added}");
@@ -1533,6 +1569,35 @@ async fn save_and_apply_patch(
         return 1;
     }
 
+    // Vendored-uuid drift (mirrors `download_and_apply_patches`): the user
+    // explicitly fetched this uuid; if the vendor ledger still wires a
+    // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
+    // until a `vendor` run refreshes the committed artifact.
+    let mut warnings: Vec<String> = Vec::new();
+    if added {
+        if let Ok(vendor_state) =
+            socket_patch_core::patch::vendor::load_state(&args.common.cwd).await
+        {
+            let entry = vendor_state.entries.get(&patch.purl).or_else(|| {
+                vendor_state
+                    .entries
+                    .values()
+                    .find(|e| e.base_purl == patch.purl)
+            });
+            if let Some(entry) = entry.filter(|e| e.uuid != patch.uuid) {
+                let w = format!(
+                    "{} is vendored at patch {} but the manifest now records {}; run \
+                     `socket-patch vendor` to refresh the committed artifact",
+                    patch.purl, entry.uuid, patch.uuid
+                );
+                if !args.common.json {
+                    eprintln!("  [note] {w}");
+                }
+                warnings.push(w);
+            }
+        }
+    }
+
     if !args.common.json {
         println!("\nPatch saved to {}", manifest_path.display());
         if added {
@@ -1591,17 +1656,18 @@ async fn save_and_apply_patch(
             // record means the consumer already saw the metadata last time.
             merge_metadata(&mut patch_record, patch_event_metadata(&patch));
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": status,
-                "found": 1,
-                "downloaded": if added { 1 } else { 0 },
-                "applied": if apply_succeeded { 1 } else { 0 },
-                "patches": [patch_record],
-            }))
-            .unwrap()
-        );
+        let mut result_json = serde_json::json!({
+            "status": status,
+            "found": 1,
+            "downloaded": if added { 1 } else { 0 },
+            "applied": if apply_succeeded { 1 } else { 0 },
+            "patches": [patch_record],
+        });
+        // Same contract as `download_and_apply_patches`: omitted when clean.
+        if !warnings.is_empty() {
+            result_json["warnings"] = serde_json::json!(warnings);
+        }
+        println!("{}", serde_json::to_string_pretty(&result_json).unwrap());
     }
 
     exit_code

@@ -492,3 +492,90 @@ fn get_help_lists_all_identifier_flags() {
         );
     }
 }
+
+#[tokio::test]
+async fn get_on_vendored_purl_warns_about_uuid_drift() {
+    // An explicit `get --id <newer-uuid>` is allowed to move the manifest
+    // past the uuid the vendor ledger still wires — but it must SAY so:
+    // until a `vendor` run refreshes the artifact, VEX verification fails
+    // closed with `vendor_uuid_mismatch`. The warning rides the JSON
+    // `warnings` array (and stderr in human mode).
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/vendored-drift@1.0.0";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{UUID_B}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID_B,
+            "purl": purl,
+            "publishedAt": "2024-02-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {},
+            "description": "Newer patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    // The vendor ledger wires the purl at UUID_A.
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "entries": { purl: {
+                "ecosystem": "npm",
+                "basePurl": purl,
+                "uuid": UUID_A,
+                "artifact": {
+                    "path": format!(".socket/vendor/npm/{UUID_A}/vendored-drift-1.0.0.tgz"),
+                },
+                "wiring": []
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "get",
+            UUID_B,
+            "--id",
+            "--save-only",
+            "--yes",
+            "--json",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(code, 0, "explicit get still succeeds; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert_eq!(v["patches"][0]["action"], "added", "stdout={stdout}");
+
+    let warnings = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("uuid drift must surface a warning; stdout={stdout}"));
+    assert_eq!(warnings.len(), 1, "stdout={stdout}");
+    let w = warnings[0].as_str().expect("warning string");
+    assert!(
+        w.contains("is vendored at patch") && w.contains(UUID_A) && w.contains(UUID_B),
+        "warning must name both uuids; got: {w}"
+    );
+    assert!(
+        w.contains("socket-patch vendor"),
+        "warning must point at the remedy; got: {w}"
+    );
+}

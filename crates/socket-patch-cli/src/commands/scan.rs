@@ -812,6 +812,28 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             };
 
+            // Vendor-owned purls are skipped BEFORE download (any uuid):
+            // the patch is consumed from the committed artifact, and
+            // moving the manifest past the vendored uuid would break VEX
+            // verification (`vendor_uuid_mismatch`) until a vendor run.
+            // A newer patch still surfaces in `updates[]` — the
+            // operator's signal to run `scan --vendor` (or `vendor`).
+            let is_vendored = |p: &str| {
+                vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p))
+            };
+            let (vendored_selected, selected): (Vec<_>, Vec<_>) =
+                selected.into_iter().partition(|p| is_vendored(&p.purl));
+            let mut vendored_records: Vec<serde_json::Value> = vendored_selected
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "purl": p.purl, "uuid": p.uuid,
+                        "action": "skipped", "errorCode": "vendored",
+                    })
+                })
+                .collect();
+            vendored_records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+
             let mut apply_code = 0i32;
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
@@ -819,7 +841,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                 // so it accurately reports what `--apply` *would* do.
                 let manifest_for_preview =
                     existing_manifest.clone().unwrap_or_else(PatchManifest::new);
-                let patches: Vec<serde_json::Value> = selected
+                let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
                         match super::get::decide_patch_action(
@@ -840,11 +862,12 @@ pub async fn run(args: ScanArgs) -> i32 {
                         }
                     })
                     .collect();
+                patches.extend(vendored_records.iter().cloned());
                 let added = patches.iter().filter(|p| p["action"] == "added").count();
                 let updated = patches.iter().filter(|p| p["action"] == "updated").count();
                 let skipped = patches.iter().filter(|p| p["action"] == "skipped").count();
                 result["apply"] = serde_json::json!({
-                    "found": selected.len(),
+                    "found": selected.len() + vendored_records.len(),
                     "downloaded": 0,
                     "skipped": skipped,
                     "failed": 0,
@@ -855,13 +878,16 @@ pub async fn run(args: ScanArgs) -> i32 {
                     "dryRun": true,
                 });
             } else if selected.is_empty() {
-                // No patches selected (e.g. all paid for a free user, or
-                // no packages had patches). Emit empty `apply` so JSON
-                // shape is stable, then fall through to GC if requested.
+                // No patches left to download (e.g. all paid for a free
+                // user, no packages had patches, or everything selected is
+                // vendor-owned). Emit a stable-shape `apply` carrying any
+                // vendored skips, then fall through to GC if requested.
                 result["apply"] = serde_json::json!({
-                    "found": 0, "downloaded": 0, "skipped": 0,
+                    "found": vendored_records.len(),
+                    "downloaded": 0,
+                    "skipped": vendored_records.len(),
                     "failed": 0, "applied": 0, "updated": 0,
-                    "patches": [],
+                    "patches": vendored_records,
                 });
             } else {
                 let params = DownloadParams {
@@ -882,6 +908,20 @@ pub async fn run(args: ScanArgs) -> i32 {
                 let mut apply_obj = apply_json;
                 if let Some(obj) = apply_obj.as_object_mut() {
                     obj.remove("status");
+                    // Fold the pre-download vendored skips into the apply
+                    // report: they were "found" by discovery and skipped
+                    // here, never downloaded.
+                    if !vendored_records.is_empty() {
+                        let n = vendored_records.len() as u64;
+                        for key in ["found", "skipped"] {
+                            let bumped = obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0) + n;
+                            obj.insert(key.to_string(), serde_json::json!(bumped));
+                        }
+                        if let Some(patches) = obj.get_mut("patches").and_then(|p| p.as_array_mut())
+                        {
+                            patches.extend(vendored_records.iter().cloned());
+                        }
+                    }
                 }
                 result["apply"] = apply_obj;
                 if apply_code != 0 {
@@ -1130,6 +1170,18 @@ pub async fn run(args: ScanArgs) -> i32 {
             Ok(s) => s,
             Err(code) => return code,
         };
+
+    // Vendor-owned purls never download/apply here (mirrors the JSON
+    // path): the committed artifact is the patch, and a manifest moved
+    // past the vendored uuid would break VEX verification until a vendor
+    // run refreshes the artifact.
+    let is_vendored =
+        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let (vendored_selected, selected): (Vec<_>, Vec<_>) =
+        selected.into_iter().partition(|p| is_vendored(&p.purl));
+    for p in &vendored_selected {
+        println!("  [skip] {} (vendored — run scan --vendor to update)", p.purl);
+    }
 
     if selected.is_empty() {
         println!("No patches selected.");
