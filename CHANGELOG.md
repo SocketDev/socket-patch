@@ -71,14 +71,6 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   command exit non-zero even when the apply/scan itself succeeded, surfacing a
   stable error code in the envelope.
 
-## [3.2.0] — 2026-05-29
-
-A repo-wide correctness, security, and filesystem-safety hardening pass: every
-source file in both crates was reviewed line by line, the bugs found were fixed,
-and regression tests were added throughout (the lib + integration suites grow by
-~10k lines of mostly tests). The audit harness used to drive the review lives in
-`scripts/study-crates.ts`.
-
 ### Fixed
 
 - **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
@@ -87,6 +79,14 @@ and regression tests were added throughout (the lib + integration suites grow by
   patches were silently omitted from the document (reported `not_applied`,
   or `package_not_found` on cache-less CI). Verification now follows the
   managed `replace` directive to the committed copy.
+
+## [3.2.0] — 2026-05-29
+
+A repo-wide correctness, security, and filesystem-safety hardening pass: every
+source file in both crates was reviewed line by line, the bugs found were fixed,
+and regression tests were added throughout (the lib + integration suites grow by
+~10k lines of mostly tests). The audit harness used to drive the review lives in
+`scripts/study-crates.ts`.
 
 ### Security
 
