@@ -16,6 +16,25 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **`vendor` now supports every major npm and pypi package manager.** The npm
+  ecosystem gained four lockfile flavors beyond `package-lock.json` — yarn
+  classic (`yarn.lock` v1), yarn berry with the node-modules linker
+  (`resolutions` + a cache-zip `10c0` checksum reproduced offline from the
+  vendored tarball), pnpm (`pnpm.overrides` + `pnpm-lock.yaml` surgery, pnpm 9
+  & 10), and bun (`bun.lock`) — all sharing the one vendored tarball and
+  selected by a content-sniffing probe (yarn-berry PnP and bun's binary
+  `bun.lockb` are refused with pointers to the native flow). The pypi
+  ecosystem gained poetry, pdm, and pipenv (lock-only `[[package]]` / entry
+  splices, like the existing uv/requirements flavors). Every lockfile
+  checksum/reference field for a vendored package is now recomputed
+  coherently (the v2 "update checksums and references" directive); the gem
+  backend handles bundler ≥ 2.6's optional `CHECKSUMS` section; composer's
+  `dist.reference` carries the patch UUID into `installed.json`. Each flavor
+  has a real-package-manager build-proof capstone (fresh-checkout, cold-cache,
+  strictest-install — `--frozen`/`--immutable`/`--deploy`/`--locked` — with
+  byte-identical revert). `vendor --force`/`--revert` accept empty env vars
+  (`SOCKET_FORCE=`) as false, matching the global-flag contract.
+
 - **New `vendor` subcommand: committable vendoring of patched dependencies.**
   Where `apply` patches installed packages in place (machine-local state),
   `socket-patch vendor` ejects each patched package into a committed

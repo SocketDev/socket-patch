@@ -336,20 +336,36 @@ lockfile; never a trust input.
 
 ### Per-ecosystem wiring matrix
 
-| eco | vendored artifact | committed wiring | consumption proof |
+The npm ecosystem has **five lockfile flavors** — all sharing one vendored
+tarball at `.socket/vendor/npm/<uuid>/[@scope/]<name>-<version>.tgz`; a
+content-sniffing probe (`npm_flavor`) picks the flavor and the ledger records
+it so `--revert` routes back. The pypi ecosystem similarly routes by lockfile
+to **six flavors**.
+
+| eco / flavor | vendored artifact | committed wiring | consumption proof |
 |---|---|---|---|
-| npm | deterministic patched tarball `[@scope/]<name>-<version>.tgz` | `package-lock.json` only (`npm-shrinkwrap.json` wins when present): every entry matching name+version gets `resolved: "file:…"` + recomputed `integrity`. `package.json` untouched | `npm ci` (integrity-verified). Plain `npm install` preserves the entry; `npm update <pkg>` re-resolves and drops it |
+| npm (package-lock) | deterministic patched tarball `[@scope/]<name>-<version>.tgz` | `package-lock.json` only (`npm-shrinkwrap.json` wins when present): every entry matching name+version gets `resolved: "file:…"` + recomputed `integrity`. `package.json` untouched | `npm ci` (integrity-verified). Plain `npm install` preserves the entry; `npm update <pkg>` re-resolves and drops it |
+| npm / yarn classic | (same tarball) | `yarn.lock` only: matching blocks get `resolved "file:./…#<sha1>"` + `integrity` (both checksums recomputed; merged-key & `npm:`-alias blocks covered) | `yarn install --frozen-lockfile --offline` (sha1 fragment + sha512 SRI both enforced; byte-stable lock) |
+| npm / yarn berry (node-modules linker) | (same tarball) | root `package.json` `resolutions` + `yarn.lock` entry with `checksum: 10c0/<sha512>` of the berry cache-zip (reproduced from the tarball offline). **PnP is refused** (`.pnp.*` → different artifact pipeline) | `yarn install --immutable --check-cache`, cold cache. Refused if `__metadata.cacheKey ≠ 10c0` or a non-default `compressionLevel` |
+| npm / pnpm (lockfileVersion 9) | (same tarball) | root `package.json` `pnpm.overrides` (versioned selector) **+** `pnpm-lock.yaml` surgery (overrides / importer version / packages `resolution.integrity` / snapshots) | `pnpm install --frozen-lockfile --offline`, cold store (integrity-verified; byte-stable on pnpm 9 & 10). lockfileVersion ≠ 9 refused |
+| npm / bun (`bun.lock`) | (same tarball) | `bun.lock` only: the packages entry's registry 4-tuple → local 3-tuple with recomputed `sha512`. `bun.lockb` (binary) refused with a `--save-text-lockfile` pointer | `bun install --frozen-lockfile`, cold cache (integrity-enforced) |
 | cargo | crate dir `<name>-<version>/` (no `.cargo-checksum.json`) | `.cargo/config.toml` `[patch.crates-io]` path entry **+** Cargo.lock surgery (the `[[package]]` entry's `source`/`checksum` removed) | `cargo build --locked --offline` on a fresh checkout. Requires cargo ≥ 1.56 (`[patch]` in config files). Note: path deps build **without** `--cap-lints allow` |
 | golang | module dir `<module>@<version>/` | `go.mod` `replace <module> <ver> => ./.socket/vendor/golang/<uuid>/<module>@<ver>` | `go build` with `GOPROXY=off` + empty `GOMODCACHE` (directory replaces bypass go.sum entirely; survives `go mod tidy`) |
 | composer | package dir `<vendor>/<name>@<version>/` | `composer.lock` only: entry's `dist` → `{type: "path", url, reference: null}`, `source` removed, `transport-options: {symlink: false}` added. `content-hash` unaffected; `composer.json` untouched | `composer install` (from the lock alone, real copy not symlink, works under `--network none`). `composer update <pkg>` reverts it |
 | gem | gem dir `<name>-<version>/` + gemspec materialized from `specifications/` | **Gemfile + Gemfile.lock pair**: the `gem` line gains `path:` (or a managed block for transitive deps); the lock's spec block moves GEM→PATH and the DEPENDENCIES entry becomes `<name> (= <ver>)!`, in bundler's exact canonical form | `bundle install` (normal **and** `BUNDLE_FROZEN=true`), byte-stable lock. Lock-only edits are a silent unpatch — hence the mandatory pair |
-| pypi | rebuilt wheel (canonical PEP 427 filename; RECORD regenerated correctly) | **uv projects** (uv.lock present): `[tool.uv.sources] <name> = {path}` in pyproject + surgical uv.lock rewrite; transitive deps via `[tool.uv] override-dependencies`. **requirements.txt** (pip / `uv pip`): pin line → `./<wheel> --hash=sha256:<hex>` (markers carried over; transitive deps appended) | `uv sync --locked` / `--frozen --offline` (hash-verified, byte-stable lock); `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
+| pypi / uv (uv.lock) | rebuilt wheel (canonical PEP 427 filename; RECORD regenerated) | `[tool.uv.sources] <name> = {path}` in pyproject + surgical uv.lock rewrite; transitive deps via `[tool.uv] override-dependencies` | `uv sync --locked` / `--frozen --offline` (hash-verified, byte-stable lock) |
+| pypi / poetry (poetry.lock 2.0/2.1) | (rebuilt wheel) | lock-only: the target `[[package]]` gets `[package.source] type="file"` + `files = [{file, hash: sha256-of-our-wheel}]`. pyproject + `metadata.content-hash` untouched | `poetry check --lock && poetry sync`, cold cache (hash fail-closed; byte-stable lock) |
+| pypi / pdm (pdm.lock) | (rebuilt wheel) | lock-only: the `[[package]]` gains the local-file `path` + `files[]` hash. pyproject + `content_hash` untouched. Non-fixture `[metadata] strategy` / hash-less locks refused | `pdm sync` (+ `pdm install --check`), cold cache |
+| pypi / pipenv (Pipfile.lock) | (rebuilt wheel) | lock-only: the `default`/`develop` entry → `{file, hashes:[sha256-of-our-wheel]}`. Pipfile + `_meta.hash` untouched. Emits `vendor_integrity_unverified` — pipenv does not hash-check file entries; the committed wheel bytes are the protection | `pipenv install --deploy` (+ `pipenv verify`), cold cache |
+| pypi / requirements.txt (pip / `uv pip`) | (rebuilt wheel) | pin line → `./<wheel> --hash=sha256:<hex>` (markers carried over; transitive deps appended) | `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
 
 Ecosystems with no vendor backend that this build still *recognizes* (maven/nuget/jsr when their
-features are compiled in), plus poetry/pdm/pipenv pyproject flavors and yarn/pnpm/bun npm layouts,
-refuse per-purl with stable reason codes pointing at the native alternative (`yarn|pnpm|bun patch`,
-the `.pth` setup hook, …). PURLs of **compiled-out** ecosystems are invisible to `vendor` exactly
-as they are to `apply` (the binary cannot parse them).
+features are compiled in) refuse per-purl with `vendor_unsupported_ecosystem`. yarn-berry **PnP**
+(`.pnp.*`) and bun's binary `bun.lockb` are refused with stable codes pointing at the native
+alternative / a text-lockfile migration; a lock-less tool marker (a `[tool.uv]`/`[tool.poetry]`/
+`[tool.pdm]` table or a `Pipfile` without its lock) refuses `<tool>_no_lockfile` unless a
+`requirements.txt` fallback exists. PURLs of **compiled-out** ecosystems are invisible to `vendor`
+exactly as they are to `apply` (the binary cannot parse them).
 
 ### Checksum coverage
 
@@ -363,8 +379,15 @@ worse, lets a warm cache silently serve unpatched bytes):
 | cargo | `[[package]].source` + `checksum`; `.cargo-checksum.json` in the copy | both lock keys removed (the canonical path-dep form); checksum sidecar excluded from the copy; originals kept verbatim in the ledger for `--revert` |
 | golang | `go.sum` | untouched **by design** — directory `replace` targets are never sum-verified. Caveat: a user `go mod tidy` may prune the replaced module's go.sum lines; revert does not restore them (the next online build re-adds them) |
 | composer | `dist.{url,reference,shasum}`, `source.reference`, `content-hash` | `dist` → `{type: path, url, reference: "<patch-uuid>"}` (the uuid is preserved verbatim into `installed.json` — in-tree traceability); `source` removed; `content-hash` untouched (covers composer.json only) |
-| gem | `CHECKSUMS` section (bundler ≥ 2.6 opt-in) | the vendored gem's entry rewritten to bundler's own path-gem form so re-locks stay byte-stable; original line in the ledger |
+| npm / yarn classic | `resolved "…#<sha1>"` fragment + `integrity` SRI | both recomputed from the packed tarball (sha1 fragment + sha512 SRI); integrity line added when the registry block lacked one — yarn then enforces both |
+| npm / yarn berry | `checksum: 10c0/<sha512>` (over berry's cache zip) | recomputed by rebuilding berry's deterministic cache-zip from the tarball and hashing it (byte-identical to yarn's own); refused if the lock's `cacheKey`/`compressionLevel` would change the zip |
+| npm / pnpm | `packages[].resolution.integrity` (sha512) | recomputed from the tarball; the versioned `pnpm.overrides` selector pins exactly the patched version |
+| npm / bun | the packages-entry trailing `sha512-…` | recomputed from the tarball; tamper fails the frozen install |
+| gem | `CHECKSUMS` section (bundler ≥ 2.6 opt-in) | the vendored gem's entry rewritten to bundler's own path-gem form (bare `name (ver)`, sha256 token stripped) so re-locks stay byte-stable; original line in the ledger |
 | pypi / uv | `wheels[].hash`, `sdist.hash`, requires-dist specifiers | single `{filename, hash: sha256-of-our-wheel}`; sdist dropped; dropped specifiers ledgered for revert |
+| pypi / poetry | `files = [{file, hash}]` | replaced with a single `{file, hash: sha256-of-our-wheel}` (poetry verifies the artifact against one listed hash; stale registry hashes removed) |
+| pypi / pdm | `[[package]].files[]` hashes | replaced with our wheel's sha256; hash-less locks refused (`pypi_pdm_lock_no_hashes`) |
+| pypi / pipenv | per-entry `hashes[]` | replaced with `["sha256:<ours>"]` — but pipenv does **not** enforce hashes on file entries (`vendor_integrity_unverified` warning); the committed wheel bytes are the actual protection |
 | pypi / requirements | `--hash=sha256:` | fresh hash of the rebuilt wheel always emitted (turns on pip's hash-checking for the line) |
 
 ### Ownership, state, and reversal
@@ -529,9 +552,15 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendored`                | `skipped`        | apply: the package is managed by `socket-patch vendor`; apply yields ownership. |
 | `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (maven/nuget/jsr, or compiled out). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
-| `vendor_pkg_manager_unsupported` | `failed`  | vendor (npm): project uses yarn/pnpm/bun — use the manager's native patch flow. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
+| `vendor_multiple_lockfiles` / `pypi_multiple_lockfiles` | `skipped` (warning) | vendor: a sibling lockfile of another package manager will still install UNPATCHED bytes; names the wired winner + the ignored locks. |
+| `vendor_yarn_berry_unsupported` / `vendor_bun_lockb_unsupported` | `failed` | vendor (npm): yarn-berry PnP / bun binary lockfile — pointer to `yarn patch` / `bun install --save-text-lockfile`. |
+| `vendor_yarn_berry_cache_unsupported` | `failed` | vendor (yarn berry): lock `cacheKey ≠ 10c0` or non-default `.yarnrc.yml` `compressionLevel` — the cache-zip checksum is not reproducible. |
+| `vendor_override_conflict` | `failed`        | vendor (pnpm/yarn-berry): a user-authored override/resolution for the package already exists. |
+| `vendor_integrity_unverified` | `skipped` (warning) | vendor (pipenv): the lockfile format does not hash-check file entries; the committed wheel bytes are the protection. |
+| `vendor_lock_checksums_unsupported` / `vendor_stale_lock_checksum` | `failed` | vendor (gem): an ambiguous/platform CHECKSUMS entry, or a v1-wired lock whose stale token blocks the hot path (run `vendor --revert` + re-vendor). |
+| `pypi_{poetry,pdm,pipenv}_no_lockfile` | `failed` | vendor (pypi): a lock-less tool marker with no `requirements.txt` fallback — run `<tool> lock`. |
 | `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
 ### Top-level `EnvelopeError` codes
