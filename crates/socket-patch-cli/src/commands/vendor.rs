@@ -300,19 +300,21 @@ pub async fn run(args: VendorArgs) -> i32 {
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
     // requested-but-failed VEX flips the exit code.
     let mut exit = exit;
-    if exit == 0 && !args.revert && args.vex.vex.is_some() {
-        let params = args.vex.to_build_params();
-        match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
-            Ok(summary) => {
-                env.vex = Some(VexSummary {
-                    path: args.vex.vex.as_ref().unwrap().display().to_string(),
-                    statements: summary.statements,
-                    format: "openvex-0.2.0".to_string(),
-                });
-            }
-            Err(e) => {
-                env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
-                exit = 1;
+    if exit == 0 && !args.revert {
+        if let Some(vex_path) = args.vex.vex.as_ref() {
+            let params = args.vex.to_build_params();
+            match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+                Ok(summary) => {
+                    env.vex = Some(VexSummary {
+                        path: vex_path.display().to_string(),
+                        statements: summary.statements,
+                        format: "openvex-0.2.0".to_string(),
+                    });
+                }
+                Err(e) => {
+                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                    exit = 1;
+                }
             }
         }
     }

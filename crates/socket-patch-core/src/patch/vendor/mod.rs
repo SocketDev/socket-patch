@@ -91,6 +91,15 @@ impl VendorWarning {
 }
 
 /// The result of one backend `vendor_*` call.
+//
+// `large_enum_variant`: `Done` is much bigger than `Refused` because it carries
+// the full `ApplyResult` plus an `Option<VendorEntry>` (which itself holds the
+// per-ecosystem `*Meta` records). That asymmetry is harmless here — a
+// `VendorOutcome` is a one-shot return value, built once per backend call and
+// consumed immediately by the router; it is never stored in a collection or a
+// hot loop. Boxing both large fields (what the lint asks for) would only spray
+// deref churn across every backend, router, and the CLI for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum VendorOutcome {
     /// Refused before any write (wrong package manager, unsupported lockfile
