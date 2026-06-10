@@ -60,7 +60,7 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
 /// clap abort the whole command with `invalid value '' for '--offline': value
 /// was not a boolean`. Every bool flag here reads such an env var, so a single
 /// stray empty var crashed every subcommand before it could do any work.
-fn parse_bool_flag(s: &str) -> Result<bool, String> {
+pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "" | "n" | "no" | "f" | "false" | "off" | "0" => Ok(false),
         "y" | "yes" | "t" | "true" | "on" | "1" => Ok(true),
@@ -130,7 +130,7 @@ pub struct GlobalArgs {
     #[arg(
         long = "download-mode",
         env = "SOCKET_DOWNLOAD_MODE",
-        default_value = "diff",
+        default_value = "diff"
     )]
     pub download_mode: String,
 
@@ -429,7 +429,12 @@ mod tests {
     #[serial_test::serial]
     fn empty_bool_env_var_parses_as_false_not_crash() {
         with_clean_socket_env(|| {
-            for var in ["SOCKET_OFFLINE", "SOCKET_JSON", "SOCKET_VERBOSE", "SOCKET_GLOBAL"] {
+            for var in [
+                "SOCKET_OFFLINE",
+                "SOCKET_JSON",
+                "SOCKET_VERBOSE",
+                "SOCKET_GLOBAL",
+            ] {
                 std::env::set_var(var, "");
             }
             let cli = TestCli::try_parse_from(["socket-patch"])
@@ -438,7 +443,12 @@ mod tests {
             assert!(!cli.common.json);
             assert!(!cli.common.verbose);
             assert!(!cli.common.global);
-            for var in ["SOCKET_OFFLINE", "SOCKET_JSON", "SOCKET_VERBOSE", "SOCKET_GLOBAL"] {
+            for var in [
+                "SOCKET_OFFLINE",
+                "SOCKET_JSON",
+                "SOCKET_VERBOSE",
+                "SOCKET_GLOBAL",
+            ] {
                 std::env::remove_var(var);
             }
         });
@@ -527,7 +537,10 @@ mod tests {
     fn api_client_overrides_default_is_all_none() {
         let o = GlobalArgs::default().api_client_overrides();
         assert!(o.api_url.is_none(), "empty api_url must not be forwarded");
-        assert!(o.proxy_url.is_none(), "empty proxy_url must not be forwarded");
+        assert!(
+            o.proxy_url.is_none(),
+            "empty proxy_url must not be forwarded"
+        );
         assert!(o.api_token.is_none());
         assert!(o.org_slug.is_none());
     }
@@ -599,7 +612,10 @@ mod tests {
         for bad in ["bogus", "NPM", "py-pi", ""] {
             let err = parse_supported_ecosystem(bad)
                 .expect_err("unsupported ecosystem name must be rejected");
-            assert!(err.contains(bad), "error should echo the bad token: {err:?}");
+            assert!(
+                err.contains(bad),
+                "error should echo the bad token: {err:?}"
+            );
             assert!(
                 err.contains("supported:"),
                 "error should list the supported set: {err:?}",
@@ -634,9 +650,8 @@ mod tests {
     fn cli_arg_overrides_env_var() {
         with_clean_socket_env(|| {
             std::env::set_var("SOCKET_MANIFEST_PATH", "from-env.json");
-            let cli =
-                TestCli::try_parse_from(["socket-patch", "--manifest-path", "from-cli.json"])
-                    .unwrap();
+            let cli = TestCli::try_parse_from(["socket-patch", "--manifest-path", "from-cli.json"])
+                .unwrap();
             assert_eq!(cli.common.manifest_path, "from-cli.json");
             std::env::remove_var("SOCKET_MANIFEST_PATH");
         });
@@ -684,7 +699,10 @@ mod tests {
         };
         apply_env_toggles(&args);
         assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
-        assert_eq!(std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(),
+            Ok("1")
+        );
 
         match saved_debug {
             Some(v) => std::env::set_var("SOCKET_DEBUG", v),

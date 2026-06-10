@@ -55,7 +55,13 @@ fn write_root_package_json(root: &Path) {
     .expect("write root package.json");
 }
 
-fn write_manifest_with_patch(socket: &Path, purl: &str, uuid: &str, before_hash: &str, after_hash: &str) {
+fn write_manifest_with_patch(
+    socket: &Path,
+    purl: &str,
+    uuid: &str,
+    before_hash: &str,
+    after_hash: &str,
+) {
     std::fs::create_dir_all(socket).expect("create .socket");
     let body = format!(
         r#"{{
@@ -118,7 +124,9 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
     // The fetcher hits /v0/orgs/{slug}/patches/blob/{hash}. Return the
     // patched bytes so the binary's content-hash check passes.
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
         .mount(&mock)
         .await;
@@ -147,8 +155,7 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
 
-    let (code, stdout, stderr) =
-        run_apply(tmp.path(), &mock.uri(), &["--download-mode", "file"]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--download-mode", "file"]);
     assert_eq!(
         code, 0,
         "apply must succeed; stdout={stdout}; stderr={stderr}"
@@ -169,7 +176,10 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
         requests.iter().any(|r| r.url.path() == blob_path),
         "apply must fetch the missing blob from the API; \
          got requests={:?}",
-        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
     // The fetch path must have actually applied the patch (not silently
     // no-op'd to a green exit). Assert the JSON summary, not just exit code.
@@ -192,9 +202,7 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
     );
 
     // The file under node_modules should now contain the patched bytes.
-    let patched_path = tmp
-        .path()
-        .join("node_modules/apply-network-test/index.js");
+    let patched_path = tmp.path().join("node_modules/apply-network-test/index.js");
     let patched_content = std::fs::read(&patched_path).expect("read patched file");
     assert_eq!(
         patched_content, after,
@@ -234,11 +242,7 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
 
-    let (code, stdout, stderr) = run_apply(
-        tmp.path(),
-        &mock.uri(),
-        &["--ecosystems", "pypi"],
-    );
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--ecosystems", "pypi"]);
     // Filtering out npm leaves nothing in scope: apply reports this as a
     // partial-failure (exit 1, status "partialFailure", all-zero summary).
     // Pin the exact contract — a disjoint `0 || 1` accept would let a
@@ -255,9 +259,18 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     // Nothing in the npm ecosystem may even be discovered/downloaded once
     // it's filtered out — guards against the filter being applied only at
     // the write step while still crawling/fetching the excluded packages.
-    assert_eq!(v["summary"]["discovered"], 0, "filtered npm must not be discovered");
-    assert_eq!(v["summary"]["downloaded"], 0, "filtered npm must not be downloaded");
-    assert_eq!(v["summary"]["failed"], 0, "skipping out-of-scope is not a failure");
+    assert_eq!(
+        v["summary"]["discovered"], 0,
+        "filtered npm must not be discovered"
+    );
+    assert_eq!(
+        v["summary"]["downloaded"], 0,
+        "filtered npm must not be downloaded"
+    );
+    assert_eq!(
+        v["summary"]["failed"], 0,
+        "skipping out-of-scope is not a failure"
+    );
     // The excluded npm patch must not appear as an applied/patched event —
     // an empty `events` array or one without our purl is fine, but a
     // "patched" event for the skipped purl would mean the filter leaked.
@@ -271,8 +284,7 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     }
 
     // Node_modules file must be UNCHANGED.
-    let content =
-        std::fs::read(tmp.path().join("node_modules/skipped/index.js")).unwrap();
+    let content = std::fs::read(tmp.path().join("node_modules/skipped/index.js")).unwrap();
     assert_eq!(content, before, "non-matching ecosystem must skip apply");
 }
 
@@ -289,13 +301,7 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(
-        tmp.path(),
-        "dryrun-target",
-        "1.0.0",
-        "index.js",
-        before,
-    );
+    write_npm_package(tmp.path(), "dryrun-target", "1.0.0", "index.js", before);
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(
         &socket,
@@ -331,8 +337,9 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
     // The verified event must be for OUR purl, not some unrelated event;
     // and dry-run must NOT emit a real "patched"/"applied" action.
     assert!(
-        events.iter().any(|e| e["purl"] == "pkg:npm/dryrun-target@1.0.0"
-            && e["action"] == "verified"),
+        events
+            .iter()
+            .any(|e| e["purl"] == "pkg:npm/dryrun-target@1.0.0" && e["action"] == "verified"),
         "dry-run must emit a verified event for the target purl; events={events:?}"
     );
     assert!(
@@ -343,9 +350,11 @@ async fn apply_dry_run_emits_verified_event_without_writing() {
     );
 
     // File content must be UNCHANGED.
-    let content =
-        std::fs::read(tmp.path().join("node_modules/dryrun-target/index.js")).unwrap();
-    assert_eq!(content, before, "dry-run must not modify node_modules files");
+    let content = std::fs::read(tmp.path().join("node_modules/dryrun-target/index.js")).unwrap();
+    assert_eq!(
+        content, before,
+        "dry-run must not modify node_modules files"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +375,13 @@ async fn apply_with_force_overrides_hash_mismatch() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "force-target", "1.0.0", "index.js", actual_before);
+    write_npm_package(
+        tmp.path(),
+        "force-target",
+        "1.0.0",
+        "index.js",
+        actual_before,
+    );
     let socket = tmp.path().join(".socket");
     write_manifest_with_patch(
         &socket,
@@ -390,7 +405,10 @@ async fn apply_with_force_overrides_hash_mismatch() {
         .expect("run socket-patch");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 0, "--force must succeed past hash mismatch; stdout={stdout}");
+    assert_eq!(
+        code, 0,
+        "--force must succeed past hash mismatch; stdout={stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     // With force on a HashMismatch, the diff path bails because the
     // on-disk hash still doesn't match `before_hash`, but the blob
@@ -404,14 +422,14 @@ async fn apply_with_force_overrides_hash_mismatch() {
     );
     let events = v["events"].as_array().expect("events array");
     assert!(
-        events
-            .iter()
-            .all(|e| e["action"] != "failed"),
+        events.iter().all(|e| e["action"] != "failed"),
         "--force run must not emit a failed event; events={events:?}"
     );
-    let content =
-        std::fs::read(tmp.path().join("node_modules/force-target/index.js")).unwrap();
-    assert_eq!(content, after, "--force must overwrite file with afterHash content");
+    let content = std::fs::read(tmp.path().join("node_modules/force-target/index.js")).unwrap();
+    assert_eq!(
+        content, after,
+        "--force must overwrite file with afterHash content"
+    );
 }
 
 #[tokio::test]
@@ -486,7 +504,11 @@ async fn apply_pypi_package_uses_python_crawler() {
     let site_packages = if cfg!(windows) {
         tmp.path().join(".venv").join("Lib").join("site-packages")
     } else {
-        tmp.path().join(".venv").join("lib").join("python3.12").join("site-packages")
+        tmp.path()
+            .join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
     };
     std::fs::create_dir_all(&site_packages).expect("create site-packages");
     std::fs::write(site_packages.join("index.js"), before).expect("write source");
@@ -516,13 +538,7 @@ async fn apply_pypi_package_uses_python_crawler() {
     // end, not just "without panicking". `VIRTUAL_ENV` is cleared so an
     // ambient venv in CI can't redirect discovery away from our `.venv`.
     let out = Command::new(binary())
-        .args([
-            "apply",
-            "--json",
-            "--offline",
-            "--ecosystems",
-            "pypi",
-        ])
+        .args(["apply", "--json", "--offline", "--ecosystems", "pypi"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .env_remove("VIRTUAL_ENV")
@@ -547,8 +563,7 @@ async fn apply_pypi_package_uses_python_crawler() {
     assert!(
         events
             .iter()
-            .any(|e| e["purl"] == "pkg:pypi/pypi_target@1.0.0"
-                && e["action"] != "failed"),
+            .any(|e| e["purl"] == "pkg:pypi/pypi_target@1.0.0" && e["action"] != "failed"),
         "must emit a non-failed event for the pypi purl; got events={events:?}"
     );
 
@@ -614,5 +629,8 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 
     // `.socket/blobs/` must still contain the cached blob (apply is
     // read-only against the persistent cache).
-    assert!(blobs.join(&after_hash).exists(), "cached blob must survive apply");
+    assert!(
+        blobs.join(&after_hash).exists(),
+        "cached blob must survive apply"
+    );
 }

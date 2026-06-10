@@ -102,7 +102,7 @@ fn parse_cargo_toml_ignores_lines_before_package_section() {
 /// for symmetry.
 #[test]
 fn cargo_crawler_default_and_new_construct_cleanly() {
-    let _a = CargoCrawler::default();
+    let _a = CargoCrawler;
     let _b = CargoCrawler::new();
 }
 
@@ -328,7 +328,9 @@ async fn get_crate_source_paths_with_vendor_dir_returns_vendor() {
 #[tokio::test]
 async fn get_crate_source_paths_vendor_without_cargo_manifest_is_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    tokio::fs::create_dir(tmp.path().join("vendor")).await.unwrap();
+    tokio::fs::create_dir(tmp.path().join("vendor"))
+        .await
+        .unwrap();
 
     let crawler = CargoCrawler;
     let paths = crawler

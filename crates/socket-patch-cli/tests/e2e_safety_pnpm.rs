@@ -157,8 +157,7 @@ where
 #[cfg(unix)]
 fn file_identity(path: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(path)
-        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    let md = std::fs::metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
     (md.dev(), md.ino())
 }
 
@@ -460,8 +459,7 @@ fn apply_in_pnpm_project_emits_layout_note() {
     let root = tempfile::tempdir().unwrap();
     let fx = setup_two_pnpm_projects(root.path());
 
-    let (_stdout, stderr) =
-        assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
+    let (_stdout, stderr) = assert_run_ok(&fx.proj_a, &["get", NPM_UUID], "socket-patch get");
 
     // The exact phrasing is a stable contract. A bare `contains("pnpm")`
     // is worthless here — every pnpm store path printed on stderr

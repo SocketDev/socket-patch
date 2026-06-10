@@ -881,14 +881,9 @@ mod tests {
         }
         // A non-version sibling dir under the id (should be ignored, not
         // emitted as `@tools`).
-        tokio::fs::create_dir_all(
-            dir.path()
-                .join("newtonsoft.json")
-                .join("tools")
-                .join("lib"),
-        )
-        .await
-        .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("newtonsoft.json").join("tools").join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         let options = CrawlerOptions {

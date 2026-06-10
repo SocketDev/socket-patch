@@ -80,7 +80,9 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
         .await;
     // Per-package search (scan --apply uses it)
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID,
@@ -169,11 +171,24 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
     // and classify it as new (not skipped/updated). Without these a regression
     // that double-counts, re-uses a stale cache, or mislabels the action stays
     // green on `applied == 1` alone.
-    assert_eq!(apply["downloaded"], 1, "the new patch must be downloaded; apply={apply:?}");
-    assert_eq!(apply["skipped"], 0, "nothing to skip on a fresh add; apply={apply:?}");
-    assert_eq!(apply["updated"], 0, "no manifest entry existed to update; apply={apply:?}");
+    assert_eq!(
+        apply["downloaded"], 1,
+        "the new patch must be downloaded; apply={apply:?}"
+    );
+    assert_eq!(
+        apply["skipped"], 0,
+        "nothing to skip on a fresh add; apply={apply:?}"
+    );
+    assert_eq!(
+        apply["updated"], 0,
+        "no manifest entry existed to update; apply={apply:?}"
+    );
     let patches = apply["patches"].as_array().expect("apply.patches array");
-    assert_eq!(patches.len(), 1, "exactly one patch record; apply={apply:?}");
+    assert_eq!(
+        patches.len(),
+        1,
+        "exactly one patch record; apply={apply:?}"
+    );
     assert_eq!(patches[0]["purl"], purl);
     assert_eq!(patches[0]["uuid"], UUID);
     assert_eq!(
@@ -184,7 +199,10 @@ async fn scan_sync_against_clean_project_adds_and_applies_patch() {
 
     // The manifest must exist AND record this exact patch/uuid.
     let manifest_path = tmp.path().join(".socket/manifest.json");
-    assert!(manifest_path.exists(), "scan --sync must write the manifest");
+    assert!(
+        manifest_path.exists(),
+        "scan --sync must write the manifest"
+    );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
             .expect("valid manifest JSON");
@@ -268,7 +286,9 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         .mount(&mock)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID,
@@ -373,16 +393,28 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
         .as_object()
         .unwrap_or_else(|| panic!("scan --apply must emit an apply sub-object; envelope={v}"));
     assert_eq!(apply["found"], 1, "apply.found; apply={apply:?}");
-    assert_eq!(apply["skipped"], 1, "patch must be skipped; apply={apply:?}");
-    assert_eq!(apply["applied"], 0, "nothing applied on a skip; apply={apply:?}");
+    assert_eq!(
+        apply["skipped"], 1,
+        "patch must be skipped; apply={apply:?}"
+    );
+    assert_eq!(
+        apply["applied"], 0,
+        "nothing applied on a skip; apply={apply:?}"
+    );
     assert_eq!(apply["failed"], 0, "apply.failed; apply={apply:?}");
     // The defining claim of this test ("skip the blob download / use the cached
     // one"): a known UUID with a cached blob must NOT trigger a blob download
     // and must NOT update the manifest. The original test asserted neither, so
     // a regression that re-downloads/re-writes on every run stayed green on
     // `skipped == 1` alone.
-    assert_eq!(apply["downloaded"], 0, "a cached/known patch must not be downloaded; apply={apply:?}");
-    assert_eq!(apply["updated"], 0, "a skipped patch must not update the manifest; apply={apply:?}");
+    assert_eq!(
+        apply["downloaded"], 0,
+        "a cached/known patch must not be downloaded; apply={apply:?}"
+    );
+    assert_eq!(
+        apply["updated"], 0,
+        "a skipped patch must not update the manifest; apply={apply:?}"
+    );
     let patches = apply["patches"].as_array().expect("apply.patches array");
     assert_eq!(patches.len(), 1, "apply={apply:?}");
     assert_eq!(patches[0]["uuid"], UUID);
@@ -413,14 +445,17 @@ async fn scan_apply_with_existing_blob_uses_local_cache() {
     // A skip must leave the manifest byte-identical: exactly the one pre-staged
     // entry under its purl with the same UUID — not duplicated, replaced, or
     // augmented with a second record.
-    let manifest_after: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
-    )
-    .expect("valid manifest JSON after skip");
+    let manifest_after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .expect("valid manifest JSON after skip");
     let entries = manifest_after["patches"]
         .as_object()
         .expect("manifest patches object");
-    assert_eq!(entries.len(), 1, "skip must not add/duplicate manifest entries; manifest={manifest_after}");
+    assert_eq!(
+        entries.len(),
+        1,
+        "skip must not add/duplicate manifest entries; manifest={manifest_after}"
+    );
     assert_eq!(
         manifest_after["patches"][purl]["uuid"], UUID,
         "skip must preserve the original manifest UUID; manifest={manifest_after}"

@@ -169,8 +169,7 @@ fn no_verify_emits_valid_openvex() {
     );
 
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let doc: Value = serde_json::from_str(&stdout)
-        .expect("vex stdout must be valid JSON");
+    let doc: Value = serde_json::from_str(&stdout).expect("vex stdout must be valid JSON");
 
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
     assert_eq!(doc["@id"], "urn:uuid:fixed-test-id");
@@ -473,17 +472,15 @@ fn auto_detect_uses_package_json() {
     write_manifest(cwd, &manifest);
 
     let out = cli()
-        .args([
-            "vex",
-            "--cwd",
-            cwd.to_str().unwrap(),
-            "--no-verify",
-        ])
+        .args(["vex", "--cwd", cwd.to_str().unwrap(), "--no-verify"])
         .output()
         .expect("invoke vex");
     assert!(out.status.success());
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(doc["statements"][0]["products"][0]["@id"], "pkg:npm/my-app@7.7.7");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:npm/my-app@7.7.7"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -875,8 +872,9 @@ fn json_envelope_partial_failure_on_mixed_verify() {
     let events = env["events"].as_array().unwrap();
     // The applied patch surfaces as a `verified` event keyed by its PURL.
     assert!(
-        events.iter().any(|e| e["action"] == "verified"
-            && e["purl"] == "pkg:npm/applied-pkg@1.0.0"),
+        events
+            .iter()
+            .any(|e| e["action"] == "verified" && e["purl"] == "pkg:npm/applied-pkg@1.0.0"),
         "expected a verified event for the applied package. events:\n{events:#?}"
     );
     // The omitted patch surfaces as a `skipped` event whose `errorCode`
@@ -895,7 +893,11 @@ fn json_envelope_partial_failure_on_mixed_verify() {
     let vex_text = std::fs::read_to_string(&vex_path).unwrap();
     let doc: Value = serde_json::from_str(&vex_text).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(stmts.len(), 1, "only the applied patch is attested. doc:\n{vex_text}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "only the applied patch is attested. doc:\n{vex_text}"
+    );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-applied");
     assert!(
         !vex_text.contains("GHSA-unapplied"),
@@ -1022,8 +1024,8 @@ fn maybe_validate_with_vexctl(vex_text: &str) {
         String::from_utf8_lossy(&out.stdout)
     );
     // Sanity: the merge output must itself be valid OpenVEX JSON.
-    let _: Value = serde_json::from_slice(&out.stdout)
-        .expect("vexctl merge output must be valid JSON");
+    let _: Value =
+        serde_json::from_slice(&out.stdout).expect("vexctl merge output must be valid JSON");
 }
 
 /// Stdlib-only `PATH` lookup for `vexctl`. Returns `None` if missing.

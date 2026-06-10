@@ -333,8 +333,14 @@ fn subprocess_configures_real_package_json() {
         "postinstall must invoke `socket-patch apply`, got {postinstall:?}"
     );
     // Original metadata must be preserved, not clobbered.
-    assert_eq!(parsed["name"], "demo", "setup must preserve existing fields");
-    assert_eq!(parsed["version"], "1.0.0", "setup must preserve existing fields");
+    assert_eq!(
+        parsed["name"], "demo",
+        "setup must preserve existing fields"
+    );
+    assert_eq!(
+        parsed["version"], "1.0.0",
+        "setup must preserve existing fields"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +470,10 @@ fn subprocess_already_configured_is_idempotent() {
         v2["status"], "already_configured",
         "re-running setup on a configured project must report 'already_configured'; payload: {v2}"
     );
-    assert_eq!(v2["updated"], 0, "no further updates expected; payload: {v2}");
+    assert_eq!(
+        v2["updated"], 0,
+        "no further updates expected; payload: {v2}"
+    );
 
     let after_second = std::fs::read_to_string(&pkg_path).expect("read");
     assert_eq!(

@@ -136,7 +136,8 @@ pub fn is_safe_relative_subpath(normalized: &str) -> bool {
     if path.is_absolute() {
         return false;
     }
-    path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    path.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 /// Verify a single file can be patched.
@@ -1066,7 +1067,9 @@ mod tests {
         }
         // The `package/`-prefixed escape that previously slipped through:
         // `package//etc/passwd` normalizes to `/etc/passwd`.
-        assert!(!is_safe_relative_subpath(normalize_file_path("package//etc/passwd")));
+        assert!(!is_safe_relative_subpath(normalize_file_path(
+            "package//etc/passwd"
+        )));
     }
 
     #[tokio::test]
@@ -2258,12 +2261,22 @@ mod tests {
         assert_eq!(tokio::fs::read(&path).await.unwrap(), patched);
         // New file still defaults to read-only.
         assert_eq!(
-            tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o7777,
+            tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o444
         );
         // The pre-existing read-only package root is restored exactly.
         assert_eq!(
-            tokio::fs::metadata(dir.path()).await.unwrap().permissions().mode() & 0o7777,
+            tokio::fs::metadata(dir.path())
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o555,
             "package root mode must be restored after the mkdir"
         );
@@ -2307,7 +2320,12 @@ mod tests {
 
         assert_eq!(tokio::fs::read(sub.join("new.js")).await.unwrap(), patched);
         assert_eq!(
-            tokio::fs::metadata(&sub).await.unwrap().permissions().mode() & 0o7777,
+            tokio::fs::metadata(&sub)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
             0o555,
             "existing subdir mode must be restored"
         );

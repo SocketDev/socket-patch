@@ -106,7 +106,10 @@ fn remove_with_unknown_identifier_emits_not_found() {
     assert_eq!(v["status"], "notFound");
     assert_eq!(v["error"]["code"], "not_found");
     if let Some(summary) = v.get("summary") {
-        assert_eq!(summary["removed"], 0, "a not-found remove must report 0 removed");
+        assert_eq!(
+            summary["removed"], 0,
+            "a not-found remove must report 0 removed"
+        );
     }
 
     // A no-match remove must leave BOTH existing entries in place and must
@@ -118,7 +121,10 @@ fn remove_with_unknown_identifier_emits_not_found() {
     assert!(patches.contains_key("pkg:npm/__remove_test_a__@1.0.0"));
     assert!(patches.contains_key("pkg:npm/__remove_test_b__@2.0.0"));
     let after = std::fs::read(socket.join("manifest.json")).expect("read after");
-    assert_eq!(before, after, "a no-op remove must not rewrite the manifest file");
+    assert_eq!(
+        before, after,
+        "a no-op remove must not rewrite the manifest file"
+    );
 }
 
 #[test]
@@ -136,7 +142,9 @@ fn remove_with_invalid_manifest_emits_error() {
     // A parse failure must be distinguished from a missing manifest, otherwise
     // a broken loader could silently treat corrupt JSON as "not found".
     assert_eq!(v["error"]["code"], "manifest_unreadable");
-    let msg = v["error"]["message"].as_str().expect("error message string");
+    let msg = v["error"]["message"]
+        .as_str()
+        .expect("error message string");
     assert!(
         msg.contains("parse") || msg.contains("JSON"),
         "error message should explain the parse failure; got: {msg}"
@@ -282,7 +290,10 @@ fn remove_without_skip_rollback_fails_closed_and_keeps_manifest() {
         v["error"]["code"], "rollback_failed",
         "remove must surface the rollback failure, not a generic error"
     );
-    assert_eq!(v["summary"]["removed"], 0, "nothing removed when rollback fails");
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "nothing removed when rollback fails"
+    );
 
     // The crucial invariant: the manifest is byte-for-byte unchanged. The
     // entry the user asked to remove is still present because its files could
@@ -364,8 +375,14 @@ fn remove_blob_sweep_does_not_inflate_removed_count() {
 
     // B's afterHash blob is still referenced, so it must survive on disk;
     // A's must be gone.
-    assert!(!blobs.join(AFTER_A).exists(), "A's orphaned blob must be swept");
-    assert!(blobs.join(AFTER_B).exists(), "B's referenced blob must remain");
+    assert!(
+        !blobs.join(AFTER_A).exists(),
+        "A's orphaned blob must be swept"
+    );
+    assert!(
+        blobs.join(AFTER_B).exists(),
+        "B's referenced blob must remain"
+    );
 }
 
 // ---------------------------------------------------------------------------

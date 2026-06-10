@@ -97,8 +97,15 @@ fn setup_ecosystems_filter_scopes_work_to_named_ecosystem() {
     let original_requirements = "requests==2.31.0\n";
     write(&proj.path().join("requirements.txt"), original_requirements);
 
-    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--json", "--yes", "--ecosystems", "npm"]);
-    assert_eq!(code, 0, "scoped setup should still succeed; stdout=\n{stdout}");
+    let (code, stdout) = run(
+        proj.path(),
+        home.path(),
+        &["setup", "--json", "--yes", "--ecosystems", "npm"],
+    );
+    assert_eq!(
+        code, 0,
+        "scoped setup should still succeed; stdout=\n{stdout}"
+    );
 
     // The npm side IS in scope and must be configured (proves the run happened).
     assert!(
@@ -147,7 +154,10 @@ fn setup_check_detects_unapplied_manifest_patch() {
     let patched = b"patched\n";
     let on_disk = b"DRIFTED-not-the-patched-content\n";
     let pkg = proj.path().join("node_modules/badpkg");
-    write(&pkg.join("package.json"), r#"{ "name": "badpkg", "version": "1.0.0" }"#);
+    write(
+        &pkg.join("package.json"),
+        r#"{ "name": "badpkg", "version": "1.0.0" }"#,
+    );
     write(&pkg.join("index.js"), &String::from_utf8_lossy(on_disk));
 
     write(

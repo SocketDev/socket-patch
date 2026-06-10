@@ -153,7 +153,10 @@ fn monorepo_target_routes_through_npm_round_trip() {
         targets.len()
     );
     let t = &targets[0];
-    assert_eq!(t["ecosystem"], "monorepo", "monorepo target ecosystem changed");
+    assert_eq!(
+        t["ecosystem"], "monorepo",
+        "monorepo target ecosystem changed"
+    );
     assert_eq!(t["pm"], "mono", "monorepo target pm changed");
     assert_eq!(
         t["image"], "npm",
@@ -171,7 +174,10 @@ fn monorepo_target_routes_through_npm_round_trip() {
         "monorepo target purl changed — the patched slice is no longer the npm dependency"
     );
     assert!(
-        t["manifest_key"].as_str().unwrap_or("").contains("index.js"),
+        t["manifest_key"]
+            .as_str()
+            .unwrap_or("")
+            .contains("index.js"),
         "monorepo manifest_key no longer points at the npm package file"
     );
     assert_eq!(

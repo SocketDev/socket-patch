@@ -20,7 +20,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::ecosystem_dispatch::{crawl_all_ecosystems, find_packages_for_rollback, partition_purls};
+use crate::ecosystem_dispatch::{
+    crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
+};
 use crate::output::{confirm, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
@@ -97,9 +99,7 @@ pub(crate) fn severity_rank(severity: &str) -> u8 {
 /// Return the highest-severity label from a vulnerabilities map.
 /// Returns `None` when the map is empty or every entry's severity is
 /// unrecognized.
-pub(crate) fn max_vuln_severity(
-    vulns: &HashMap<String, VulnerabilityResponse>,
-) -> Option<String> {
+pub(crate) fn max_vuln_severity(vulns: &HashMap<String, VulnerabilityResponse>) -> Option<String> {
     vulns
         .values()
         .max_by_key(|v| severity_rank(&v.severity))
@@ -155,10 +155,7 @@ pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
         "license".into(),
         serde_json::Value::String(patch.license.clone()),
     );
-    meta.insert(
-        "tier".into(),
-        serde_json::Value::String(patch.tier.clone()),
-    );
+    meta.insert("tier".into(), serde_json::Value::String(patch.tier.clone()));
     meta.insert(
         "exportedAt".into(),
         serde_json::Value::String(patch.published_at.clone()),
@@ -174,8 +171,7 @@ pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
 /// per-patch action record. Convenience wrapper that handles the
 /// unwrap of `Value::Object`.
 fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
-    if let (Some(record_obj), serde_json::Value::Object(meta_obj)) =
-        (record.as_object_mut(), meta)
+    if let (Some(record_obj), serde_json::Value::Object(meta_obj)) = (record.as_object_mut(), meta)
     {
         for (k, v) in meta_obj {
             record_obj.insert(k, v);
@@ -262,8 +258,8 @@ async fn write_blob_entry(
     file_path: &str,
     label: &str,
 ) -> Result<(), String> {
-    let decoded = base64_decode(b64)
-        .map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
+    let decoded =
+        base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
     tokio::fs::write(blobs_dir.join(hash), &decoded)
         .await
         .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))
@@ -278,9 +274,7 @@ async fn write_all_patch_blobs(
     quiet: bool,
 ) -> Result<(), ()> {
     for (file_path, file_info) in &patch.files {
-        if let (Some(blob), Some(hash)) =
-            (&file_info.blob_content, &file_info.after_hash)
-        {
+        if let (Some(blob), Some(hash)) = (&file_info.blob_content, &file_info.after_hash) {
             if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, "blob").await {
                 if !quiet {
                     eprintln!("  [error] {e}");
@@ -288,11 +282,8 @@ async fn write_all_patch_blobs(
                 return Err(());
             }
         }
-        if let (Some(blob), Some(hash)) =
-            (&file_info.before_blob_content, &file_info.before_hash)
-        {
-            if let Err(e) =
-                write_blob_entry(blobs_dir, blob, hash, file_path, "before-blob").await
+        if let (Some(blob), Some(hash)) = (&file_info.before_blob_content, &file_info.before_hash) {
+            if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, "before-blob").await
             {
                 if !quiet {
                     eprintln!("  [error] {e}");
@@ -329,10 +320,7 @@ fn vulnerabilities_for_manifest(
 /// `patch`. `files` is the (purl-keyed) before/after-hash map the
 /// caller built — semantics for what counts as a "patchable file" differ
 /// between the get and download flows, so the caller owns that decision.
-fn build_patch_record(
-    patch: &PatchResponse,
-    files: HashMap<String, PatchFileInfo>,
-) -> PatchRecord {
+fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInfo>) -> PatchRecord {
     PatchRecord {
         uuid: patch.uuid.clone(),
         exported_at: patch.published_at.clone(),
@@ -369,7 +357,12 @@ pub struct GetArgs {
     pub package: bool,
 
     /// Download patch without applying it.
-    #[arg(long = "save-only", alias = "no-apply", env = "SOCKET_SAVE_ONLY", default_value_t = false)]
+    #[arg(
+        long = "save-only",
+        alias = "no-apply",
+        env = "SOCKET_SAVE_ONLY",
+        default_value_t = false
+    )]
     pub save_only: bool,
 
     /// Apply patch immediately without saving to .socket folder.
@@ -413,7 +406,8 @@ impl fmt::Display for IdentifierType {
 }
 
 fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
-    let uuid_re = Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
+    let uuid_re =
+        Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").unwrap();
     let cve_re = Regex::new(r"(?i)^CVE-\d{4}-\d+$").unwrap();
     let ghsa_re = Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$").unwrap();
 
@@ -839,7 +833,10 @@ pub async fn download_and_apply_patches(
                 }
 
                 let quiet = params.json || params.silent;
-                if write_all_patch_blobs(&blobs_dir, &patch, quiet).await.is_err() {
+                if write_all_patch_blobs(&blobs_dir, &patch, quiet)
+                    .await
+                    .is_err()
+                {
                     patches_failed += 1;
                     downloaded_patches.push(serde_json::json!({
                         "purl": patch.purl,
@@ -1303,16 +1300,16 @@ pub async fn run(args: GetArgs) -> i32 {
         if args.common.json {
             print_json(&empty_result_json("not_found"));
         } else {
-            println!(
-                "No patches found for {}: {}",
-                id_type, args.identifier
-            );
+            println!("No patches found for {}: {}", id_type, args.identifier);
         }
         return 0;
     }
 
     if !args.common.json {
-        display_search_results(&search_response.patches, search_response.can_access_paid_patches);
+        display_search_results(
+            &search_response.patches,
+            search_response.can_access_paid_patches,
+        );
     }
 
     // Filter accessible patches
@@ -1442,8 +1439,7 @@ async fn save_and_apply_patch(
     _org_slug: Option<&str>,
 ) -> i32 {
     // For UUID mode, fetch and save
-    let (api_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let (api_client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let effective_org: Option<&str> = None; // org slug is already stored in the client
 
     let patch = match api_client.fetch_patch(effective_org, uuid).await {
@@ -1467,7 +1463,10 @@ async fn save_and_apply_patch(
     let manifest_path = socket_dir.join("manifest.json");
 
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        report_error(args.common.json, format!("Failed to create blobs directory: {e}"));
+        report_error(
+            args.common.json,
+            format!("Failed to create blobs directory: {e}"),
+        );
         return 1;
     }
 
@@ -1512,7 +1511,10 @@ async fn save_and_apply_patch(
                 }],
             }));
         } else {
-            eprintln!("Error: Blob decode or write failed for patch {}", patch.purl);
+            eprintln!(
+                "Error: Blob decode or write failed for patch {}",
+                patch.purl
+            );
         }
         return 1;
     }
@@ -1589,13 +1591,17 @@ async fn save_and_apply_patch(
             // record means the consumer already saw the metadata last time.
             merge_metadata(&mut patch_record, patch_event_metadata(&patch));
         }
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "status": status,
-            "found": 1,
-            "downloaded": if added { 1 } else { 0 },
-            "applied": if apply_succeeded { 1 } else { 0 },
-            "patches": [patch_record],
-        })).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "found": 1,
+                "downloaded": if added { 1 } else { 0 },
+                "applied": if apply_succeeded { 1 } else { 0 },
+                "patches": [patch_record],
+            }))
+            .unwrap()
+        );
     }
 
     exit_code
@@ -1720,12 +1726,7 @@ mod tests {
 
     // --- select_patches ---------------------------------------------------
 
-    fn mk_patch(
-        uuid: &str,
-        purl: &str,
-        tier: &str,
-        published_at: &str,
-    ) -> PatchSearchResult {
+    fn mk_patch(uuid: &str, purl: &str, tier: &str, published_at: &str) -> PatchSearchResult {
         PatchSearchResult {
             uuid: uuid.into(),
             purl: purl.into(),
@@ -2218,7 +2219,10 @@ mod tests {
 
     #[test]
     fn short_uuid_truncates_normal_uuid() {
-        assert_eq!(short_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c"), "80630680");
+        assert_eq!(
+            short_uuid("80630680-4da6-45f9-bba8-b888e0ffd58c"),
+            "80630680"
+        );
     }
 
     #[test]
@@ -2234,7 +2238,7 @@ mod tests {
         // char boundary here — but byte 7 would not be). Use a value whose
         // 8th byte splits a char to exercise the None fallback.
         let s = "ab€cd"; // '€' is 3 bytes: bytes are a b € c d -> len 7
-        // get(..8) is out of range -> None -> whole string, no panic.
+                         // get(..8) is out of range -> None -> whole string, no panic.
         assert_eq!(short_uuid(s), s);
         // A value where byte 8 splits the trailing multibyte char.
         let s2 = "abcdef€"; // 6 ascii + 3-byte '€' = 9 bytes; byte 8 mid-char

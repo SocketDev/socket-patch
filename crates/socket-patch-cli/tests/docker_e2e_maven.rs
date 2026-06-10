@@ -60,8 +60,7 @@ fn git_sha256(content: &[u8]) -> String {
 }
 
 async fn make_mock_server(after_hash: &str) -> MockServer {
-    let listener =
-        std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
     let server = MockServer::builder().listener(listener).start().await;
 
     Mock::given(method("POST"))
@@ -81,7 +80,9 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": PURL,

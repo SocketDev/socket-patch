@@ -180,10 +180,15 @@ async fn scan_emits_patch_scanned_telemetry_on_success() {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::POST
-                && r.url.path().ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
+                && r.url
+                    .path()
+                    .ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
         })
         .count();
-    assert!(batch_hits >= 1, "scan must POST to the patches/batch endpoint");
+    assert!(
+        batch_hits >= 1,
+        "scan must POST to the patches/batch endpoint"
+    );
 }
 
 #[tokio::test]
@@ -198,18 +203,29 @@ async fn scan_skips_telemetry_in_airgap_mode() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2");
 
-    let (code, stdout, stderr) =
-        run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[("SOCKET_OFFLINE", "1")]);
+    let (code, stdout, stderr) = run_cmd(
+        tmp.path(),
+        &mock.uri(),
+        "scan",
+        &[],
+        &[("SOCKET_OFFLINE", "1")],
+    );
 
     // Guard against a vacuous pass: prove scan actually ran its body (it
     // crawled node_modules and reported the one package) rather than
     // crashing before the telemetry-suppression point, which would also
     // yield zero POSTs.
     assert_eq!(code, 0, "offline scan must still succeed; stderr={stderr}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("scan stdout not JSON: {e}\n{stdout}"));
-    assert_eq!(v["status"], "success", "offline scan status; stdout={stdout}");
-    assert_eq!(v["scannedPackages"], 1, "offline scan must crawl the one package; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("scan stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(
+        v["status"], "success",
+        "offline scan status; stdout={stdout}"
+    );
+    assert_eq!(
+        v["scannedPackages"], 1,
+        "offline scan must crawl the one package; stdout={stdout}"
+    );
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
@@ -245,13 +261,7 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
     write_root_package_json(tmp.path());
     write_npm_package(tmp.path(), "lodash", "4.17.20");
 
-    let (code, stdout, stderr) = run_cmd(
-        tmp.path(),
-        &mock.uri(),
-        "get",
-        &["--id", UUID],
-        &[],
-    );
+    let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "get", &["--id", UUID], &[]);
 
     // The mock serves the patch on the real `patches/view/{uuid}` endpoint,
     // so this is a genuine SUCCESS: get must fire exactly one
@@ -282,13 +292,18 @@ async fn get_emits_patch_fetched_telemetry_on_uuid_lookup_success() {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::GET
-                && r.url.path().contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
+                && r.url
+                    .path()
+                    .contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
         })
         .count();
     assert!(
         view_hits >= 1,
         "get must GET the patches/view/{{uuid}} endpoint; saw paths: {:?}",
-        received.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        received
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -331,13 +346,18 @@ async fn get_skips_telemetry_in_airgap_mode() {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::GET
-                && r.url.path().contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
+                && r.url
+                    .path()
+                    .contains(&format!("/v0/orgs/{ORG_SLUG}/patches/view/"))
         })
         .count();
     assert!(
         view_hits >= 1,
         "offline get must still query the view endpoint; saw paths: {:?}; stdout={stdout}",
-        received.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        received
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 
     let count = telemetry_post_count(&mock, None).await;
@@ -366,11 +386,7 @@ async fn apply_skips_telemetry_in_airgap_mode() {
     // runs the command body (and would normally fire telemetry).
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{"patches":{}}"#,
-    )
-    .unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
 
     let (_code, stdout, _stderr) = run_cmd(
         tmp.path(),
@@ -385,10 +401,16 @@ async fn apply_skips_telemetry_in_airgap_mode() {
     // wasn't a side effect of an early crash. (Apply on an empty manifest
     // currently reports partialFailure — a separately tracked design gap —
     // so we assert on the envelope shape, not the status string.)
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("apply stdout not JSON: {e}\n{stdout}"));
-    assert_eq!(v["command"], "apply", "apply must emit its command envelope; stdout={stdout}");
-    assert!(v.get("summary").is_some(), "apply envelope must carry a summary; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("apply stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(
+        v["command"], "apply",
+        "apply must emit its command envelope; stdout={stdout}"
+    );
+    assert!(
+        v.get("summary").is_some(),
+        "apply envelope must carry a summary; stdout={stdout}"
+    );
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(
@@ -414,11 +436,7 @@ async fn list_emits_patch_listed_telemetry_when_telemetry_enabled() {
     write_root_package_json(tmp.path());
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{"patches":{}}"#,
-    )
-    .unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
 
     let (code, _stdout, _stderr) = run_cmd(tmp.path(), &mock.uri(), "list", &[], &[]);
     assert_eq!(code, 0);
@@ -489,7 +507,8 @@ async fn scan_falls_back_to_proxy_on_401_and_tags_telemetry() {
         .expect("recording enabled")
         .iter()
         .filter(|r| {
-            r.method == wiremock::http::Method::GET && r.url.path().starts_with("/patch/by-package/")
+            r.method == wiremock::http::Method::GET
+                && r.url.path().starts_with("/patch/by-package/")
         })
         .count();
     assert!(
@@ -578,7 +597,9 @@ async fn scan_does_not_fall_back_on_500() {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::POST
-                && r.url.path().ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
+                && r.url
+                    .path()
+                    .ends_with(&format!("/v0/orgs/{ORG_SLUG}/patches/batch"))
         })
         .count();
     assert!(
@@ -608,11 +629,7 @@ async fn list_skips_telemetry_in_airgap_mode() {
     write_root_package_json(tmp.path());
     let socket = tmp.path().join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        r#"{"patches":{}}"#,
-    )
-    .unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
 
     let (code, stdout, stderr) = run_cmd(
         tmp.path(),
@@ -626,10 +643,16 @@ async fn list_skips_telemetry_in_airgap_mode() {
     // (it's a local command) rather than crashing before the telemetry
     // decision, which would also yield zero POSTs.
     assert_eq!(code, 0, "offline list must succeed; stderr={stderr}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("list stdout not JSON: {e}\n{stdout}"));
-    assert_eq!(v["command"], "list", "list must emit its command envelope; stdout={stdout}");
-    assert_eq!(v["status"], "success", "offline list status; stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("list stdout not JSON: {e}\n{stdout}"));
+    assert_eq!(
+        v["command"], "list",
+        "list must emit its command envelope; stdout={stdout}"
+    );
+    assert_eq!(
+        v["status"], "success",
+        "offline list status; stdout={stdout}"
+    );
 
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(count, 0, "SOCKET_OFFLINE=1 must suppress patch_listed");

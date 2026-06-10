@@ -172,7 +172,10 @@ pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Ve
 
 /// Unwire the project: strip the Gemfile block (byte-for-byte restore) and
 /// delete the generated plugin directory.
-pub async fn remove_plugin_directive(project: &BundlerProject, dry_run: bool) -> Vec<GemEditResult> {
+pub async fn remove_plugin_directive(
+    project: &BundlerProject,
+    dry_run: bool,
+) -> Vec<GemEditResult> {
     vec![
         edit_gemfile_remove(&project.gemfile, dry_run).await,
         remove_plugin_files(&project.root, dry_run).await,
@@ -188,7 +191,10 @@ mod tests {
     #[test]
     fn test_add_appends_block_and_is_idempotent() {
         let out = gemfile_add(GEMFILE).unwrap();
-        assert!(out.starts_with(GEMFILE), "original bytes preserved as a prefix");
+        assert!(
+            out.starts_with(GEMFILE),
+            "original bytes preserved as a prefix"
+        );
         assert!(is_plugin_directive_present(&out));
         assert!(out.contains("plugin 'socket-patch'"));
         assert!(out.contains("File.expand_path('.socket/bundler-plugin', __dir__)"));
@@ -200,7 +206,10 @@ mod tests {
     fn test_add_then_remove_round_trips_byte_for_byte() {
         let added = gemfile_add(GEMFILE).unwrap();
         let removed = gemfile_remove(&added).unwrap();
-        assert_eq!(removed, GEMFILE, "remove must restore the original bytes exactly");
+        assert_eq!(
+            removed, GEMFILE,
+            "remove must restore the original bytes exactly"
+        );
     }
 
     #[test]
@@ -377,7 +386,9 @@ mod tests {
 
         // Idempotent re-run.
         let again = add_plugin_directive(&project, false).await;
-        assert!(again.iter().all(|r| r.status == GemSetupStatus::AlreadyConfigured));
+        assert!(again
+            .iter()
+            .all(|r| r.status == GemSetupStatus::AlreadyConfigured));
 
         let removed = remove_plugin_directive(&project, false).await;
         assert!(removed.iter().all(|r| r.status == GemSetupStatus::Updated));

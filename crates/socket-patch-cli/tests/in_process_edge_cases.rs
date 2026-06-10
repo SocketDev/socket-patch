@@ -130,12 +130,7 @@ async fn apply_overwrites_read_only_file() {
         r#"{"name":"r","version":"0.0.0"}"#,
     )
     .unwrap();
-    write_npm_pkg(
-        tmp.path(),
-        "ro-target",
-        "1.0.0",
-        &[("index.js", original)],
-    );
+    write_npm_pkg(tmp.path(), "ro-target", "1.0.0", &[("index.js", original)]);
     // Make the package file read-only — apply must make it writable to
     // overwrite. This mimics the cargo-registry-source layout.
     let file = tmp.path().join("node_modules/ro-target/index.js");
@@ -302,12 +297,7 @@ async fn apply_blob_after_hash_mismatch_reports_failure() {
     let claimed_after_hash = git_sha256(b"different content"); // mismatched
     let actual_blob_bytes = b"this is what's on disk\n"; // doesn't hash to claimed_after_hash
     let before_hash = git_sha256(original);
-    write_npm_pkg(
-        tmp.path(),
-        "mismatch",
-        "1.0.0",
-        &[("index.js", original)],
-    );
+    write_npm_pkg(tmp.path(), "mismatch", "1.0.0", &[("index.js", original)]);
 
     let socket = tmp.path().join(".socket");
     write_manifest(
@@ -353,7 +343,11 @@ async fn apply_blob_after_hash_mismatch_reports_failure() {
         actual_blob_bytes.as_slice(),
         "unverified blob bytes must never reach the target file"
     );
-    assert_eq!(post.as_slice(), original, "file must remain the pristine original");
+    assert_eq!(
+        post.as_slice(),
+        original,
+        "file must remain the pristine original"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -373,12 +367,7 @@ async fn apply_twice_second_run_is_idempotent() {
     let patched = b"patched\n";
     let before_hash = git_sha256(original);
     let after_hash = git_sha256(patched);
-    write_npm_pkg(
-        tmp.path(),
-        "idempotent",
-        "1.0.0",
-        &[("index.js", original)],
-    );
+    write_npm_pkg(tmp.path(), "idempotent", "1.0.0", &[("index.js", original)]);
 
     let socket = tmp.path().join(".socket");
     write_manifest(
@@ -417,7 +406,10 @@ async fn apply_twice_second_run_is_idempotent() {
     // allocates a fresh inode, so a lost short-circuit fails loudly here.
     assert_eq!(apply_run(default_apply(tmp.path())).await, 0);
     let after = std::fs::read(&target).unwrap();
-    assert_eq!(after, patched, "idempotent re-apply preserves patched content");
+    assert_eq!(
+        after, patched,
+        "idempotent re-apply preserves patched content"
+    );
     #[cfg(unix)]
     assert_eq!(
         file_identity(&target),
@@ -472,7 +464,10 @@ async fn apply_with_missing_target_file_reports_failure() {
     assert!(!target.exists(), "precondition: target file must be absent");
 
     let code = apply_run(default_apply(tmp.path())).await;
-    assert_eq!(code, 1, "missing target file (non-empty beforeHash) must fail");
+    assert_eq!(
+        code, 1,
+        "missing target file (non-empty beforeHash) must fail"
+    );
     // The non-force failure path must not have conjured the file either.
     assert!(
         !target.exists(),
@@ -553,7 +548,7 @@ async fn rollback_already_original_short_circuits() {
             global: false,
             global_prefix: None,
             org: None,
-                        api_token: None,
+            api_token: None,
             ecosystems: Some(vec!["npm".to_string()]),
             json: true,
             verbose: false,

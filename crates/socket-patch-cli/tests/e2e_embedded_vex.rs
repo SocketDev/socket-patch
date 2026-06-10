@@ -251,12 +251,14 @@ fn apply_vex_writes_document_on_success() {
     assert_eq!(compute_git_sha256_from_bytes(&on_disk), after_hash);
 
     // The VEX doc landed at --vex with a statement for our GHSA.
-    let doc: Value =
-        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
     assert_eq!(doc["version"], 1, "OpenVEX revision counter starts at 1");
     assert!(
-        doc["author"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        doc["author"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
         "document must carry a non-empty author, got {:?}",
         doc["author"]
     );
@@ -305,8 +307,7 @@ fn apply_json_envelope_carries_vex_summary() {
     // The envelope's reported count must match what actually landed on
     // disk — otherwise a stub could report `statements: 1` while writing
     // an empty (or absent) document.
-    let doc: Value =
-        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     let stmts = doc["statements"].as_array().expect("doc.statements array");
     assert_eq!(
         stmts.len(),
@@ -413,12 +414,14 @@ fn scan_json_vex_no_verify_emits_summary() {
     assert_eq!(result["vex"]["format"], "openvex-0.2.0");
     assert_eq!(result["vex"]["path"], vex_path.to_str().unwrap());
 
-    let doc: Value =
-        serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
     assert_eq!(doc["version"], 1, "OpenVEX revision counter starts at 1");
     assert!(
-        doc["author"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+        doc["author"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
         "document must carry a non-empty author, got {:?}",
         doc["author"]
     );

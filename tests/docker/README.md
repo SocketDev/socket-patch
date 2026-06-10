@@ -13,6 +13,8 @@ against a wiremock-served patch fixture.
 | npm       | `npm install minimist@1.2.2`                                  | install + scan + apply + verify patched marker on disk |
 | pypi      | `pip install pydantic-ai==0.0.36` (in venv)                  | install + scan discovery  |
 | gem       | `gem install activestorage -v 5.2.0` (vendor/bundle)         | install + scan discovery  |
+| composer (vendor) | `composer update` (psr/log 3.0.x)                     | `docker_e2e_vendor_composer`: vendor → fresh-checkout `composer install --network none` → revert (see below) |
+| gem (vendor) | `bundle install` (rack ~> 3.1, bundler ~> 2.7)             | `docker_e2e_vendor_gem`: vendor → fresh-checkout frozen `bundle install --network none` → revert (see below) |
 | cargo     | `cargo fetch` with `serde = "=1.0.200"` in Cargo.toml         | install + scan discovery  |
 | golang    | `go mod download github.com/gin-gonic/gin@v1.9.1`             | install + scan discovery  |
 | maven     | `mvn dependency:get -Dartifact=org.apache.commons:commons-lang3:3.12.0` | install + scan discovery  |
@@ -56,6 +58,35 @@ cargo test -p socket-patch-cli --features docker-e2e \
 
 A default `cargo test` (no `--features docker-e2e`) skips this entire
 suite. Developers who aren't editing the test infra never need Docker.
+
+## Vendor capstone suites (`docker_e2e_vendor_*`)
+
+`tests/docker_e2e_vendor_composer.rs` and `tests/docker_e2e_vendor_gem.rs`
+prove the CLI_CONTRACT "Vendor command contract" rows against the real
+package managers. Unlike the scan→apply suites they are MULTI-STAGE: a host
+tempdir is bind-mounted at `/workspace` and shared across three `docker run`s
+(networked fixture install + offline `socket-patch vendor`; then a
+fresh-checkout install under `--network none` with cold caches; then
+idempotent re-vendor / `--revert` / re-vendor). Shared helpers live in
+`tests/docker_vendor_common/mod.rs`. They reuse the same images and run the
+same way:
+
+```sh
+docker build -f tests/docker/Dockerfile.base -t socket-patch-test-base:latest .
+docker build -f tests/docker/Dockerfile.composer -t socket-patch-test-composer:latest .
+docker build -f tests/docker/Dockerfile.gem -t socket-patch-test-gem:latest .
+cargo test -p socket-patch-cli --features docker-e2e \
+  --test docker_e2e_vendor_composer --test docker_e2e_vendor_gem
+```
+
+Because the vendor capstones exercise the binary BAKED into the base image,
+rebuild `Dockerfile.base` after changing vendor code or the runs test a
+stale binary. Note `Dockerfile.gem` is built on the official ruby image with
+bundler pinned `~> 2.7` (the series the gem vendor lock grammar was
+spike-validated against; bundler >= 2.7 needs ruby >= 3.2, newer than
+Debian 12's apt ruby). The gem suite runs against the default no-CHECKSUMS
+lock — the bundler >= 2.6 `lockfile_checksums` variant is a follow-up
+(see the TODO in `docker_e2e_vendor_gem.rs`).
 
 ## Host mode (no Docker)
 

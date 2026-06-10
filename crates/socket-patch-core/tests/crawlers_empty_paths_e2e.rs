@@ -197,7 +197,11 @@ async fn python_crawler_crawl_all_empty_returns_empty() {
     // Positive control: a populated .venv site-packages yields the package.
     let populated = tempfile::tempdir().unwrap();
     #[cfg(windows)]
-    let sp = populated.path().join(".venv").join("Lib").join("site-packages");
+    let sp = populated
+        .path()
+        .join(".venv")
+        .join("Lib")
+        .join("site-packages");
     #[cfg(not(windows))]
     let sp = populated
         .path()

@@ -195,8 +195,7 @@ async fn scan_discovers_go_modules() {
     // assertion below would fail.
     let decoy_cache = cache_dir.join("cache").join("download").join("evil@v9.9.9");
     std::fs::create_dir_all(&decoy_cache).unwrap();
-    std::fs::create_dir_all(cache_dir.join("github.com").join("plain").join("noversion"))
-        .unwrap();
+    std::fs::create_dir_all(cache_dir.join("github.com").join("plain").join("noversion")).unwrap();
 
     // Create a go.mod in the project directory so local mode activates
     std::fs::write(
@@ -291,8 +290,7 @@ async fn scan_discovers_case_encoded_modules() {
 
     // Decoy: a root-level cache/ download dir whose versioned entry must be
     // pruned, so the count stays at exactly one.
-    std::fs::create_dir_all(cache_dir.join("cache").join("download").join("evil@v9.9.9"))
-        .unwrap();
+    std::fs::create_dir_all(cache_dir.join("cache").join("download").join("evil@v9.9.9")).unwrap();
 
     // Create a go.mod in the project directory so local mode activates.
     std::fs::write(

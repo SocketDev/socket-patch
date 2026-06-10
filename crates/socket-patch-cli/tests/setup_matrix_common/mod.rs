@@ -81,7 +81,9 @@ fn matrix_path() -> PathBuf {
 /// Host mode runs the driver against host-installed toolchains instead
 /// of a container. Mirrors the `docker_e2e_*` convention.
 fn host_mode() -> bool {
-    std::env::var("SOCKET_PATCH_TEST_HOST").map(|v| v == "1").unwrap_or(false)
+    std::env::var("SOCKET_PATCH_TEST_HOST")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn docker_on_path() -> bool {
@@ -96,7 +98,11 @@ fn docker_on_path() -> bool {
 
 fn image_present(image: &str) -> bool {
     Command::new("docker")
-        .args(["image", "inspect", &format!("socket-patch-test-{image}:latest")])
+        .args([
+            "image",
+            "inspect",
+            &format!("socket-patch-test-{image}:latest"),
+        ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -153,8 +159,14 @@ impl Case {
             ("SM_PM".into(), self.pm.clone()),
             ("SM_SCENARIO".into(), self.scenario.clone()),
             ("SM_PATCHSET".into(), self.patchset.clone()),
-            ("SM_RUN_SETUP".into(), if self.run_setup { "1" } else { "0" }.into()),
-            ("SM_EXPECT_APPLIED".into(), if self.expect_applied { "1" } else { "0" }.into()),
+            (
+                "SM_RUN_SETUP".into(),
+                if self.run_setup { "1" } else { "0" }.into(),
+            ),
+            (
+                "SM_EXPECT_APPLIED".into(),
+                if self.expect_applied { "1" } else { "0" }.into(),
+            ),
             ("SM_PACKAGE".into(), self.package.clone()),
             ("SM_VERSION".into(), self.version.clone()),
             ("SM_PURL".into(), self.purl.clone()),
@@ -180,15 +192,18 @@ fn load_section(
     ecosystem: &str,
     pm: &str,
 ) -> Vec<Case> {
-    let text = std::fs::read_to_string(matrix_path())
-        .unwrap_or_else(|e| panic!("read matrix.json: {e}"));
-    let spec: serde_json::Value =
-        serde_json::from_str(&text).expect("parse matrix.json");
+    let text =
+        std::fs::read_to_string(matrix_path()).unwrap_or_else(|e| panic!("read matrix.json: {e}"));
+    let spec: serde_json::Value = serde_json::from_str(&text).expect("parse matrix.json");
     let marker = spec["marker"].as_str().unwrap_or("").to_string();
     let alt_marker = spec["alt_marker"].as_str().unwrap_or("").to_string();
     let known_regressions: std::collections::HashSet<String> = spec["known_regressions"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let target = spec[targets_key]
@@ -258,8 +273,8 @@ fn run_case(case: &Case) -> RunResult {
         }
         cmd.output().expect("spawn bash driver")
     } else {
-        let script = std::fs::read_to_string(&driver)
-            .unwrap_or_else(|e| panic!("read driver: {e}"));
+        let script =
+            std::fs::read_to_string(&driver).unwrap_or_else(|e| panic!("read driver: {e}"));
         let mut cmd = Command::new("docker");
         cmd.args(["run", "--rm"]);
         for (k, v) in &env {
@@ -320,7 +335,13 @@ pub fn run_pm(ecosystem: &str, pm: &str) {
 pub fn run_workspace_pm(ecosystem: &str, pm: &str) {
     run_cases(
         &format!("{ecosystem}/{pm} [workspace]"),
-        load_section("workspace_targets", "workspace_scenarios", "workspace", ecosystem, pm),
+        load_section(
+            "workspace_targets",
+            "workspace_scenarios",
+            "workspace",
+            ecosystem,
+            pm,
+        ),
     );
 }
 
@@ -328,7 +349,13 @@ pub fn run_workspace_pm(ecosystem: &str, pm: &str) {
 pub fn run_monorepo() {
     run_cases(
         "monorepo",
-        load_section("monorepo_targets", "monorepo_scenarios", "monorepo", "monorepo", "mono"),
+        load_section(
+            "monorepo_targets",
+            "monorepo_scenarios",
+            "monorepo",
+            "monorepo",
+            "mono",
+        ),
     );
 }
 
@@ -418,7 +445,11 @@ fn run_cases(label: &str, cases: Vec<Case>) {
                 };
                 failures.push(format!(
                     "  - {}: expected applied={}, got {} [{}]\n{}",
-                    case.id, case.expect_applied, applied, tag, indent(&res.raw)
+                    case.id,
+                    case.expect_applied,
+                    applied,
+                    tag,
+                    indent(&res.raw)
                 ));
             }
         }
@@ -534,10 +565,14 @@ fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
         ));
     }
     if check_setup != Some(0) {
-        problems.push(format!("check-after-setup exit={check_setup:?} (want 0; configured)"));
+        problems.push(format!(
+            "check-after-setup exit={check_setup:?} (want 0; configured)"
+        ));
     }
     if remove != Some(0) {
-        problems.push(format!("remove exit={remove:?} (want 0; remove must succeed)"));
+        problems.push(format!(
+            "remove exit={remove:?} (want 0; remove must succeed)"
+        ));
     }
     if !matches!(check_remove, Some(n) if n != 0) {
         problems.push(format!(
@@ -557,5 +592,8 @@ fn round_trip_failure(case: &Case, res: &RunResult) -> Option<String> {
 }
 
 fn indent(s: &str) -> String {
-    s.lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("      {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

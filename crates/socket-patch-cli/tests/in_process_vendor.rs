@@ -1,0 +1,883 @@
+//! In-process + envelope contract tests for `socket-patch vendor` (npm
+//! backend, plus the golang apply-yields-to-vendor handshake).
+//!
+//! The lifecycle tests call `socket_patch_cli::commands::vendor::run(args)`
+//! directly (the in-process convention of `in_process_cargo_apply.rs` /
+//! `in_process_edge_cases.rs`) and assert exit codes + disk state. The
+//! in-process `run()` prints its JSON envelope to the process stdout, which
+//! a test cannot capture — so every assertion that needs the envelope JSON
+//! itself goes through the built binary (`CARGO_BIN_EXE_socket-patch`) with
+//! a fully scrubbed child environment, exactly like the `e2e_*` suites.
+//!
+//! Hermeticity: every fixture stages its patch blob under `.socket/blobs/`
+//! and runs with `--offline`/`offline: true`, so the patch pipeline never
+//! touches the network. Subprocess children additionally get every ambient
+//! `SOCKET_*` var removed (env-robustness) and `SOCKET_TELEMETRY_DISABLED=1`.
+//! No test mutates this process's environment, so none of them need
+//! `#[serial]` — each runs in its own tempdir.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use socket_patch_cli::args::GlobalArgs;
+use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+/// Canonical-grammar patch UUID — the vendor path layer validates the uuid
+/// path level fail-closed, so fixtures must use the real shape.
+const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+const PURL: &str = "pkg:npm/left-pad@1.3.0";
+const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
+const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
+const REG_RESOLVED: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+const REG_INTEGRITY: &str = "sha512-orig==";
+
+/// Project-relative tarball path the npm backend must produce:
+/// `.socket/vendor/<eco>/<patch-uuid>/<name>-<version>.tgz`.
+fn rel_tgz() -> String {
+    format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+}
+
+// ───────────────────────────── fixture ─────────────────────────────
+
+/// One self-contained npm project: root package.json, a v3 package-lock with
+/// a registry-resolved `left-pad` entry, the installed package under
+/// node_modules/, and a `.socket/` manifest + after-hash blob so vendor runs
+/// fully offline.
+struct NpmFixture {
+    tmp: tempfile::TempDir,
+    /// The lockfile bytes exactly as the fixture wrote them — the
+    /// byte-identity oracle for dry-run / revert round-trips.
+    original_lock: Vec<u8>,
+    /// Manifest bytes as written (vendor must never touch the manifest).
+    original_manifest: Vec<u8>,
+    after_hash: String,
+}
+
+impl NpmFixture {
+    fn root(&self) -> &Path {
+        self.tmp.path()
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.root().join("package-lock.json")
+    }
+    fn lock_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.lock_path()).expect("read package-lock.json")
+    }
+    fn lock_value(&self) -> Value {
+        serde_json::from_slice(&self.lock_bytes()).expect("lock parses")
+    }
+    fn manifest_path(&self) -> PathBuf {
+        self.root().join(".socket/manifest.json")
+    }
+    fn vendor_dir(&self) -> PathBuf {
+        self.root().join(".socket/vendor")
+    }
+    fn tgz_path(&self) -> PathBuf {
+        self.root().join(rel_tgz())
+    }
+    fn marker_path(&self) -> PathBuf {
+        self.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ))
+    }
+    fn state_path(&self) -> PathBuf {
+        self.root().join(".socket/vendor/state.json")
+    }
+    fn installed_index(&self) -> PathBuf {
+        self.root().join("node_modules/left-pad/index.js")
+    }
+}
+
+/// The manifest patch record every fixture purl shares (same files map ⇒ one
+/// staged blob satisfies the offline source check for all of them).
+fn patch_record(before_hash: &str, after_hash: &str) -> Value {
+    json!({
+        "uuid": UUID,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+            "package/index.js": { "beforeHash": before_hash, "afterHash": after_hash }
+        },
+        "vulnerabilities": {},
+        "description": "synthetic vendor test patch",
+        "license": "MIT",
+        "tier": "free"
+    })
+}
+
+/// Build the fixture with a manifest covering `manifest_purls` (each gets an
+/// identical record). The installed package + lock entry always describe
+/// `left-pad@1.3.0`.
+fn npm_fixture_with_purls(manifest_purls: &[&str]) -> NpmFixture {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+
+    // Installed package (original, unpatched bytes).
+    let pkg = root.join("node_modules/left-pad");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        br#"{"name":"left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+
+    // Root project files. The lock is written pretty + 2-space indent +
+    // trailing newline — the exact shape the production serializer emits —
+    // so byte-identity assertions across vendor/revert are meaningful.
+    std::fs::write(
+        root.join("package.json"),
+        br#"{"name":"fixture","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    let lock = json!({
+        "name": "fixture",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "fixture",
+                "version": "1.0.0",
+                "dependencies": { "left-pad": "^1.3.0" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REG_RESOLVED,
+                "integrity": REG_INTEGRITY,
+                "license": "WTFPL"
+            }
+        }
+    });
+    let mut original_lock = serde_json::to_vec_pretty(&lock).unwrap();
+    original_lock.push(b'\n');
+    std::fs::write(root.join("package-lock.json"), &original_lock).unwrap();
+
+    // Manifest + staged after-hash blob (offline source).
+    let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
+    let after_hash = compute_git_sha256_from_bytes(PATCHED_INDEX);
+    let mut patches = serde_json::Map::new();
+    for purl in manifest_purls {
+        patches.insert(purl.to_string(), patch_record(&before_hash, &after_hash));
+    }
+    let manifest = json!({ "patches": patches });
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut original_manifest = serde_json::to_vec_pretty(&manifest).unwrap();
+    original_manifest.push(b'\n');
+    std::fs::write(socket.join("manifest.json"), &original_manifest).unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), PATCHED_INDEX).unwrap();
+
+    NpmFixture {
+        tmp,
+        original_lock,
+        original_manifest,
+        after_hash,
+    }
+}
+
+fn npm_fixture() -> NpmFixture {
+    npm_fixture_with_purls(&[PURL])
+}
+
+/// In-process `VendorArgs` for the fixture: `json` suppresses interactive
+/// prompts/human output, `offline` keeps the patch pipeline on the staged
+/// local blobs (no network).
+fn vendor_args(cwd: &Path) -> VendorArgs {
+    VendorArgs {
+        common: GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            json: true,
+            silent: true,
+            offline: true,
+            ..GlobalArgs::default()
+        },
+        force: false,
+        revert: false,
+        vex: Default::default(),
+    }
+}
+
+// ───────────────────────── subprocess runner ─────────────────────────
+
+/// Run the built `socket-patch` binary with every ambient `SOCKET_*` env var
+/// scrubbed from the child (env-robustness: the assertions must reflect the
+/// argv, not the developer's shell) and telemetry hard-disabled. Returns
+/// `(exit_code, stdout, stderr)`.
+fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.args(args).current_dir(cwd);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn socket-patch binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `vendor --json --offline --cwd <cwd> <extra...>` through the binary,
+/// returning `(exit_code, parsed envelope)`.
+fn vendor_cli(cwd: &Path, extra: &[&str]) -> (i32, Value) {
+    let mut args = vec![
+        "vendor",
+        "--json",
+        "--offline",
+        "--cwd",
+        cwd.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    let (code, stdout, stderr) = run_cli(cwd, &args, &[]);
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env)
+}
+
+fn events(envelope: &Value) -> &Vec<Value> {
+    envelope["events"].as_array().expect("events array")
+}
+
+/// The single event matching `action` (+ optional `errorCode`), or panic
+/// with the envelope.
+fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str>) -> &'a Value {
+    events(envelope)
+        .iter()
+        .find(|e| e["action"] == action && error_code.is_none_or(|c| e["errorCode"] == c))
+        .unwrap_or_else(|| {
+            panic!("expected a `{action}` event (errorCode={error_code:?}) in:\n{envelope:#}")
+        })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 1. end-to-end: vendor an installed npm package
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vendor_npm_end_to_end() {
+    let fx = npm_fixture();
+    let code = vendor_run(vendor_args(fx.root())).await;
+    assert_eq!(code, 0, "vendor must succeed");
+
+    // Artifact: deterministic tarball at the contract path, plus the
+    // informational marker beside it.
+    assert!(fx.tgz_path().is_file(), "tarball at {}", rel_tgz());
+    let marker: Value =
+        serde_json::from_slice(&std::fs::read(fx.marker_path()).expect("marker written"))
+            .expect("marker is JSON");
+    assert_eq!(marker["purl"], PURL);
+    assert_eq!(marker["patchUuid"], UUID);
+    assert_eq!(marker["ecosystem"], "npm");
+
+    // Ledger: the state entry carries the artifact facts and the VERBATIM
+    // pre-vendor lock fragment (revert's only offline source of truth).
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).expect("state.json written"))
+            .expect("state.json is JSON");
+    let entry = &state["entries"][PURL];
+    assert_eq!(entry["ecosystem"], "npm");
+    assert_eq!(entry["uuid"], UUID);
+    assert_eq!(entry["artifact"]["path"], rel_tgz());
+    let tgz = std::fs::read(fx.tgz_path()).unwrap();
+    assert_eq!(
+        entry["artifact"]["sha256"],
+        hex::encode(Sha256::digest(&tgz)),
+        "ledger sha256 must describe the tarball actually on disk"
+    );
+    let wiring = entry["wiring"].as_array().expect("wiring array");
+    assert_eq!(wiring.len(), 1, "one rewritten lock instance");
+    assert_eq!(wiring[0]["file"], "package-lock.json");
+    assert_eq!(wiring[0]["action"], "rewritten");
+    assert_eq!(
+        wiring[0]["original"]["resolved"], REG_RESOLVED,
+        "wiring must record the verbatim pre-vendor resolved URL"
+    );
+    assert_eq!(wiring[0]["original"]["integrity"], REG_INTEGRITY);
+
+    // Lock rewrite: resolved → relative file: spec carrying the uuid path,
+    // integrity → the RECOMPUTED tarball hash (a reused registry integrity
+    // would let a warm npm cache install the unpatched bytes); the entry's
+    // other fields are byte-preserved.
+    let lock = fx.lock_value();
+    let live = &lock["packages"]["node_modules/left-pad"];
+    assert_eq!(live["resolved"], format!("file:{}", rel_tgz()));
+    let integrity = live["integrity"].as_str().expect("integrity string");
+    assert!(integrity.starts_with("sha512-"), "sri sha512: {integrity}");
+    assert_ne!(integrity, REG_INTEGRITY, "integrity must be recomputed");
+    assert_eq!(live["version"], "1.3.0", "version field preserved");
+    assert_eq!(live["license"], "WTFPL", "license field preserved");
+    // Untouched lock regions stay identical (root project entry).
+    let original: Value = serde_json::from_slice(&fx.original_lock).unwrap();
+    assert_eq!(lock["packages"][""], original["packages"][""]);
+
+    // The manifest is read-only input; node_modules is NOT patched in place
+    // (vendor patches a staged copy and packs it — the installed tree keeps
+    // the original bytes until/unless `apply` runs).
+    assert_eq!(
+        std::fs::read(fx.manifest_path()).unwrap(),
+        fx.original_manifest,
+        "vendor must not touch the manifest"
+    );
+    assert_eq!(
+        std::fs::read(fx.installed_index()).unwrap(),
+        ORIG_INDEX,
+        "vendor must not patch node_modules in place"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 2. idempotent re-run
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn rerun_is_idempotent() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "first vendor");
+    let lock_after_first = fx.lock_bytes();
+    let tgz_first = std::fs::read(fx.tgz_path()).unwrap();
+    let state_first = std::fs::read(fx.state_path()).unwrap();
+
+    // Second run through the binary so the envelope is observable.
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "re-run must exit 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    assert_eq!(
+        env["summary"]["applied"], 0,
+        "nothing newly applied: {env:#}"
+    );
+    assert_eq!(env["summary"]["failed"], 0);
+    assert_eq!(env["summary"]["skipped"], 1);
+    // The in-sync re-run synthesizes its result against the vendored
+    // artifact path, which routes to the `vendored` skip reason (the same
+    // tag `apply` uses for vendor-owned packages) — pin the actual contract.
+    let skipped = find_event(&env, "skipped", Some("already_vendored"));
+    assert_eq!(skipped["purl"], PURL);
+
+    // NOTHING on disk churned.
+    assert_eq!(fx.lock_bytes(), lock_after_first, "lock byte-stable");
+    assert_eq!(
+        std::fs::read(fx.tgz_path()).unwrap(),
+        tgz_first,
+        "tarball byte-stable (deterministic pack)"
+    );
+    assert_eq!(
+        std::fs::read(fx.state_path()).unwrap(),
+        state_first,
+        "ledger byte-stable (no re-recorded originals)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 3. --dry-run writes nothing
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn dry_run_writes_nothing() {
+    let fx = npm_fixture();
+    let mut args = vendor_args(fx.root());
+    args.common.dry_run = true;
+    assert_eq!(vendor_run(args).await, 0, "dry-run must exit 0");
+
+    assert!(
+        !fx.vendor_dir().exists(),
+        "--dry-run must not create .socket/vendor (no tarball, no state.json)"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-identical");
+    assert_eq!(
+        std::fs::read(fx.manifest_path()).unwrap(),
+        fx.original_manifest
+    );
+    assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 4. vendor → revert round-trip
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn revert_round_trip() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert_ne!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "sanity: vendor actually rewired the lock"
+    );
+
+    let mut revert = vendor_args(fx.root());
+    revert.revert = true;
+    assert_eq!(vendor_run(revert).await, 0, "revert must exit 0");
+
+    // The lock is restored to the EXACT original fixture bytes — revert
+    // restores the recorded verbatim fragments, not a re-serialization
+    // guess.
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "revert must restore the original lock byte-for-byte"
+    );
+    // The whole vendor tree is gone — artifacts, marker, state.json, the
+    // eco level, and .socket/vendor itself (no empty-dir residue).
+    assert!(
+        !fx.vendor_dir().exists(),
+        ".socket/vendor must be fully pruned after a complete revert"
+    );
+
+    // Second revert is a clean no-op: exit 0, ZERO events.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "second revert must exit 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    assert!(
+        events(&env).is_empty(),
+        "nothing left to revert ⇒ no events: {env:#}"
+    );
+    assert_eq!(env["summary"]["removed"], 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 5. revert works without a manifest
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn revert_works_without_manifest() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    // Simulate `remove`/manual deletion: the manifest is gone but the
+    // committed ledger + artifacts remain. `--revert` derives everything
+    // from state.json and must still restore.
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+
+    let mut revert = vendor_args(fx.root());
+    revert.revert = true;
+    assert_eq!(
+        vendor_run(revert).await,
+        0,
+        "revert must work without a manifest"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(!fx.vendor_dir().exists(), "vendor tree removed");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 6. unsupported-ecosystem purls
+// ─────────────────────────────────────────────────────────────────────
+
+/// Contract behavior (CLI_CONTRACT.md "Vendor command contract"): a PURL of an
+/// ecosystem `vendor` cannot vendor is a benign skip — it never fails the run,
+/// and the supported npm patch still vendors. How the `pkg:nuget/...` entry
+/// surfaces depends on whether this build compiled the `nuget` ecosystem in:
+///   * compiled out (default features): the purl is unknown, dropped by
+///     `partition_purls` before vendor's is_vendorable partition → no event.
+///   * compiled in (`--all-features`, as CI runs): the purl is recognized but
+///     not vendorable → a `skipped` event carrying `vendor_unsupported_ecosystem`.
+///
+/// Either way the nuget purl is never `applied`, the npm patch vendors, and the
+/// run exits 0.
+#[tokio::test]
+async fn unsupported_ecosystem_purl_is_a_benign_skip() {
+    let fx = npm_fixture_with_purls(&[PURL, "pkg:nuget/Foo.Bar@1.0.0"]);
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "benign skip must not fail the run: {env:#}");
+    assert_eq!(env["status"], "success");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    assert_eq!(env["summary"]["applied"], 1);
+
+    let nuget_event = events(&env)
+        .iter()
+        .find(|e| e["purl"].as_str().is_some_and(|p| p.contains("nuget")))
+        .cloned();
+    // The nuget purl is never vendored, on any feature set.
+    assert!(
+        nuget_event
+            .as_ref()
+            .is_none_or(|e| e["action"] != "applied"),
+        "nuget purl must never be applied: {env:#}"
+    );
+
+    if cfg!(feature = "nuget") {
+        // Recognized but not vendorable ⇒ an explicit, informative skip.
+        let ev = nuget_event.expect("nuget compiled in ⇒ explicit skip event");
+        assert_eq!(ev["action"], "skipped", "{env:#}");
+        assert_eq!(ev["errorCode"], "vendor_unsupported_ecosystem", "{env:#}");
+    } else {
+        // Compiled out ⇒ the unknown purl is dropped before vendor sees it.
+        assert!(
+            nuget_event.is_none(),
+            "nuget compiled out ⇒ no event: {env:#}"
+        );
+    }
+
+    assert!(fx.tgz_path().is_file(), "the npm patch still vendors");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 7. package not installed
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn package_not_installed_fails() {
+    // The manifest names a package that is nowhere in node_modules. The
+    // user asked for it to be vendored and it wasn't — that is a partial
+    // failure (exit 1), surfaced as a skipped event with the stable code.
+    let fx = npm_fixture_with_purls(&["pkg:npm/ghost-pkg@9.9.9"]);
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(
+        code, 1,
+        "an unsatisfiable manifest entry must exit 1: {env:#}"
+    );
+    assert_eq!(env["status"], "partialFailure");
+    let skipped = find_event(&env, "skipped", Some("package_not_installed"));
+    assert_eq!(skipped["purl"], "pkg:npm/ghost-pkg@9.9.9");
+    assert!(
+        !fx.vendor_dir().exists(),
+        "nothing may be written for a package that isn't installed"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8. reconcile: entries dropped from the manifest are auto-reverted
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn reconcile_drops_stale_entries() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    assert!(fx.tgz_path().is_file());
+
+    // The patch is dropped from the manifest (e.g. `remove` ran, which is
+    // vendoring-unaware by design). The next vendor run must revert the
+    // now-stale entry even though zero in-scope patches remain.
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "reconcile-only run must exit 0: {env:#}");
+    let removed = find_event(&env, "removed", Some("vendor_reconciled"));
+    assert_eq!(removed["purl"], PURL);
+
+    assert!(
+        !fx.vendor_dir().exists(),
+        "the stale artifact (and the emptied vendor tree) must be gone"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "the lock must be restored to the pre-vendor registry fragment"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 9. offline with no local source
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn offline_missing_source_fails() {
+    let fx = npm_fixture();
+    // Remove the staged blob: offline + no blob/diff/package ⇒ the patch has
+    // no usable local source and vendor must fail loudly, not guess.
+    std::fs::remove_file(fx.root().join(".socket/blobs").join(&fx.after_hash)).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 1, "offline with no local source must exit 1: {env:#}");
+    assert_eq!(env["status"], "error");
+    assert_eq!(env["error"]["code"], "no_local_source");
+    assert!(
+        !fx.vendor_dir().exists(),
+        "a failed staging must write nothing"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 10a. apply after vendor — npm (documented in-place behavior)
+// ─────────────────────────────────────────────────────────────────────
+
+/// DOCUMENTED BEHAVIOR, deliberately pinned: for npm, `apply` does NOT
+/// consult the vendor ledger (only the golang path calls
+/// `is_purl_vendored`, because a go re-apply would repoint the vendor-owned
+/// `replace` directive). An npm apply after vendor simply patches
+/// node_modules in place — harmless: the lockfile still consumes the
+/// vendored tarball, and the in-place edit makes the installed tree match
+/// the patched bytes. The vendored artifact and the lock wiring are
+/// untouched.
+#[tokio::test]
+async fn vendored_npm_purl_apply_patches_in_place() {
+    use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
+
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let lock_after_vendor = fx.lock_bytes();
+    let tgz_after_vendor = std::fs::read(fx.tgz_path()).unwrap();
+    assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
+
+    let apply_args = ApplyArgs {
+        common: GlobalArgs {
+            cwd: fx.root().to_path_buf(),
+            json: true,
+            silent: true,
+            offline: true,
+            ..GlobalArgs::default()
+        },
+        force: false,
+        check: false,
+        vex: Default::default(),
+    };
+    assert_eq!(apply_run(apply_args).await, 0, "apply after vendor exits 0");
+
+    assert_eq!(
+        std::fs::read(fx.installed_index()).unwrap(),
+        PATCHED_INDEX,
+        "npm apply patches node_modules in place even when the purl is vendored \
+         (apply consults the vendor ledger for golang only)"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        lock_after_vendor,
+        "apply must not disturb the vendored lock wiring"
+    );
+    assert_eq!(
+        std::fs::read(fx.tgz_path()).unwrap(),
+        tgz_after_vendor,
+        "apply must not touch the vendored artifact"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 10b. apply after vendor — golang yields with skipped/vendored
+// ─────────────────────────────────────────────────────────────────────
+
+/// The golang half of "apply yields to vendor" (CLI_CONTRACT.md): a module
+/// recorded in `.socket/vendor/state.json` must be skipped by `apply` with
+/// reason `vendored` — apply must never repoint the vendor-owned `replace`
+/// back at `.socket/go-patches/`. The ledger entry is seeded by hand (the
+/// exact state `vendor` persists) so the test needs no full go vendor run.
+#[cfg(feature = "golang")]
+#[tokio::test]
+async fn vendored_golang_purl_skipped_by_apply() {
+    use socket_patch_core::patch::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+
+    const MODULE: &str = "github.com/foo/bar";
+    const VERSION: &str = "v1.4.2";
+    let purl = format!("pkg:golang/{MODULE}@{VERSION}");
+    const PRISTINE: &[u8] = b"package bar\n\nfunc Hello() string { return \"hi\" }\n";
+    const GO_PATCHED: &[u8] = b"package bar\n\nfunc Hello() string { return \"PATCHED\" }\n";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // Fake extracted module cache (the crawler's discovery source).
+    let cache_dir = root.join("modcache").join(format!("{MODULE}@{VERSION}"));
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("bar.go"), PRISTINE).unwrap();
+    std::fs::write(
+        cache_dir.join("go.mod"),
+        "module github.com/foo/bar\n\ngo 1.21\n",
+    )
+    .unwrap();
+
+    // Consumer go.mod carrying the vendor-owned replace, exactly as the
+    // vendor backend wires it.
+    let replace_target = format!("./.socket/vendor/golang/{UUID}/{MODULE}@{VERSION}");
+    let gomod = format!(
+        "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n\n\
+         replace {MODULE} {VERSION} => {replace_target}\n"
+    );
+    std::fs::write(root.join("go.mod"), &gomod).unwrap();
+
+    // Manifest + offline blob for the golang patch.
+    let before_hash = compute_git_sha256_from_bytes(PRISTINE);
+    let after_hash = compute_git_sha256_from_bytes(GO_PATCHED);
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let manifest = json!({
+        "patches": {
+            purl.clone(): {
+                "uuid": UUID,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "bar.go": { "beforeHash": before_hash, "afterHash": after_hash } },
+                "vulnerabilities": {},
+                "description": "synthetic", "license": "MIT", "tier": "free"
+            }
+        }
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(&after_hash), GO_PATCHED).unwrap();
+
+    // Seed the ledger with the golang entry (what a `vendor` run records).
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.clone(),
+        VendorEntry {
+            ecosystem: "golang".to_string(),
+            base_purl: purl.clone(),
+            uuid: UUID.to_string(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/golang/{UUID}/{MODULE}@{VERSION}"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        },
+    );
+    socket_patch_core::patch::vendor::save_state(root, &state)
+        .await
+        .expect("seed state.json");
+
+    // apply (through the binary: scrubbed env + child-only GOMODCACHE).
+    let (code, stdout, stderr) = run_cli(
+        root,
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--cwd",
+            root.to_str().unwrap(),
+        ],
+        &[("GOMODCACHE", root.join("modcache").to_str().unwrap())],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --json envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "apply must succeed while yielding: {env:#}");
+    assert_eq!(env["status"], "success");
+    let skipped = find_event(&env, "skipped", Some("vendored"));
+    assert_eq!(skipped["purl"], purl);
+
+    // Apply must not have re-pointed the replace or materialised a
+    // go-patches redirect.
+    assert_eq!(
+        std::fs::read_to_string(root.join("go.mod")).unwrap(),
+        gomod,
+        "go.mod must be byte-unchanged (the vendor-owned replace stays)"
+    );
+    assert!(
+        !root.join(".socket/go-patches").exists(),
+        "apply must not materialise a go-patches redirect for a vendored module"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 11. lock contention
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn lock_contention_exits_lock_held() {
+    let fx = npm_fixture();
+    // Hold the same advisory lock `vendor` takes (`<.socket>/apply.lock`);
+    // vendor shares it with apply/rollback so an apply↔vendor race is
+    // impossible. flock contention is cross-process, so the child binary
+    // genuinely contends with this test's guard.
+    let _guard = socket_patch_core::patch::apply_lock::acquire(
+        &fx.root().join(".socket"),
+        std::time::Duration::ZERO,
+    )
+    .expect("test holds the lock first");
+
+    let (code, env) = vendor_cli(fx.root(), &["--lock-timeout", "1"]);
+    assert_eq!(code, 1, "contended vendor must exit 1: {env:#}");
+    assert_eq!(
+        env["command"], "vendor",
+        "the failure envelope is vendor's own"
+    );
+    assert_eq!(env["status"], "error");
+    assert_eq!(env["error"]["code"], "lock_held");
+    assert!(
+        events(&env).is_empty(),
+        "a pre-event failure carries no events: {env:#}"
+    );
+
+    // Nothing happened while contended.
+    assert!(
+        !fx.vendor_dir().exists(),
+        "no vendor writes under contention"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 12. JSON envelope shape
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn json_envelope_shape() {
+    // Wet run.
+    let fx = npm_fixture();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["command"], "vendor");
+    assert_eq!(env["status"], "success");
+    assert_eq!(env["dryRun"], false, "dryRun mirrors the (absent) flag");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    assert_eq!(
+        applied["files"][0]["path"], "package/index.js",
+        "applied event enumerates the patched files"
+    );
+    // The pre-aggregated summary carries every counter field.
+    let summary = env["summary"].as_object().expect("summary object");
+    for field in [
+        "discovered",
+        "downloaded",
+        "applied",
+        "updated",
+        "skipped",
+        "failed",
+        "removed",
+        "verified",
+    ] {
+        assert!(
+            summary.contains_key(field),
+            "summary.{field} present: {env:#}"
+        );
+    }
+    assert_eq!(env["summary"]["applied"], 1);
+    assert_eq!(env["summary"]["failed"], 0);
+
+    // Dry run on a fresh fixture: dryRun flips, the patch is Verified (not
+    // Applied), and the envelope is still command=vendor.
+    let fx2 = npm_fixture();
+    let (code, env) = vendor_cli(fx2.root(), &["--dry-run"]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["command"], "vendor");
+    assert_eq!(env["dryRun"], true, "dryRun mirrors --dry-run");
+    assert_eq!(env["status"], "success");
+    find_event(&env, "verified", None);
+    assert_eq!(env["summary"]["verified"], 1);
+    assert_eq!(env["summary"]["applied"], 0);
+
+    // No manifest at all: same contract as apply — clean no-op, exit 0,
+    // status noManifest (the envelope still identifies the command).
+    let empty = tempfile::tempdir().unwrap();
+    let (code, env) = vendor_cli(empty.path(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["command"], "vendor");
+    assert_eq!(env["status"], "noManifest");
+    assert!(events(&env).is_empty());
+}

@@ -832,11 +832,7 @@ mod tests {
         // a versioned directory must not abort the walk of its siblings.
         let dir = tempfile::tempdir().unwrap();
 
-        let v1 = dir
-            .path()
-            .join("github.com")
-            .join("foo")
-            .join("bar@v1.0.0");
+        let v1 = dir.path().join("github.com").join("foo").join("bar@v1.0.0");
         tokio::fs::create_dir_all(&v1).await.unwrap();
 
         let v2 = dir
@@ -919,7 +915,7 @@ mod tests {
         let crawler = GoCrawler::new();
         let qualified = "pkg:golang/github.com/gin-gonic/gin@v1.9.1?type=module".to_string();
         let result = crawler
-            .find_by_purls(dir.path(), &[qualified.clone()])
+            .find_by_purls(dir.path(), std::slice::from_ref(&qualified))
             .await
             .unwrap();
 

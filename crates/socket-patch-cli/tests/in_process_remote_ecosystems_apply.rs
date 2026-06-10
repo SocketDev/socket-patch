@@ -131,7 +131,9 @@ async fn setup_apply_mock(
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": uuid, "purl": purl,
@@ -178,9 +180,7 @@ async fn golang_handcrafted_install_apply_patches_file() {
     // GOMODCACHE layout: <encoded-module-path>@<version>/<files>.
     // For `github.com/gin-gonic/gin@v1.9.1`, the encoded module path is
     // the same string (no uppercase letters to escape).
-    let module_dir = tmp
-        .path()
-        .join("github.com/gin-gonic/gin@v1.9.1");
+    let module_dir = tmp.path().join("github.com/gin-gonic/gin@v1.9.1");
     std::fs::create_dir_all(&module_dir).unwrap();
     let gin_file = module_dir.join("gin.go");
     let original = b"package gin\n\nfunc Version() string { return \"1.9.1\" }\n";
@@ -209,15 +209,20 @@ async fn golang_handcrafted_install_apply_patches_file() {
     // A single free patch that downloads + applies cleanly must exit 0.
     // `download_and_apply_patches` only returns 1 when a patch fails to
     // download or apply, so 1 here means the apply path silently broke.
-    assert_eq!(code, 0, "scan --sync should fully apply the golang patch (exit 0)");
+    assert_eq!(
+        code, 0,
+        "scan --sync should fully apply the golang patch (exit 0)"
+    );
 
     // Golden check: the file must equal the EXACT patched bytes the mock
     // served, not merely contain the marker substring (a corrupting apply
     // could append the marker while mangling the rest).
     let after = std::fs::read(&gin_file).expect("read after");
     assert_eq!(
-        after, patched,
-        "patched {} bytes do not match the served blob exactly", gin_file.display()
+        after,
+        patched,
+        "patched {} bytes do not match the served blob exactly",
+        gin_file.display()
     );
 
     std::env::remove_var("GOMODCACHE");
@@ -234,8 +239,7 @@ async fn maven_handcrafted_install_apply_patches_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // m2 layout: $repo/org/apache/commons/commons-lang3/3.12.0/<files>
     let repo = tmp.path().join("m2-repo");
-    let version_dir = repo
-        .join("org/apache/commons/commons-lang3/3.12.0");
+    let version_dir = repo.join("org/apache/commons/commons-lang3/3.12.0");
     std::fs::create_dir_all(&version_dir).unwrap();
     // The maven crawler verifies presence of a .pom file. Without it,
     // the version dir is ignored.
@@ -273,12 +277,17 @@ async fn maven_handcrafted_install_apply_patches_file() {
 
     let args = default_scan_args(tmp.path(), "maven", server.uri());
     let code = scan_run(args).await;
-    assert_eq!(code, 0, "scan --sync should fully apply the maven patch (exit 0)");
+    assert_eq!(
+        code, 0,
+        "scan --sync should fully apply the maven patch (exit 0)"
+    );
 
     let after = std::fs::read(&payload_file).expect("read after");
     assert_eq!(
-        after, patched,
-        "patched {} bytes do not match the served blob exactly", payload_file.display()
+        after,
+        patched,
+        "patched {} bytes do not match the served blob exactly",
+        payload_file.display()
     );
 
     std::env::remove_var("MAVEN_REPO_LOCAL");
@@ -345,7 +354,9 @@ async fn maven_multi_classifier_patches_every_present_jar() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [
                 { "uuid": uuid_a, "purl": purl_a, "publishedAt": "2024-01-01T00:00:00Z",
@@ -461,12 +472,17 @@ async fn composer_handcrafted_install_apply_patches_file() {
     let mut args = default_scan_args(tmp.path(), "composer", server.uri());
     args.common.global = false;
     let code = scan_run(args).await;
-    assert_eq!(code, 0, "scan --sync should fully apply the composer patch (exit 0)");
+    assert_eq!(
+        code, 0,
+        "scan --sync should fully apply the composer patch (exit 0)"
+    );
 
     let after = std::fs::read(&payload).expect("read after");
     assert_eq!(
-        after, patched,
-        "patched {} bytes do not match the served blob exactly", payload.display()
+        after,
+        patched,
+        "patched {} bytes do not match the served blob exactly",
+        payload.display()
     );
 }
 
@@ -518,12 +534,17 @@ async fn nuget_handcrafted_install_apply_patches_file() {
 
     let args = default_scan_args(tmp.path(), "nuget", server.uri());
     let code = scan_run(args).await;
-    assert_eq!(code, 0, "scan --sync should fully apply the nuget patch (exit 0)");
+    assert_eq!(
+        code, 0,
+        "scan --sync should fully apply the nuget patch (exit 0)"
+    );
 
     let after = std::fs::read(&payload).expect("read after");
     assert_eq!(
-        after, patched,
-        "patched {} bytes do not match the served blob exactly", payload.display()
+        after,
+        patched,
+        "patched {} bytes do not match the served blob exactly",
+        payload.display()
     );
 
     std::env::remove_var("NUGET_PACKAGES");

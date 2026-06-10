@@ -1,4 +1,5 @@
-//! Filesystem helpers shared by the ecosystem crawlers.
+//! Filesystem helpers shared by the ecosystem crawlers, plus the
+//! crate-wide atomic file writer ([`atomic_write_bytes`]).
 //!
 //! Each crawler walks one or more package directories and decides
 //! whether each entry is a candidate package. The two operations that
@@ -79,6 +80,58 @@ pub async fn entry_is_dir(entry: &DirEntry) -> bool {
 /// not the resolved-target kind from `metadata()`.
 pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
     entry.file_type().await.ok()
+}
+
+/// Atomically commit `content` to `path` via stage + fsync + rename.
+///
+/// The single shared implementation of the hardened-writer pattern used for
+/// every user-owned file socket-patch edits (`go.mod`, `package.json`,
+/// `pyproject.toml`, lockfiles, `.socket/vendor/state.json`, …). A bare
+/// `fs::write` truncates the target before writing, so a crash, power loss, or
+/// `ENOSPC` mid-write would leave the file torn or empty. Instead we stage a
+/// sibling file, fsync it, then rename over the target (atomic on the same
+/// filesystem), so a reader or recovering process only ever sees the complete
+/// old or the complete new bytes.
+pub async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

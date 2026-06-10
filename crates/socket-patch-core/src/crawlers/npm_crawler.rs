@@ -795,10 +795,9 @@ mod tests {
         assert_eq!(name, "foo");
         assert_eq!(ver, "1.0.0");
 
-        let (ns, name, ver) = NpmCrawler::parse_purl_components(
-            "pkg:npm/@types/node@20.0.0?maintainer=a@b.com",
-        )
-        .unwrap();
+        let (ns, name, ver) =
+            NpmCrawler::parse_purl_components("pkg:npm/@types/node@20.0.0?maintainer=a@b.com")
+                .unwrap();
         assert_eq!(ns.as_deref(), Some("@types"));
         assert_eq!(name, "node");
         assert_eq!(ver, "20.0.0");
@@ -1043,7 +1042,9 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         // Keyed by the verbatim qualified input, and the stored PURL matches.
-        let foo = result.get(&unscoped_q).expect("qualified unscoped resolved");
+        let foo = result
+            .get(&unscoped_q)
+            .expect("qualified unscoped resolved");
         assert_eq!(foo.purl, unscoped_q);
         assert_eq!(foo.name, "foo");
         assert_eq!(foo.version, "1.0.0");

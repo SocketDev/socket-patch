@@ -22,14 +22,13 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
-    build_document, detect_product, BuildOptions, Document, FailedPatch, VerifyOutcome,
+    build_document_with_vendored, detect_product, BuildOptions, Document, FailedPatch,
+    VendorContext, VerifyOutcome,
 };
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
-use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent,
-};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 #[derive(Args)]
 pub struct VexArgs {
@@ -56,7 +55,11 @@ pub struct VexArgs {
     /// emitted; this flag flips that off — useful when generating a
     /// VEX doc on a build machine that doesn't have the patched files
     /// laid out yet.
-    #[arg(long = "no-verify", env = "SOCKET_VEX_NO_VERIFY", default_value_t = false)]
+    #[arg(
+        long = "no-verify",
+        env = "SOCKET_VEX_NO_VERIFY",
+        default_value_t = false
+    )]
     pub no_verify: bool,
 
     /// Override the document `@id`. Default is `urn:uuid:<random v4>`,
@@ -93,7 +96,11 @@ pub struct VexEmbedArgs {
 
     /// Skip the on-disk file-hash check when building the VEX document and
     /// trust the manifest. See `socket-patch vex --no-verify`.
-    #[arg(long = "vex-no-verify", env = "SOCKET_VEX_NO_VERIFY", default_value_t = false)]
+    #[arg(
+        long = "vex-no-verify",
+        env = "SOCKET_VEX_NO_VERIFY",
+        default_value_t = false
+    )]
     pub vex_no_verify: bool,
 
     /// Pin the VEX document `@id`. See `socket-patch vex --doc-id`.
@@ -101,7 +108,11 @@ pub struct VexEmbedArgs {
     pub vex_doc_id: Option<String>,
 
     /// Emit compact (non-pretty) JSON for the VEX document.
-    #[arg(long = "vex-compact", env = "SOCKET_VEX_COMPACT", default_value_t = false)]
+    #[arg(
+        long = "vex-compact",
+        env = "SOCKET_VEX_COMPACT",
+        default_value_t = false
+    )]
     pub vex_compact: bool,
 }
 
@@ -290,17 +301,28 @@ pub(crate) async fn generate_vex(
     let mut outcome = if params.no_verify {
         VerifyOutcome {
             applied: manifest.patches.keys().cloned().collect(),
-            failed: Vec::new(),
+            ..Default::default()
         }
     } else {
         let package_paths = resolve_package_paths(common, manifest).await;
-        socket_patch_core::vex::applied_patches(manifest, &package_paths).await
+        let vendor = load_vendor_context(common, manifest).await;
+        socket_patch_core::vex::applied_patches_with_vendor(
+            manifest,
+            &package_paths,
+            vendor.as_ref(),
+        )
+        .await
     };
 
     // Property 7: attest a patch only for an ecosystem that is actually set up —
     // or explicitly declared `manual` in the manifest. Patches for an ecosystem
     // that is neither are dropped regardless of verification mode (so even
     // `--no-verify` won't attest an un-set-up ecosystem's patches).
+    // Exemption: VENDORED patches bypass the filter — the committed
+    // `.socket/vendor/` artifact + lockfile wiring IS the persistence
+    // mechanism, so no install hook exists (or is needed) by construction.
+    let vendored_set: std::collections::HashSet<String> =
+        outcome.vendored.iter().cloned().collect();
     let mut allowed = crate::commands::setup::configured_ecosystems(common).await;
     if let Some(s) = &manifest.setup {
         for name in &s.manual {
@@ -311,9 +333,10 @@ pub(crate) async fn generate_vex(
     }
     let before = outcome.applied.len();
     outcome.applied.retain(|purl| {
-        Ecosystem::from_purl(purl)
-            .map(|e| allowed.contains(&e))
-            .unwrap_or(false)
+        vendored_set.contains(purl)
+            || Ecosystem::from_purl(purl)
+                .map(|e| allowed.contains(&e))
+                .unwrap_or(false)
     });
     if outcome.applied.len() != before && !common.silent && !common.json {
         eprintln!(
@@ -342,22 +365,24 @@ pub(crate) async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document(manifest, &outcome.applied, &opts) {
-        Some(doc) => doc,
-        None => {
-            track_vex_failed(
-                "no_applicable_patches",
-                common.api_token.as_deref(),
-                common.org.as_deref(),
-            )
-            .await;
-            return Err(VexGenError {
-                code: "no_applicable_patches",
-                message: "No applied patches with vulnerability metadata to attest.".to_string(),
-                failed: outcome.failed,
-            });
-        }
-    };
+    let doc =
+        match build_document_with_vendored(manifest, &outcome.applied, &outcome.vendored, &opts) {
+            Some(doc) => doc,
+            None => {
+                track_vex_failed(
+                    "no_applicable_patches",
+                    common.api_token.as_deref(),
+                    common.org.as_deref(),
+                )
+                .await;
+                return Err(VexGenError {
+                    code: "no_applicable_patches",
+                    message: "No applied patches with vulnerability metadata to attest."
+                        .to_string(),
+                    failed: outcome.failed,
+                });
+            }
+        };
 
     // Serialize.
     let serialized = if params.compact {
@@ -467,6 +492,133 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
     })
 }
 
+/// Build the [`VendorContext`] for verification: the committed
+/// `.socket/vendor/state.json` ledger plus synthesized entries for the
+/// legacy `.socket/go-patches/` redirect backend.
+///
+/// The go-patches synthesis fixes a latent bug: an apply-redirected Go
+/// patch leaves the module cache pristine (the `replace` directive routes
+/// the build at the copy dir), so verifying against the crawler-resolved
+/// cache path reported `not_applied`/`package_not_found` and the patch was
+/// silently omitted from the VEX document. The redirect copy dir holds the
+/// bytes the build actually consumes, so it is what verification must hash.
+///
+/// An unreadable/corrupt vendor ledger degrades to "no vendor entries"
+/// (with a stderr warning): vendored PURLs then fall through to the
+/// installed tree, fail verification there, and are omitted — fail-closed,
+/// never falsely attested. Returns `None` when there is nothing vendored
+/// and no redirect to synthesize (the common case).
+async fn load_vendor_context(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+) -> Option<VendorContext> {
+    let entries = match socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+        Ok(state) => state.entries,
+        Err(e) => {
+            if !common.silent {
+                eprintln!(
+                    "Warning: unreadable vendor state ({e}); vendored patches will be \
+                     omitted from VEX"
+                );
+            }
+            HashMap::new()
+        }
+    };
+
+    let go_patches = {
+        #[cfg(feature = "golang")]
+        {
+            synthesize_go_patches(common, manifest, &entries).await
+        }
+        #[cfg(not(feature = "golang"))]
+        {
+            let _ = manifest;
+            HashMap::new()
+        }
+    };
+
+    if entries.is_empty() && go_patches.is_empty() {
+        return None;
+    }
+    Some(VendorContext {
+        project_root: common.cwd.clone(),
+        entries,
+        go_patches,
+    })
+}
+
+/// Synthesize go-patches redirect targets for [`load_vendor_context`]: for
+/// every socket-owned (`.socket/go-patches/`) `replace` in `go.mod` whose
+/// module+version maps to a manifest golang PURL with no explicit vendor
+/// entry, record the absolute redirect copy dir for dir-hash verification.
+#[cfg(feature = "golang")]
+async fn synthesize_go_patches(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+    entries: &HashMap<String, socket_patch_core::patch::vendor::VendorEntry>,
+) -> HashMap<String, PathBuf> {
+    use socket_patch_core::patch::go_mod_edit::{
+        read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
+    };
+    use socket_patch_core::utils::purl::build_golang_purl;
+
+    let mut go_patches = HashMap::new();
+    for entry in read_replace_entries(&common.cwd).await {
+        if entry.owner != Some(ReplaceOwner::GoPatches) {
+            continue;
+        }
+        let Some(version) = entry.version.as_deref() else {
+            continue;
+        };
+        let purl = build_golang_purl(&entry.module, version);
+        if !manifest.patches.contains_key(&purl) {
+            continue;
+        }
+        // Explicit vendor entries take precedence over the synthesis
+        // (vendor may have taken over an apply redirect).
+        if entries.contains_key(&purl) || entries.values().any(|e| e.base_purl == purl) {
+            continue;
+        }
+        // SECURITY: module/version come from a committed (tamper-able)
+        // go.mod and are about to key a path we hash. Validate with the
+        // same per-segment rules `go_redirect::are_safe_redirect_coords`
+        // applies (it is crate-private to core) before building the
+        // copy-dir path.
+        if !are_safe_go_redirect_coords(&entry.module, version) {
+            continue;
+        }
+        go_patches.insert(
+            purl,
+            common
+                .cwd
+                .join(GO_PATCHES_DIR)
+                .join(format!("{}@{version}", entry.module)),
+        );
+    }
+    go_patches
+}
+
+/// Local mirror of core's `go_redirect::are_safe_redirect_coords` (which is
+/// `pub(crate)` there): a module path is `/`-separated segments, each
+/// non-empty and not `.`/`..`, no leading `/`, no backslash/NUL; a version
+/// is a single such segment. Fail-closed before any disk access.
+#[cfg(feature = "golang")]
+fn are_safe_go_redirect_coords(module: &str, version: &str) -> bool {
+    fn safe_segment(seg: &str) -> bool {
+        !seg.is_empty() && seg != "." && seg != ".."
+    }
+    let module_ok = !module.is_empty()
+        && !module.starts_with('/')
+        && !module.contains('\\')
+        && !module.contains('\0')
+        && module.split('/').all(safe_segment);
+    let version_ok = safe_segment(version)
+        && !version.contains('/')
+        && !version.contains('\\')
+        && !version.contains('\0');
+    module_ok && version_ok
+}
+
 /// Walk the ecosystem dispatch to build the PURL -> on-disk-path map
 /// used by `vex::verify::applied_patches`.
 async fn resolve_package_paths(
@@ -548,12 +700,13 @@ fn emit_envelope_success(doc: &Document, failures: &[FailedPatch]) {
         for prod in &st.products {
             for sub in &prod.subcomponents {
                 env.record(
-                    PatchEvent::new(PatchAction::Verified, sub.id.clone())
-                        .with_details(serde_json::json!({
+                    PatchEvent::new(PatchAction::Verified, sub.id.clone()).with_details(
+                        serde_json::json!({
                             "vulnerability": st.vulnerability.name,
                             "aliases": st.vulnerability.aliases,
                             "status": "not_affected",
-                        })),
+                        }),
+                    ),
                 );
             }
         }
@@ -592,7 +745,10 @@ mod tests {
         #[cfg(feature = "golang")]
         assert_eq!(ecosystem_from_manual_name("go"), Some(Ecosystem::Golang));
         #[cfg(feature = "composer")]
-        assert_eq!(ecosystem_from_manual_name("composer"), Some(Ecosystem::Composer));
+        assert_eq!(
+            ecosystem_from_manual_name("composer"),
+            Some(Ecosystem::Composer)
+        );
         #[cfg(feature = "maven")]
         assert_eq!(ecosystem_from_manual_name("maven"), Some(Ecosystem::Maven));
         #[cfg(feature = "nuget")]
@@ -621,6 +777,38 @@ mod tests {
                 e.cli_name(),
             );
         }
+    }
+
+    /// The local mirror of core's `are_safe_redirect_coords` must enforce
+    /// the same accept/reject set (cases lifted from core's pinned tests) —
+    /// a divergence would let a tampered go.mod `replace` key an
+    /// out-of-tree path into the go-patches verification map.
+    #[cfg(feature = "golang")]
+    #[test]
+    fn go_redirect_coord_guard_matches_core_rules() {
+        assert!(are_safe_go_redirect_coords("github.com/foo/bar", "v1.4.2"));
+        assert!(are_safe_go_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));
+        assert!(are_safe_go_redirect_coords(
+            "github.com/foo/bar/v2",
+            "v2.0.0-20210101000000-abcdef123456"
+        ));
+        assert!(!are_safe_go_redirect_coords("../../../etc", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords(
+            "github.com/../../../etc",
+            "v1.0.0"
+        ));
+        assert!(!are_safe_go_redirect_coords("/abs/path", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords("github.com//bar", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords("foo/./bar", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords("foo\\bar", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords("", "v1.0.0"));
+        assert!(!are_safe_go_redirect_coords(
+            "github.com/foo/bar",
+            "../../../evil"
+        ));
+        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", "v1/0/0"));
+        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ".."));
+        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ""));
     }
 
     #[derive(Parser)]

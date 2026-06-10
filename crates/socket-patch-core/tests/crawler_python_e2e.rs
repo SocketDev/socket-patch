@@ -706,7 +706,7 @@ async fn crawl_all_handles_unreadable_site_packages() {
 /// `PythonCrawler::default()` should forward to `new()`.
 #[test]
 fn python_crawler_default_and_new_construct_cleanly() {
-    let _a = PythonCrawler::default();
+    let _a = PythonCrawler;
     let _b = PythonCrawler::new();
 }
 
@@ -741,7 +741,10 @@ async fn find_by_purls_matches_canonicalized_name() {
     let pkg = result
         .get("pkg:pypi/requests@2.28.0")
         .expect("result must be keyed by the queried PURL");
-    assert_eq!(pkg.name, "requests", "name must be canonicalized to lowercase");
+    assert_eq!(
+        pkg.name, "requests",
+        "name must be canonicalized to lowercase"
+    );
     assert_eq!(pkg.version, "2.28.0");
     assert_eq!(pkg.purl, "pkg:pypi/requests@2.28.0");
     assert_eq!(pkg.namespace, None);
@@ -842,7 +845,11 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
         batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
-    assert_eq!(result.len(), 2, "exactly the two dist-info dirs; got {result:?}");
+    assert_eq!(
+        result.len(),
+        2,
+        "exactly the two dist-info dirs; got {result:?}"
+    );
 
     // Verify the full identity of each package, not just the name — a
     // regression that mangled the version or PURL (or canonicalization)

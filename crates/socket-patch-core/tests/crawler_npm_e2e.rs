@@ -155,7 +155,7 @@ async fn read_package_json_empty_version_returns_none() {
 #[test]
 fn npm_crawler_new_and_default_construct_cleanly() {
     let _a = NpmCrawler::new();
-    let _b = NpmCrawler::default();
+    let _b = NpmCrawler;
 }
 
 // ── get_node_modules_paths ─────────────────────────────────────
@@ -494,7 +494,7 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     let crawler = NpmCrawler;
     let qualified = "pkg:npm/lodash@4.17.21?extension=tgz".to_string();
     let result = crawler
-        .find_by_purls(&nm, &[qualified.clone()])
+        .find_by_purls(&nm, std::slice::from_ref(&qualified))
         .await
         .unwrap();
 
@@ -684,12 +684,15 @@ async fn crawl_all_recurses_into_workspace_packages() {
     let crawler = NpmCrawler;
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
-    let lodash = result.iter().find(|p| p.name == "lodash").unwrap_or_else(|| {
-        panic!(
-            "workspace recursion must discover nested node_modules; got {:?}",
-            result.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
-        )
-    });
+    let lodash = result
+        .iter()
+        .find(|p| p.name == "lodash")
+        .unwrap_or_else(|| {
+            panic!(
+                "workspace recursion must discover nested node_modules; got {:?}",
+                result.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
+            )
+        });
     assert_eq!(lodash.version, "4.17.21");
     assert_eq!(lodash.purl, "pkg:npm/lodash@4.17.21");
     assert_eq!(
@@ -921,7 +924,10 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let ver = |n: &str| -> Option<&str> {
-        result.iter().find(|p| p.name == n).map(|p| p.version.as_str())
+        result
+            .iter()
+            .find(|p| p.name == n)
+            .map(|p| p.version.as_str())
     };
     assert_eq!(ver("a"), Some("1.0.0"), "direct dep at depth 1");
     assert_eq!(ver("b"), Some("2.0.0"), "transitive at depth 2");
@@ -932,7 +938,11 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
         "the depth-4 transitive dep must still be discovered (unbounded recursion)"
     );
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(result.len(), 4, "exactly the four chained packages; got {names:?}");
+    assert_eq!(
+        result.len(),
+        4,
+        "exactly the four chained packages; got {names:?}"
+    );
 }
 
 #[tokio::test]

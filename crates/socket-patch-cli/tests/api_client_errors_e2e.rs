@@ -68,7 +68,8 @@ fn assert_error_envelope(v: &serde_json::Value, needle: &str) {
         .unwrap_or_else(|| panic!("error field must be a string, got: {v}"));
     assert!(!msg.is_empty(), "error message must not be empty: {v}");
     assert!(
-        msg.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()),
+        msg.to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase()),
         "error message {msg:?} must mention {needle:?}"
     );
 }
@@ -459,7 +460,11 @@ async fn get_by_ghsa_with_404_reports_not_found() {
         .output()
         .expect("run");
     let code = out.status.code().unwrap_or(-1);
-    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/by-ghsa/{ghsa}")).await;
+    assert_path_hit(
+        &mock,
+        &format!("/v0/orgs/{ORG_SLUG}/patches/by-ghsa/{ghsa}"),
+    )
+    .await;
     assert_eq!(code, 0, "GHSA 404 is a graceful not-found, exit 0");
     let v = json_stdout(&out);
     assert_eq!(
@@ -478,7 +483,9 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     let after_hash = "1111111111111111111111111111111111111111111111111111111111111111";
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}")))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock)
         .await;
@@ -520,7 +527,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
             "--download-only",
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_API_URL", &mock.uri())
+        .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
         .output()
@@ -530,14 +537,17 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     // Prove the blob download was actually attempted against the mock (and
     // returned 404) — the failure must come from the real fetch path, not
     // from repair bailing out before it ever tried to download.
-    assert_path_hit(&mock, &format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}")).await;
+    assert_path_hit(
+        &mock,
+        &format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"),
+    )
+    .await;
     assert_eq!(
         code, 1,
         "repair must exit non-zero when an artifact download fails so CI guarding on \
          the exit code doesn't treat a half-finished repair as success; stdout={stdout}"
     );
-    let v: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("must be JSON");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("must be JSON");
     // The repair envelope's summary tracks failures. Require BOTH the
     // summary counter AND a per-event `failed` record so a regression that
     // drops one but not the other is still caught (the original test
@@ -565,7 +575,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     let has_failed_event = v
         .get("events")
         .and_then(|e| e.as_array())
-        .map_or(false, |a| a.iter().any(|e| e["action"] == "failed"));
+        .is_some_and(|a| a.iter().any(|e| e["action"] == "failed"));
     assert!(
         has_failed_event,
         "repair must emit a per-artifact `failed` event for the 404; got: {v}"

@@ -47,7 +47,11 @@ fn ruby_version() -> Option<String> {
         return None;
     }
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if v.is_empty() { None } else { Some(v) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// Install a small gem into `<tmp>/vendor/bundle/ruby/<ver>/` and
@@ -116,7 +120,9 @@ async fn setup_gem_apply_mock(
         .await;
 
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": purl,
@@ -207,7 +213,10 @@ async fn gem_install_scan_sync_patches_real_file() {
         vex: Default::default(),
     };
     let code = scan_run(args).await;
-    assert_eq!(code, 0, "scan --sync should succeed when the patch applies cleanly");
+    assert_eq!(
+        code, 0,
+        "scan --sync should succeed when the patch applies cleanly"
+    );
 
     // The apply must have driven the REAL code path end to end:
     //   crawler discovers the gem -> POSTs its purl to /batch -> fetches the
@@ -234,7 +243,10 @@ async fn gem_install_scan_sync_patches_real_file() {
     assert!(
         view_hits >= 1,
         "view endpoint never fetched — apply short-circuited (paths seen: {:?})",
-        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 
     // Verify the file on disk is EXACTLY the patched fixture, byte-for-byte.
@@ -319,8 +331,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         .expect("mock server recorded requests");
     let batch_path = format!("/v0/orgs/{ORG}/patches/batch");
     let discovered = requests.iter().any(|r| {
-        r.url.path() == batch_path
-            && String::from_utf8_lossy(&r.body).contains(purl.as_str())
+        r.url.path() == batch_path && String::from_utf8_lossy(&r.body).contains(purl.as_str())
     });
     assert!(
         discovered,
@@ -332,7 +343,8 @@ async fn gem_crawler_finds_real_installed_gem() {
     // patches behind the user's back during a read-only pass.
     let after_scan = std::fs::read(&lib_file).expect("read colorize.rb after scan");
     assert_eq!(
-        after_scan, before_scan,
+        after_scan,
+        before_scan,
         "read-only scan mutated the installed gem file at {}",
         lib_file.display()
     );

@@ -65,9 +65,7 @@ fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     for var in SOCKET_ENV_VARS {
         cmd.env_remove(var);
     }
-    let out = cmd
-        .output()
-        .expect("failed to execute socket-patch binary");
+    let out = cmd.output().expect("failed to execute socket-patch binary");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -191,7 +189,10 @@ fn unlock_reports_held_when_lock_actively_held() {
         "control precondition: the lock file must persist across the release"
     );
     let (code2, stdout2, stderr2) = run(dir.path(), &["unlock", "--json"]);
-    assert_eq!(code2, 0, "free after release: stdout={stdout2}\nstderr={stderr2}");
+    assert_eq!(
+        code2, 0,
+        "free after release: stdout={stdout2}\nstderr={stderr2}"
+    );
     let env2 = parse_json_envelope(&stdout2);
     assert_eq!(
         json_string(&env2, "status"),
@@ -374,7 +375,10 @@ fn unlock_human_mode_release_reports_removed_when_leftover() {
         !lower.contains("no lock file to remove"),
         "a real removal must not emit the no-op wording, got:\n{stdout}"
     );
-    assert!(!lock_file.exists(), "--release should have deleted the file");
+    assert!(
+        !lock_file.exists(),
+        "--release should have deleted the file"
+    );
 }
 
 /// Human-mode `--release` against a clean `.socket/` (no pre-existing

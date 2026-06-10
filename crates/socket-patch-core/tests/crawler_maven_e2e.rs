@@ -69,7 +69,7 @@ fn parse_pom_well_formed_extracts_coordinates() {
 }
 
 #[test]
-fn parse_pom_missing_groupId_returns_none() {
+fn parse_pom_missing_group_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
   <artifactId>commons-lang3</artifactId>
@@ -165,7 +165,7 @@ fn parse_pom_property_reference_version_returns_none() {
 /// reference — must NOT be accepted as a fallback groupId (line 86-87
 /// skip arm).
 #[test]
-fn parse_pom_missing_artifactId_returns_none() {
+fn parse_pom_missing_artifact_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
   <groupId>org.apache.commons</groupId>
@@ -195,7 +195,7 @@ fn parse_pom_split_tag_returns_none() {
 /// `MavenCrawler::default()` should forward to `new()`.
 #[test]
 fn maven_crawler_default_and_new_construct_cleanly() {
-    let _a = MavenCrawler::default();
+    let _a = MavenCrawler;
     let _b = MavenCrawler::new();
 }
 
@@ -379,7 +379,9 @@ async fn find_by_purls_finds_package_in_m2_layout() {
         .await
         .unwrap();
     assert_eq!(result.len(), 1);
-    let pkg = result.get(purl).expect("requested purl must be the map key");
+    let pkg = result
+        .get(purl)
+        .expect("requested purl must be the map key");
     assert_eq!(pkg.path, pkg_dir, "path must point at the version dir");
     assert_eq!(pkg.name, "commons-lang3", "name = artifactId");
     assert_eq!(pkg.version, "3.12.0");
@@ -434,8 +436,7 @@ async fn crawl_all_discovers_packages_in_repo() {
     let result = crawler.crawl_all(&opts).await;
     // `>= 2` would pass on garbage/duplicate packages — assert the exact
     // coordinates were discovered and nothing extra leaked in.
-    let purls: std::collections::HashSet<&str> =
-        result.iter().map(|p| p.purl.as_str()).collect();
+    let purls: std::collections::HashSet<&str> = result.iter().map(|p| p.purl.as_str()).collect();
     assert!(
         purls.contains("pkg:maven/org.apache.commons/commons-lang3@3.12.0"),
         "commons-lang3 must be discovered; got {result:?}"

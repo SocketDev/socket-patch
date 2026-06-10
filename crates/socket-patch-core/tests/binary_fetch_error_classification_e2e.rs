@@ -128,8 +128,14 @@ async fn fetch_blob_500_still_classifies_as_other() {
 
     match &err {
         ApiError::Other(msg) => {
-            assert!(msg.contains("500"), "Other must embed the status; got: {msg}");
-            assert!(msg.contains("boom"), "Other must embed the body; got: {msg}");
+            assert!(
+                msg.contains("500"),
+                "Other must embed the status; got: {msg}"
+            );
+            assert!(
+                msg.contains("boom"),
+                "Other must embed the body; got: {msg}"
+            );
         }
         other => panic!("500 must be Other; got: {other:?}"),
     }

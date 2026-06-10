@@ -58,11 +58,24 @@ fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
     // File-proxy layout: proxy/<mod>/@v/<ver>.{info,mod,zip}.
     let pxv = tmp.join("proxy").join(UMOD).join("@v");
     std::fs::create_dir_all(&pxv).unwrap();
-    std::fs::write(pxv.join(format!("{UVER}.info")), format!("{{\"Version\":\"{UVER}\"}}")).unwrap();
-    std::fs::write(pxv.join(format!("{UVER}.mod")), format!("module {UMOD}\n\ngo 1.21\n")).unwrap();
+    std::fs::write(
+        pxv.join(format!("{UVER}.info")),
+        format!("{{\"Version\":\"{UVER}\"}}"),
+    )
+    .unwrap();
+    std::fs::write(
+        pxv.join(format!("{UVER}.mod")),
+        format!("module {UMOD}\n\ngo 1.21\n"),
+    )
+    .unwrap();
     let zip_out = pxv.join(format!("{UVER}.zip"));
     let zip_status = Command::new("zip")
-        .args(["-q", "-r", zip_out.to_str().unwrap(), &format!("{UMOD}@{UVER}")])
+        .args([
+            "-q",
+            "-r",
+            zip_out.to_str().unwrap(),
+            &format!("{UMOD}@{UVER}"),
+        ])
         .current_dir(tmp.join("stage"))
         .status()
         .expect("run zip");
@@ -89,8 +102,16 @@ fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
     .unwrap();
 
     let env = go_env(modcache.to_str().unwrap(), &proxy_url);
-    let dl = go(&consumer, &["mod", "download", &format!("{UMOD}@{UVER}")], &env);
-    assert!(dl.status.success(), "go mod download failed: {}", String::from_utf8_lossy(&dl.stderr));
+    let dl = go(
+        &consumer,
+        &["mod", "download", &format!("{UMOD}@{UVER}")],
+        &env,
+    );
+    assert!(
+        dl.status.success(),
+        "go mod download failed: {}",
+        String::from_utf8_lossy(&dl.stderr)
+    );
 
     (consumer, modcache, proxy_url)
 }
@@ -143,7 +164,11 @@ fn go_build_links_patch_via_replace_redirect() {
 
     // Baseline build links PRISTINE.
     let base = go(&consumer, &["run", "."], &goenv);
-    assert!(base.status.success(), "baseline run failed: {}", String::from_utf8_lossy(&base.stderr));
+    assert!(
+        base.status.success(),
+        "baseline run failed: {}",
+        String::from_utf8_lossy(&base.stderr)
+    );
     assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
 
     // Patch + apply (socket-patch reads only the cache; no `go`). This writes the
@@ -158,7 +183,11 @@ fn go_build_links_patch_via_replace_redirect() {
 
     // The patched bytes are now LINKED by `go build` via the `replace` redirect.
     let patched = go(&consumer, &["run", "."], &goenv);
-    assert!(patched.status.success(), "patched run failed: {}", String::from_utf8_lossy(&patched.stderr));
+    assert!(
+        patched.status.success(),
+        "patched run failed: {}",
+        String::from_utf8_lossy(&patched.stderr)
+    );
     assert!(
         String::from_utf8_lossy(&patched.stdout).contains("OUT: PATCHED"),
         "patched symbol not linked: {}",
@@ -183,13 +212,20 @@ fn go_build_links_patch_via_replace_redirect() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&copy_file, std::fs::Permissions::from_mode(0o644));
     }
-    std::fs::write(&copy_file, "package upstream\n\nfunc Greeting() string { return \"DRIFT\" }\n").unwrap();
+    std::fs::write(
+        &copy_file,
+        "package upstream\n\nfunc Greeting() string { return \"DRIFT\" }\n",
+    )
+    .unwrap();
     let (code, _so, _se) = run_with_env(
         &consumer,
         &["apply", "--check", "--ecosystems", "golang", "--cwd", cs],
         &[("GOMODCACHE", mc)],
     );
-    assert_ne!(code, 0, "apply --check must detect drift in the committed copy");
+    assert_ne!(
+        code, 0,
+        "apply --check must detect drift in the committed copy"
+    );
 
     // A fresh `apply` re-materialises the copy and `go build` links PATCHED again.
     let (code, _so, _se) = run_with_env(

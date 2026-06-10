@@ -768,7 +768,10 @@ mod tests {
         // violating the documented contract — `(true, ..)` means a socket-patch
         // segment was removed, which did not happen.
         let (changed, new) = remove_socket_patch_from_script("echo a &&  && echo b");
-        assert!(!changed, "no socket-patch present, must not report a removal");
+        assert!(
+            !changed,
+            "no socket-patch present, must not report a removal"
+        );
         assert_eq!(new.as_deref(), Some("echo a &&  && echo b"));
     }
 
@@ -865,8 +868,7 @@ mod tests {
     fn test_remove_content_roundtrip_with_update() {
         // update then remove must return to a no-socket-patch state.
         let original = r#"{"name":"x","scripts":{"build":"tsc"}}"#;
-        let (_, updated, ..) =
-            update_package_json_content(original, PackageManager::Npm).unwrap();
+        let (_, updated, ..) = update_package_json_content(original, PackageManager::Npm).unwrap();
         assert!(updated.contains("socket-patch"));
 
         let (modified, removed, _) = remove_package_json_content(&updated).unwrap();
@@ -880,7 +882,8 @@ mod tests {
 
     #[test]
     fn test_remove_content_idempotent() {
-        let configured = r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
+        let configured =
+            r#"{"name":"x","scripts":{"postinstall":"npx @socketsecurity/socket-patch apply"}}"#;
         let (modified1, removed, _) = remove_package_json_content(configured).unwrap();
         assert!(modified1);
         let (modified2, _, _) = remove_package_json_content(&removed).unwrap();
@@ -891,8 +894,7 @@ mod tests {
     fn test_remove_content_roundtrip_pnpm() {
         // update (pnpm) then remove must fully revert to a no-socket-patch state.
         let original = r#"{"name":"x","scripts":{"build":"tsc"}}"#;
-        let (_, updated, ..) =
-            update_package_json_content(original, PackageManager::Pnpm).unwrap();
+        let (_, updated, ..) = update_package_json_content(original, PackageManager::Pnpm).unwrap();
         assert!(updated.contains("pnpm dlx @socketsecurity/socket-patch apply"));
 
         let (modified, removed, _) = remove_package_json_content(&updated).unwrap();

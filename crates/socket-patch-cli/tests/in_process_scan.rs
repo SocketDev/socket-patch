@@ -26,7 +26,7 @@ fn default_args(cwd: &Path) -> ScanArgs {
             yes: true,
             global: false,
             global_prefix: None,
-                        api_token: Some("fake".to_string()),
+            api_token: Some("fake".to_string()),
             ecosystems: None,
             download_mode: "diff".to_string(),
             dry_run: false,
@@ -100,7 +100,9 @@ async fn mock_batch_one(server: &MockServer) {
 
 async fn mock_by_package(server: &MockServer) {
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": PURL,
@@ -153,7 +155,9 @@ fn batch_posts(reqs: &[wiremock::Request]) -> Vec<&wiremock::Request> {
 
 fn by_package_gets(reqs: &[wiremock::Request]) -> usize {
     reqs.iter()
-        .filter(|r| format!("{}", r.method) == "GET" && r.url.path().contains("/patches/by-package/"))
+        .filter(|r| {
+            format!("{}", r.method) == "GET" && r.url.path().contains("/patches/by-package/")
+        })
         .count()
 }
 
@@ -284,7 +288,10 @@ async fn scan_apply_wet_writes_manifest_and_blob() {
     // partial_failure (exit 1): the on-disk "package/index.js" doesn't
     // match the fixture's beforeHash, so the patch can't be applied. The
     // download stage still ran, though — that's what we verify.
-    assert_eq!(code, 1, "apply over a hash-mismatched file must partial-fail");
+    assert_eq!(
+        code, 1,
+        "apply over a hash-mismatched file must partial-fail"
+    );
 
     // The view endpoint (which carries the blob) must have been hit.
     let reqs = recorded(&server).await;
@@ -359,7 +366,11 @@ async fn scan_prune_only_dry_run_reports_orphans() {
     let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
     let patches = manifest["patches"].as_object().unwrap();
-    assert_eq!(patches.len(), 1, "dry-run prune must not mutate the manifest");
+    assert_eq!(
+        patches.len(),
+        1,
+        "dry-run prune must not mutate the manifest"
+    );
     assert!(
         patches.contains_key("pkg:npm/stale@1.0.0"),
         "stale entry must be preserved by a dry-run prune; got {manifest}"
@@ -446,7 +457,10 @@ async fn scan_sync_full_cycle_against_clean_project() {
     let code = run(args).await;
     // --sync == --apply --prune; apply over the hash-mismatched fixture file
     // deterministically partial-fails (exit 1) just like the apply-wet case.
-    assert_eq!(code, 1, "sync over a hash-mismatched file must partial-fail");
+    assert_eq!(
+        code, 1,
+        "sync over a hash-mismatched file must partial-fail"
+    );
 
     // The full apply pipeline ran: view fetched, manifest written with the
     // package, and the after-blob persisted with the exact decoded bytes.
@@ -507,14 +521,20 @@ async fn scan_small_batch_size_chunks_requests() {
             .iter()
             .filter(|n| body.contains(*n))
             .count();
-        assert_eq!(hits, 1, "each chunk must carry exactly one package; body={body}");
+        assert_eq!(
+            hits, 1,
+            "each chunk must carry exactly one package; body={body}"
+        );
         for (i, n) in ["pkg-a", "pkg-b", "pkg-c"].iter().enumerate() {
             if body.contains(n) {
                 covered[i] = true;
             }
         }
     }
-    assert!(covered.iter().all(|c| *c), "all three packages must be queried");
+    assert!(
+        covered.iter().all(|c| *c),
+        "all three packages must be queried"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +671,11 @@ async fn scan_api_500_does_not_panic() {
     // Real path actually executed: the batch endpoint was queried (and 500'd)
     // and no spurious manifest was written.
     let reqs = recorded(&server).await;
-    assert_eq!(batch_posts(&reqs).len(), 1, "the batch endpoint must be queried");
+    assert_eq!(
+        batch_posts(&reqs).len(),
+        1,
+        "the batch endpoint must be queried"
+    );
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "a fully-failed scan must not write a manifest"
@@ -690,7 +714,6 @@ async fn scan_unreachable_api_does_not_panic() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // Regression: --batch-size 0 must not panic
 // ---------------------------------------------------------------------------
@@ -718,7 +741,11 @@ async fn scan_batch_size_zero_does_not_panic() {
     assert_eq!(run(args).await, 0);
     let reqs = recorded(&server).await;
     let posts = batch_posts(&reqs);
-    assert_eq!(posts.len(), 1, "batch must still be queried with a clamped size");
+    assert_eq!(
+        posts.len(),
+        1,
+        "batch must still be queried with a clamped size"
+    );
     assert!(
         req_body(posts[0]).contains(PURL),
         "the discovered purl must be sent even with --batch-size 0"
@@ -804,7 +831,11 @@ async fn scan_prune_with_ecosystem_filter_keeps_other_ecosystem() {
         patches.contains_key("pkg:gem/live-gem@2.0.0"),
         "an installed package of a filtered-OUT ecosystem must NOT be pruned; got {m}"
     );
-    assert_eq!(patches.len(), 2, "exactly the orphan should be removed; got {m}");
+    assert_eq!(
+        patches.len(),
+        2,
+        "exactly the orphan should be removed; got {m}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +882,10 @@ async fn scan_non_json_dry_run_does_not_mutate() {
     // Manifest is byte-for-byte unchanged: neither the apply nor the prune
     // GC touched it.
     let after = std::fs::read_to_string(socket.join("manifest.json")).unwrap();
-    assert_eq!(after, before, "non-JSON dry-run must not mutate the manifest");
+    assert_eq!(
+        after, before,
+        "non-JSON dry-run must not mutate the manifest"
+    );
     assert!(
         !socket.join("blobs").exists(),
         "non-JSON dry-run must not download/write blobs"

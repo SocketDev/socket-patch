@@ -26,7 +26,7 @@ fn default_args(identifier: &str, cwd: &Path) -> GetArgs {
             org: Some(ORG.to_string()),
             cwd: cwd.to_path_buf(),
             yes: true,
-                        api_token: Some("fake-token-for-tests".to_string()),
+            api_token: Some("fake-token-for-tests".to_string()),
             global: false,
             global_prefix: None,
             json: true,
@@ -67,7 +67,14 @@ async fn make_view_mock(server: &MockServer, uuid: &str, purl: &str, tier: &str)
         .await;
 }
 
-async fn make_search_mock_one(server: &MockServer, kind: &str, key: &str, uuid: &str, purl: &str, tier: &str) {
+async fn make_search_mock_one(
+    server: &MockServer,
+    kind: &str,
+    key: &str,
+    uuid: &str,
+    purl: &str,
+    tier: &str,
+) {
     let url_path = format!("/v0/orgs/{ORG}/patches/{kind}/{key}");
     Mock::given(method("GET"))
         .and(path(url_path))
@@ -221,7 +228,10 @@ async fn get_by_uuid_404_emits_not_found() {
     args.common.api_url = url;
 
     let code = run(args).await;
-    assert_eq!(code, 0, "not_found is reported via JSON, not via exit code 1");
+    assert_eq!(
+        code, 0,
+        "not_found is reported via JSON, not via exit code 1"
+    );
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "no manifest must be written on 404"
@@ -363,7 +373,10 @@ async fn get_by_purl_multi_patch_in_json_mode_errors() {
     // prompt non-interactively. The previous `0 || 1` accepted the broken
     // case where the CLI silently auto-picks one and reports success — the
     // exact behavior this test exists to forbid.
-    assert_eq!(code, 1, "ambiguous multi-patch selection in --json must exit 1");
+    assert_eq!(
+        code, 1,
+        "ambiguous multi-patch selection in --json must exit 1"
+    );
     // And it must NOT have downloaded/saved an arbitrarily-chosen patch.
     assert_no_manifest(tmp.path());
 }
@@ -466,7 +479,10 @@ async fn get_with_explicit_package_no_install_short_circuits() {
     assert!(
         requests.is_empty(),
         "no_packages short-circuit must make zero API calls, saw: {:?}",
-        requests.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        requests
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -505,11 +521,15 @@ async fn get_with_explicit_package_flag_resolves_installed_and_saves() {
     let requests = server.received_requests().await.unwrap();
     let paths: Vec<String> = requests.iter().map(|r| r.url.path().to_string()).collect();
     assert!(
-        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/by-package/{encoded}")),
+        paths
+            .iter()
+            .any(|p| p == &format!("/v0/orgs/{ORG}/patches/by-package/{encoded}")),
         "must search by the resolved PURL, saw: {paths:?}"
     );
     assert!(
-        paths.iter().any(|p| p == &format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
+        paths
+            .iter()
+            .any(|p| p == &format!("/v0/orgs/{ORG}/patches/view/{UUID}")),
         "must fetch the selected patch's view, saw: {paths:?}"
     );
 }

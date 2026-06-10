@@ -212,7 +212,10 @@ mod tests {
             },
         );
 
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[test]

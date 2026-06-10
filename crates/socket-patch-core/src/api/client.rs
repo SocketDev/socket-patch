@@ -1582,10 +1582,12 @@ mod tests {
 
     #[test]
     fn classify_auth_error_maps_401_to_unauthorized() {
-        let err = classify_auth_error(StatusCode::UNAUTHORIZED, false)
-            .expect("401 must classify");
+        let err = classify_auth_error(StatusCode::UNAUTHORIZED, false).expect("401 must classify");
         assert!(matches!(err, ApiError::Unauthorized(_)));
-        assert!(is_fallback_candidate(&err), "401 must drive the proxy fallback");
+        assert!(
+            is_fallback_candidate(&err),
+            "401 must drive the proxy fallback"
+        );
     }
 
     #[test]
@@ -1593,7 +1595,10 @@ mod tests {
         // Proxy path (use_public_proxy = true) → paid-subscriber hint.
         let proxy = classify_auth_error(StatusCode::FORBIDDEN, true).expect("403 classifies");
         assert!(matches!(proxy, ApiError::Forbidden(_)));
-        assert!(is_fallback_candidate(&proxy), "403 must drive the proxy fallback");
+        assert!(
+            is_fallback_candidate(&proxy),
+            "403 must drive the proxy fallback"
+        );
         assert!(
             proxy.to_string().contains("paid subscribers"),
             "proxy 403 must carry the paid-subscriber hint; got: {proxy}"
@@ -1609,8 +1614,8 @@ mod tests {
 
     #[test]
     fn classify_auth_error_maps_429_to_rate_limited() {
-        let err = classify_auth_error(StatusCode::TOO_MANY_REQUESTS, false)
-            .expect("429 must classify");
+        let err =
+            classify_auth_error(StatusCode::TOO_MANY_REQUESTS, false).expect("429 must classify");
         assert!(matches!(err, ApiError::RateLimited(_)));
         // Rate limits are intentionally *not* a fallback candidate — they
         // surface as-is so the operator sees them.

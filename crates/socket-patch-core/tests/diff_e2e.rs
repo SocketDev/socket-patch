@@ -155,9 +155,12 @@ fn forged_max_u64_header_is_safe() {
     let huge: u64 = i64::MAX as u64;
     forged[24..32].copy_from_slice(&huge.to_le_bytes());
 
-    let result = apply_diff(before, &forged)
-        .expect("clamped apply must succeed on a max-size forged hint");
-    assert_eq!(result, after, "max-size forged hint must not corrupt output");
+    let result =
+        apply_diff(before, &forged).expect("clamped apply must succeed on a max-size forged hint");
+    assert_eq!(
+        result, after,
+        "max-size forged hint must not corrupt output"
+    );
 }
 
 /// Security regression (mirrors the lib's

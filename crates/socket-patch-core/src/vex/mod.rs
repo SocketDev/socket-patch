@@ -20,13 +20,15 @@ pub mod schema;
 pub mod time;
 pub mod verify;
 
-pub use build::{build_document, BuildOptions};
+pub use build::{build_document, build_document_with_vendored, BuildOptions};
 pub use product::{detect_product, DetectResult};
 pub use schema::{
     Document, Justification, Product, Statement, Status, Subcomponent, Vulnerability,
     OPENVEX_CONTEXT_V0_2_0,
 };
-pub use verify::{applied_patches, FailedPatch, VerifyOutcome};
+pub use verify::{
+    applied_patches, applied_patches_with_vendor, FailedPatch, VendorContext, VerifyOutcome,
+};
 
 #[cfg(test)]
 mod conformance_tests;

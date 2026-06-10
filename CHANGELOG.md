@@ -16,6 +16,50 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **`vendor` now supports every major npm and pypi package manager.** The npm
+  ecosystem gained four lockfile flavors beyond `package-lock.json` — yarn
+  classic (`yarn.lock` v1), yarn berry with the node-modules linker
+  (`resolutions` + a cache-zip `10c0` checksum reproduced offline from the
+  vendored tarball), pnpm (`pnpm.overrides` + `pnpm-lock.yaml` surgery, pnpm 9
+  & 10), and bun (`bun.lock`) — all sharing the one vendored tarball and
+  selected by a content-sniffing probe (yarn-berry PnP and bun's binary
+  `bun.lockb` are refused with pointers to the native flow). The pypi
+  ecosystem gained poetry, pdm, and pipenv (lock-only `[[package]]` / entry
+  splices, like the existing uv/requirements flavors). Every lockfile
+  checksum/reference field for a vendored package is now recomputed
+  coherently (the v2 "update checksums and references" directive); the gem
+  backend handles bundler ≥ 2.6's optional `CHECKSUMS` section; composer's
+  `dist.reference` carries the patch UUID into `installed.json`. Each flavor
+  has a real-package-manager build-proof capstone (fresh-checkout, cold-cache,
+  strictest-install — `--frozen`/`--immutable`/`--deploy`/`--locked` — with
+  byte-identical revert). `vendor --force`/`--revert` accept empty env vars
+  (`SOCKET_FORCE=`) as false, matching the global-flag contract.
+
+- **New `vendor` subcommand: committable vendoring of patched dependencies.**
+  Where `apply` patches installed packages in place (machine-local state),
+  `socket-patch vendor` ejects each patched package into a committed
+  `.socket/vendor/<ecosystem>/<patch-uuid>/<artifact>` and rewires the
+  ecosystem's lockfile so the project consumes the vendored copy — after
+  committing, a fresh checkout builds with the patched dependency on machines
+  with no socket-patch installed and no Socket API access. Per ecosystem
+  (each mechanism validated against the real package manager): npm rewrites
+  `package-lock.json` only (deterministic patched tarball, recomputed
+  integrity, `npm ci`-verified); cargo writes a `[patch.crates-io]` entry in
+  `.cargo/config.toml` plus surgical Cargo.lock edits so `cargo build
+  --locked --offline` works; golang reuses the `replace`-directive engine
+  pointed at the vendor tree; composer rewrites the lock entry to a
+  `dist: path` copy; gem edits the Gemfile + Gemfile.lock pair in bundler's
+  canonical form; pypi rebuilds a valid wheel (regenerated RECORD) wired
+  through uv's `pyproject.toml`/`uv.lock` pair (uv-first) or
+  requirements.txt (`pip` / `uv pip`). The patch UUID is recoverable from the
+  lockfile path string alone (a documented convention for external tools), a
+  committed `.socket/vendor/state.json` ledger records the verbatim original
+  lockfile fragments, and `vendor --revert` restores them byte-exactly.
+  `vendor --vex` mirrors `apply --vex`; VEX generation attests vendored
+  patches by hashing the committed artifacts, and `apply` yields ownership of
+  vendored packages (`vendored` skip reason).
+
+
 - **Cargo support (`cargo` is now a default feature).** `apply` patches a Rust
   dependency **in place** wherever the crawler finds it — the project `vendor/`
   directory or the shared `$CARGO_HOME` registry cache — rewriting the crate's
@@ -58,6 +102,15 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   recognize, such as `pkg:jsr/…` — per-package queries tolerate those
   individually, so one exotic package can't fail a whole scan). Rate limits
   and over-capacity 503s still surface instead of silently degrading. (MINOR)
+
+### Fixed
+
+- **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
+  previously verified golang patches against the pristine module cache
+  instead of the patched `.socket/go-patches/` copy, so redirect-applied
+  patches were silently omitted from the document (reported `not_applied`,
+  or `package_not_found` on cache-less CI). Verification now follows the
+  managed `replace` directive to the committed copy.
 
 ## [3.2.0] — 2026-05-29
 

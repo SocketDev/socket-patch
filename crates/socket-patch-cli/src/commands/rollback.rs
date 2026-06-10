@@ -1,15 +1,15 @@
 use clap::Args;
-use socket_patch_core::api::blob_fetcher::{
-    fetch_blobs_by_hash, format_fetch_result,
-};
+use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
-use socket_patch_core::patch::rollback::{rollback_package_patch, RollbackResult, VerifyRollbackStatus};
+use socket_patch_core::patch::rollback::{
+    rollback_package_patch, RollbackResult, VerifyRollbackStatus,
+};
 use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
-use socket_patch_core::utils::telemetry::{track_patch_rolled_back, track_patch_rollback_failed};
+use socket_patch_core::utils::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -93,6 +93,7 @@ async fn try_rollback_local_go(
     patch: &PatchRecord,
     common: &GlobalArgs,
 ) -> Option<RollbackResult> {
+    use socket_patch_core::patch::go_mod_edit::{ReplaceOwner, GO_PATCHES_DIR};
     use socket_patch_core::patch::go_redirect::remove_go_redirect;
     if !is_local_go(purl, common) {
         return None;
@@ -105,7 +106,15 @@ async fn try_rollback_local_go(
         files_rolled_back: patch.files.keys().cloned().collect(),
         error: None,
     };
-    if let Err(e) = remove_go_redirect(purl, &common.cwd, common.dry_run).await {
+    if let Err(e) = remove_go_redirect(
+        purl,
+        &common.cwd,
+        GO_PATCHES_DIR,
+        ReplaceOwner::GoPatches,
+        common.dry_run,
+    )
+    .await
+    {
         result.success = false;
         result.files_rolled_back.clear();
         result.error = Some(e.to_string());
@@ -174,10 +183,7 @@ fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
     blobs
 }
 
-async fn get_missing_before_blobs(
-    manifest: &PatchManifest,
-    blobs_path: &Path,
-) -> HashSet<String> {
+async fn get_missing_before_blobs(manifest: &PatchManifest, blobs_path: &Path) -> HashSet<String> {
     let before_blobs = get_before_hash_blobs(manifest);
     let mut missing = HashSet::new();
     for hash in before_blobs {
@@ -262,10 +268,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Validate one-off requires identifier
     if args.one_off && args.identifier.is_none() {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "--one-off requires an identifier (UUID or PURL)",
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": "--one-off requires an identifier (UUID or PURL)",
+                }))
+                .unwrap()
+            );
         } else {
             eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
         }
@@ -275,10 +285,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Handle one-off mode
     if args.one_off {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "One-off rollback mode is not yet implemented",
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": "One-off rollback mode is not yet implemented",
+                }))
+                .unwrap()
+            );
         } else {
             eprintln!("One-off rollback mode: fetching patch data...");
         }
@@ -289,11 +303,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.common.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "error",
-                "error": "Manifest not found",
-                "path": manifest_path.display().to_string(),
-            })).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "error": "Manifest not found",
+                    "path": manifest_path.display().to_string(),
+                }))
+                .unwrap()
+            );
         } else if !args.common.silent {
             eprintln!("Manifest not found at {}", manifest_path.display());
         }
@@ -347,15 +365,19 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         ),
                     }));
                 }
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": if success { "success" } else { "partial_failure" },
-                    "rolledBack": rolled_back_count,
-                    "alreadyOriginal": already_original_count,
-                    "failed": failed_count,
-                    "dryRun": args.common.dry_run,
-                    "warnings": warnings,
-                    "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
-                })).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": if success { "success" } else { "partial_failure" },
+                        "rolledBack": rolled_back_count,
+                        "alreadyOriginal": already_original_count,
+                        "failed": failed_count,
+                        "dryRun": args.common.dry_run,
+                        "warnings": warnings,
+                        "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+                    }))
+                    .unwrap()
+                );
             } else if !args.common.silent && !results.is_empty() {
                 let rolled_back: Vec<_> = results
                     .iter()
@@ -436,25 +458,43 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             if success {
-                track_patch_rolled_back(rolled_back_count, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_rolled_back(
+                    rolled_back_count,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             } else {
-                track_patch_rollback_failed("One or more rollbacks failed", api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_rollback_failed(
+                    "One or more rollbacks failed",
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             }
 
-            if success { 0 } else { 1 }
+            if success {
+                0
+            } else {
+                1
+            }
         }
         Err(e) => {
             track_patch_rollback_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
             if args.common.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": e,
-                    "rolledBack": 0,
-                    "alreadyOriginal": 0,
-                    "failed": 0,
-                    "dryRun": args.common.dry_run,
-                    "results": [],
-                })).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "error",
+                        "error": e,
+                        "rolledBack": 0,
+                        "alreadyOriginal": 0,
+                        "failed": 0,
+                        "dryRun": args.common.dry_run,
+                        "results": [],
+                    }))
+                    .unwrap()
+                );
             } else if !args.common.silent {
                 eprintln!("Error: {e}");
             }
@@ -478,8 +518,7 @@ async fn rollback_patches_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let patches_to_rollback =
-        find_patches_to_rollback(&manifest, args.identifier.as_deref());
+    let patches_to_rollback = find_patches_to_rollback(&manifest, args.identifier.as_deref());
 
     if patches_to_rollback.is_empty() {
         if args.identifier.is_some() {
@@ -526,8 +565,7 @@ async fn rollback_patches_inner(
             println!("Downloading {} missing blob(s)...", missing_blobs.len());
         }
 
-        let (client, _) =
-            get_api_client_with_overrides(args.common.api_client_overrides()).await;
+        let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
         let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, &client, None).await;
 
         if !args.common.silent && !args.common.json {
@@ -553,8 +591,7 @@ async fn rollback_patches_inner(
 
     // Partition PURLs by ecosystem
     let rollback_purls: Vec<String> = patches_to_rollback.iter().map(|p| p.purl.clone()).collect();
-    let partitioned =
-        partition_purls(&rollback_purls, args.common.ecosystems.as_deref());
+    let partitioned = partition_purls(&rollback_purls, args.common.ecosystems.as_deref());
 
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
@@ -563,8 +600,12 @@ async fn rollback_patches_inner(
         batch_size: 100,
     };
 
-    let all_packages =
-        find_packages_for_rollback(&partitioned, &crawler_options, args.common.silent || args.common.json).await;
+    let all_packages = find_packages_for_rollback(
+        &partitioned,
+        &crawler_options,
+        args.common.silent || args.common.json,
+    )
+    .await;
 
     if all_packages.is_empty() {
         if !args.common.silent && !args.common.json {
@@ -617,8 +658,10 @@ async fn rollback_patches_inner(
                 // mismatch rather than silently skipping the package.
                 entries
             } else {
-                let winners: HashSet<String> =
-                    matched.iter().map(|&i| candidates[i].0.to_string()).collect();
+                let winners: HashSet<String> = matched
+                    .iter()
+                    .map(|&i| candidates[i].0.to_string())
+                    .collect();
                 entries
                     .into_iter()
                     .filter(|(p, _)| winners.contains(*p))
@@ -721,7 +764,10 @@ mod tests {
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
         patches.insert("pkg:npm/bar@2.0".to_string(), make_record("uuid-bar"));
         patches.insert("pkg:pypi/baz@3.0".to_string(), make_record("uuid-baz"));
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[test]
@@ -734,8 +780,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_match() {
         let manifest = make_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
+        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/foo@1.0"));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:npm/foo@1.0");
     }
@@ -743,8 +788,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_purl_no_match() {
         let manifest = make_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
+        let result = find_patches_to_rollback(&manifest, Some("pkg:npm/nonexistent@1"));
         assert!(result.is_empty());
     }
 
@@ -760,8 +804,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_uuid_no_match() {
         let manifest = make_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
+        let result = find_patches_to_rollback(&manifest, Some("uuid-does-not-exist"));
         assert!(result.is_empty());
     }
 
@@ -782,14 +825,16 @@ mod tests {
             make_record("uuid-sdist"),
         );
         patches.insert("pkg:npm/foo@1.0".to_string(), make_record("uuid-foo"));
-        PatchManifest { patches, setup: None }
+        PatchManifest {
+            patches,
+            setup: None,
+        }
     }
 
     #[test]
     fn test_find_patches_to_rollback_base_purl_matches_all_variants() {
         let manifest = make_multi_variant_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
         // Base PURL (no qualifier) expands to every release variant.
         assert_eq!(result.len(), 3);
         for p in &result {
@@ -800,10 +845,8 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_qualified_purl_matches_one_variant() {
         let manifest = make_multi_variant_manifest();
-        let result = find_patches_to_rollback(
-            &manifest,
-            Some("pkg:pypi/six@1.16.0?artifact_id=sdist"),
-        );
+        let result =
+            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0?artifact_id=sdist"));
         // A fully-qualified PURL targets exactly one variant.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].purl, "pkg:pypi/six@1.16.0?artifact_id=sdist");
@@ -812,8 +855,7 @@ mod tests {
     #[test]
     fn test_find_patches_to_rollback_base_purl_does_not_leak_other_packages() {
         let manifest = make_multi_variant_manifest();
-        let result =
-            find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
+        let result = find_patches_to_rollback(&manifest, Some("pkg:pypi/six@1.16.0"));
         assert!(result.iter().all(|p| p.purl.contains("six@1.16.0")));
     }
 
@@ -844,8 +886,7 @@ mod tests {
         verified_statuses: &[VerifyRollbackStatus],
         rolled_back: &[&str],
     ) -> RollbackResult {
-        let files_verified: Vec<_> =
-            verified_statuses.iter().cloned().map(verified).collect();
+        let files_verified: Vec<_> = verified_statuses.iter().cloned().map(verified).collect();
         let success = files_verified.iter().all(|f| {
             f.status == VerifyRollbackStatus::Ready
                 || f.status == VerifyRollbackStatus::AlreadyOriginal
@@ -979,7 +1020,10 @@ mod tests {
             "pkg:npm/foo@1.0.0".to_string(),
             record_with_file("uuid-npm", "index.js", "npm_before"),
         );
-        let manifest = PatchManifest { patches, setup: None };
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
 
         // Local mode (no --global / --global-prefix).
         let common = crate::args::GlobalArgs::default();
@@ -988,7 +1032,9 @@ mod tests {
         // Blobs dir holds only the npm before-blob; the cargo one is absent.
         let tmp = tempfile::tempdir().unwrap();
         let blobs = tmp.path();
-        tokio::fs::write(blobs.join("npm_before"), b"x").await.unwrap();
+        tokio::fs::write(blobs.join("npm_before"), b"x")
+            .await
+            .unwrap();
 
         // The gate must STILL report the cargo before-blob as missing — cargo
         // is an in-place rollback that genuinely needs it.
@@ -1021,7 +1067,10 @@ mod tests {
             "pkg:npm/foo@1.0.0".to_string(),
             record_with_file("uuid-npm", "index.js", "npm_before"),
         );
-        let manifest = PatchManifest { patches, setup: None };
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
 
         // Local mode (no --global / --global-prefix).
         let common = crate::args::GlobalArgs::default();
@@ -1030,7 +1079,9 @@ mod tests {
         // Blobs dir holds only the npm before-blob; the go one is absent.
         let tmp = tempfile::tempdir().unwrap();
         let blobs = tmp.path();
-        tokio::fs::write(blobs.join("npm_before"), b"x").await.unwrap();
+        tokio::fs::write(blobs.join("npm_before"), b"x")
+            .await
+            .unwrap();
 
         // Full manifest: the go before-blob shows up as missing — exactly what
         // the buggy (cargo-only) gate left in, spuriously aborting rollback.
@@ -1049,12 +1100,18 @@ mod tests {
 
         // And `is_local_redirect` must classify the go PURL as a redirect in
         // local mode but a global PURL as in-place (gate must keep the latter).
-        assert!(is_local_redirect("pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1", &common));
+        assert!(is_local_redirect(
+            "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1",
+            &common
+        ));
         let global = crate::args::GlobalArgs {
             global: true,
             ..crate::args::GlobalArgs::default()
         };
-        assert!(!is_local_redirect("pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1", &global));
+        assert!(!is_local_redirect(
+            "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1",
+            &global
+        ));
     }
 
     /// Regression: rolling back a local-GO patch must DROP the project-local
@@ -1070,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
         use socket_patch_core::patch::go_mod_edit::{
-            ensure_replace_entry, read_replace_entries,
+            ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
         };
 
         const MODULE: &str = "github.com/foo/bar";
@@ -1088,7 +1145,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let changed = ensure_replace_entry(root, MODULE, VERSION, false)
+        let changed = ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
             .await
             .unwrap();
         assert!(changed, "fixture must install a socket-owned replace");
@@ -1104,7 +1161,7 @@ mod tests {
         assert!(read_replace_entries(root)
             .await
             .iter()
-            .any(|e| e.module == MODULE && e.socket_owned));
+            .any(|e| e.module == MODULE && e.socket_owned()));
 
         let patch = record_with_file("uuid-go", "errors.go", "go_before");
         let common = crate::args::GlobalArgs {
@@ -1129,7 +1186,7 @@ mod tests {
             read_replace_entries(root)
                 .await
                 .iter()
-                .all(|e| !(e.module == MODULE && e.socket_owned)),
+                .all(|e| !(e.module == MODULE && e.socket_owned())),
             "socket-owned replace directive must be dropped"
         );
         // ...the require directive (user-authored) survives...
@@ -1162,6 +1219,9 @@ mod tests {
             &global,
         )
         .await;
-        assert!(result.is_none(), "global go must not use the redirect backend");
+        assert!(
+            result.is_none(),
+            "global go must not use the redirect backend"
+        );
     }
 }

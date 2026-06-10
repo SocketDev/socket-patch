@@ -48,9 +48,12 @@ async fn stage_vendor_gem(subproject: &Path, name: &str, version: &str) {
         .join("lib");
     tokio::fs::create_dir_all(&pkg).await.unwrap();
     // Realistic Bundler project marker (the subproject dir now exists).
-    tokio::fs::write(subproject.join("Gemfile"), b"source 'https://rubygems.org'\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        subproject.join("Gemfile"),
+        b"source 'https://rubygems.org'\n",
+    )
+    .await
+    .unwrap();
 }
 
 // ── GREEN: per-subproject crawl works (the cwd-scoped model) ──────────────

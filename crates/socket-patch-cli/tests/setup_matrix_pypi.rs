@@ -161,8 +161,9 @@ mod host_guard {
     /// promises — a non-JSON / multi-line dump means the command did not
     /// run the path we think it did.
     fn parse_json(stdout: &str, who: &str) -> serde_json::Value {
-        serde_json::from_str(stdout.trim())
-            .unwrap_or_else(|e| panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}"))
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{who}: stdout was not a single JSON object ({e}):\n{stdout}")
+        })
     }
 
     fn json_str(v: &serde_json::Value, key: &str, who: &str) -> String {
@@ -247,7 +248,11 @@ mod host_guard {
             "pristine pip project must report needs_configuration:\n{v}"
         );
         assert_eq!(
-            json_str(&pth_entry(&v, "check (pristine)"), "status", "check (pristine) pth"),
+            json_str(
+                &pth_entry(&v, "check (pristine)"),
+                "status",
+                "check (pristine) pth"
+            ),
             "needs_configuration",
             "the requirements.txt pth entry must read needs_configuration before setup:\n{v}"
         );
@@ -256,7 +261,10 @@ mod host_guard {
 
         // ── setup: must append the hook dep and report success ──────────────
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "setup must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_json(&out, "setup");
         assert_eq!(
             json_str(&v, "status", "setup"),
@@ -309,14 +317,21 @@ mod host_guard {
             "after setup the project must report configured:\n{v}"
         );
         assert_eq!(
-            json_str(&pth_entry(&v, "check (configured)"), "status", "check (configured) pth"),
+            json_str(
+                &pth_entry(&v, "check (configured)"),
+                "status",
+                "check (configured) pth"
+            ),
             "configured",
             "the requirements.txt pth entry must read configured after setup:\n{v}"
         );
 
         // ── idempotent re-setup: no further change ──────────────────────────
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "re-setup must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "re-setup must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_json(&out, "re-setup");
         assert_eq!(
             json_str(&v, "status", "re-setup"),
@@ -332,8 +347,14 @@ mod host_guard {
         assert_requirements(root, REQ_WITH_HOOK, "after re-setup");
 
         // ── remove: strip the hook dep, restore the original manifest ───────
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "setup --remove must succeed.\nstdout:\n{out}\nstderr:\n{err}");
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
+        assert_eq!(
+            code, 0,
+            "setup --remove must succeed.\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_json(&out, "remove");
         assert_eq!(
             json_str(&v, "status", "remove"),

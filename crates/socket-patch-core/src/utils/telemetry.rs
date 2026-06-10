@@ -39,6 +39,9 @@ pub enum PatchTelemetryEventType {
     PatchScanFailed,
     PatchFetched,
     PatchFetchFailed,
+    // Write-side: vendor
+    PatchVendored,
+    PatchVendorFailed,
     // Inspection / housekeeping
     PatchListed,
     PatchRepaired,
@@ -58,6 +61,8 @@ impl PatchTelemetryEventType {
             Self::PatchApplied => "patch_applied",
             Self::PatchApplyFailed => "patch_apply_failed",
             Self::PatchRemoved => "patch_removed",
+            Self::PatchVendored => "patch_vendored",
+            Self::PatchVendorFailed => "patch_vendor_failed",
             Self::PatchRemoveFailed => "patch_remove_failed",
             Self::PatchRolledBack => "patch_rolled_back",
             Self::PatchRollbackFailed => "patch_rollback_failed",
@@ -451,6 +456,42 @@ pub async fn track_patch_apply_failed(
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
         "apply",
+        serde_json::json!({ "dry_run": dry_run }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
+    .await;
+}
+
+/// Track a successful vendor run (count = packages vendored).
+pub async fn track_patch_vendored(
+    vendored_count: u32,
+    dry_run: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    fire(
+        PatchTelemetryEventType::PatchVendored,
+        "vendor",
+        serde_json::json!({ "patches_count": vendored_count, "dry_run": dry_run }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
+    .await;
+}
+
+/// Track a failed vendor run.
+pub async fn track_patch_vendor_failed(
+    error: impl std::fmt::Display,
+    dry_run: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    fire(
+        PatchTelemetryEventType::PatchVendorFailed,
+        "vendor",
         serde_json::json!({ "dry_run": dry_run }),
         Some(error),
         api_token,
@@ -1087,7 +1128,7 @@ mod tests {
     /// arithmetic — so a regression in either is caught.
     fn brute_days_to_ymd(days: u64) -> (u64, u64, u64) {
         fn is_leap(y: u64) -> bool {
-            (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+            (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
         }
         let mut rem = days;
         let mut y = 1970u64;
@@ -1217,7 +1258,10 @@ mod tests {
     fn test_resolve_telemetry_endpoint_empty_strings_fall_back() {
         let (url, auth) = resolve_telemetry_endpoint(Some("tok"), Some(""));
         assert!(!auth, "empty slug must not authenticate");
-        assert!(!url.contains("/orgs//"), "empty slug leaked into URL: {url}");
+        assert!(
+            !url.contains("/orgs//"),
+            "empty slug leaked into URL: {url}"
+        );
         assert!(url.ends_with("/patch/telemetry"), "got {url}");
 
         let (_url, auth) = resolve_telemetry_endpoint(Some(""), Some("acme"));

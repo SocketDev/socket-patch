@@ -57,11 +57,7 @@ fn write_project(root: &Path) {
     // alter this file.
     let blobs = socket.join("blobs");
     std::fs::create_dir_all(&blobs).expect("create blobs dir");
-    std::fs::write(
-        blobs.join("sentinel"),
-        b"do not modify me",
-    )
-    .expect("write sentinel");
+    std::fs::write(blobs.join("sentinel"), b"do not modify me").expect("write sentinel");
     // Empty node_modules so the npm crawler returns nothing.
     std::fs::create_dir_all(root.join("node_modules")).expect("create node_modules");
     // A package.json so the crawler considers this a project root.
@@ -311,8 +307,7 @@ fn apply_with_no_socket_dir_emits_no_manifest_envelope() {
     // Note: NO .socket/ directory at all — completely fresh tree.
     let (code, stdout) = run_apply(tmp.path(), &[]);
     assert_eq!(code, 0, "no-manifest is not an error; stdout=\n{stdout}");
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("envelope must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope must be valid JSON");
     assert_eq!(v["command"], "apply");
     assert_eq!(v["status"], "noManifest");
     // noManifest is a clean no-op, not a partial failure dressed up: no
@@ -346,7 +341,10 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
         .expect("run socket-patch");
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.trim().is_empty(), "silent must produce no stdout; got {stdout:?}");
+    assert!(
+        stdout.trim().is_empty(),
+        "silent must produce no stdout; got {stdout:?}"
+    );
 
     // Control run: the same no-manifest scenario WITHOUT `--silent` must
     // print the friendly skip message to stdout. Without this control the

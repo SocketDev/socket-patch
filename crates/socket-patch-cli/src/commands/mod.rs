@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod fetch_stage;
 pub mod get;
 pub mod list;
 pub mod lock_cli;
@@ -8,4 +9,5 @@ pub mod rollback;
 pub mod scan;
 pub mod setup;
 pub mod unlock;
+pub mod vendor;
 pub mod vex;

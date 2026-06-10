@@ -389,11 +389,7 @@ fn second_positional_fails() {
 
 #[test]
 fn unknown_flag_fails() {
-    let err = match Cli::try_parse_from([
-        "socket-patch",
-        "rollback",
-        "--unknown-flag",
-    ]) {
+    let err = match Cli::try_parse_from(["socket-patch", "rollback", "--unknown-flag"]) {
         Ok(_) => panic!("expected parse failure"),
         Err(e) => e,
     };

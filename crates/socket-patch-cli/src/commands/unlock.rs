@@ -34,7 +34,11 @@ pub struct UnlockArgs {
     /// When the lock is free, also delete the lock file. Refused if
     /// the lock is currently held — use `--break-lock` on the
     /// mutating subcommand instead for that scenario.
-    #[arg(long = "release", env = "SOCKET_UNLOCK_RELEASE", default_value_t = false)]
+    #[arg(
+        long = "release",
+        env = "SOCKET_UNLOCK_RELEASE",
+        default_value_t = false
+    )]
     pub release: bool,
 }
 
@@ -97,8 +101,13 @@ pub async fn run(args: UnlockArgs) -> i32 {
                         // The file was never created (e.g. socket
                         // dir existed but no run has acquired the
                         // lock yet). Treat as success.
-                        track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref())
-                            .await;
+                        track_patch_unlocked(
+                            false,
+                            false,
+                            api_token.as_deref(),
+                            org_slug.as_deref(),
+                        )
+                        .await;
                         emit_free(args.common.json, &lock_file, false, true)
                     }
                     Err(e) => {
@@ -153,11 +162,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
             1
         }
         Err(LockError::Io { path, source }) => {
-            let msg = format!(
-                "failed to open lock file at {}: {}",
-                path.display(),
-                source
-            );
+            let msg = format!("failed to open lock file at {}: {}", path.display(), source);
             track_patch_unlock_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
             emit_error(args.common.json, args.common.silent, "lock_io", &msg);
             1

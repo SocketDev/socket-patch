@@ -80,8 +80,7 @@ fn cov_docker_args() -> Vec<String> {
 /// minimist fixture as `docker_e2e_npm.rs`; we duplicate it here to
 /// keep this test file self-contained.
 async fn make_npm_mock_server(after_hash: &str) -> MockServer {
-    let listener =
-        std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
     let server = MockServer::builder().listener(listener).start().await;
 
     Mock::given(method("POST"))
@@ -151,9 +150,7 @@ async fn make_npm_mock_server(after_hash: &str) -> MockServer {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/v0/orgs/{ORG}/patches/blob/{after_hash}"
-        )))
+        .and(path(format!("/v0/orgs/{ORG}/patches/blob/{after_hash}")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(PATCHED_BYTES))
         .mount(&server)
         .await;

@@ -84,10 +84,8 @@ fn make_yarn_berry_project(cwd: &Path) {
         r#"{"name":"yarn-berry-fixture","version":"0.0.0","private":true}"#,
     )
     .expect("write package.json");
-    std::fs::write(cwd.join(".pnp.cjs"), b"// stub PnP loader\n")
-        .expect("write .pnp.cjs");
-    std::fs::create_dir_all(cwd.join(".yarn").join("cache"))
-        .expect("create .yarn/cache");
+    std::fs::write(cwd.join(".pnp.cjs"), b"// stub PnP loader\n").expect("write .pnp.cjs");
+    std::fs::create_dir_all(cwd.join(".yarn").join("cache")).expect("create .yarn/cache");
 }
 
 /// Manifest-only helper for the `list`-discovery guard test. The
@@ -328,7 +326,9 @@ fn npm_layout_does_not_trigger_yarn_pnp_refusal() {
         "npm layout apply should report success.\nenvelope: {env}"
     );
     assert_eq!(
-        env.get("summary").and_then(|s| s.get("applied")).and_then(|v| v.as_u64()),
+        env.get("summary")
+            .and_then(|s| s.get("applied"))
+            .and_then(|v| v.as_u64()),
         Some(1),
         "npm layout apply should patch exactly the one staged file.\nenvelope: {env}"
     );

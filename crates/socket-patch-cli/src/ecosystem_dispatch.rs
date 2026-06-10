@@ -7,17 +7,17 @@ use std::path::PathBuf;
 
 #[cfg(feature = "cargo")]
 use socket_patch_core::crawlers::CargoCrawler;
-use socket_patch_core::crawlers::RubyCrawler;
+#[cfg(feature = "composer")]
+use socket_patch_core::crawlers::ComposerCrawler;
+#[cfg(feature = "deno")]
+use socket_patch_core::crawlers::DenoCrawler;
 #[cfg(feature = "golang")]
 use socket_patch_core::crawlers::GoCrawler;
 #[cfg(feature = "maven")]
 use socket_patch_core::crawlers::MavenCrawler;
-#[cfg(feature = "composer")]
-use socket_patch_core::crawlers::ComposerCrawler;
 #[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
-#[cfg(feature = "deno")]
-use socket_patch_core::crawlers::DenoCrawler;
+use socket_patch_core::crawlers::RubyCrawler;
 
 /// Runtime opt-in gate for experimental Maven support.
 ///
@@ -158,8 +158,7 @@ macro_rules! scan_ecosystem {
 /// Signature shared by `merge_first_wins` and `merge_qualified`.
 /// `dispatch_find` swaps between them so the rollback path can fan one
 /// crawler result back out to every caller-supplied qualified PURL.
-type MergeFn =
-    fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, CrawledPackage>);
+type MergeFn = fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, CrawledPackage>);
 
 /// Default merge: insert the crawler-returned PURL → first wins.
 fn merge_first_wins(
@@ -185,9 +184,7 @@ fn merge_qualified(
 ) {
     for (base_purl, pkg) in packages {
         for qualified in purls {
-            if strip_purl_qualifiers(qualified) == base_purl
-                && !out.contains_key(qualified)
-            {
+            if strip_purl_qualifiers(qualified) == base_purl && !out.contains_key(qualified) {
                 out.insert(qualified.clone(), pkg.path.clone());
             }
         }
@@ -546,7 +543,10 @@ mod tests {
             &purls,
             packages(&[("pkg:pypi/requests@2.28.0", "/sp")]),
         );
-        assert_eq!(out.get("pkg:pypi/requests@2.28.0"), Some(&PathBuf::from("/sp")));
+        assert_eq!(
+            out.get("pkg:pypi/requests@2.28.0"),
+            Some(&PathBuf::from("/sp"))
+        );
     }
 
     #[test]
@@ -615,8 +615,16 @@ mod tests {
         // the per-path iteration in the scan macro.
         let mut out: HashMap<String, PathBuf> = HashMap::new();
         let purls = vec!["pkg:gem/nokogiri@1.16.5?platform=arm64-darwin".to_string()];
-        merge_qualified(&mut out, &purls, packages(&[("pkg:gem/nokogiri@1.16.5", "/first")]));
-        merge_qualified(&mut out, &purls, packages(&[("pkg:gem/nokogiri@1.16.5", "/second")]));
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[("pkg:gem/nokogiri@1.16.5", "/first")]),
+        );
+        merge_qualified(
+            &mut out,
+            &purls,
+            packages(&[("pkg:gem/nokogiri@1.16.5", "/second")]),
+        );
         assert_eq!(
             out.get("pkg:gem/nokogiri@1.16.5?platform=arm64-darwin"),
             Some(&PathBuf::from("/first"))
@@ -670,10 +678,7 @@ mod tests {
 
     #[test]
     fn passthrough_purls_is_identity() {
-        let purls = vec![
-            "pkg:npm/foo@1.0".to_string(),
-            "pkg:npm/bar@2.0".to_string(),
-        ];
+        let purls = vec!["pkg:npm/foo@1.0".to_string(), "pkg:npm/bar@2.0".to_string()];
         assert_eq!(passthrough_purls(&purls), purls);
     }
 
@@ -784,10 +789,7 @@ mod tests {
 
     #[test]
     fn partition_purls_no_filter_duplicate_purls_preserved() {
-        let purls = vec![
-            "pkg:npm/foo@1.0".to_string(),
-            "pkg:npm/foo@1.0".to_string(),
-        ];
+        let purls = vec!["pkg:npm/foo@1.0".to_string(), "pkg:npm/foo@1.0".to_string()];
         let map = partition_purls(&purls, None);
         assert_eq!(map.len(), 1);
         assert_eq!(
@@ -952,9 +954,12 @@ mod tests {
 
         let qualified = "pkg:npm/foo@1.0.0?vcs_url=git@github.com".to_string();
         let partitioned = partition_purls(std::slice::from_ref(&qualified), None);
-        let out =
-            find_packages_for_rollback(&partitioned, &local_options(tmp.path().to_path_buf()), true)
-                .await;
+        let out = find_packages_for_rollback(
+            &partitioned,
+            &local_options(tmp.path().to_path_buf()),
+            true,
+        )
+        .await;
         assert_eq!(out.get(&qualified), Some(&pkg_dir));
     }
 
@@ -963,7 +968,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let empty: HashMap<Ecosystem, Vec<String>> = HashMap::new();
         let opts = local_options(tmp.path().to_path_buf());
-        assert!(find_packages_for_purls(&empty, &opts, true).await.is_empty());
+        assert!(find_packages_for_purls(&empty, &opts, true)
+            .await
+            .is_empty());
         assert!(find_packages_for_rollback(&empty, &opts, true)
             .await
             .is_empty());

@@ -130,7 +130,10 @@ fn rollback_one_off_without_identifier_errors() {
     // Without one, rollback bails with an error envelope.
     let tmp = tempfile::tempdir().expect("tempdir");
     let (code, stdout) = run(tmp.path(), &["--json", "--one-off"]);
-    assert_eq!(code, 1, "--one-off w/o identifier must exit 1; stdout=\n{stdout}");
+    assert_eq!(
+        code, 1,
+        "--one-off w/o identifier must exit 1; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
     let err = v["error"].as_str().expect("error message string");
@@ -146,8 +149,14 @@ fn rollback_one_off_with_identifier_reports_not_implemented() {
     // implemented". We pin it here so a real implementation can't land
     // silently without updating the contract.
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (code, stdout) =
-        run(tmp.path(), &["--json", "--one-off", "33333333-3333-4333-8333-333333333333"]);
+    let (code, stdout) = run(
+        tmp.path(),
+        &[
+            "--json",
+            "--one-off",
+            "33333333-3333-4333-8333-333333333333",
+        ],
+    );
     assert_eq!(code, 1, "one-off mode must exit 1 today; stdout=\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "error");
@@ -198,7 +207,10 @@ fn rollback_offline_with_missing_before_blob_partial_failure() {
     // aborts before crawling, so `failed` stays 0 and `results` is empty even
     // though the run did not succeed. Pin that exact shape so the bail can't
     // silently morph into either a real failure count or a spurious success.
-    assert_eq!(v["failed"], 0, "contentless bail records no per-package failure");
+    assert_eq!(
+        v["failed"], 0,
+        "contentless bail records no per-package failure"
+    );
     assert_eq!(
         v["results"].as_array().expect("results array").len(),
         0,
@@ -222,7 +234,10 @@ fn rollback_with_no_installed_packages_succeeds_quietly() {
     std::fs::write(blobs.join(before_hash), b"original content").unwrap();
 
     let (code, stdout) = run(tmp.path(), &["--json"]);
-    assert_eq!(code, 0, "no installed packages must exit 0; stdout=\n{stdout}");
+    assert_eq!(
+        code, 0,
+        "no installed packages must exit 0; stdout=\n{stdout}"
+    );
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["rolledBack"], 0);
@@ -340,14 +355,18 @@ fn rollback_restores_file_to_before_content() {
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert_eq!(
-        code, 0,
+        code,
+        0,
         "rollback must succeed; stdout={stdout}; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["rolledBack"], 1);
-    assert_eq!(v["failed"], 0, "no file should fail to roll back; stdout={stdout}");
+    assert_eq!(
+        v["failed"], 0,
+        "no file should fail to roll back; stdout={stdout}"
+    );
     assert_eq!(v["alreadyOriginal"], 0, "file was patched, not original");
     assert_eq!(v["dryRun"], false, "live rollback, not dry-run");
     // The single result must name our package and actually list the restored file.
@@ -441,7 +460,10 @@ fn rollback_already_original_skips_work() {
     assert_eq!(v["status"], "success", "stdout={stdout}");
     assert_eq!(v["alreadyOriginal"], 1);
     assert_eq!(v["rolledBack"], 0);
-    assert_eq!(v["failed"], 0, "no-op must not record a failure; stdout={stdout}");
+    assert_eq!(
+        v["failed"], 0,
+        "no-op must not record a failure; stdout={stdout}"
+    );
     assert_eq!(v["dryRun"], false);
 
     // The package must actually be discovered and reported as already-original,
@@ -455,12 +477,17 @@ fn rollback_already_original_skips_work() {
     assert_eq!(entry["success"], true);
     // Nothing was rewritten, so filesRolledBack must be empty...
     assert_eq!(
-        entry["filesRolledBack"].as_array().expect("filesRolledBack array").len(),
+        entry["filesRolledBack"]
+            .as_array()
+            .expect("filesRolledBack array")
+            .len(),
         0,
         "already-original package must roll back zero files; stdout={stdout}"
     );
     // ...and the file must be verified as already at its original state.
-    let verified = entry["filesVerified"].as_array().expect("filesVerified array");
+    let verified = entry["filesVerified"]
+        .as_array()
+        .expect("filesVerified array");
     let file = verified
         .iter()
         .find(|f| f["file"] == "package/index.js")
@@ -553,7 +580,10 @@ fn rollback_dry_run_does_not_modify_file() {
         .iter()
         .find(|r| r["purl"] == "pkg:npm/dry-target@1.0.0")
         .unwrap_or_else(|| panic!("dry-run must discover the installed package; stdout={stdout}"));
-    assert_eq!(entry["success"], true, "discovered package entry must be success");
+    assert_eq!(
+        entry["success"], true,
+        "discovered package entry must be success"
+    );
     let verified = entry["filesVerified"]
         .as_array()
         .expect("filesVerified array");

@@ -11,9 +11,7 @@
 //! integration boundary.
 
 use super::*;
-use crate::manifest::schema::{
-    PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
-};
+use crate::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo};
 use std::collections::HashMap;
 
 fn vuln(cves: &[&str]) -> VulnerabilityInfo {
@@ -62,10 +60,7 @@ fn sample_doc() -> Document {
     let mut manifest = PatchManifest::new();
     manifest.patches.insert(
         "pkg:npm/lodash@4.17.20".to_string(),
-        record(
-            "uuid-1",
-            &[("GHSA-aaaa", &["CVE-2024-1", "CVE-2024-2"])],
-        ),
+        record("uuid-1", &[("GHSA-aaaa", &["CVE-2024-1", "CVE-2024-2"])]),
     );
     manifest.patches.insert(
         "pkg:npm/minimist@1.2.0".to_string(),
@@ -89,6 +84,7 @@ fn sample_doc() -> Document {
 /// transpose to collapse:
 ///   * two PURLs into one product with TWO subcomponents, and
 ///   * the duplicated `CVE-DUP` into a single alias.
+///
 /// The uniqueness/dedup conformance invariants below are vacuous
 /// against `sample_doc`; they only have teeth against a merged
 /// statement.
@@ -540,7 +536,11 @@ fn vulnerability_aliases_are_unique_within_statement() {
     // Non-vacuous guard: the merged statement carries multiple aliases
     // with the overlapping CVE present exactly once. If alias dedup
     // regressed, the loop above would fire on `CVE-DUP`.
-    assert_eq!(doc.statements.len(), 1, "fixture must merge to one statement");
+    assert_eq!(
+        doc.statements.len(),
+        1,
+        "fixture must merge to one statement"
+    );
     assert_eq!(
         doc.statements[0].vulnerability.aliases,
         vec![
@@ -594,7 +594,11 @@ fn merged_statement_emits_all_subcomponents_with_at_id_in_serialized_json() {
     let doc = merged_doc();
     let v = serde_json::to_value(&doc).unwrap();
     let statements = v["statements"].as_array().unwrap();
-    assert_eq!(statements.len(), 1, "two patches sharing a vuln → one statement");
+    assert_eq!(
+        statements.len(),
+        1,
+        "two patches sharing a vuln → one statement"
+    );
 
     let subs = statements[0]["products"][0]["subcomponents"]
         .as_array()
@@ -648,7 +652,10 @@ fn statement_level_id_renders_under_at_sign() {
     s.id = None;
     let v = serde_json::to_value(&s).unwrap();
     let obj = v.as_object().unwrap();
-    assert!(!obj.contains_key("@id"), "absent statement id must omit @id");
+    assert!(
+        !obj.contains_key("@id"),
+        "absent statement id must omit @id"
+    );
     assert!(!obj.contains_key("id"));
 }
 

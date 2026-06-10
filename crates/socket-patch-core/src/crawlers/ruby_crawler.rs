@@ -676,8 +676,16 @@ mod tests {
     /// correct on Unix.
     #[test]
     fn gem_homes_split_honors_os_separator() {
-        let home_a = PathBuf::from(if cfg!(windows) { r"C:\rubies\3.2.0" } else { "/opt/rubies/3.2.0" });
-        let home_b = PathBuf::from(if cfg!(windows) { r"D:\gems\global" } else { "/home/dev/.gem/ruby/3.2.0" });
+        let home_a = PathBuf::from(if cfg!(windows) {
+            r"C:\rubies\3.2.0"
+        } else {
+            "/opt/rubies/3.2.0"
+        });
+        let home_b = PathBuf::from(if cfg!(windows) {
+            r"D:\gems\global"
+        } else {
+            "/home/dev/.gem/ruby/3.2.0"
+        });
         let joined = std::env::join_paths([&home_a, &home_b]).unwrap();
         let joined = joined.to_str().unwrap();
 
@@ -694,7 +702,11 @@ mod tests {
     #[test]
     fn gem_homes_split_drops_empty_segments() {
         let sep = if cfg!(windows) { ';' } else { ':' };
-        let only = if cfg!(windows) { r"C:\rubies\3.2.0" } else { "/opt/rubies/3.2.0" };
+        let only = if cfg!(windows) {
+            r"C:\rubies\3.2.0"
+        } else {
+            "/opt/rubies/3.2.0"
+        };
         let input = format!("{sep}{only}{sep}{sep}");
         let dirs = gem_homes_to_gems_dirs(&input);
         assert_eq!(dirs, vec![PathBuf::from(only).join("gems")]);
@@ -717,7 +729,10 @@ mod tests {
             .find_by_purls(dir.path(), &["pkg:gem/foo@1.0".to_string()])
             .await
             .unwrap();
-        assert!(result.is_empty(), "1.0 wrongly matched plain foo-1.0.0: {result:?}");
+        assert!(
+            result.is_empty(),
+            "1.0 wrongly matched plain foo-1.0.0: {result:?}"
+        );
     }
 
     /// `crawl_all` must skip dirs that parse as `<name>-<version>` but are
@@ -834,7 +849,10 @@ mod tests {
             batch_size: 100,
         };
         let paths = crawler.get_gem_paths(&options).await.unwrap();
-        assert!(paths.is_empty(), "non-Ruby project must yield no gem paths: {paths:?}");
+        assert!(
+            paths.is_empty(),
+            "non-Ruby project must yield no gem paths: {paths:?}"
+        );
     }
 
     /// Gem names with embedded underscores/digits and multi-dash names

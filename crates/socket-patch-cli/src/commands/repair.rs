@@ -24,7 +24,11 @@ pub struct RepairArgs {
 
     /// Only download missing artifacts; skip the cleanup phase.
     /// Incompatible with `--offline`.
-    #[arg(long = "download-only", env = "SOCKET_DOWNLOAD_ONLY", default_value_t = false)]
+    #[arg(
+        long = "download-only",
+        env = "SOCKET_DOWNLOAD_ONLY",
+        default_value_t = false
+    )]
     pub download_only: bool,
 }
 
@@ -34,8 +38,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     // --offline implies strict airgap: no network calls. `--download-only`
     // is the inverse (network-only). The two are now mutually exclusive.
     if args.common.offline && args.download_only {
-        let msg =
-            "--offline and --download-only are mutually exclusive".to_string();
+        let msg = "--offline and --download-only are mutually exclusive".to_string();
         if args.common.json {
             let mut env = Envelope::new(Command::Repair);
             env.dry_run = args.common.dry_run;
@@ -164,7 +167,8 @@ pub(crate) async fn repair_inner(
     let diffs_path = socket_dir.join("diffs");
     let packages_path = socket_dir.join("packages");
 
-    let download_mode = DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
+    let download_mode =
+        DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
 
     // `--silent` ("suppress non-error output") must mute the human-readable
     // progress just like `--json` does — otherwise a silent repair still
@@ -284,7 +288,10 @@ pub(crate) async fn repair_inner(
                             cleanup_result.blobs_checked
                         );
                     } else {
-                        println!("{}", format_cleanup_result(&cleanup_result, args.common.dry_run));
+                        println!(
+                            "{}",
+                            format_cleanup_result(&cleanup_result, args.common.dry_run)
+                        );
                     }
                 }
             }
@@ -370,12 +377,10 @@ pub(crate) async fn repair_inner(
         );
     }
     if download_failed_count > 0 {
-        env.record(
-            PatchEvent::artifact(PatchAction::Failed).with_error(
-                "download_failed",
-                format!("{} artifact(s) failed to download", download_failed_count),
-            ),
-        );
+        env.record(PatchEvent::artifact(PatchAction::Failed).with_error(
+            "download_failed",
+            format!("{} artifact(s) failed to download", download_failed_count),
+        ));
         env.mark_partial_failure();
     }
     if blobs_cleaned > 0 {
@@ -384,10 +389,12 @@ pub(crate) async fn repair_inner(
         } else {
             PatchAction::Removed
         };
-        env.record(PatchEvent::artifact(cleanup_action).with_details(serde_json::json!({
-            "count": blobs_cleaned,
-            "checked": blobs_checked,
-        })));
+        env.record(
+            PatchEvent::artifact(cleanup_action).with_details(serde_json::json!({
+                "count": blobs_cleaned,
+                "checked": blobs_checked,
+            })),
+        );
     }
     Ok((
         env,
@@ -472,12 +479,9 @@ mod tests {
     /// True when `env` carries the download / would-download artifact event
     /// (identified by its `details.mode` field, unique to that event).
     fn has_download_event(env: &Envelope) -> bool {
-        env.events.iter().any(|e| {
-            e.details
-                .as_ref()
-                .and_then(|d| d.get("mode"))
-                .is_some()
-        })
+        env.events
+            .iter()
+            .any(|e| e.details.as_ref().and_then(|d| d.get("mode")).is_some())
     }
 
     /// Regression for the offline + dry-run leak: with `--offline` set, the
@@ -603,7 +607,12 @@ mod tests {
         // Orphan archives (unknown UUIDs) must be swept.
         let orphan_diff = b"orphan diff archive bytes"; // 25 bytes
         let orphan_pkg = b"orphan package bytes!!"; // 22 bytes
-        write_archive(&socket, "diffs", "99999999-9999-4999-8999-999999999999", orphan_diff);
+        write_archive(
+            &socket,
+            "diffs",
+            "99999999-9999-4999-8999-999999999999",
+            orphan_diff,
+        );
         write_archive(
             &socket,
             "packages",

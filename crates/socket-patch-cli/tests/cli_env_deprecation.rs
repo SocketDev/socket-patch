@@ -199,7 +199,11 @@ fn legacy_telemetry_disabled_warns() {
 /// must still be a complete, correct warning, not a degraded one.
 #[test]
 fn legacy_warning_fires_under_silent() {
-    let out = run_with_legacy_env("SOCKET_PATCH_PROXY_URL", "https://legacy.example", &["--silent"]);
+    let out = run_with_legacy_env(
+        "SOCKET_PATCH_PROXY_URL",
+        "https://legacy.example",
+        &["--silent"],
+    );
     // The exact-line check inside this helper is the real guard: passing
     // `--silent` must not degrade, truncate, or suppress the warning — under
     // `--silent` it must be byte-for-byte the same line emitted without it.
@@ -226,7 +230,11 @@ fn legacy_warning_fires_under_silent() {
 /// deprecation belongs on stderr, separate from the JSON payload on stdout.
 #[test]
 fn legacy_warning_fires_under_json() {
-    let out = run_with_legacy_env("SOCKET_PATCH_PROXY_URL", "https://legacy.example", &["--json"]);
+    let out = run_with_legacy_env(
+        "SOCKET_PATCH_PROXY_URL",
+        "https://legacy.example",
+        &["--json"],
+    );
     assert_deprecation_warning(&out.stderr, "SOCKET_PATCH_PROXY_URL", "SOCKET_PROXY_URL");
     // The whole point of routing the warning to stderr under --json is that
     // stdout stays parseable. Prove stdout is untouched JSON, free of the
@@ -243,8 +251,12 @@ fn legacy_warning_fires_under_json() {
         "--json should still emit a JSON document on stdout; stdout was:\n{}",
         out.stdout
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(trimmed).unwrap_or_else(|e| panic!("stdout must be valid JSON ({e}); stdout was:\n{}", out.stdout));
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be valid JSON ({e}); stdout was:\n{}",
+            out.stdout
+        )
+    });
     assert_eq!(
         parsed.get("command").and_then(|v| v.as_str()),
         Some("list"),

@@ -714,7 +714,9 @@ version = "fake"
         // Mimic a Composer layout: vendor/<org>/<pkg>/composer.json
         let pkg = vendor.join("monolog").join("monolog");
         tokio::fs::create_dir_all(&pkg).await.unwrap();
-        tokio::fs::write(pkg.join("composer.json"), "{}").await.unwrap();
+        tokio::fs::write(pkg.join("composer.json"), "{}")
+            .await
+            .unwrap();
 
         let crawler = CargoCrawler::new();
         let options = CrawlerOptions {

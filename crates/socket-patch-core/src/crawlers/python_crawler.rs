@@ -1012,11 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_python_dirs_matches_bare_python3() {
         let dir = tempfile::tempdir().unwrap();
-        let dist = dir
-            .path()
-            .join("lib")
-            .join("python3")
-            .join("dist-packages");
+        let dist = dir.path().join("lib").join("python3").join("dist-packages");
         tokio::fs::create_dir_all(&dist).await.unwrap();
 
         let results = find_python_dirs(dir.path(), &["lib", "python3.*", "dist-packages"]).await;
@@ -1252,4 +1248,3 @@ mod tests {
         assert!(!result.contains_key("pkg:pypi/flask@3.0.0"));
     }
 }
-

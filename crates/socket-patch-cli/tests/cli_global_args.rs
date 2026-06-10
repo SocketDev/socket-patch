@@ -10,6 +10,10 @@
 //! take an identifier), we supply a dummy value alongside the flag under
 //! test so clap's parser can complete.
 
+// The case tables below are tuples ending in `fn(&GlobalArgs)` pointers; a
+// `type` alias per shape would add more noise than it removes in this test.
+#![allow(clippy::type_complexity)]
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -27,7 +31,7 @@ use socket_patch_cli::Cli;
 /// being listed here — closing the "someone forgot the flatten on a new
 /// command and nobody noticed" gap this file claims to guard.
 const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
-    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vex",
+    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vendor", "vex",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -45,7 +49,9 @@ const DUMMY_IDENTIFIER: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 /// the assertion can distinguish "bound" from "left at default".
 fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArgs))> {
     vec![
-        ("--cwd", Some("/tmp"), |c| assert_eq!(c.cwd, PathBuf::from("/tmp"))),
+        ("--cwd", Some("/tmp"), |c| {
+            assert_eq!(c.cwd, PathBuf::from("/tmp"))
+        }),
         ("--manifest-path", Some("custom.json"), |c| {
             assert_eq!(c.manifest_path, "custom.json")
         }),
@@ -55,7 +61,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--api-token", Some("tok123"), |c| {
             assert_eq!(c.api_token.as_deref(), Some("tok123"))
         }),
-        ("--org", Some("acme"), |c| assert_eq!(c.org.as_deref(), Some("acme"))),
+        ("--org", Some("acme"), |c| {
+            assert_eq!(c.org.as_deref(), Some("acme"))
+        }),
         ("--proxy-url", Some("https://proxy.example.com"), |c| {
             assert_eq!(c.proxy_url, "https://proxy.example.com")
         }),
@@ -81,7 +89,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--debug", None, |c| assert!(c.debug)),
         ("--no-telemetry", None, |c| assert!(c.no_telemetry)),
         ("--break-lock", None, |c| assert!(c.break_lock)),
-        ("--lock-timeout", Some("30"), |c| assert_eq!(c.lock_timeout, Some(30))),
+        ("--lock-timeout", Some("30"), |c| {
+            assert_eq!(c.lock_timeout, Some(30))
+        }),
     ]
 }
 
@@ -100,6 +110,7 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Setup(a) => &a.common,
         Repair(a) => &a.common,
         Unlock(a) => &a.common,
+        Vendor(a) => &a.common,
         Vex(a) => &a.common,
     }
 }
@@ -228,7 +239,10 @@ fn all_subcommands_are_covered() {
         .collect();
 
     // Every real subcommand is exercised by the global-flag matrix.
-    let missing: Vec<&String> = real.iter().filter(|n| !tested.contains(n.as_str())).collect();
+    let missing: Vec<&String> = real
+        .iter()
+        .filter(|n| !tested.contains(n.as_str()))
+        .collect();
     assert!(
         missing.is_empty(),
         "subcommands not covered by the global-flag tests: {:?}. \
@@ -263,7 +277,9 @@ fn every_global_short_form_parses_on_every_subcommand() {
     // field, not just that it parses (a short silently rebound to a different
     // field would otherwise stay green).
     let shorts: &[(&str, Option<&str>, fn(&GlobalArgs))] = &[
-        ("-o", Some("acme"), |c| assert_eq!(c.org.as_deref(), Some("acme"))), // --org
+        ("-o", Some("acme"), |c| {
+            assert_eq!(c.org.as_deref(), Some("acme"))
+        }), // --org
         ("-e", Some("npm"), |c| {
             assert_eq!(c.ecosystems.as_deref(), Some(&["npm".to_string()][..]))
         }), // --ecosystems
@@ -476,7 +492,10 @@ fn bool_env_vars_accept_one_and_yes() {
         assert!(args.common.silent, "SOCKET_SILENT=y must parse as true");
         assert!(args.common.dry_run, "SOCKET_DRY_RUN=1 must parse as true");
         assert!(args.common.yes, "SOCKET_YES=yes must parse as true");
-        assert!(args.common.break_lock, "SOCKET_BREAK_LOCK=1 must parse as true");
+        assert!(
+            args.common.break_lock,
+            "SOCKET_BREAK_LOCK=1 must parse as true"
+        );
         assert!(args.common.debug, "SOCKET_DEBUG=1 must parse as true");
         assert!(
             args.common.no_telemetry,
@@ -533,7 +552,10 @@ fn bool_env_vars_reject_zero_and_falsey() {
         // vacuous.
         std::env::set_var(var, "1");
         let common = parse_list().unwrap_or_else(|e| panic!("{var}=1 should parse: {e}"));
-        assert!(get(&common), "{var}=1 must engage the bool (proves binding is live)");
+        assert!(
+            get(&common),
+            "{var}=1 must engage the bool (proves binding is live)"
+        );
         std::env::remove_var(var);
 
         // Each falsey idiom must resolve to false — not true, not a parse error.
@@ -583,9 +605,8 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
         let result = Cli::try_parse_from(["socket-patch", "list"]);
         std::env::remove_var(var);
 
-        let cli = result.unwrap_or_else(|e| {
-            panic!("{var}= (empty) must parse cleanly, got error: {e}")
-        });
+        let cli =
+            result.unwrap_or_else(|e| panic!("{var}= (empty) must parse cleanly, got error: {e}"));
         assert!(
             !accessor(common_of(&cli)),
             "{var}= (empty) must resolve to false",
@@ -723,7 +744,10 @@ fn production_defaults_populate_when_unset() {
     // non-empty, so api_client_overrides must forward them.
     let o = c.api_client_overrides();
     assert_eq!(o.api_url.as_deref(), Some("https://api.socket.dev"));
-    assert_eq!(o.proxy_url.as_deref(), Some("https://patches-api.socket.dev"));
+    assert_eq!(
+        o.proxy_url.as_deref(),
+        Some("https://patches-api.socket.dev")
+    );
     assert!(o.api_token.is_none());
     assert!(o.org_slug.is_none());
 

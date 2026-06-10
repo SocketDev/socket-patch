@@ -128,6 +128,7 @@ fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) 
 ///   * the atomic writer (`apply::write_atomic`) stages `.socket-stage-*`,
 ///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
 ///     branches) stages `.socket-cow-*`.
+///
 /// Both must be renamed-over on success or unlinked on failure, so a
 /// completed apply — success OR clean failure — must leave neither prefix
 /// behind.
@@ -314,10 +315,7 @@ fn apply_replaces_symlink_with_private_file() {
         "index.js must be a regular file after apply, not a symlink"
     );
     // Patched content on the package side.
-    assert_eq!(
-        git_sha256_file(&fx.index_js()),
-        git_sha256(PATCHED_BYTES)
-    );
+    assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(PATCHED_BYTES));
     // Original outside target untouched.
     assert_eq!(
         git_sha256_file(&outside),
@@ -391,7 +389,10 @@ fn apply_breaks_hardlinks_on_multi_file_patch() {
     );
 
     // Both inside files patched.
-    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), b"AAA patched!\n");
+    assert_eq!(
+        std::fs::read(pkg.join("index.js")).unwrap(),
+        b"AAA patched!\n"
+    );
     assert_eq!(
         std::fs::read(pkg.join("lib/helper.js")).unwrap(),
         b"BBB patched!\n"

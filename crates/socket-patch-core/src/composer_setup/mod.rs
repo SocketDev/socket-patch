@@ -155,7 +155,11 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
     if !changed {
         // We created an empty `scripts` object above only if it was absent;
         // drop it again so a no-op truly changes nothing.
-        if root.get("scripts").and_then(Value::as_object).is_some_and(Map::is_empty) {
+        if root
+            .get("scripts")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
             root.remove("scripts");
         }
         return Ok(None);
@@ -289,7 +293,9 @@ async fn edit(
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    fs::write(composer_json, &new).await.map_err(|e| e.to_string())?;
+                    fs::write(composer_json, &new)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(true)
             }
@@ -303,7 +309,8 @@ async fn edit(
 mod tests {
     use super::*;
 
-    const BASIC: &str = "{\n  \"name\": \"acme/app\",\n  \"require\": {\n    \"php\": \">=8.1\"\n  }\n}\n";
+    const BASIC: &str =
+        "{\n  \"name\": \"acme/app\",\n  \"require\": {\n    \"php\": \">=8.1\"\n  }\n}\n";
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
@@ -315,7 +322,10 @@ mod tests {
         let doc = parse(&out);
         for event in HOOK_EVENTS {
             let arr = doc["scripts"][event].as_array().unwrap();
-            assert!(arr.iter().any(|v| v == APPLY_COMMAND), "{event} must carry our command");
+            assert!(
+                arr.iter().any(|v| v == APPLY_COMMAND),
+                "{event} must carry our command"
+            );
         }
         assert!(is_hook_present(&out));
         // Idempotent: second add is a no-op.
@@ -329,7 +339,10 @@ mod tests {
         let pos_name = out.find("\"name\"").unwrap();
         let pos_require = out.find("\"require\"").unwrap();
         let pos_scripts = out.find("\"scripts\"").unwrap();
-        assert!(pos_name < pos_require && pos_require < pos_scripts, "key order preserved:\n{out}");
+        assert!(
+            pos_name < pos_require && pos_require < pos_scripts,
+            "key order preserved:\n{out}"
+        );
         assert_eq!(parse(&out)["require"]["php"], ">=8.1");
     }
 
@@ -371,7 +384,10 @@ mod tests {
         let added = composer_add(BASIC).unwrap().unwrap();
         let removed = composer_remove(&added).unwrap().unwrap();
         // We created `scripts` solely for our two events; removing both prunes it.
-        assert!(parse(&removed).get("scripts").is_none(), "emptied scripts pruned:\n{removed}");
+        assert!(
+            parse(&removed).get("scripts").is_none(),
+            "emptied scripts pruned:\n{removed}"
+        );
         assert!(!is_hook_present(&removed));
     }
 
@@ -396,7 +412,10 @@ mod tests {
             "{{\n  \"scripts\": {{\n    \"post-install-cmd\": \"{APPLY_COMMAND}\",\n    \"post-update-cmd\": \"{APPLY_COMMAND}\"\n  }}\n}}\n"
         );
         assert!(is_hook_present(&already));
-        assert!(composer_add(&already).unwrap().is_none(), "exact-string command is idempotent");
+        assert!(
+            composer_add(&already).unwrap().is_none(),
+            "exact-string command is idempotent"
+        );
     }
 
     #[test]
@@ -427,11 +446,18 @@ mod tests {
         assert!(is_hook_present(&fs::read_to_string(&cj).await.unwrap()));
 
         // Idempotent.
-        assert_eq!(add_hook(&project, false).await.status, ComposerSetupStatus::AlreadyConfigured);
+        assert_eq!(
+            add_hook(&project, false).await.status,
+            ComposerSetupStatus::AlreadyConfigured
+        );
 
         let removed = remove_hook(&project, false).await;
         assert_eq!(removed.status, ComposerSetupStatus::Updated);
-        assert_eq!(fs::read_to_string(&cj).await.unwrap(), BASIC, "byte-for-byte restore");
+        assert_eq!(
+            fs::read_to_string(&cj).await.unwrap(),
+            BASIC,
+            "byte-for-byte restore"
+        );
     }
 
     #[tokio::test]
@@ -442,7 +468,11 @@ mod tests {
         let project = discover_composer_project(dir.path()).await.unwrap();
         let res = add_hook(&project, true).await;
         assert_eq!(res.status, ComposerSetupStatus::Updated);
-        assert_eq!(fs::read_to_string(&cj).await.unwrap(), BASIC, "dry-run must not write");
+        assert_eq!(
+            fs::read_to_string(&cj).await.unwrap(),
+            BASIC,
+            "dry-run must not write"
+        );
     }
 
     #[tokio::test]
@@ -478,7 +508,10 @@ mod tests {
         // (composer_add) errors on it; `setup --remove` must too, rather than
         // silently swallowing it as a no-op success.
         let err = composer_remove("{\"scripts\": \"oops\"}").unwrap_err();
-        assert!(err.contains("\"scripts\" is not a JSON object"), "got: {err}");
+        assert!(
+            err.contains("\"scripts\" is not a JSON object"),
+            "got: {err}"
+        );
         assert!(composer_remove("{\"scripts\": 7}").is_err());
         assert!(composer_remove("{\"scripts\": [\"a\"]}").is_err());
         // add and remove agree on what counts as malformed.
@@ -518,7 +551,10 @@ mod tests {
                 // add is idempotent
                 let after_add = match composer_add(&json).unwrap() {
                     Some(out) => {
-                        assert!(is_hook_present(&out), "add changed but not present:\n{json}\n{out}");
+                        assert!(
+                            is_hook_present(&out),
+                            "add changed but not present:\n{json}\n{out}"
+                        );
                         assert!(
                             composer_add(&out).unwrap().is_none(),
                             "add NOT idempotent:\n{json}\n{out}"
@@ -557,9 +593,15 @@ mod tests {
         ];
         for inp in inputs {
             if let Some(out) = composer_add(inp).unwrap() {
-                assert!(is_hook_present(&out), "add changed but check false for {inp}\n{out}");
+                assert!(
+                    is_hook_present(&out),
+                    "add changed but check false for {inp}\n{out}"
+                );
                 // second add is a no-op
-                assert!(composer_add(&out).unwrap().is_none(), "not idempotent for {inp}");
+                assert!(
+                    composer_add(&out).unwrap().is_none(),
+                    "not idempotent for {inp}"
+                );
                 // remove undoes
                 let rem = composer_remove(&out).unwrap().unwrap();
                 assert!(!is_hook_present(&rem), "remove left hook for {inp}\n{rem}");

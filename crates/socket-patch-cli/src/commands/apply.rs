@@ -1,8 +1,4 @@
 use clap::Args;
-use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
-    get_missing_blobs, DownloadMode,
-};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
@@ -23,9 +19,8 @@ use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
-use tempfile::TempDir;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
@@ -33,39 +28,6 @@ use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
     VexSummary,
 };
-
-/// Overlay every regular file from `src` into `dst` via hard link (falling
-/// back to copy if hard linking fails — e.g. cross-filesystem, permission
-/// quirk). Skips files that already exist at `dst`. Silently no-ops if
-/// `src` doesn't exist so fresh projects with no `.socket/` cache work.
-///
-/// Used by `apply` to stage a transient overlay of the persistent
-/// `.socket/` cache inside a tempdir so the apply pipeline can read
-/// pre-cached artifacts and freshly-fetched ones from the same path
-/// without ever mutating `.socket/`.
-async fn overlay_dir(src: &Path, dst: &Path) {
-    let mut entries = match tokio::fs::read_dir(src).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let file_type = match entry.file_type().await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if tokio::fs::metadata(&to).await.is_ok() {
-            continue;
-        }
-        if tokio::fs::hard_link(&from, &to).await.is_err() {
-            let _ = tokio::fs::copy(&from, &to).await;
-        }
-    }
-}
 
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
@@ -75,7 +37,13 @@ pub struct ApplyArgs {
     pub common: GlobalArgs,
 
     /// Skip pre-application hash verification (apply even if package version differs).
-    #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
+    #[arg(
+        short = 'f',
+        long,
+        env = "SOCKET_FORCE",
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
+    )]
     pub force: bool,
 
     /// Read-only: verify that the committed Go `replace`-redirects match the
@@ -139,6 +107,23 @@ async fn try_local_go_apply(
     if !is_local_go(purl, common) {
         return None;
     }
+    // Vendor ownership wins: a module recorded in `.socket/vendor/state.json`
+    // is managed by the explicit `socket-patch vendor` action; the implicit
+    // apply must not repoint its `replace` back at `.socket/go-patches/`.
+    // The synthesized result's vendored package_path routes the event to
+    // `Skipped`/`vendored` (see `result_to_event`).
+    if socket_patch_core::patch::vendor::is_purl_vendored(&common.cwd, purl).await {
+        return Some(ApplyResult {
+            package_key: purl.to_string(),
+            package_path: VENDOR_OWNED_MARKER.to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        });
+    }
     // `pkg_path` is the pristine, case-encoded module-cache dir; `module`/
     // `version` are the decoded PURL components keying the copy + `replace`.
     let (module, version) = parse_golang_purl(purl)?;
@@ -149,6 +134,7 @@ async fn try_local_go_apply(
             version,
             pkg_path,
             &common.cwd,
+            socket_patch_core::patch::go_mod_edit::GO_PATCHES_DIR,
             &patch.files,
             sources,
             Some(&patch.uuid),
@@ -185,7 +171,11 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
         .collect();
     let removed = reconcile_go_redirects(&common.cwd, &desired, common.dry_run).await;
     if !removed.is_empty() && !common.silent && !common.json {
-        let verb = if common.dry_run { "Would remove" } else { "Removed" };
+        let verb = if common.dry_run {
+            "Would remove"
+        } else {
+            "Removed"
+        };
         println!("{verb} {} stale go patch redirect(s):", removed.len());
         for purl in &removed {
             println!("  {purl}");
@@ -227,10 +217,23 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     {
         use socket_patch_core::patch::go_redirect::Drift as GoDrift;
         if go_in_local_scope(&args.common) {
+            // Vendored modules are excluded: their replace directives point at
+            // `.socket/vendor/golang/` (the verify engine skips Vendor-owned
+            // entries) and their state is audited by `vendor`, not `--check`.
+            let vendored = socket_patch_core::patch::vendor::load_state(&args.common.cwd)
+                .await
+                .map(|s| {
+                    s.entries
+                        .iter()
+                        .flat_map(|(k, e)| [k.clone(), e.base_purl.clone()])
+                        .collect::<HashSet<String>>()
+                })
+                .unwrap_or_default();
             let desired: HashSet<String> = manifest
                 .patches
                 .keys()
                 .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
+                .filter(|p| !vendored.contains(*p))
                 .cloned()
                 .collect();
             checked += desired.len();
@@ -297,6 +300,11 @@ async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
 /// True when every file the engine verified for this package is already
 /// at its `afterHash` — i.e. the patch is a complete no-op on disk.
 ///
+/// Sentinel `package_path` for a result synthesized because the purl is
+/// owned by `socket-patch vendor` (recorded in `.socket/vendor/state.json`).
+/// `result_to_event` routes it to `Skipped`/`vendored` by exact equality.
+pub(crate) const VENDOR_OWNED_MARKER: &str = "managed by socket-patch vendor";
+
 /// Single source of truth for the `already_patched` classification, shared
 /// by [`result_to_event`] (which feeds the JSON envelope) and the
 /// human-readable summaries so both label packages identically.
@@ -334,12 +342,10 @@ fn all_files_already_patched(result: &ApplyResult) -> bool {
 /// while a wheel is installed). Skipping it avoids attempting — and
 /// spuriously reporting a `Failed` event for — a variant that was never
 /// installed.
-fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
+pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
     match first_file_status {
         None => true,
-        Some(status) => {
-            *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched
-        }
+        Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
 }
 
@@ -367,6 +373,17 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         );
     }
 
+    // A package managed by `socket-patch vendor` is skipped with its own
+    // reason: apply runs implicitly (postinstall/CI) and must never flip
+    // ownership back from the explicit vendor action. The synthesized result
+    // carries the exact sentinel as its package_path — an equality check, NOT
+    // a substring match: the vendor command's own successful results carry
+    // real `.socket/vendor/…` copy paths and must classify as Applied.
+    if result.package_path == VENDOR_OWNED_MARKER {
+        return PatchEvent::new(PatchAction::Skipped, purl)
+            .with_reason("vendored", "managed by `socket-patch vendor`");
+    }
+
     if all_files_already_patched(result) {
         return PatchEvent::new(PatchAction::Skipped, purl)
             .with_reason("already_patched", "All files already match afterHash");
@@ -376,9 +393,7 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         let files = result
             .files_verified
             .iter()
-            .filter(|f| {
-                f.status == VerifyStatus::Ready || f.status == VerifyStatus::AlreadyPatched
-            })
+            .filter(|f| f.status == VerifyStatus::Ready || f.status == VerifyStatus::AlreadyPatched)
             .map(|f| PatchEventFile {
                 path: f.file.clone(),
                 verified: true,
@@ -522,10 +537,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // fail-the-command contract). `None` => not requested.
             let vex_result = if success && args.vex.vex.is_some() {
                 let params = args.vex.to_build_params();
-                Some(
-                    generate_vex_from_manifest_path(&args.common, &params, &manifest_path)
-                        .await,
-                )
+                Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
             };
@@ -601,11 +613,8 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             // package: if everything came from the same
                             // source, show just that tag; otherwise list
                             // distinct sources.
-                            let mut tags: Vec<&'static str> = result
-                                .applied_via
-                                .values()
-                                .map(|v| v.as_tag())
-                                .collect();
+                            let mut tags: Vec<&'static str> =
+                                result.applied_via.values().map(|v| v.as_tag()).collect();
                             tags.sort_unstable();
                             tags.dedup();
                             let suffix = if tags.is_empty() {
@@ -671,9 +680,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
 
             // Track telemetry
             if success {
-                track_patch_applied(patched_count, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_applied(
+                    patched_count,
+                    args.common.dry_run,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             } else {
-                track_patch_apply_failed("One or more patches failed to apply", args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+                track_patch_apply_failed(
+                    "One or more patches failed to apply",
+                    args.common.dry_run,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
             }
 
             // A requested-but-failed VEX flips an otherwise-successful
@@ -685,7 +706,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_apply_failed(&e, args.common.dry_run, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_apply_failed(
+                &e,
+                args.common.dry_run,
+                api_token.as_deref(),
+                org_slug.as_deref(),
+            )
+            .await;
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
                 env.dry_run = args.common.dry_run;
@@ -708,182 +735,28 @@ async fn apply_patches_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    // The persistent cache directories under `.socket/`. Apply only ever
-    // *reads* from these — writes (downloads, cleanup) happen against a
-    // transient overlay tempdir constructed below when fetching is needed.
+    // Resolve patch sources (read `.socket/` directly, or stage an overlay
+    // tempdir + download the gap). Shared with `vendor` via fetch_stage.
     let socket_dir = manifest_path.parent().unwrap();
-    let socket_blobs_path = socket_dir.join("blobs");
-    let socket_diffs_path = socket_dir.join("diffs");
-    let socket_packages_path = socket_dir.join("packages");
-
-    let download_mode = DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
-
-    // Compute per-patch source availability so both the offline guard
-    // (next block) and the `download_needed` decision below share the
-    // same notion of what's already on disk. These probes are read-only.
-    let missing_blobs = get_missing_blobs(&manifest, &socket_blobs_path).await;
-    let missing_diff_archives = get_missing_archives(&manifest, &socket_diffs_path).await;
-    let missing_package_archives = get_missing_archives(&manifest, &socket_packages_path).await;
-
-    // A patch is "locally applicable" iff at least one of:
-    //   - every `after_hash` blob it references is on disk, OR
-    //   - its diff archive is on disk, OR
-    //   - its package archive is on disk.
-    // The apply pipeline will pick whichever is present per file.
-    let patches_without_source: Vec<&str> = manifest
-        .patches
-        .iter()
-        .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
-            let diff_present = !missing_diff_archives.contains(&record.uuid);
-            let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present || pkg_present {
-                None
-            } else {
-                Some(purl.as_str())
-            }
-        })
-        .collect();
-
-    if args.common.offline {
-        // Offline: bail only if some patch has no usable local source.
-        // Note: with `--force`, the apply pipeline can short-circuit
-        // verification on its own; we still surface the no-source
-        // diagnosis so the user runs `repair` before retrying.
-        if !patches_without_source.is_empty() {
-            if !args.common.silent && !args.common.json {
-                eprintln!(
-                    "Error: {} patch(es) have no local source and --offline is set:",
-                    patches_without_source.len()
-                );
-                for purl in patches_without_source.iter().take(5) {
-                    eprintln!("  - {}", purl);
-                }
-                if patches_without_source.len() > 5 {
-                    eprintln!("  ... and {} more", patches_without_source.len() - 5);
-                }
-                eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
-            }
-            return Ok((false, Vec::new(), Vec::new()));
+    let staged = match crate::commands::fetch_stage::stage_patch_sources(
+        &args.common,
+        &manifest,
+        socket_dir,
+    )
+    .await?
+    {
+        crate::commands::fetch_stage::StageOutcome::Ready(s) => s,
+        crate::commands::fetch_stage::StageOutcome::Unavailable => {
+            return Ok((false, Vec::new(), Vec::new()))
         }
-    }
-
-    // Decide what (if anything) needs downloading.
-    //
-    // The apply pipeline tries sources in the order package → diff →
-    // blob locally. We honor `--download-mode` for the primary fetch
-    // when there's actually a gap to close. Skip the archive fetch
-    // entirely when all file blobs are already present locally —
-    // apply will succeed via the blob path, and the archive endpoints
-    // would just 404 (current server doesn't serve them yet).
-    let download_needed = !args.common.offline
-        && match download_mode {
-            DownloadMode::File => !missing_blobs.is_empty(),
-            DownloadMode::Diff | DownloadMode::Package if missing_blobs.is_empty() => false,
-            DownloadMode::Diff => !missing_diff_archives.is_empty(),
-            DownloadMode::Package => !missing_package_archives.is_empty(),
-        };
-
-    // Determine where the apply pipeline should read patch sources from.
-    //
-    // - If nothing needs downloading (offline mode, or every required
-    //   artifact is already in `.socket/`), read straight from `.socket/`.
-    //   Apply is purely read-only against the persistent cache.
-    // - Otherwise, stage a transient overlay tempdir that hardlinks every
-    //   existing `.socket/` artifact and receives fresh downloads. Apply
-    //   reads exclusively from the tempdir; `.socket/` is never mutated.
-    //
-    // `_stage_dir` keeps the `TempDir` handle alive for the rest of this
-    // function — on drop the OS removes the directory and any downloaded
-    // bytes go with it.
-    let (blobs_path, diffs_path, packages_path, _stage_dir): (
-        PathBuf,
-        PathBuf,
-        PathBuf,
-        Option<TempDir>,
-    ) = if download_needed {
-        let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let stage_blobs = stage.path().join("blobs");
-        let stage_diffs = stage.path().join("diffs");
-        let stage_packages = stage.path().join("packages");
-        for dir in [&stage_blobs, &stage_diffs, &stage_packages] {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        overlay_dir(&socket_blobs_path, &stage_blobs).await;
-        overlay_dir(&socket_diffs_path, &stage_diffs).await;
-        overlay_dir(&socket_packages_path, &stage_packages).await;
-
-        if !args.common.silent && !args.common.json {
-            println!(
-                "Downloading missing patch artifacts (mode: {})...",
-                download_mode.as_tag()
-            );
-        }
-
-        let (client, _) =
-            get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let sources = PatchSources {
-            blobs_path: &stage_blobs,
-            packages_path: Some(&stage_packages),
-            diffs_path: Some(&stage_diffs),
-        };
-        let fetch_result =
-            fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
-
-        if !args.common.silent && !args.common.json {
-            println!("{}", format_fetch_result(&fetch_result));
-        }
-
-        // For non-file modes, automatically fetch any still-missing file
-        // blobs as a fallback. Patches that lack the requested mode on
-        // the server will still apply via the legacy blob path.
-        if download_mode != DownloadMode::File {
-            let still_missing_blobs = get_missing_blobs(&manifest, &stage_blobs).await;
-            if !still_missing_blobs.is_empty() {
-                if !args.common.silent && !args.common.json {
-                    println!(
-                        "Falling back to per-file blob downloads for {} blob(s)...",
-                        still_missing_blobs.len()
-                    );
-                }
-                let blob_result =
-                    fetch_missing_blobs(&manifest, &stage_blobs, &client, None).await;
-                if !args.common.silent && !args.common.json {
-                    println!("{}", format_fetch_result(&blob_result));
-                }
-                if blob_result.failed > 0 && fetch_result.failed > 0 {
-                    if !args.common.silent && !args.common.json {
-                        eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
-                    }
-                    return Ok((false, Vec::new(), Vec::new()));
-                }
-            }
-        } else if fetch_result.failed > 0 {
-            if !args.common.silent && !args.common.json {
-                eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
-            }
-            return Ok((false, Vec::new(), Vec::new()));
-        }
-
-        (stage_blobs, stage_diffs, stage_packages, Some(stage))
-    } else {
-        (
-            socket_blobs_path.clone(),
-            socket_diffs_path.clone(),
-            socket_packages_path.clone(),
-            None,
-        )
     };
+    let blobs_path = staged.blobs.clone();
+    let diffs_path = staged.diffs.clone();
+    let packages_path = staged.packages.clone();
 
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned =
-        partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
+    let partitioned = partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
 
     let target_manifest_purls: HashSet<String> = partitioned
         .values()
@@ -904,8 +777,12 @@ async fn apply_patches_inner(
         batch_size: 100,
     };
 
-    let all_packages =
-        find_packages_for_purls(&partitioned, &crawler_options, args.common.silent || args.common.json).await;
+    let all_packages = find_packages_for_purls(
+        &partitioned,
+        &crawler_options,
+        args.common.silent || args.common.json,
+    )
+    .await;
 
     let has_any_purls = !partitioned.is_empty();
 
@@ -929,7 +806,9 @@ async fn apply_patches_inner(
                 "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
                 target_manifest_purls.len()
             );
-            eprintln!("  Check that packages are installed and --cwd points to the right directory.");
+            eprintln!(
+                "  Check that packages are installed and --cwd points to the right directory."
+            );
         }
         let unmatched: Vec<String> = target_manifest_purls.iter().cloned().collect();
         return Ok((false, Vec::new(), unmatched));
@@ -993,9 +872,11 @@ async fn apply_patches_inner(
                 // Mirrors `select_installed_variants`, used by rollback/get.
                 if !args.force {
                     let first_status = match patch.files.iter().next() {
-                        Some((file_name, file_info)) => {
-                            Some(verify_file_patch(pkg_path, file_name, file_info).await.status)
-                        }
+                        Some((file_name, file_info)) => Some(
+                            verify_file_patch(pkg_path, file_name, file_info)
+                                .await
+                                .status,
+                        ),
                         None => None,
                     };
                     if !variant_matches_installed(first_status.as_ref()) {
@@ -1093,30 +974,24 @@ async fn apply_patches_inner(
             // Everything else — npm/pypi/gem and cargo (vendored or registry
             // cache) — patches in place via `apply_package_patch`. Without the
             // `golang` feature `try_local_go_apply` is an inert `None`.
-            let result = match try_local_go_apply(
-                purl,
-                pkg_path,
-                patch,
-                &sources,
-                &args.common,
-                args.force,
-            )
-            .await
-            {
-                Some(r) => r,
-                None => {
-                    apply_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &sources,
-                        Some(&patch.uuid),
-                        args.common.dry_run,
-                        args.force,
-                    )
+            let result =
+                match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, args.force)
                     .await
-                }
-            };
+                {
+                    Some(r) => r,
+                    None => {
+                        apply_package_patch(
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            Some(&patch.uuid),
+                            args.common.dry_run,
+                            args.force,
+                        )
+                        .await
+                    }
+                };
 
             if !result.success {
                 has_errors = true;
@@ -1141,13 +1016,19 @@ async fn apply_patches_inner(
         .collect();
 
     if !unmatched.is_empty() && !args.common.silent && !args.common.json {
-        eprintln!("\nWarning: {} manifest patch(es) had no matching installed package:", unmatched.len());
+        eprintln!(
+            "\nWarning: {} manifest patch(es) had no matching installed package:",
+            unmatched.len()
+        );
         for purl in &unmatched {
             eprintln!("  - {}", purl);
         }
     }
 
-    if !target_manifest_purls.is_empty() && matched_manifest_purls.is_empty() && !all_packages.is_empty() {
+    if !target_manifest_purls.is_empty()
+        && matched_manifest_purls.is_empty()
+        && !all_packages.is_empty()
+    {
         if !args.common.silent && !args.common.json {
             eprintln!("Warning: None of the targeted manifest patches matched installed packages.");
         }
@@ -1156,8 +1037,14 @@ async fn apply_patches_inner(
 
     // Post-apply summary
     if !args.common.silent && !args.common.json {
-        let applied_count = results.iter().filter(|r| r.success && !r.files_patched.is_empty()).count();
-        let already_count = results.iter().filter(|r| all_files_already_patched(r)).count();
+        let applied_count = results
+            .iter()
+            .filter(|r| r.success && !r.files_patched.is_empty())
+            .count();
+        let already_count = results
+            .iter()
+            .filter(|r| all_files_already_patched(r))
+            .count();
         println!(
             "\nSummary: {}/{} targeted patches applied, {} already patched, {} not found on disk",
             applied_count,
@@ -1245,7 +1132,11 @@ mod tests {
         // Dry-run events list verified files but never an `appliedVia`
         // — nothing was actually written.
         assert_eq!(v["files"][0]["path"], "package/index.js");
-        assert!(v["files"][0].as_object().unwrap().get("appliedVia").is_none());
+        assert!(v["files"][0]
+            .as_object()
+            .unwrap()
+            .get("appliedVia")
+            .is_none());
     }
 
     #[test]
@@ -1329,19 +1220,13 @@ mod tests {
 
     #[test]
     fn all_files_already_patched_true_when_every_file_matches() {
-        let result = sample_verified(&[
-            VerifyStatus::AlreadyPatched,
-            VerifyStatus::AlreadyPatched,
-        ]);
+        let result = sample_verified(&[VerifyStatus::AlreadyPatched, VerifyStatus::AlreadyPatched]);
         assert!(all_files_already_patched(&result));
     }
 
     #[test]
     fn all_files_already_patched_false_when_any_file_differs() {
-        let result = sample_verified(&[
-            VerifyStatus::AlreadyPatched,
-            VerifyStatus::Ready,
-        ]);
+        let result = sample_verified(&[VerifyStatus::AlreadyPatched, VerifyStatus::Ready]);
         assert!(!all_files_already_patched(&result));
     }
 
@@ -1374,11 +1259,15 @@ mod tests {
         // Installed distribution: first file applies cleanly, or is
         // already at afterHash → this variant is the one on disk.
         assert!(variant_matches_installed(Some(&VerifyStatus::Ready)));
-        assert!(variant_matches_installed(Some(&VerifyStatus::AlreadyPatched)));
+        assert!(variant_matches_installed(Some(
+            &VerifyStatus::AlreadyPatched
+        )));
 
         // Not the installed distribution → must be skipped. The NotFound
         // case is the specific regression this guards.
-        assert!(!variant_matches_installed(Some(&VerifyStatus::HashMismatch)));
+        assert!(!variant_matches_installed(Some(
+            &VerifyStatus::HashMismatch
+        )));
         assert!(!variant_matches_installed(Some(&VerifyStatus::NotFound)));
 
         // A variant with no files has nothing to disqualify it — match,

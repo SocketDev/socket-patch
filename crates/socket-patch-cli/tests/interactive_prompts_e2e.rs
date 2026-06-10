@@ -122,12 +122,7 @@ fn setup_interactive_y_proceeds_with_update() {
 
     // Without --yes, setup prompts "Proceed with these changes? (y/N): ".
     // Sending "y\n" should make it proceed with the update.
-    let (code, output) = run_in_pty(
-        &["setup"],
-        tmp.path(),
-        "y\n",
-        Duration::from_secs(15),
-    );
+    let (code, output) = run_in_pty(&["setup"], tmp.path(), "y\n", Duration::from_secs(15));
     assert_eq!(code, 0, "setup with 'y' must succeed");
 
     // The interactive prompt MUST have actually run — otherwise this test
@@ -165,12 +160,7 @@ fn setup_interactive_n_aborts_without_update() {
 "#;
     std::fs::write(tmp.path().join("package.json"), original).unwrap();
 
-    let (code, output) = run_in_pty(
-        &["setup"],
-        tmp.path(),
-        "n\n",
-        Duration::from_secs(15),
-    );
+    let (code, output) = run_in_pty(&["setup"], tmp.path(), "n\n", Duration::from_secs(15));
     assert_eq!(code, 0, "setup with 'n' must exit cleanly");
     // The interactive prompt MUST have run, then aborted.
     assert!(
@@ -204,12 +194,7 @@ fn setup_interactive_default_no_aborts() {
 "#;
     std::fs::write(tmp.path().join("package.json"), original).unwrap();
 
-    let (code, output) = run_in_pty(
-        &["setup"],
-        tmp.path(),
-        "\n",
-        Duration::from_secs(15),
-    );
+    let (code, output) = run_in_pty(&["setup"], tmp.path(), "\n", Duration::from_secs(15));
     assert_eq!(code, 0);
     // The prompt MUST have run; bare Enter must hit the default-N abort.
     // Without these, the test passes vacuously if setup never prompts and
@@ -264,7 +249,11 @@ fn remove_interactive_y_proceeds() {
     write_remove_manifest(tmp.path());
 
     let (code, output) = run_in_pty(
-        &["remove", "pkg:npm/__interactive_remove__@1.0.0", "--skip-rollback"],
+        &[
+            "remove",
+            "pkg:npm/__interactive_remove__@1.0.0",
+            "--skip-rollback",
+        ],
         tmp.path(),
         "y\n",
         Duration::from_secs(15),
@@ -296,7 +285,10 @@ fn remove_interactive_y_proceeds() {
     let patches = manifest["patches"]
         .as_object()
         .unwrap_or_else(|| panic!("manifest must keep a 'patches' object; got: {body}"));
-    assert!(patches.is_empty(), "remove 'y' must drop the entry; got: {body}");
+    assert!(
+        patches.is_empty(),
+        "remove 'y' must drop the entry; got: {body}"
+    );
 }
 
 #[test]
@@ -305,7 +297,11 @@ fn remove_interactive_n_cancels() {
     write_remove_manifest(tmp.path());
 
     let (code, output) = run_in_pty(
-        &["remove", "pkg:npm/__interactive_remove__@1.0.0", "--skip-rollback"],
+        &[
+            "remove",
+            "pkg:npm/__interactive_remove__@1.0.0",
+            "--skip-rollback",
+        ],
         tmp.path(),
         "n\n",
         Duration::from_secs(15),
@@ -359,12 +355,7 @@ fn remove_interactive_n_cancels() {
 #[test]
 fn apply_in_pty_with_no_manifest_prints_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, output) = run_in_pty(
-        &["apply"],
-        tmp.path(),
-        "",
-        Duration::from_secs(15),
-    );
+    let (code, output) = run_in_pty(&["apply"], tmp.path(), "", Duration::from_secs(15));
     assert_eq!(code, 0);
     // Assert the full message, not either half of it. The `||` previously
     // let a truncated/garbled message ("...skipping...") pass.

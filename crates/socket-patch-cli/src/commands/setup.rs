@@ -1,8 +1,11 @@
 use clap::Args;
-use socket_patch_core::gem_setup::{self, GemSetupStatus};
 #[cfg(feature = "composer")]
 use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
+use socket_patch_core::crawlers::CrawlerOptions;
+use socket_patch_core::gem_setup::{self, GemSetupStatus};
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
     detect_package_manager, find_package_json_files, PackageJsonLocation, WorkspaceType,
@@ -15,9 +18,6 @@ use socket_patch_core::pth_hook::{
     add_hook_dependency, deps_contain_hook, detect_python_pm, pyproject_contains_hook,
     remove_hook_dependency, ManifestKind, PthEditResult, PthStatus, PythonPackageManager,
 };
-use socket_patch_core::crawlers::CrawlerOptions;
-use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
-use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::utils::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches;
 use std::io::{self, Write};
@@ -90,11 +90,7 @@ pub struct SetupArgs {
     /// to the repo root). The exclusion is persisted in `.socket/manifest.json`
     /// so `setup --check` and a fresh clone honor it without re-passing the flag
     /// (CLI_CONTRACT property 9).
-    #[arg(
-        long = "exclude",
-        env = "SOCKET_SETUP_EXCLUDE",
-        value_delimiter = ',',
-    )]
+    #[arg(long = "exclude", env = "SOCKET_SETUP_EXCLUDE", value_delimiter = ',')]
     pub exclude: Vec<String>,
 
     #[command(flatten)]
@@ -584,7 +580,8 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
         };
         out.preview.push(header.to_string());
         for p in &added_paths {
-            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+            out.preview
+                .push(format!("  + {}", pathdiff(p, &common.cwd)));
         }
     }
 
@@ -655,7 +652,8 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
         };
         out.preview.push(header.to_string());
         for p in &added_paths {
-            out.preview.push(format!("  + {}", pathdiff(p, &common.cwd)));
+            out.preview
+                .push(format!("  + {}", pathdiff(p, &common.cwd)));
         }
     }
 
@@ -663,7 +661,11 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
 }
 
 #[cfg(not(feature = "composer"))]
-async fn build_composer_outcome(_common: &GlobalArgs, _remove: bool, _dry_run: bool) -> SetupOutcome {
+async fn build_composer_outcome(
+    _common: &GlobalArgs,
+    _remove: bool,
+    _dry_run: bool,
+) -> SetupOutcome {
     SetupOutcome::default()
 }
 
@@ -940,9 +942,18 @@ async fn run_check(args: &SetupArgs) -> i32 {
         );
     }
 
-    let configured = entries.iter().filter(|(_, _, s, _)| *s == CheckState::Configured).count();
-    let needs = entries.iter().filter(|(_, _, s, _)| *s == CheckState::NeedsConfiguration).count();
-    let errs = entries.iter().filter(|(_, _, s, _)| *s == CheckState::Error).count();
+    let configured = entries
+        .iter()
+        .filter(|(_, _, s, _)| *s == CheckState::Configured)
+        .count();
+    let needs = entries
+        .iter()
+        .filter(|(_, _, s, _)| *s == CheckState::NeedsConfiguration)
+        .count();
+    let errs = entries
+        .iter()
+        .filter(|(_, _, s, _)| *s == CheckState::Error)
+        .count();
 
     let all_ok = needs == 0 && errs == 0;
     let status = if errs > 0 {
@@ -1060,18 +1071,34 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         print_remove_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
-    let n_remove = npm_preview.iter().filter(|r| r.status == RemoveStatus::Removed).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
+    let n_remove = npm_preview
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Removed)
+        .count()
+        + py_preview
+            .iter()
+            .filter(|r| r.status == PthStatus::Updated)
+            .count()
         + extra_preview.changed;
-    let preview_errs = npm_preview.iter().filter(|r| r.status == RemoveStatus::Error).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
+    let preview_errs = npm_preview
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .count()
+        + py_preview
+            .iter()
+            .filter(|r| r.status == PthStatus::Error)
+            .count()
         + extra_preview.errors;
 
     // Nothing to remove: clean (exit 0) or some file errored (exit 1).
     if n_remove == 0 {
         if common.json {
             print_remove_envelope(
-                if preview_errs > 0 { "error" } else { "not_configured" },
+                if preview_errs > 0 {
+                    "error"
+                } else {
+                    "not_configured"
+                },
                 &npm_preview,
                 &py_preview,
                 &extra_preview,
@@ -1133,21 +1160,37 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         build_composer_outcome(common, true, false).await,
     );
 
-    let errs = npm_results.iter().filter(|r| r.status == RemoveStatus::Error).count()
-        + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
+    let errs = npm_results
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .count()
+        + py_results
+            .iter()
+            .filter(|r| r.status == PthStatus::Error)
+            .count()
         + extra_results.errors;
 
     if common.json {
         print_remove_envelope(
-            if errs > 0 { "partial_failure" } else { "success" },
+            if errs > 0 {
+                "partial_failure"
+            } else {
+                "success"
+            },
             &npm_results,
             &py_results,
             &extra_results,
             &warnings,
         );
     } else {
-        let removed = npm_results.iter().filter(|r| r.status == RemoveStatus::Removed).count()
-            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
+        let removed = npm_results
+            .iter()
+            .filter(|r| r.status == RemoveStatus::Removed)
+            .count()
+            + py_results
+                .iter()
+                .filter(|r| r.status == PthStatus::Updated)
+                .count()
             + extra_results.changed;
         println!("\nSummary:");
         println!("  {removed} item(s) had socket-patch removed");
@@ -1194,8 +1237,14 @@ fn print_remove_preview(
     extra: &SetupOutcome,
     common: &GlobalArgs,
 ) {
-    let to_remove: Vec<_> = npm.iter().filter(|r| r.status == RemoveStatus::Removed).collect();
-    let py_remove: Vec<_> = py.iter().filter(|r| r.status == PthStatus::Updated).collect();
+    let to_remove: Vec<_> = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Removed)
+        .collect();
+    let py_remove: Vec<_> = py
+        .iter()
+        .filter(|r| r.status == PthStatus::Updated)
+        .collect();
     println!("\nProposed changes:\n");
     if !to_remove.is_empty() {
         println!("Will remove socket-patch from:");
@@ -1205,7 +1254,10 @@ fn print_remove_preview(
             println!("    postinstall:   \"{}\"", r.old_script);
             println!("    -> postinstall: {}", render_removed(&r.new_script));
             println!("    dependencies:  \"{}\"", r.old_dependencies_script);
-            println!("    -> dependencies: {}", render_removed(&r.new_dependencies_script));
+            println!(
+                "    -> dependencies: {}",
+                render_removed(&r.new_dependencies_script)
+            );
         }
         println!();
     }
@@ -1252,13 +1304,24 @@ fn print_remove_envelope(
     extra: &SetupOutcome,
     warnings: &[String],
 ) {
-    let removed = npm.iter().filter(|r| r.status == RemoveStatus::Removed).count()
+    let removed = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Removed)
+        .count()
         + py.iter().filter(|r| r.status == PthStatus::Updated).count()
         + extra.changed;
-    let not_cfg = npm.iter().filter(|r| r.status == RemoveStatus::NotConfigured).count()
-        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
+    let not_cfg = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::NotConfigured)
+        .count()
+        + py.iter()
+            .filter(|r| r.status == PthStatus::AlreadyConfigured)
+            .count()
         + extra.already;
-    let errors = npm.iter().filter(|r| r.status == RemoveStatus::Error).count()
+    let errors = npm
+        .iter()
+        .filter(|r| r.status == RemoveStatus::Error)
+        .count()
         + py.iter().filter(|r| r.status == PthStatus::Error).count()
         + extra.errors;
 
@@ -1391,17 +1454,33 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         print_setup_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
-    let n_changes = npm_preview.iter().filter(|r| r.status == UpdateStatus::Updated).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Updated).count()
+    let n_changes = npm_preview
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Updated)
+        .count()
+        + py_preview
+            .iter()
+            .filter(|r| r.status == PthStatus::Updated)
+            .count()
         + extra_preview.changed;
-    let preview_errors = npm_preview.iter().filter(|r| r.status == UpdateStatus::Error).count()
-        + py_preview.iter().filter(|r| r.status == PthStatus::Error).count()
+    let preview_errors = npm_preview
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Error)
+        .count()
+        + py_preview
+            .iter()
+            .filter(|r| r.status == PthStatus::Error)
+            .count()
         + extra_preview.errors;
 
     if n_changes == 0 {
         if common.json {
             print_setup_envelope(
-                if preview_errors > 0 { "error" } else { "already_configured" },
+                if preview_errors > 0 {
+                    "error"
+                } else {
+                    "already_configured"
+                },
                 &npm_preview,
                 &py_preview,
                 &extra_preview,
@@ -1478,13 +1557,23 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         warnings.extend(finalize_gem(common).await);
     }
 
-    let errors = npm_results.iter().filter(|r| r.status == UpdateStatus::Error).count()
-        + py_results.iter().filter(|r| r.status == PthStatus::Error).count()
+    let errors = npm_results
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Error)
+        .count()
+        + py_results
+            .iter()
+            .filter(|r| r.status == PthStatus::Error)
+            .count()
         + extra_results.errors;
 
     if common.json {
         print_setup_envelope(
-            if errors > 0 { "partial_failure" } else { "success" },
+            if errors > 0 {
+                "partial_failure"
+            } else {
+                "success"
+            },
             &npm_results,
             &py_results,
             &extra_results,
@@ -1493,8 +1582,14 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             &warnings,
         );
     } else {
-        let updated = npm_results.iter().filter(|r| r.status == UpdateStatus::Updated).count()
-            + py_results.iter().filter(|r| r.status == PthStatus::Updated).count()
+        let updated = npm_results
+            .iter()
+            .filter(|r| r.status == UpdateStatus::Updated)
+            .count()
+            + py_results
+                .iter()
+                .filter(|r| r.status == PthStatus::Updated)
+                .count()
             + extra_results.changed;
         println!("\nSummary:");
         println!("  {updated} item(s) updated");
@@ -1534,8 +1629,14 @@ fn print_setup_preview(
     extra: &SetupOutcome,
     common: &GlobalArgs,
 ) {
-    let npm_changes: Vec<_> = npm.iter().filter(|r| r.status == UpdateStatus::Updated).collect();
-    let py_changes: Vec<_> = py.iter().filter(|r| r.status == PthStatus::Updated).collect();
+    let npm_changes: Vec<_> = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Updated)
+        .collect();
+    let py_changes: Vec<_> = py
+        .iter()
+        .filter(|r| r.status == PthStatus::Updated)
+        .collect();
 
     if !npm_changes.is_empty() {
         println!("\npackage.json files to update:");
@@ -1557,8 +1658,14 @@ fn print_setup_preview(
         }
     }
 
-    let npm_already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count();
-    let py_already = py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count();
+    let npm_already = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::AlreadyConfigured)
+        .count();
+    let py_already = py
+        .iter()
+        .filter(|r| r.status == PthStatus::AlreadyConfigured)
+        .count();
     if npm_already + py_already + extra.already > 0 {
         println!(
             "\nAlready configured (will skip): {}",
@@ -1595,13 +1702,24 @@ fn print_setup_envelope(
     py_plan: Option<&PythonPlan>,
     warnings: &[String],
 ) {
-    let updated = npm.iter().filter(|r| r.status == UpdateStatus::Updated).count()
+    let updated = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Updated)
+        .count()
         + py.iter().filter(|r| r.status == PthStatus::Updated).count()
         + extra.changed;
-    let already = npm.iter().filter(|r| r.status == UpdateStatus::AlreadyConfigured).count()
-        + py.iter().filter(|r| r.status == PthStatus::AlreadyConfigured).count()
+    let already = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::AlreadyConfigured)
+        .count()
+        + py.iter()
+            .filter(|r| r.status == PthStatus::AlreadyConfigured)
+            .count()
         + extra.already;
-    let errors = npm.iter().filter(|r| r.status == UpdateStatus::Error).count()
+    let errors = npm
+        .iter()
+        .filter(|r| r.status == UpdateStatus::Error)
+        .count()
         + py.iter().filter(|r| r.status == PthStatus::Error).count()
         + extra.errors;
 

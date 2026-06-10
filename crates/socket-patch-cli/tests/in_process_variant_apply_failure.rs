@@ -365,7 +365,11 @@ fn partial_multi_variant_failure_fails_the_command() {
         1,
         "expected exactly one applied variant: {out}"
     );
-    assert_eq!(failed.len(), 1, "expected exactly one failed variant: {out}");
+    assert_eq!(
+        failed.len(),
+        1,
+        "expected exactly one failed variant: {out}"
+    );
     assert_eq!(applied[0]["purl"], serde_json::Value::String(variant_a));
     assert_eq!(failed[0]["purl"], serde_json::Value::String(variant_b));
 

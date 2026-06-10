@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Parser;
-use socket_patch_cli::commands::list::{ListArgs, run};
+use socket_patch_cli::commands::list::{run, ListArgs};
 use socket_patch_cli::{Cli, Commands};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
@@ -83,12 +83,10 @@ fn populated_manifest() -> PatchManifest {
     files.insert(
         "package/index.js".to_string(),
         PatchFileInfo {
-            before_hash:
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111"
-                    .to_string(),
-            after_hash:
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111"
-                    .to_string(),
+            before_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1111"
+                .to_string(),
+            after_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1111"
+                .to_string(),
         },
     );
 
@@ -117,7 +115,10 @@ fn populated_manifest() -> PatchManifest {
         },
     );
 
-    PatchManifest { patches, setup: None }
+    PatchManifest {
+        patches,
+        setup: None,
+    }
 }
 
 #[tokio::test]
@@ -271,12 +272,7 @@ fn missing_manifest_json_status_is_error_via_binary() {
     // (object with code + message), plus the usual envelope fields.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_socket-patch"))
-        .args([
-            "list",
-            "--cwd",
-            tmp.path().to_str().unwrap(),
-            "--json",
-        ])
+        .args(["list", "--cwd", tmp.path().to_str().unwrap(), "--json"])
         .output()
         .expect("failed to execute socket-patch binary");
 
@@ -319,9 +315,8 @@ fn run_list_with_manifest_body(body: &str) -> (Option<i32>, serde_json::Value) {
     std::fs::write(socket_dir.join("manifest.json"), body).unwrap();
 
     let out = run_list_binary(tmp.path(), &["--json"]);
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     (out.status.code(), v)
 }
 
@@ -375,9 +370,8 @@ fn missing_manifest_under_valid_cwd_reports_manifest_not_found_via_binary() {
     // file was corrupt. It was masked by a now-removed metadata pre-check.)
     let tmp = tempfile::tempdir().unwrap();
     let out = run_list_binary(tmp.path(), &["--json"]);
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
     assert_eq!(v["status"], "error");
     assert_eq!(
@@ -414,9 +408,8 @@ fn manifest_path_is_existing_directory_reports_unreadable_via_binary() {
         tmp.path(),
         &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
     );
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     assert_eq!(out.status.code(), Some(1), "I/O error must exit 1");
     assert_eq!(v["status"], "error");
     assert_eq!(
@@ -472,21 +465,45 @@ fn populated_manifest_plain_lists_full_record_via_binary() {
     );
 
     // Every field of the single record must be rendered, not just an exit 0.
-    assert!(stdout.contains("Found 1 patch(es):"), "missing count header: {stdout}");
-    assert!(stdout.contains("Package: pkg:npm/test-pkg@1.0.0"), "missing purl: {stdout}");
+    assert!(
+        stdout.contains("Found 1 patch(es):"),
+        "missing count header: {stdout}"
+    );
+    assert!(
+        stdout.contains("Package: pkg:npm/test-pkg@1.0.0"),
+        "missing purl: {stdout}"
+    );
     assert!(
         stdout.contains("UUID: 11111111-1111-4111-8111-111111111111"),
         "missing uuid: {stdout}"
     );
     assert!(stdout.contains("Tier: free"), "missing tier: {stdout}");
     assert!(stdout.contains("License: MIT"), "missing license: {stdout}");
-    assert!(stdout.contains("Exported: 2024-01-01T00:00:00Z"), "missing exportedAt: {stdout}");
-    assert!(stdout.contains("Description: Test patch"), "missing description: {stdout}");
-    assert!(stdout.contains("GHSA-test-test-test"), "missing advisory id: {stdout}");
+    assert!(
+        stdout.contains("Exported: 2024-01-01T00:00:00Z"),
+        "missing exportedAt: {stdout}"
+    );
+    assert!(
+        stdout.contains("Description: Test patch"),
+        "missing description: {stdout}"
+    );
+    assert!(
+        stdout.contains("GHSA-test-test-test"),
+        "missing advisory id: {stdout}"
+    );
     assert!(stdout.contains("CVE-2024-0001"), "missing cve: {stdout}");
-    assert!(stdout.contains("Severity: high"), "missing severity: {stdout}");
-    assert!(stdout.contains("Summary: test vuln"), "missing summary: {stdout}");
-    assert!(stdout.contains("package/index.js"), "missing patched file path: {stdout}");
+    assert!(
+        stdout.contains("Severity: high"),
+        "missing severity: {stdout}"
+    );
+    assert!(
+        stdout.contains("Summary: test vuln"),
+        "missing summary: {stdout}"
+    );
+    assert!(
+        stdout.contains("package/index.js"),
+        "missing patched file path: {stdout}"
+    );
 }
 
 #[test]
@@ -502,9 +519,8 @@ fn populated_manifest_json_envelope_via_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
     assert_eq!(v["command"], "list");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["discovered"], 1);
@@ -550,7 +566,10 @@ fn empty_manifest_plain_says_no_patches_via_binary() {
         "empty manifest must report no patches, got: {stdout}"
     );
     // Guard against a regression that prints a record anyway.
-    assert!(!stdout.contains("Package:"), "empty manifest must not list any package: {stdout}");
+    assert!(
+        !stdout.contains("Package:"),
+        "empty manifest must not list any package: {stdout}"
+    );
 }
 
 #[test]
@@ -560,9 +579,8 @@ fn empty_manifest_json_has_no_events_via_binary() {
 
     let out = run_list_binary(tmp.path(), &["--json"]);
     assert_eq!(out.status.code(), Some(0), "empty list --json must exit 0");
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
     assert_eq!(v["command"], "list");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["discovered"], 0);
@@ -645,7 +663,10 @@ fn multi_manifest() -> PatchManifest {
             &["mmm/only.js"],
         ),
     );
-    PatchManifest { patches, setup: None }
+    PatchManifest {
+        patches,
+        setup: None,
+    }
 }
 
 /// Byte offset of `needle` in `haystack`; panics with context if absent.
@@ -741,9 +762,8 @@ fn multi_manifest_json_lists_all_records_sorted_via_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
     assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["discovered"], 3, "discovered count must be 3");
 
@@ -787,7 +807,11 @@ fn multi_manifest_json_lists_all_records_sorted_via_binary() {
         .iter()
         .map(|f| f["path"].as_str().expect("path"))
         .collect();
-    assert_eq!(paths, vec!["zzz/a.js", "zzz/z.js"], "files must be sorted by path");
+    assert_eq!(
+        paths,
+        vec!["zzz/a.js", "zzz/z.js"],
+        "files must be sorted by path"
+    );
 }
 
 #[test]
@@ -810,14 +834,23 @@ fn absolute_manifest_path_content_wins_over_cwd_via_binary() {
         .patches
         .insert("pkg:npm/abs-only-pkg@9.9.9".to_string(), rec);
     let abs_path = tmp_manifest_dir.path().join("abs.json");
-    std::fs::write(&abs_path, serde_json::to_string_pretty(&abs_manifest).unwrap()).unwrap();
+    std::fs::write(
+        &abs_path,
+        serde_json::to_string_pretty(&abs_manifest).unwrap(),
+    )
+    .unwrap();
 
     let out = run_list_binary(
         tmp_cwd.path(),
         &["--manifest-path", abs_path.to_str().unwrap()],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "must exit 0, stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
         stdout.contains("pkg:npm/abs-only-pkg@9.9.9"),
         "absolute manifest's package must be listed: {stdout}"

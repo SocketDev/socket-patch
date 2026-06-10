@@ -141,9 +141,7 @@ mod host_guard {
         for var in SOCKET_ENV_VARS {
             cmd.env_remove(var);
         }
-        let out = cmd
-            .output()
-            .expect("failed to execute socket-patch binary");
+        let out = cmd.output().expect("failed to execute socket-patch binary");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).to_string(),
@@ -217,7 +215,13 @@ mod host_guard {
         // Count fields are optional in the `no_files` envelope, but any that
         // ARE emitted must be zero — a non-zero count would mean setup thought
         // it had work to do on a project it does not support.
-        for key in ["updated", "alreadyConfigured", "errors", "configured", "needsConfiguration"] {
+        for key in [
+            "updated",
+            "alreadyConfigured",
+            "errors",
+            "configured",
+            "needsConfiguration",
+        ] {
             if let Some(n) = v.get(key) {
                 assert_eq!(
                     n.as_i64(),
@@ -266,7 +270,10 @@ mod host_guard {
         assert_pristine(root, "after setup");
 
         // ── setup --remove: nothing was configured, so nothing to remove ────
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
         assert_eq!(
             code, 0,
             "setup --remove on a maven project must exit 0 and do nothing.\nstdout:\n{out}\nstderr:\n{err}"
@@ -285,7 +292,13 @@ mod host_guard {
         std::fs::write(ctrl_root.join("package.json"), PACKAGE_JSON).unwrap();
         let (code, out, err) = run(
             ctrl_root,
-            &["setup", "--check", "--cwd", ctrl_root.to_str().unwrap(), "--json"],
+            &[
+                "setup",
+                "--check",
+                "--cwd",
+                ctrl_root.to_str().unwrap(),
+                "--json",
+            ],
         );
         assert_eq!(
             code, 1,

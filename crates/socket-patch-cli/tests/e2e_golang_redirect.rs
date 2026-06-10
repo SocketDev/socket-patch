@@ -15,7 +15,9 @@ use std::path::Path;
 #[path = "common/mod.rs"]
 mod common;
 
-use common::{git_sha256, git_sha256_file, run_with_env, write_blob, write_minimal_manifest, PatchEntry};
+use common::{
+    git_sha256, git_sha256_file, run_with_env, write_blob, write_minimal_manifest, PatchEntry,
+};
 
 const MODULE: &str = "github.com/foo/bar";
 const VERSION: &str = "v1.4.2";
@@ -35,7 +37,11 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let cache_dir = gomodcache.join(format!("{MODULE}@{VERSION}"));
     std::fs::create_dir_all(&cache_dir).unwrap();
     std::fs::write(cache_dir.join("bar.go"), PRISTINE).unwrap();
-    std::fs::write(cache_dir.join("go.mod"), "module github.com/foo/bar\n\ngo 1.21\n").unwrap();
+    std::fs::write(
+        cache_dir.join("go.mod"),
+        "module github.com/foo/bar\n\ngo 1.21\n",
+    )
+    .unwrap();
 
     // Consumer module.
     std::fs::write(
@@ -64,7 +70,14 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 fn apply(root: &Path, gomodcache: &Path) -> (i32, String, String) {
     run_with_env(
         root,
-        &["apply", "--offline", "--ecosystems", "golang", "--cwd", root.to_str().unwrap()],
+        &[
+            "apply",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--cwd",
+            root.to_str().unwrap(),
+        ],
         &[("GOMODCACHE", gomodcache.to_str().unwrap())],
     )
 }
@@ -72,7 +85,15 @@ fn apply(root: &Path, gomodcache: &Path) -> (i32, String, String) {
 fn check(root: &Path, gomodcache: &Path) -> i32 {
     run_with_env(
         root,
-        &["apply", "--check", "--offline", "--ecosystems", "golang", "--cwd", root.to_str().unwrap()],
+        &[
+            "apply",
+            "--check",
+            "--offline",
+            "--ecosystems",
+            "golang",
+            "--cwd",
+            root.to_str().unwrap(),
+        ],
         &[("GOMODCACHE", gomodcache.to_str().unwrap())],
     )
     .0
@@ -85,11 +106,17 @@ fn apply_materializes_redirect_and_check_passes() {
     let (gomodcache, cache_dir) = stage(root);
 
     let (code, stdout, stderr) = apply(root, &gomodcache);
-    assert_eq!(code, 0, "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "apply failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     // go.mod gained the socket-owned replace.
     let gomod = std::fs::read_to_string(root.join("go.mod")).unwrap();
-    assert!(gomod.contains(REPLACE_LINE), "replace directive missing:\n{gomod}");
+    assert!(
+        gomod.contains(REPLACE_LINE),
+        "replace directive missing:\n{gomod}"
+    );
 
     // The copy holds the patched bytes (== afterHash); the module cache is pristine.
     let copy_file = root.join(COPY_REL).join("bar.go");
@@ -104,12 +131,19 @@ fn apply_materializes_redirect_and_check_passes() {
     assert!(root.join(COPY_REL).join("go.mod").exists());
 
     // In sync.
-    assert_eq!(check(root, &gomodcache), 0, "apply --check should be in sync");
+    assert_eq!(
+        check(root, &gomodcache),
+        0,
+        "apply --check should be in sync"
+    );
 
     // Idempotent re-apply: still in sync, replace unchanged.
     assert_eq!(apply(root, &gomodcache).0, 0);
     assert_eq!(
-        std::fs::read_to_string(root.join("go.mod")).unwrap().matches(REPLACE_LINE).count(),
+        std::fs::read_to_string(root.join("go.mod"))
+            .unwrap()
+            .matches(REPLACE_LINE)
+            .count(),
         1,
         "re-apply must not duplicate the replace"
     );
@@ -125,7 +159,11 @@ fn check_detects_missing_replace_and_heals() {
 
     // Simulate a `go mod tidy`/`go mod vendor` that wiped our replace.
     let gomod = std::fs::read_to_string(root.join("go.mod")).unwrap();
-    let stripped: String = gomod.lines().filter(|l| !l.contains("go-patches")).collect::<Vec<_>>().join("\n");
+    let stripped: String = gomod
+        .lines()
+        .filter(|l| !l.contains("go-patches"))
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(root.join("go.mod"), format!("{stripped}\n")).unwrap();
 
     assert_eq!(check(root, &gomodcache), 1, "missing replace must be drift");
@@ -133,7 +171,9 @@ fn check_detects_missing_replace_and_heals() {
     // Heal.
     assert_eq!(apply(root, &gomodcache).0, 0);
     assert_eq!(check(root, &gomodcache), 0, "re-apply heals the replace");
-    assert!(std::fs::read_to_string(root.join("go.mod")).unwrap().contains(REPLACE_LINE));
+    assert!(std::fs::read_to_string(root.join("go.mod"))
+        .unwrap()
+        .contains(REPLACE_LINE));
 }
 
 #[test]
@@ -168,9 +208,7 @@ fn check_detects_resolved_version_mismatch() {
     // would silently link the UNPATCHED v1.5.0 — must be flagged.
     std::fs::write(
         root.join("go.mod"),
-        format!(
-            "module example.com/app\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n\n{REPLACE_LINE}\n"
-        ),
+        format!("module example.com/app\n\ngo 1.21\n\nrequire {MODULE} v1.5.0\n\n{REPLACE_LINE}\n"),
     )
     .unwrap();
     assert_eq!(
@@ -183,7 +221,11 @@ fn check_detects_resolved_version_mismatch() {
     // is stale (it patches v1.4.2, the build wants v1.5.0). apply re-affirms the
     // v1.4.2 redirect but cannot make the build use it, so check STAYS red until
     // a human re-scans. (Fail-closed stays closed — never a false "in sync".)
-    assert_eq!(apply(root, &gomodcache).0, 0, "apply itself succeeds (re-affirms v1.4.2)");
+    assert_eq!(
+        apply(root, &gomodcache).0,
+        0,
+        "apply itself succeeds (re-affirms v1.4.2)"
+    );
     assert_eq!(
         check(root, &gomodcache),
         1,
@@ -206,11 +248,24 @@ fn coexists_with_user_replace_at_different_version() {
     .unwrap();
 
     let (code, so, se) = apply(root, &gomodcache);
-    assert_eq!(code, 0, "apply must coexist with a user replace.\n{so}\n{se}");
+    assert_eq!(
+        code, 0,
+        "apply must coexist with a user replace.\n{so}\n{se}"
+    );
 
     // Both replaces survive: the user's v1.0.0 fork AND our v1.4.2 redirect.
     let gomod = std::fs::read_to_string(root.join("go.mod")).unwrap();
-    assert!(gomod.contains(&format!("replace {MODULE} v1.0.0 => ../my-fork")), "user replace clobbered:\n{gomod}");
-    assert!(gomod.contains(REPLACE_LINE), "socket replace missing:\n{gomod}");
-    assert_eq!(check(root, &gomodcache), 0, "check passes with both replaces present");
+    assert!(
+        gomod.contains(&format!("replace {MODULE} v1.0.0 => ../my-fork")),
+        "user replace clobbered:\n{gomod}"
+    );
+    assert!(
+        gomod.contains(REPLACE_LINE),
+        "socket replace missing:\n{gomod}"
+    );
+    assert_eq!(
+        check(root, &gomodcache),
+        0,
+        "check passes with both replaces present"
+    );
 }

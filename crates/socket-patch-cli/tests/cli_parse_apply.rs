@@ -174,7 +174,10 @@ fn default_download_mode_is_diff() {
 /// `.socket/manifest.json` as the canonical location.
 #[test]
 fn default_manifest_path_is_dot_socket_manifest_json() {
-    assert_eq!(parse_apply(&[]).common.manifest_path, ".socket/manifest.json");
+    assert_eq!(
+        parse_apply(&[]).common.manifest_path,
+        ".socket/manifest.json"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -379,13 +382,18 @@ fn all_short_flags_map_to_distinct_fields() {
 
 #[test]
 fn cwd_long() {
-    assert_eq!(parse_apply(&["--cwd", "/tmp/x"]).common.cwd, PathBuf::from("/tmp/x"));
+    assert_eq!(
+        parse_apply(&["--cwd", "/tmp/x"]).common.cwd,
+        PathBuf::from("/tmp/x")
+    );
 }
 
 #[test]
 fn manifest_path_long() {
     assert_eq!(
-        parse_apply(&["--manifest-path", "custom.json"]).common.manifest_path,
+        parse_apply(&["--manifest-path", "custom.json"])
+            .common
+            .manifest_path,
         "custom.json"
     );
 }
@@ -393,7 +401,9 @@ fn manifest_path_long() {
 #[test]
 fn global_prefix_long() {
     assert_eq!(
-        parse_apply(&["--global-prefix", "/foo"]).common.global_prefix,
+        parse_apply(&["--global-prefix", "/foo"])
+            .common
+            .global_prefix,
         Some(PathBuf::from("/foo"))
     );
 }
@@ -401,7 +411,9 @@ fn global_prefix_long() {
 #[test]
 fn api_url_long() {
     assert_eq!(
-        parse_apply(&["--api-url", "https://api.example.test"]).common.api_url,
+        parse_apply(&["--api-url", "https://api.example.test"])
+            .common
+            .api_url,
         "https://api.example.test"
     );
 }
@@ -409,7 +421,10 @@ fn api_url_long() {
 #[test]
 fn api_token_long() {
     assert_eq!(
-        parse_apply(&["--api-token", "tok-123"]).common.api_token.as_deref(),
+        parse_apply(&["--api-token", "tok-123"])
+            .common
+            .api_token
+            .as_deref(),
         Some("tok-123")
     );
 }
@@ -417,24 +432,35 @@ fn api_token_long() {
 #[test]
 fn proxy_url_long() {
     assert_eq!(
-        parse_apply(&["--proxy-url", "https://proxy.example.test"]).common.proxy_url,
+        parse_apply(&["--proxy-url", "https://proxy.example.test"])
+            .common
+            .proxy_url,
         "https://proxy.example.test"
     );
 }
 
 #[test]
 fn org_long() {
-    assert_eq!(parse_apply(&["--org", "acme"]).common.org.as_deref(), Some("acme"));
+    assert_eq!(
+        parse_apply(&["--org", "acme"]).common.org.as_deref(),
+        Some("acme")
+    );
 }
 
 #[test]
 fn org_short() {
-    assert_eq!(parse_apply(&["-o", "acme"]).common.org.as_deref(), Some("acme"));
+    assert_eq!(
+        parse_apply(&["-o", "acme"]).common.org.as_deref(),
+        Some("acme")
+    );
 }
 
 #[test]
 fn lock_timeout_long() {
-    assert_eq!(parse_apply(&["--lock-timeout", "30"]).common.lock_timeout, Some(30));
+    assert_eq!(
+        parse_apply(&["--lock-timeout", "30"]).common.lock_timeout,
+        Some(30)
+    );
 }
 
 #[test]
@@ -453,8 +479,14 @@ fn ecosystems_short() {
 #[test]
 fn ecosystems_csv_splits_into_vec() {
     assert_eq!(
-        parse_apply(&["--ecosystems", "npm,pypi,cargo"]).common.ecosystems,
-        Some(vec!["npm".to_string(), "pypi".to_string(), "cargo".to_string()])
+        parse_apply(&["--ecosystems", "npm,pypi,cargo"])
+            .common
+            .ecosystems,
+        Some(vec![
+            "npm".to_string(),
+            "pypi".to_string(),
+            "cargo".to_string()
+        ])
     );
 }
 
@@ -472,20 +504,32 @@ fn ecosystems_single_value() {
 
 #[test]
 fn download_mode_diff() {
-    assert_eq!(parse_apply(&["--download-mode", "diff"]).common.download_mode, "diff");
+    assert_eq!(
+        parse_apply(&["--download-mode", "diff"])
+            .common
+            .download_mode,
+        "diff"
+    );
 }
 
 #[test]
 fn download_mode_package() {
     assert_eq!(
-        parse_apply(&["--download-mode", "package"]).common.download_mode,
+        parse_apply(&["--download-mode", "package"])
+            .common
+            .download_mode,
         "package"
     );
 }
 
 #[test]
 fn download_mode_file() {
-    assert_eq!(parse_apply(&["--download-mode", "file"]).common.download_mode, "file");
+    assert_eq!(
+        parse_apply(&["--download-mode", "file"])
+            .common
+            .download_mode,
+        "file"
+    );
 }
 
 /// Values pass through verbatim — no lowercasing, trimming, or aliasing at the
@@ -495,13 +539,20 @@ fn download_mode_file() {
 fn download_mode_values_are_not_normalized() {
     // Case is preserved verbatim (parse does not canonicalize).
     assert_eq!(
-        parse_apply(&["--download-mode", "DIFF"]).common.download_mode,
+        parse_apply(&["--download-mode", "DIFF"])
+            .common
+            .download_mode,
         "DIFF"
     );
     // The three valid tokens are distinct and round-trip exactly.
     for token in ["diff", "package", "file"] {
-        let got = parse_apply(&["--download-mode", token]).common.download_mode;
-        assert_eq!(got, token, "download-mode `{token}` must round-trip exactly");
+        let got = parse_apply(&["--download-mode", token])
+            .common
+            .download_mode;
+        assert_eq!(
+            got, token,
+            "download-mode `{token}` must round-trip exactly"
+        );
     }
 }
 

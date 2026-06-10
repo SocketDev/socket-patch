@@ -56,13 +56,11 @@ pub fn run(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// to flip the per-ecosystem runtime gates (`SOCKET_EXPERIMENTAL_NUGET`)
 /// or override discovery roots (`NUGET_PACKAGES`, `GOMODCACHE`) without
 /// touching the parent process's environment — keeps tests parallel-safe.
-pub fn run_with_env(
-    cwd: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-) -> (i32, String, String) {
+pub fn run_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd).env_remove("SOCKET_API_TOKEN");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("SOCKET_API_TOKEN");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -101,8 +99,7 @@ pub fn git_sha256(content: &[u8]) -> String {
 /// Git-SHA-256 of the file at `path`. Panics if the file can't be
 /// read — tests use this on paths they know exist.
 pub fn git_sha256_file(path: &Path) -> String {
-    let content =
-        std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let content = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     git_sha256(&content)
 }
 
@@ -303,15 +300,11 @@ mod oracle_selftests {
     use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
     // Independently computed: sha256(b"blob <len>\0" + content).
-    const GIT_BLOB_EMPTY: &str =
-        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
-    const GIT_BLOB_HELLO: &str =
-        "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
+    const GIT_BLOB_EMPTY: &str = "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813";
+    const GIT_BLOB_HELLO: &str = "8aec4e4876f854f688d0ebfc8f37598f38e5fd6903cccc850ca36591175aeb60";
     // Independently computed: bare sha256(content), no Git framing.
-    const SHA256_EMPTY: &str =
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const SHA256_HELLO: &str =
-        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const SHA256_HELLO: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
     #[test]
     fn git_sha256_matches_independent_golden() {
@@ -374,8 +367,7 @@ mod oracle_selftests {
         // which differs in nothing BUT the length digits.
         let content = b"socket-patch length-header probe";
         let mut framed_with_len = Vec::new();
-        framed_with_len
-            .extend_from_slice(format!("blob {}\0", content.len()).as_bytes());
+        framed_with_len.extend_from_slice(format!("blob {}\0", content.len()).as_bytes());
         framed_with_len.extend_from_slice(content);
         assert_eq!(
             git_sha256(content),
@@ -402,7 +394,8 @@ mod oracle_selftests {
         let h = git_sha256(b"hello");
         assert_eq!(h.len(), 64, "hash must be 32 bytes of hex");
         assert!(
-            h.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            h.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "hash must be lowercase hex, got {h}"
         );
     }
@@ -445,8 +438,11 @@ mod oracle_selftests {
     // Unique temp dir per (pid, callsite) so the fixture-builder self-tests
     // never collide with each other or across parallel test binaries.
     fn scratch_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("socket-patch-oracle-{}-{}", std::process::id(), tag));
+        let d = std::env::temp_dir().join(format!(
+            "socket-patch-oracle-{}-{}",
+            std::process::id(),
+            tag
+        ));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -480,8 +476,7 @@ mod oracle_selftests {
             "manifest must land at <socket_dir>/manifest.json"
         );
         let raw = std::fs::read_to_string(&path).expect("manifest written");
-        let v: serde_json::Value =
-            serde_json::from_str(&raw).expect("manifest must be valid JSON");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("manifest must be valid JSON");
 
         let patch = v
             .get("patches")
@@ -561,7 +556,11 @@ mod oracle_selftests {
         // Non-string and absent top-level fields must yield None, not a coerced
         // value — otherwise `assert_eq!(json_string(..), Some(..))` could be
         // dodged or a missing field read as empty.
-        assert_eq!(json_string(&env, "count"), None, "numeric field is not a string");
+        assert_eq!(
+            json_string(&env, "count"),
+            None,
+            "numeric field is not a string"
+        );
         assert_eq!(json_string(&env, "missing"), None);
         assert_eq!(envelope_error_code(&env), Some("lock_held"));
         assert_eq!(

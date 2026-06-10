@@ -127,9 +127,7 @@ mod host_guard {
         for var in SOCKET_ENV_VARS {
             cmd.env_remove(var);
         }
-        let out = cmd
-            .output()
-            .expect("failed to execute socket-patch binary");
+        let out = cmd.output().expect("failed to execute socket-patch binary");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).to_string(),
@@ -215,7 +213,10 @@ mod host_guard {
 
         // ── setup: must rewrite package.json with a real apply hook ─────────
         let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "setup must succeed (exit 0).\nstdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(
+            code, 0,
+            "setup must succeed (exit 0).\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_json(&out, "setup");
         assert_eq!(
             json_str_field(&v, "status", "setup"),
@@ -251,7 +252,10 @@ mod host_guard {
         let pkg = std::fs::read_to_string(root.join("package.json")).unwrap();
         let pkg_v: serde_json::Value = serde_json::from_str(&pkg).unwrap();
         assert_eq!(
-            pkg_v.get("dependencies").and_then(|d| d.get("minimist")).and_then(|m| m.as_str()),
+            pkg_v
+                .get("dependencies")
+                .and_then(|d| d.get("minimist"))
+                .and_then(|m| m.as_str()),
             Some("1.2.2"),
             "setup must preserve the project's existing dependencies.\n{pkg}"
         );
@@ -281,8 +285,14 @@ mod host_guard {
         );
 
         // ── remove: must delete the hook and succeed ────────────────────────
-        let (code, out, err) = run(root, &["setup", "--remove", "--cwd", root_s, "--yes", "--json"]);
-        assert_eq!(code, 0, "setup --remove must succeed (exit 0).\nstdout:\n{out}\nstderr:\n{err}");
+        let (code, out, err) = run(
+            root,
+            &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
+        );
+        assert_eq!(
+            code, 0,
+            "setup --remove must succeed (exit 0).\nstdout:\n{out}\nstderr:\n{err}"
+        );
         let v = parse_json(&out, "remove");
         assert_eq!(
             json_str_field(&v, "status", "remove"),

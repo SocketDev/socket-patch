@@ -40,7 +40,8 @@ const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 /// Marker we splice into the patched bytes so the test can assert
 /// post-apply that the file has been overwritten.
-const PATCHED_BYTES: &[u8] = b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
+const PATCHED_BYTES: &[u8] =
+    b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
 
 /// Git-SHA256: SHA256("blob <len>\0" ++ content). Matches the binary's
 /// content-addressable hashing for fetched blobs.
@@ -101,8 +102,7 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
     // Bind to 0.0.0.0 so the container can reach the host via the
     // `host.docker.internal` alias (added with `--add-host` in
     // `run_in_container`). Random port chosen by the kernel.
-    let listener =
-        std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
     let server = MockServer::builder().listener(listener).start().await;
 
     // 1. Batch search → returns one patch for the installed PURL.
@@ -567,7 +567,9 @@ fn skip_if_no_docker_image() -> bool {
         .args(["image", "inspect", "socket-patch-test-npm:latest"])
         .output()
     else {
-        eprintln!("skipping: `docker` not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on the host)");
+        eprintln!(
+            "skipping: `docker` not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on the host)"
+        );
         return true;
     };
     if !out.status.success() {

@@ -85,11 +85,7 @@ fn global_long_form() {
 
 #[test]
 fn manifest_path_long_form() {
-    let args = parse_remove(&[
-        "pkg:npm/foo@1",
-        "--manifest-path",
-        "custom/manifest.json",
-    ]);
+    let args = parse_remove(&["pkg:npm/foo@1", "--manifest-path", "custom/manifest.json"]);
     assert_eq!(args.common.manifest_path, "custom/manifest.json");
 }
 
@@ -113,12 +109,11 @@ fn json_long_form() {
 
 #[test]
 fn global_prefix_long_form() {
-    let args = parse_remove(&[
-        "pkg:npm/foo@1",
-        "--global-prefix",
-        "/opt/node-global",
-    ]);
-    assert_eq!(args.common.global_prefix, Some(PathBuf::from("/opt/node-global")));
+    let args = parse_remove(&["pkg:npm/foo@1", "--global-prefix", "/opt/node-global"]);
+    assert_eq!(
+        args.common.global_prefix,
+        Some(PathBuf::from("/opt/node-global"))
+    );
 }
 
 #[test]
@@ -142,7 +137,10 @@ fn all_flags_combined() {
     assert!(args.skip_rollback);
     assert!(args.common.yes);
     assert!(args.common.global);
-    assert_eq!(args.common.global_prefix, Some(PathBuf::from("/opt/node-global")));
+    assert_eq!(
+        args.common.global_prefix,
+        Some(PathBuf::from("/opt/node-global"))
+    );
     assert!(args.common.json);
 }
 
@@ -246,9 +244,15 @@ async fn run_removes_matching_patch_and_exits_zero() {
         "pkg:npm/bar@2".to_string(),
         record("22222222-2222-2222-2222-222222222222"),
     );
-    write_manifest(&manifest_path, &PatchManifest { patches, setup: None })
-        .await
-        .expect("write manifest");
+    write_manifest(
+        &manifest_path,
+        &PatchManifest {
+            patches,
+            setup: None,
+        },
+    )
+    .await
+    .expect("write manifest");
 
     let args = RemoveArgs {
         common: socket_patch_cli::args::GlobalArgs {
@@ -351,9 +355,8 @@ fn missing_manifest_json_envelope_via_binary() {
         "missing manifest must exit 1, stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "error", "missing manifest is a hard error");
     assert_eq!(
@@ -386,9 +389,8 @@ fn no_match_json_envelope_via_binary() {
         "no-match remove must exit 1, stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "notFound", "unmatched identifier → notFound");
     assert_eq!(v["error"]["code"], "not_found");
@@ -423,9 +425,8 @@ fn removes_matching_patch_json_envelope_via_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let v: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("stdout must be valid JSON envelope");
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON envelope");
     assert_eq!(v["command"], "remove");
     assert_eq!(v["status"], "success");
     assert_eq!(
@@ -450,10 +451,9 @@ fn removes_matching_patch_json_envelope_via_binary() {
 
     // The on-disk manifest must actually reflect the removal — parsed
     // independently of the production schema types.
-    let after: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .expect("manifest still valid JSON");
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap())
+            .expect("manifest still valid JSON");
     let patches = after["patches"].as_object().expect("patches object");
     assert!(
         !patches.contains_key("pkg:npm/foo@1"),

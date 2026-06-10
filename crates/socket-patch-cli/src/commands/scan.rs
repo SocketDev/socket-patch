@@ -138,7 +138,7 @@ async fn run_apply_gc(
         // file-level cleanup below still operates on the in-memory copy.
         let _ = write_manifest(manifest_path, &manifest).await;
     }
-    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/false).await
+    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await
 }
 
 /// Dry-run preview of the apply-mode GC pass. Same shape as
@@ -164,7 +164,7 @@ async fn preview_apply_gc(
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
-    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/true).await
+    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ true).await
 }
 
 /// PURL strings present in the manifest but absent from `scanned_purls`.
@@ -184,8 +184,10 @@ pub(crate) fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
 ) -> Vec<String> {
-    let scanned_bases: HashSet<&str> =
-        scanned_purls.iter().map(|p| strip_purl_qualifiers(p)).collect();
+    let scanned_bases: HashSet<&str> = scanned_purls
+        .iter()
+        .map(|p| strip_purl_qualifiers(p))
+        .collect();
     manifest
         .patches
         .keys()
@@ -449,8 +451,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // prune used the filtered set instead, `scan --ecosystems npm --prune`
     // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
-    let installed_purls: HashSet<String> =
-        all_crawled.iter().map(|p| p.purl.clone()).collect();
+    let installed_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -481,7 +482,11 @@ pub async fn run(args: ScanArgs) -> i32 {
             0,
             0,
             false,
-            args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+            args.common
+                .ecosystems
+                .clone()
+                .unwrap_or_default()
+                .as_slice(),
             false,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
@@ -531,7 +536,10 @@ pub async fn run(args: ScanArgs) -> i32 {
     for eco in Ecosystem::all() {
         let count = if args.common.ecosystems.is_some() {
             // When filtering, count the filtered packages
-            filtered_crawled.iter().filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco)).count()
+            filtered_crawled
+                .iter()
+                .filter(|p| Ecosystem::from_purl(&p.purl) == Some(*eco))
+                .count()
         } else {
             eco_counts.get(eco).copied().unwrap_or(0)
         };
@@ -626,8 +634,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // than silently reporting zero patches (which historically looked
     // identical to "no patches for these packages").
     if total_batches > 0 && batch_error_count == total_batches {
-        let err = last_batch_error
-            .unwrap_or_else(|| "all batches failed".to_string());
+        let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
         track_patch_scan_failed(
             &err,
             fallback_to_proxy,
@@ -709,7 +716,11 @@ pub async fn run(args: ScanArgs) -> i32 {
         free_patches,
         paid_patches,
         can_access_paid_patches,
-        args.common.ecosystems.clone().unwrap_or_default().as_slice(),
+        args.common
+            .ecosystems
+            .clone()
+            .unwrap_or_default()
+            .as_slice(),
         fallback_to_proxy,
         telemetry_token.as_deref(),
         telemetry_org.as_deref(),
@@ -784,9 +795,8 @@ pub async fn run(args: ScanArgs) -> i32 {
                 // Synthesize the per-patch outcome without touching disk.
                 // `decide_patch_action` consults the existing manifest,
                 // so it accurately reports what `--apply` *would* do.
-                let manifest_for_preview = existing_manifest
-                    .clone()
-                    .unwrap_or_else(PatchManifest::new);
+                let manifest_for_preview =
+                    existing_manifest.clone().unwrap_or_else(PatchManifest::new);
                 let patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
@@ -871,9 +881,14 @@ pub async fn run(args: ScanArgs) -> i32 {
                 };
             }
 
-            let final_code =
-                embed_vex_into_json(&args.common, &args.vex, &manifest_path, apply_code, &mut result)
-                    .await;
+            let final_code = embed_vex_into_json(
+                &args.common,
+                &args.vex,
+                &manifest_path,
+                apply_code,
+                &mut result,
+            )
+            .await;
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             return final_code;
         }
@@ -939,7 +954,11 @@ pub async fn run(args: ScanArgs) -> i32 {
             if can_access_paid_patches {
                 format!("{}+{}", pkg_free, pkg_paid)
             } else {
-                format!("{}+{}", pkg_free, color(&pkg_paid.to_string(), "33", use_color))
+                format!(
+                    "{}+{}",
+                    pkg_free,
+                    color(&pkg_paid.to_string(), "33", use_color)
+                )
             }
         } else {
             format!("{}", pkg_free)
@@ -957,11 +976,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         // each group sorted — see collect_vuln_ids).
         let vuln_ids = collect_vuln_ids(pkg);
         let vuln_str = if vuln_ids.len() > 2 {
-            format!(
-                "{} (+{})",
-                vuln_ids[..2].join(", "),
-                vuln_ids.len() - 2
-            )
+            format!("{} (+{})", vuln_ids[..2].join(", "), vuln_ids.len() - 2)
         } else if vuln_ids.is_empty() {
             "-".to_string()
         } else {
@@ -1011,7 +1026,10 @@ pub async fn run(args: ScanArgs) -> i32 {
             println!(
                 "{}",
                 color(
-                    &format!("         + {} additional patch(es) available with paid subscription", paid_patches),
+                    &format!(
+                        "         + {} additional patch(es) available with paid subscription",
+                        paid_patches
+                    ),
                     "33",
                     use_color,
                 ),
@@ -1111,9 +1129,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                 }
             }
             let sev = vuln.severity.as_str();
-            if highest_severity
-                .is_none_or(|cur| severity_order(sev) < severity_order(cur))
-            {
+            if highest_severity.is_none_or(|cur| severity_order(sev) < severity_order(cur)) {
                 highest_severity = Some(sev);
             }
         }
@@ -1338,10 +1354,7 @@ mod tests {
 
     #[test]
     fn detect_updates_reports_multiple_updates() {
-        let m = manifest_with(&[
-            ("pkg:npm/foo@1.0", "uuid-a"),
-            ("pkg:npm/bar@2.0", "uuid-c"),
-        ]);
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-c")]);
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-b"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-d"]),
@@ -1414,20 +1427,14 @@ mod tests {
 
     #[test]
     fn detect_prunable_all_entries_present_in_scan() {
-        let m = manifest_with(&[
-            ("pkg:npm/foo@1.0", "uuid-a"),
-            ("pkg:npm/bar@2.0", "uuid-b"),
-        ]);
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
         let s = scanned(&["pkg:npm/foo@1.0", "pkg:npm/bar@2.0"]);
         assert!(detect_prunable(&m, &s).is_empty());
     }
 
     #[test]
     fn detect_prunable_returns_missing_entries() {
-        let m = manifest_with(&[
-            ("pkg:npm/foo@1.0", "uuid-a"),
-            ("pkg:npm/bar@2.0", "uuid-b"),
-        ]);
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
         // foo is still installed, bar is gone.
         let s = scanned(&["pkg:npm/foo@1.0"]);
         let mut out = detect_prunable(&m, &s);
@@ -1437,10 +1444,7 @@ mod tests {
 
     #[test]
     fn detect_prunable_returns_everything_when_scan_is_empty() {
-        let m = manifest_with(&[
-            ("pkg:npm/foo@1.0", "uuid-a"),
-            ("pkg:npm/bar@2.0", "uuid-b"),
-        ]);
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
         let mut out = detect_prunable(&m, &scanned(&[]));
         out.sort();
         assert_eq!(
@@ -1556,7 +1560,10 @@ mod tests {
             "bytesReclaimable must be > 0 when an orphan blob would be freed"
         );
         // Preview is non-mutating: blob and manifest untouched.
-        assert!(blob_path.exists(), "dry-run preview must not delete the blob");
+        assert!(
+            blob_path.exists(),
+            "dry-run preview must not delete the blob"
+        );
         let m = read_manifest(&manifest_path).await.unwrap().unwrap();
         assert!(
             m.patches.contains_key("pkg:npm/gone@1.0.0"),
@@ -1674,10 +1681,7 @@ mod tests {
         };
         assert_eq!(
             collect_vuln_ids(&pkg),
-            vec![
-                "CVE-2024-1".to_string(),
-                "GHSA-aaaa-aaaa-aaaa".to_string(),
-            ],
+            vec!["CVE-2024-1".to_string(), "GHSA-aaaa-aaaa-aaaa".to_string(),],
         );
     }
 

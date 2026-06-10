@@ -153,7 +153,10 @@ fn lock_held_human_mode_mentions_other_process() {
     let _external = take_external_lock(&socket_dir);
 
     let (code, stdout, stderr) = run(dir.path(), &["apply"]);
-    assert_eq!(code, 1, "human-mode contention must exit 1.\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 1,
+        "human-mode contention must exit 1.\nstderr:\n{stderr}"
+    );
     // Human mode must NOT leak a JSON envelope to stdout — the error
     // is a human line on stderr. A regression that printed JSON here
     // (or emitted nothing) would otherwise slip past a loose

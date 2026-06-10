@@ -28,9 +28,9 @@
 //! 2. **Negative control**: mutate the source file without running
 //!    apply, run `cargo check` — fails with "checksum changed".
 //!    Proves cargo actually verifies.
-//! 3. **Sidecar round trip**: synthesize a `.socket/manifest.json`
-//!    + after-hash blob, run `socket-patch apply`, run `cargo check`
-//!    — succeeds. The sidecar fixup is the load-bearing piece.
+//! 3. **Sidecar round trip**: synthesize a `.socket/manifest.json` plus an
+//!    after-hash blob, run `socket-patch apply`, run `cargo check` — it
+//!    succeeds. The sidecar fixup is the load-bearing piece.
 //! 4. **`package` field preserved**: assert
 //!    `.cargo-checksum.json`'s `"package"` key survives the rewrite
 //!    unchanged (cargo doesn't verify it at build time, but we
@@ -54,7 +54,8 @@ use common::{
 
 const ORIGINAL_LIB_RS: &str = "pub fn hello() -> &'static str { \"world\" }\n";
 const PATCHED_LIB_RS: &str = "pub fn hello() -> &'static str { \"PATCHED\" }\n";
-const FIXTURE_TOML: &str = "[package]\nname = \"safety-fixture\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+const FIXTURE_TOML: &str =
+    "[package]\nname = \"safety-fixture\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
 
 /// PURL the synthetic manifest points at. The cargo crawler resolves
 /// `pkg:cargo/<name>@<version>` against the consumer's `vendor/`
@@ -311,10 +312,8 @@ fn apply_then_cargo_check_succeeds() {
     // the apply both rewrote the per-file hash AND preserved the
     // `package` field.
     let pre_checksum: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            consumer.join("vendor/safety-fixture/.cargo-checksum.json"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(consumer.join("vendor/safety-fixture/.cargo-checksum.json"))
+            .unwrap(),
     )
     .unwrap();
 
@@ -335,10 +334,8 @@ fn apply_then_cargo_check_succeeds() {
     // entry must now be the raw SHA256 of the patched bytes; the
     // `package` field must be unchanged.
     let post_checksum: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            consumer.join("vendor/safety-fixture/.cargo-checksum.json"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(consumer.join("vendor/safety-fixture/.cargo-checksum.json"))
+            .unwrap(),
     )
     .unwrap();
     let expected_lib_hash = sha256_hex(PATCHED_LIB_RS.as_bytes());
@@ -402,17 +399,17 @@ fn apply_reports_cargo_checksum_in_sidecars_updated() {
     );
 
     let env = parse_json_envelope(&stdout);
-    let sidecars = env["sidecars"]
-        .as_array()
-        .unwrap_or_else(|| panic!(
-            "envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ));
+    let sidecars = env["sidecars"].as_array().unwrap_or_else(|| {
+        panic!("envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     let cargo_record = sidecars
         .iter()
         .find(|s| s["ecosystem"] == "cargo")
-        .unwrap_or_else(|| panic!(
-            "envelope.sidecars must contain a record with ecosystem=cargo.\nstdout:\n{stdout}"
-        ));
+        .unwrap_or_else(|| {
+            panic!(
+                "envelope.sidecars must contain a record with ecosystem=cargo.\nstdout:\n{stdout}"
+            )
+        });
     let files = cargo_record["files"].as_array().expect("files array");
     assert!(
         files.iter().any(|f| {
@@ -422,8 +419,7 @@ fn apply_reports_cargo_checksum_in_sidecars_updated() {
     );
     // No advisory expected for the cargo success path.
     assert!(
-        cargo_record.get("advisory").is_none()
-            || cargo_record["advisory"].is_null(),
+        cargo_record.get("advisory").is_none() || cargo_record["advisory"].is_null(),
         "cargo success path should not carry an advisory; got {cargo_record}"
     );
     // PURL is denormalized into the record for jq filtering.
@@ -491,21 +487,17 @@ fn apply_with_malformed_checksum_reports_sidecar_fixup_failed() {
         env["status"], "success",
         "sidecar fixup failure must not flip the top-level status; got {env}"
     );
-    let sidecars = env["sidecars"]
-        .as_array()
-        .unwrap_or_else(|| panic!(
-            "envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ));
+    let sidecars = env["sidecars"].as_array().unwrap_or_else(|| {
+        panic!("envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
     let cargo_record = sidecars
         .iter()
         .find(|s| s["ecosystem"] == "cargo")
-        .unwrap_or_else(|| panic!(
-            "envelope.sidecars must contain a cargo record.\nstdout:\n{stdout}"
-        ));
+        .unwrap_or_else(|| {
+            panic!("envelope.sidecars must contain a cargo record.\nstdout:\n{stdout}")
+        });
     let advisory = cargo_record.get("advisory").unwrap_or_else(|| {
-        panic!(
-            "malformed checksum should produce an advisory.\nrecord: {cargo_record}"
-        )
+        panic!("malformed checksum should produce an advisory.\nrecord: {cargo_record}")
     });
     assert_eq!(
         advisory["code"], "sidecar_fixup_failed",
@@ -555,7 +547,11 @@ fn apply_with_missing_files_field_reports_sidecar_fixup_failed() {
     // arm in cargo::fixup that returns Malformed with a different
     // detail string than the serde parse path.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
-    std::fs::write(&checksum, br#"{"package":"0000000000000000000000000000000000000000000000000000000000000000"}"#).unwrap();
+    std::fs::write(
+        &checksum,
+        br#"{"package":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+    )
+    .unwrap();
 
     let (code, stdout, stderr) = run(
         &consumer,
@@ -661,7 +657,10 @@ fn apply_with_readonly_checksum_still_rewrites_it() {
     let mode = std::fs::metadata(&checksum).unwrap().permissions().mode() & 0o7777;
     // Re-grant write so tempdir cleanup can unlink.
     let _ = std::fs::set_permissions(&checksum, std::fs::Permissions::from_mode(0o644));
-    assert_eq!(mode, 0o444, "checksum file must stay read-only after rewrite");
+    assert_eq!(
+        mode, 0o444,
+        "checksum file must stay read-only after rewrite"
+    );
 
     // The sidecar reports a successful rewrite — not a failure advisory.
     let env = parse_json_envelope(&stdout);
@@ -770,8 +769,7 @@ fn apply_without_cargo_checksum_emits_no_sidecar_record() {
 
     // Remove the checksum entirely so the fixup hits the
     // `NotFound -> Ok(None)` early return.
-    std::fs::remove_file(consumer.join("vendor/safety-fixture/.cargo-checksum.json"))
-        .unwrap();
+    std::fs::remove_file(consumer.join("vendor/safety-fixture/.cargo-checksum.json")).unwrap();
 
     let (code, stdout, stderr) = run(
         &consumer,
@@ -868,10 +866,8 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
     // of the PATCHED bytes (cargo's directory source verifies exactly
     // this). Compare against that, not just "a string exists".
     let checksum: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(
-            consumer.join("vendor/safety-fixture/.cargo-checksum.json"),
-        )
-        .unwrap(),
+        &std::fs::read_to_string(consumer.join("vendor/safety-fixture/.cargo-checksum.json"))
+            .unwrap(),
     )
     .unwrap();
     let expected_patched_hash = sha256_hex(PATCHED_LIB_RS.as_bytes());
@@ -890,9 +886,7 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
          the raw SHA256 of the patched bytes; got {checksum}"
     );
     assert!(
-        checksum["files"]
-            .get("package/src/lib.rs")
-            .is_none(),
+        checksum["files"].get("package/src/lib.rs").is_none(),
         "rewriter must NOT create a `package/`-prefixed key"
     );
     // The unpatched Cargo.toml entry must survive untouched — proves
@@ -910,8 +904,9 @@ fn apply_normalizes_package_prefix_in_cargo_checksum() {
     let cargo = sidecars.iter().find(|s| s["ecosystem"] == "cargo").unwrap();
     let files = cargo["files"].as_array().unwrap();
     assert!(
-        files.iter().any(|f| f["path"] == ".cargo-checksum.json"
-            && f["action"] == "rewritten"),
+        files
+            .iter()
+            .any(|f| f["path"] == ".cargo-checksum.json" && f["action"] == "rewritten"),
         "sidecar record must still report .cargo-checksum.json:rewritten; got {cargo}"
     );
 }
@@ -962,11 +957,7 @@ traitobject = { version = "0.0.1", features = ["allow-unmaintained"] }
 "#,
     )
     .unwrap();
-    std::fs::write(
-        consumer.join("src/main.rs"),
-        "fn main() {}\n",
-    )
-    .unwrap();
+    std::fs::write(consumer.join("src/main.rs"), "fn main() {}\n").unwrap();
 
     // 1. Fetch traitobject@0.0.1 from crates.io (real network).
     //    Hermetic CARGO_HOME means we never touch the user's cache.
