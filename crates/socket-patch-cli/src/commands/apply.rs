@@ -101,6 +101,26 @@ async fn try_local_go_apply(
     if !is_local_go(purl, common) {
         return None;
     }
+    // Vendor ownership wins: a module recorded in `.socket/vendor/state.json`
+    // is managed by the explicit `socket-patch vendor` action; the implicit
+    // apply must not repoint its `replace` back at `.socket/go-patches/`.
+    // The synthesized result's vendored package_path routes the event to
+    // `Skipped`/`vendored` (see `result_to_event`).
+    if socket_patch_core::patch::vendor::is_purl_vendored(&common.cwd, purl).await {
+        return Some(ApplyResult {
+            package_key: purl.to_string(),
+            package_path: format!(
+                "{}/golang (managed by vendor)",
+                socket_patch_core::patch::vendor::VENDOR_DIR
+            ),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        });
+    }
     // `pkg_path` is the pristine, case-encoded module-cache dir; `module`/
     // `version` are the decoded PURL components keying the copy + `replace`.
     let (module, version) = parse_golang_purl(purl)?;
@@ -190,10 +210,23 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     {
         use socket_patch_core::patch::go_redirect::Drift as GoDrift;
         if go_in_local_scope(&args.common) {
+            // Vendored modules are excluded: their replace directives point at
+            // `.socket/vendor/golang/` (the verify engine skips Vendor-owned
+            // entries) and their state is audited by `vendor`, not `--check`.
+            let vendored = socket_patch_core::patch::vendor::load_state(&args.common.cwd)
+                .await
+                .map(|s| {
+                    s.entries
+                        .iter()
+                        .flat_map(|(k, e)| [k.clone(), e.base_purl.clone()])
+                        .collect::<HashSet<String>>()
+                })
+                .unwrap_or_default();
             let desired: HashSet<String> = manifest
                 .patches
                 .keys()
                 .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Golang))
+                .filter(|p| !vendored.contains(*p))
                 .cloned()
                 .collect();
             checked += desired.len();
@@ -328,6 +361,15 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
                 .clone()
                 .unwrap_or_else(|| "unknown error".to_string()),
         );
+    }
+
+    // A package managed by `socket-patch vendor` is skipped with its own
+    // reason: apply runs implicitly (postinstall/CI) and must never flip
+    // ownership back from the explicit vendor action. The synthesized result
+    // carries the vendored path as its package_path, which is the marker.
+    if result.package_path.contains(".socket/vendor/") {
+        return PatchEvent::new(PatchAction::Skipped, purl)
+            .with_reason("vendored", "managed by `socket-patch vendor`");
     }
 
     if all_files_already_patched(result) {
