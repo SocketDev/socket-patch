@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchManifest;
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
+use crate::patch::vendor::state::VendorEntry;
+use crate::patch::vendor::verify::verify_vendored_patch_record;
 
 /// One entry per manifest PURL that did NOT pass verification. The
 /// `reason` is a short snake_case tag the CLI can route on (matches
@@ -34,6 +36,31 @@ pub struct VerifyOutcome {
     pub applied: Vec<String>,
     /// PURLs whose verification failed (with a routing tag).
     pub failed: Vec<FailedPatch>,
+    /// The subset of `applied` that was attested via the committed
+    /// vendor artifact (`.socket/vendor/…`) rather than the installed
+    /// tree. Every member is also present in `applied`.
+    pub vendored: Vec<String>,
+}
+
+/// Vendored-patch context for [`applied_patches_with_vendor`].
+///
+/// Built by the CLI from the committed `.socket/vendor/state.json` ledger
+/// (plus the legacy `.socket/go-patches/` redirect synthesis); kept as plain
+/// data so this module stays free of state-loading concerns.
+#[derive(Debug, Clone, Default)]
+pub struct VendorContext {
+    /// Project root the vendor artifact paths are relative to.
+    pub project_root: PathBuf,
+    /// Vendor-state entries, keyed by manifest PURL (a manifest PURL also
+    /// matches an entry whose `base_purl` equals it — qualified manifest
+    /// keys resolve to the entry recorded under the base PURL).
+    pub entries: HashMap<String, VendorEntry>,
+    /// Legacy `apply`-redirect copies: PURL → absolute
+    /// `.socket/go-patches/<module>@<version>` copy dir. These are verified
+    /// with the ordinary dir-hash check (NOT the vendor artifact check —
+    /// their paths live outside `.socket/vendor/`) and count as `applied`
+    /// but not `vendored`.
+    pub go_patches: HashMap<String, PathBuf>,
 }
 
 /// Walk the manifest and bucket each PURL into `applied` / `failed`.
@@ -45,9 +72,63 @@ pub async fn applied_patches(
     manifest: &PatchManifest,
     package_paths: &HashMap<String, PathBuf>,
 ) -> VerifyOutcome {
+    applied_patches_with_vendor(manifest, package_paths, None).await
+}
+
+/// [`applied_patches`] with vendored-patch awareness.
+///
+/// Per-PURL precedence:
+/// 1. A vendor-state entry (matched by map key or `base_purl`) means the
+///    committed artifact is the SOLE evidence: success lands the PURL in
+///    both `applied` and `vendored`; failure lands it in `failed` with the
+///    vendor routing tag. There is deliberately no fallback to the
+///    installed tree in either direction — an unpatched `node_modules` is
+///    EXPECTED after vendoring and must not block attestation, and a
+///    patched-looking installed tree must not launder a tampered vendor
+///    artifact.
+/// 2. A `go_patches` entry verifies the redirect copy dir with the normal
+///    dir-hash check (`applied` only, not `vendored`); again no fallback —
+///    an active redirect makes the copy dir the consumed bytes, while the
+///    module cache stays pristine by design.
+/// 3. Otherwise the installed-tree behavior of [`applied_patches`], verbatim.
+pub async fn applied_patches_with_vendor(
+    manifest: &PatchManifest,
+    package_paths: &HashMap<String, PathBuf>,
+    vendor: Option<&VendorContext>,
+) -> VerifyOutcome {
     let mut out = VerifyOutcome::default();
 
     for (purl, record) in &manifest.patches {
+        if let Some(ctx) = vendor {
+            let entry = ctx
+                .entries
+                .get(purl)
+                .or_else(|| ctx.entries.values().find(|e| e.base_purl == *purl));
+            if let Some(entry) = entry {
+                match verify_vendored_patch_record(&ctx.project_root, entry, record).await {
+                    Ok(()) => {
+                        out.applied.push(purl.clone());
+                        out.vendored.push(purl.clone());
+                    }
+                    Err(reason) => out.failed.push(FailedPatch {
+                        purl: purl.clone(),
+                        reason,
+                    }),
+                }
+                continue;
+            }
+            if let Some(copy_dir) = ctx.go_patches.get(purl) {
+                match verify_patch_record(copy_dir, record).await {
+                    Ok(()) => out.applied.push(purl.clone()),
+                    Err(reason) => out.failed.push(FailedPatch {
+                        purl: purl.clone(),
+                        reason,
+                    }),
+                }
+                continue;
+            }
+        }
+
         let pkg_path = match package_paths.get(purl) {
             Some(p) => p,
             None => {
@@ -816,5 +897,303 @@ mod tests {
             "unexpected reason: {}",
             out.failed[0].reason
         );
+    }
+
+    // ── Vendored-patch awareness (`applied_patches_with_vendor`) ──
+
+    use crate::patch::vendor::state::{VendorArtifact, VendorEntry};
+
+    /// Canonical-grammar patch UUID — `verify_vendored_patch_record`
+    /// validates the uuid path level, so vendor fixtures must use a real
+    /// uuid (unlike the `"u"` shorthand of the installed-tree tests).
+    const VUUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn vendor_entry(purl: &str, rel_path: &str) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "cargo".to_string(),
+            base_purl: purl.to_string(),
+            uuid: VUUID.to_string(),
+            artifact: VendorArtifact {
+                path: rel_path.to_string(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            flavor: None,
+            uv: None,
+        }
+    }
+
+    /// `applied_patches` must be exactly `applied_patches_with_vendor(.., None)`
+    /// on a mixed fixture (one applied, one failed) — the wrapper carries the
+    /// pre-vendor contract verbatim, with an empty `vendored` set.
+    #[tokio::test]
+    async fn wrapper_equals_with_vendor_none() {
+        let ok_dir = tempfile::tempdir().unwrap();
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(ok_dir.path().join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert("pkg:npm/ok@1.0.0".to_string(), record_with_one_file(&hash));
+        manifest.patches.insert(
+            "pkg:npm/missing@2.0.0".to_string(),
+            record_with_one_file("deadbeef"),
+        );
+
+        let mut paths = HashMap::new();
+        paths.insert("pkg:npm/ok@1.0.0".to_string(), ok_dir.path().to_path_buf());
+
+        let a = applied_patches(&manifest, &paths).await;
+        let b = applied_patches_with_vendor(&manifest, &paths, None).await;
+        assert_eq!(a.applied, b.applied);
+        assert_eq!(a.failed, b.failed);
+        assert!(a.vendored.is_empty());
+        assert!(b.vendored.is_empty());
+    }
+
+    /// Happy path: a vendor-state entry + healthy vendored dir attests the
+    /// PURL with the installed tree entirely ABSENT (`package_paths` empty —
+    /// the post-vendor `node_modules`-less checkout). The PURL lands in BOTH
+    /// `applied` and `vendored`.
+    #[tokio::test]
+    async fn vendored_dir_attests_without_installed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let dir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), patched).await.unwrap();
+
+        let mut rec = record_with_one_file(&hash);
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+        };
+
+        let paths: HashMap<String, PathBuf> = HashMap::new(); // no installed tree
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// A manifest PURL matches a vendor entry recorded under a different map
+    /// key when `entry.base_purl` equals it (qualified-key manifests resolve
+    /// to the base-PURL ledger entry).
+    #[tokio::test]
+    async fn vendor_entry_matched_by_base_purl() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let dir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), patched).await.unwrap();
+
+        let mut rec = record_with_one_file(&hash);
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        // Keyed by some other (qualified) string; base_purl carries the match.
+        let mut entries = HashMap::new();
+        entries.insert(
+            "pkg:cargo/serde@1.0.0?qualifier=x".to_string(),
+            vendor_entry(purl, &rel),
+        );
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+        };
+
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+    }
+
+    /// Precedence, healthy direction: the installed tree still holds the
+    /// UN-patched bytes (expected after vendoring — the lockfile points at
+    /// the vendored copy now) while the vendor artifact is healthy. The
+    /// vendor path must win: applied + vendored, no `not_applied` failure.
+    #[tokio::test]
+    async fn healthy_vendor_beats_unpatched_installed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let original = b"original-unpatched";
+        let patched = b"patched-content";
+        let before = compute_git_sha256_from_bytes(original);
+        let after = compute_git_sha256_from_bytes(patched);
+
+        // Vendored copy: patched.
+        let vdir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&vdir).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), patched).await.unwrap();
+        // Installed tree: still original.
+        let installed = root.path().join("installed");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), original)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: before,
+                after_hash: after,
+            },
+        );
+        let rec = PatchRecord {
+            uuid: VUUID.to_string(),
+            exported_at: String::new(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+        };
+        let mut paths = HashMap::new();
+        paths.insert(purl.to_string(), installed);
+
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(
+            out.applied,
+            vec![purl.to_string()],
+            "the unpatched installed tree must not block a healthy vendor attestation"
+        );
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+        assert!(out.failed.is_empty());
+    }
+
+    /// Precedence, fail-closed direction: a TAMPERED vendor artifact fails
+    /// with `vendor_hash_mismatch` even though the installed tree happens to
+    /// look patched — a patched-looking tree must not launder a tampered
+    /// committed artifact into an attestation.
+    #[tokio::test]
+    async fn tampered_vendor_not_laundered_by_patched_installed_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{VUUID}/serde-1.0.0");
+        let patched = b"patched-content";
+        let hash = compute_git_sha256_from_bytes(patched);
+
+        // Vendored copy: tampered.
+        let vdir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&vdir).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), b"tampered").await.unwrap();
+        // Installed tree: at afterHash (would verify if consulted).
+        let installed = root.path().join("installed");
+        tokio::fs::create_dir_all(&installed).await.unwrap();
+        tokio::fs::write(installed.join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let mut rec = record_with_one_file(&hash);
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+        };
+        let mut paths = HashMap::new();
+        paths.insert(purl.to_string(), installed);
+
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert!(
+            out.applied.is_empty(),
+            "a tampered vendor artifact must never be attested"
+        );
+        assert!(out.vendored.is_empty());
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].reason, "vendor_hash_mismatch");
+    }
+
+    /// The `go_patches` map verifies the redirect copy dir with the normal
+    /// dir-hash check: success → `applied` (NOT `vendored`); a stale/
+    /// unpatched copy → failed. No installed-tree fallback either way.
+    #[tokio::test]
+    async fn go_patches_copy_dir_verifies_as_applied_not_vendored() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let patched = b"patched-go-source";
+        let hash = compute_git_sha256_from_bytes(patched);
+        let copy_dir = root
+            .path()
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+        tokio::fs::write(copy_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest
+            .patches
+            .insert(purl.to_string(), record_with_one_file(&hash));
+
+        let mut go_patches = HashMap::new();
+        go_patches.insert(purl.to_string(), copy_dir.clone());
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries: HashMap::new(),
+            go_patches,
+        };
+
+        // No installed tree (module cache absent) — the redirect copy is
+        // the consumed bytes.
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert!(
+            out.vendored.is_empty(),
+            "go-patches redirects are applied, not vendored"
+        );
+        assert!(out.failed.is_empty());
+
+        // Tamper the copy dir → failed with the dir-hash reason, never
+        // attested.
+        tokio::fs::write(copy_dir.join("index.js"), b"tampered")
+            .await
+            .unwrap();
+        let out =
+            applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].reason, "hash_mismatch");
     }
 }

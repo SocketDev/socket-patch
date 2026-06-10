@@ -557,7 +557,15 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                     for w in &warnings {
                         record_warning(env, candidate, w, common);
                     }
-                    if let Some(entry) = entry {
+                    if let Some(mut entry) = entry {
+                        // A re-vendor run re-derives the entry from current
+                        // disk state, where the takeover already happened —
+                        // preserve the prior flag or the revert-time
+                        // "takeover_not_restored" hint is lost.
+                        if let Some(prev) = state.entries.get(candidate) {
+                            entry.took_over_go_patches =
+                                entry.took_over_go_patches || prev.took_over_go_patches;
+                        }
                         state.entries.insert(candidate.clone(), entry);
                         // Persist per-package so a crash mid-run leaves a
                         // ledger that matches what's already wired.

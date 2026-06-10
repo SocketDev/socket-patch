@@ -95,7 +95,7 @@ pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Async wrapper over [`force_remove_dir_all`].
-pub(crate) async fn remove_tree(dir: &Path) -> std::io::Result<()> {
+pub async fn remove_tree(dir: &Path) -> std::io::Result<()> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || force_remove_dir_all(&dir))
         .await

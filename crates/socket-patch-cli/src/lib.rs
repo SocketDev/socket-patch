@@ -69,6 +69,11 @@ pub enum Commands {
     /// lock file when it is free.
     Unlock(commands::unlock::UnlockArgs),
 
+    /// Eject patched dependencies into committable `.socket/vendor/`
+    /// and rewire lockfiles so fresh checkouts build with the patches
+    /// (no socket-patch or Socket API needed). `--revert` undoes it.
+    Vendor(commands::vendor::VendorArgs),
+
     /// Generate an OpenVEX 0.2.0 attestation describing the
     /// vulnerabilities mitigated by the applied patches.
     Vex(commands::vex::VexArgs),

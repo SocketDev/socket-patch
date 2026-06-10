@@ -27,7 +27,7 @@ use socket_patch_cli::Cli;
 /// being listed here — closing the "someone forgot the flatten on a new
 /// command and nobody noticed" gap this file claims to guard.
 const SUBCOMMANDS_NO_POSITIONAL: &[&str] = &[
-    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vex",
+    "apply", "list", "scan", "setup", "repair", "rollback", "unlock", "vendor", "vex",
 ];
 
 /// Subcommands that require a positional identifier.
@@ -100,6 +100,7 @@ fn common_of(cli: &Cli) -> &GlobalArgs {
         Setup(a) => &a.common,
         Repair(a) => &a.common,
         Unlock(a) => &a.common,
+        Vendor(a) => &a.common,
         Vex(a) => &a.common,
     }
 }

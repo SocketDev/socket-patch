@@ -50,9 +50,26 @@ pub fn build_document(
     applied: &[String],
     opts: &BuildOptions,
 ) -> Option<Document> {
+    build_document_with_vendored(manifest, applied, &[], opts)
+}
+
+/// [`build_document`] with vendored-patch awareness: PURLs in `vendored`
+/// (a subset of `applied`, from `VerifyOutcome::vendored`) carry the
+/// impact-statement phrasing "Patched via Socket patch `<uuid>` (vendored)"
+/// so the attestation records that the evidence is the committed
+/// `.socket/vendor/` artifact, not the installed tree. Status and
+/// justification are identical to the non-vendored form.
+pub fn build_document_with_vendored(
+    manifest: &PatchManifest,
+    applied: &[String],
+    vendored: &[String],
+    opts: &BuildOptions,
+) -> Option<Document> {
     let timestamp = now_rfc3339();
     let applied_set: std::collections::HashSet<&str> =
         applied.iter().map(|s| s.as_str()).collect();
+    let vendored_set: std::collections::HashSet<&str> =
+        vendored.iter().map(|s| s.as_str()).collect();
 
     // vuln-id -> (aliases, impact-statement parts, subcomponent PURLs)
     // BTreeMap keeps statement order deterministic by vuln id, which
@@ -71,9 +88,11 @@ pub fn build_document(
                 }
             }
             entry.subcomponents.insert(purl.clone());
-            entry
-                .impact_parts
-                .push(format!("Patched via Socket patch {}", record.uuid));
+            entry.impact_parts.push(if vendored_set.contains(purl.as_str()) {
+                format!("Patched via Socket patch {} (vendored)", record.uuid)
+            } else {
+                format!("Patched via Socket patch {}", record.uuid)
+            });
         }
     }
 
@@ -719,5 +738,124 @@ mod tests {
         assert_eq!(subs[0].id, "pkg:npm/aaa@1.0.0");
         assert_eq!(subs[1].id, "pkg:npm/mmm@1.0.0");
         assert_eq!(subs[2].id, "pkg:npm/zzz@1.0.0");
+    }
+
+    // ── Vendored-patch phrasing (`build_document_with_vendored`) ──
+
+    /// A vendored PURL's impact statement carries the "(vendored)" suffix;
+    /// status/justification stay identical to the non-vendored form.
+    #[test]
+    fn vendored_purl_gets_vendored_impact_phrasing() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:cargo/serde@1.0.0".to_string(),
+            record("u-vend", vec![("GHSA-vvvv", vec!["CVE-2024-7"])]),
+        );
+        let applied = vec!["pkg:cargo/serde@1.0.0".to_string()];
+        let doc =
+            build_document_with_vendored(&manifest, &applied, &applied, &opts()).unwrap();
+        let st = &doc.statements[0];
+        assert_eq!(
+            st.impact_statement.as_deref(),
+            Some("Patched via Socket patch u-vend (vendored)")
+        );
+        // The vendored path must not perturb the pinned status/justification.
+        assert_eq!(st.status, Status::NotAffected);
+        assert_eq!(
+            st.justification,
+            Some(Justification::InlineMitigationsAlreadyExist)
+        );
+    }
+
+    /// `build_document` is exactly `build_document_with_vendored(.., &[], ..)`
+    /// — no "(vendored)" phrasing without a vendored set.
+    #[test]
+    fn build_document_is_empty_vendored_wrapper() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record("u1", vec![("GHSA-aaaa", vec!["CVE-1"])]),
+        );
+        let applied = vec!["pkg:npm/x@1.0.0".to_string()];
+        let strip = |mut d: Document| -> Document {
+            d.timestamp = String::new();
+            for s in d.statements.iter_mut() {
+                s.timestamp = None;
+            }
+            d
+        };
+        let a = strip(build_document(&manifest, &applied, &opts()).unwrap());
+        let b = strip(
+            build_document_with_vendored(&manifest, &applied, &[], &opts()).unwrap(),
+        );
+        assert_eq!(a, b);
+        assert!(!a.statements[0]
+            .impact_statement
+            .as_deref()
+            .unwrap()
+            .contains("(vendored)"));
+    }
+
+    /// Same patch UUID across a vendored and a non-vendored PURL sharing a
+    /// GHSA: the two phrasings differ, so BOTH survive the dedup — the
+    /// statement records that one attestation is vendored and one is not.
+    #[test]
+    fn same_uuid_vendored_and_non_vendored_keeps_both_phrasings() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
+        );
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.1".to_string(),
+            record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
+        );
+        let applied = vec![
+            "pkg:npm/x@1.0.0".to_string(),
+            "pkg:npm/x@1.0.1".to_string(),
+        ];
+        let vendored = vec!["pkg:npm/x@1.0.1".to_string()];
+        let doc =
+            build_document_with_vendored(&manifest, &applied, &vendored, &opts()).unwrap();
+        let imp = doc.statements[0].impact_statement.as_ref().unwrap();
+        assert!(
+            imp.contains("Patched via Socket patch shared-uuid (vendored)"),
+            "vendored phrasing missing: {imp}"
+        );
+        assert!(
+            imp.contains("Patched via Socket patch shared-uuid;")
+                || imp.ends_with("Patched via Socket patch shared-uuid"),
+            "plain phrasing missing: {imp}"
+        );
+        assert_eq!(imp.matches("shared-uuid").count(), 2, "both forms kept: {imp}");
+    }
+
+    /// Same UUID across two VENDORED PURLs sharing a GHSA: identical
+    /// phrasing collapses to one mention (the vendored twin of
+    /// `same_uuid_across_two_purls_deduped_in_impact_statement`).
+    #[test]
+    fn same_uuid_two_vendored_purls_deduped_in_impact_statement() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
+        );
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.1".to_string(),
+            record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
+        );
+        let applied = vec![
+            "pkg:npm/x@1.0.0".to_string(),
+            "pkg:npm/x@1.0.1".to_string(),
+        ];
+        let doc =
+            build_document_with_vendored(&manifest, &applied, &applied, &opts()).unwrap();
+        let imp = doc.statements[0].impact_statement.as_ref().unwrap();
+        assert_eq!(
+            imp.matches("shared-uuid").count(),
+            1,
+            "duplicate vendored UUID must collapse: {imp}"
+        );
+        assert!(imp.contains("(vendored)"));
     }
 }
