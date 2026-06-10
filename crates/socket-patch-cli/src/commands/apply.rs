@@ -115,10 +115,7 @@ async fn try_local_go_apply(
     if socket_patch_core::patch::vendor::is_purl_vendored(&common.cwd, purl).await {
         return Some(ApplyResult {
             package_key: purl.to_string(),
-            package_path: format!(
-                "{}/golang (managed by vendor)",
-                socket_patch_core::patch::vendor::VENDOR_DIR
-            ),
+            package_path: VENDOR_OWNED_MARKER.to_string(),
             success: true,
             files_verified: Vec::new(),
             files_patched: Vec::new(),
@@ -299,6 +296,11 @@ async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
 /// True when every file the engine verified for this package is already
 /// at its `afterHash` — i.e. the patch is a complete no-op on disk.
 ///
+/// Sentinel `package_path` for a result synthesized because the purl is
+/// owned by `socket-patch vendor` (recorded in `.socket/vendor/state.json`).
+/// `result_to_event` routes it to `Skipped`/`vendored` by exact equality.
+pub(crate) const VENDOR_OWNED_MARKER: &str = "managed by socket-patch vendor";
+
 /// Single source of truth for the `already_patched` classification, shared
 /// by [`result_to_event`] (which feeds the JSON envelope) and the
 /// human-readable summaries so both label packages identically.
@@ -372,8 +374,10 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     // A package managed by `socket-patch vendor` is skipped with its own
     // reason: apply runs implicitly (postinstall/CI) and must never flip
     // ownership back from the explicit vendor action. The synthesized result
-    // carries the vendored path as its package_path, which is the marker.
-    if result.package_path.contains(".socket/vendor/") {
+    // carries the exact sentinel as its package_path — an equality check, NOT
+    // a substring match: the vendor command's own successful results carry
+    // real `.socket/vendor/…` copy paths and must classify as Applied.
+    if result.package_path == VENDOR_OWNED_MARKER {
         return PatchEvent::new(PatchAction::Skipped, purl)
             .with_reason("vendored", "managed by `socket-patch vendor`");
     }

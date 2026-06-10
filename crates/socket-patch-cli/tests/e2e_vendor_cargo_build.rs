@@ -248,7 +248,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
     // NOTE: summary.applied / the event action are asserted in the
-    // #[ignore]d `cargo_vendor_reports_applied_event` below — a successful
+    // `cargo_vendor_reports_applied_event` below — a successful
     // cargo vendor is currently misreported as skipped/`vendored` (see the
     // BUG note there). The on-disk + build assertions here are unaffected.
 
@@ -411,7 +411,6 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 /// package_path is a stage tempdir / site-packages). Human output says
 /// "Vendored 0 package(s); 1 skipped" and `track_patch_vendored` reports 0.
 #[test]
-#[ignore = "BUG: result_to_event misroutes successful cargo/golang/composer/gem vendors to skipped/`vendored` (summary.applied == 0) because the backends' package_path is the .socket/vendor/ copy dir"]
 fn cargo_vendor_reports_applied_event() {
     if !has_command("cargo") {
         println!("SKIP: `cargo` not installed");

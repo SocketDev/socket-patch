@@ -158,6 +158,21 @@ pub async fn vendor_go_module(
             .join(GO_PATCHES_DIR)
             .join(format!("{module}@{version}"));
         let _ = remove_tree(&stale).await;
+        // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
+        // and including the go-patches root. `remove_dir` is non-recursive:
+        // a parent still holding another module's copy fails harmlessly.
+        let go_patches_root = project_root.join(GO_PATCHES_DIR);
+        let mut parent = stale.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = parent {
+            if !dir.starts_with(&go_patches_root) || dir < go_patches_root {
+                break;
+            }
+            if tokio::fs::remove_dir(&dir).await.is_err() {
+                break; // non-empty (or already gone) — stop pruning
+            }
+            parent = dir.parent().map(|p| p.to_path_buf());
+        }
+        let _ = tokio::fs::remove_dir(&go_patches_root).await;
         warnings.push(VendorWarning::new(
             "vendor_takeover",
             format!(

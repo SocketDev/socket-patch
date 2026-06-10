@@ -246,7 +246,7 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     let env = parse_envelope(&stdout);
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    // NOTE: summary.applied / the event action are pinned in the #[ignore]d
+    // NOTE: summary.applied / the event action are pinned in the
     // `go_vendor_reports_applied_event` below — successful golang vendors
     // are currently misreported as skipped/`vendored` (shared
     // result_to_event bug). The wiring/build proofs here are unaffected.
@@ -513,7 +513,6 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
 /// `e2e_vendor_cargo_build.rs` for the root cause (shared `result_to_event`
 /// misroutes results whose package_path is the `.socket/vendor/` copy dir).
 #[test]
-#[ignore = "BUG: result_to_event misroutes successful cargo/golang/composer/gem vendors to skipped/`vendored` (summary.applied == 0) because the backends' package_path is the .socket/vendor/ copy dir"]
 fn go_vendor_reports_applied_event() {
     if !has_command("go") || !has_command("zip") {
         println!("SKIP: `go`/`zip` not installed");

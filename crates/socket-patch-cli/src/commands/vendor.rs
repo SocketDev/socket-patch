@@ -559,7 +559,20 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                             );
                         }
                     }
-                    env.record(result_to_event(&result, common.dry_run));
+                    let mut event = result_to_event(&result, common.dry_run);
+                    // The shared translator's in-sync classification reads
+                    // `already_patched`; under `vendor` the contract tag is
+                    // `already_vendored` (artifact + wiring already in sync).
+                    if event.action == PatchAction::Skipped
+                        && event.error_code.as_deref() == Some("already_patched")
+                    {
+                        event = PatchEvent::new(PatchAction::Skipped, candidate.clone())
+                            .with_reason(
+                                "already_vendored",
+                                "artifact and lockfile wiring already in sync",
+                            );
+                    }
+                    env.record(event);
                     for w in &warnings {
                         record_warning(env, candidate, w, common);
                     }

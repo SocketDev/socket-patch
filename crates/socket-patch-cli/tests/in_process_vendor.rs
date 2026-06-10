@@ -353,7 +353,7 @@ async fn rerun_is_idempotent() {
     // The in-sync re-run synthesizes its result against the vendored
     // artifact path, which routes to the `vendored` skip reason (the same
     // tag `apply` uses for vendor-owned packages) — pin the actual contract.
-    let skipped = find_event(&env, "skipped", Some("vendored"));
+    let skipped = find_event(&env, "skipped", Some("already_vendored"));
     assert_eq!(skipped["purl"], PURL);
 
     // NOTHING on disk churned.
