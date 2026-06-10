@@ -657,11 +657,21 @@ async fn reconcile_dropped(
         Ok(s) => s,
         Err(_) => return false, // unreadable state is reported by the main path
     };
+    // Respect this run's --ecosystems scope: a `vendor --ecosystems npm`
+    // invocation must not silently revert a cargo/go entry (restoring its
+    // lockfile and deleting its artifact) as a cross-ecosystem side effect.
+    let in_scope = |eco: &str| match common.ecosystems.as_deref() {
+        None => true,
+        Some(list) => list.iter().any(|e| {
+            e.eq_ignore_ascii_case(eco) || (eco == "golang" && e.eq_ignore_ascii_case("go"))
+        }),
+    };
     let stale: Vec<String> = state
         .entries
         .iter()
         .filter(|(purl, entry)| {
-            !manifest.patches.contains_key(*purl)
+            in_scope(&entry.ecosystem)
+                && !manifest.patches.contains_key(*purl)
                 && !manifest.patches.contains_key(&entry.base_purl)
         })
         .map(|(purl, _)| purl.clone())
@@ -752,9 +762,13 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // wiring for these is already gone or owned by a recorded entry, so
     // removal is safe; unparseable dirs are reported, never deleted.
     let swept = vendor::path::sweep_vendor_dirs(&common.cwd).await;
-    let recorded_uuids: HashSet<&str> = state.entries.values().map(|e| e.uuid.as_str()).collect();
+    let recorded_units: HashSet<(&str, &str)> = state
+        .entries
+        .values()
+        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
+        .collect();
     for unit in swept {
-        if recorded_uuids.contains(unit.uuid.as_str()) {
+        if recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
             continue;
         }
         if !common.dry_run {

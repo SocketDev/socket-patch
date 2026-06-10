@@ -141,8 +141,34 @@ pub async fn revert_requirements(
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // Group records per file, preserving application order within each.
+    //
+    // SECURITY: `rec.file` comes verbatim from the committed, tamper-able
+    // state.json and is about to be READ and atomically REWRITTEN. Every
+    // other backend writes only to fixed/whitelisted lockfile paths; the
+    // requirements flavor legitimately edits multiple files (`-r` includes),
+    // so each recorded path must re-pass the same in-root constraint
+    // vendor-time planning enforced — a `..`/absolute/NUL path would
+    // otherwise let a poisoned ledger splice attacker `original` lines into
+    // an arbitrary file via `vendor --revert`. Reject fail-closed per file
+    // (skip + drift warning), never fail open.
     let mut files: Vec<String> = Vec::new();
     for rec in &entry.wiring {
+        let norm = rec.file.replace('\\', "/");
+        if norm.is_empty()
+            || norm.starts_with('/')
+            || norm.contains('\0')
+            || !crate::patch::apply::is_safe_relative_subpath(&norm)
+        {
+            warnings.push(VendorWarning::new(
+                "vendor_revert_line_drifted",
+                format!(
+                    "refusing to revert wiring record for unsafe path `{}` \
+                     (outside the project root)",
+                    rec.file
+                ),
+            ));
+            continue;
+        }
         if !files.contains(&rec.file) {
             files.push(rec.file.clone());
         }
@@ -903,6 +929,50 @@ mod tests {
     }
 
     // ── revert edge cases ────────────────────────────────────────────────
+
+    /// SECURITY regression: a poisoned state.json wiring record naming a
+    /// `..`/absolute `file` must never make `--revert` read or rewrite a file
+    /// outside the project root — the record is skipped with a warning and
+    /// the out-of-tree target stays byte-identical. (Found by adversarial
+    /// review: revert previously joined `rec.file` unvalidated, an arbitrary
+    /// content-injection write.)
+    #[tokio::test]
+    async fn revert_refuses_unsafe_wiring_file_paths() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        // A precious sibling OUTSIDE the project root.
+        let precious = outer.path().join("precious.txt");
+        tokio::fs::write(&precious, "keep me intact\n").await.unwrap();
+
+        for bad in ["../precious.txt", "/etc/hosts", "a/../../precious.txt"] {
+            let wiring = vec![WiringRecord {
+                file: bad.to_string(),
+                kind: "requirements_line".to_string(),
+                action: WiringAction::Rewritten,
+                key: None,
+                original: Some(serde_json::json!(["malicious payload"])),
+                new: Some(serde_json::json!("keep me intact")),
+            }];
+            let outcome = revert_requirements(&entry_for(wiring), &root, false).await;
+            assert!(
+                outcome.success,
+                "unsafe record is skipped (fail-closed), not a hard error: {bad}"
+            );
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_revert_line_drifted"),
+                "skip must be surfaced for {bad}"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read_to_string(&precious).await.unwrap(),
+            "keep me intact\n",
+            "out-of-tree file must be byte-untouched"
+        );
+    }
 
     #[tokio::test]
     async fn revert_warns_on_drifted_line_and_leaves_it() {
