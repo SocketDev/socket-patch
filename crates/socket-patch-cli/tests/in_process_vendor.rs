@@ -862,6 +862,150 @@ async fn vendored_purl_excluded_from_rollback() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 10a″. remove after vendor — vendoring is reverted
+// ─────────────────────────────────────────────────────────────────────
+
+/// `remove` on a vendored purl reverts the vendoring (lock restored
+/// byte-for-byte, artifact + ledger entry gone) in addition to deleting
+/// the manifest entry — one command, patch fully gone. The reverted purl
+/// rides the envelope as `removed`/`vendor_reverted` WITHOUT bumping
+/// `summary.removed` (that count stays "manifest entries deleted").
+#[tokio::test]
+async fn remove_reverts_vendoring() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("remove --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "remove of a vendored purl exits 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    let reverted = find_event(&env, "removed", Some("vendor_reverted"));
+    assert_eq!(reverted["purl"], PURL);
+    assert_eq!(
+        env["summary"]["removed"], 1,
+        "summary.removed counts manifest entries only: {env:#}"
+    );
+
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "remove must restore the pre-vendor lock byte-for-byte"
+    );
+    assert!(!fx.vendor_dir().exists(), "vendor tree fully removed");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    assert!(
+        manifest["patches"].as_object().unwrap().is_empty(),
+        "manifest entry removed: {manifest:#}"
+    );
+}
+
+/// `--skip-rollback` promises "don't touch my tree": the vendor wiring and
+/// artifact stay in place (surfaced as `skipped`/`vendor_state_retained`),
+/// only the manifest entry goes. The next plain `vendor` run then
+/// reconcile-reverts the dropped entry.
+#[tokio::test]
+async fn remove_skip_rollback_retains_vendoring() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let wired_lock = fx.lock_bytes();
+
+    let (code, stdout, _stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--skip-rollback",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).expect("envelope");
+    assert_eq!(code, 0, "{env:#}");
+    let retained = find_event(&env, "skipped", Some("vendor_state_retained"));
+    assert_eq!(retained["purl"], PURL);
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_reverted"),
+        "--skip-rollback must not revert: {env:#}"
+    );
+
+    assert_eq!(fx.lock_bytes(), wired_lock, "wiring untouched");
+    assert!(fx.tgz_path().is_file(), "artifact untouched");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(state["entries"][PURL].is_object(), "ledger entry retained");
+
+    // The dropped-from-manifest entry is now reconcile-reverted by the
+    // next plain vendor run (completing the two-step lifecycle).
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "removed", Some("vendor_reconciled"));
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+}
+
+/// A detached vendored patch has no manifest entry; `remove <purl>` must
+/// still find it in the ledger, revert it, and exit 0 — not `not_found`.
+/// Here the revert IS the removal, so it bumps `summary.removed`.
+#[tokio::test]
+async fn remove_detached_only_purl_reverts() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    // Detach the entry and drop the manifest record (the state a
+    // `scan --vendor --detached` run leaves behind).
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    state["entries"][PURL]["detached"] = json!(true);
+    std::fs::write(fx.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("remove --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "detached purl must be removable: {env:#}");
+    assert_eq!(env["status"], "success");
+    let reverted = find_event(&env, "removed", Some("vendor_reverted"));
+    assert_eq!(reverted["purl"], PURL);
+    assert_eq!(env["summary"]["removed"], 1, "{env:#}");
+
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(!fx.vendor_dir().exists(), "vendor tree removed");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 10b. apply after vendor — golang yields with skipped/vendored
 // ─────────────────────────────────────────────────────────────────────
 
