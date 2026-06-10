@@ -473,16 +473,19 @@ async fn revert_works_without_manifest() {
 // 6. unsupported-ecosystem purls
 // ─────────────────────────────────────────────────────────────────────
 
-/// Contract behavior (CLI_CONTRACT.md "Vendor command contract"): PURLs of
-/// COMPILED-OUT ecosystems are invisible to `vendor` exactly as they are to
-/// `apply` — on this build (default features — no `nuget`), a `pkg:nuget/...`
-/// manifest entry is dropped by `partition_purls` before vendor's
-/// is_vendorable partition, producing no event. The
-/// `vendor_unsupported_ecosystem` skip fires only for ecosystems the build
-/// recognizes but cannot vendor (e.g. maven/nuget purls on feature-enabled
-/// builds). The npm patch still vendors and the run exits 0.
+/// Contract behavior (CLI_CONTRACT.md "Vendor command contract"): a PURL of an
+/// ecosystem `vendor` cannot vendor is a benign skip — it never fails the run,
+/// and the supported npm patch still vendors. How the `pkg:nuget/...` entry
+/// surfaces depends on whether this build compiled the `nuget` ecosystem in:
+///   * compiled out (default features): the purl is unknown, dropped by
+///     `partition_purls` before vendor's is_vendorable partition → no event.
+///   * compiled in (`--all-features`, as CI runs): the purl is recognized but
+///     not vendorable → a `skipped` event carrying `vendor_unsupported_ecosystem`.
+///
+/// Either way the nuget purl is never `applied`, the npm patch vendors, and the
+/// run exits 0.
 #[tokio::test]
-async fn unsupported_ecosystem_purl_is_currently_dropped_silently() {
+async fn unsupported_ecosystem_purl_is_a_benign_skip() {
     let fx = npm_fixture_with_purls(&[PURL, "pkg:nuget/Foo.Bar@1.0.0"]);
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 0, "benign skip must not fail the run: {env:#}");
@@ -490,13 +493,32 @@ async fn unsupported_ecosystem_purl_is_currently_dropped_silently() {
     let applied = find_event(&env, "applied", None);
     assert_eq!(applied["purl"], PURL);
     assert_eq!(env["summary"]["applied"], 1);
-    // The compiled-out purl vanishes without a trace (the gap being pinned).
+
+    let nuget_event = events(&env)
+        .iter()
+        .find(|e| e["purl"].as_str().is_some_and(|p| p.contains("nuget")))
+        .cloned();
+    // The nuget purl is never vendored, on any feature set.
     assert!(
-        !events(&env)
-            .iter()
-            .any(|e| { e["purl"].as_str().is_some_and(|p| p.contains("nuget")) }),
-        "current behavior: no event for the compiled-out nuget purl: {env:#}"
+        nuget_event
+            .as_ref()
+            .is_none_or(|e| e["action"] != "applied"),
+        "nuget purl must never be applied: {env:#}"
     );
+
+    if cfg!(feature = "nuget") {
+        // Recognized but not vendorable ⇒ an explicit, informative skip.
+        let ev = nuget_event.expect("nuget compiled in ⇒ explicit skip event");
+        assert_eq!(ev["action"], "skipped", "{env:#}");
+        assert_eq!(ev["errorCode"], "vendor_unsupported_ecosystem", "{env:#}");
+    } else {
+        // Compiled out ⇒ the unknown purl is dropped before vendor sees it.
+        assert!(
+            nuget_event.is_none(),
+            "nuget compiled out ⇒ no event: {env:#}"
+        );
+    }
+
     assert!(fx.tgz_path().is_file(), "the npm patch still vendors");
 }
 
