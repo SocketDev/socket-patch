@@ -557,9 +557,10 @@ async fn reconcile_drops_stale_entries() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     assert!(fx.tgz_path().is_file());
 
-    // The patch is dropped from the manifest (e.g. `remove` ran, which is
-    // vendoring-unaware by design). The next vendor run must revert the
-    // now-stale entry even though zero in-scope patches remain.
+    // The patch is dropped from the manifest (e.g. `remove --skip-rollback`
+    // ran, which deliberately leaves the vendoring in place, or the manifest
+    // was hand-edited). The next vendor run must revert the now-stale entry
+    // even though zero in-scope patches remain.
     std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
 
     let (code, env) = vendor_cli(fx.root(), &[]);

@@ -6,8 +6,15 @@
 //! vendored copy. After committing `.socket/vendor/` + the lockfile edits, a
 //! fresh checkout builds with the patched dependency on machines with no
 //! socket-patch and no Socket API access. `--revert` restores the recorded
-//! original lockfile fragments and removes the artifacts. `rollback`/`remove`
-//! stay vendoring-unaware by design — this command owns the whole lifecycle.
+//! original lockfile fragments and removes the artifacts.
+//!
+//! The rest of the CLI is vendor-aware: `apply`/`rollback` yield ownership of
+//! ledger-recorded purls, `remove` reverts vendoring as part of removing a
+//! patch, `scan --prune` exempts vendored entries, and `scan --vendor`
+//! drives this module's [`vendor_records`] engine directly (optionally
+//! `--detached`, writing ledger entries with embedded patch records instead
+//! of manifest entries). See CLI_CONTRACT.md "Ownership, state, and
+//! reversal".
 
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;

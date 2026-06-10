@@ -29,9 +29,13 @@
 //!
 //! `.socket/vendor/state.json` (committed) records the verbatim original
 //! lockfile fragments every wire replaced; `vendor --revert` restores them
-//! and removes the artifacts. `rollback`/`remove` stay vendoring-unaware by
-//! design. The path-level UUID makes "is this Socket-vendored, by which
-//! patch" recoverable from the lockfile string alone ([`path`]).
+//! and removes the artifacts. The rest of the CLI yields ownership of
+//! ledger-recorded purls (`apply`/`rollback` skip them, `scan --prune`
+//! exempts them) and `remove` reverts vendoring as part of removing a
+//! patch. Detached entries (`scan --vendor --detached`) carry an embedded
+//! patch record instead of a manifest entry. The path-level UUID makes "is
+//! this Socket-vendored, by which patch" recoverable from the lockfile
+//! string alone ([`path`]).
 //!
 //! [`ReplaceOwner::Vendor`]: crate::patch::go_mod_edit::ReplaceOwner
 
