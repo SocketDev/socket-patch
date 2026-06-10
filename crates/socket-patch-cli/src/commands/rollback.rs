@@ -562,8 +562,7 @@ async fn rollback_patches_inner(
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
         .into_iter()
         .partition(|p| is_vendored(&p.purl));
-    let mut vendored_skipped: Vec<String> =
-        vendored_targets.into_iter().map(|p| p.purl).collect();
+    let mut vendored_skipped: Vec<String> = vendored_targets.into_iter().map(|p| p.purl).collect();
     vendored_skipped.sort();
     if patches_to_rollback.is_empty() {
         // Everything targeted is vendor-owned: a benign skip, not an error

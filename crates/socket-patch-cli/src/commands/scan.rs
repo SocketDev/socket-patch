@@ -436,10 +436,7 @@ async fn embed_vex_human(
 /// discovery. Action values are part of the CLI contract:
 /// `would_vendor` (no ledger entry), `already_vendored` (entry at this
 /// uuid), `would_revendor` + `oldUuid` (entry at an older uuid).
-async fn preview_vendor_json(
-    cwd: &Path,
-    selected: &[PatchSearchResult],
-) -> serde_json::Value {
+async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serde_json::Value {
     let state = socket_patch_core::patch::vendor::load_state(cwd)
         .await
         .unwrap_or_default();
@@ -1110,7 +1107,8 @@ pub async fn run(args: ScanArgs) -> i32 {
             // --- GC (if requested) --------------------------------------
             if prune {
                 let gc = if dry {
-                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
+                        .await
                 } else {
                     run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
                 };
@@ -1164,9 +1162,13 @@ pub async fn run(args: ScanArgs) -> i32 {
                 // and preview the GC, exactly like `--apply`'s dry run.
                 result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
                 if prune {
-                    let gc =
-                        preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
-                            .await;
+                    let gc = preview_apply_gc(
+                        &manifest_path,
+                        &socket_dir,
+                        &scanned_purls,
+                        &vendored_purls,
+                    )
+                    .await;
                     result["gc"] = gc.to_preview_json();
                 }
                 let final_code =
@@ -1196,8 +1198,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             };
             let mut has_errors = false;
             let detached_records: Option<HashMap<String, PatchRecord>> = if args.detached {
-                let (code, mut dl_json, records) =
-                    download_patch_records(&selected, &params).await;
+                let (code, mut dl_json, records) = download_patch_records(&selected, &params).await;
                 has_errors |= code != 0;
                 if let Some(obj) = dl_json.as_object_mut() {
                     obj.remove("status");
@@ -1229,9 +1230,8 @@ pub async fn run(args: ScanArgs) -> i32 {
             //    package_not_installed; vendored entries are exempt from
             //    the prune itself.
             if prune {
-                let gc =
-                    run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
-                        .await;
+                let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
+                    .await;
                 result["gc"] = gc.to_apply_json();
             }
 
@@ -1520,7 +1520,10 @@ pub async fn run(args: ScanArgs) -> i32 {
         selected.into_iter().partition(|p| is_vendored(&p.purl))
     };
     for p in &vendored_selected {
-        println!("  [skip] {} (vendored — run scan --vendor to update)", p.purl);
+        println!(
+            "  [skip] {} (vendored — run scan --vendor to update)",
+            p.purl
+        );
     }
 
     if selected.is_empty() && !args.vendor {
@@ -1660,8 +1663,13 @@ pub async fn run(args: ScanArgs) -> i32 {
                 });
             }
         }
-        match run_scan_vendor_step(&args.common, &manifest_path, &socket_dir, detached_records.as_ref())
-            .await
+        match run_scan_vendor_step(
+            &args.common,
+            &manifest_path,
+            &socket_dir,
+            detached_records.as_ref(),
+        )
+        .await
         {
             Ok((vendor_errors, venv)) => {
                 has_errors |= vendor_errors;

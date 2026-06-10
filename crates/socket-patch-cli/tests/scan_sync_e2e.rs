@@ -650,14 +650,21 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
     let apply = v["apply"].as_object().expect("apply sub-object");
     assert_eq!(apply["found"], 1, "apply={apply:?}");
     assert_eq!(apply["skipped"], 1, "apply={apply:?}");
-    assert_eq!(apply["downloaded"], 0, "vendored purl must not download; apply={apply:?}");
+    assert_eq!(
+        apply["downloaded"], 0,
+        "vendored purl must not download; apply={apply:?}"
+    );
     assert_eq!(apply["applied"], 0, "apply={apply:?}");
     assert_eq!(apply["failed"], 0, "apply={apply:?}");
     let patches = apply["patches"].as_array().expect("patches array");
     assert_eq!(patches.len(), 1, "apply={apply:?}");
     assert_eq!(patches[0]["purl"], purl);
     assert_eq!(patches[0]["action"], "skipped", "record={:?}", patches[0]);
-    assert_eq!(patches[0]["errorCode"], "vendored", "record={:?}", patches[0]);
+    assert_eq!(
+        patches[0]["errorCode"], "vendored",
+        "record={:?}",
+        patches[0]
+    );
 
     // The newer uuid still surfaces as an available update.
     let updates = v["updates"].as_array().expect("updates array");
@@ -667,17 +674,15 @@ async fn scan_apply_skips_vendored_purl_without_downloading() {
     assert_eq!(updates[0]["newUuid"], NEW_UUID);
 
     // The manifest must STILL record the vendored uuid.
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(socket.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(
         manifest["patches"][purl]["uuid"], UUID,
         "manifest must not move past the vendored uuid; manifest={manifest}"
     );
     // And the installed tree is untouched (no in-place apply happened).
-    let on_disk =
-        std::fs::read(tmp.path().join("node_modules/sync-target/index.js")).unwrap();
+    let on_disk = std::fs::read(tmp.path().join("node_modules/sync-target/index.js")).unwrap();
     assert_eq!(on_disk, before, "installed tree must stay untouched");
 
     // Load-bearing: the full patch view was NEVER fetched.

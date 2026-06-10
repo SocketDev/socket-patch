@@ -192,7 +192,10 @@ async fn scan_vendor_manifest_mode_end_to_end() {
         &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest["patches"][PURL]["uuid"], UUID, "manifest={manifest}");
+    assert_eq!(
+        manifest["patches"][PURL]["uuid"], UUID,
+        "manifest={manifest}"
+    );
 
     // Vendor phase: a full vendor Envelope with one applied event.
     let venv = v["vendor"].as_object().expect("vendor sub-object");
@@ -267,10 +270,9 @@ async fn scan_vendor_detached_mode_writes_no_manifest() {
     // Embedded VEX works manifest-less: the detached entry's embedded
     // record is the attestation source.
     assert_eq!(v["vex"]["statements"], 1, "envelope={v}");
-    let doc: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join("out.vex.json")).unwrap(),
-    )
-    .unwrap();
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("out.vex.json")).unwrap())
+            .unwrap();
     let stmts = doc["statements"].as_array().expect("statements");
     assert_eq!(stmts.len(), 1, "doc={doc}");
     assert!(
@@ -400,7 +402,10 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
             .expect("run");
         let code = out.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(code, 2, "argv={argv:?} must be a clap usage error: {stderr}");
+        assert_eq!(
+            code, 2,
+            "argv={argv:?} must be a clap usage error: {stderr}"
+        );
         assert!(
             stderr.contains("cannot be used with") || stderr.contains("required"),
             "argv={argv:?}: {stderr}"

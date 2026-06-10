@@ -483,7 +483,12 @@ mod tests {
             .unwrap();
         assert!(text.contains("\"detached\": true"), "wire form: {text}");
         // The embedded record keeps the manifest's camelCase wire shape.
-        for key in ["\"record\"", "\"beforeHash\"", "\"afterHash\"", "\"exportedAt\""] {
+        for key in [
+            "\"record\"",
+            "\"beforeHash\"",
+            "\"afterHash\"",
+            "\"exportedAt\"",
+        ] {
             assert!(text.contains(key), "{key} missing from wire form: {text}");
         }
 

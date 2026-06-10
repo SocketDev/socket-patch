@@ -603,8 +603,7 @@ fn tampered_detached_artifact_omitted() {
         "tampered-only ⇒ no_applicable_patches (exit 1). stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    let env: Value =
-        serde_json::from_slice(&out.stdout).expect("vex --json emits an envelope");
+    let env: Value = serde_json::from_slice(&out.stdout).expect("vex --json emits an envelope");
     assert_eq!(env["status"], "error", "{env}");
     assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
     // Same surfacing shape as the manifest-tracked tamper test: a skipped

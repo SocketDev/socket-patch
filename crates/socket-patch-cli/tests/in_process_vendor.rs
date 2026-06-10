@@ -597,11 +597,7 @@ async fn reconcile_leaves_detached_entries_alone() {
     let mut state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap())
         .expect("state.json is JSON");
     state["entries"][PURL]["detached"] = json!(true);
-    std::fs::write(
-        fx.state_path(),
-        serde_json::to_vec_pretty(&state).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(fx.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
 
     let (code, env) = vendor_cli(fx.root(), &[]);
@@ -614,8 +610,7 @@ async fn reconcile_leaves_detached_entries_alone() {
     );
     assert!(fx.tgz_path().is_file(), "artifact must survive");
     assert_eq!(fx.lock_bytes(), wired_lock, "wiring must survive");
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert!(
         state["entries"][PURL].is_object(),
         "ledger entry must survive: {state:#}"
@@ -671,8 +666,7 @@ async fn revendor_new_uuid_cleans_stale_artifact_and_still_reverts() {
         .root()
         .join(format!(".socket/vendor/npm/{UUID2}/left-pad-1.3.0.tgz"));
     assert!(new_tgz.is_file(), "artifact re-vendored under the new uuid");
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert_eq!(state["entries"][PURL]["uuid"], UUID2);
     let lock_text = String::from_utf8(fx.lock_bytes()).unwrap();
     assert!(
@@ -952,8 +946,7 @@ async fn remove_skip_rollback_retains_vendoring() {
 
     assert_eq!(fx.lock_bytes(), wired_lock, "wiring untouched");
     assert!(fx.tgz_path().is_file(), "artifact untouched");
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert!(state["entries"][PURL].is_object(), "ledger entry retained");
 
     // The dropped-from-manifest entry is now reconcile-reverted by the

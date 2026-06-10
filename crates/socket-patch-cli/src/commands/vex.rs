@@ -193,9 +193,11 @@ pub async fn run(args: VexArgs) -> i32 {
         }
     };
     let had_manifest_file = manifest_file.is_some();
-    let manifest =
-        augment_with_detached(&args.common, manifest_file.unwrap_or_else(PatchManifest::new))
-            .await;
+    let manifest = augment_with_detached(
+        &args.common,
+        manifest_file.unwrap_or_else(PatchManifest::new),
+    )
+    .await;
 
     if manifest.patches.is_empty() {
         if !had_manifest_file {

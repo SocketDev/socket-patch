@@ -1108,8 +1108,7 @@ pub async fn download_and_apply_patches(
     if let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(&params.cwd).await {
         if !vendor_state.entries.is_empty() {
             for rec in &downloaded_patches {
-                let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str())
-                else {
+                let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str()) else {
                     continue;
                 };
                 if !matches!(rec["action"].as_str(), Some("added" | "updated")) {

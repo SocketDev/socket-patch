@@ -389,8 +389,7 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
     };
     let sources = staged.as_patch_sources();
 
-    has_errors |=
-        vendor_records(common, &manifest.patches, &sources, false, args.force, env).await;
+    has_errors |= vendor_records(common, &manifest.patches, &sources, false, args.force, env).await;
 
     if has_errors {
         env.mark_partial_failure();
@@ -656,13 +655,12 @@ pub(crate) async fn vendor_records(
                             // `(eco, uuid)` ownership test as `--revert`'s
                             // orphan sweep). Only the live entry would
                             // otherwise reclaim it, and that never happens.
-                            let still_referenced = state.entries.values().any(|e| {
-                                e.ecosystem == prev.ecosystem && e.uuid == prev.uuid
-                            });
-                            let stale_rel = vendor::path::vendor_uuid_dir_rel(
-                                &prev.ecosystem,
-                                &prev.uuid,
-                            );
+                            let still_referenced = state
+                                .entries
+                                .values()
+                                .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
+                            let stale_rel =
+                                vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
                             if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
                                 if !common.dry_run {
                                     let _ = remove_tree(&common.cwd.join(rel)).await;
