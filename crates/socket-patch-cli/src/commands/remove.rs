@@ -189,7 +189,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         )
         .await
         {
-            Ok((success, results)) => {
+            Ok((success, results, _vendored_skipped)) => {
                 if !success {
                     track_patch_remove_failed(
                         "Rollback failed during patch removal",

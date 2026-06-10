@@ -809,6 +809,59 @@ async fn vendored_npm_purl_skipped_even_without_installed_tree() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 10a′. rollback after vendor — vendored purls are excluded
+// ─────────────────────────────────────────────────────────────────────
+
+/// `rollback` excludes vendor-owned purls from in-place restoration: the
+/// patch lives in the committed artifact + lock wiring, so before-blob
+/// restoration has nothing to restore (and would only hash-mismatch).
+/// The skip is benign (exit 0) and surfaced in the JSON `vendored` array;
+/// an identifier that targets ONLY a vendored purl is still exit 0, not
+/// `not_found`.
+#[tokio::test]
+async fn vendored_purl_excluded_from_rollback() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let lock_after_vendor = fx.lock_bytes();
+
+    for extra in [&[][..], &[PURL][..]] {
+        let mut argv = vec![
+            "rollback",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_cli(fx.root(), &argv, &[]);
+        let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("rollback --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        });
+        assert_eq!(code, 0, "vendored-only rollback exits 0: {out:#}");
+        assert_eq!(out["status"], "success", "{out:#}");
+        assert_eq!(
+            out["vendored"],
+            json!([PURL]),
+            "vendored skip must be surfaced: {out:#}"
+        );
+        assert_eq!(out["rolledBack"], 0, "{out:#}");
+        assert_eq!(out["failed"], 0, "{out:#}");
+    }
+
+    assert_eq!(
+        std::fs::read(fx.installed_index()).unwrap(),
+        ORIG_INDEX,
+        "rollback must not touch the installed tree of a vendored purl"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        lock_after_vendor,
+        "rollback must not disturb the vendored lock wiring"
+    );
+    assert!(fx.tgz_path().is_file(), "artifact untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 10b. apply after vendor — golang yields with skipped/vendored
 // ─────────────────────────────────────────────────────────────────────
 
