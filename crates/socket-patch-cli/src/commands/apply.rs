@@ -37,7 +37,13 @@ pub struct ApplyArgs {
     pub common: GlobalArgs,
 
     /// Skip pre-application hash verification (apply even if package version differs).
-    #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
+    #[arg(
+        short = 'f',
+        long,
+        env = "SOCKET_FORCE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     pub force: bool,
 
     /// Read-only: verify that the committed Go `replace`-redirects match the

@@ -345,16 +345,20 @@ lockfile; never a trust input.
 | gem | gem dir `<name>-<version>/` + gemspec materialized from `specifications/` | **Gemfile + Gemfile.lock pair**: the `gem` line gains `path:` (or a managed block for transitive deps); the lock's spec block moves GEM→PATH and the DEPENDENCIES entry becomes `<name> (= <ver>)!`, in bundler's exact canonical form | `bundle install` (normal **and** `BUNDLE_FROZEN=true`), byte-stable lock. Lock-only edits are a silent unpatch — hence the mandatory pair |
 | pypi | rebuilt wheel (canonical PEP 427 filename; RECORD regenerated correctly) | **uv projects** (uv.lock present): `[tool.uv.sources] <name> = {path}` in pyproject + surgical uv.lock rewrite; transitive deps via `[tool.uv] override-dependencies`. **requirements.txt** (pip / `uv pip`): pin line → `./<wheel> --hash=sha256:<hex>` (markers carried over; transitive deps appended) | `uv sync --locked` / `--frozen --offline` (hash-verified, byte-stable lock); `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
 
-Unsupported in this build (maven/nuget/jsr, compiled-out ecosystems, poetry/pdm/pipenv pyproject
-flavors, yarn/pnpm/bun npm layouts) refuse per-purl with stable reason codes pointing at the native
-alternative (`yarn|pnpm|bun patch`, the `.pth` setup hook, …).
+Ecosystems with no vendor backend that this build still *recognizes* (maven/nuget/jsr when their
+features are compiled in), plus poetry/pdm/pipenv pyproject flavors and yarn/pnpm/bun npm layouts,
+refuse per-purl with stable reason codes pointing at the native alternative (`yarn|pnpm|bun patch`,
+the `.pth` setup hook, …). PURLs of **compiled-out** ecosystems are invisible to `vendor` exactly
+as they are to `apply` (the binary cannot parse them).
 
 ### Ownership, state, and reversal
 
 * `.socket/vendor/state.json` (committed) is the revert ledger: every wiring edit records the
   **verbatim original** lockfile fragment it replaced (registry URLs, integrity strings, Cargo.lock
   `source`/`checksum`, requirement lines, uv specifiers). Those are not recoverable offline, so
-  `--revert` without the ledger fails with `vendor_state_missing` rather than guessing.
+  `--revert` never guesses at unrecorded fragments: a missing ledger is an empty ledger (clean
+  no-op plus the orphan-dir sweep), and entries whose recorded fragments no longer match are left
+  alone with warnings.
 * `vendor --revert` restores the originals (fragments that no longer match — a user re-resolved —
   are left alone with a `vendor_lock_entry_drifted` warning), removes the artifacts, prunes the
   ledger, and sweeps orphan uuid dirs. It works without a manifest.

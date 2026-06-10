@@ -44,7 +44,13 @@ pub struct VendorArgs {
 
     /// Skip pre-vendor hash verification (vendor even if the installed
     /// package's files differ from the patch's beforeHash).
-    #[arg(short = 'f', long, env = "SOCKET_FORCE", default_value_t = false)]
+    #[arg(
+        short = 'f',
+        long,
+        env = "SOCKET_FORCE",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     pub force: bool,
 
     /// Undo vendoring: restore the recorded original lockfile fragments and
