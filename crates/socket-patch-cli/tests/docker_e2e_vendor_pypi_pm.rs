@@ -118,11 +118,11 @@ echo "===ARTIFACT VERIFIED==="
 
 // ── poetry ────────────────────────────────────────────────────────────────
 
-/// Poetry stage 1: `poetry add six==1.16.0` (in-project venv) + marker patch
-/// + offline vendor + the lock-only `[[package]]` splice asserts + fresh
-/// staging. Poetry's wiring (spike P1/P2): files[] reduced to the single
-/// patched-wheel `{file, hash}`, a `[package.source] type="file"` table
-/// appended; pyproject.toml + content-hash untouched.
+/// Poetry stage 1 (in-project venv): `poetry add six==1.16.0`, marker patch,
+/// offline vendor, the lock-only splice asserts, then fresh staging. Poetry's
+/// wiring (spike P1/P2) reduces the `files` array to the single patched-wheel
+/// `{file, hash}` element and appends a `package.source` table
+/// (`type = "file"`); pyproject and content-hash stay untouched.
 const POETRY_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
 export SOCKET_OFFLINE=1
@@ -248,11 +248,11 @@ exit 0
 
 // ── pdm ───────────────────────────────────────────────────────────────────
 
-/// PDM stage 1: `pdm init -n` + `pdm add six==1.16.0` (in-project venv) +
-/// marker patch + offline vendor + the lock-only `[[package]]` splice asserts
-/// + fresh staging. PDM's wiring (spike D1): a relative `path = "./…"` key
-/// inserted after `requires_python`, files[] reduced to the single
-/// patched-wheel hash; pyproject.toml + content_hash untouched.
+/// PDM stage 1 (in-project venv): `pdm init -n`, `pdm add six==1.16.0`,
+/// marker patch, offline vendor, the lock-only splice asserts, then fresh
+/// staging. PDM's wiring (spike D1) inserts a relative `path = "./…"` key
+/// after `requires_python` and reduces the `files` array to the single
+/// patched-wheel hash; pyproject and content_hash stay untouched.
 const PDM_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
 export SOCKET_OFFLINE=1
@@ -370,11 +370,11 @@ exit 0
 
 // ── pipenv ──────────────────────────────────────────────────────────────────
 
-/// pipenv stage 1: `pipenv install six==1.16.0` (in-project venv) + marker
-/// patch + offline vendor + the lock-only entry rewrite asserts + fresh
-/// staging. pipenv's wiring (spike V1/V2): `default.six` becomes
-/// `{file: "./<wheel>", hashes: [sha256:<patched>], markers}` (index +
-/// version dropped); Pipfile untouched. Also asserts the
+/// pipenv stage 1 (in-project venv): `pipenv install six==1.16.0`, marker
+/// patch, offline vendor, the lock-only entry-rewrite asserts, then fresh
+/// staging. pipenv's wiring (spike V1/V2) rewrites `default.six` to
+/// `{file: "./<wheel>", hashes: [sha256:<patched>], markers}` (dropping
+/// index and version); Pipfile stays untouched. The suite also asserts the
 /// `vendor_integrity_unverified` warning surfaces in the vendor envelope.
 const PIPENV_STAGE1: &str = r#"
 mkdir -p /workspace/proj && cd /workspace/proj
@@ -509,7 +509,10 @@ exit 0
 
 /// Splice the shared vendor body into a flavor stage-1 template, then render.
 fn render_stage1(template: &str, uuid: &str) -> String {
-    render(&template.replace("__VENDOR_COMMON__", STAGE1_VENDOR_COMMON), uuid)
+    render(
+        &template.replace("__VENDOR_COMMON__", STAGE1_VENDOR_COMMON),
+        uuid,
+    )
 }
 
 fn host_dir() -> (tempfile::TempDir, std::path::PathBuf) {
