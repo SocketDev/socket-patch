@@ -1,0 +1,10 @@
+[tool.poetry]
+name = "scratch"
+version = "0.1.0"
+description = ""
+authors = ["Spike <spike@example.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.9"
+six = {path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"}

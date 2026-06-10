@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::utils::fs::atomic_write_bytes;
@@ -30,6 +31,9 @@ pub struct PackedTarball {
     pub integrity: String,
     /// Plain sha256 hex of the tgz bytes (the vendor ledger's artifact hash).
     pub sha256_hex: String,
+    /// Plain sha1 hex of the tgz bytes (the checksum field yarn-classic and
+    /// other legacy lockfile flavors record for tarballs).
+    pub sha1_hex: String,
     /// Byte size of the tgz.
     pub size: u64,
 }
@@ -58,6 +62,7 @@ pub async fn pack_deterministic(staged_dir: &Path, dest: &Path) -> std::io::Resu
     Ok(PackedTarball {
         integrity,
         sha256_hex: hex::encode(Sha256::digest(&bytes)),
+        sha1_hex: hex::encode(Sha1::digest(&bytes)),
         size: bytes.len() as u64,
     })
 }
@@ -221,11 +226,19 @@ mod tests {
         let bytes2 = tokio::fs::read(&dest2).await.unwrap();
         assert_eq!(bytes1, bytes2, "two packs of the same tree must be byte-identical");
         assert_eq!(packed1.sha256_hex, packed2.sha256_hex);
+        assert_eq!(packed1.sha1_hex, packed2.sha1_hex, "sha1 stable across packs");
         assert_eq!(packed1.integrity, packed2.integrity);
 
         // The reported facts describe the final on-disk bytes.
         assert_eq!(packed1.size, bytes1.len() as u64);
         assert_eq!(packed1.sha256_hex, hex::encode(Sha256::digest(&bytes1)));
+        assert_eq!(packed1.sha1_hex, hex::encode(Sha1::digest(&bytes1)));
+        assert_eq!(packed1.sha1_hex.len(), 40, "sha1 hex is 40 chars");
+        assert!(
+            packed1.sha1_hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "sha1 hex must be hex digits only: {}",
+            packed1.sha1_hex
+        );
         let expected_integrity = format!(
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes1))

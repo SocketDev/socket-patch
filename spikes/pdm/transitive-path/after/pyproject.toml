@@ -1,0 +1,18 @@
+[project]
+name = "transitive-path"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    {name = "Mikola Lysenko",email = "mikolalysenko@gmail.com"},
+]
+dependencies = ["python-dateutil==2.9.0.post0"]
+requires-python = "==3.14.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+
+[tool.pdm]
+distribution = false
+
+[tool.pdm.resolution.overrides]
+six = "file:///${PROJECT_ROOT}/.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"

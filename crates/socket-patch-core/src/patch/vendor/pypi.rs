@@ -28,6 +28,12 @@ use super::{RevertOutcome, VendorOutcome, VendorWarning};
 pub enum PypiFlavor {
     /// `uv.lock`-managed project → paired pyproject + lock surgery.
     UvProject,
+    /// `poetry.lock`-managed project → lock-only `[[package]]` splice.
+    Poetry,
+    /// `pdm.lock`-managed project → lock-only `[[package]]` splice.
+    Pdm,
+    /// `Pipfile.lock`-managed project → lock-only JSON entry rewrite.
+    Pipenv,
     /// Plain `requirements.txt` (pip / `uv pip`) → line rewriting.
     Requirements,
 }
@@ -36,6 +42,9 @@ impl PypiFlavor {
     fn as_str(self) -> &'static str {
         match self {
             PypiFlavor::UvProject => "uv",
+            PypiFlavor::Poetry => "poetry",
+            PypiFlavor::Pdm => "pdm",
+            PypiFlavor::Pipenv => "pipenv",
             PypiFlavor::Requirements => "requirements",
         }
     }
@@ -45,24 +54,69 @@ const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";
 
-/// Route the project to a wiring flavor, first match wins:
-/// 1. `uv.lock` at the root → uv;
-/// 2. `[tool.uv]` without a lock (and no requirements.txt fallback) →
-///    refuse, asking for `uv lock`;
-/// 3. Pipenv / Poetry / PDM markers → refuse (no spike-verified wiring);
-/// 4. `requirements.txt` → requirements;
-/// 5. a lone pyproject → refuse (no lock, nothing to wire);
-/// 6. nothing → refuse.
+/// Route the project to a wiring flavor, first match wins. Lockfiles are the
+/// authoritative "this tool manages installs" signal, so locks are compared
+/// with locks (precedence follows migration direction / ecosystem currency:
+/// uv > poetry > pdm > pipenv), and a lock-less tool MARKER refuses with a
+/// "run `<tool> lock`" pointer — falling through to `requirements.txt` when
+/// one exists (a marker alone must not block the requirements wiring):
+/// 1. `uv.lock` → uv;  2. `poetry.lock` → poetry;  3. `pdm.lock` → pdm;
+/// 4. `Pipfile.lock` → pipenv;
+/// 5. lock-less `[tool.uv]`/`[tool.poetry]`/`[tool.pdm]`/`Pipfile` →
+///    `<tool>_no_lockfile` refusal unless requirements.txt exists;
+/// 6. `requirements.txt` → requirements;
+/// 7. a lone pyproject → refuse;  8. nothing → refuse.
+///
+/// When more than one tool lockfile coexists, the winner is wired and a LOUD
+/// `pypi_multiple_lockfiles` warning names the ignored locks — they go
+/// stale-but-valid, which is otherwise invisible.
 pub async fn detect_pypi_flavor(
     project_root: &Path,
-) -> Result<PypiFlavor, (&'static str, String)> {
+) -> Result<(PypiFlavor, Vec<VendorWarning>), (&'static str, String)> {
     let exists = |name: &str| {
         let p = project_root.join(name);
         async move { tokio::fs::metadata(&p).await.is_ok() }
     };
-    if exists("uv.lock").await {
-        return Ok(PypiFlavor::UvProject);
+    let has_uv_lock = exists("uv.lock").await;
+    let has_poetry_lock = exists("poetry.lock").await;
+    let has_pdm_lock = exists("pdm.lock").await;
+    let has_pipfile_lock = exists("Pipfile.lock").await;
+    let has_pipfile = exists("Pipfile").await;
+
+    // Coexisting tool locks: wire the precedence winner, warn about the rest.
+    let locks: Vec<(&str, bool)> = vec![
+        ("uv.lock", has_uv_lock),
+        ("poetry.lock", has_poetry_lock),
+        ("pdm.lock", has_pdm_lock),
+        ("Pipfile.lock", has_pipfile_lock),
+    ];
+    let present: Vec<&str> = locks.iter().filter(|(_, p)| *p).map(|(n, _)| *n).collect();
+    let mut warnings = Vec::new();
+    if present.len() > 1 {
+        let winner = present[0];
+        let losers = present[1..].join(", ");
+        warnings.push(VendorWarning::new(
+            "pypi_multiple_lockfiles",
+            format!(
+                "multiple python lockfiles found; wiring `{winner}` — installs driven by \
+                 {losers} will still install the UNPATCHED registry bytes"
+            ),
+        ));
     }
+
+    if has_uv_lock {
+        return Ok((PypiFlavor::UvProject, warnings));
+    }
+    if has_poetry_lock {
+        return Ok((PypiFlavor::Poetry, warnings));
+    }
+    if has_pdm_lock {
+        return Ok((PypiFlavor::Pdm, warnings));
+    }
+    if has_pipfile_lock {
+        return Ok((PypiFlavor::Pipenv, warnings));
+    }
+
     let pyproject_text = tokio::fs::read_to_string(project_root.join("pyproject.toml"))
         .await
         .ok();
@@ -73,35 +127,49 @@ pub async fn detect_pypi_flavor(
             .map(|t| has_table(t, prefix))
             .unwrap_or(false)
     };
-    if has_pyproject_table("tool.uv") && !has_requirements {
-        return Err((
-            "pypi_uv_no_lockfile",
-            format!(
-                "pyproject.toml declares [tool.uv] but there is no uv.lock; run `uv lock` and \
-                 re-run vendor, or {SETUP_ALTERNATIVE}"
-            ),
-        ));
-    }
-    if exists("Pipfile").await || exists("Pipfile.lock").await {
-        return Err((
-            "pypi_pipenv_unsupported",
-            format!("Pipenv projects are not supported by vendor; {SETUP_ALTERNATIVE}"),
-        ));
-    }
-    if exists("poetry.lock").await || has_pyproject_table("tool.poetry") {
-        return Err((
-            "pypi_poetry_unsupported",
-            format!("Poetry projects are not supported by vendor; {SETUP_ALTERNATIVE}"),
-        ));
-    }
-    if exists("pdm.lock").await || has_pyproject_table("tool.pdm") {
-        return Err((
-            "pypi_pdm_unsupported",
-            format!("PDM projects are not supported by vendor; {SETUP_ALTERNATIVE}"),
-        ));
+    // Lock-less tool markers: a `requirements.txt` fallback wins (the marker
+    // alone must not block wiring the file pip/uv-pip actually install from);
+    // without one, refuse with the tool-specific "generate your lock" pointer.
+    if !has_requirements {
+        if has_pyproject_table("tool.uv") {
+            return Err((
+                "pypi_uv_no_lockfile",
+                format!(
+                    "pyproject.toml declares [tool.uv] but there is no uv.lock; run `uv lock` and \
+                     re-run vendor, or {SETUP_ALTERNATIVE}"
+                ),
+            ));
+        }
+        if has_pyproject_table("tool.poetry") {
+            return Err((
+                "pypi_poetry_no_lockfile",
+                format!(
+                    "pyproject.toml declares [tool.poetry] but there is no poetry.lock; run \
+                     `poetry lock` and re-run vendor, or {SETUP_ALTERNATIVE}"
+                ),
+            ));
+        }
+        if has_pyproject_table("tool.pdm") {
+            return Err((
+                "pypi_pdm_no_lockfile",
+                format!(
+                    "pyproject.toml declares [tool.pdm] but there is no pdm.lock; run `pdm lock` \
+                     and re-run vendor, or {SETUP_ALTERNATIVE}"
+                ),
+            ));
+        }
+        if has_pipfile {
+            return Err((
+                "pypi_pipenv_no_lockfile",
+                format!(
+                    "a Pipfile exists but there is no Pipfile.lock; run `pipenv lock` and re-run \
+                     vendor, or {SETUP_ALTERNATIVE}"
+                ),
+            ));
+        }
     }
     if has_requirements {
-        return Ok(PypiFlavor::Requirements);
+        return Ok((PypiFlavor::Requirements, warnings));
     }
     if pyproject_text.is_some() {
         return Err((
@@ -185,14 +253,14 @@ pub async fn vendor_pypi(
         };
     };
 
-    let flavor = match detect_pypi_flavor(project_root).await {
+    let (flavor, flavor_warnings) = match detect_pypi_flavor(project_root).await {
         Ok(f) => f,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },
     };
 
     // Pre-flight the wiring guards BEFORE building anything, so refusals
     // leave the tree byte-untouched.
-    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut warnings: Vec<VendorWarning> = flavor_warnings;
     let plan = match flavor {
         PypiFlavor::UvProject => {
             let project = match load_uv_project(project_root).await {
@@ -213,6 +281,32 @@ pub async fn vendor_pypi(
                 return VendorOutcome::Refused { code, detail };
             }
             WiringPlan::Requirements
+        }
+        // Detected but not yet wired: the backends land behind these arms
+        // (spike-verified GO — see spikes/PHASE0-V2-FINDINGS.txt).
+        PypiFlavor::Poetry => {
+            return VendorOutcome::Refused {
+                code: "pypi_poetry_unsupported",
+                detail: format!(
+                    "Poetry projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
+                ),
+            }
+        }
+        PypiFlavor::Pdm => {
+            return VendorOutcome::Refused {
+                code: "pypi_pdm_unsupported",
+                detail: format!(
+                    "PDM projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
+                ),
+            }
+        }
+        PypiFlavor::Pipenv => {
+            return VendorOutcome::Refused {
+                code: "pypi_pipenv_unsupported",
+                detail: format!(
+                    "Pipenv projects are not supported by this build yet; {SETUP_ALTERNATIVE}"
+                ),
+            }
         }
     };
 
@@ -268,6 +362,11 @@ pub async fn vendor_pypi(
         let per_flavor = match flavor {
             PypiFlavor::UvProject => {
                 "uv.lock now resolves it from this single-platform wheel only"
+            }
+            PypiFlavor::Poetry => "poetry.lock now resolves it from this single-platform wheel only",
+            PypiFlavor::Pdm => "pdm.lock now resolves it from this single-platform wheel only",
+            PypiFlavor::Pipenv => {
+                "Pipfile.lock now resolves it from this single-platform wheel only"
             }
             PypiFlavor::Requirements => {
                 "the requirements.txt path line installs on this platform only"
@@ -363,6 +462,10 @@ pub async fn vendor_pypi(
         took_over_go_patches: false,
         flavor: Some(flavor.as_str().to_string()),
         uv: uv_meta,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
     VendorOutcome::Done {
         result,
@@ -441,15 +544,45 @@ mod tests {
         tokio::fs::write(root.join(name), content).await.unwrap();
     }
 
+    /// One assert per row of the v2 routing table (locks > lock-less markers
+    /// with requirements fallthrough > requirements > pyproject > nothing).
     #[tokio::test]
-    async fn flavor_routing_table_all_six_rules() {
-        // 1. uv.lock wins outright.
+    async fn flavor_routing_table_v2_precedence() {
+        let flavor = |tmp: &Path| {
+            let tmp = tmp.to_path_buf();
+            async move { detect_pypi_flavor(&tmp).await.map(|(f, _)| f) }
+        };
+
+        // 1. uv.lock wins outright (even over requirements + other markers).
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "uv.lock", "version = 1\n").await;
         touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap(), PypiFlavor::UvProject);
+        assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::UvProject);
 
-        // 2. [tool.uv] without a lock (and no requirements fallback).
+        // 2-4. Tool locks route to their flavors.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "poetry.lock", "").await;
+        assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Poetry);
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "pdm.lock", "").await;
+        assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Pdm);
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Pipenv);
+
+        // Lock precedence among coexisting locks + the LOUD warning.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "poetry.lock", "").await;
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        let (f, warnings) = detect_pypi_flavor(tmp.path()).await.unwrap();
+        assert_eq!(f, PypiFlavor::Poetry);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "pypi_multiple_lockfiles");
+        assert!(warnings[0].detail.contains("Pipfile.lock"), "{}", warnings[0].detail);
+
+        // 5. Lock-less tool markers refuse with the per-tool pointer...
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n\n[tool.uv]\ndev = true\n").await;
         let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
@@ -457,43 +590,59 @@ mod tests {
         assert!(err.1.contains("uv lock"));
         assert!(err.1.contains("socket-patch setup"));
 
-        // ...but WITH requirements.txt present the pip flavor still serves.
-        touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap(), PypiFlavor::Requirements);
-
-        // 3. Pipenv / Poetry / PDM markers refuse (file and table forms).
-        let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "Pipfile", "").await;
-        touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_pipenv_unsupported");
-
-        let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "poetry.lock", "").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_poetry_unsupported");
-
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[tool.poetry]\nname = \"x\"\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_poetry_unsupported");
-
-        let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "pdm.lock", "").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_pdm_unsupported");
+        let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_no_lockfile");
+        assert!(err.1.contains("poetry lock"));
 
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[tool.pdm]\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_pdm_unsupported");
+        assert_eq!(
+            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            "pypi_pdm_no_lockfile"
+        );
 
-        // 4. requirements.txt at the root.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile", "").await;
+        assert_eq!(
+            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            "pypi_pipenv_no_lockfile"
+        );
+
+        // ...but every lock-less marker falls through to requirements.txt when
+        // one exists (the marker alone must not block the pip wiring) — this
+        // expands v1, where a bare Pipfile + requirements.txt refused.
+        for marker in [
+            ("pyproject.toml", "[tool.uv]\n"),
+            ("pyproject.toml", "[tool.poetry]\n"),
+            ("pyproject.toml", "[tool.pdm]\n"),
+            ("Pipfile", ""),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), marker.0, marker.1).await;
+            touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
+            assert_eq!(
+                flavor(tmp.path()).await.unwrap(),
+                PypiFlavor::Requirements,
+                "marker {marker:?} must fall through to requirements"
+            );
+        }
+
+        // 6. requirements.txt at the root.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "requirements.txt", "six==1.16.0\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap(), PypiFlavor::Requirements);
+        assert_eq!(flavor(tmp.path()).await.unwrap(), PypiFlavor::Requirements);
 
-        // 5. a lone pyproject.
+        // 7. a lone pyproject.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "pyproject.toml", "[project]\nname = \"x\"\n").await;
-        assert_eq!(detect_pypi_flavor(tmp.path()).await.unwrap_err().0, "pypi_pyproject_only");
+        assert_eq!(
+            detect_pypi_flavor(tmp.path()).await.unwrap_err().0,
+            "pypi_pyproject_only"
+        );
 
-        // 6. nothing at all.
+        // 8. nothing at all.
         let tmp = tempfile::tempdir().unwrap();
         let err = detect_pypi_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_no_requirements");
@@ -817,6 +966,10 @@ mod tests {
             took_over_go_patches: false,
             flavor: Some("mystery".into()),
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         };
         let outcome = revert_pypi(&entry, &fx.root, false).await;
         assert!(!outcome.success);

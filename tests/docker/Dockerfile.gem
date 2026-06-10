@@ -1,11 +1,36 @@
-# gem (Ruby) ecosystem test image: base + Ruby + bundler.
-FROM socket-patch-test-base:latest
+# gem (Ruby) ecosystem test image: Ruby 3.3 + bundler ~> 2.7 + socket-patch.
+#
+# Bundler is pinned to the 2.7 series — the version the gem vendor backend's
+# lockfile grammar was spike-validated against (spikes/gem-checksums/).
+# Bundler >= 2.7 requires Ruby >= 3.2 and Debian 12's apt ruby is 3.1, so this
+# image follows the Dockerfile.nuget pattern: FROM the official ruby image,
+# COPY socket-patch in from our base stage.
+#
+# NOTE for test scripts: the official ruby image sets
+# `BUNDLE_APP_CONFIG=/usr/local/bundle`, which redirects `bundle config set
+# --local` away from `./.bundle/config`. Scripts that need a project-local
+# bundler config (e.g. the vendor capstone's committable `.bundle/config`)
+# must `export BUNDLE_APP_CONFIG="$PWD/.bundle"` first.
+FROM socket-patch-test-base:latest AS sptool
 
+FROM ruby:3.3-slim-bookworm
+
+# Runtime utilities the test scripts and native-extension gem builds need
+# (the slim ruby image drops git/curl/compilers; build-essential replaces the
+# old image's ruby-dev + build-essential pair — the official ruby build ships
+# its own headers).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ruby \
-      ruby-dev \
       build-essential \
+      ca-certificates \
+      curl \
+      git \
  && rm -rf /var/lib/apt/lists/* \
- && gem install bundler --no-document \
- && ruby --version && gem --version && bundle --version
+ && gem install bundler -v '~> 2.7' --no-document
+
+COPY --from=sptool /usr/local/bin/socket-patch /usr/local/bin/socket-patch
+RUN ruby --version && gem --version && bundle --version \
+ && bundle --version | grep -q 'Bundler version 2\.7\.' \
+ && socket-patch --version
+
+WORKDIR /workspace

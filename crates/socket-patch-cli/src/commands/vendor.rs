@@ -11,7 +11,7 @@
 
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::crawlers::{detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager};
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
@@ -92,7 +92,9 @@ async fn dispatch_vendor_one(
     let eco = ecosystem_dir_for_purl(purl)?;
     Some(match eco {
         "npm" => {
-            socket_patch_core::patch::vendor::npm_lock::vendor_npm(
+            // The flavor router probes the project's lockfile (package-lock /
+            // yarn / pnpm / bun) and dispatches or refuses per flavor.
+            socket_patch_core::patch::vendor::npm_flavor::vendor_npm_any(
                 purl,
                 pkg_path,
                 project_root,
@@ -184,8 +186,12 @@ async fn dispatch_revert_one(
 ) -> RevertOutcome {
     match entry.ecosystem.as_str() {
         "npm" => {
-            socket_patch_core::patch::vendor::npm_lock::revert_npm(entry, project_root, dry_run)
-                .await
+            socket_patch_core::patch::vendor::npm_flavor::revert_npm_any(
+                entry,
+                project_root,
+                dry_run,
+            )
+            .await
         }
         "pypi" => {
             socket_patch_core::patch::vendor::pypi::revert_pypi(entry, project_root, dry_run).await
@@ -400,17 +406,6 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         return i32::from(has_errors);
     }
 
-    // npm layout gate: vendor rewrites package-lock.json semantics only.
-    // yarn/pnpm/bun each have a native first-class patch flow; refuse their
-    // npm purls per-purl so other ecosystems still vendor.
-    let pkg_manager = detect_npm_pkg_manager(&common.cwd);
-    let npm_manager_refusal: Option<&str> = match pkg_manager {
-        NpmPkgManager::YarnBerryPnP | NpmPkgManager::YarnClassic => Some("yarn patch <pkg>"),
-        NpmPkgManager::Pnpm => Some("pnpm patch <pkg>"),
-        NpmPkgManager::Bun => Some("bun patch <pkg>"),
-        _ => None,
-    };
-
     let vendorable_partition: HashMap<Ecosystem, Vec<String>> = partitioned
         .into_iter()
         .map(|(eco, purls)| {
@@ -489,22 +484,6 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                 }
             }
             matched.insert(candidate.clone());
-
-            // npm layout refusal.
-            if ecosystem_dir_for_purl(candidate) == Some("npm") {
-                if let Some(native) = npm_manager_refusal {
-                    has_errors = true;
-                    env.record(
-                        PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
-                            "vendor_pkg_manager_unsupported",
-                            format!(
-                                "this project uses {pkg_manager:?}; socket-patch vendor only rewrites package-lock.json — use `{native}` instead"
-                            ),
-                        ),
-                    );
-                    continue;
-                }
-            }
 
             let outcome = dispatch_vendor_one(
                 candidate,

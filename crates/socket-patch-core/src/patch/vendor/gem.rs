@@ -23,7 +23,15 @@
 //!   empty the empty `specs:` stanza is KEPT (that is what bundler writes);
 //! * the DEPENDENCIES entry becomes `<name> (= <version>)!` — exact pin plus
 //!   the `!` path-source marker; PLATFORMS / BUNDLED WITH / everything else is
-//!   byte-preserved.
+//!   byte-preserved;
+//! * bundler ≥ 2.6 with `lockfile_checksums` adds a CHECKSUMS section whose
+//!   registry entries read `  <name> (<version>) sha256=<hex>`; a path-sourced
+//!   gem keeps a BARE `  <name> (<version>)` entry (bundler 2.7.2 spike —
+//!   `spikes/PHASE0-V2-FINDINGS.txt` gemChecksums G2/G3). The registry token
+//!   MUST be stripped on vendor — bundler never repairs it itself (G4: a stale
+//!   token is silently preserved, i.e. permanent lock-vs-regen churn) — and
+//!   restored verbatim on revert: a bare entry on a registry-sourced gem
+//!   hard-fails `BUNDLE_FROZEN=true bundle install` (exit 16).
 //!
 //! The Gemfile gains `path:` on the gem's declaration (rewritten in place when
 //! it is a statically-parseable single top-level line, quote style preserved)
@@ -63,7 +71,7 @@ use super::{RevertOutcome, VendorOutcome, VendorWarning};
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
 
-/// Wiring-record discriminators (`key` is the gem name for both).
+/// Wiring-record discriminators (`key` is the gem name for all three).
 ///
 /// `gemfile_line`: `original`/`new` are verbatim line/block strings.
 ///
@@ -73,8 +81,14 @@ const GEMFILE_LOCK: &str = "Gemfile.lock";
 /// entry — its absence means the gem was transitive and revert deletes the
 /// added entry. In `new`, the last element is the DEPENDENCIES entry we wrote
 /// and the rest is the emitted PATH section.
+///
+/// `gemfile_lock_checksum`: `original`/`new` are the verbatim CHECKSUMS line
+/// strings (the registry `  <name> (<version>) sha256=<hex>` form vs the bare
+/// `  <name> (<version>)` path form). A SEPARATE record — never appended into
+/// `gemfile_lock_spec`'s arrays, whose revert parses them positionally.
 const GEMFILE_WIRING_KIND: &str = "gemfile_line";
 const LOCK_WIRING_KIND: &str = "gemfile_lock_spec";
+const LOCK_CHECKSUM_WIRING_KIND: &str = "gemfile_lock_checksum";
 
 /// Managed-block fence for transitive (not-Gemfile-declared) gems.
 const MANAGED_OPEN: &str = "# >>> socket-patch vendor (managed) >>>";
@@ -227,17 +241,34 @@ pub async fn vendor_gem(
     // the first run's ledger entry holds the only copy of the pre-vendor
     // originals.
     let remote_line = format!("  remote: {copy_rel}");
-    if copy_matches_after_hashes(&copy_dir, &record.files).await
+    let wired = copy_matches_after_hashes(&copy_dir, &record.files).await
         && tokio::fs::metadata(copy_dir.join(format!("{name}.gemspec"))).await.is_ok()
         && lock_text.split('\n').any(|l| l == remote_line)
-        && gemfile_text.contains(&copy_rel)
-    {
-        let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &copy_dir, verified, true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        && gemfile_text.contains(&copy_rel);
+    if wired {
+        if lock_checksum_in_sync(&lock_text, name, version) {
+            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            return VendorOutcome::Done {
+                result: synthesized_result(purl, &copy_dir, verified, true, None),
+                entry: None,
+                warnings: Vec::new(),
+            };
+        }
+        // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
+        // carries the registry form — a lock wired by a pre-CHECKSUMS-aware
+        // socket-patch. Bundler never repairs this itself (spike G4: install,
+        // frozen install and `bundle lock` all silently preserve a stale
+        // token), and we cannot strip it here: this run records no ledger
+        // entry, so a revert would put back everything EXCEPT the token —
+        // leaving a bare CHECKSUMS entry on a registry-sourced gem, which
+        // hard-fails frozen installs (exit 16). Refuse with the repair path
+        // instead of the generic "already carries `path:`" Gemfile refusal.
+        return refused(
+            "vendor_stale_lock_checksum",
+            format!(
+                "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
+            ),
+        );
     }
 
     // ── dry run: verify-only against the installed dir, no writes ────────
@@ -398,6 +429,21 @@ pub async fn vendor_gem(
         original: Some(Value::Array(original_lines)),
         new: Some(Value::Array(new_lines)),
     };
+    let mut wiring = vec![gemfile_record, lock_record];
+    // The CHECKSUMS rewrite (when the lock had a registry entry for the gem)
+    // rides in its OWN record: revert must restore the registry `sha256=`
+    // line verbatim — it is not recomputable offline, and a bare entry on a
+    // registry-sourced gem hard-fails frozen installs (spike, exit 16).
+    if let Some((orig_line, new_line)) = &lock_edit.checksum_rewrite {
+        wiring.push(WiringRecord {
+            file: GEMFILE_LOCK.to_string(),
+            kind: LOCK_CHECKSUM_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(name.to_string()),
+            original: Some(Value::String(orig_line.clone())),
+            new: Some(Value::String(new_line.clone())),
+        });
+    }
 
     let entry = VendorEntry {
         ecosystem: "gem".to_string(),
@@ -409,11 +455,15 @@ pub async fn vendor_gem(
             size: None,
             platform_locked: None,
         },
-        wiring: vec![gemfile_record, lock_record],
+        wiring,
         lock: None,
         took_over_go_patches: false,
         flavor: None,
         uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
 
     VendorOutcome::Done {
@@ -424,8 +474,9 @@ pub async fn vendor_gem(
 }
 
 /// Revert a gem vendor entry: restore the Gemfile line / delete the managed
-/// block, splice the lock's spec block back into GEM specs (sorted) and the
-/// original DEPENDENCIES entry back in, then remove the validated uuid dir.
+/// block, splice the lock's spec block back into GEM specs (sorted), the
+/// original DEPENDENCIES entry back in and the registry CHECKSUMS line back
+/// over the bare path form, then remove the validated uuid dir.
 /// Each fragment that no longer looks like what vendor wrote — a hand edit, a
 /// `bundle update`, a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
@@ -447,6 +498,9 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
             LOCK_WIRING_KIND => revert_lock_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await,
+            LOCK_CHECKSUM_WIRING_KIND => {
+                revert_lock_checksum_record(&project_root.join(GEMFILE_LOCK), w, dry_run).await
+            }
             GEMFILE_WIRING_KIND => revert_gemfile_record(&project_root.join(GEMFILE), w, dry_run).await,
             _ => {
                 warnings.push(VendorWarning::new(
@@ -642,6 +696,12 @@ struct LockEdit {
     path_section: Vec<String>,
     /// The DEPENDENCIES entry we wrote (`  <name> (= <version>)!`).
     new_dep_line: String,
+    /// CHECKSUMS rewrite `(original line, bare replacement)`; `None` when the
+    /// lock has no CHECKSUMS section, no entry for the gem, or the entry was
+    /// already bare (idempotency: our own edit is never recorded as an
+    /// "original" — reverting it onto a registry-sourced lock would break
+    /// frozen installs).
+    checksum_rewrite: Option<(String, String)>,
 }
 
 /// Produce the pair-edited lock text (see the module doc for the canonical
@@ -712,12 +772,69 @@ fn edit_lock(text: &str, name: &str, version: &str, rel: &str) -> Result<LockEdi
     insert.push(String::new()); // blank separator before GEM
     lines.splice(gem_hdr..gem_hdr, insert);
 
+    // 4. CHECKSUMS (bundler ≥ 2.6 `lockfile_checksums`): a path-sourced gem
+    // keeps a BARE `  <name> (<version>)` entry — bundler's own re-lock emits
+    // exactly that form (spike G2), so the registry `sha256=` token must be
+    // stripped here or the committed lock diverges from any regen forever
+    // (spike G4: bundler silently preserves a stale token, never repairs it).
+    // Absent section / absent entry are both tolerated by bundler — touched
+    // by nothing. Re-found via section_span because the PATH splice above
+    // shifted every index.
+    let mut checksum_rewrite: Option<(String, String)> = None;
+    if let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") {
+        let bare = format!("  {name} ({version})");
+        let platform_prefix = format!("{version}-");
+        let mut plain_at: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().take(ck_end).skip(ck_start + 1) {
+            match checksum_entry(line) {
+                Some((n, v)) if n == name && v == version => {
+                    if plain_at.is_some() {
+                        // SECURITY/fail-closed: duplicate entries mean the
+                        // grammar assumption is wrong for this lock — editing
+                        // one of them would be a guess.
+                        return Err(format!(
+                            "Gemfile.lock CHECKSUMS has more than one entry for `{name} ({version})`"
+                        ));
+                    }
+                    plain_at = Some(i);
+                }
+                Some((n, v)) if n == name && v.starts_with(&platform_prefix) => {
+                    // SECURITY/fail-closed: platform-suffixed installs were
+                    // refused (`platform_gem_unsupported`) before this point,
+                    // so a platform sibling here means the lock disagrees
+                    // with the installed tree — never guess which entries
+                    // bundler would collapse for a PATH spec.
+                    return Err(format!(
+                        "Gemfile.lock CHECKSUMS has a platform-suffixed entry `{n} ({v})` but the installed gem is not platform-specific; the lock disagrees with the install (re-resolve it before vendoring)"
+                    ));
+                }
+                Some(_) => {}
+                // SECURITY/fail-closed: a line that names the gem but does
+                // not fit the entry grammar would be left half-edited or
+                // skipped silently — both wrong. Err unwinds the Gemfile.
+                None if checksum_line_names_gem(line, name) => {
+                    return Err(format!(
+                        "Gemfile.lock CHECKSUMS entry for `{name}` is not parseable: {line:?}"
+                    ));
+                }
+                None => {}
+            }
+        }
+        if let Some(i) = plain_at {
+            if lines[i] != bare {
+                checksum_rewrite = Some((lines[i].clone(), bare.clone()));
+                lines[i] = bare;
+            }
+        }
+    }
+
     Ok(LockEdit {
         text: lines.join("\n"),
         removed_spec_block,
         old_dep_line,
         path_section,
         new_dep_line,
+        checksum_rewrite,
     })
 }
 
@@ -754,6 +871,65 @@ fn spec_entry_name(line: &str) -> Option<&str> {
         return None;
     }
     Some(rest.split(' ').next().unwrap_or(rest))
+}
+
+/// Parse a CHECKSUMS entry line: two-space indent, `<name> (<version>)` or
+/// `<name> (<version>-<platform>)`, then optional space-separated tokens
+/// (`sha256=<hex>` on registry entries, nothing on path entries). Returns
+/// `(name, parenthesized token)` — the platform suffix stays inside the token
+/// because matching must mirror the GEM specs grammar (spike G5: native gems
+/// get one CHECKSUMS line per platform spec, `ffi (1.17.2-aarch64-linux-gnu)`).
+fn checksum_entry(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("  ")?;
+    if rest.is_empty() || rest.starts_with(' ') {
+        return None;
+    }
+    let open = rest.find(" (")?;
+    let after = &rest[open + 2..];
+    let close = after.find(')')?;
+    let (name, ver, tail) = (&rest[..open], &after[..close], &after[close + 1..]);
+    if name.is_empty() || ver.is_empty() || !(tail.is_empty() || tail.starts_with(' ')) {
+        return None;
+    }
+    Some((name, ver))
+}
+
+/// True when a CHECKSUMS-section line's leading token is `name` — used to
+/// fail closed on lines that mention the gem but do not fit the
+/// [`checksum_entry`] grammar (editing around them would be a guess).
+fn checksum_line_names_gem(line: &str, name: &str) -> bool {
+    line.strip_prefix("  ")
+        .filter(|r| !r.starts_with(' '))
+        .and_then(|r| r.split([' ', '(']).next())
+        == Some(name)
+}
+
+/// True when the lock's CHECKSUMS section is coherent with a path-sourced
+/// gem: no section, no entry for the gem, or exactly the bare
+/// `  <name> (<version>)` form. A leftover registry `sha256=` token (a lock
+/// wired by a pre-CHECKSUMS-aware socket-patch) is NOT in sync — bundler
+/// silently preserves it forever (spike G4), so the hot path must not declare
+/// such a lock done; only revert + re-vendor can repair it.
+fn lock_checksum_in_sync(lock_text: &str, name: &str, version: &str) -> bool {
+    let lines: Vec<String> = lock_text.split('\n').map(str::to_string).collect();
+    let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") else {
+        return true;
+    };
+    let bare = format!("  {name} ({version})");
+    let platform_prefix = format!("{version}-");
+    for line in &lines[ck_start + 1..ck_end] {
+        match checksum_entry(line) {
+            Some((n, v)) if n == name && (v == version || v.starts_with(&platform_prefix)) => {
+                if line.as_str() != bare {
+                    return false;
+                }
+            }
+            Some(_) => {}
+            None if checksum_line_names_gem(line, name) => return false,
+            None => {}
+        }
+    }
+    true
 }
 
 // ── revert helpers ───────────────────────────────────────────────────────────
@@ -838,6 +1014,48 @@ fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
         .iter()
         .map(|x| x.as_str().map(str::to_string))
         .collect()
+}
+
+/// Restore one `gemfile_lock_checksum` record: the registry CHECKSUMS line
+/// (`sha256=` token and all) goes back over the bare path-form line vendor
+/// wrote. Restoring is not optional polish — a bare entry left on a
+/// registry-sourced gem hard-fails `BUNDLE_FROZEN=true bundle install`
+/// (exit 16) and plain installs rewrite the lock to refill the token (churn);
+/// the token is not recomputable offline (spike `bare-checksum-registry-gem`
+/// pair). The search is confined to the CHECKSUMS section so a coincidental
+/// identical line elsewhere (e.g. a DEPENDENCIES entry) is never clobbered.
+/// `Ok(true)` = restored (or would be, on dry run); `Ok(false)` = the line is
+/// gone (drift), left alone.
+async fn revert_lock_checksum_record(
+    lock_path: &Path,
+    w: &WiringRecord,
+    dry_run: bool,
+) -> Result<bool, String> {
+    let Some(original) = w.original.as_ref().and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let text = match tokio::fs::read_to_string(lock_path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
+    };
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") else {
+        return Ok(false);
+    };
+    let Some(i) = (ck_start + 1..ck_end).find(|&i| lines[i] == written) else {
+        return Ok(false);
+    };
+    lines[i] = original.to_string();
+    if !dry_run {
+        atomic_write_bytes(lock_path, lines.join("\n").as_bytes())
+            .await
+            .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
+    }
+    Ok(true)
 }
 
 /// Pure splice reversing [`edit_lock`]: drop the PATH section vendor emitted,
@@ -1580,5 +1798,445 @@ mod tests {
             !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
             "uuid dir still removed"
         );
+    }
+
+    // ── bundler ≥ 2.6 CHECKSUMS (spike: gemChecksums, bundler 2.7.2) ─────────
+
+    const PURL_318: &str = "pkg:gem/rack@3.1.8";
+    const PRISTINE_318: &[u8] = b"module Rack\n  VERSION = \"3.1.8\"\nend\n";
+    const PATCHED_318: &[u8] = b"module Rack\n  SOCKET_PATCHED = true\n  VERSION = \"3.1.8\"\nend\n";
+    const GEMSPEC_318: &str = "Gem::Specification.new do |s|\n  s.name = \"rack\"\n  s.version = \"3.1.8\"\n  s.require_paths = [\"lib\"]\nend\n";
+
+    // Embedded VERBATIM from the spike pair
+    // `spikes/gem-checksums/path-with-checksums/{before,after}/` (bundler
+    // 2.7.2, ruby 3.3.11, aarch64-linux; the `after` lock was written by
+    // bundler itself via `bundle lock`, never by hand). G3 pinned exactly this
+    // pair byte-stable under `bundle install`, `BUNDLE_FROZEN=true bundle
+    // install` and a from-scratch `bundle lock`.
+    const SPIKE_GEMFILE_CHECKSUMS: &str =
+        "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.1.8\"\n";
+    const SPIKE_RACK_SHA_LINE: &str =
+        "  rack (3.1.8) sha256=d3fbcbca43dc2b43c9c6d7dfbac01667ae58643c42cea10013d0da970218a1b1";
+    const SPIKE_LOCK_CHECKSUMS_BEFORE: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.1.8)\n\nPLATFORMS\n  aarch64-linux\n  ruby\n\nDEPENDENCIES\n  rack (= 3.1.8)\n\nCHECKSUMS\n  rack (3.1.8) sha256=d3fbcbca43dc2b43c9c6d7dfbac01667ae58643c42cea10013d0da970218a1b1\n\nBUNDLED WITH\n   2.7.2\n";
+    const SPIKE_LOCK_CHECKSUMS_AFTER: &str = "PATH\n  remote: vendored/rack-3.1.8\n  specs:\n    rack (3.1.8)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  aarch64-linux\n  ruby\n\nDEPENDENCIES\n  rack (= 3.1.8)!\n\nCHECKSUMS\n  rack (3.1.8)\n\nBUNDLED WITH\n   2.7.2\n";
+
+    fn copy_rel_318() -> String {
+        format!(".socket/vendor/gem/{UUID}/rack-3.1.8")
+    }
+
+    /// The spike `after` lock byte-for-byte, except the PATH remote points
+    /// into `.socket/vendor/` instead of the spike's hand-placed `vendored/`
+    /// dir — the only divergence; everything else (including the bare
+    /// CHECKSUMS entry) must match bundler's own output exactly for the lock
+    /// to stay byte-stable under re-lock.
+    fn expected_lock_checksums() -> String {
+        SPIKE_LOCK_CHECKSUMS_AFTER.replace(
+            "  remote: vendored/rack-3.1.8\n",
+            &format!("  remote: {}\n", copy_rel_318()),
+        )
+    }
+
+    /// rack-3.1.8 twin of [`fixture`] (the CHECKSUMS spike pinned that exact
+    /// version, so the oracles can embed the spike locks verbatim).
+    async fn fixture_318(
+        gemfile: &str,
+        lock: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, PatchRecord) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let installed = base.join("gem_home/gems/rack-3.1.8");
+        tokio::fs::create_dir_all(installed.join("lib")).await.unwrap();
+        tokio::fs::write(installed.join("lib/rack.rb"), PRISTINE_318).await.unwrap();
+        let specs = base.join("gem_home/specifications");
+        tokio::fs::create_dir_all(&specs).await.unwrap();
+        tokio::fs::write(specs.join("rack-3.1.8.gemspec"), GEMSPEC_318).await.unwrap();
+
+        let root = base.join("project");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE), gemfile).await.unwrap();
+        tokio::fs::write(root.join(GEMFILE_LOCK), lock).await.unwrap();
+
+        let before = compute_git_sha256_from_bytes(PRISTINE_318);
+        let after = compute_git_sha256_from_bytes(PATCHED_318);
+        let blobs = base.join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+        tokio::fs::write(blobs.join(&after), PATCHED_318).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "lib/rack.rb".to_string(),
+            PatchFileInfo {
+                before_hash: before,
+                after_hash: after,
+            },
+        );
+        let record = PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: "2026-06-09T00:00:00Z".to_string(),
+            files,
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        (dir, root, installed, blobs, record)
+    }
+
+    async fn run_vendor_318(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        dry_run: bool,
+    ) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(blobs);
+        vendor_gem(
+            PURL_318,
+            installed,
+            root,
+            record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            dry_run,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_checksums_direct_vendor_matches_spike_pair() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
+
+        // Lock: bundler's own path-gem output (spike G3 pair) byte-for-byte,
+        // modulo the PATH remote value.
+        let lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        assert_eq!(lock, expected_lock_checksums());
+
+        // Ledger: the checksum rewrite is its own third record with the
+        // verbatim registry line as original and the bare form as new.
+        let entry = entry.expect("success must carry a ledger entry");
+        assert_eq!(entry.wiring.len(), 3);
+        let ck = &entry.wiring[2];
+        assert_eq!(ck.file, GEMFILE_LOCK);
+        assert_eq!(ck.kind, LOCK_CHECKSUM_WIRING_KIND);
+        assert_eq!(ck.action, WiringAction::Rewritten);
+        assert_eq!(ck.key.as_deref(), Some("rack"));
+        assert_eq!(
+            ck.original.as_ref().unwrap(),
+            &Value::String(SPIKE_RACK_SHA_LINE.to_string())
+        );
+        assert_eq!(
+            ck.new.as_ref().unwrap(),
+            &Value::String("  rack (3.1.8)".to_string())
+        );
+        // The positional gemfile_lock_spec record must NOT have absorbed the
+        // checksum line (its revert parses original/new by position).
+        let spec = &entry.wiring[1];
+        assert!(
+            !spec
+                .original
+                .as_ref()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("sha256=")),
+            "checksum line must not leak into gemfile_lock_spec: {:?}",
+            spec.original
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checksums_transitive_vendor_strips_only_our_token() {
+        let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
+        let puma_sha_line =
+            "  puma (6.4.2) sha256=9c4f1f9d8f7c3a1b5e2d6c8a0b4f7e1d3c5a9b8e7f6d4c2a1b3e5d7c9f8a6b4c";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n    rack (3.1.8)\n\nPLATFORMS\n  aarch64-linux\n  ruby\n\nDEPENDENCIES\n  puma\n\nCHECKSUMS\n{puma_sha_line}\n{SPIKE_RACK_SHA_LINE}\n\nBUNDLED WITH\n   2.7.2\n"
+        );
+        let (_tmp, root, installed, blobs, record) = fixture_318(gemfile, &lock).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        // Full oracle: rack moved to PATH + sorted `!` dep + bare CHECKSUMS
+        // entry; puma's checksum line is byte-untouched.
+        let new_lock = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        assert_eq!(
+            new_lock,
+            format!(
+                "PATH\n  remote: {rel}\n  specs:\n    rack (3.1.8)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.4.2)\n      nio4r (~> 2.0)\n\nPLATFORMS\n  aarch64-linux\n  ruby\n\nDEPENDENCIES\n  puma\n  rack (= 3.1.8)!\n\nCHECKSUMS\n{puma_sha_line}\n  rack (3.1.8)\n\nBUNDLED WITH\n   2.7.2\n",
+                rel = copy_rel_318()
+            )
+        );
+
+        // Revert restores both files byte-exactly (added dep deleted, managed
+        // block removed, registry checksum line back).
+        let entry = entry.unwrap();
+        assert_eq!(entry.wiring.len(), 3);
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), gemfile);
+        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), lock);
+    }
+
+    #[tokio::test]
+    async fn test_checksums_revert_round_trip() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            !outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"),
+            "clean revert must not report drift: {:?}",
+            outcome.warnings
+        );
+        // Byte-exact restore — the registry sha256 token is back (a bare
+        // CHECKSUMS entry on a registry gem fails frozen installs, exit 16).
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            SPIKE_LOCK_CHECKSUMS_BEFORE
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    #[tokio::test]
+    async fn test_checksums_idempotent_rerun_in_sync() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+
+        let (r1, e1, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        assert!(e1.is_some());
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+
+        // The bare CHECKSUMS entry counts as in-sync: the rerun takes the hot
+        // path and records nothing.
+        let (r2, e2, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r2.success);
+        assert!(e2.is_none(), "hot path must not re-record");
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(), lock1);
+    }
+
+    #[tokio::test]
+    async fn test_checksums_already_bare_records_nothing() {
+        // Spike `bare-checksum-registry-gem/before`: a registry-sourced lock
+        // whose CHECKSUMS entry is already the bare form. Vendor must not
+        // record our own target form as an "original" — reverting it later
+        // would NOT be a restore (and per the spike a bare entry is exactly
+        // what the path form needs anyway).
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, "  rack (3.1.8)");
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert_eq!(
+            entry.wiring.len(),
+            2,
+            "already-bare entry must not produce a checksum record: {:?}",
+            entry.wiring
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            expected_lock_checksums(),
+            "the bare line is kept verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checksums_absent_entry_untouched() {
+        // CHECKSUMS section present but no entry for our gem: bundler
+        // tolerates absent entries, so vendor touches nothing there.
+        let other_line =
+            "  puma (6.4.2) sha256=9c4f1f9d8f7c3a1b5e2d6c8a0b4f7e1d3c5a9b8e7f6d4c2a1b3e5d7c9f8a6b4c";
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, other_line);
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(entry.unwrap().wiring.len(), 2, "no checksum record for an absent entry");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            expected_lock_checksums().replace("  rack (3.1.8)\n\nBUNDLED", &format!("{other_line}\n\nBUNDLED")),
+            "the foreign entry is byte-untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checksums_unparseable_entry_unwinds() {
+        // A CHECKSUMS line that names our gem but breaks the entry grammar
+        // (lost closing paren) fails closed AFTER the Gemfile was rewritten:
+        // the pair-edit unwind must restore the Gemfile bytes.
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, "  rack (3.1.8 sha256=deadbeef");
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(err.contains("CHECKSUMS") && err.contains("not parseable"), "{err}");
+        assert!(entry.is_none());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS,
+            "Gemfile unwound to its original bytes"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock,
+            "lock untouched"
+        );
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    #[tokio::test]
+    async fn test_checksums_platform_sibling_fails_closed() {
+        // vendor_gem refuses platform-suffixed INSTALL dirs before the lock
+        // edit, so a platform-suffixed CHECKSUMS sibling means the lock
+        // disagrees with the installed tree — never guess which entries
+        // bundler would collapse; fail closed and unwind.
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(
+            SPIKE_RACK_SHA_LINE,
+            &format!("{SPIKE_RACK_SHA_LINE}\n  rack (3.1.8-aarch64-linux) sha256=d3fbcbca43dc2b43c9c6d7dfbac01667ae58643c42cea10013d0da970218a1b1"),
+        );
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, &lock).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("platform-suffixed"),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS,
+            "Gemfile unwound"
+        );
+        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), lock);
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    #[test]
+    fn test_checksums_duplicate_entries_fail_closed() {
+        let lock = SPIKE_LOCK_CHECKSUMS_BEFORE.replace(
+            SPIKE_RACK_SHA_LINE,
+            &format!("{SPIKE_RACK_SHA_LINE}\n{SPIKE_RACK_SHA_LINE}"),
+        );
+        let err = match edit_lock(&lock, "rack", "3.1.8", &copy_rel_318()) {
+            Err(e) => e,
+            Ok(_) => panic!("duplicate CHECKSUMS entries must fail closed"),
+        };
+        assert!(err.contains("more than one entry"), "{err}");
+    }
+
+    #[test]
+    fn test_no_checksums_lock_records_no_checksum_wiring() {
+        // Regression: a lock WITHOUT a CHECKSUMS section must keep producing
+        // the exact pre-CHECKSUMS output and no checksum record.
+        let edit = edit_lock(LOCK_DIRECT, "rack", "3.2.6", &copy_rel()).unwrap();
+        assert!(edit.checksum_rewrite.is_none());
+        assert_eq!(edit.text, expected_lock_direct());
+    }
+
+    #[tokio::test]
+    async fn test_checksums_revert_drift_warning() {
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+
+        let (result, entry, _w) =
+            unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+
+        // Third-party drift on ONLY the checksum line (someone hand-restored
+        // a token): revert must leave that line alone with a warning, never
+        // clobber it, while the other records still restore cleanly.
+        let drifted_line = "  rack (3.1.8) sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let edited = wired.replace("\nCHECKSUMS\n  rack (3.1.8)\n", &format!("\nCHECKSUMS\n{drifted_line}\n"));
+        assert_ne!(edited, wired, "fixture edit must hit the bare line");
+        tokio::fs::write(root.join(GEMFILE_LOCK), &edited).await.unwrap();
+
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drift_count = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .count();
+        assert_eq!(drift_count, 1, "exactly the checksum record drifts: {:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(),
+            SPIKE_LOCK_CHECKSUMS_BEFORE.replace(SPIKE_RACK_SHA_LINE, drifted_line),
+            "everything else restored; the drifted checksum line preserved verbatim"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            SPIKE_GEMFILE_CHECKSUMS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_checksum_rerun_refused_with_guidance() {
+        // A lock wired by a pre-CHECKSUMS-aware socket-patch: PATH wiring in
+        // place but the registry sha256 token still on the CHECKSUMS line
+        // (the spike's stale-checksum-v1-bug shape — bundler itself never
+        // repairs it). The rerun must NOT report in-sync, and must refuse
+        // with the revert+re-vendor repair path rather than silently editing
+        // a lock it has no ledger entry for.
+        let (_tmp, root, installed, blobs, record) =
+            fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
+        let (r1, _e1, _) = unwrap_done(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        let wired = tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap();
+        let v1 = wired.replace(
+            "\nCHECKSUMS\n  rack (3.1.8)\n",
+            &format!("\nCHECKSUMS\n{SPIKE_RACK_SHA_LINE}\n"),
+        );
+        assert_ne!(v1, wired, "fixture edit must hit the bare line");
+        tokio::fs::write(root.join(GEMFILE_LOCK), &v1).await.unwrap();
+        let gemfile = tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap();
+
+        let (code, detail) =
+            unwrap_refused(run_vendor_318(&root, &blobs, &installed, &record, false).await);
+        assert_eq!(code, "vendor_stale_lock_checksum");
+        assert!(detail.contains("vendor --revert"), "{detail}");
+        // The refusal mutates nothing.
+        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(), gemfile);
+        assert_eq!(tokio::fs::read_to_string(root.join(GEMFILE_LOCK)).await.unwrap(), v1);
     }
 }

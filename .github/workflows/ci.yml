@@ -326,10 +326,17 @@ jobs:
 
       - name: Run ${{ matrix.ecosystem }} Docker e2e test with coverage
         run: |
+          # Vendor build-proof capstones ride the same image as their
+          # ecosystem's main suite (extend the case as new vendor suites land).
+          EXTRA=""
+          case "${{ matrix.ecosystem }}" in
+            composer) EXTRA="--test docker_e2e_vendor_composer" ;;
+            gem)      EXTRA="--test docker_e2e_vendor_gem" ;;
+          esac
           cargo llvm-cov \
             --features docker-e2e,cargo,golang,maven,composer,nuget,deno \
             --no-report \
-            --test docker_e2e_${{ matrix.ecosystem }}
+            --test docker_e2e_${{ matrix.ecosystem }} $EXTRA
 
       - name: Generate per-ecosystem lcov
         run: |

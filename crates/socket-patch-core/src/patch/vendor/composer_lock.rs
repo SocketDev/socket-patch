@@ -297,6 +297,10 @@ pub async fn vendor_composer(
         took_over_go_patches: false,
         flavor: None,
         uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
 
     VendorOutcome::Done {

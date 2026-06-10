@@ -444,6 +444,10 @@ pub async fn vendor_cargo_crate(
         took_over_go_patches: false,
         flavor: None,
         uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
 
     done(result, Some(entry), warnings)

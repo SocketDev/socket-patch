@@ -698,6 +698,10 @@ mod tests {
             took_over_go_patches: false,
             flavor: Some("requirements".into()),
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         }
     }
 

@@ -233,6 +233,10 @@ pub async fn vendor_go_module(
         took_over_go_patches: takeover,
         flavor: None,
         uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
 
     VendorOutcome::Done {

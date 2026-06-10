@@ -20,6 +20,11 @@
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
 //! | pypi     | rebuilt wheel       | uv: pyproject+uv.lock pair; pip: requirements  |
 //!
+//! npm requests route through [`npm_flavor`], which content-sniffs the
+//! project's lockfile (package-lock / yarn / pnpm / bun) and dispatches to
+//! the matching backend — today only the package-lock backend exists and
+//! the other flavors refuse with stable reason codes.
+//!
 //! ## Ownership & reversal
 //!
 //! `.socket/vendor/state.json` (committed) records the verbatim original
@@ -44,12 +49,15 @@ pub mod composer_lock;
 pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
+mod npm_common;
+pub mod npm_flavor;
 pub mod npm_lock;
 pub mod npm_pack;
 pub mod pypi;
 pub mod pypi_requirements;
 pub mod pypi_uv;
 pub mod pypi_wheel;
+mod toml_surgery;
 pub mod verify;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};

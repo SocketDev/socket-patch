@@ -129,6 +129,10 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
             took_over_go_patches: false,
             flavor: None,
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         },
     );
     let dir = cwd.join(".socket/vendor");

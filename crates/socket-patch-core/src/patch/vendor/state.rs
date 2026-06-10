@@ -14,6 +14,14 @@
 //! through `path_safety` / `vendor::path` first; the artifact contents are
 //! always re-verified against the manifest's afterHashes, never against this
 //! file alone.
+//!
+//! Forward compatibility: the schema evolves by ADDING optional fields and
+//! new [`WiringRecord::kind`] STRINGS — never new [`WiringAction`] variants
+//! (an older binary must still deserialize a newer ledger). A revert routine
+//! that meets an unknown `kind` degrades to a `vendor_lock_entry_drifted`
+//! warning and leaves the fragment alone; flavor routers fail closed on
+//! flavor strings they have no backend for. Both keep an old binary safe
+//! against a newer project checkout.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -133,6 +141,52 @@ pub struct UvMeta {
     pub lock_revision: Option<u64>,
 }
 
+/// npm/pnpm bookkeeping: which `pnpm-workspace.yaml`/`package.json` tables
+/// the wiring had to create (revert then removes the emptied tables too).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PnpmMeta {
+    /// Vendor created the `overrides` table itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_overrides_table: bool,
+    /// Vendor created the enclosing `pnpm` table itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_pnpm_table: bool,
+}
+
+/// pypi/poetry bookkeeping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PoetryMeta {
+    /// How the target is declared (`direct` | `transitive`).
+    pub dep_class: String,
+    /// poetry.lock `lock-version` observed at vendor time.
+    pub lock_version: String,
+}
+
+/// pypi/pdm bookkeeping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PdmMeta {
+    /// How the target is declared (`direct` | `transitive`).
+    pub dep_class: String,
+    /// pdm.lock `lock_version` observed at vendor time.
+    pub lock_version: String,
+    /// pdm.lock `strategy` list observed at vendor time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strategy: Vec<String>,
+}
+
+/// pypi/pipenv bookkeeping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PipenvMeta {
+    /// The Pipfile/Pipfile.lock sections the wiring touched (`default`,
+    /// `develop`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<String>,
+}
+
 /// One vendored package.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -156,12 +210,28 @@ pub struct VendorEntry {
     /// golang: vendor took over an existing `.socket/go-patches/` redirect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub took_over_go_patches: bool,
-    /// pypi: which wiring flavor was used (`uv` | `requirements`).
+    /// Which wiring flavor was used, for the multi-flavor ecosystems —
+    /// npm: `package-lock` | `yarn-classic` | `pnpm` | `bun` (absent on
+    /// pre-flavor entries ⇒ `package-lock`); pypi: `uv` | `requirements` |
+    /// `poetry` | `pdm` | `pipenv`. Reverts route on this and fail closed
+    /// on flavors this build has no backend for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flavor: Option<String>,
     /// pypi/uv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uv: Option<UvMeta>,
+    /// npm/pnpm extras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pnpm: Option<PnpmMeta>,
+    /// pypi/poetry extras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poetry: Option<PoetryMeta>,
+    /// pypi/pdm extras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdm: Option<PdmMeta>,
+    /// pypi/pipenv extras.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipenv: Option<PipenvMeta>,
 }
 
 /// The ledger.
@@ -306,6 +376,10 @@ mod tests {
             took_over_go_patches: false,
             flavor: None,
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         }
     }
 
@@ -332,7 +406,84 @@ mod tests {
         let text = String::from_utf8(bytes1).unwrap();
         assert!(!text.contains("tookOverGoPatches"));
         assert!(!text.contains("\"flavor\""));
+        for absent in ["\"uv\"", "\"pnpm\"", "\"poetry\"", "\"pdm\"", "\"pipenv\""] {
+            assert!(!text.contains(absent), "{absent} must not serialize when None");
+        }
         assert!(text.contains("\"basePurl\""), "camelCase keys: {text}");
+    }
+
+    #[tokio::test]
+    async fn v2_meta_structs_round_trip_with_camel_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut entry = sample_entry();
+        entry.flavor = Some("pnpm".into());
+        entry.pnpm = Some(PnpmMeta {
+            created_overrides_table: true,
+            created_pnpm_table: false,
+        });
+        entry.poetry = Some(PoetryMeta {
+            dep_class: "direct".into(),
+            lock_version: "2.1".into(),
+        });
+        entry.pdm = Some(PdmMeta {
+            dep_class: "transitive".into(),
+            lock_version: "4.5.0".into(),
+            strategy: vec!["inherit_metadata".into(), "static_urls".into()],
+        });
+        entry.pipenv = Some(PipenvMeta {
+            sections: vec!["default".into(), "develop".into()],
+        });
+        let mut state = VendorState::new();
+        state.entries.insert("pkg:npm/lodash@4.17.21".into(), entry);
+
+        save_state(root, &state).await.unwrap();
+        let loaded = load_state(root).await.unwrap();
+        assert_eq!(loaded, state, "every meta survives the round trip");
+
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL)).await.unwrap();
+        // camelCase keys on the wire.
+        for key in [
+            "\"createdOverridesTable\"",
+            "\"depClass\"",
+            "\"lockVersion\"",
+            "\"strategy\"",
+            "\"sections\"",
+        ] {
+            assert!(text.contains(key), "{key} missing: {text}");
+        }
+        // Skip-empty inner fields: the false bool and any empty vec vanish.
+        assert!(!text.contains("createdPnpmTable"), "false bool omitted: {text}");
+    }
+
+    #[test]
+    fn v2_meta_empty_inner_fields_do_not_serialize() {
+        let pnpm = serde_json::to_string(&PnpmMeta {
+            created_overrides_table: false,
+            created_pnpm_table: false,
+        })
+        .unwrap();
+        assert_eq!(pnpm, "{}", "all-default PnpmMeta serializes empty");
+
+        let pipenv = serde_json::to_string(&PipenvMeta { sections: Vec::new() }).unwrap();
+        assert_eq!(pipenv, "{}", "empty sections omitted");
+
+        let pdm = serde_json::to_string(&PdmMeta {
+            dep_class: "direct".into(),
+            lock_version: "4.5.0".into(),
+            strategy: Vec::new(),
+        })
+        .unwrap();
+        assert!(!pdm.contains("strategy"), "empty strategy omitted: {pdm}");
+
+        // And the omitted spellings deserialize back to the defaults.
+        let back: PnpmMeta = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            back,
+            PnpmMeta { created_overrides_table: false, created_pnpm_table: false }
+        );
+        let back: PipenvMeta = serde_json::from_str("{}").unwrap();
+        assert!(back.sections.is_empty());
     }
 
     #[tokio::test]

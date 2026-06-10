@@ -1,0 +1,18 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bn1-ground-truth",
+      "dependencies": {
+        "lp": "./lp.tgz",
+        "lp2": "file:./lp2.tgz",
+      },
+    },
+  },
+  "packages": {
+    "lp": ["left-pad@./lp.tgz", {}, "sha512-BeCz4t+xVlVhKgnBa2K5pAR1MKUgHxv3w9G4T/ADxBhxHNY1ByfS0zcyKi6WQYEM+W2MbTE5kpwwVpgkS//6lQ=="],
+
+    "lp2": ["left-pad@./lp2.tgz", {}, "sha512-BeCz4t+xVlVhKgnBa2K5pAR1MKUgHxv3w9G4T/ADxBhxHNY1ByfS0zcyKi6WQYEM+W2MbTE5kpwwVpgkS//6lQ=="],
+  }
+}

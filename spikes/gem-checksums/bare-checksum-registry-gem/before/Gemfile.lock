@@ -1,0 +1,17 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rack (3.1.8)
+
+PLATFORMS
+  aarch64-linux
+  ruby
+
+DEPENDENCIES
+  rack (= 3.1.8)
+
+CHECKSUMS
+  rack (3.1.8)
+
+BUNDLED WITH
+   2.7.2

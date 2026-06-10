@@ -20,21 +20,21 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
-};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
-use crate::patch::path_safety;
+use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
-use crate::utils::purl::strip_purl_qualifiers;
 
-use super::npm_pack::pack_deterministic;
+use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
+
+// Test-only re-imports: the helpers moved to `npm_common` but the existing
+// suite exercises them through `use super::*` and stays unmodified.
+#[cfg(test)]
+use super::npm_common::{is_safe_npm_name, parse_npm_purl, tgz_rel_leaf};
 
 /// `npm-shrinkwrap.json` wins over `package-lock.json` when both exist —
 /// npm itself ignores the package-lock in that case, so editing it would be
@@ -85,38 +85,15 @@ pub async fn vendor_npm(
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
-    // ── 1. Coordinates ──────────────────────────────────────────────────
-    // SECURITY: name/version/uuid come from a committed, tamper-able
-    // manifest and key the artifact path under `.socket/vendor/npm/` plus
-    // the `file:` string written into the lock. A `..` segment, separator,
-    // or non-canonical uuid would escape the vendor dir (arbitrary write on
-    // vendor, arbitrary delete on revert) — reject fail-closed before any
-    // disk access.
-    let Some((name, version)) = parse_npm_purl(purl) else {
-        return refused(
-            "unsafe_coordinates",
-            format!("cannot parse an npm name@version out of `{purl}`"),
-        );
+    // ── 1. Coordinates (shared guard: fail-closed before any disk access,
+    //       see `npm_common::guard_coordinates` for the security note) ────
+    let coords = match guard_coordinates(purl, record) {
+        Ok(coords) => coords,
+        Err(outcome) => return *outcome,
     };
-    if !is_safe_npm_name(name) || !path_safety::is_safe_single_segment(version) {
-        return refused(
-            "unsafe_coordinates",
-            format!(
-                "refusing to vendor `{name}@{version}`: a `..` segment, absolute path, or \
-                 separator would escape .socket/vendor/npm/"
-            ),
-        );
-    }
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &record.uuid) else {
-        return refused(
-            "unsafe_coordinates",
-            format!(
-                "refusing to vendor with non-canonical patch uuid `{}`",
-                record.uuid
-            ),
-        );
-    };
-    let base_purl = strip_purl_qualifiers(purl).to_string();
+    let (name, version) = (coords.name, coords.version);
+    let uuid_dir_rel = coords.uuid_dir_rel;
+    let base_purl = coords.base_purl;
 
     // ── 2. Lockfile selection ───────────────────────────────────────────
     let (lock_name, lock_bytes) = match select_lockfile(project_root).await {
@@ -187,95 +164,39 @@ pub async fn vendor_npm(
         );
     }
 
-    // ── 4. Stage + patch a private copy ─────────────────────────────────
-    // The stage lives in a tempdir OUTSIDE the project: nothing inside the
-    // project is written until the patched tarball verifies.
-    let stage_tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => return done_failure(purl, format!("cannot create staging tempdir: {e}")),
-    };
-    let stage = stage_tmp.path().join("stage");
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
-        return done_failure(purl, format!("cannot stage a copy of the installed package: {e}"));
-    }
-    // The tarball must carry ONLY the package's own files: a nested
-    // node_modules (hoisting leftovers, file:-dep installs) would balloon
-    // the artifact and shadow the lock's own resolution.
-    if let Err(e) = remove_tree(&stage.join("node_modules")).await {
-        return done_failure(purl, format!("cannot prune staged node_modules: {e}"));
-    }
-    // Bundled dependencies ship INSIDE the package tarball; since we just
-    // dropped nested node_modules, repacking would produce a tarball npm
-    // cannot satisfy those deps from. Refuse before patching.
-    if let Ok(bytes) = tokio::fs::read(stage.join("package.json")).await {
-        if let Ok(pkg) = serde_json::from_slice::<Value>(&bytes) {
-            if declares_bundled_deps(&pkg) {
-                return refused(
-                    "vendor_bundled_deps_unsupported",
-                    format!(
-                        "{name}@{version} declares bundleDependencies; vendoring would repack \
-                         the tarball without its bundled node_modules and break installs"
-                    ),
-                );
-            }
-        }
-    }
-
-    // Delegate to the hardened apply pipeline, pointed at the stage (which
-    // plays the role of the installed package dir — manifest npm keys carry
-    // the `package/` prefix and `apply` strips it via `normalize_file_path`,
-    // exactly as it does for an in-place npm apply).
-    let result = apply_package_patch(
+    // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline:
+    //         tempdir stage outside the project, nested node_modules prune,
+    //         bundled-deps refusal, hardened apply, deterministic pack) ────
+    let (staged, result) = match stage_patch_pack(
         purl,
-        &stage,
-        &record.files,
+        installed_dir,
+        project_root,
+        record,
         sources,
-        Some(&record.uuid),
         dry_run,
         force,
     )
-    .await;
-    if !result.success {
-        // No lock writes — wiring is last, so a failed patch leaves the
-        // project byte-untouched.
-        return VendorOutcome::Done { result, entry: None, warnings };
-    }
-
-    // ── 5. Dry run stops after the verify ───────────────────────────────
-    if dry_run {
-        return VendorOutcome::Done { result, entry: None, warnings };
-    }
-
-    // ── 6. Pack the deterministic tarball ───────────────────────────────
-    let rel_tgz = format!("{uuid_dir_rel}/{}", tgz_rel_leaf(name, version));
-    let dest = project_root.join(&rel_tgz);
-    if let Some(parent) = dest.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return done_failure(purl, format!("cannot create {}: {e}", parent.display()));
-        }
-    }
-    let packed = match pack_deterministic(&stage, &dest).await {
-        Ok(p) => p,
-        Err(e) => return done_failure(purl, format!("cannot pack the vendored tarball: {e}")),
+    .await
+    {
+        Ok(pair) => pair,
+        Err(outcome) => return *outcome,
     };
+    let Some(staged) = staged else {
+        // Failed patch (no lock writes — wiring is last, so the project is
+        // byte-untouched) or a dry run (stops after the verify).
+        return VendorOutcome::Done { result, entry: None, warnings };
+    };
+    // `staged.name`/`staged.version` echo the validated coords (the wiring
+    // below keeps using the borrowed `name`/`version`).
+    debug_assert_eq!((staged.name.as_str(), staged.version.as_str()), (name, version));
+    let rel_tgz = staged.rel_tgz;
+    let packed = staged.packed;
+    let staged_pkg_json = staged.staged_pkg_json;
+    let dest = project_root.join(&rel_tgz);
     // Forward slashes by construction (uuid_dir_rel + leaf are built with
     // `/`), relative to the project dir — the spelling npm resolves
     // `file:` specs against.
     let resolved = format!("file:{rel_tgz}");
-
-    // ── 7. Patched package.json ⇒ the lock's dependency mirror is stale ─
-    let staged_pkg_json = if record
-        .files
-        .keys()
-        .any(|k| normalize_file_path(k) == "package.json")
-    {
-        match read_staged_package_json(&stage).await {
-            Ok(pkg) => Some(pkg),
-            Err(e) => return done_failure(purl, e),
-        }
-    } else {
-        None
-    };
 
     // ── 8. Lock rewrite (in-place Value mutation: untouched keys stay
     //       byte-stable thanks to serde_json's preserve_order) ────────────
@@ -402,6 +323,10 @@ pub async fn vendor_npm(
         took_over_go_patches: false,
         flavor: None,
         uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
     };
     VendorOutcome::Done { result, entry: Some(entry), warnings }
 }
@@ -759,42 +684,7 @@ fn revert_one_record(
 }
 
 // ───────────────────────────── small helpers ─────────────────────────────
-
-/// `pkg:npm/[@scope/]name@version` → `(name, version)`; scoped names keep
-/// the `@scope/` prefix. The LAST `@` separates the version (a leading
-/// scope-`@` is at index 0 and never the last `@` of a versioned purl).
-fn parse_npm_purl(purl: &str) -> Option<(&str, &str)> {
-    let base = strip_purl_qualifiers(purl);
-    let rest = base.strip_prefix("pkg:npm/")?;
-    let at = rest.rfind('@').filter(|&i| i > 0)?;
-    let (name, version) = (&rest[..at], &rest[at + 1..]);
-    if name.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((name, version))
-}
-
-/// npm-name shape on top of the generic traversal guard: at most one `/`,
-/// and only with an `@scope` first segment (so a smuggled `a/b/c` can't
-/// create surprise directory levels under the uuid dir).
-fn is_safe_npm_name(name: &str) -> bool {
-    if !path_safety::is_safe_multi_segment(name) {
-        return false;
-    }
-    match name.split_once('/') {
-        None => !name.starts_with('@'),
-        Some((scope, bare)) => scope.starts_with('@') && !bare.contains('/'),
-    }
-}
-
-/// The artifact path under the uuid dir: `[@scope/]<name>-<version>.tgz`,
-/// with the scope kept as a real subdirectory.
-fn tgz_rel_leaf(name: &str, version: &str) -> String {
-    match name.split_once('/') {
-        Some((scope, bare)) => format!("{scope}/{bare}-{version}.tgz"),
-        None => format!("{name}-{version}.tgz"),
-    }
-}
+// (the flavor-agnostic coordinate/staging helpers live in `npm_common`)
 
 async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String, Vec<u8>)>> {
     for lock_name in [SHRINKWRAP, PACKAGE_LOCK] {
@@ -805,25 +695,6 @@ async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String,
         }
     }
     Ok(None)
-}
-
-/// `bundleDependencies` (npm) / `bundledDependencies` (legacy alias):
-/// `true` means "all deps", an array names them; either makes the package
-/// unvendorable (see the refusal site).
-fn declares_bundled_deps(pkg: &Value) -> bool {
-    ["bundleDependencies", "bundledDependencies"].iter().any(|k| match pkg.get(*k) {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Array(a)) => !a.is_empty(),
-        _ => false,
-    })
-}
-
-async fn read_staged_package_json(stage: &Path) -> Result<Value, String> {
-    let bytes = tokio::fs::read(stage.join("package.json"))
-        .await
-        .map_err(|e| format!("patched package.json unreadable in the stage: {e}"))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| format!("patched package.json is not parseable JSON: {e}"))
 }
 
 /// The lock's indent unit: the leading whitespace of the first indented
@@ -850,20 +721,6 @@ fn serialize_lock(lock: &Value, indent: &str) -> std::io::Result<Vec<u8>> {
     lock.serialize(&mut ser).map_err(std::io::Error::other)?;
     out.push(b'\n');
     Ok(out)
-}
-
-fn refused(code: &'static str, detail: String) -> VendorOutcome {
-    VendorOutcome::Refused { code, detail }
-}
-
-/// A backend failure after the refusal phase: `Done` with a failed
-/// [`ApplyResult`], mirroring `go_redirect`'s synthesized results.
-fn done_failure(purl: &str, error: String) -> VendorOutcome {
-    VendorOutcome::Done {
-        result: synthesized_result(purl, Path::new(""), Vec::new(), false, Some(error)),
-        entry: None,
-        warnings: Vec::new(),
-    }
 }
 
 fn synthesized_result(
@@ -1605,6 +1462,10 @@ mod tests {
             took_over_go_patches: false,
             flavor: None,
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         };
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(!outcome.success, "tampered uuid must fail closed");

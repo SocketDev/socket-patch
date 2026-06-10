@@ -707,6 +707,10 @@ async fn vendored_golang_purl_skipped_by_apply() {
             took_over_go_patches: false,
             flavor: None,
             uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
         },
     );
     socket_patch_core::patch::vendor::save_state(root, &state)
