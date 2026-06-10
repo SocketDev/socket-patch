@@ -253,12 +253,33 @@ async fn scan_vendor_detached_mode_writes_no_manifest() {
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
 
-    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--detached"]);
+    let (code, stdout, stderr) = run_scan_vendor(
+        tmp.path(),
+        &mock.uri(),
+        &["--detached", "--vex", "out.vex.json"],
+    );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(v["download"]["detached"], true, "envelope={v}");
     assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+
+    // Embedded VEX works manifest-less: the detached entry's embedded
+    // record is the attestation source.
+    assert_eq!(v["vex"]["statements"], 1, "envelope={v}");
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("out.vex.json")).unwrap(),
+    )
+    .unwrap();
+    let stmts = doc["statements"].as_array().expect("statements");
+    assert_eq!(stmts.len(), 1, "doc={doc}");
+    assert!(
+        stmts[0]["impact_statement"]
+            .as_str()
+            .unwrap()
+            .contains("(vendored)"),
+        "doc={doc}"
+    );
 
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
