@@ -27,6 +27,7 @@ const ORG_SLUG: &str = "test-org";
 ///     manifest-not-found / override assertions would be meaningless;
 ///   * `SOCKET_DOWNLOAD_ONLY` / `SOCKET_DOWNLOAD_MODE` / `SOCKET_DRY_RUN`
 ///     could flip the cleanup-vs-download branch out from under the test.
+///
 /// We scrub the whole set and then re-set only the handful a given test
 /// deliberately controls.
 const SOCKET_ENV_VARS: &[&str] = &[
@@ -495,7 +496,7 @@ async fn repair_online_downloads_missing_blob() {
             "file",
             "--download-only",
         ])
-        .env("SOCKET_API_URL", &mock.uri())
+        .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token-for-test")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
         .output()

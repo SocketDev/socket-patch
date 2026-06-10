@@ -228,6 +228,9 @@ async fn crawl_all_handles_unreadable_cache_path() {
 
 /// `GoCrawler::default()` should forward to `new()` — and the two must be
 /// behaviorally identical, not merely both constructible.
+// The whole point of this test is to exercise `::default()`, so the
+// `default_constructed_unit_structs` lint is deliberately allowed here.
+#[allow(clippy::default_constructed_unit_structs)]
 #[tokio::test]
 async fn go_crawler_default_and_new_construct_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -294,7 +297,7 @@ async fn find_by_purls_module_dir_missing_returns_empty() {
     let crawler = GoCrawler;
     let missing_purl = "pkg:golang/github.com/gin-gonic/gin@v9.9.9".to_string();
     let result = crawler
-        .find_by_purls(tmp.path(), &[missing_purl.clone()])
+        .find_by_purls(tmp.path(), std::slice::from_ref(&missing_purl))
         .await
         .unwrap();
     assert!(

@@ -290,7 +290,7 @@ fn test_pypi_full_lifecycle() {
     let has_cve = vulns.iter().any(|v| {
         v["cves"]
             .as_array()
-            .map_or(false, |cves| cves.iter().any(|c| c == "CVE-2026-25580"))
+            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2026-25580"))
     });
     assert!(has_cve, "vulnerability list should include CVE-2026-25580");
 

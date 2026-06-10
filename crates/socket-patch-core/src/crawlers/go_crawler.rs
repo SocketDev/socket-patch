@@ -915,7 +915,7 @@ mod tests {
         let crawler = GoCrawler::new();
         let qualified = "pkg:golang/github.com/gin-gonic/gin@v1.9.1?type=module".to_string();
         let result = crawler
-            .find_by_purls(dir.path(), &[qualified.clone()])
+            .find_by_purls(dir.path(), std::slice::from_ref(&qualified))
             .await
             .unwrap();
 

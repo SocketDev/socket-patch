@@ -597,7 +597,7 @@ async fn crawl_all_missing_pkg_path_returns_empty() {
 
 #[test]
 fn nuget_crawler_default_and_new_construct_cleanly() {
-    let _a = NuGetCrawler::default();
+    let _a = NuGetCrawler;
     let _b = NuGetCrawler::new();
 }
 

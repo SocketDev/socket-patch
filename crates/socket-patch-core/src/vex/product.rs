@@ -1129,9 +1129,9 @@ mod tests {
         );
     }
 
-    /// When multiple manifests are present but NONE parse, there is no
-    /// product to surface and therefore no "using X" warning to emit
-    /// (it would name a manifest that wasn't actually used).
+    // When multiple manifests are present but NONE parse, there is no
+    // product to surface and therefore no "using X" warning to emit
+    // (it would name a manifest that wasn't actually used).
     // ── Regression: TOML single-quoted (literal) string values ────────
     // TOML permits `key = 'value'` (literal strings) as well as
     // `key = "value"`. The scanner previously only accepted the

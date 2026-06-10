@@ -152,7 +152,7 @@ fn assert_apply_dispatched(code: i32, env: &Value, ecosystem: &str, expected_pur
     );
     for purl in expected_purls {
         let found = events.iter().any(|e| {
-            e["purl"] == Value::from(*purl)
+            e["purl"] == *purl
                 && e["action"] == "skipped"
                 && e["errorCode"] == "package_not_installed"
         });
@@ -192,7 +192,7 @@ fn assert_apply_not_dispatched(env: &Value, ecosystem: &str, out_of_scope_purls:
         events.len()
     );
     for purl in out_of_scope_purls {
-        let leaked = events.iter().any(|e| e["purl"] == Value::from(*purl));
+        let leaked = events.iter().any(|e| e["purl"] == *purl);
         assert!(
             !leaked,
             "apply --ecosystems={ecosystem}: out-of-scope PURL {purl} leaked into events — the --ecosystems filter did not exclude it; env={env}"

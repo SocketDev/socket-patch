@@ -155,7 +155,7 @@ async fn read_package_json_empty_version_returns_none() {
 #[test]
 fn npm_crawler_new_and_default_construct_cleanly() {
     let _a = NpmCrawler::new();
-    let _b = NpmCrawler::default();
+    let _b = NpmCrawler;
 }
 
 // ── get_node_modules_paths ─────────────────────────────────────
@@ -494,7 +494,7 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     let crawler = NpmCrawler;
     let qualified = "pkg:npm/lodash@4.17.21?extension=tgz".to_string();
     let result = crawler
-        .find_by_purls(&nm, &[qualified.clone()])
+        .find_by_purls(&nm, std::slice::from_ref(&qualified))
         .await
         .unwrap();
 

@@ -268,8 +268,7 @@ async fn requested_purls(server: &MockServer) -> Vec<String> {
         .filter(|r| format!("{}", r.method) == "GET")
         .filter_map(|r| {
             let p = r.url.path();
-            p.strip_prefix("/patch/by-package/")
-                .map(|seg| percent_decode(seg))
+            p.strip_prefix("/patch/by-package/").map(percent_decode)
         })
         .collect()
 }
@@ -454,7 +453,7 @@ fn test_gem_full_lifecycle() {
 
     let files = &patch["files"];
     assert!(
-        files.as_object().map_or(false, |f| !f.is_empty()),
+        files.as_object().is_some_and(|f| !f.is_empty()),
         "patch should modify at least one file"
     );
 
@@ -487,7 +486,7 @@ fn test_gem_full_lifecycle() {
     let has_cve = vulns.iter().any(|v| {
         v["cves"]
             .as_array()
-            .map_or(false, |cves| cves.iter().any(|c| c == "CVE-2022-21831"))
+            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2022-21831"))
     });
     assert!(has_cve, "vulnerability list should include CVE-2022-21831");
 

@@ -545,7 +545,7 @@ mod tests {
         let json = r#"{ "patches": {}, "setup": {} }"#;
         let manifest: PatchManifest = serde_json::from_str(json).unwrap();
         // The empty object parses into a (logically empty) config...
-        assert!(manifest.setup.as_ref().map_or(true, SetupConfig::is_empty));
+        assert!(manifest.setup.as_ref().is_none_or(SetupConfig::is_empty));
         // ...but must not survive into the serialized form.
         let reserialized = serde_json::to_string(&manifest).unwrap();
         assert!(

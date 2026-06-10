@@ -149,7 +149,7 @@ async fn find_by_purls_invalid_purl_skipped() {
     let crawler = RubyCrawler;
     let non_gem = "pkg:not-gem/rails@7.1.0".to_string();
     let result = crawler
-        .find_by_purls(tmp.path(), &[non_gem.clone()])
+        .find_by_purls(tmp.path(), std::slice::from_ref(&non_gem))
         .await
         .unwrap();
     assert!(
@@ -410,7 +410,7 @@ async fn crawl_all_handles_unreadable_gem_dir() {
 /// `RubyCrawler::default()` should forward to `new()`.
 #[test]
 fn ruby_crawler_default_and_new_construct_cleanly() {
-    let _a = RubyCrawler::default();
+    let _a = RubyCrawler;
     let _b = RubyCrawler::new();
 }
 

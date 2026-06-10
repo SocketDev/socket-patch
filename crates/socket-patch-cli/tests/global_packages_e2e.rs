@@ -172,7 +172,7 @@ fn assert_rollback_noop(stdout: &str) {
 #[test]
 fn apply_global_resolves_real_npm_prefix() {
     let tmp = tempfile::tempdir().unwrap();
-    write_manifest(&tmp.path(), "pkg:npm/__global_test__@1.0.0");
+    write_manifest(tmp.path(), "pkg:npm/__global_test__@1.0.0");
 
     let out = Command::new(binary())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
@@ -192,7 +192,7 @@ fn apply_global_resolves_real_npm_prefix() {
 #[test]
 fn rollback_global_resolves_real_npm_prefix() {
     let tmp = tempfile::tempdir().unwrap();
-    write_manifest(&tmp.path(), "pkg:npm/__rollback_global__@1.0.0");
+    write_manifest(tmp.path(), "pkg:npm/__rollback_global__@1.0.0");
 
     let out = Command::new(binary())
         .args(["rollback", "--global", "--offline", "--json", "--silent"])
@@ -354,7 +354,7 @@ fn apply_global_with_empty_path_handles_missing_npm() {
     // deterministic "package_not_installed" outcome as a resolved-but-
     // empty global tree.
     let tmp = tempfile::tempdir().unwrap();
-    write_manifest(&tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
+    write_manifest(tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
 
     let out = Command::new(binary())
         .args(["apply", "--global", "--offline", "--json", "--silent"])
@@ -376,7 +376,7 @@ fn apply_global_with_empty_path_handles_missing_npm() {
 #[test]
 fn rollback_global_with_empty_path_handles_missing_npm() {
     let tmp = tempfile::tempdir().unwrap();
-    write_manifest(&tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
+    write_manifest(tmp.path(), "pkg:npm/__missing_npm__@1.0.0");
 
     let out = Command::new(binary())
         .args(["rollback", "--global", "--offline", "--json", "--silent"])

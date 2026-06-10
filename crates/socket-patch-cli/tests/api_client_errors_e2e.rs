@@ -527,7 +527,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
             "--download-only",
         ])
         .current_dir(tmp.path())
-        .env("SOCKET_API_URL", &mock.uri())
+        .env("SOCKET_API_URL", mock.uri())
         .env("SOCKET_API_TOKEN", "fake-token")
         .env("SOCKET_ORG_SLUG", ORG_SLUG)
         .output()
@@ -575,7 +575,7 @@ async fn repair_with_blob_404_marks_failure_in_summary() {
     let has_failed_event = v
         .get("events")
         .and_then(|e| e.as_array())
-        .map_or(false, |a| a.iter().any(|e| e["action"] == "failed"));
+        .is_some_and(|a| a.iter().any(|e| e["action"] == "failed"));
     assert!(
         has_failed_event,
         "repair must emit a per-artifact `failed` event for the 404; got: {v}"

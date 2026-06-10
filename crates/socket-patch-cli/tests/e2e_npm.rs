@@ -195,7 +195,7 @@ fn test_npm_full_lifecycle() {
     let has_cve = vulns.iter().any(|v| {
         v["cves"]
             .as_array()
-            .map_or(false, |cves| cves.iter().any(|c| c == "CVE-2021-44906"))
+            .is_some_and(|cves| cves.iter().any(|c| c == "CVE-2021-44906"))
     });
     assert!(has_cve, "vulnerability list should include CVE-2021-44906");
 

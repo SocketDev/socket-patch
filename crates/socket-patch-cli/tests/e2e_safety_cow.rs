@@ -128,6 +128,7 @@ fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) 
 ///   * the atomic writer (`apply::write_atomic`) stages `.socket-stage-*`,
 ///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
 ///     branches) stages `.socket-cow-*`.
+///
 /// Both must be renamed-over on success or unlinked on failure, so a
 /// completed apply — success OR clean failure — must leave neither prefix
 /// behind.

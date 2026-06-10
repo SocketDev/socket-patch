@@ -10,6 +10,10 @@
 //! take an identifier), we supply a dummy value alongside the flag under
 //! test so clap's parser can complete.
 
+// The case tables below are tuples ending in `fn(&GlobalArgs)` pointers; a
+// `type` alias per shape would add more noise than it removes in this test.
+#![allow(clippy::type_complexity)]
+
 use std::path::PathBuf;
 
 use clap::Parser;

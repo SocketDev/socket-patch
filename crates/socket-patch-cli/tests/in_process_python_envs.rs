@@ -106,7 +106,7 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
             yes: true,
             global: false,
             global_prefix: None,
-            api_url: api_url,
+            api_url,
             api_token: Some("fake".to_string()),
             ecosystems: Some(vec!["pypi".to_string()]),
             download_mode: "diff".to_string(),

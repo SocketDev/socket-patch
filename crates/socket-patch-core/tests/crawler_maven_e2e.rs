@@ -69,7 +69,7 @@ fn parse_pom_well_formed_extracts_coordinates() {
 }
 
 #[test]
-fn parse_pom_missing_groupId_returns_none() {
+fn parse_pom_missing_group_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
   <artifactId>commons-lang3</artifactId>
@@ -165,7 +165,7 @@ fn parse_pom_property_reference_version_returns_none() {
 /// reference — must NOT be accepted as a fallback groupId (line 86-87
 /// skip arm).
 #[test]
-fn parse_pom_missing_artifactId_returns_none() {
+fn parse_pom_missing_artifact_id_returns_none() {
     let pom = r#"<?xml version="1.0"?>
 <project>
   <groupId>org.apache.commons</groupId>
@@ -195,7 +195,7 @@ fn parse_pom_split_tag_returns_none() {
 /// `MavenCrawler::default()` should forward to `new()`.
 #[test]
 fn maven_crawler_default_and_new_construct_cleanly() {
-    let _a = MavenCrawler::default();
+    let _a = MavenCrawler;
     let _b = MavenCrawler::new();
 }
 

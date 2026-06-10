@@ -84,6 +84,7 @@ fn sample_doc() -> Document {
 /// transpose to collapse:
 ///   * two PURLs into one product with TWO subcomponents, and
 ///   * the duplicated `CVE-DUP` into a single alias.
+///
 /// The uniqueness/dedup conformance invariants below are vacuous
 /// against `sample_doc`; they only have teeth against a merged
 /// statement.

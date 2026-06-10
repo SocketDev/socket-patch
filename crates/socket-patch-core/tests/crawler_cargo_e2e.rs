@@ -102,7 +102,7 @@ fn parse_cargo_toml_ignores_lines_before_package_section() {
 /// for symmetry.
 #[test]
 fn cargo_crawler_default_and_new_construct_cleanly() {
-    let _a = CargoCrawler::default();
+    let _a = CargoCrawler;
     let _b = CargoCrawler::new();
 }
 

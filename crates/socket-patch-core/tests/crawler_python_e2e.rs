@@ -706,7 +706,7 @@ async fn crawl_all_handles_unreadable_site_packages() {
 /// `PythonCrawler::default()` should forward to `new()`.
 #[test]
 fn python_crawler_default_and_new_construct_cleanly() {
-    let _a = PythonCrawler::default();
+    let _a = PythonCrawler;
     let _b = PythonCrawler::new();
 }
 

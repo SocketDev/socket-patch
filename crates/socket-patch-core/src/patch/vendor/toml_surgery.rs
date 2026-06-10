@@ -237,8 +237,7 @@ mod tests {
     fn find_unit_span_selects_the_matching_package_unit() {
         // The first unit includes its [package.*] sub-table but not the
         // trailing blank separator.
-        let span =
-            find_unit_span(LOCK, |lines| lines.iter().any(|l| *l == "name = \"proj\"")).unwrap();
+        let span = find_unit_span(LOCK, |lines| lines.contains(&"name = \"proj\"")).unwrap();
         let unit = &LOCK[span];
         assert!(unit.starts_with("[[package]]"));
         assert!(unit.contains("[package.metadata]"), "sub-table included");
@@ -248,18 +247,14 @@ mod tests {
         );
 
         // The second (last) unit ends at the last non-blank line.
-        let span =
-            find_unit_span(LOCK, |lines| lines.iter().any(|l| *l == "name = \"six\"")).unwrap();
+        let span = find_unit_span(LOCK, |lines| lines.contains(&"name = \"six\"")).unwrap();
         assert_eq!(
             &LOCK[span],
             "[[package]]\nname = \"six\"\nversion = \"1.16.0\""
         );
 
         // No match → None.
-        assert!(find_unit_span(LOCK, |lines| lines
-            .iter()
-            .any(|l| *l == "name = \"absent\""))
-        .is_none());
+        assert!(find_unit_span(LOCK, |lines| lines.contains(&"name = \"absent\"")).is_none());
     }
 
     #[test]

@@ -309,6 +309,9 @@ mod tests {
         assert!(!is_deno_project(tmp.path()).await);
     }
 
+    // The whole point of this test is to exercise `::default()`, so the
+    // `default_constructed_unit_structs` lint is deliberately allowed here.
+    #[allow(clippy::default_constructed_unit_structs)]
     #[tokio::test]
     async fn deno_crawler_default_and_new_construct_cleanly() {
         let _a = DenoCrawler::default();

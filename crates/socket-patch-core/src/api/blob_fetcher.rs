@@ -585,7 +585,7 @@ mod tests {
             files.insert(
                 format!("package/file{}.js", i),
                 PatchFileInfo {
-                    before_hash: format!("before{}{}", "0".repeat(58), format!("{:06}", i)),
+                    before_hash: format!("before{}{:06}", "0".repeat(58), i),
                     after_hash: ah.to_string(),
                 },
             );

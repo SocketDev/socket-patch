@@ -28,9 +28,9 @@
 //! 2. **Negative control**: mutate the source file without running
 //!    apply, run `cargo check` — fails with "checksum changed".
 //!    Proves cargo actually verifies.
-//! 3. **Sidecar round trip**: synthesize a `.socket/manifest.json`
-//!    + after-hash blob, run `socket-patch apply`, run `cargo check`
-//!    — succeeds. The sidecar fixup is the load-bearing piece.
+//! 3. **Sidecar round trip**: synthesize a `.socket/manifest.json` plus an
+//!    after-hash blob, run `socket-patch apply`, run `cargo check` — it
+//!    succeeds. The sidecar fixup is the load-bearing piece.
 //! 4. **`package` field preserved**: assert
 //!    `.cargo-checksum.json`'s `"package"` key survives the rewrite
 //!    unchanged (cargo doesn't verify it at build time, but we
