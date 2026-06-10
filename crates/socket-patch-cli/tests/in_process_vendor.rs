@@ -715,46 +715,47 @@ async fn offline_missing_source_fails() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 10a. apply after vendor — npm (documented in-place behavior)
+// 10a. apply after vendor — npm yields with skipped/vendored
 // ─────────────────────────────────────────────────────────────────────
 
-/// DOCUMENTED BEHAVIOR, deliberately pinned: for npm, `apply` does NOT
-/// consult the vendor ledger (only the golang path calls
-/// `is_purl_vendored`, because a go re-apply would repoint the vendor-owned
-/// `replace` directive). An npm apply after vendor simply patches
-/// node_modules in place — harmless: the lockfile still consumes the
-/// vendored tarball, and the in-place edit makes the installed tree match
-/// the patched bytes. The vendored artifact and the lock wiring are
-/// untouched.
+/// Apply yields to vendor for EVERY ecosystem (CLI_CONTRACT.md): a purl
+/// recorded in `.socket/vendor/state.json` is skipped with reason
+/// `vendored` — the committed artifact + lock wiring are the patch, so an
+/// in-place re-patch of node_modules is redundant at best and fights the
+/// vendor lifecycle at worst. Installed tree, lock, and artifact must all
+/// be byte-untouched.
 #[tokio::test]
-async fn vendored_npm_purl_apply_patches_in_place() {
-    use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
-
+async fn vendored_npm_purl_skipped_by_apply() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     let lock_after_vendor = fx.lock_bytes();
     let tgz_after_vendor = std::fs::read(fx.tgz_path()).unwrap();
     assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
 
-    let apply_args = ApplyArgs {
-        common: GlobalArgs {
-            cwd: fx.root().to_path_buf(),
-            json: true,
-            silent: true,
-            offline: true,
-            ..GlobalArgs::default()
-        },
-        force: false,
-        check: false,
-        vex: Default::default(),
-    };
-    assert_eq!(apply_run(apply_args).await, 0, "apply after vendor exits 0");
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "apply after vendor exits 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    let skipped = find_event(&env, "skipped", Some("vendored"));
+    assert_eq!(skipped["purl"], PURL);
+    assert_eq!(env["summary"]["applied"], 0);
 
     assert_eq!(
         std::fs::read(fx.installed_index()).unwrap(),
-        PATCHED_INDEX,
-        "npm apply patches node_modules in place even when the purl is vendored \
-         (apply consults the vendor ledger for golang only)"
+        ORIG_INDEX,
+        "apply must not re-patch a vendor-owned installed tree"
     );
     assert_eq!(
         fx.lock_bytes(),
@@ -765,6 +766,45 @@ async fn vendored_npm_purl_apply_patches_in_place() {
         std::fs::read(fx.tgz_path()).unwrap(),
         tgz_after_vendor,
         "apply must not touch the vendored artifact"
+    );
+}
+
+/// The wiped-tree variant: with node_modules gone entirely, a vendored
+/// purl must STILL surface as `skipped`/`vendored` (exit 0) — never as
+/// `package_not_installed` — because the committed artifact is the source
+/// of truth, not the installed tree.
+#[tokio::test]
+async fn vendored_npm_purl_skipped_even_without_installed_tree() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(
+        code, 0,
+        "vendored purl with no installed tree must exit 0: {env:#}"
+    );
+    assert_eq!(env["status"], "success");
+    let skipped = find_event(&env, "skipped", Some("vendored"));
+    assert_eq!(skipped["purl"], PURL);
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "package_not_installed"),
+        "vendored must win over package_not_installed: {env:#}"
     );
 }
 

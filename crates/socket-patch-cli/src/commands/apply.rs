@@ -107,23 +107,10 @@ async fn try_local_go_apply(
     if !is_local_go(purl, common) {
         return None;
     }
-    // Vendor ownership wins: a module recorded in `.socket/vendor/state.json`
-    // is managed by the explicit `socket-patch vendor` action; the implicit
-    // apply must not repoint its `replace` back at `.socket/go-patches/`.
-    // The synthesized result's vendored package_path routes the event to
-    // `Skipped`/`vendored` (see `result_to_event`).
-    if socket_patch_core::patch::vendor::is_purl_vendored(&common.cwd, purl).await {
-        return Some(ApplyResult {
-            package_key: purl.to_string(),
-            package_path: VENDOR_OWNED_MARKER.to_string(),
-            success: true,
-            files_verified: Vec::new(),
-            files_patched: Vec::new(),
-            applied_via: HashMap::new(),
-            error: None,
-            sidecar: None,
-        });
-    }
+    // NOTE: vendor ownership is enforced upstream for every ecosystem —
+    // `apply_patches_inner` synthesizes a `Skipped`/`vendored` result and
+    // never routes a vendored purl here, so this function only sees
+    // modules the implicit apply actually owns.
     // `pkg_path` is the pristine, case-encoded module-cache dir; `module`/
     // `version` are the decoded PURL components keying the copy + `replace`.
     let (module, version) = parse_golang_purl(purl)?;
@@ -763,6 +750,67 @@ async fn apply_patches_inner(
         .flat_map(|purls| purls.iter().cloned())
         .collect();
 
+    // Vendor ownership wins for EVERY ecosystem: a purl recorded in
+    // `.socket/vendor/state.json` is managed by the explicit `vendor`
+    // action — apply must not re-patch its installed tree (or repoint a
+    // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
+    // by ledger key, resolved base purl, or qualifier-stripped key so
+    // release-variant manifest keys (pypi `?artifact_id=`…) hit too.
+    // Unreadable state degrades to "nothing vendored" (the same fail-open
+    // contract as `is_purl_vendored`).
+    let vendored_purls: HashSet<String> =
+        match socket_patch_core::patch::vendor::load_state(&args.common.cwd).await {
+            Ok(state) => state
+                .entries
+                .iter()
+                .flat_map(|(key, entry)| {
+                    [
+                        key.clone(),
+                        entry.base_purl.clone(),
+                        strip_purl_qualifiers(key).to_string(),
+                    ]
+                })
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+    let is_vendored =
+        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+
+    // Synthesize one vendor-owned result per in-scope vendored purl BEFORE
+    // the crawl-driven matching (and its empty-crawl early returns): a
+    // vendored package must surface as `Skipped`/`vendored` — never as
+    // `package_not_installed` — even when its installed tree is absent
+    // (e.g. node_modules wiped; the committed artifact is the source of
+    // truth). Sorted for deterministic event order.
+    let mut results: Vec<ApplyResult> = Vec::new();
+    let mut matched_manifest_purls: HashSet<String> = HashSet::new();
+    let mut vendored_targets: Vec<String> = target_manifest_purls
+        .iter()
+        .filter(|p| is_vendored(p))
+        .cloned()
+        .collect();
+    vendored_targets.sort();
+    for purl in vendored_targets {
+        results.push(ApplyResult {
+            package_key: purl.clone(),
+            package_path: VENDOR_OWNED_MARKER.to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        });
+        matched_manifest_purls.insert(purl);
+    }
+    // A vendored variant accounts for its qualified siblings (mirrors
+    // vendor's own unmatched accounting): the other variants describe
+    // distributions of the same package@version that vendor now owns.
+    let vendored_bases: HashSet<String> = matched_manifest_purls
+        .iter()
+        .map(|p| strip_purl_qualifiers(p).to_string())
+        .collect();
+
     // Local go: prune `replace`-redirects whose patches were dropped from the
     // manifest (orphans). Done here — before the crawl + the "no packages
     // found" early returns — so orphans are reconciled even when the manifest
@@ -800,22 +848,32 @@ async fn apply_patches_inner(
     }
 
     if all_packages.is_empty() {
-        if !args.common.silent && !args.common.json {
+        // Vendored purls are already accounted for (synthesized Skipped/
+        // vendored results above); only the remainder is genuinely
+        // unmatched. An all-vendored manifest with an absent installed
+        // tree is a SUCCESS — the committed artifacts are the patch.
+        let unmatched: Vec<String> = target_manifest_purls
+            .iter()
+            .filter(|p| {
+                !matched_manifest_purls.contains(*p)
+                    && !vendored_bases.contains(strip_purl_qualifiers(p))
+            })
+            .cloned()
+            .collect();
+        if !unmatched.is_empty() && !args.common.silent && !args.common.json {
             eprintln!("Warning: No packages found that match available patches");
             eprintln!(
                 "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
-                target_manifest_purls.len()
+                unmatched.len()
             );
             eprintln!(
                 "  Check that packages are installed and --cwd points to the right directory."
             );
         }
-        let unmatched: Vec<String> = target_manifest_purls.iter().cloned().collect();
-        return Ok((false, Vec::new(), unmatched));
+        return Ok((unmatched.is_empty(), results, unmatched));
     }
 
     // Apply patches
-    let mut results: Vec<ApplyResult> = Vec::new();
     let mut has_errors = false;
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
@@ -836,7 +894,6 @@ async fn apply_patches_inner(
     }
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
-    let mut matched_manifest_purls: HashSet<String> = HashSet::new();
 
     for (purl, pkg_path) in &all_packages {
         if Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants()) {
@@ -849,6 +906,15 @@ async fn apply_patches_inner(
                 .get(&base_purl)
                 .cloned()
                 .unwrap_or_else(|| vec![base_purl.clone()]);
+
+            // Vendor-owned base: the synthesized results above already
+            // reported it; re-attempting here would re-patch a vendored
+            // tree and mis-flag `has_errors` when every variant skips.
+            if vendored_bases.contains(base_purl.as_str())
+                || variants.iter().any(|v| is_vendored(v))
+            {
+                continue;
+            }
             let mut applied = false;
             // Did at least one variant reach `apply_package_patch`? A
             // variant reaches it only after passing the first-file
@@ -957,6 +1023,11 @@ async fn apply_patches_inner(
                 }
             }
         } else {
+            // Vendor-owned purl: already reported by the synthesized
+            // Skipped/vendored result above.
+            if is_vendored(purl) {
+                continue;
+            }
             // npm PURLs: direct lookup
             let patch = match manifest.patches.get(purl) {
                 Some(p) => p,
@@ -1008,10 +1079,15 @@ async fn apply_patches_inner(
         }
     }
 
-    // Check if targeted manifest entries had no matches
+    // Check if targeted manifest entries had no matches. Qualified siblings
+    // of a vendored variant are accounted for by the vendored base, not
+    // "not installed".
     let unmatched: Vec<String> = target_manifest_purls
         .iter()
-        .filter(|p| !matched_manifest_purls.contains(*p))
+        .filter(|p| {
+            !matched_manifest_purls.contains(*p)
+                && !vendored_bases.contains(strip_purl_qualifiers(p))
+        })
         .cloned()
         .collect();
 
