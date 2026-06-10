@@ -223,9 +223,14 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        // Prune now-empty .socket/vendor (and only it — never recursive).
+        // Prune now-empty ecosystem levels, then .socket/vendor itself.
+        // `remove_dir` is non-recursive: a dir still holding artifacts (or
+        // anything we don't own) fails harmlessly and is kept.
         let vendor_root = project_root.join(VENDOR_DIR);
-        let _ = tokio::fs::remove_dir(&vendor_root).await; // fails non-empty: fine
+        for eco in super::path::ECOSYSTEM_DIRS {
+            let _ = tokio::fs::remove_dir(vendor_root.join(eco)).await;
+        }
+        let _ = tokio::fs::remove_dir(&vendor_root).await;
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -368,6 +373,9 @@ mod tests {
             .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
         save_state(root, &state).await.unwrap();
         tokio::fs::create_dir_all(root.join(".socket/vendor/npm")).await.unwrap();
+        tokio::fs::write(root.join(".socket/vendor/npm/stray.tgz"), b"x")
+            .await
+            .unwrap();
         state.entries.clear();
         save_state(root, &state).await.unwrap();
         assert!(root.join(".socket/vendor/npm").exists(), "non-empty dir kept");
