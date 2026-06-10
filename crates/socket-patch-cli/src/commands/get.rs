@@ -729,6 +729,175 @@ fn files_for_selection(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> 
 /// Download and apply a set of selected patches.
 ///
 /// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
+/// Download patches and their blobs WITHOUT touching the manifest, and
+/// return the fetched records keyed by purl — the `scan --vendor
+/// --detached` download phase, where the vendor ledger (not the manifest)
+/// carries the records. Honors the same installed-release narrowing as
+/// [`download_and_apply_patches`]. A purl already vendored DETACHED at the
+/// selected uuid skips the network fetch and reuses the ledger's embedded
+/// record, so idempotent re-runs stay cheap (mirrors what
+/// `decide_patch_action` does for the manifest-tracked flow).
+pub(crate) async fn download_patch_records(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
+    let mut overrides = params.api_overrides.clone();
+    if overrides.org_slug.is_none() {
+        overrides.org_slug = params.org.clone();
+    }
+    let (api_client, _) =
+        socket_patch_core::api::client::get_api_client_with_overrides(overrides).await;
+    let effective_org: Option<&str> = None;
+
+    let socket_dir = params.cwd.join(".socket");
+    let blobs_dir = socket_dir.join("blobs");
+    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+        let err = format!("Failed to create blobs directory: {}", e);
+        report_error(params.json, &err);
+        return (
+            1,
+            serde_json::json!({"status": "error", "error": err}),
+            HashMap::new(),
+        );
+    }
+
+    let mut narrow_warnings: Vec<String> = Vec::new();
+    let selected_owned: Vec<PatchSearchResult>;
+    let selected: &[PatchSearchResult] = if params.all_releases {
+        selected
+    } else {
+        let (kept, warns) =
+            filter_to_installed_releases(selected, params, &api_client, effective_org).await;
+        if !params.json && !params.silent {
+            for w in &warns {
+                eprintln!("  [note] {w}");
+            }
+        }
+        narrow_warnings = warns;
+        selected_owned = kept;
+        &selected_owned
+    };
+
+    let vendor_state = socket_patch_core::patch::vendor::load_state(&params.cwd)
+        .await
+        .unwrap_or_default();
+
+    let mut records: HashMap<String, PatchRecord> = HashMap::new();
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut patch_records_json: Vec<serde_json::Value> = Vec::new();
+
+    for search_result in selected {
+        // Idempotency: a detached entry already at this uuid carries its
+        // own record — no view fetch needed.
+        let existing = vendor_state
+            .entries
+            .get(&search_result.purl)
+            .or_else(|| {
+                vendor_state
+                    .entries
+                    .values()
+                    .find(|e| e.base_purl == search_result.purl)
+            })
+            .filter(|e| e.detached && e.uuid == search_result.uuid);
+        if let Some(record) = existing.and_then(|e| e.record.clone()) {
+            if !params.json && !params.silent {
+                eprintln!("  [skip] {} (already vendored)", search_result.purl);
+            }
+            patch_records_json.push(serde_json::json!({
+                "purl": search_result.purl,
+                "uuid": search_result.uuid,
+                "action": "skipped",
+            }));
+            records.insert(search_result.purl.clone(), record);
+            skipped += 1;
+            continue;
+        }
+
+        match api_client
+            .fetch_patch(effective_org, &search_result.uuid)
+            .await
+        {
+            Ok(Some(patch)) => {
+                // Same both-hashes rule as the download flow: new files
+                // (no beforeHash) are skipped from the record.
+                let mut files = HashMap::new();
+                for (file_path, file_info) in &patch.files {
+                    if let (Some(before), Some(after)) =
+                        (&file_info.before_hash, &file_info.after_hash)
+                    {
+                        files.insert(
+                            file_path.clone(),
+                            PatchFileInfo {
+                                before_hash: before.clone(),
+                                after_hash: after.clone(),
+                            },
+                        );
+                    }
+                }
+                let quiet = params.json || params.silent;
+                if write_all_patch_blobs(&blobs_dir, &patch, quiet)
+                    .await
+                    .is_err()
+                {
+                    failed += 1;
+                    patch_records_json.push(serde_json::json!({
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "error": "Blob decode or write failed",
+                    }));
+                    continue;
+                }
+                if !params.json && !params.silent {
+                    eprintln!("  [fetch] {}", patch.purl);
+                }
+                let mut record_json = serde_json::json!({
+                    "purl": patch.purl,
+                    "uuid": patch.uuid,
+                    "action": "downloaded",
+                });
+                merge_metadata(&mut record_json, patch_event_metadata(&patch));
+                patch_records_json.push(record_json);
+                records.insert(patch.purl.clone(), build_patch_record(&patch, files));
+                downloaded += 1;
+            }
+            Ok(None) => {
+                failed += 1;
+                patch_records_json.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": "could not fetch details",
+                }));
+            }
+            Err(e) => {
+                failed += 1;
+                patch_records_json.push(serde_json::json!({
+                    "purl": search_result.purl,
+                    "uuid": search_result.uuid,
+                    "action": "failed",
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+
+    let mut result_json = serde_json::json!({
+        "found": selected.len(),
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "failed": failed,
+        "detached": true,
+        "patches": patch_records_json,
+    });
+    if !narrow_warnings.is_empty() {
+        result_json["warnings"] = serde_json::json!(narrow_warnings);
+    }
+    (i32::from(failed > 0), result_json, records)
+}
+
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,

@@ -723,7 +723,8 @@ pub(crate) async fn vendor_records(
 }
 
 /// Revert vendored entries whose patches were dropped from the manifest.
-async fn reconcile_dropped(
+/// Shared with `scan --vendor` (which runs the same engine in-process).
+pub(crate) async fn reconcile_dropped(
     manifest: &PatchManifest,
     common: &GlobalArgs,
     env: &mut Envelope,

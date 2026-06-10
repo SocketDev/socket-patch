@@ -98,6 +98,8 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
         apply: false,
         prune: false,
         sync: true,
+        vendor: false,
+        detached: false,
         all_releases: false,
         vex: Default::default(),
     }
