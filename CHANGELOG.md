@@ -40,16 +40,6 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   patches by hashing the committed artifacts, and `apply` yields ownership of
   vendored packages (`vendored` skip reason).
 
-### Fixed
-
-- **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
-  previously verified golang patches against the pristine module cache
-  instead of the patched `.socket/go-patches/` copy, so redirect-applied
-  patches were silently omitted from the document (reported `not_applied`,
-  or `package_not_found` on cache-less CI). Verification now follows the
-  managed `replace` directive to the committed copy.
-
-### Added (pre-existing unreleased entries)
 
 - **Cargo support (`cargo` is now a default feature).** `apply` patches a Rust
   dependency **in place** wherever the crawler finds it — the project `vendor/`
@@ -88,6 +78,15 @@ source file in both crates was reviewed line by line, the bugs found were fixed,
 and regression tests were added throughout (the lib + integration suites grow by
 ~10k lines of mostly tests). The audit harness used to drive the review lives in
 `scripts/study-crates.ts`.
+
+### Fixed
+
+- **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
+  previously verified golang patches against the pristine module cache
+  instead of the patched `.socket/go-patches/` copy, so redirect-applied
+  patches were silently omitted from the document (reported `not_applied`,
+  or `package_not_found` on cache-less CI). Verification now follows the
+  managed `replace` directive to the committed copy.
 
 ### Security
 
