@@ -713,6 +713,53 @@ pub async fn run(args: ApplyArgs) -> i32 {
     }
 }
 
+/// Synthesize one vendor-owned `Skipped`/`vendored` result per in-scope
+/// vendored purl, BEFORE the crawl-driven matching (and its empty-crawl
+/// early returns): a vendored package must surface as vendored — never as
+/// `package_not_installed` — even when its installed tree is absent (e.g.
+/// node_modules wiped; the committed artifact is the source of truth).
+/// Sorted for deterministic event order. Returns `(results, matched,
+/// vendored_bases)` where `vendored_bases` lets a vendored variant account
+/// for its qualified siblings (mirrors vendor's own unmatched accounting).
+///
+/// A plain fn (not inlined into `apply_patches_inner`) so its temporaries
+/// don't ride the async poll frame — that frame sits on the
+/// scan→download→apply in-process chain and must fit Windows' 1 MiB
+/// main-thread stack in debug builds.
+fn synthesize_vendor_owned_results(
+    target_manifest_purls: &HashSet<String>,
+    vendored_purls: &HashSet<String>,
+) -> (Vec<ApplyResult>, HashSet<String>, HashSet<String>) {
+    let is_vendored =
+        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
+    let mut results: Vec<ApplyResult> = Vec::new();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut vendored_targets: Vec<String> = target_manifest_purls
+        .iter()
+        .filter(|p| is_vendored(p))
+        .cloned()
+        .collect();
+    vendored_targets.sort();
+    for purl in vendored_targets {
+        results.push(ApplyResult {
+            package_key: purl.clone(),
+            package_path: VENDOR_OWNED_MARKER.to_string(),
+            success: true,
+            files_verified: Vec::new(),
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        });
+        matched.insert(purl);
+    }
+    let vendored_bases: HashSet<String> = matched
+        .iter()
+        .map(|p| strip_purl_qualifiers(p).to_string())
+        .collect();
+    (results, matched, vendored_bases)
+}
+
 async fn apply_patches_inner(
     args: &ApplyArgs,
     manifest_path: &Path,
@@ -761,41 +808,9 @@ async fn apply_patches_inner(
         socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-
-    // Synthesize one vendor-owned result per in-scope vendored purl BEFORE
-    // the crawl-driven matching (and its empty-crawl early returns): a
-    // vendored package must surface as `Skipped`/`vendored` — never as
-    // `package_not_installed` — even when its installed tree is absent
-    // (e.g. node_modules wiped; the committed artifact is the source of
-    // truth). Sorted for deterministic event order.
-    let mut results: Vec<ApplyResult> = Vec::new();
-    let mut matched_manifest_purls: HashSet<String> = HashSet::new();
-    let mut vendored_targets: Vec<String> = target_manifest_purls
-        .iter()
-        .filter(|p| is_vendored(p))
-        .cloned()
-        .collect();
-    vendored_targets.sort();
-    for purl in vendored_targets {
-        results.push(ApplyResult {
-            package_key: purl.clone(),
-            package_path: VENDOR_OWNED_MARKER.to_string(),
-            success: true,
-            files_verified: Vec::new(),
-            files_patched: Vec::new(),
-            applied_via: HashMap::new(),
-            error: None,
-            sidecar: None,
-        });
-        matched_manifest_purls.insert(purl);
-    }
-    // A vendored variant accounts for its qualified siblings (mirrors
-    // vendor's own unmatched accounting): the other variants describe
-    // distributions of the same package@version that vendor now owns.
-    let vendored_bases: HashSet<String> = matched_manifest_purls
-        .iter()
-        .map(|p| strip_purl_qualifiers(p).to_string())
-        .collect();
+    let (mut results, matched_manifest_purls, vendored_bases) =
+        synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
+    let mut matched_manifest_purls = matched_manifest_purls;
 
     // Local go: prune `replace`-redirects whose patches were dropped from the
     // manifest (orphans). Done here — before the crawl + the "no packages

@@ -898,6 +898,50 @@ pub(crate) async fn download_patch_records(
     (i32::from(failed > 0), result_json, records)
 }
 
+/// Emit a warning (stderr `[note]` + `warnings[]`) for every added/updated
+/// patch record whose purl the vendor ledger still wires at a DIFFERENT
+/// uuid — VEX verification fails closed (`vendor_uuid_mismatch`) until a
+/// `vendor` run refreshes the committed artifact.
+///
+/// Kept out of [`download_and_apply_patches`]'s body on purpose: that
+/// function sits on the in-process scan→download→apply chain, whose summed
+/// poll frames must fit Windows' 1 MiB main-thread stack in debug builds.
+async fn warn_on_vendored_uuid_drift(
+    params: &DownloadParams,
+    downloaded_patches: &[serde_json::Value],
+    warnings: &mut Vec<String>,
+) {
+    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(&params.cwd).await else {
+        return;
+    };
+    if vendor_state.entries.is_empty() {
+        return;
+    }
+    for rec in downloaded_patches {
+        let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str()) else {
+            continue;
+        };
+        if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
+            continue;
+        }
+        let entry = vendor_state
+            .entries
+            .get(purl)
+            .or_else(|| vendor_state.entries.values().find(|e| e.base_purl == purl));
+        if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
+            let w = format!(
+                "{purl} is vendored at patch {} but the manifest now records {uuid}; \
+                 run `socket-patch vendor` to refresh the committed artifact",
+                entry.uuid
+            );
+            if !params.json && !params.silent {
+                eprintln!("  [note] {w}");
+            }
+            warnings.push(w);
+        }
+    }
+}
+
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -1105,33 +1149,7 @@ pub async fn download_and_apply_patches(
     // uuid — tell the operator now instead of letting VEX surprise them
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
-    if let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(&params.cwd).await {
-        if !vendor_state.entries.is_empty() {
-            for rec in &downloaded_patches {
-                let (Some(purl), Some(uuid)) = (rec["purl"].as_str(), rec["uuid"].as_str()) else {
-                    continue;
-                };
-                if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
-                    continue;
-                }
-                let entry = vendor_state
-                    .entries
-                    .get(purl)
-                    .or_else(|| vendor_state.entries.values().find(|e| e.base_purl == purl));
-                if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
-                    let w = format!(
-                        "{purl} is vendored at patch {} but the manifest now records {uuid}; \
-                         run `socket-patch vendor` to refresh the committed artifact",
-                        entry.uuid
-                    );
-                    if !params.json && !params.silent {
-                        eprintln!("  [note] {w}");
-                    }
-                    narrow_warnings.push(w);
-                }
-            }
-        }
-    }
+    warn_on_vendored_uuid_drift(params, &downloaded_patches, &mut narrow_warnings).await;
 
     if !params.json && !params.silent {
         eprintln!("\nPatches saved to {}", manifest_path.display());
