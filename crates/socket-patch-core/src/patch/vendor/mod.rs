@@ -49,16 +49,24 @@ pub mod composer_lock;
 pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
+mod berry_zip;
+pub mod bun_lock;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
 pub mod npm_pack;
+pub mod pnpm_lock;
 pub mod pypi;
+pub mod pypi_pdm;
+pub mod pypi_pipenv;
+pub mod pypi_poetry;
 pub mod pypi_requirements;
 pub mod pypi_uv;
 pub mod pypi_wheel;
 mod toml_surgery;
 pub mod verify;
+pub mod yarn_berry_lock;
+pub mod yarn_classic_lock;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
 pub use state::{load_state, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
