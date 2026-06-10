@@ -372,6 +372,7 @@ pub enum Command {
     Repair,
     Setup,
     Unlock,
+    Vendor,
     Vex,
 }
 
@@ -844,6 +845,7 @@ mod tests {
             (Command::Repair, "repair"),
             (Command::Setup, "setup"),
             (Command::Unlock, "unlock"),
+            (Command::Vendor, "vendor"),
             (Command::Vex, "vex"),
         ] {
             let serialized = serde_json::to_string(&command).unwrap();
