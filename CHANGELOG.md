@@ -16,6 +16,41 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **New `vendor` subcommand: committable vendoring of patched dependencies.**
+  Where `apply` patches installed packages in place (machine-local state),
+  `socket-patch vendor` ejects each patched package into a committed
+  `.socket/vendor/<ecosystem>/<patch-uuid>/<artifact>` and rewires the
+  ecosystem's lockfile so the project consumes the vendored copy — after
+  committing, a fresh checkout builds with the patched dependency on machines
+  with no socket-patch installed and no Socket API access. Per ecosystem
+  (each mechanism validated against the real package manager): npm rewrites
+  `package-lock.json` only (deterministic patched tarball, recomputed
+  integrity, `npm ci`-verified); cargo writes a `[patch.crates-io]` entry in
+  `.cargo/config.toml` plus surgical Cargo.lock edits so `cargo build
+  --locked --offline` works; golang reuses the `replace`-directive engine
+  pointed at the vendor tree; composer rewrites the lock entry to a
+  `dist: path` copy; gem edits the Gemfile + Gemfile.lock pair in bundler's
+  canonical form; pypi rebuilds a valid wheel (regenerated RECORD) wired
+  through uv's `pyproject.toml`/`uv.lock` pair (uv-first) or
+  requirements.txt (`pip` / `uv pip`). The patch UUID is recoverable from the
+  lockfile path string alone (a documented convention for external tools), a
+  committed `.socket/vendor/state.json` ledger records the verbatim original
+  lockfile fragments, and `vendor --revert` restores them byte-exactly.
+  `vendor --vex` mirrors `apply --vex`; VEX generation attests vendored
+  patches by hashing the committed artifacts, and `apply` yields ownership of
+  vendored packages (`vendored` skip reason).
+
+### Fixed
+
+- **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
+  previously verified golang patches against the pristine module cache
+  instead of the patched `.socket/go-patches/` copy, so redirect-applied
+  patches were silently omitted from the document (reported `not_applied`,
+  or `package_not_found` on cache-less CI). Verification now follows the
+  managed `replace` directive to the committed copy.
+
+### Added (pre-existing unreleased entries)
+
 - **Cargo support (`cargo` is now a default feature).** `apply` patches a Rust
   dependency **in place** wherever the crawler finds it — the project `vendor/`
   directory or the shared `$CARGO_HOME` registry cache — rewriting the crate's

@@ -16,6 +16,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
 | `setup` | — | Wire automatic-patching install hooks (npm/pypi/gem) |
 | `repair` | `gc` | Download missing blobs + clean up unused ones |
+| `vendor` | — | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles |
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
 **Bare-UUID fallback.** `socket-patch <UUID>` is rewritten to `socket-patch get <UUID>`. The UUID shape checked is the standard 8-4-4-4-12 hex pattern (case-insensitive). See [`src/lib.rs::looks_like_uuid`](src/lib.rs).
@@ -54,8 +55,10 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | Subcommand | Local arg | Env var | Purpose |
 |---|---|---|---|
 | `apply` | `--force` / `-f` | `SOCKET_FORCE` | Bypass beforeHash check |
-| `apply`, `scan` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
-| `apply`, `scan` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
+| `vendor` | `--force` / `-f` | `SOCKET_FORCE` | Bypass beforeHash check when staging the vendored copy |
+| `vendor` | `--revert` | `SOCKET_VENDOR_REVERT` | Undo vendoring: restore recorded original lockfile fragments + remove `.socket/vendor/` artifacts. Works without a manifest |
+| `apply`, `scan`, `vendor` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
+| `apply`, `scan`, `vendor` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
 | `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune) |
 | `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size (default `100`) |
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
@@ -75,9 +78,9 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 The hidden alias `--no-apply` on `get --save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
 
-### Embedded VEX (`apply --vex` / `scan --vex`)
+### Embedded VEX (`apply --vex` / `scan --vex` / `vendor --vex`)
 
-`--vex <path>` folds OpenVEX 0.2.0 generation into `apply` and `scan`: on a successful run the command writes the document to `<path>` using the same engine as the standalone `vex` command. The `--vex-*` flags mirror `vex`'s `--product` / `--no-verify` / `--doc-id` / `--compact` knobs (namespaced to avoid colliding with the host command), and reuse the standalone env vars (`SOCKET_VEX_PRODUCT`, etc.). They are inert unless `--vex` is set.
+`--vex <path>` folds OpenVEX 0.2.0 generation into `apply`, `scan`, and `vendor`: on a successful run the command writes the document to `<path>` using the same engine as the standalone `vex` command. The `--vex-*` flags mirror `vex`'s `--product` / `--no-verify` / `--doc-id` / `--compact` knobs (namespaced to avoid colliding with the host command), and reuse the standalone env vars (`SOCKET_VEX_PRODUCT`, etc.). They are inert unless `--vex` is set.
 
 Contract details:
 
@@ -137,8 +140,10 @@ in particular, are behavior changes that gate a version bump when implemented).
    the clone with no re-run required. *(Implemented; a consequence of properties 5 + 1.)*
 
 7. **Reflected in VEX.** A patch contributes a `not_affected` statement to the repo's OpenVEX document
-   only for ecosystems that are **actually set up** — or explicitly declared **manual** (below). Patches
-   for an ecosystem that is neither set up nor declared manual produce no VEX statement. *(Implemented —
+   only for ecosystems that are **actually set up** — or explicitly declared **manual** (below) — or
+   **vendored** (a `socket-patch vendor`ed package needs no install hook by construction: the package
+   manager itself installs the patched artifact, so its purls bypass this filter). Patches for an
+   ecosystem that is neither set up, declared manual, nor vendored produce no VEX statement. *(Implemented —
    `generate_vex` filters `applied` to ecosystems returned by `commands/setup::configured_ecosystems`
    (on-disk hook presence) ∪ the manifest's `setup.manual`, in addition to the existing `--ecosystems`
    filter and on-disk verification. Applies in both verify and `--no-verify` modes.)*
@@ -299,6 +304,84 @@ and none errored):
 `no_files` and `not_configured`); `1` on any per-file error, partial failure, or — for `--check` — any
 manifest that needs configuration. `setup --check --remove` is a clap usage error (exit `2`).
 
+## Vendor command contract
+
+`vendor` is `apply`'s committable sibling: instead of patching installed packages in place
+(machine-local state), it ejects each patched package into `.socket/vendor/` and rewires the
+ecosystem's lockfile/config so the project consumes the vendored copy. After committing
+`.socket/vendor/` + the lockfile edits, a fresh checkout builds with the patched dependency on
+machines with **no socket-patch installed and no Socket API access** (registry access for other,
+unvendored dependencies may still be needed). Every mechanism below was validated against the real
+package managers (`spikes/PHASE0-FINDINGS.txt`).
+
+### Path convention + patch-UUID recovery (stable)
+
+```text
+.socket/vendor/<eco>/<patch-uuid>/<natural-leaf>
+```
+
+The full 36-char lowercase hyphenated patch UUID is a dedicated path level, so it appears verbatim
+in every lockfile-visible path string. External tools recover "this dependency is Socket-vendored,
+by patch `<uuid>`" from the lockfile alone with this rule (no access to `.socket/` needed):
+
+```text
+(?:file:)?(?:\./)?\.socket[/\\]vendor[/\\](npm|cargo|golang|composer|gem|pypi)[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\](.+)
+```
+
+Updating a patch changes the UUID → changes the path → changes the lockfile, so staleness is
+diffable by construction. Each vendored unit also carries an informational
+`socket-patch.vendor.json` marker (`{schemaVersion, purl, patchUuid, ecosystem, vulnerabilities,
+vendoredAt}`) next to the artifact — belt-and-braces for tools that have the tree but not the
+lockfile; never a trust input.
+
+### Per-ecosystem wiring matrix
+
+| eco | vendored artifact | committed wiring | consumption proof |
+|---|---|---|---|
+| npm | deterministic patched tarball `[@scope/]<name>-<version>.tgz` | `package-lock.json` only (`npm-shrinkwrap.json` wins when present): every entry matching name+version gets `resolved: "file:…"` + recomputed `integrity`. `package.json` untouched | `npm ci` (integrity-verified). Plain `npm install` preserves the entry; `npm update <pkg>` re-resolves and drops it |
+| cargo | crate dir `<name>-<version>/` (no `.cargo-checksum.json`) | `.cargo/config.toml` `[patch.crates-io]` path entry **+** Cargo.lock surgery (the `[[package]]` entry's `source`/`checksum` removed) | `cargo build --locked --offline` on a fresh checkout. Requires cargo ≥ 1.56 (`[patch]` in config files). Note: path deps build **without** `--cap-lints allow` |
+| golang | module dir `<module>@<version>/` | `go.mod` `replace <module> <ver> => ./.socket/vendor/golang/<uuid>/<module>@<ver>` | `go build` with `GOPROXY=off` + empty `GOMODCACHE` (directory replaces bypass go.sum entirely; survives `go mod tidy`) |
+| composer | package dir `<vendor>/<name>@<version>/` | `composer.lock` only: entry's `dist` → `{type: "path", url, reference: null}`, `source` removed, `transport-options: {symlink: false}` added. `content-hash` unaffected; `composer.json` untouched | `composer install` (from the lock alone, real copy not symlink, works under `--network none`). `composer update <pkg>` reverts it |
+| gem | gem dir `<name>-<version>/` + gemspec materialized from `specifications/` | **Gemfile + Gemfile.lock pair**: the `gem` line gains `path:` (or a managed block for transitive deps); the lock's spec block moves GEM→PATH and the DEPENDENCIES entry becomes `<name> (= <ver>)!`, in bundler's exact canonical form | `bundle install` (normal **and** `BUNDLE_FROZEN=true`), byte-stable lock. Lock-only edits are a silent unpatch — hence the mandatory pair |
+| pypi | rebuilt wheel (canonical PEP 427 filename; RECORD regenerated correctly) | **uv projects** (uv.lock present): `[tool.uv.sources] <name> = {path}` in pyproject + surgical uv.lock rewrite; transitive deps via `[tool.uv] override-dependencies`. **requirements.txt** (pip / `uv pip`): pin line → `./<wheel> --hash=sha256:<hex>` (markers carried over; transitive deps appended) | `uv sync --locked` / `--frozen --offline` (hash-verified, byte-stable lock); `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
+
+Unsupported in this build (maven/nuget/jsr, compiled-out ecosystems, poetry/pdm/pipenv pyproject
+flavors, yarn/pnpm/bun npm layouts) refuse per-purl with stable reason codes pointing at the native
+alternative (`yarn|pnpm|bun patch`, the `.pth` setup hook, …).
+
+### Ownership, state, and reversal
+
+* `.socket/vendor/state.json` (committed) is the revert ledger: every wiring edit records the
+  **verbatim original** lockfile fragment it replaced (registry URLs, integrity strings, Cargo.lock
+  `source`/`checksum`, requirement lines, uv specifiers). Those are not recoverable offline, so
+  `--revert` without the ledger fails with `vendor_state_missing` rather than guessing.
+* `vendor --revert` restores the originals (fragments that no longer match — a user re-resolved —
+  are left alone with a `vendor_lock_entry_drifted` warning), removes the artifacts, prunes the
+  ledger, and sweeps orphan uuid dirs. It works without a manifest.
+* Re-running `vendor` is idempotent (byte-stable lockfiles, deterministic artifacts →
+  `already_vendored` skips). Patches dropped from the manifest are auto-reverted at the start of
+  the next `vendor` run (`vendor_reconciled` events).
+* `rollback` and `remove` are **vendoring-unaware by design**: `remove <purl>` deletes the manifest
+  entry but the vendoring stays until the next `vendor` run reconciles it (or `--revert`).
+* **apply yields to vendor**: a purl recorded in the ledger is skipped by `apply` with reason
+  `vendored` (golang especially — apply never repoints a vendor-owned `replace` back at
+  `.socket/go-patches/`), and `apply --check` excludes vendored modules from its drift audit.
+
+### Caveats (documented behavior, not bugs)
+
+* npm: a **warm local npm cache** can satisfy `npm ci` by integrity even when the vendored tarball
+  is deleted or corrupted on disk — the lockfile integrity, not the file, is the source of truth.
+  Fresh checkouts (the committable guarantee) fail closed. Never reuse a stale registry integrity:
+  recomputation is mandatory and enforced by the implementation.
+* npm redacts uuid-like path segments as `***` in its own error output (its secret heuristic);
+  the path on disk and in the lockfile is unaffected.
+* cargo: invoking cargo from **outside** the project root skips `.cargo/config.toml` discovery and
+  an unlocked build will silently re-lock to the registry crate. CI should build with `--locked`.
+* pip/`uv pip`: bare relative requirement paths resolve against the invoking process's CWD; run
+  installs from the project root.
+* `vendor` exits like `apply`: 0 on success (benign skips included), 1 on any refusal/failure
+  (`partialFailure`), 2 on usage errors. `--dry-run` verifies and writes nothing.
+
 ## Environment variables
 
 All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names are still honored at runtime for compatibility: on first read of any of the three the binary emits a one-shot deprecation warning to stderr (the warning fires unconditionally — even under `--silent` / `--json` — because it's a transition signal users need to see). The legacy names will be removed in the next major release.
@@ -423,6 +506,13 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `paid_required`           | `failed` / status=`paidRequired` | get/scan: patch needs a paid plan and the caller's token isn't entitled. |
 | `download_failed`         | `failed`         | repair/get: network or 404 on patch fetch. |
 | `rollback_failed`         | `failed`         | remove/rollback: file restore could not complete. |
+| `vendored`                | `skipped`        | apply: the package is managed by `socket-patch vendor`; apply yields ownership. |
+| `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (maven/nuget/jsr, or compiled out). |
+| `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
+| `vendor_pkg_manager_unsupported` | `failed`  | vendor (npm): project uses yarn/pnpm/bun — use the manager's native patch flow. |
+| `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
+| `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
+| `vendor_*` / `pypi_*` / `gemfile_*` / `lock_*` / `locked_version_mismatch` / `user_authored_*` / `native_extensions_unsupported` / `platform_gem_unsupported` | `failed`/`skipped` | vendor: per-ecosystem refusal + drift vocabulary; see the Vendor command contract section. New tags are additive (MINOR). |
 
 ### Top-level `EnvelopeError` codes
 
@@ -439,7 +529,8 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Subcommand   | Emits |
 |--------------|---|
-| `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed) · `Failed` · `Verified` (dry-run) |
+| `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
+| `vendor`     | `Applied` (= vendored; `command` routes) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
 | `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`) |
 | `repair`/`gc`| `Downloaded` (or `Verified` on dry-run) · `Removed` (or `Verified`) · `Failed` artifact events |
 | `remove`     | `Removed` (per purl) · artifact-level `Removed` event (with `details.blobsRemoved`, `details.rolledBack`) |
