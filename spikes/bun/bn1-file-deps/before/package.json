@@ -1,8 +1,0 @@
-{
-  "name": "bn1-ground-truth",
-  "version": "1.0.0",
-  "dependencies": {
-    "lp": "./lp.tgz",
-    "lp2": "file:./lp2.tgz"
-  }
-}
