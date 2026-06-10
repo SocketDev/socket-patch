@@ -755,24 +755,10 @@ async fn apply_patches_inner(
     // action — apply must not re-patch its installed tree (or repoint a
     // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
     // by ledger key, resolved base purl, or qualifier-stripped key so
-    // release-variant manifest keys (pypi `?artifact_id=`…) hit too.
-    // Unreadable state degrades to "nothing vendored" (the same fail-open
-    // contract as `is_purl_vendored`).
-    let vendored_purls: HashSet<String> =
-        match socket_patch_core::patch::vendor::load_state(&args.common.cwd).await {
-            Ok(state) => state
-                .entries
-                .iter()
-                .flat_map(|(key, entry)| {
-                    [
-                        key.clone(),
-                        entry.base_purl.clone(),
-                        strip_purl_qualifiers(key).to_string(),
-                    ]
-                })
-                .collect(),
-            Err(_) => HashSet::new(),
-        };
+    // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
+    // unreadable state degrades to "nothing vendored" (fail-open).
+    let vendored_purls =
+        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
 

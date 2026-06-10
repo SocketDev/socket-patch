@@ -555,21 +555,8 @@ async fn rollback_patches_inner(
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
     // ledger-key / base-purl / qualifier-stripped triple; unreadable state
     // degrades to "nothing vendored".
-    let vendored_keys: HashSet<String> =
-        match socket_patch_core::patch::vendor::load_state(&args.common.cwd).await {
-            Ok(state) => state
-                .entries
-                .iter()
-                .flat_map(|(key, entry)| {
-                    [
-                        key.clone(),
-                        entry.base_purl.clone(),
-                        strip_purl_qualifiers(key).to_string(),
-                    ]
-                })
-                .collect(),
-            Err(_) => HashSet::new(),
-        };
+    let vendored_keys =
+        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback

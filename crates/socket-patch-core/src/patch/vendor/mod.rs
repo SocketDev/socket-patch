@@ -156,3 +156,30 @@ pub async fn is_purl_vendored(project_root: &std::path::Path, purl: &str) -> boo
         Err(_) => false,
     }
 }
+
+/// Every purl spelling under which the ledger's entries are addressable:
+/// each entry's map key (the manifest purl, possibly qualified), its
+/// resolved base purl, and the qualifier-stripped key. The one-load,
+/// many-lookups companion to [`is_purl_vendored`] for callers that match
+/// whole purl sets against vendor ownership (apply / rollback / scan
+/// prune). An unreadable ledger degrades to the empty set — the same
+/// fail-open contract as `is_purl_vendored`; mutating callers that need
+/// fail-closed semantics use [`load_state`] directly.
+pub async fn vendored_purl_keys(
+    project_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    match load_state(project_root).await {
+        Ok(state) => state
+            .entries
+            .iter()
+            .flat_map(|(key, entry)| {
+                [
+                    key.clone(),
+                    entry.base_purl.clone(),
+                    crate::utils::purl::strip_purl_qualifiers(key).to_string(),
+                ]
+            })
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}

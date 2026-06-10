@@ -122,6 +122,7 @@ async fn run_apply_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
+    vendored: &HashSet<String>,
 ) -> GcSummary {
     // Re-read the just-written manifest (the apply step may have added
     // or updated entries we now want to consider for pruning).
@@ -129,7 +130,7 @@ async fn run_apply_gc(
         Ok(Some(m)) => m,
         _ => return GcSummary::default(),
     };
-    let prunable = detect_prunable(&manifest, scanned_purls);
+    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
@@ -148,12 +149,13 @@ async fn preview_apply_gc(
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
+    vendored: &HashSet<String>,
 ) -> GcSummary {
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         _ => return GcSummary::default(),
     };
-    let prunable = detect_prunable(&manifest, scanned_purls);
+    let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     // Mirror `run_apply_gc`: drop the prunable entries from the manifest
     // *before* computing orphans (no write — this is the preview). The
     // cleanup helpers derive the "referenced" blob/archive set from the
@@ -180,9 +182,17 @@ async fn preview_apply_gc(
 /// installed package while still pruning all variants of one that is
 /// gone — otherwise `scan --all-releases --sync` would prune the very
 /// variants it just downloaded.
+///
+/// `vendored` (the ledger's purl-key set, see `vendored_purl_keys`) is
+/// always exempt: a vendored package is consumed from the committed
+/// `.socket/vendor/` artifact, so the crawler not finding an installed
+/// copy is its NORMAL state, not "no longer installed". Without this, a
+/// wiped node_modules would prune the manifest entry — and the next
+/// `vendor` run would then reconcile-revert the vendoring itself.
 pub(crate) fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
+    vendored: &HashSet<String>,
 ) -> Vec<String> {
     let scanned_bases: HashSet<&str> = scanned_purls
         .iter()
@@ -191,7 +201,12 @@ pub(crate) fn detect_prunable(
     manifest
         .patches
         .keys()
-        .filter(|p| !scanned_bases.contains(strip_purl_qualifiers(p)))
+        .filter(|p| {
+            let base = strip_purl_qualifiers(p);
+            !scanned_bases.contains(base)
+                && !vendored.contains(p.as_str())
+                && !vendored.contains(base)
+        })
         .cloned()
         .collect()
 }
@@ -452,6 +467,13 @@ pub async fn run(args: ScanArgs) -> i32 {
     // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
     let installed_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
+
+    // Vendor-ledger purl keys, loaded once and shared by the prune
+    // exemption (a vendored package is consumed from the committed
+    // artifact, so "absent from the crawl" is its normal state, not
+    // grounds for pruning) and the vendored-skip in the apply path.
+    let vendored_purls =
+        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -870,9 +892,9 @@ pub async fn run(args: ScanArgs) -> i32 {
             // --- GC (if requested) --------------------------------------
             if prune {
                 let gc = if dry {
-                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
                 } else {
-                    run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                    run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
                 };
                 result["gc"] = if dry {
                     gc.to_preview_json()
@@ -896,9 +918,9 @@ pub async fn run(args: ScanArgs) -> i32 {
         // --- GC-only path (no --apply, just --prune) --------------------
         if prune {
             let gc = if dry {
-                preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
             } else {
-                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await
+                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
             };
             result["gc"] = if dry {
                 gc.to_preview_json()
@@ -1214,7 +1236,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // beyond what `--apply` added — users wanting to clean up should
     // run `socket-patch gc` (or `repair`) explicitly.
     if prune {
-        let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls).await;
+        let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await;
         let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
         if !gc.pruned.is_empty() || total > 0 {
             println!(
@@ -1411,10 +1433,15 @@ mod tests {
         purls.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// The "nothing vendored" set most prune tests run with.
+    fn no_vendored() -> HashSet<String> {
+        HashSet::new()
+    }
+
     #[test]
     fn detect_prunable_empty_manifest_empty_scanned() {
         let m = PatchManifest::new();
-        assert!(detect_prunable(&m, &scanned(&[])).is_empty());
+        assert!(detect_prunable(&m, &scanned(&[]), &no_vendored()).is_empty());
     }
 
     #[test]
@@ -1422,14 +1449,14 @@ mod tests {
         let m = PatchManifest::new();
         // No manifest entries → nothing to prune even if the crawl found
         // packages that don't appear in the manifest.
-        assert!(detect_prunable(&m, &scanned(&["pkg:npm/foo@1"])).is_empty());
+        assert!(detect_prunable(&m, &scanned(&["pkg:npm/foo@1"]), &no_vendored()).is_empty());
     }
 
     #[test]
     fn detect_prunable_all_entries_present_in_scan() {
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
         let s = scanned(&["pkg:npm/foo@1.0", "pkg:npm/bar@2.0"]);
-        assert!(detect_prunable(&m, &s).is_empty());
+        assert!(detect_prunable(&m, &s, &no_vendored()).is_empty());
     }
 
     #[test]
@@ -1437,7 +1464,7 @@ mod tests {
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
         // foo is still installed, bar is gone.
         let s = scanned(&["pkg:npm/foo@1.0"]);
-        let mut out = detect_prunable(&m, &s);
+        let mut out = detect_prunable(&m, &s, &no_vendored());
         out.sort();
         assert_eq!(out, vec!["pkg:npm/bar@2.0".to_string()]);
     }
@@ -1445,7 +1472,7 @@ mod tests {
     #[test]
     fn detect_prunable_returns_everything_when_scan_is_empty() {
         let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
-        let mut out = detect_prunable(&m, &scanned(&[]));
+        let mut out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         out.sort();
         assert_eq!(
             out,
@@ -1463,7 +1490,7 @@ mod tests {
             ("pkg:pypi/six@1.16.0?artifact_id=wheel-b", "uuid-b"),
             ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
         ]);
-        let out = detect_prunable(&m, &scanned(&["pkg:pypi/six@1.16.0"]));
+        let out = detect_prunable(&m, &scanned(&["pkg:pypi/six@1.16.0"]), &no_vendored());
         assert!(
             out.is_empty(),
             "variants of an installed base must not be pruned; got {out:?}"
@@ -1478,8 +1505,39 @@ mod tests {
             ("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a"),
             ("pkg:pypi/six@1.16.0?artifact_id=sdist", "uuid-c"),
         ]);
-        let out = detect_prunable(&m, &scanned(&[]));
+        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
         assert_eq!(out.len(), 2, "all variants of a gone package should prune");
+    }
+
+    #[test]
+    fn detect_prunable_exempts_vendored_purls() {
+        // A vendored package is consumed from the committed artifact —
+        // the crawler not seeing an installed copy (wiped node_modules)
+        // is its normal state. Pruning it would orphan the manifest
+        // entry and let the next `vendor` run reconcile-revert the
+        // vendoring itself.
+        let m = manifest_with(&[("pkg:npm/foo@1.0", "uuid-a"), ("pkg:npm/bar@2.0", "uuid-b")]);
+        let vendored: HashSet<String> = ["pkg:npm/foo@1.0".to_string()].into_iter().collect();
+        let out = detect_prunable(&m, &scanned(&[]), &vendored);
+        assert_eq!(
+            out,
+            vec!["pkg:npm/bar@2.0".to_string()],
+            "vendored foo exempt, non-vendored bar prunable"
+        );
+    }
+
+    #[test]
+    fn detect_prunable_exempts_qualified_variant_of_vendored_base() {
+        // The ledger key set carries qualifier-stripped bases (see
+        // `vendored_purl_keys`), so a qualified manifest variant of a
+        // vendored package is exempt via its base purl.
+        let m = manifest_with(&[("pkg:pypi/six@1.16.0?artifact_id=wheel-a", "uuid-a")]);
+        let vendored: HashSet<String> = ["pkg:pypi/six@1.16.0".to_string()].into_iter().collect();
+        let out = detect_prunable(&m, &scanned(&[]), &vendored);
+        assert!(
+            out.is_empty(),
+            "qualified variant of a vendored base must not prune; got {out:?}"
+        );
     }
 
     // ---- preview_apply_gc / run_apply_gc parity ----------------------------
@@ -1543,7 +1601,7 @@ mod tests {
             seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
 
         let scanned: HashSet<String> = HashSet::new();
-        let preview = preview_apply_gc(&manifest_path, &socket_dir, &scanned).await;
+        let preview = preview_apply_gc(&manifest_path, &socket_dir, &scanned, &no_vendored()).await;
 
         assert_eq!(
             preview.pruned,
@@ -1580,13 +1638,13 @@ mod tests {
         let (mp_p, sd_p, blob_p) =
             seed_manifest_with_blob(tmp_preview.path(), "pkg:npm/gone@1.0.0", &after_hash);
         let scanned: HashSet<String> = HashSet::new();
-        let preview = preview_apply_gc(&mp_p, &sd_p, &scanned).await;
+        let preview = preview_apply_gc(&mp_p, &sd_p, &scanned, &no_vendored()).await;
         assert!(blob_p.exists(), "preview must not mutate");
 
         let tmp_wet = tempfile::tempdir().unwrap();
         let (mp_w, sd_w, blob_w) =
             seed_manifest_with_blob(tmp_wet.path(), "pkg:npm/gone@1.0.0", &after_hash);
-        let wet = run_apply_gc(&mp_w, &sd_w, &scanned).await;
+        let wet = run_apply_gc(&mp_w, &sd_w, &scanned, &no_vendored()).await;
 
         assert_eq!(
             preview.blobs.blobs_removed, wet.blobs.blobs_removed,
