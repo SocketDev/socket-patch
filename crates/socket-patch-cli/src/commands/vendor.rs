@@ -179,7 +179,7 @@ async fn dispatch_vendor_one(
 }
 
 /// Dispatch one recorded entry to its ecosystem's revert.
-async fn dispatch_revert_one(
+pub(crate) async fn dispatch_revert_one(
     entry: &VendorEntry,
     project_root: &Path,
     dry_run: bool,
@@ -382,7 +382,36 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
     };
     let sources = staged.as_patch_sources();
 
-    let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
+    has_errors |=
+        vendor_records(common, &manifest.patches, &sources, false, args.force, env).await;
+
+    if has_errors {
+        env.mark_partial_failure();
+        1
+    } else {
+        0
+    }
+}
+
+/// The vendoring engine, decoupled from the manifest file. `records` is the
+/// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
+/// manifest-driven `vendor` command (and `scan --vendor`), or the
+/// freshly-fetched record map for `scan --vendor --detached`. Entries written
+/// in `detached` mode carry [`VendorEntry::detached`] plus an embedded copy
+/// of their record, so revert/verify/VEX work without a manifest entry.
+///
+/// Does NOT lock, read the manifest, or print the envelope — callers own all
+/// three. Returns whether any non-benign failure occurred.
+pub(crate) async fn vendor_records(
+    common: &GlobalArgs,
+    records: &HashMap<String, PatchRecord>,
+    sources: &PatchSources<'_>,
+    detached: bool,
+    force: bool,
+    env: &mut Envelope,
+) -> bool {
+    let mut has_errors = false;
+    let manifest_purls: Vec<String> = records.keys().cloned().collect();
     let partitioned = partition_purls(&manifest_purls, common.ecosystems.as_deref());
     let target_manifest_purls: HashSet<String> = partitioned
         .values()
@@ -408,7 +437,7 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         if !common.json && !common.silent {
             println!("No vendorable patches in scope.");
         }
-        return i32::from(has_errors);
+        return has_errors;
     }
 
     let vendorable_partition: HashMap<Ecosystem, Vec<String>> = partitioned
@@ -442,7 +471,7 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         Ok(s) => s,
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
-            return 1;
+            return true;
         }
     };
 
@@ -479,13 +508,13 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         };
 
         for candidate in &candidates {
-            let Some(record) = manifest.patches.get(candidate) else {
+            let Some(record) = records.get(candidate) else {
                 continue;
             };
 
             // Variant probe: only the installed distribution's variant is
             // vendored (mirrors apply / select_installed_variants).
-            if is_variant_eco && !args.force {
+            if is_variant_eco && !force {
                 let first = match record.files.iter().next() {
                     Some((f, info)) => Some(verify_file_patch(pkg_path, f, info).await.status),
                     None => None,
@@ -501,10 +530,10 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                 pkg_path,
                 &common.cwd,
                 record,
-                &sources,
+                sources,
                 &vendored_at,
                 common.dry_run,
-                args.force,
+                force,
             )
             .await;
 
@@ -567,14 +596,42 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                         record_warning(env, candidate, w, common);
                     }
                     if let Some(mut entry) = entry {
+                        entry.detached = detached;
+                        entry.record = detached.then(|| record.clone());
                         // A re-vendor run re-derives the entry from current
                         // disk state, where the takeover already happened —
                         // preserve the prior flag or the revert-time
                         // "takeover_not_restored" hint is lost.
-                        if let Some(prev) = state.entries.get(candidate) {
+                        let prev = state.entries.get(candidate).cloned();
+                        if let Some(prev) = &prev {
                             entry.took_over_go_patches =
                                 entry.took_over_go_patches || prev.took_over_go_patches;
+                            // A re-vendor (new patch uuid) rewrites our own
+                            // stale wiring, so the backend records
+                            // `original: None` (it must never record a
+                            // dangling `.socket/vendor/` pointer as the
+                            // pre-vendor fragment). The TRUE pre-vendor
+                            // original lives in the entry being replaced —
+                            // carry it forward by wiring identity, or a
+                            // later `--revert` can only shrug
+                            // (`vendor_lock_entry_drifted`) instead of
+                            // restoring the registry fragment.
+                            for rec in &mut entry.wiring {
+                                if rec.action
+                                    == socket_patch_core::patch::vendor::state::WiringAction::Rewritten
+                                    && rec.original.is_none()
+                                {
+                                    if let Some(prev_rec) = prev.wiring.iter().find(|p| {
+                                        p.file == rec.file
+                                            && p.kind == rec.kind
+                                            && p.key == rec.key
+                                    }) {
+                                        rec.original = prev_rec.original.clone();
+                                    }
+                                }
+                            }
                         }
+                        let new_uuid = entry.uuid.clone();
                         state.entries.insert(candidate.clone(), entry);
                         // Persist per-package so a crash mid-run leaves a
                         // ledger that matches what's already wired.
@@ -584,6 +641,33 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
                                 PatchEvent::new(PatchAction::Failed, candidate.clone())
                                     .with_error("vendor_state_write_failed", e.to_string()),
                             );
+                        } else if let Some(prev) = prev.filter(|p| p.uuid != new_uuid) {
+                            // Re-vendor under a newer patch uuid: the old
+                            // uuid's dir is an orphan now — the wiring and
+                            // ledger both point at the new uuid — unless
+                            // another entry still shares it (the same
+                            // `(eco, uuid)` ownership test as `--revert`'s
+                            // orphan sweep). Only the live entry would
+                            // otherwise reclaim it, and that never happens.
+                            let still_referenced = state.entries.values().any(|e| {
+                                e.ecosystem == prev.ecosystem && e.uuid == prev.uuid
+                            });
+                            let stale_rel = vendor::path::vendor_uuid_dir_rel(
+                                &prev.ecosystem,
+                                &prev.uuid,
+                            );
+                            if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
+                                if !common.dry_run {
+                                    let _ = remove_tree(&common.cwd.join(rel)).await;
+                                }
+                                env.record(
+                                    PatchEvent::new(PatchAction::Removed, candidate.clone())
+                                        .with_reason(
+                                            "vendor_stale_artifact_removed",
+                                            "previous patch uuid's vendored artifact removed",
+                                        ),
+                                );
+                            }
                         }
                     }
                 }
@@ -635,12 +719,7 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         }
     }
 
-    if has_errors {
-        env.mark_partial_failure();
-        1
-    } else {
-        0
-    }
+    has_errors
 }
 
 /// Revert vendored entries whose patches were dropped from the manifest.
@@ -666,7 +745,12 @@ async fn reconcile_dropped(
         .entries
         .iter()
         .filter(|(purl, entry)| {
-            in_scope(&entry.ecosystem)
+            // Detached entries (`scan --vendor --detached`) are never
+            // manifest-tracked, so "absent from the manifest" is their
+            // normal state, not a drop — only `vendor --revert` or
+            // `remove` may undo them.
+            !entry.detached
+                && in_scope(&entry.ecosystem)
                 && !manifest.patches.contains_key(*purl)
                 && !manifest.patches.contains_key(&entry.base_purl)
         })

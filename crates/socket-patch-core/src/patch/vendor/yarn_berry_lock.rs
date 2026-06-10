@@ -431,6 +431,8 @@ pub async fn vendor_yarn_berry(
         wiring,
         lock: None,
         took_over_go_patches: false,
+        detached: false,
+        record: None,
         flavor: Some("yarn-berry".to_string()),
         uv: None,
         pnpm: None,

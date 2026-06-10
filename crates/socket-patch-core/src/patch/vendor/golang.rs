@@ -231,6 +231,8 @@ pub async fn vendor_go_module(
         }],
         lock: None,
         took_over_go_patches: takeover,
+        detached: false,
+        record: None,
         flavor: None,
         uv: None,
         pnpm: None,

@@ -579,6 +579,120 @@ async fn reconcile_drops_stale_entries() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 8b. reconcile: detached entries are exempt
+// ─────────────────────────────────────────────────────────────────────
+
+/// A detached entry (`scan --vendor --detached`) is never manifest-tracked,
+/// so "absent from the manifest" is its normal state — reconcile must leave
+/// it alone. Only `vendor --revert` or `remove` may undo it.
+#[tokio::test]
+async fn reconcile_leaves_detached_entries_alone() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let wired_lock = fx.lock_bytes();
+
+    // Mark the entry detached (the shape `scan --vendor --detached` writes)
+    // and drop the patch from the manifest.
+    let mut state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap())
+        .expect("state.json is JSON");
+    state["entries"][PURL]["detached"] = json!(true);
+    std::fs::write(
+        fx.state_path(),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "detached-only run must exit 0: {env:#}");
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_reconciled"),
+        "a detached entry must never be reconcile-reverted: {env:#}"
+    );
+    assert!(fx.tgz_path().is_file(), "artifact must survive");
+    assert_eq!(fx.lock_bytes(), wired_lock, "wiring must survive");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(
+        state["entries"][PURL].is_object(),
+        "ledger entry must survive: {state:#}"
+    );
+
+    // `--revert` is still the detached entry's exit path.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert must undo detached entries: {env:#}");
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(!fx.vendor_dir().exists(), "vendor tree removed");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8c. re-vendor under a new patch uuid
+// ─────────────────────────────────────────────────────────────────────
+
+/// Re-vendoring after the manifest moved to a newer patch uuid (the
+/// `scan --vendor` auto-update path) must (a) rewire the lock at the new
+/// uuid, (b) remove the old uuid's now-orphaned artifact dir, and (c) carry
+/// the pre-vendor lock fragment forward so a later `--revert` still
+/// restores the registry spelling byte-for-byte.
+#[tokio::test]
+async fn revendor_new_uuid_cleans_stale_artifact_and_still_reverts() {
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let old_uuid_dir = fx.root().join(format!(".socket/vendor/npm/{UUID}"));
+    assert!(old_uuid_dir.is_dir());
+
+    // The manifest record moves to a newer patch uuid (same files/hashes —
+    // the staged blob is keyed by content hash, not uuid).
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = json!(UUID2);
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "re-vendor must succeed: {env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    let stale = find_event(&env, "removed", Some("vendor_stale_artifact_removed"));
+    assert_eq!(stale["purl"], PURL);
+
+    assert!(
+        !old_uuid_dir.exists(),
+        "the old uuid's artifact dir is an orphan and must be removed"
+    );
+    let new_tgz = fx
+        .root()
+        .join(format!(".socket/vendor/npm/{UUID2}/left-pad-1.3.0.tgz"));
+    assert!(new_tgz.is_file(), "artifact re-vendored under the new uuid");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(state["entries"][PURL]["uuid"], UUID2);
+    let lock_text = String::from_utf8(fx.lock_bytes()).unwrap();
+    assert!(
+        lock_text.contains(UUID2) && !lock_text.contains(UUID),
+        "lock must point at the new uuid only"
+    );
+
+    // The pre-vendor registry fragment was recorded by the FIRST vendor run;
+    // the re-vendor rewrote our own wiring (original: None from the backend)
+    // and must have carried the true original forward.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert after re-vendor must succeed: {env:#}");
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "revert must restore the pre-vendor registry fragment byte-for-byte"
+    );
+    assert!(!fx.vendor_dir().exists(), "vendor tree fully pruned");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 9. offline with no local source
 // ─────────────────────────────────────────────────────────────────────
 
@@ -736,6 +850,8 @@ async fn vendored_golang_purl_skipped_by_apply() {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: None,
             uv: None,
             pnpm: None,

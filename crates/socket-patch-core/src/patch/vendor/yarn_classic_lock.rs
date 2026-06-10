@@ -268,6 +268,8 @@ pub async fn vendor_yarn_classic(
         wiring,
         lock: None,
         took_over_go_patches: false,
+        detached: false,
+        record: None,
         flavor: Some("yarn-classic".to_string()),
         uv: None,
         pnpm: None,
