@@ -39,6 +39,9 @@ pub enum PatchTelemetryEventType {
     PatchScanFailed,
     PatchFetched,
     PatchFetchFailed,
+    // Write-side: vendor
+    PatchVendored,
+    PatchVendorFailed,
     // Inspection / housekeeping
     PatchListed,
     PatchRepaired,
@@ -58,6 +61,8 @@ impl PatchTelemetryEventType {
             Self::PatchApplied => "patch_applied",
             Self::PatchApplyFailed => "patch_apply_failed",
             Self::PatchRemoved => "patch_removed",
+            Self::PatchVendored => "patch_vendored",
+            Self::PatchVendorFailed => "patch_vendor_failed",
             Self::PatchRemoveFailed => "patch_remove_failed",
             Self::PatchRolledBack => "patch_rolled_back",
             Self::PatchRollbackFailed => "patch_rollback_failed",
@@ -451,6 +456,42 @@ pub async fn track_patch_apply_failed(
     fire(
         PatchTelemetryEventType::PatchApplyFailed,
         "apply",
+        serde_json::json!({ "dry_run": dry_run }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
+    .await;
+}
+
+/// Track a successful vendor run (count = packages vendored).
+pub async fn track_patch_vendored(
+    vendored_count: u32,
+    dry_run: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    fire(
+        PatchTelemetryEventType::PatchVendored,
+        "vendor",
+        serde_json::json!({ "patches_count": vendored_count, "dry_run": dry_run }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
+    .await;
+}
+
+/// Track a failed vendor run.
+pub async fn track_patch_vendor_failed(
+    error: impl std::fmt::Display,
+    dry_run: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    fire(
+        PatchTelemetryEventType::PatchVendorFailed,
+        "vendor",
         serde_json::json!({ "dry_run": dry_run }),
         Some(error),
         api_token,

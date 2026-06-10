@@ -330,7 +330,7 @@ fn all_files_already_patched(result: &ApplyResult) -> bool {
 /// while a wheel is installed). Skipping it avoids attempting — and
 /// spuriously reporting a `Failed` event for — a variant that was never
 /// installed.
-fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
+pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>) -> bool {
     match first_file_status {
         None => true,
         Some(status) => {
