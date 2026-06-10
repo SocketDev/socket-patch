@@ -1,8 +1,4 @@
 use clap::Args;
-use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
-    get_missing_blobs, DownloadMode,
-};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
@@ -23,9 +19,8 @@ use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
-use tempfile::TempDir;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
@@ -33,39 +28,6 @@ use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
     VexSummary,
 };
-
-/// Overlay every regular file from `src` into `dst` via hard link (falling
-/// back to copy if hard linking fails — e.g. cross-filesystem, permission
-/// quirk). Skips files that already exist at `dst`. Silently no-ops if
-/// `src` doesn't exist so fresh projects with no `.socket/` cache work.
-///
-/// Used by `apply` to stage a transient overlay of the persistent
-/// `.socket/` cache inside a tempdir so the apply pipeline can read
-/// pre-cached artifacts and freshly-fetched ones from the same path
-/// without ever mutating `.socket/`.
-async fn overlay_dir(src: &Path, dst: &Path) {
-    let mut entries = match tokio::fs::read_dir(src).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let file_type = match entry.file_type().await {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if tokio::fs::metadata(&to).await.is_ok() {
-            continue;
-        }
-        if tokio::fs::hard_link(&from, &to).await.is_err() {
-            let _ = tokio::fs::copy(&from, &to).await;
-        }
-    }
-}
 
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
@@ -709,177 +671,24 @@ async fn apply_patches_inner(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    // The persistent cache directories under `.socket/`. Apply only ever
-    // *reads* from these — writes (downloads, cleanup) happen against a
-    // transient overlay tempdir constructed below when fetching is needed.
+    // Resolve patch sources (read `.socket/` directly, or stage an overlay
+    // tempdir + download the gap). Shared with `vendor` via fetch_stage.
     let socket_dir = manifest_path.parent().unwrap();
-    let socket_blobs_path = socket_dir.join("blobs");
-    let socket_diffs_path = socket_dir.join("diffs");
-    let socket_packages_path = socket_dir.join("packages");
-
-    let download_mode = DownloadMode::parse(&args.common.download_mode).map_err(|e| e.to_string())?;
-
-    // Compute per-patch source availability so both the offline guard
-    // (next block) and the `download_needed` decision below share the
-    // same notion of what's already on disk. These probes are read-only.
-    let missing_blobs = get_missing_blobs(&manifest, &socket_blobs_path).await;
-    let missing_diff_archives = get_missing_archives(&manifest, &socket_diffs_path).await;
-    let missing_package_archives = get_missing_archives(&manifest, &socket_packages_path).await;
-
-    // A patch is "locally applicable" iff at least one of:
-    //   - every `after_hash` blob it references is on disk, OR
-    //   - its diff archive is on disk, OR
-    //   - its package archive is on disk.
-    // The apply pipeline will pick whichever is present per file.
-    let patches_without_source: Vec<&str> = manifest
-        .patches
-        .iter()
-        .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
-            let diff_present = !missing_diff_archives.contains(&record.uuid);
-            let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present || pkg_present {
-                None
-            } else {
-                Some(purl.as_str())
-            }
-        })
-        .collect();
-
-    if args.common.offline {
-        // Offline: bail only if some patch has no usable local source.
-        // Note: with `--force`, the apply pipeline can short-circuit
-        // verification on its own; we still surface the no-source
-        // diagnosis so the user runs `repair` before retrying.
-        if !patches_without_source.is_empty() {
-            if !args.common.silent && !args.common.json {
-                eprintln!(
-                    "Error: {} patch(es) have no local source and --offline is set:",
-                    patches_without_source.len()
-                );
-                for purl in patches_without_source.iter().take(5) {
-                    eprintln!("  - {}", purl);
-                }
-                if patches_without_source.len() > 5 {
-                    eprintln!("  ... and {} more", patches_without_source.len() - 5);
-                }
-                eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
-            }
-            return Ok((false, Vec::new(), Vec::new()));
+    let staged = match crate::commands::fetch_stage::stage_patch_sources(
+        &args.common,
+        &manifest,
+        socket_dir,
+    )
+    .await?
+    {
+        crate::commands::fetch_stage::StageOutcome::Ready(s) => s,
+        crate::commands::fetch_stage::StageOutcome::Unavailable => {
+            return Ok((false, Vec::new(), Vec::new()))
         }
-    }
-
-    // Decide what (if anything) needs downloading.
-    //
-    // The apply pipeline tries sources in the order package → diff →
-    // blob locally. We honor `--download-mode` for the primary fetch
-    // when there's actually a gap to close. Skip the archive fetch
-    // entirely when all file blobs are already present locally —
-    // apply will succeed via the blob path, and the archive endpoints
-    // would just 404 (current server doesn't serve them yet).
-    let download_needed = !args.common.offline
-        && match download_mode {
-            DownloadMode::File => !missing_blobs.is_empty(),
-            DownloadMode::Diff | DownloadMode::Package if missing_blobs.is_empty() => false,
-            DownloadMode::Diff => !missing_diff_archives.is_empty(),
-            DownloadMode::Package => !missing_package_archives.is_empty(),
-        };
-
-    // Determine where the apply pipeline should read patch sources from.
-    //
-    // - If nothing needs downloading (offline mode, or every required
-    //   artifact is already in `.socket/`), read straight from `.socket/`.
-    //   Apply is purely read-only against the persistent cache.
-    // - Otherwise, stage a transient overlay tempdir that hardlinks every
-    //   existing `.socket/` artifact and receives fresh downloads. Apply
-    //   reads exclusively from the tempdir; `.socket/` is never mutated.
-    //
-    // `_stage_dir` keeps the `TempDir` handle alive for the rest of this
-    // function — on drop the OS removes the directory and any downloaded
-    // bytes go with it.
-    let (blobs_path, diffs_path, packages_path, _stage_dir): (
-        PathBuf,
-        PathBuf,
-        PathBuf,
-        Option<TempDir>,
-    ) = if download_needed {
-        let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let stage_blobs = stage.path().join("blobs");
-        let stage_diffs = stage.path().join("diffs");
-        let stage_packages = stage.path().join("packages");
-        for dir in [&stage_blobs, &stage_diffs, &stage_packages] {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        overlay_dir(&socket_blobs_path, &stage_blobs).await;
-        overlay_dir(&socket_diffs_path, &stage_diffs).await;
-        overlay_dir(&socket_packages_path, &stage_packages).await;
-
-        if !args.common.silent && !args.common.json {
-            println!(
-                "Downloading missing patch artifacts (mode: {})...",
-                download_mode.as_tag()
-            );
-        }
-
-        let (client, _) =
-            get_api_client_with_overrides(args.common.api_client_overrides()).await;
-        let sources = PatchSources {
-            blobs_path: &stage_blobs,
-            packages_path: Some(&stage_packages),
-            diffs_path: Some(&stage_diffs),
-        };
-        let fetch_result =
-            fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
-
-        if !args.common.silent && !args.common.json {
-            println!("{}", format_fetch_result(&fetch_result));
-        }
-
-        // For non-file modes, automatically fetch any still-missing file
-        // blobs as a fallback. Patches that lack the requested mode on
-        // the server will still apply via the legacy blob path.
-        if download_mode != DownloadMode::File {
-            let still_missing_blobs = get_missing_blobs(&manifest, &stage_blobs).await;
-            if !still_missing_blobs.is_empty() {
-                if !args.common.silent && !args.common.json {
-                    println!(
-                        "Falling back to per-file blob downloads for {} blob(s)...",
-                        still_missing_blobs.len()
-                    );
-                }
-                let blob_result =
-                    fetch_missing_blobs(&manifest, &stage_blobs, &client, None).await;
-                if !args.common.silent && !args.common.json {
-                    println!("{}", format_fetch_result(&blob_result));
-                }
-                if blob_result.failed > 0 && fetch_result.failed > 0 {
-                    if !args.common.silent && !args.common.json {
-                        eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
-                    }
-                    return Ok((false, Vec::new(), Vec::new()));
-                }
-            }
-        } else if fetch_result.failed > 0 {
-            if !args.common.silent && !args.common.json {
-                eprintln!("Some blobs could not be downloaded. Cannot apply patches.");
-            }
-            return Ok((false, Vec::new(), Vec::new()));
-        }
-
-        (stage_blobs, stage_diffs, stage_packages, Some(stage))
-    } else {
-        (
-            socket_blobs_path.clone(),
-            socket_diffs_path.clone(),
-            socket_packages_path.clone(),
-            None,
-        )
     };
+    let blobs_path = staged.blobs.clone();
+    let diffs_path = staged.diffs.clone();
+    let packages_path = staged.packages.clone();
 
     // Partition manifest PURLs by ecosystem
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();

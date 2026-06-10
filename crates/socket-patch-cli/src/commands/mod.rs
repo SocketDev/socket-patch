@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod fetch_stage;
 pub mod get;
 pub mod list;
 pub mod lock_cli;
