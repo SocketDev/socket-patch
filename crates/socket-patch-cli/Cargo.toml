@@ -59,6 +59,9 @@ setup-e2e = []
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# scan_vendor_e2e builds pristine registry tarballs for the auto-fetch tests.
+tar = { workspace = true }
+flate2 = { workspace = true }
 hex = { workspace = true }
 wiremock = { workspace = true }
 portable-pty = { workspace = true }

@@ -145,6 +145,48 @@ async fn fetch_npm(
     })
 }
 
+/// Stage a package from an on-disk vendored tarball (the fresh-clone
+/// re-vendor path: the project has our committed artifact but no installed
+/// copy). The bytes are verified against the LEDGER-recorded sha256 before
+/// extraction — same fail-closed posture as the registry path; an entry
+/// with no recorded hash is refused.
+pub async fn stage_local_artifact(
+    tgz_path: &Path,
+    expected_sha256_hex: &str,
+) -> Result<FetchedPackage, FetchError> {
+    if expected_sha256_hex.is_empty() {
+        return Err(FetchError::Unverifiable(
+            "the vendor ledger records no sha256 for the artifact".to_string(),
+        ));
+    }
+    let bytes = tokio::fs::read(tgz_path)
+        .await
+        .map_err(|e| FetchError::Failed(format!("cannot read {}: {e}", tgz_path.display())))?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(FetchError::Failed(format!(
+            "{}: artifact exceeds the {MAX_DOWNLOAD_BYTES}-byte cap",
+            tgz_path.display()
+        )));
+    }
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected_sha256_hex) {
+        return Err(FetchError::Failed(format!(
+            "{}: sha256 mismatch against the vendor ledger (recorded {expected_sha256_hex}, \
+             on-disk bytes hash to {actual})",
+            tgz_path.display()
+        )));
+    }
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
+    let dir = tmp.path().join("package");
+    extract_tgz(&bytes, &dir).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage {
+        dir,
+        url: format!("file:{}", tgz_path.display()),
+        _tmp: tmp,
+    })
+}
+
 /// Capped download. http(s) only; the cap is enforced on the declared
 /// Content-Length AND the actual stream (a lying server cannot blow past
 /// it).

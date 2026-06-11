@@ -525,12 +525,139 @@ pub(crate) async fn vendor_records(
         global_prefix: common.global_prefix.clone(),
         batch_size: 100,
     };
-    let all_packages = find_packages_for_purls(
+    let mut all_packages = find_packages_for_purls(
         &vendorable_partition,
         &crawler_options,
         common.silent || common.json,
     )
     .await;
+
+    // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
+    // A manifest patch whose package is not on disk but IS resolvable from
+    // the project's lockfile is fetched pristine from its registry (lock-
+    // recorded URL else the conventional one), verified against the lock's
+    // integrity FAIL-CLOSED, and staged from a private tempdir — the
+    // project tree is never touched, and the lock wiring works without an
+    // installed copy (it keys off lock entries). The holders keep the
+    // tempdirs alive until the dispatch loop below has staged from them.
+    let mut fetched_holders: Vec<socket_patch_core::patch::vendor::registry_fetch::FetchedPackage> =
+        Vec::new();
+    // Fetch failures must keep their distinct Failed event; this set
+    // suppresses the later duplicate `package_not_installed` skip.
+    let mut fetch_failed: HashSet<String> = HashSet::new();
+    {
+        use socket_patch_core::patch::vendor::{lock_inventory, registry_fetch};
+        let missing: Vec<String> = vendorable
+            .iter()
+            .filter(|p| !all_packages.contains_key(*p))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            // The inventory is a local file read — fine offline; only the
+            // fetch itself needs the network.
+            let inventory = lock_inventory::inventory_npm_lock(&common.cwd)
+                .await
+                .map(|(_, entries)| entries)
+                .unwrap_or_default();
+            let client = registry_fetch::build_registry_client();
+            // Pre-loaded vendor ledger for the artifact-staging path: an
+            // already-vendored purl with no installed copy (fresh clone)
+            // stages from its own committed artifact, sha256-verified
+            // against the ledger — offline-safe, no registry traffic.
+            let ledger = load_state(&common.cwd).await.unwrap_or_default();
+            for purl in &missing {
+                if let Some(entry) = ledger
+                    .entries
+                    .get(purl)
+                    .or_else(|| ledger.entries.values().find(|e| &e.base_purl == purl))
+                    .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
+                {
+                    let tgz = common.cwd.join(&entry.artifact.path);
+                    match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
+                        .await
+                    {
+                        Ok(staged) => {
+                            all_packages.insert(purl.clone(), staged.dir().to_path_buf());
+                            fetched_holders.push(staged);
+                            continue;
+                        }
+                        Err(registry_fetch::FetchError::Failed(detail)) => {
+                            // A corrupt committed artifact is worth a loud
+                            // failure — re-vendoring over it would mask the
+                            // corruption.
+                            fetch_failed.insert(purl.clone());
+                            env.record(
+                                PatchEvent::new(PatchAction::Failed, purl.clone())
+                                    .with_error("vendor_fetch_failed", detail.clone()),
+                            );
+                            if !common.silent && !common.json {
+                                eprintln!(
+                                    "Cannot vendor {}: {detail}",
+                                    normalize_purl(purl)
+                                );
+                            }
+                            continue;
+                        }
+                        Err(registry_fetch::FetchError::Unverifiable(_)) => {
+                            // No recorded hash (legacy ledger) — fall
+                            // through to the lockfile/registry path.
+                        }
+                    }
+                }
+                let Some(entry) = lock_inventory::lookup(&inventory, purl) else {
+                    continue; // not lockfile-resolvable → package_not_installed
+                };
+                if common.offline {
+                    // The enriched skip detail lands below in the unmatched
+                    // pass (the purl stays unmatched).
+                    continue;
+                }
+                match registry_fetch::fetch_and_stage(entry, &client).await {
+                    Ok(fetched) => {
+                        record_warning(
+                            env,
+                            purl,
+                            &VendorWarning::new(
+                                "vendor_fetched_missing",
+                                format!(
+                                    "{}@{} is not installed; fetched the pristine artifact \
+                                     from {} (integrity verified against the lockfile) and \
+                                     vendored from that copy — the project tree was not \
+                                     touched",
+                                    entry.name, entry.version, fetched.url
+                                ),
+                            ),
+                            common,
+                        );
+                        all_packages.insert(purl.clone(), fetched.dir().to_path_buf());
+                        fetched_holders.push(fetched);
+                    }
+                    Err(registry_fetch::FetchError::Unverifiable(detail)) => {
+                        record_warning(
+                            env,
+                            purl,
+                            &VendorWarning::new("vendor_fetch_unverifiable", detail),
+                            common,
+                        );
+                        // Falls through to package_not_installed below.
+                    }
+                    Err(registry_fetch::FetchError::Failed(detail)) => {
+                        fetch_failed.insert(purl.clone());
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, purl.clone())
+                                .with_error("vendor_fetch_failed", detail.clone()),
+                        );
+                        if !common.silent && !common.json {
+                            eprintln!(
+                                "Cannot vendor {}: fetch failed: {detail}",
+                                normalize_purl(purl)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let vendored_at = now_rfc3339();
     let mut state = match load_state(&common.cwd).await {
@@ -763,10 +890,10 @@ pub(crate) async fn vendor_records(
     }
 
     // Manifest entries that targeted in-scope ecosystems but had no
-    // installed package on disk.
+    // installed package on disk (and could not be auto-fetched).
     let mut unmatched: Vec<String> = vendorable
         .iter()
-        .filter(|p| !matched.contains(*p))
+        .filter(|p| !matched.contains(*p) && !fetch_failed.contains(*p))
         .cloned()
         .collect();
     unmatched.sort();
@@ -776,15 +903,42 @@ pub(crate) async fn vendor_records(
         .map(|p| strip_purl_qualifiers(p).to_string())
         .collect();
     unmatched.retain(|p| !vendored_bases.contains(strip_purl_qualifiers(p)));
+    has_errors |= !fetch_failed.is_empty();
     if !unmatched.is_empty() {
         has_errors = true;
+        // Offline runs name the packages the lockfile COULD have fetched —
+        // the inventory is a local file read, allowed offline.
+        let lock_resolvable: HashSet<String> = if common.offline {
+            let entries = socket_patch_core::patch::vendor::lock_inventory::inventory_npm_lock(
+                &common.cwd,
+            )
+            .await
+            .map(|(_, e)| e)
+            .unwrap_or_default();
+            unmatched
+                .iter()
+                .filter(|p| {
+                    socket_patch_core::patch::vendor::lock_inventory::lookup(&entries, p)
+                        .is_some()
+                })
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for purl in &unmatched {
+            let detail = if lock_resolvable.contains(purl) {
+                "no installed package found; --offline prevents fetching it from the \
+                 registry (the lockfile resolves it)"
+            } else {
+                "no installed package found"
+            };
             env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone())
-                    .with_reason("package_not_installed", "no installed package found"),
+                    .with_reason("package_not_installed", detail),
             );
             if !common.silent && !common.json {
-                eprintln!("Cannot vendor {}: package not installed", normalize_purl(purl));
+                eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
             }
         }
     }

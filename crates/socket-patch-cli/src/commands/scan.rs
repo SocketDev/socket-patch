@@ -281,6 +281,123 @@ pub(crate) fn detect_prunable(
         .collect()
 }
 
+/// Lockfile-only packages: dependencies the project's lockfile resolves
+/// that have no crawled (installed) counterpart.
+#[derive(Default)]
+struct LockfileSupplement {
+    packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
+    /// Literal crawler-form purls, for fast membership tests.
+    purls: HashSet<String>,
+    /// The lockfile the entries came from, for messages.
+    source: &'static str,
+}
+
+/// Inventory the project's lockfile(s) and fabricate crawl entries for
+/// dependencies that are not installed. The fabricated `path` is the
+/// WOULD-BE install dir — every consumer degrades safely on a nonexistent
+/// path (hash verify → NotFound, apply → partitioned skip, vendor →
+/// auto-fetch). Global scans target the machine's global tree, not this
+/// project's lockfile, so they get no supplement.
+async fn lockfile_supplement(
+    common: &GlobalArgs,
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+) -> LockfileSupplement {
+    use socket_patch_core::patch::vendor::lock_inventory;
+    use socket_patch_core::patch::vendor::npm_flavor::NpmLockFlavor;
+
+    let mut out = LockfileSupplement::default();
+    if common.global || common.global_prefix.is_some() {
+        return out;
+    }
+    let Some((flavor, entries)) = lock_inventory::inventory_npm_lock(&common.cwd).await else {
+        return out;
+    };
+    out.source = match flavor {
+        NpmLockFlavor::PackageLock => "package-lock.json",
+        NpmLockFlavor::Pnpm => "pnpm-lock.yaml",
+        NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => "yarn.lock",
+        NpmLockFlavor::Bun => "bun.lock",
+    };
+    let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    for entry in entries {
+        if crawled_purls.contains(entry.purl.as_str()) {
+            continue;
+        }
+        let (namespace, name) = match entry.name.split_once('/') {
+            Some((scope, bare)) => (Some(scope.to_string()), bare.to_string()),
+            None => (None, entry.name.clone()),
+        };
+        out.purls.insert(entry.purl.clone());
+        out.packages.push(socket_patch_core::crawlers::types::CrawledPackage {
+            name,
+            version: entry.version.clone(),
+            namespace,
+            purl: entry.purl.clone(),
+            path: common.cwd.join("node_modules").join(&entry.name),
+        });
+    }
+    out
+}
+
+/// A displayable crawl entry fabricated from a purl (decoded form). The
+/// path is a placeholder consumers degrade safely on.
+fn crawled_from_purl(
+    purl: &str,
+    cwd: &std::path::Path,
+) -> Option<socket_patch_core::crawlers::types::CrawledPackage> {
+    let decoded = normalize_purl(strip_purl_qualifiers(purl)).into_owned();
+    let rest = decoded.strip_prefix("pkg:")?;
+    let (_eco, rest) = rest.split_once('/')?;
+    let at = rest.rfind('@').filter(|&i| i > 0)?;
+    let (name_part, version) = (&rest[..at], &rest[at + 1..]);
+    let (namespace, name) = match name_part.rsplit_once('/') {
+        Some((ns, n)) => (Some(ns.to_string()), n.to_string()),
+        None => (None, name_part.to_string()),
+    };
+    Some(socket_patch_core::crawlers::types::CrawledPackage {
+        name,
+        version: version.to_string(),
+        namespace,
+        purl: decoded.clone(),
+        path: cwd.join("node_modules").join(name_part),
+    })
+}
+
+/// Vendored-ledger packages with no crawled counterpart: on a fresh clone
+/// the committed artifact IS the dependency, so these stay discoverable
+/// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
+/// runs all keep working before any install). They are NOT "lockfile-only"
+/// — nothing needs installing; the artifact satisfies the lock.
+async fn vendored_ledger_supplement(
+    common: &GlobalArgs,
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
+    if common.global || common.global_prefix.is_some() {
+        return Vec::new();
+    }
+    let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await else {
+        return Vec::new();
+    };
+    let crawled_norm: HashSet<String> = crawled
+        .iter()
+        .map(|p| normalize_purl(&p.purl).into_owned())
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for entry in state.entries.values() {
+        let base = strip_purl_qualifiers(&entry.base_purl);
+        let norm = normalize_purl(base).into_owned();
+        if crawled_norm.contains(&norm) || !seen.insert(norm) {
+            continue;
+        }
+        if let Some(pkg) = crawled_from_purl(base, &common.cwd) {
+            out.push(pkg);
+        }
+    }
+    out.sort_by(|a, b| a.purl.cmp(&b.purl));
+    out
+}
+
 /// Vendor-mode pre-prompt check: uuids of selected patches whose installed
 /// files match NEITHER beforeHash nor afterHash — the patch was built
 /// against different bytes than the installed artifact. Vendoring still
@@ -296,6 +413,7 @@ async fn preverify_vendor_baselines(
     org_slug: Option<&str>,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    lockfile_only: &HashSet<String>,
 ) -> HashSet<String> {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
@@ -306,6 +424,11 @@ async fn preverify_vendor_baselines(
         // API purls come percent-encoded, crawler purls literal — purl_eq
         // bridges the two spellings.
         let base = strip_purl_qualifiers(&patch.purl);
+        // Lockfile-only packages have no installed bytes to compare — the
+        // vendor engine fetches them pristine (nothing to annotate).
+        if lockfile_only.contains(normalize_purl(base).as_ref()) {
+            continue;
+        }
         let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
             continue;
         };
@@ -951,6 +1074,39 @@ fn partition_vendored_selected(
     (kept, vendored_records)
 }
 
+/// Lockfile-only patches are skipped BEFORE download in apply mode: the
+/// package is not on disk to patch in place, and downloading its patch
+/// into the manifest would create a not-yet-appliable entry (and flip the
+/// apply path's exit code). `scan --vendor` is the route that handles them
+/// (the vendor engine auto-fetches lockfile-resolved packages). Matching
+/// bridges API purl encoding via `normalize_purl`. Same shape/mechanics as
+/// [`partition_vendored_selected`].
+fn partition_not_installed_selected(
+    selected: Vec<PatchSearchResult>,
+    lockfile_only: &HashSet<String>,
+) -> (Vec<PatchSearchResult>, Vec<serde_json::Value>) {
+    if lockfile_only.is_empty() {
+        return (selected, Vec::new());
+    }
+    let is_lockfile_only = |p: &str| {
+        lockfile_only.contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
+    };
+    let (not_installed, kept): (Vec<_>, Vec<_>) = selected
+        .into_iter()
+        .partition(|p| is_lockfile_only(&p.purl));
+    let mut records: Vec<serde_json::Value> = not_installed
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "purl": p.purl, "uuid": p.uuid,
+                "action": "skipped", "errorCode": "package_not_installed",
+            })
+        })
+        .collect();
+    records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    (kept, records)
+}
+
 /// Fold the pre-download vendored skips into the apply report returned by
 /// `download_and_apply_patches`: they were "found" by discovery and
 /// skipped here, never downloaded. Also strips the inner `status` (scan
@@ -1184,7 +1340,24 @@ pub async fn run(args: ScanArgs) -> i32 {
     }
 
     // Crawl packages
-    let (all_crawled, eco_counts) = crawl_all_ecosystems(&crawler_options).await;
+    let (mut all_crawled, mut eco_counts) = crawl_all_ecosystems(&crawler_options).await;
+
+    // Lockfile supplement: dependencies the project's lockfile resolves
+    // that have NO installed copy (fresh clone, partial install). They join
+    // discovery — counts, API lookup, table, the prune "scanned" set — and
+    // are flagged "not yet installed" everywhere a user could act on them.
+    let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
+    if !lockfile_only.packages.is_empty() {
+        *eco_counts.entry(Ecosystem::Npm).or_insert(0) += lockfile_only.packages.len();
+        all_crawled.extend(lockfile_only.packages.iter().cloned());
+    }
+    let ledger_supplement = vendored_ledger_supplement(&args.common, &all_crawled).await;
+    for pkg in &ledger_supplement {
+        if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
+            *eco_counts.entry(eco).or_insert(0) += 1;
+        }
+    }
+    all_crawled.extend(ledger_supplement);
 
     // Every PURL the crawl found, captured BEFORE the `--ecosystems`
     // display/query filter is applied. Prune (below) must reference the
@@ -1193,6 +1366,9 @@ pub async fn run(args: ScanArgs) -> i32 {
     // prune used the filtered set instead, `scan --ecosystems npm --prune`
     // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
+    // Lockfile-only purls are deliberately included: a dependency the
+    // lockfile still resolves must not be pruned just because node_modules
+    // is wiped or partially installed.
     let installed_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Vendor-ledger purl keys, loaded once and shared by the prune
@@ -1250,6 +1426,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             let mut result = serde_json::json!({
                 "status": "success",
                 "scannedPackages": 0,
+                "lockfileOnlyPackages": 0,
                 "packagesWithPatches": 0,
                 "totalPatches": 0,
                 "freePatches": 0,
@@ -1309,6 +1486,13 @@ pub async fn run(args: ScanArgs) -> i32 {
             eprintln!("\rFound {package_count} packages{eco_summary}");
         } else {
             eprintln!("Found {package_count} packages{eco_summary}");
+        }
+        if !lockfile_only.purls.is_empty() {
+            eprintln!(
+                "Note: {} package(s) from {} are not yet installed (lockfile-only).",
+                lockfile_only.purls.len(),
+                lockfile_only.source,
+            );
         }
     }
 
@@ -1495,6 +1679,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         let mut result = serde_json::json!({
             "status": "success",
             "scannedPackages": package_count,
+            "lockfileOnlyPackages": lockfile_only.purls.len(),
             "packagesWithPatches": all_packages_with_patches.len(),
             "totalPatches": total_patches,
             "freePatches": free_patches,
@@ -1507,6 +1692,19 @@ pub async fn run(args: ScanArgs) -> i32 {
                 "newUuid": u.new_uuid,
             })).collect::<Vec<_>>(),
         });
+        // Flag lockfile-only packages so JSON consumers can tell "patch
+        // available but not installed" from the installed case. Additive
+        // field; absent means installed.
+        if let Some(packages) = result["packages"].as_array_mut() {
+            for pkg in packages {
+                let is_lockfile_only = pkg["purl"]
+                    .as_str()
+                    .is_some_and(|p| lockfile_only.purls.contains(p));
+                if is_lockfile_only {
+                    pkg["notInstalled"] = serde_json::json!(true);
+                }
+            }
+        }
 
         // `apply` and `prune` are computed once at the top of run()
         // (factoring in --sync, which implies both). They're independent
@@ -1549,6 +1747,17 @@ pub async fn run(args: ScanArgs) -> i32 {
             // operator's signal to run `scan --vendor` (or `vendor`).
             let (selected, vendored_records) =
                 partition_vendored_selected(selected, &vendored_purls);
+            // Lockfile-only purls leave the apply selection here (calm
+            // skip records, never an error); the union rides the same
+            // bookkeeping as the vendored skips.
+            let (selected, vendored_records) = {
+                let (kept, not_installed) =
+                    partition_not_installed_selected(selected, &lockfile_only.purls);
+                let mut all = vendored_records;
+                all.extend(not_installed);
+                all.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+                (kept, all)
+            };
 
             let mut apply_code = 0i32;
             if dry {
@@ -1791,14 +2000,22 @@ pub async fn run(args: ScanArgs) -> i32 {
             } else {
                 String::new()
             };
+            // Lockfile-only packages can be patched by `scan --vendor`
+            // (which fetches them pristine) but not applied in place.
+            let not_installed_marker = if lockfile_only.purls.contains(pkg.purl.as_str()) {
+                color(" [NOT INSTALLED]", "33", use_color)
+            } else {
+                String::new()
+            };
 
             println!(
-                "{:<40}  {:>8}  {:<16}  {}{}",
+                "{:<40}  {:>8}  {:<16}  {}{}{}",
                 display_purl,
                 count_str,
                 format_severity(severity, use_color),
                 vuln_str,
                 update_marker,
+                not_installed_marker,
             );
         }
 
@@ -1930,6 +2147,29 @@ pub async fn run(args: ScanArgs) -> i32 {
         }
     }
 
+    // Lockfile-only purls leave the in-place apply selection (calm skip,
+    // mirrors the JSON path). In `--vendor` mode they stay: the vendor
+    // engine fetches lockfile-resolved packages pristine.
+    let (selected, not_installed_selected): (Vec<_>, Vec<String>) = if args.vendor {
+        (selected, Vec::new())
+    } else {
+        let (kept, skipped) = partition_not_installed_selected(selected, &lockfile_only.purls);
+        let printed: Vec<String> = skipped
+            .iter()
+            .filter_map(|r| r["purl"].as_str().map(str::to_string))
+            .collect();
+        (kept, printed)
+    };
+    if !args.common.silent {
+        for purl in &not_installed_selected {
+            println!(
+                "  [skip] {} (not installed — run your package manager's install first, \
+                 or `scan --vendor` to vendor it from the lockfile)",
+                normalize_purl(purl)
+            );
+        }
+    }
+
     if selected.is_empty() && !args.vendor {
         if !args.common.silent {
             println!("No patches selected.");
@@ -1946,6 +2186,7 @@ pub async fn run(args: ScanArgs) -> i32 {
             effective_org_slug,
             &selected,
             &filtered_crawled,
+            &lockfile_only.purls,
         )
         .await
     } else {
