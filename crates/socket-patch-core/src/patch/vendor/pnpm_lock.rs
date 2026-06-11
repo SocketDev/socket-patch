@@ -1581,7 +1581,7 @@ async fn commit_pair(
 // pnpm-lock.yaml is machine-emitted with a fixed 2/4/6/8-space shape; these
 // helpers splice line blocks and never interpret YAML generically.
 
-fn split_lines(text: &str) -> Vec<String> {
+pub(super) fn split_lines(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_string).collect()
 }
 
@@ -1592,7 +1592,7 @@ fn join_lines(lines: &[String]) -> String {
 /// `(header_idx, end_idx)` of a top-level `name:` section; `end` is the
 /// first following column-0 line (exclusive), so trailing blank separator
 /// lines belong to the section.
-fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
+pub(super) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
     let header = format!("{name}:");
     let start = lines.iter().position(|l| l == &header)?;
     let end = lines
@@ -1608,10 +1608,10 @@ fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
 /// One 2-space-keyed block inside a section (`[header, end)`; `end` stops at
 /// the blank separator / next block header, so the captured fragment is the
 /// verbatim entry without surrounding blanks).
-struct YamlBlock {
-    header: usize,
-    end: usize,
-    key: String,
+pub(super) struct YamlBlock {
+    pub(super) header: usize,
+    pub(super) end: usize,
+    pub(super) key: String,
     /// The key exactly as spelled in the file (incl. quotes) — rekeys
     /// preserve the file's quoting style.
     repr: String,
@@ -1631,7 +1631,7 @@ impl YamlBlock {
 }
 
 /// The next block at or after line `i` (within `[i, end)`).
-fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
+pub(super) fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
     while i < end {
         if let Some((key, repr, rest)) = parse_key_line(&lines[i], 2) {
             let mut j = i + 1;

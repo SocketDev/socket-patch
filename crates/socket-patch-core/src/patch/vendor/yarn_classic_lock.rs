@@ -555,7 +555,7 @@ fn rewrite_classic_block(
 
 /// Does this block's `resolved` already point into `.socket/vendor/npm/`
 /// (ours — current or stale uuid)?
-fn block_points_into_vendor(lines: &[String]) -> bool {
+pub(super) fn block_points_into_vendor(lines: &[String]) -> bool {
     classic_field(lines, "resolved")
         .and_then(parse_vendor_path)
         .is_some_and(|p| p.eco == "npm")

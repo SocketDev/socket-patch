@@ -898,7 +898,7 @@ fn carried_sections(lines: &[String]) -> Vec<String> {
 }
 
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
-fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(super) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
         let Some(rest) = body_field_line(line) else {
             continue;

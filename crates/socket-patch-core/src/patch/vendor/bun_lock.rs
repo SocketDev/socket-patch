@@ -423,7 +423,7 @@ fn revert_one_record(
 // ───────────────────────── conservative line grammar ──────────────────────
 
 /// One parsed single-line packages entry.
-struct BunEntry {
+pub(super) struct BunEntry {
     line_idx: usize,
     /// Leading whitespace, re-emitted verbatim.
     indent: String,
@@ -432,7 +432,7 @@ struct BunEntry {
     /// The key token exactly as spelled (incl. quotes), re-emitted verbatim.
     key_raw: String,
     /// Verbatim top-level tuple elements (trimmed).
-    elems: Vec<String>,
+    pub(super) elems: Vec<String>,
     trailing_comma: bool,
 }
 
@@ -472,14 +472,14 @@ fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShap
 }
 
 /// `name@spec` split at the LAST `@` (scoped names keep their leading `@`).
-fn split_name_spec(s: &str) -> Option<(&str, &str)> {
+pub(super) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
     let at = s.rfind('@').filter(|&i| i > 0)?;
     Some((&s[..at], &s[at + 1..]))
 }
 
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
 /// lockfile version is spliced (fail-closed on anything newer/older).
-fn check_lock_version(text: &str) -> Result<(), String> {
+pub(super) fn check_lock_version(text: &str) -> Result<(), String> {
     let version = text.lines().take(5).find_map(|line| {
         line.trim()
             .strip_prefix("\"lockfileVersion\":")
@@ -514,7 +514,7 @@ fn packages_bounds(lines: &[String]) -> Option<(usize, usize)> {
 
 /// Strictly parse every entry line of the packages section. Any line that
 /// is neither blank nor a single-line `"key": [tuple]` entry fails CLOSED.
-fn parse_packages_section(lines: &[String]) -> Result<Vec<BunEntry>, String> {
+pub(super) fn parse_packages_section(lines: &[String]) -> Result<Vec<BunEntry>, String> {
     let Some((start, end)) = packages_bounds(lines) else {
         // No (or unterminated) packages section: an empty lock simply has
         // no entries; an unterminated one is malformed.
@@ -651,7 +651,7 @@ fn split_top_level(interior: &str) -> Result<Vec<String>, String> {
 }
 
 /// Decode a verbatim JSON string token; `None` if it is not one.
-fn decode_json_string(token: &str) -> Option<String> {
+pub(super) fn decode_json_string(token: &str) -> Option<String> {
     if !token.starts_with('"') {
         return None;
     }

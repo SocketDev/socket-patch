@@ -53,6 +53,7 @@ pub mod cargo_lock;
 #[cfg(feature = "composer")]
 pub mod composer_lock;
 pub mod gem;
+pub mod lock_inventory;
 #[cfg(feature = "golang")]
 pub mod golang;
 mod npm_common;
