@@ -135,6 +135,9 @@ pub fn acquire_or_emit(
                 // `break_probe_held_message` takes no timeout precisely so
                 // the wrong value can't be passed back in.
                 let msg = break_probe_held_message();
+                // The user already passed --break-lock and it was refused:
+                // advising it again would be self-defeating. Only the
+                // inspect path remains actionable.
                 emit(
                     command,
                     json,
@@ -142,13 +145,13 @@ pub fn acquire_or_emit(
                     dry_run,
                     "lock_held",
                     &msg,
-                    Some(socket_dir),
+                    Hint::UnlockOnly,
                 );
                 return Err(1);
             }
             Err(LockError::Io { path, source }) => {
                 let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-                emit(command, json, silent, dry_run, "lock_io", &msg, None);
+                emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
                 return Err(1);
             }
         }
@@ -168,13 +171,13 @@ pub fn acquire_or_emit(
                 dry_run,
                 "lock_held",
                 &msg,
-                Some(socket_dir),
+                Hint::UnlockOrBreakLock,
             );
             Err(1)
         }
         Err(LockError::Io { path, source }) => {
             let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            emit(command, json, silent, dry_run, "lock_io", &msg, None);
+            emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
             Err(1)
         }
     }
@@ -248,6 +251,16 @@ fn error_envelope(command: Command, dry_run: bool, code: &str, message: &str) ->
     env
 }
 
+/// Remediation hint appended under the human-mode error line. The
+/// `--break-lock` advice is only valid when the caller hasn't already
+/// tried it — a refused `--break-lock` (live holder) must not advise
+/// rerunning with `--break-lock`, which is exactly what just failed.
+enum Hint {
+    None,
+    UnlockOnly,
+    UnlockOrBreakLock,
+}
+
 fn emit(
     command: Command,
     json: bool,
@@ -255,7 +268,7 @@ fn emit(
     dry_run: bool,
     code: &str,
     message: &str,
-    hint_dir: Option<&Path>,
+    hint: Hint,
 ) {
     if json {
         println!(
@@ -264,10 +277,16 @@ fn emit(
         );
     } else if !silent {
         eprintln!("Error: {message}.");
-        if hint_dir.is_some() {
-            eprintln!(
-                "  Run `socket-patch unlock` to inspect, or rerun with --break-lock if you're sure no holder exists."
-            );
+        match hint {
+            Hint::None => {}
+            Hint::UnlockOnly => {
+                eprintln!("  Run `socket-patch unlock` to inspect.");
+            }
+            Hint::UnlockOrBreakLock => {
+                eprintln!(
+                    "  Run `socket-patch unlock` to inspect, or rerun with --break-lock if you're sure no holder exists."
+                );
+            }
         }
     }
 }

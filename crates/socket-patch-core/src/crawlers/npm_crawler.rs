@@ -1138,7 +1138,7 @@ mod tests {
         let crawler = NpmCrawler::new();
         let traversal = "pkg:npm/../evil@1.0.0".to_string();
         let result = crawler
-            .find_by_purls(&nm, &[traversal.clone()])
+            .find_by_purls(&nm, std::slice::from_ref(&traversal))
             .await
             .unwrap();
 
@@ -1173,7 +1173,7 @@ mod tests {
         let crawler = NpmCrawler::new();
         let traversal = "pkg:npm/@x/../../evil@1.0.0".to_string();
         let result = crawler
-            .find_by_purls(&nm, &[traversal.clone()])
+            .find_by_purls(&nm, std::slice::from_ref(&traversal))
             .await
             .unwrap();
 

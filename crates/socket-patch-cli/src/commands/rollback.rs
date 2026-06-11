@@ -1449,7 +1449,7 @@ mod tests {
         // With no npm package installed under the tempdir the run finds
         // nothing to do — but it must get past the gate and report success,
         // not abort over a blob it would never read.
-        let (success, results) = rollback_patches(
+        let (success, results, _vendored_skipped) = rollback_patches(
             root,
             &manifest_path,
             None,
@@ -1496,7 +1496,7 @@ mod tests {
             .unwrap();
         // The npm before-blob is deliberately absent.
 
-        let (success, results) = rollback_patches(
+        let (success, results, _vendored_skipped) = rollback_patches(
             root,
             &manifest_path,
             None,
