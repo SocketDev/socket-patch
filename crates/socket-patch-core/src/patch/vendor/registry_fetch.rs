@@ -126,7 +126,29 @@ async fn fetch_npm(
         npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version)
     });
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    verify_integrity(&bytes, &entry.integrity)?;
+    match &entry.integrity {
+        // yarn berry locks never hash the tarball itself — the checksum is
+        // sha512 of the deterministic cache zip. Rebuild it from the fetched
+        // bytes (the same spike-pinned recipe the berry wiring uses) and
+        // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
+        LockIntegrity::BerryChecksum(expected) => {
+            if !expected.starts_with("10c0/") {
+                return Err(FetchError::Unverifiable(format!(
+                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; the \
+                     cache-zip recipe is not reproducible for it"
+                )));
+            }
+            let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
+                .map_err(FetchError::Failed)?;
+            if &actual != expected {
+                return Err(FetchError::Failed(format!(
+                    "yarn berry cache checksum mismatch: lockfile records {expected}, the \
+                     fetched tarball rebuilds to {actual}"
+                )));
+            }
+        }
+        other => verify_integrity(&bytes, other)?,
+    }
 
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
@@ -578,6 +600,70 @@ mod tests {
                 std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
                 "nothing may extract from a traversal-bearing tarball"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn berry_checksum_verifies_via_cache_zip_rebuild() {
+        let tgz = make_tgz(&[
+            ("package/package.json", br#"{"name":"left-pad"}"#, false),
+            ("package/index.js", b"module.exports = 1;\n", false),
+        ]);
+        let expected =
+            super::super::berry_zip::berry_cache_checksum_10c0(&tgz, "left-pad").unwrap();
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
+            .mount(&mock)
+            .await;
+
+        let entry = npm_entry(
+            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
+            LockIntegrity::BerryChecksum(expected),
+        );
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        assert!(fetched.dir().join("package.json").is_file());
+
+        // Tampered checksum → Failed; foreign cacheKey → Unverifiable.
+        let entry = npm_entry(
+            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
+            LockIntegrity::BerryChecksum(format!("10c0/{}", "0".repeat(128))),
+        );
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+        let entry = npm_entry(
+            Some(format!("{}/left-pad/-/left-pad-1.3.0.tgz", mock.uri())),
+            LockIntegrity::BerryChecksum(format!("9/{}", "0".repeat(128))),
+        );
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("cacheKey"), "{msg}"),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_local_artifact_verifies_ledger_sha256() {
+        let tgz = make_tgz(&[("package/package.json", b"{}", false)]);
+        let tmp = tempfile::tempdir().unwrap();
+        let tgz_path = tmp.path().join("left-pad-1.3.0.tgz");
+        std::fs::write(&tgz_path, &tgz).unwrap();
+        let sha = hex::encode(Sha256::digest(&tgz));
+
+        let staged = stage_local_artifact(&tgz_path, &sha).await.unwrap();
+        assert!(staged.dir().join("package.json").is_file());
+
+        match stage_local_artifact(&tgz_path, &"0".repeat(64)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
+            other => panic!("expected ledger mismatch, got {other:?}"),
+        }
+        match stage_local_artifact(&tgz_path, "").await {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("expected Unverifiable for empty hash, got {other:?}"),
         }
     }
 
