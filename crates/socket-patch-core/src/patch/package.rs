@@ -68,7 +68,29 @@ fn normalize_entry_path(path: &str) -> &str {
 /// extraction step itself — the on-disk write site is the single,
 /// hash-verified path inside `apply_file_patch`.
 pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    // Open non-blockingly and require a regular file. A plain `open(2)` of a
+    // FIFO planted at the archive path waits for a writer that may never
+    // come — wedging the whole apply run before any parsing happens (the
+    // caller only stats the path first, which a FIFO passes). `O_NONBLOCK`
+    // has no effect on regular-file reads; the handle-based `is_file` guard
+    // then rejects FIFOs/devices outright (mirrors
+    // `compute_file_git_sha256` in file_hash.rs).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(archive_path)?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(archive_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(ArchiveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("archive {} is not a regular file", archive_path.display()),
+        )));
+    }
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
     // truncated-archive error.
@@ -535,6 +557,51 @@ mod tests {
         // key, matching the existing non-canonicalizing behavior).
         assert_eq!(map.len(), 1, "curdir-prefixed real path must be accepted");
         assert_eq!(map.values().next().map(|v| v.as_slice()), Some(&b"ok"[..]));
+    }
+
+    /// A FIFO planted at the archive path must be rejected promptly with an
+    /// error, not block forever. A plain `open(2)` with `O_RDONLY` on a FIFO
+    /// waits for a writer that may never come, and the caller
+    /// (`load_archive_if_present`) only stats the path before calling — a stat
+    /// a FIFO passes — so without a non-blocking open the whole apply run
+    /// wedges before any parsing or validation runs.
+    #[cfg(unix)]
+    #[test]
+    fn test_read_archive_rejects_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("arc.tar.gz");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success(), "mkfifo failed");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo_for_thread = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_archive_to_map(&fifo_for_thread));
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => {
+                let err = result.expect_err("FIFO archive must be rejected, never parsed");
+                assert!(
+                    matches!(
+                        &err,
+                        ArchiveError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput
+                    ),
+                    "expected InvalidInput for FIFO archive, got {err:?}"
+                );
+            }
+            Err(_) => {
+                // The open is wedged in the spawned thread; connect a writer
+                // to release it so this test can FAIL instead of hanging the
+                // whole suite.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("reading a FIFO archive must error promptly, not hang");
+            }
+        }
     }
 
     #[test]

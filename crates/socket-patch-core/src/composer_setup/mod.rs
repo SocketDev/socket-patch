@@ -212,8 +212,13 @@ fn ensure_scripts_object(root: &mut Map<String, Value>) -> &mut Map<String, Valu
 }
 
 /// Add [`APPLY_COMMAND`] to one event, normalising string → array. Returns
-/// whether the event changed. Already-present (exact command) is a no-op.
+/// whether the event changed. Any command already carrying [`HOOK_MARKER`]
+/// counts as present — the same predicate as [`is_hook_present`] / `--check`,
+/// so a user-customized flag set is left alone rather than duplicated.
 fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
+    if event_contains_marker(scripts.get(event)) {
+        return false;
+    }
     let cmd = Value::String(APPLY_COMMAND.to_string());
     match scripts.get_mut(event) {
         None => {
@@ -221,21 +226,13 @@ fn add_command_to_event(scripts: &mut Map<String, Value>, event: &str) -> bool {
             true
         }
         Some(Value::String(s)) => {
-            if s == APPLY_COMMAND {
-                false
-            } else {
-                let existing = Value::String(s.clone());
-                scripts.insert(event.to_string(), Value::Array(vec![existing, cmd]));
-                true
-            }
+            let existing = Value::String(s.clone());
+            scripts.insert(event.to_string(), Value::Array(vec![existing, cmd]));
+            true
         }
         Some(Value::Array(arr)) => {
-            if arr.iter().any(|v| v.as_str() == Some(APPLY_COMMAND)) {
-                false
-            } else {
-                arr.push(cmd);
-                true
-            }
+            arr.push(cmd);
+            true
         }
         // A non-string/array script value is user data we won't clobber.
         Some(_) => false,
@@ -267,6 +264,57 @@ fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> b
 
 // ── async wrappers ───────────────────────────────────────────────────────────
 
+/// Atomically write `content` to `path`.
+///
+/// A bare `fs::write` truncates the target before writing, so a crash, power
+/// loss, or interrupted process mid-write would leave the user's committed
+/// `composer.json` truncated or empty — destroying the file we only meant to
+/// append two script events to. Instead we write to a sibling stage file,
+/// fsync it, then rename over the target (rename is atomic on the same
+/// filesystem) so a reader ever sees either the old bytes or the complete new
+/// bytes. Mirrors the hardened writer in `package_json/update.rs`.
+async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "composer.json".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Wire the project: append our command to the composer script events.
 pub async fn add_hook(project: &ComposerProject, dry_run: bool) -> ComposerEditResult {
     edit(&project.composer_json, dry_run, composer_add).await
@@ -293,7 +341,7 @@ async fn edit(
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    fs::write(composer_json, &new)
+                    atomic_write(composer_json, &new)
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -577,6 +625,78 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_add_noops_on_flag_variant_hook() {
+        // Regression: `setup --check` (is_hook_present) treats any
+        // `socket-patch apply` variant as configured, and `setup` must agree —
+        // appending the stock command next to a user-customized flag set would
+        // run the hook twice on every install. Mirrors the npm backend's
+        // `script_is_configured` contract (loose marker on both sides).
+        let customized = "{\"scripts\":{\
+            \"post-install-cmd\":[\"socket-patch apply --offline --ecosystems composer\"],\
+            \"post-update-cmd\":\"socket-patch apply --offline --ecosystems composer\"}}";
+        assert!(is_hook_present(customized), "variant reads as configured");
+        assert!(
+            composer_add(customized).unwrap().is_none(),
+            "add must not duplicate a hook --check already reports as configured"
+        );
+    }
+
+    // ── atomic-write contract (no truncation / no stage litter) ──────
+    //
+    // The edit must go through stage+fsync+rename, never a bare truncating
+    // write, so a crash can't leave the user's committed composer.json empty.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_replaces_readonly_manifest_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        // Oracle for the truncating-write bug: rename needs only directory
+        // write permission, while a bare `fs::write` must open the target
+        // itself for writing — so a read-only composer.json distinguishes the
+        // two (EACCES under truncate, clean replace under stage+rename, same
+        // as the npm/pypi/cargo/go manifest writers).
+        let dir = tempfile::tempdir().unwrap();
+        let cj = dir.path().join("composer.json");
+        fs::write(&cj, BASIC).await.unwrap();
+        std::fs::set_permissions(&cj, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let project = discover_composer_project(dir.path()).await.unwrap();
+        let res = add_hook(&project, false).await;
+        assert_eq!(
+            res.status,
+            ComposerSetupStatus::Updated,
+            "err: {:?}",
+            res.error
+        );
+        assert!(is_hook_present(&fs::read_to_string(&cj).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_edit_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let cj = dir.path().join("composer.json");
+        fs::write(&cj, BASIC).await.unwrap();
+        let project = discover_composer_project(dir.path()).await.unwrap();
+
+        assert_eq!(
+            add_hook(&project, false).await.status,
+            ComposerSetupStatus::Updated
+        );
+        assert_eq!(
+            remove_hook(&project, false).await.status,
+            ComposerSetupStatus::Updated
+        );
+        assert_eq!(fs::read_to_string(&cj).await.unwrap(), BASIC);
+
+        // No half-written `.socket-stage-*` sibling left behind.
+        let mut rd = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
         }
     }
 

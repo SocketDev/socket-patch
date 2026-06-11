@@ -217,10 +217,10 @@ pub struct GlobalArgs {
     #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,
 
-    /// Force-remove `<.socket>/apply.lock` before attempting
-    /// acquisition. Use when you are certain no other socket-patch
-    /// process is running (e.g. a previous run crashed in a way that
-    /// stripped the OS lock but left the file). Emits a
+    /// Reclaim a stale `<.socket>/apply.lock` left behind by a
+    /// crashed run (the file is never deleted — deleting a lock file
+    /// defeats mutual exclusion). Refuses with `lock_held` if a live
+    /// socket-patch process still holds the lock. Emits a
     /// `lock_broken` warning event in the JSON envelope so the
     /// action is auditable. Only meaningful for mutating
     /// subcommands; other commands accept it silently.
@@ -282,15 +282,73 @@ impl GlobalArgs {
 }
 
 /// Apply CLI-flag toggles for env-driven knobs by mirroring them into env
-/// vars. This is how `--debug` / `--no-telemetry` reach core code that
-/// reads `SOCKET_DEBUG` / `SOCKET_TELEMETRY_DISABLED` directly. Idempotent
-/// and a no-op when the flags are off.
+/// vars. This is how `--offline` / `--debug` / `--no-telemetry` reach core
+/// code that reads `SOCKET_OFFLINE` / `SOCKET_DEBUG` /
+/// `SOCKET_TELEMETRY_DISABLED` directly. Idempotent and a no-op when the
+/// flags are off.
+///
+/// `offline` matters most: the telemetry kill-switch
+/// (`socket_patch_core::utils::telemetry::is_telemetry_disabled`) honors the
+/// strict-airgap contract by reading `SOCKET_OFFLINE` from the env, so
+/// without this mirror a bare `--offline` flag (or a truthy spelling like
+/// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
+/// still let telemetry fire a network request.
 pub fn apply_env_toggles(common: &GlobalArgs) {
+    if common.offline {
+        std::env::set_var("SOCKET_OFFLINE", "1");
+    }
     if common.debug {
         std::env::set_var("SOCKET_DEBUG", "1");
     }
     if common.no_telemetry {
         std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+    }
+}
+
+/// Every env var `GlobalArgs` binds (one per `env = "..."` attribute above).
+/// Single source of truth for [`scrub_empty_global_env_vars`] and the
+/// clean-environment test harnesses.
+pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_API_TOKEN",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_OFFLINE",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_BREAK_LOCK",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+];
+
+/// Remove exported-but-**empty** `GlobalArgs` env vars before clap parses.
+///
+/// `SOCKET_CWD=` — the conventional shell/CI idiom for blanking a variable
+/// without unsetting it — must mean "unset, fall back to the default", not
+/// abort the command. [`parse_bool_flag`] already gives the bool flags that
+/// semantic, but clap rejects an empty `SOCKET_CWD` / `SOCKET_GLOBAL_PREFIX`
+/// ("a value is required"), `SOCKET_LOCK_TIMEOUT` ("cannot parse integer
+/// from empty string") and `SOCKET_ECOSYSTEMS` (the per-token validator)
+/// outright — a single stray blank var crashed every subcommand — and an
+/// empty `SOCKET_DOWNLOAD_MODE` / `SOCKET_MANIFEST_PATH` leaked `""` past
+/// the documented defaults. Called from `main` after legacy-name promotion
+/// and before clap runs. Only exactly-empty values are scrubbed; whitespace
+/// is significant in paths, so it is left for the parsers to judge.
+pub fn scrub_empty_global_env_vars() {
+    for &var in GLOBAL_ARG_ENV_VARS {
+        if matches!(std::env::var(var).as_deref(), Ok("")) {
+            std::env::remove_var(var);
+        }
     }
 }
 
@@ -350,28 +408,8 @@ mod tests {
 
     /// Full list of env vars `GlobalArgs` reads, so each clap-parse test starts
     /// from a known-clean environment (no ambient `SOCKET_*` bleed-through).
-    const SOCKET_ENV_VARS: &[&str] = &[
-        "SOCKET_CWD",
-        "SOCKET_MANIFEST_PATH",
-        "SOCKET_API_URL",
-        "SOCKET_API_TOKEN",
-        "SOCKET_ORG_SLUG",
-        "SOCKET_PROXY_URL",
-        "SOCKET_ECOSYSTEMS",
-        "SOCKET_DOWNLOAD_MODE",
-        "SOCKET_OFFLINE",
-        "SOCKET_GLOBAL",
-        "SOCKET_GLOBAL_PREFIX",
-        "SOCKET_JSON",
-        "SOCKET_VERBOSE",
-        "SOCKET_SILENT",
-        "SOCKET_DRY_RUN",
-        "SOCKET_YES",
-        "SOCKET_LOCK_TIMEOUT",
-        "SOCKET_BREAK_LOCK",
-        "SOCKET_DEBUG",
-        "SOCKET_TELEMETRY_DISABLED",
-    ];
+    /// Aliases the production list so the scrub and the harness can't drift.
+    const SOCKET_ENV_VARS: &[&str] = GLOBAL_ARG_ENV_VARS;
 
     /// Snapshot/clear every `SOCKET_*` var, run `f`, then restore. Keeps the
     /// env-mutating clap tests hermetic and reversible.
@@ -390,6 +428,118 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// Clear the extra env the core telemetry gate reads beyond the
+    /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` and the
+    /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests
+    /// below can't pass or fail vacuously. Restores afterwards.
+    fn with_clean_telemetry_env(f: impl FnOnce()) {
+        const EXTRA: &[&str] = &["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"];
+        let saved: Vec<(&str, Option<String>)> =
+            EXTRA.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for &k in EXTRA {
+            std::env::remove_var(k);
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// `--offline` promises "never contact the network", but the telemetry
+    /// kill-switch (`socket_patch_core::utils::telemetry::is_telemetry_disabled`)
+    /// reads the `SOCKET_OFFLINE` env var directly — it never sees the parsed
+    /// flag. `apply_env_toggles` must therefore mirror `--offline` into the
+    /// env exactly like `--debug` / `--no-telemetry`, or an airgapped
+    /// `socket-patch apply --offline` still fires a telemetry HTTP request.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_toggles_mirrors_offline_into_env_for_airgap() {
+        with_clean_socket_env(|| {
+            with_clean_telemetry_env(|| {
+                let args = GlobalArgs {
+                    offline: true,
+                    ..GlobalArgs::default()
+                };
+                apply_env_toggles(&args);
+                assert_eq!(std::env::var("SOCKET_OFFLINE").as_deref(), Ok("1"));
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "--offline must disable telemetry (strict airgap: never contact the network)",
+                );
+            });
+        });
+    }
+
+    /// The full `SOCKET_OFFLINE` vocabulary must reach the telemetry gate.
+    /// clap (via `parse_bool_flag`) accepts `yes`/`on`/`y`/`t` as true, but
+    /// core's direct env read matches only `"1" | "true"` — so the toggle
+    /// mirror has to re-export the parsed flag in normalized form.
+    #[test]
+    #[serial_test::serial]
+    fn truthy_offline_env_vocabulary_reaches_telemetry_gate() {
+        with_clean_socket_env(|| {
+            with_clean_telemetry_env(|| {
+                std::env::set_var("SOCKET_OFFLINE", "yes");
+                let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+                assert!(cli.common.offline, "SOCKET_OFFLINE=yes parses as offline");
+                apply_env_toggles(&cli.common);
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "SOCKET_OFFLINE=yes must disable telemetry like SOCKET_OFFLINE=1",
+                );
+            });
+        });
+    }
+
+    /// `scrub_empty_global_env_vars` removes exactly-empty `SOCKET_*` globals
+    /// (the `VAR=` blank-without-unsetting idiom) and nothing else: set,
+    /// non-empty values — even whitespace-only ones, which are significant in
+    /// paths — survive, and the previously-crashing parse then sees plain
+    /// defaults.
+    #[test]
+    #[serial_test::serial]
+    fn scrub_empty_global_env_vars_unsets_only_empties() {
+        with_clean_socket_env(|| {
+            std::env::set_var("SOCKET_CWD", "");
+            std::env::set_var("SOCKET_LOCK_TIMEOUT", "");
+            std::env::set_var("SOCKET_GLOBAL_PREFIX", "");
+            std::env::set_var("SOCKET_ECOSYSTEMS", "");
+            std::env::set_var("SOCKET_DOWNLOAD_MODE", "");
+            std::env::set_var("SOCKET_MANIFEST_PATH", "keep.json");
+            std::env::set_var("SOCKET_ORG_SLUG", " ");
+
+            scrub_empty_global_env_vars();
+
+            assert!(
+                std::env::var("SOCKET_CWD").is_err(),
+                "empty var is scrubbed"
+            );
+            assert!(std::env::var("SOCKET_LOCK_TIMEOUT").is_err());
+            assert_eq!(
+                std::env::var("SOCKET_MANIFEST_PATH").as_deref(),
+                Ok("keep.json"),
+                "non-empty values must survive the scrub",
+            );
+            assert_eq!(
+                std::env::var("SOCKET_ORG_SLUG").as_deref(),
+                Ok(" "),
+                "whitespace-only values are left for the parsers to judge",
+            );
+
+            let cli = TestCli::try_parse_from(["socket-patch"])
+                .expect("blank env vars must mean 'unset', not a parse abort");
+            assert_eq!(cli.common.cwd, PathBuf::from("."));
+            assert_eq!(cli.common.lock_timeout, None);
+            assert!(cli.common.global_prefix.is_none());
+            assert!(cli.common.ecosystems.is_none());
+            assert_eq!(cli.common.download_mode, "diff");
+            assert_eq!(cli.common.manifest_path, "keep.json");
+        });
     }
 
     /// `parse_bool_flag` accepts the same vocabulary as clap's

@@ -12,7 +12,10 @@
 //!   literal `@`-prefixed keys.
 //! * Optional fields use `Option<T>` + `skip_serializing_if = "Option::is_none"`
 //!   so the emitted JSON omits them rather than emitting `null`. Matches
-//!   the Go implementation's `omitempty` behavior.
+//!   the Go implementation's `omitempty` behavior. Two exceptions keep
+//!   the Go zero value instead of `Option`: `products` (empty `Vec` =
+//!   absent, like `aliases`/`subcomponents`) and the component `@id`
+//!   (empty `String` = absent), both optional per spec.
 //! * `version` is the OpenVEX document revision counter (integer,
 //!   starts at 1). NOT the schema version.
 //! * `Vec<Statement>` is always present (the spec allows it to be empty
@@ -69,6 +72,13 @@ pub struct Statement {
     /// RFC 3339 timestamp of the most recent revision of this statement.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_updated: Option<String>,
+    /// Products the statement applies to. Optional per spec — like
+    /// `timestamp` above it cascades down from the encapsulating
+    /// document when omitted (see OpenVEX inheritance rules). Our
+    /// builder always emits at least one, but the type must accept its
+    /// absence on parse; an empty list omits the key, matching the Go
+    /// implementation's `products,omitempty`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub products: Vec<Product>,
     pub status: Status,
     /// Optional supplier IRI overriding the document-level author for
@@ -102,7 +112,11 @@ pub struct Vulnerability {
 /// subcomponent list pinpoints the vulnerable transitive dep.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Product {
-    #[serde(rename = "@id")]
+    /// Optional IRI per spec — a component may instead be addressed
+    /// via `identifiers`/`hashes`. Stays a plain `String` (not
+    /// `Option`) mirroring go-vex's `@id,omitempty` zero value: absent
+    /// parses as `""`, and `""` is omitted on serialize.
+    #[serde(rename = "@id", default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     /// Optional auxiliary identifiers (PURL, CPE 2.2, CPE 2.3, etc.).
     /// Keys are the identifier type (e.g. `"purl"`, `"cpe23"`),
@@ -121,7 +135,9 @@ pub struct Product {
 /// the patch covers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Subcomponent {
-    #[serde(rename = "@id")]
+    /// Optional IRI per spec; same zero-value `omitempty` handling as
+    /// [`Product::id`].
+    #[serde(rename = "@id", default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub identifiers: Option<BTreeMap<String, String>>,
@@ -657,6 +673,132 @@ mod tests {
         assert!(
             v.as_object().unwrap().get("timestamp").is_none(),
             "None timestamp must be omitted, never serialized as null/empty"
+        );
+    }
+
+    // ── Statement products is optional/inheritable per spec ────────
+
+    /// Regression: `products` is OPTIONAL in OpenVEX 0.2.0 — "While a
+    /// product is required to have a complete statement, this field is
+    /// optional as it can cascade down from the encapsulating
+    /// document" (spec, Statement Fields; go-vex tags it
+    /// `products,omitempty`). A spec-valid statement that omits it
+    /// MUST parse, not error with "missing field `products`" — the
+    /// same inheritance rule that made `timestamp` optional above.
+    #[test]
+    fn statement_without_products_parses_and_leaves_it_empty() {
+        let doc_json = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": 1,
+            "statements": [
+              {
+                "vulnerability": {"name": "CVE-2014-123456"},
+                "timestamp": "2024-01-01T00:00:00Z",
+                "status": "under_investigation"
+              }
+            ]
+        }"#;
+        let doc: Document =
+            serde_json::from_str(doc_json).expect("statement may omit products (inherited)");
+        assert!(
+            doc.statements[0].products.is_empty(),
+            "omitted products must deserialize to an empty list, not error"
+        );
+    }
+
+    /// Empty `products` serializes by omitting the key, matching the
+    /// Go implementation's `products,omitempty` (no `"products": []`).
+    #[test]
+    fn statement_with_empty_products_omits_key() {
+        let mut s = minimal_statement();
+        s.products = Vec::new();
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(
+            v.as_object().unwrap().get("products").is_none(),
+            "empty products must omit the key (Go omitempty parity)"
+        );
+    }
+
+    // ── Product/Subcomponent `@id` is optional per spec ────────────
+
+    /// Regression: the component `@id` is OPTIONAL in OpenVEX 0.2.0 —
+    /// "Optional IRI identifying the component to make it externally
+    /// referenceable" — a product may instead be addressed via its
+    /// `identifiers`/`hashes` maps (go-vex tags it `@id,omitempty`).
+    /// A spec-valid product identified only by `identifiers` MUST
+    /// parse, not error with "missing field `@id`".
+    #[test]
+    fn product_without_at_id_parses_via_identifiers() {
+        let doc_json = r#"{
+            "@context": "https://openvex.dev/ns/v0.2.0",
+            "@id": "urn:uuid:1",
+            "author": "Socket",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "version": 1,
+            "statements": [
+              {
+                "vulnerability": {"name": "GHSA-x"},
+                "timestamp": "2024-01-01T00:00:00Z",
+                "products": [{
+                  "identifiers": {"purl": "pkg:apk/wolfi/git@2.39.0-r1?arch=armv7"},
+                  "subcomponents": [{"hashes": {"sha256": "abc123"}}]
+                }],
+                "status": "not_affected",
+                "justification": "component_not_present"
+              }
+            ]
+        }"#;
+        let doc: Document =
+            serde_json::from_str(doc_json).expect("product may omit @id (identifiers address it)");
+        let p = &doc.statements[0].products[0];
+        assert_eq!(p.id, "", "absent product @id must default, not error");
+        assert_eq!(
+            p.identifiers.as_ref().unwrap()["purl"],
+            "pkg:apk/wolfi/git@2.39.0-r1?arch=armv7"
+        );
+        assert_eq!(
+            p.subcomponents[0].id, "",
+            "absent subcomponent @id must default"
+        );
+        assert_eq!(
+            p.subcomponents[0].hashes.as_ref().unwrap()["sha256"],
+            "abc123"
+        );
+    }
+
+    /// An empty component `@id` is omitted on serialize (Go `omitempty`
+    /// zero-value parity), so an identifiers-only product round-trips
+    /// without gaining a bogus `"@id": ""`.
+    #[test]
+    fn product_with_empty_id_omits_at_id_key() {
+        let p = Product {
+            id: String::new(),
+            identifiers: Some(BTreeMap::from([(
+                "purl".to_string(),
+                "pkg:npm/app@1.0.0".to_string(),
+            )])),
+            hashes: None,
+            subcomponents: vec![Subcomponent {
+                id: String::new(),
+                identifiers: None,
+                hashes: Some(BTreeMap::from([("sha256".to_string(), "abc".to_string())])),
+            }],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            v.as_object().unwrap().get("@id").is_none(),
+            "empty product @id must be omitted"
+        );
+        assert!(
+            v["subcomponents"][0]
+                .as_object()
+                .unwrap()
+                .get("@id")
+                .is_none(),
+            "empty subcomponent @id must be omitted"
         );
     }
 

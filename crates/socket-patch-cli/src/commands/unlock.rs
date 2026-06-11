@@ -23,7 +23,7 @@ use clap::Args;
 use socket_patch_core::patch::apply_lock::{acquire, LockError};
 use socket_patch_core::utils::telemetry::{track_patch_unlock_failed, track_patch_unlocked};
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::json_envelope::{Command, Envelope, EnvelopeError};
 
 #[derive(Args)]
@@ -34,10 +34,19 @@ pub struct UnlockArgs {
     /// When the lock is free, also delete the lock file. Refused if
     /// the lock is currently held — use `--break-lock` on the
     /// mutating subcommand instead for that scenario.
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool
+    /// flags: clap's default bool parser accepts only the literal
+    /// strings `true`/`false` from the env binding, so
+    /// `SOCKET_UNLOCK_RELEASE=1` (or an exported-but-empty
+    /// `SOCKET_UNLOCK_RELEASE=`) aborted every `unlock` invocation.
+    /// This flag is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s
+    /// empty-var scrub never rescues it.
     #[arg(
         long = "release",
         env = "SOCKET_UNLOCK_RELEASE",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = parse_bool_flag,
     )]
     pub release: bool,
 }
@@ -45,7 +54,13 @@ pub struct UnlockArgs {
 pub async fn run(args: UnlockArgs) -> i32 {
     apply_env_toggles(&args.common);
 
-    let socket_dir = args.common.cwd.join(".socket");
+    // Derive the lock directory exactly like the mutating subcommands
+    // do (`manifest_path.parent()`) — they're the processes whose lock
+    // this command exists to observe. Hardcoding `<cwd>/.socket` here
+    // would probe a directory nobody locks whenever `--manifest-path`
+    // points elsewhere.
+    let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let lock_file = socket_dir.join("apply.lock");
     let api_token = args.common.api_token.clone();
     let org_slug = args.common.org.clone();
@@ -59,7 +74,13 @@ pub async fn run(args: UnlockArgs) -> i32 {
         // user passed --release. Telemetry and the emitted envelope
         // must agree on this.
         track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
-        return emit_free(args.common.json, &lock_file, false, args.release);
+        return emit_free(
+            args.common.json,
+            args.common.silent,
+            &lock_file,
+            false,
+            args.release,
+        );
     }
 
     // Snapshot whether a lock file already exists *before* acquiring.
@@ -70,7 +91,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
     // created), we have to capture this now.
     let lock_existed = lock_file.exists();
 
-    match acquire(&socket_dir, Duration::ZERO) {
+    match acquire(socket_dir, Duration::ZERO) {
         Ok(guard) => {
             // We successfully claimed the lock — nobody else holds
             // it. Release our handle before deleting the file so the
@@ -95,7 +116,13 @@ pub async fn run(args: UnlockArgs) -> i32 {
                             org_slug.as_deref(),
                         )
                         .await;
-                        emit_free(args.common.json, &lock_file, lock_existed, true)
+                        emit_free(
+                            args.common.json,
+                            args.common.silent,
+                            &lock_file,
+                            lock_existed,
+                            true,
+                        )
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         // The file was never created (e.g. socket
@@ -108,7 +135,13 @@ pub async fn run(args: UnlockArgs) -> i32 {
                             org_slug.as_deref(),
                         )
                         .await;
-                        emit_free(args.common.json, &lock_file, false, true)
+                        emit_free(
+                            args.common.json,
+                            args.common.silent,
+                            &lock_file,
+                            false,
+                            true,
+                        )
                     }
                     Err(e) => {
                         let msg = format!(
@@ -124,7 +157,13 @@ pub async fn run(args: UnlockArgs) -> i32 {
                 }
             } else {
                 track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_free(args.common.json, &lock_file, false, false)
+                emit_free(
+                    args.common.json,
+                    args.common.silent,
+                    &lock_file,
+                    false,
+                    false,
+                )
             }
         }
         Err(LockError::Held) => {
@@ -173,7 +212,10 @@ pub async fn run(args: UnlockArgs) -> i32 {
 /// Print the "free" success envelope and return exit code 0.
 /// `removed` is true when `--release` actually deleted the file
 /// (vs. the no-op case where the file didn't exist).
-fn emit_free(json: bool, lock_file: &Path, removed: bool, release: bool) -> i32 {
+/// `silent` suppresses the human-readable lines (the JSON envelope is
+/// machine output and always prints) — same `--silent` contract as the
+/// sibling subcommands.
+fn emit_free(json: bool, silent: bool, lock_file: &Path, removed: bool, release: bool) -> i32 {
     if json {
         // Build the success body by hand rather than re-using the
         // shared `Envelope` shape — the `events`/`summary` fields
@@ -188,6 +230,8 @@ fn emit_free(json: bool, lock_file: &Path, removed: bool, release: bool) -> i32 
             "released": removed,
         });
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
+    } else if silent {
+        // Suppress the informational lines; the exit code carries the verdict.
     } else if release && removed {
         println!("Lock is free. Removed {}.", lock_file.display());
     } else if release {

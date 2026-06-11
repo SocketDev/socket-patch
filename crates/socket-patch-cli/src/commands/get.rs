@@ -249,6 +249,15 @@ fn report_error(json: bool, message: impl std::fmt::Display) {
     }
 }
 
+/// A blob hash must be a SHA-256 hex string — the same shape `fetch_blob`
+/// enforces before splicing a hash into a URL. Enforced here because the
+/// hash comes from an untrusted API response and is used as a filesystem
+/// path component: anything else (`../../x`, an absolute path) would
+/// escape the blobs directory via `Path::join`.
+fn is_valid_blob_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Decode a base64 string and write it to `blobs_dir/hash`. Returns a
 /// formatted error string referencing `file_path` and `label` on failure.
 async fn write_blob_entry(
@@ -258,6 +267,11 @@ async fn write_blob_entry(
     file_path: &str,
     label: &str,
 ) -> Result<(), String> {
+    if !is_valid_blob_hash(hash) {
+        return Err(format!(
+            "Refusing to write {label} for {file_path}: invalid blob hash {hash:?} (expected 64 hex chars)"
+        ));
+    }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
     tokio::fs::write(blobs_dir.join(hash), &decoded)
@@ -1249,6 +1263,9 @@ pub async fn run(args: GetArgs) -> i32 {
     }
 
     apply_env_toggles(&args.common);
+    // `--silent` is "errors only" (CLI_CONTRACT.md): every informational
+    // print below is gated on this; errors and JSON envelopes are not.
+    let quiet = args.common.json || args.common.silent;
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
@@ -1277,7 +1294,7 @@ pub async fn run(args: GetArgs) -> i32 {
         match detect_identifier_type(&args.identifier) {
             Some(t) => t,
             None => {
-                if !args.common.json {
+                if !quiet {
                     println!("Treating \"{}\" as a package name search", args.identifier);
                 }
                 IdentifierType::Package
@@ -1287,7 +1304,7 @@ pub async fn run(args: GetArgs) -> i32 {
 
     // Handle UUID: fetch and download directly
     if id_type == IdentifierType::Uuid {
-        if !args.common.json {
+        if !quiet {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
         let mut fetch_result = api_client
@@ -1335,7 +1352,7 @@ pub async fn run(args: GetArgs) -> i32 {
                                 "tier": "paid",
                             }],
                         }));
-                    } else {
+                    } else if !args.common.silent {
                         println!("\nThis patch requires a paid subscription to download.");
                         println!("\n  Patch: {}", patch.purl);
                         println!("  Tier:  paid");
@@ -1359,9 +1376,10 @@ pub async fn run(args: GetArgs) -> i32 {
                     telemetry_org.as_deref(),
                 )
                 .await;
-                // Save to manifest
-                return save_and_apply_patch(&args, &patch.purl, &patch.uuid, effective_org_slug)
-                    .await;
+                // Save to manifest. Pass the fetched patch through so the
+                // save step reuses this (possibly proxy-fallback) result
+                // instead of re-fetching with a fresh client.
+                return save_and_apply_patch(&args, &patch).await;
             }
             Ok(None) => {
                 track_patch_fetch_failed(
@@ -1374,7 +1392,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 .await;
                 if args.common.json {
                     print_json(&empty_result_json("not_found"));
-                } else {
+                } else if !args.common.silent {
                     println!("No patch found with UUID: {}", args.identifier);
                 }
                 return 0;
@@ -1398,7 +1416,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // the matching endpoint, and surface errors via `report_fetch_failure`.
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve | IdentifierType::Ghsa | IdentifierType::Purl => {
-            if !args.common.json {
+            if !quiet {
                 let label = match id_type {
                     IdentifierType::Cve => "CVE",
                     IdentifierType::Ghsa => "GHSA",
@@ -1441,7 +1459,7 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Package => {
-            if !args.common.json {
+            if !quiet {
                 println!("Enumerating packages...");
             }
             let crawler_options = CrawlerOptions {
@@ -1455,25 +1473,27 @@ pub async fn run(args: GetArgs) -> i32 {
             if all_packages.is_empty() {
                 if args.common.json {
                     print_json(&empty_result_json("no_packages"));
-                } else if args.common.global {
-                    println!("No global packages found.");
-                } else {
-                    #[allow(unused_mut)]
-                    let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-                    #[cfg(feature = "cargo")]
-                    install_cmds.push_str("/cargo");
-                    #[cfg(feature = "golang")]
-                    install_cmds.push_str("/go");
-                    #[cfg(feature = "maven")]
-                    install_cmds.push_str("/mvn");
-                    #[cfg(feature = "composer")]
-                    install_cmds.push_str("/composer");
-                    println!("No packages found. Run {install_cmds} install first.");
+                } else if !args.common.silent {
+                    if args.common.global {
+                        println!("No global packages found.");
+                    } else {
+                        #[allow(unused_mut)]
+                        let mut install_cmds = String::from("npm/yarn/pnpm/pip");
+                        #[cfg(feature = "cargo")]
+                        install_cmds.push_str("/cargo");
+                        #[cfg(feature = "golang")]
+                        install_cmds.push_str("/go");
+                        #[cfg(feature = "maven")]
+                        install_cmds.push_str("/mvn");
+                        #[cfg(feature = "composer")]
+                        install_cmds.push_str("/composer");
+                        println!("No packages found. Run {install_cmds} install first.");
+                    }
                 }
                 return 0;
             }
 
-            if !args.common.json {
+            if !quiet {
                 println!("Found {} packages", all_packages.len());
             }
 
@@ -1482,13 +1502,13 @@ pub async fn run(args: GetArgs) -> i32 {
             if matches.is_empty() {
                 if args.common.json {
                     print_json(&empty_result_json("no_match"));
-                } else {
+                } else if !args.common.silent {
                     println!("No packages matching \"{}\" found.", args.identifier);
                 }
                 return 0;
             }
 
-            if !args.common.json {
+            if !quiet {
                 println!(
                     "Found {} matching package(s), checking for available patches...",
                     matches.len()
@@ -1521,13 +1541,13 @@ pub async fn run(args: GetArgs) -> i32 {
     if search_response.patches.is_empty() {
         if args.common.json {
             print_json(&empty_result_json("not_found"));
-        } else {
+        } else if !args.common.silent {
             println!("No patches found for {}: {}", id_type, args.identifier);
         }
         return 0;
     }
 
-    if !args.common.json {
+    if !quiet {
         display_search_results(
             &search_response.patches,
             search_response.can_access_paid_patches,
@@ -1555,7 +1575,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     "tier": p.tier,
                 })).collect::<Vec<_>>(),
             }));
-        } else {
+        } else if !args.common.silent {
             println!("\nAll available patches require a paid subscription.");
             println!("\n  Upgrade at: https://socket.dev/pricing\n");
         }
@@ -1573,7 +1593,7 @@ pub async fn run(args: GetArgs) -> i32 {
     };
 
     if selected.is_empty() {
-        if !args.common.json {
+        if !quiet {
             println!("No patches selected.");
         }
         return 0;
@@ -1582,7 +1602,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // Confirm before downloading (default YES)
     let prompt = format!("Download {} patch(es)?", selected.len());
     if !confirm(&prompt, true, args.common.yes, args.common.json) {
-        if !args.common.json {
+        if !quiet {
             println!("Download cancelled.");
         }
         return 0;
@@ -1597,7 +1617,7 @@ pub async fn run(args: GetArgs) -> i32 {
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
-        silent: false,
+        silent: args.common.silent,
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
@@ -1654,32 +1674,16 @@ fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) 
     }
 }
 
-async fn save_and_apply_patch(
-    args: &GetArgs,
-    _purl: &str,
-    uuid: &str,
-    _org_slug: Option<&str>,
-) -> i32 {
-    // For UUID mode, fetch and save
-    let (api_client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let effective_org: Option<&str> = None; // org slug is already stored in the client
-
-    let patch = match api_client.fetch_patch(effective_org, uuid).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            if args.common.json {
-                print_json(&empty_result_json("not_found"));
-            } else {
-                println!("No patch found with UUID: {uuid}");
-            }
-            return 0;
-        }
-        Err(e) => {
-            report_error(args.common.json, e);
-            return 1;
-        }
-    };
-
+/// Save an already-fetched patch to the manifest and (unless
+/// `--save-only`) apply it. Takes the `PatchResponse` the caller fetched
+/// rather than re-fetching by UUID: the caller's client may have fallen
+/// back to the public proxy after a 401/403, and a fresh client built
+/// here would hit the same auth failure again, breaking the fallback
+/// end to end.
+async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
+    // Same "errors only" gate as `run` — informational prints respect
+    // `--silent`; errors and the JSON envelope do not.
+    let quiet = args.common.json || args.common.silent;
     let socket_dir = args.common.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
     let manifest_path = socket_dir.join("manifest.json");
@@ -1714,7 +1718,7 @@ async fn save_and_apply_patch(
         }
     }
 
-    if write_all_patch_blobs(&blobs_dir, &patch, args.common.json)
+    if write_all_patch_blobs(&blobs_dir, patch, args.common.json)
         .await
         .is_err()
     {
@@ -1748,7 +1752,7 @@ async fn save_and_apply_patch(
 
     manifest
         .patches
-        .insert(patch.purl.clone(), build_patch_record(&patch, files));
+        .insert(patch.purl.clone(), build_patch_record(patch, files));
 
     if let Err(e) = write_manifest(&manifest_path, &manifest).await {
         report_error(args.common.json, format!("Error writing manifest: {e}"));
@@ -1776,7 +1780,7 @@ async fn save_and_apply_patch(
                      `socket-patch vendor` to refresh the committed artifact",
                     patch.purl, entry.uuid, patch.uuid
                 );
-                if !args.common.json {
+                if !quiet {
                     eprintln!("  [note] {w}");
                 }
                 warnings.push(w);
@@ -1784,7 +1788,7 @@ async fn save_and_apply_patch(
         }
     }
 
-    if !args.common.json {
+    if !quiet {
         println!("\nPatch saved to {}", manifest_path.display());
         if added {
             println!("  Added: 1");
@@ -1795,7 +1799,7 @@ async fn save_and_apply_patch(
 
     let mut apply_succeeded = false;
     if !args.save_only && added {
-        if !args.common.json {
+        if !quiet {
             println!("\nApplying patches...");
         }
         let apply_args = super::apply::ApplyArgs {
@@ -1804,7 +1808,7 @@ async fn save_and_apply_patch(
                 manifest_path: manifest_path.display().to_string(),
                 global: args.common.global,
                 global_prefix: args.common.global_prefix.clone(),
-                silent: args.common.json,
+                silent: quiet,
                 download_mode: args.common.download_mode.clone(),
                 ..crate::args::GlobalArgs::default()
             },
@@ -1817,7 +1821,7 @@ async fn save_and_apply_patch(
         };
         let code = super::apply::run(apply_args).await;
         apply_succeeded = code == 0;
-        if code != 0 && !args.common.json {
+        if code != 0 && !quiet {
             eprintln!("\nSome patches could not be applied.");
         }
     }
@@ -1840,7 +1844,7 @@ async fn save_and_apply_patch(
         if added {
             // Only enrich when the patch was actually added — a `skipped`
             // record means the consumer already saw the metadata last time.
-            merge_metadata(&mut patch_record, patch_event_metadata(&patch));
+            merge_metadata(&mut patch_record, patch_event_metadata(patch));
         }
         let mut result_json = serde_json::json!({
             "status": status,
@@ -2462,6 +2466,79 @@ mod tests {
         assert_eq!(out.chars().count(), 80);
         assert!(out.ends_with("..."));
         assert_eq!(out, format!("{}...", "é".repeat(77)));
+    }
+
+    // --- write_blob_entry ------------------------------------------------
+    // Blob hashes come straight from the API response and are used as
+    // filesystem path components (`blobs_dir.join(hash)`). A hostile or
+    // compromised API/proxy returning `afterHash: "../../x"` must not be
+    // able to write outside the blobs directory.
+
+    // "patched\n" in base64 — a valid payload so only the hash is at fault.
+    const BLOB_B64: &str = "cGF0Y2hlZAo=";
+
+    #[tokio::test]
+    async fn write_blob_entry_rejects_relative_traversal_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tmp.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let res = write_blob_entry(
+            &blobs_dir,
+            BLOB_B64,
+            "../escaped",
+            "package/index.js",
+            "blob",
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a traversal hash must be rejected, got {res:?}"
+        );
+        assert!(
+            !tmp.path().join("escaped").exists(),
+            "traversal hash must not write outside the blobs dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_blob_entry_rejects_absolute_path_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tmp.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        // An absolute "hash" makes Path::join discard blobs_dir entirely.
+        let target = tmp.path().join("abs_escape");
+        let res = write_blob_entry(
+            &blobs_dir,
+            BLOB_B64,
+            target.to_str().unwrap(),
+            "package/index.js",
+            "blob",
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "an absolute-path hash must be rejected, got {res:?}"
+        );
+        assert!(
+            !target.exists(),
+            "absolute-path hash must not write outside the blobs dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_blob_entry_accepts_valid_sha256_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tmp.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        write_blob_entry(&blobs_dir, BLOB_B64, hash, "package/index.js", "blob")
+            .await
+            .expect("a canonical 64-hex hash must be accepted");
+        let written = std::fs::read(blobs_dir.join(hash)).unwrap();
+        assert_eq!(written, b"patched\n");
     }
 
     // --- short_uuid ------------------------------------------------------

@@ -273,6 +273,41 @@ fn parse_path_coordinates(
     Some((group_id, artifact_id, version))
 }
 
+/// Whether the PURL-derived Maven coordinates are safe to join onto the
+/// repository root in [`MavenCrawler::find_by_purls`].
+///
+/// The coordinates come straight from the (untrusted) manifest PURL and are
+/// joined onto the repo root, after which the resolved directory is patched IN
+/// PLACE (Maven has no `replace`-redirect backend). A tampered PURL must not be
+/// able to traverse out of the repository. `verify_maven_at_path` only checks
+/// for a `.pom` file, so it is no defense — this gate is. Fails closed.
+///
+/// - `artifact_id` and `version` are each a single path segment, so a real one
+///   never contains a separator, a `.`/`..` segment, a backslash, or a NUL.
+/// - `group_id` is dot-separated and run through [`group_id_to_path`] (each
+///   `.` becomes `/`). Requiring every dot-split segment to be non-empty
+///   rejects the forms that would convert to an absolute or `..`-bearing path
+///   (`.` -> `/`, `.a` -> `/a`, `a..b` -> `a//b`).
+///
+/// Mirrors the `go_crawler` / `deno_crawler` coordinate guards.
+fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
+    let safe_segment = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+    };
+    let group_ok = !group_id.is_empty()
+        && !group_id.contains('\\')
+        && !group_id.contains('\0')
+        && group_id
+            .split('.')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+    group_ok && safe_segment(artifact_id) && safe_segment(version)
+}
+
 // ---------------------------------------------------------------------------
 // MavenCrawler
 // ---------------------------------------------------------------------------
@@ -375,6 +410,14 @@ impl MavenCrawler {
             if let Some((group_id, artifact_id, version)) =
                 crate::utils::purl::parse_maven_purl(purl)
             {
+                // SECURITY: the coordinates are untrusted manifest input joined
+                // onto the repo root and then patched IN PLACE. Reject anything
+                // that could traverse out of the repository before touching the
+                // filesystem — the `.pom` check below is no defense.
+                if !is_safe_maven_coordinate(group_id, artifact_id, version) {
+                    continue;
+                }
+
                 let expected_path = src_path
                     .join(group_id_to_path(group_id))
                     .join(artifact_id)
@@ -1074,6 +1117,77 @@ mod tests {
         assert_eq!(pkg.name, "commons-lang3");
         assert_eq!(pkg.version, "3.12.0");
         assert_eq!(pkg.namespace, Some("org.apache.commons".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_coordinate() {
+        // SECURITY: a tampered manifest PURL whose coordinates carry a `..`
+        // segment (here the artifactId `../../escaped`) must NOT resolve to a
+        // directory outside the Maven repo root. Maven patches are applied IN
+        // PLACE at the directory the crawler returns (no redirect backend
+        // stands between resolution and disk), so an escape means an
+        // arbitrary out-of-tree write. `verify_maven_at_path` only checks for
+        // a `.pom` file, which does nothing to stop traversal — hence the
+        // fail-closed coordinate guard. Twin of the go/deno crawler guards.
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        // The intermediate group dir must exist for the OS to resolve the
+        // `..` segments — real `~/.m2/repository` trees are full of them.
+        tokio::fs::create_dir_all(repo.join("g")).await.unwrap();
+
+        // An out-of-tree directory that DOES contain a `.pom`, so the only
+        // thing standing between the attacker and a match is the guard.
+        let escaped = root.path().join("escaped").join("1.0.0");
+        tokio::fs::create_dir_all(&escaped).await.unwrap();
+        tokio::fs::write(escaped.join("evil.pom"), "<project/>")
+            .await
+            .unwrap();
+
+        // repo/g/../../escaped/1.0.0 == root/escaped/1.0.0
+        let purls = vec!["pkg:maven/g/../../escaped@1.0.0".to_string()];
+
+        let crawler = MavenCrawler::new();
+        let result = crawler.find_by_purls(&repo, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "traversal PURL must not resolve to an out-of-tree directory, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate() {
+        // Legit coordinates pass.
+        assert!(is_safe_maven_coordinate(
+            "org.apache.commons",
+            "commons-lang3",
+            "3.12.0"
+        ));
+        assert!(is_safe_maven_coordinate(
+            "com.google.guava",
+            "guava",
+            "32.1.3-jre"
+        ));
+        // `..` in any single-segment coordinate is rejected.
+        assert!(!is_safe_maven_coordinate("g", "..", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "../../escaped", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "a", ".."));
+        // A `/` in the artifactId/version (never legitimate) is rejected.
+        assert!(!is_safe_maven_coordinate("g", "a/b", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "a", "1/0"));
+        // groupId forms that convert to an absolute or empty-segment path
+        // (`.` -> `/`, `.a` -> `/a`) are rejected.
+        assert!(!is_safe_maven_coordinate(".", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("..", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate(".org", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("org.", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("a..b", "a", "1.0.0"));
+        // Backslash / NUL anywhere is rejected.
+        assert!(!is_safe_maven_coordinate("g", "a\\b", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g\0x", "a", "1.0.0"));
+        // Empty coordinates are rejected.
+        assert!(!is_safe_maven_coordinate("", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "a", ""));
     }
 
     // ---- crawl_all tests ----

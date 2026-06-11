@@ -69,9 +69,10 @@ pub struct Envelope {
     /// JOIN against `events[]`.
     ///
     /// Empty (and omitted from JSON via `skip_serializing_if`) for
-    /// commands that don't produce sidecar work — `rollback`,
-    /// `repair`, `list`, etc. — and for apply runs against ecosystems
-    /// with no sidecar contract (e.g. npm).
+    /// commands that don't surface sidecar records here — `rollback`
+    /// reports its sidecar *resync* per-result in its own envelope,
+    /// `repair`/`list` produce no sidecar work — and for apply runs
+    /// against ecosystems with no sidecar contract (e.g. npm).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sidecars: Vec<SidecarRecord>,
     /// Present only when `--vex <path>` was passed to `apply`/`scan` and

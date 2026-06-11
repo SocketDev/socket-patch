@@ -810,6 +810,169 @@ fn rollback_dispatch_branch_composer() {
     assert_rollback_restored(root, "composer", &fixture);
 }
 
+// ---------------------------------------------------------------------------
+// Machine-output purity at dispatch call sites.
+//
+// The scan macro in `ecosystem_dispatch` prints "Using <X> at: <path>" to
+// STDOUT whenever the crawl is global (`--global` / `--global-prefix`) and
+// the caller did not pass `silent = true`. `apply` and `rollback` pass
+// `silent || json`, but the `vex` and `setup --check` call sites passed only
+// `silent`, so in `--json` mode (envelope on stdout) — and in vex's
+// doc-to-stdout mode — the chrome line corrupted the machine stream.
+// `--global-prefix` makes the leak deterministic: the npm crawler returns
+// the prefix verbatim as a node_modules root, so `paths` is never empty.
+// ---------------------------------------------------------------------------
+
+use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
+
+/// Run the binary with a scrubbed SOCKET_* environment so ambient
+/// developer/CI configuration (tokens, silent/json toggles, vex modes)
+/// can't change the branch under test.
+fn run_scrubbed(cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.args(args).current_dir(cwd);
+    for var in GLOBAL_ARG_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for var in [
+        "SOCKET_VEX",
+        "SOCKET_VEX_OUTPUT",
+        "SOCKET_VEX_PRODUCT",
+        "SOCKET_VEX_NO_VERIFY",
+        "SOCKET_VEX_DOC_ID",
+        "SOCKET_VEX_COMPACT",
+        "SOCKET_SETUP_EXCLUDE",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// `vex --json` reserves stdout for the envelope (`--output` is mandatory
+/// in that mode for exactly that reason). A global-prefixed npm crawl must
+/// not leak the dispatch's "Using <X> at:" line into the stream.
+#[test]
+fn vex_json_global_prefix_stdout_is_pure_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_manifest(tmp.path(), "pkg:npm/__dispatch_test__@1.0.0");
+    let gp = tmp.path().join("gprefix");
+    std::fs::create_dir_all(&gp).unwrap();
+    let out_file = tmp.path().join("vex.json");
+
+    let (code, stdout, stderr) = run_scrubbed(
+        tmp.path(),
+        &[
+            "vex",
+            "--json",
+            "--output",
+            out_file.to_str().unwrap(),
+            "--product",
+            "pkg:npm/__product__@1.0.0",
+            "--global-prefix",
+            gp.to_str().unwrap(),
+        ],
+    );
+
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "vex --json stdout must be exactly the JSON envelope — the dispatch's \
+             'Using <X> at:' chrome must not leak onto stdout ({e}); \
+             stdout={stdout:?} stderr={stderr:?}"
+        )
+    });
+    // Prove the run got PAST the package crawl (a bail-out before
+    // `resolve_package_paths` would make the purity assertion vacuous): the
+    // file-less patch fails verification, so the envelope must be the
+    // post-crawl `no_applicable_patches` error with its soft exit 1.
+    assert_eq!(env["command"], "vex", "stdout={stdout:?}");
+    assert_eq!(
+        env["error"]["code"], "no_applicable_patches",
+        "expected the post-crawl verification error (proves the crawl ran); stdout={stdout:?}"
+    );
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+}
+
+/// Standalone `vex` with no `--output` writes the VEX document itself to
+/// stdout; every other vex line deliberately goes to stderr. The dispatch
+/// chrome must not be the one exception.
+#[test]
+fn vex_doc_to_stdout_global_prefix_emits_no_chrome_on_stdout() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_manifest(tmp.path(), "pkg:npm/__dispatch_test__@1.0.0");
+    let gp = tmp.path().join("gprefix");
+    std::fs::create_dir_all(&gp).unwrap();
+
+    let (code, stdout, stderr) = run_scrubbed(
+        tmp.path(),
+        &[
+            "vex",
+            "--product",
+            "pkg:npm/__product__@1.0.0",
+            "--global-prefix",
+            gp.to_str().unwrap(),
+        ],
+    );
+
+    // The file-less fixture fails verification after the crawl, so no doc
+    // is emitted: the no-applicable error goes to stderr with exit 1 and
+    // stdout must be completely empty.
+    assert_eq!(
+        code, 1,
+        "expected the no_applicable_patches soft failure; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("No applied patches"),
+        "expected the post-crawl no-applicable error on stderr (proves the crawl ran); \
+         stderr={stderr:?}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "vex doc-to-stdout mode must keep stdout empty when no document is emitted — \
+         the dispatch's 'Using <X> at:' chrome leaked: {stdout:?}"
+    );
+}
+
+/// `setup --check --json` prints its JSON report to stdout after the patch
+/// consistency pass, which crawls via the dispatch. The chrome line must
+/// not precede (and corrupt) the report.
+#[test]
+fn setup_check_json_global_prefix_stdout_is_pure_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_manifest(tmp.path(), "pkg:npm/__dispatch_test__@1.0.0");
+    let gp = tmp.path().join("gprefix");
+    std::fs::create_dir_all(&gp).unwrap();
+
+    let (_code, stdout, stderr) = run_scrubbed(
+        tmp.path(),
+        &[
+            "setup",
+            "--check",
+            "--json",
+            "--global-prefix",
+            gp.to_str().unwrap(),
+        ],
+    );
+
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "setup --check --json stdout must be exactly the JSON report — the \
+             dispatch's 'Using <X> at:' chrome must not leak onto stdout ({e}); \
+             stdout={stdout:?} stderr={stderr:?}"
+        )
+    });
+    assert!(report["status"].is_string(), "stdout={stdout:?}");
+    assert!(report["files"].is_array(), "stdout={stdout:?}");
+}
+
 #[cfg(feature = "nuget")]
 #[test]
 // Experimental ecosystem (nuget), kept OFF the blocking CI suite — see the

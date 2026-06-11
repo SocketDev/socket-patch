@@ -254,23 +254,28 @@ pub async fn verify_file_patch(
 /// A package@version may resolve to several patch variants (PyPI
 /// `?artifact_id=...` releases, one per wheel/sdist). Only one
 /// distribution is ever installed in a given environment, so only one
-/// variant can apply. This mirrors the first-file hash check the apply
-/// pipeline uses: a variant matches when its first patched file is not
-/// in a [`VerifyStatus::HashMismatch`] state against the on-disk
-/// package. A variant with no files (nothing to verify) is treated as a
-/// match.
+/// variant can apply. This mirrors the representative-file hash check
+/// the apply pipeline uses: a variant matches when its representative
+/// patched file is not in a [`VerifyStatus::HashMismatch`] state
+/// against the on-disk package. A variant with no files (nothing to
+/// verify) is treated as a match.
 ///
 /// `variants` maps a variant key (typically a qualified PURL) to that
 /// variant's patched files. Returns the indices of **every** variant
-/// whose first patched file is in a [`VerifyStatus::Ready`] or
+/// whose representative patched file is in a [`VerifyStatus::Ready`] or
 /// [`VerifyStatus::AlreadyPatched`] state — i.e. its `beforeHash` (or
-/// `afterHash`, if already applied) matches the installed bytes.
+/// `afterHash`, if already applied) matches the installed bytes. The
+/// representative is the lexicographically smallest file with a
+/// non-empty `beforeHash`: only a file that modifies existing content
+/// can discriminate between distributions (a new file verifies Ready
+/// everywhere), and the deterministic pick keeps selection stable
+/// across runs (`HashMap` iteration order is randomized).
 ///
 /// A [`VerifyStatus::NotFound`] (a missing pre-existing file) or
 /// [`VerifyStatus::HashMismatch`] does **not** count as a match: those
 /// signal the variant describes a distribution that is *not* present on
-/// disk. A variant with no files (nothing to verify) is treated as a
-/// match.
+/// disk. A variant with no discriminating file (no files at all, or
+/// only new files — nothing to verify) is treated as a match.
 ///
 /// Returning all matches (not just the first) is what lets ecosystems
 /// whose variants *coexist* on disk work — e.g. Maven, where several
@@ -286,8 +291,19 @@ pub async fn select_installed_variants(
 ) -> Vec<usize> {
     let mut matched = Vec::new();
     for (idx, (_key, files)) in variants.iter().enumerate() {
-        // No files to verify — nothing to disqualify the variant.
-        let Some((file_name, file_info)) = files.iter().next() else {
+        // Representative file: only a file that modifies existing content
+        // (non-empty `beforeHash`) can discriminate between distributions —
+        // a NEW file (empty `beforeHash`) verifies Ready against any
+        // environment, so it can neither identify nor disqualify a variant.
+        // Take the lexicographically smallest such key so the choice is
+        // deterministic (`HashMap` iteration order is randomized per
+        // instance). No discriminating file (no files at all, or only new
+        // files) — nothing to disqualify the variant.
+        let representative = files
+            .iter()
+            .filter(|(_, info)| !info.before_hash.is_empty())
+            .min_by(|(a, _), (b, _)| a.cmp(b));
+        let Some((file_name, file_info)) = representative else {
             matched.push(idx);
             continue;
         };
@@ -869,7 +885,26 @@ pub async fn apply_package_patch(
         use crate::patch::sidecars::{
             dispatch_fixup, SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord, SidecarSeverity,
         };
-        match dispatch_fixup(package_key, pkg_path, &result.files_patched, files).await {
+        // Include files verified `AlreadyPatched` alongside the ones
+        // written this run: a previous apply that failed partway left
+        // them patched on disk but returned before this boundary, so
+        // their sidecar entries (e.g. `.cargo-checksum.json` hashes)
+        // are still pre-patch — and this retry is the only chance to
+        // resync them. They exist at their after-hash, so rehashing is
+        // a no-op rewrite in the common already-synced case.
+        let fixup_files: Vec<String> = result
+            .files_patched
+            .iter()
+            .cloned()
+            .chain(
+                result
+                    .files_verified
+                    .iter()
+                    .filter(|v| v.status == VerifyStatus::AlreadyPatched)
+                    .map(|v| v.file.clone()),
+            )
+            .collect();
+        match dispatch_fixup(package_key, pkg_path, &fixup_files, files).await {
             Ok(Some(record)) => result.sidecar = Some(record),
             Ok(None) => {}
             Err(e) => {
@@ -2338,6 +2373,97 @@ mod tests {
             .unwrap();
     }
 
+    /// Variant selection must be driven by an on-disk `beforeHash` match
+    /// against a file that can actually discriminate between
+    /// distributions. A NEW file (empty `beforeHash`) verifies Ready
+    /// against ANY environment, so it must never be the basis for
+    /// selecting a variant. Regression: the representative file was taken
+    /// via `HashMap::iter().next()`, whose order is randomized per map
+    /// instance — whenever the new file came up first, a variant
+    /// describing a different, NOT-installed distribution matched, and
+    /// the result flipped between runs (wrong-variant rollback attempts,
+    /// wrong variants kept by `get`). The loop re-builds the maps each
+    /// round so the randomized iteration order is exercised.
+    #[tokio::test]
+    async fn test_select_installed_variants_new_file_never_drives_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = b"installed wheel bytes";
+        tokio::fs::write(dir.path().join("mod.py"), installed)
+            .await
+            .unwrap();
+        let installed_hash = compute_git_sha256_from_bytes(installed);
+        let other_hash = compute_git_sha256_from_bytes(b"other wheel bytes");
+
+        for round in 0..64 {
+            // Variant A: matches the installed distribution.
+            let mut variant_a = HashMap::new();
+            variant_a.insert(
+                "mod.py".to_string(),
+                PatchFileInfo {
+                    before_hash: installed_hash.clone(),
+                    after_hash: "a".repeat(64),
+                },
+            );
+            variant_a.insert(
+                "zz_new_shim.py".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(), // new file
+                    after_hash: "b".repeat(64),
+                },
+            );
+            // Variant B: a different distribution (mod.py bytes differ),
+            // but it adds the same new file.
+            let mut variant_b = HashMap::new();
+            variant_b.insert(
+                "mod.py".to_string(),
+                PatchFileInfo {
+                    before_hash: other_hash.clone(),
+                    after_hash: "c".repeat(64),
+                },
+            );
+            variant_b.insert(
+                "zz_new_shim.py".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(), // new file
+                    after_hash: "d".repeat(64),
+                },
+            );
+
+            let variants: Vec<(&str, &HashMap<String, PatchFileInfo>)> = vec![
+                ("pkg:pypi/x@1.0.0?artifact_id=installed", &variant_a),
+                ("pkg:pypi/x@1.0.0?artifact_id=other", &variant_b),
+            ];
+            let matched = select_installed_variants(dir.path(), &variants).await;
+            assert_eq!(
+                matched,
+                vec![0],
+                "round {round}: only the installed variant may match — a new \
+                 file (empty beforeHash) must never drive selection"
+            );
+        }
+    }
+
+    /// A variant whose files are ALL new (no `beforeHash` anywhere) has
+    /// nothing that can disqualify it against the installed bytes — it
+    /// must keep matching, consistent with the documented no-files
+    /// behavior.
+    #[tokio::test]
+    async fn test_select_installed_variants_all_new_files_variant_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut variant = HashMap::new();
+        variant.insert(
+            "shim.py".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: "a".repeat(64),
+            },
+        );
+        let variants: Vec<(&str, &HashMap<String, PatchFileInfo>)> =
+            vec![("pkg:pypi/x@1.0.0?artifact_id=only", &variant)];
+        let matched = select_installed_variants(dir.path(), &variants).await;
+        assert_eq!(matched, vec![0]);
+    }
+
     #[test]
     fn test_applied_via_as_tag() {
         assert_eq!(AppliedVia::Package.as_tag(), "package");
@@ -2351,5 +2477,105 @@ mod tests {
         let sources = PatchSources::blobs_only(dir.path());
         assert!(sources.packages_path.is_none());
         assert!(sources.diffs_path.is_none());
+    }
+
+    /// Regression (retried partial apply wedges cargo): a previous apply
+    /// that failed partway (e.g. a missing blob for the second file) left
+    /// the first file PATCHED on disk but returned before the sidecar
+    /// boundary, so `.cargo-checksum.json` still carries that file's
+    /// ORIGINAL hash. On the retry the file verifies `AlreadyPatched` and
+    /// is skipped by the patch loop — but it must still be included in the
+    /// sidecar fixup, or its checksum entry stays stale forever and
+    /// `cargo build` refuses the crate even though the retry reported
+    /// success.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_retry_resyncs_already_patched_checksum_entries() {
+        fn plain_sha256(b: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b);
+            format!("{:x}", h.finalize())
+        }
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+
+        // State left by the interrupted run: a.rs already patched, b.rs
+        // still original, checksum entries both at ORIGINAL hashes.
+        tokio::fs::write(pkg.join("a.rs"), b"patched a")
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.join("b.rs"), b"original b")
+            .await
+            .unwrap();
+        let checksum = serde_json::json!({
+            "files": {
+                "a.rs": plain_sha256(b"original a"),
+                "b.rs": plain_sha256(b"original b"),
+            },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(".cargo-checksum.json"),
+            serde_json::to_string_pretty(&checksum).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // The retry has b's blob available.
+        let b_after = compute_git_sha256_from_bytes(b"patched b");
+        tokio::fs::write(blobs_dir.path().join(&b_after), b"patched b")
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "a.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original a"),
+                after_hash: compute_git_sha256_from_bytes(b"patched a"),
+            },
+        );
+        files.insert(
+            "b.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original b"),
+                after_hash: b_after,
+            },
+        );
+
+        let result = apply_package_patch(
+            "pkg:cargo/mycrate@1.0.0",
+            pkg,
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result.success, "retry must succeed: {:?}", result.error);
+        assert_eq!(result.files_patched, vec!["b.rs".to_string()]);
+
+        let post: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(pkg.join(".cargo-checksum.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            post["files"]["b.rs"].as_str().unwrap(),
+            plain_sha256(b"patched b"),
+            "the freshly patched file's entry must be rewritten"
+        );
+        assert_eq!(
+            post["files"]["a.rs"].as_str().unwrap(),
+            plain_sha256(b"patched a"),
+            "an AlreadyPatched file from the interrupted run must be resynced \
+             too — a stale original-hash entry wedges cargo build"
+        );
     }
 }

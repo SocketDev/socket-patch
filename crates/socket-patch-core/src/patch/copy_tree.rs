@@ -73,7 +73,15 @@ pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+                // `follow_root_links` defaults to true: a symlink *at* `dir`
+                // would otherwise be followed and the external target tree
+                // chmod'd. Disabled, a symlink root is yielded as a symlink
+                // and hits the skip below.
+                for entry in walkdir::WalkDir::new(dir)
+                    .follow_root_links(false)
+                    .into_iter()
+                    .flatten()
+                {
                     let ft = entry.file_type();
                     // Never chmod a symlink: `set_permissions` follows the link
                     // and would mutate its *target's* mode — which may live
@@ -295,5 +303,52 @@ mod tests {
             mode
         );
         assert!(outside.exists());
+    }
+
+    /// Regression: the perm-relax retry must not traverse *through* a
+    /// symlinked root either. walkdir follows root symlinks by default
+    /// (`follow_root_links`), so if the tree path itself is a symlink and the
+    /// first remove fails (e.g. its parent dir is unwritable), the relax loop
+    /// would descend into the external target and chmod everything in it to
+    /// 0o755/0o644 — mutating a tree entirely outside `.socket/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relax_loop_must_not_traverse_symlinked_root() {
+        let base = tempfile::tempdir().unwrap();
+        // External target tree with restrictive perms.
+        let target = base.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("secret.txt"), b"secret").unwrap();
+        fs::set_permissions(target.join("secret.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Symlink at the tree path; read-only parent so the first
+        // remove_dir_all (an unlink of the symlink) fails and the relax
+        // retry path runs.
+        let parent = base.path().join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let root = parent.join("tree");
+        std::os::unix::fs::symlink(&target, &root).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = remove_tree(&root).await;
+
+        // Restore parent so tempdir cleanup works.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "removal cannot succeed under a read-only parent"
+        );
+        let mode = fs::metadata(target.join("secret.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "file behind symlinked root was chmod'd to {:o}",
+            mode
+        );
+        assert_eq!(fs::read(target.join("secret.txt")).unwrap(), b"secret");
     }
 }

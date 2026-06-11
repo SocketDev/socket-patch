@@ -163,7 +163,16 @@ fn parse_pnpm_workspace_patterns(yaml_content: &str) -> Vec<String> {
     for line in yaml_content.lines() {
         let trimmed = line.trim();
 
-        if trimmed == "packages:" {
+        // The header may carry an inline comment (`packages: # globs`); a `#`
+        // opens a comment only when preceded by whitespace.
+        let is_packages_header = match trimmed.strip_prefix("packages:") {
+            Some("") => true,
+            Some(rest) => {
+                rest.starts_with(|c: char| c.is_whitespace()) && rest.trim_start().starts_with('#')
+            }
+            None => false,
+        };
+        if is_packages_header {
             in_packages = true;
             continue;
         }
@@ -247,6 +256,15 @@ async fn collect_workspace_members(
         return;
     }
     for pattern in &config.patterns {
+        // npm (`@npmcli/map-workspaces`), yarn, and pnpm all support
+        // `!`-prefixed exclusion patterns, processed in order: a negation
+        // removes whatever earlier patterns matched. Resolve the negated
+        // pattern with the same matcher and drop those members.
+        if let Some(negated) = pattern.strip_prefix('!') {
+            let excluded = find_packages_matching_pattern(root_path, negated).await;
+            results.retain(|loc| !excluded.contains(&loc.path));
+            continue;
+        }
         let packages = find_packages_matching_pattern(root_path, pattern).await;
         for p in packages {
             let member_dir = p.parent().map(Path::to_path_buf);
@@ -296,6 +314,16 @@ async fn find_packages_matching_pattern(root_path: &Path, pattern: &str) -> Vec<
             if last == "*" {
                 search_one_level(&search_path, &mut results).await;
             } else {
+                // Globstar matches zero segments too — npm/pnpm glob
+                // `<prefix>/**/package.json`, which matches the prefix dir's
+                // own `package.json` — so the prefix directory itself is a
+                // candidate member, not just its descendants. (For a bare
+                // `**` this re-finds the root manifest; the caller's de-dup
+                // keeps the root entry.)
+                let own_pkg = search_path.join("package.json");
+                if fs::metadata(&own_pkg).await.is_ok() {
+                    results.push(own_pkg);
+                }
                 search_recursive(&search_path, &mut results).await;
             }
         }
@@ -1037,6 +1065,123 @@ mod tests {
             "only the real member must be found; symlinks not followed: {:?}",
             result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_negation_excludes_member() {
+        // npm (`@npmcli/map-workspaces`), yarn, and pnpm all support
+        // `!`-prefixed exclusion patterns: a member matched by an earlier
+        // pattern and then negated is NOT a workspace member. Previously the
+        // `!pattern` was treated as a literal directory named `!packages`, so
+        // the exclusion was silently ignored and `setup` edited a package.json
+        // the user had explicitly excluded.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["packages/*", "!packages/private"]}"#,
+        )
+        .await
+        .unwrap();
+        for member in ["a", "private"] {
+            let m = dir.path().join("packages").join(member);
+            fs::create_dir_all(&m).await.unwrap();
+            fs::write(m.join("package.json"), r#"{"name":"m"}"#)
+                .await
+                .unwrap();
+        }
+        let result = find_package_json_files(dir.path()).await;
+        let members: Vec<_> = result.files.iter().filter(|f| f.is_workspace).collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "negated member must be excluded: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(members[0].path.ends_with("packages/a/package.json"));
+    }
+
+    #[tokio::test]
+    async fn test_find_workspace_glob_negation_excludes_subtree() {
+        // A negation can itself be a glob (pnpm's docs show `!**/test/**`);
+        // `!legacy/**` must remove every member an earlier positive pattern
+        // picked up under legacy/.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["**", "!legacy/**"]}"#,
+        )
+        .await
+        .unwrap();
+        let app = dir.path().join("app");
+        fs::create_dir_all(&app).await.unwrap();
+        fs::write(app.join("package.json"), r#"{"name":"app"}"#)
+            .await
+            .unwrap();
+        let old = dir.path().join("legacy").join("old");
+        fs::create_dir_all(&old).await.unwrap();
+        fs::write(old.join("package.json"), r#"{"name":"old"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        let members: Vec<_> = result.files.iter().filter(|f| f.is_workspace).collect();
+        assert_eq!(
+            members.len(),
+            1,
+            "legacy subtree must be excluded: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(members[0].path.ends_with("app/package.json"));
+    }
+
+    #[tokio::test]
+    async fn test_find_double_glob_matches_prefix_dir_itself() {
+        // Globstar matches zero segments: npm/pnpm resolve members by globbing
+        // `apps/**/package.json`, which matches `apps/package.json` itself. A
+        // package living at the pattern's prefix directory is a workspace
+        // member too, not just its descendants — previously it was silently
+        // skipped and never configured.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces": ["apps/**"]}"#,
+        )
+        .await
+        .unwrap();
+        let apps = dir.path().join("apps");
+        fs::create_dir_all(&apps).await.unwrap();
+        fs::write(apps.join("package.json"), r#"{"name":"apps"}"#)
+            .await
+            .unwrap();
+        let web = apps.join("web");
+        fs::create_dir_all(&web).await.unwrap();
+        fs::write(web.join("package.json"), r#"{"name":"web"}"#)
+            .await
+            .unwrap();
+        let result = find_package_json_files(dir.path()).await;
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("apps/package.json")),
+            "prefix dir's own package.json must be a member: {:?}",
+            result.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|f| f.is_workspace && f.path.ends_with("apps/web/package.json")),
+            "descendant member must still be found"
+        );
+    }
+
+    #[test]
+    fn test_parse_pnpm_packages_key_inline_comment() {
+        // The section header itself may carry an inline comment
+        // (`packages: # workspace globs`); the exact-equality compare missed
+        // it and silently dropped the whole section.
+        let yaml = "packages: # workspace globs\n  - packages/*";
+        assert_eq!(parse_pnpm_workspace_patterns(yaml), vec!["packages/*"]);
     }
 
     // ── detect_package_manager ──────────────────────────────────────

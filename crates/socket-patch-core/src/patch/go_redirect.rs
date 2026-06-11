@@ -30,7 +30,7 @@ use crate::patch::apply::{
     apply_package_patch, normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::purl::{build_golang_purl, parse_golang_purl};
+use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
 use super::copy_tree::{fresh_copy, remove_tree};
 use super::go_mod_edit::{
@@ -336,9 +336,13 @@ pub async fn reconcile_go_redirects(
     }
 
     // (b) Orphan copy dirs not referenced by a desired PURL (catches copies left
-    // behind by a hand-deleted directive or a version bump).
+    // behind by a hand-deleted directive or a version bump). A desired manifest
+    // key may carry `?qualifiers`/`#subpath` (raw API PURL), while the PURL
+    // reconstructed from the copy dir is the canonical base — compare bases, or
+    // a qualified key's freshly applied copy is pruned as an orphan.
+    let desired_bases: HashSet<&str> = desired.iter().map(|p| strip_purl_qualifiers(p)).collect();
     for (purl, dir) in collect_copy_modules(&project_root.join(GO_PATCHES_DIR)).await {
-        if !desired.contains(&purl) {
+        if !desired_bases.contains(purl.as_str()) {
             if !dry_run {
                 let _ = remove_tree(&dir).await;
             }
@@ -1398,6 +1402,73 @@ mod tests {
         assert!(!are_safe_redirect_coords("github.com/foo/bar", "v1/0/0"));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ".."));
         assert!(!are_safe_redirect_coords("github.com/foo/bar", ""));
+    }
+
+    /// SECURITY regression: a leading drive-letter segment (`C:/evil`) passes
+    /// the per-segment checks (it is not `.`/`..`, has no `\` and no leading
+    /// `/`), but on Windows `Path::join` REPLACES the base path when handed an
+    /// absolute path — so a tampered `pkg:golang/C:/evil@v1.0.0` would resolve
+    /// the copy dir to `C:\evil@v1.0.0` and `fresh_copy`/`remove_tree` would
+    /// write/delete there, outside `.socket/go-patches/`. A real Go module
+    /// path element / version never contains `:` (letters, digits, `-._~`
+    /// only), so rejecting it is fail-closed on every platform.
+    #[test]
+    fn test_safe_redirect_coords_reject_windows_drive() {
+        assert!(!are_safe_redirect_coords("C:/evil", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("c:/evil", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("C:", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", "C:evil"));
+    }
+
+    /// A manifest key may carry `?qualifiers` / `#subpath` (the keys are raw
+    /// API PURLs; `parse_golang_purl` strips both, which is why apply and
+    /// verify tolerate them). Reconcile must compare desired PURLs by their
+    /// canonical base — not raw string equality — or the just-applied copy of
+    /// a qualified key is "pruned" as an orphan while its socket-owned
+    /// `replace` survives (the module is still desired), leaving go.mod
+    /// pointing at a deleted directory.
+    #[tokio::test]
+    async fn test_reconcile_keeps_qualified_desired_purl() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let qualified = "pkg:golang/github.com/foo/bar@v1.4.2?type=module";
+        // The CLI keys the copy off the parsed (qualifier-stripped) coords.
+        let (module, version) = parse_golang_purl(qualified).unwrap();
+        let result = apply_go_redirect(
+            qualified,
+            module,
+            version,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert!(result.success, "apply failed: {:?}", result.error);
+
+        let desired: HashSet<String> = [qualified.to_string()].into_iter().collect();
+        let removed = reconcile_go_redirects(root, &desired, false).await;
+        assert!(
+            removed.is_empty(),
+            "a desired (qualified) redirect must not be pruned: {removed:?}"
+        );
+        assert!(
+            root.join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+                .exists(),
+            "copy of a desired patch must survive reconcile"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "socket-owned replace must survive"
+        );
     }
 
     /// SECURITY regression: a tampered manifest PURL with `..` in the module path

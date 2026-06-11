@@ -1,13 +1,14 @@
 /**
- * Example prompt module for scripts/study-crates.ts.
+ * Bug-fixing sweep prompt module for scripts/study-crates.ts.
  *
  * Pass it with:
- *   npx tsx scripts/study-crates.ts --prompt-file scripts/study-crates.config.example.ts
+ *   npx tsx scripts/study-crates.ts --prompt-file scripts/fix-bugs.config.example.ts
  *
  * The module's default export is a function `(ctx: FileCtx) => string` that
  * returns the prompt for one file. This gives you full programmatic control:
  * branch on the crate, the path, the file name, inject extra instructions for
- * specific subsystems, etc.
+ * specific subsystems, etc. The `model` export pins the model for the sweep;
+ * an explicit --model flag overrides it.
  *
  * FileCtx fields available:
  *   file        repo-relative POSIX path, e.g. "crates/socket-patch-core/src/lib.rs"
@@ -20,15 +21,21 @@
 
 import type { FileCtx } from "./study-crates.ts";
 
+export const model = "claude-fable-5";
+
 export default function render(ctx: FileCtx): string {
   const base = [
-    `There are bugs in ${ctx.file} in the ${ctx.crate} crate.`,
-    `Carefully read the code line by line and fix all of the bugs.  Add additional tests to prevent regressions.`,
-    `If you can't find any problems, it's ok to quit.`
+    `Review ${ctx.file} in the ${ctx.crate} crate for real production bugs.`,
+    `Read it line by line. Treat every suspected bug as unconfirmed until you`,
+    `write a regression test that fails on the current code; then apply the`,
+    `minimal fix and make the test pass.`,
+    `Do not refactor, clean up, or restructure beyond what each fix requires,`,
+    `and never weaken an existing test to get green.`,
+    `If the file turns out to be clean, say so plainly and stop — do not invent findings.`,
   ];
 
-  // Example of path-specific emphasis: be extra careful around the patch engine
-  // and crawlers, which carry the most invariants.
+  // Path-specific emphasis: the patch engine and crawlers carry the most
+  // invariants.
   if (ctx.relInCrate.startsWith("patch/")) {
     base.push(
       `This file is part of the patch engine — pay special attention to`,
@@ -41,6 +48,9 @@ export default function render(ctx: FileCtx): string {
     );
   }
 
-  base.push(`End with a concise 3-6 bullet summary of the most important takeaways.`);
+  base.push(
+    `Finish by running the affected tests, then end with a concise 3-6 bullet`,
+    `summary: bugs found (or "clean"), fixes applied, and test results.`,
+  );
   return base.join(" ");
 }

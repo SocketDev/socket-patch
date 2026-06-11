@@ -19,9 +19,9 @@ use socket_patch_core::patch::apply_lock::{acquire, LockError, LockGuard};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 /// Stable `errorCode` tag emitted as a `Skipped` warning event when
-/// `--break-lock` actually deletes a pre-existing lock file. Exposed
-/// for downstream consumers and integration tests that pattern-match
-/// on it.
+/// `--break-lock` actually reclaims a stale pre-existing lock file.
+/// Exposed for downstream consumers and integration tests that
+/// pattern-match on it.
 pub const LOCK_BROKEN_CODE: &str = "lock_broken";
 
 /// Outcome of a successful lock acquisition. Callers attach a
@@ -33,8 +33,8 @@ pub const LOCK_BROKEN_CODE: &str = "lock_broken";
 #[derive(Debug)]
 pub struct LockAcquired {
     pub guard: LockGuard,
-    /// True iff `--break-lock` was set AND the helper actually
-    /// removed a pre-existing `apply.lock` file before acquiring.
+    /// True iff `--break-lock` was set AND a pre-existing
+    /// `apply.lock` file (with no live holder) was reclaimed.
     /// False when the file didn't exist (nothing to break) — the
     /// flag was a no-op in that case so no warning is warranted.
     pub broke_lock: bool,
@@ -53,15 +53,18 @@ pub struct LockAcquired {
 /// try-once shape. Positive values wait with a 100 ms backoff —
 /// see `socket_patch_core::patch::apply_lock::acquire`.
 ///
-/// `break_lock = true` clears a *stale* `<socket_dir>/apply.lock`
-/// before the acquire attempt. The motivating case is a crashed prior
-/// run that left the file behind. It is **not** a force-steal: a
-/// non-blocking probe runs first, and if a live holder still owns the
-/// lock the helper refuses with `lock_held` rather than removing the
-/// file out from under it (which would defeat mutual exclusion — the
-/// unlink recreates a fresh inode the holder's advisory lock no longer
-/// guards). When a pre-existing file is removed with no live holder the
-/// return value's `broke_lock` is true and the caller should attach a
+/// `break_lock = true` reclaims a *stale* `<socket_dir>/apply.lock`
+/// via a non-blocking acquire. The motivating case is a crashed prior
+/// run that left the file behind — harmless to a fresh acquire (the
+/// kernel already released the dead holder's advisory lock), but worth
+/// an audit event. It is **not** a force-steal: if a live holder still
+/// owns the lock the helper refuses with `lock_held` rather than
+/// stealing. The file is deliberately never unlinked — an unlink
+/// defeats mutual exclusion, because a competitor (live holder or
+/// mid-acquire racer) can keep or take an advisory lock on the
+/// orphaned inode while a fresh acquire locks its replacement. When a
+/// pre-existing file is reclaimed with no live holder the return
+/// value's `broke_lock` is true and the caller should attach a
 /// `lock_broken` warning event to their envelope.
 pub fn acquire_or_emit(
     socket_dir: &Path,
@@ -72,7 +75,6 @@ pub fn acquire_or_emit(
     timeout: Duration,
     break_lock: bool,
 ) -> Result<LockAcquired, i32> {
-    let mut broke_lock = false;
     if break_lock {
         let path = socket_dir.join("apply.lock");
 
@@ -80,27 +82,50 @@ pub fn acquire_or_emit(
         // anything. The probe `acquire` below opens with `create(true)`,
         // so afterwards the file always exists — even on a clean tree.
         // We only want to report `broke_lock` (and emit the warning
-        // event) when a *pre-existing* leftover was actually removed,
+        // event) when a *pre-existing* leftover was actually reclaimed,
         // mirroring `unlock`'s `lock_existed` source-of-truth pattern.
         let lock_existed = path.exists();
 
-        // CRITICAL: never steal a lock from a *live* holder. A bare
-        // `remove_file` + re-`acquire` is unsafe — on Unix the unlink
-        // recreates a fresh inode, so a still-running holder keeps its
-        // `flock(2)` on the old (unlinked) inode while we lock the new
-        // one. Both processes then believe they hold the lock and race
-        // on every file write, which is exactly what the lock exists to
-        // prevent. So probe with a non-blocking acquire first:
-        //   * Ok  => no live holder (a crashed run's flock is already
-        //            auto-released by the kernel), so breaking the
-        //            leftover file is safe. Drop our probe handle and
-        //            fall through to remove + re-acquire below.
+        // CRITICAL: never steal a lock from a *live* holder, and never
+        // unlink the lock file at all. Removal defeats mutual exclusion
+        // in two ways:
+        //   * unlinking a *held* file leaves the holder flocking the
+        //     old (unlinked) inode while we lock a fresh one — both
+        //     processes then believe they hold the lock and race on
+        //     every file write, which is exactly what the lock exists
+        //     to prevent;
+        //   * even when a probe proves no holder at unlink time, a
+        //     competitor mid-`acquire` that opened the file *before*
+        //     the unlink can flock the orphaned inode *after* it, with
+        //     the same double-hold result.
+        // A leftover file from a crashed run needs no removal anyway:
+        // the kernel released the dead process's advisory lock along
+        // with its file handle, so a non-blocking acquire simply
+        // reclaims the file in place.
+        //   * Ok  => no live holder — the probe guard IS the lock.
+        //            Return it; `broke_lock` reports whether a
+        //            pre-existing leftover was reclaimed so callers
+        //            attach the warning event.
         //   * Held => a live holder exists. Refuse rather than steal —
         //            this is the case `--break-lock` was *wrongly*
         //            relied on for, and the only one where it mattered.
         //   * Io   => surface the real fault.
         match acquire(socket_dir, Duration::ZERO) {
-            Ok(guard) => drop(guard),
+            Ok(guard) => {
+                // Only a *pre-existing* leftover counts as "broke a
+                // lock". If the probe itself just created the file on a
+                // clean tree, the flag was a no-op for the warning
+                // surface — `broke_lock` stays false so callers don't
+                // emit a spurious event.
+                let broke_lock = lock_existed;
+                if broke_lock && !silent && !json {
+                    eprintln!(
+                        "Warning: --break-lock reclaimed stale {} (no live holder).",
+                        path.display()
+                    );
+                }
+                return Ok(LockAcquired { guard, broke_lock });
+            }
             Err(LockError::Held) => {
                 // The probe above is a *non-blocking* try-once
                 // (`Duration::ZERO`), so report a zero wait. Threading
@@ -110,6 +135,9 @@ pub fn acquire_or_emit(
                 // `break_probe_held_message` takes no timeout precisely so
                 // the wrong value can't be passed back in.
                 let msg = break_probe_held_message();
+                // The user already passed --break-lock and it was refused:
+                // advising it again would be self-defeating. Only the
+                // inspect path remains actionable.
                 emit(
                     command,
                     json,
@@ -117,59 +145,23 @@ pub fn acquire_or_emit(
                     dry_run,
                     "lock_held",
                     &msg,
-                    Some(socket_dir),
+                    Hint::UnlockOnly,
                 );
                 return Err(1);
             }
             Err(LockError::Io { path, source }) => {
                 let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-                emit(command, json, silent, dry_run, "lock_io", &msg, None);
-                return Err(1);
-            }
-        }
-
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                // Only a *pre-existing* leftover counts as "broke a
-                // lock". If the probe itself just created the file on a
-                // clean tree, removing it is a no-op for the warning
-                // surface — `broke_lock` stays false so callers don't
-                // emit a spurious event.
-                broke_lock = lock_existed;
-                if broke_lock && !silent && !json {
-                    eprintln!(
-                        "Warning: --break-lock removed {} before acquisition.",
-                        path.display()
-                    );
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // No file to break — silently proceed to the normal
-                // acquire path. Documented as a no-op so scripts can
-                // pass --break-lock unconditionally on retry.
-            }
-            Err(source) => {
-                let msg = format!(
-                    "failed to remove lock file at {}: {}",
-                    path.display(),
-                    source
-                );
-                emit(
-                    command,
-                    json,
-                    silent,
-                    dry_run,
-                    "lock_break_failed",
-                    &msg,
-                    None,
-                );
+                emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
                 return Err(1);
             }
         }
     }
 
     match acquire(socket_dir, timeout) {
-        Ok(guard) => Ok(LockAcquired { guard, broke_lock }),
+        Ok(guard) => Ok(LockAcquired {
+            guard,
+            broke_lock: false,
+        }),
         Err(LockError::Held) => {
             let msg = held_message(timeout);
             emit(
@@ -179,13 +171,13 @@ pub fn acquire_or_emit(
                 dry_run,
                 "lock_held",
                 &msg,
-                Some(socket_dir),
+                Hint::UnlockOrBreakLock,
             );
             Err(1)
         }
         Err(LockError::Io { path, source }) => {
             let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            emit(command, json, silent, dry_run, "lock_io", &msg, None);
+            emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
             Err(1)
         }
     }
@@ -199,7 +191,7 @@ pub fn lock_broken_event(socket_dir: &Path) -> PatchEvent {
     PatchEvent::artifact(PatchAction::Skipped).with_reason(
         LOCK_BROKEN_CODE,
         format!(
-            "--break-lock removed {}/apply.lock before acquisition",
+            "--break-lock reclaimed stale {}/apply.lock (no live holder)",
             socket_dir.display()
         ),
     )
@@ -259,6 +251,16 @@ fn error_envelope(command: Command, dry_run: bool, code: &str, message: &str) ->
     env
 }
 
+/// Remediation hint appended under the human-mode error line. The
+/// `--break-lock` advice is only valid when the caller hasn't already
+/// tried it — a refused `--break-lock` (live holder) must not advise
+/// rerunning with `--break-lock`, which is exactly what just failed.
+enum Hint {
+    None,
+    UnlockOnly,
+    UnlockOrBreakLock,
+}
+
 fn emit(
     command: Command,
     json: bool,
@@ -266,7 +268,7 @@ fn emit(
     dry_run: bool,
     code: &str,
     message: &str,
-    hint_dir: Option<&Path>,
+    hint: Hint,
 ) {
     if json {
         println!(
@@ -275,10 +277,16 @@ fn emit(
         );
     } else if !silent {
         eprintln!("Error: {message}.");
-        if hint_dir.is_some() {
-            eprintln!(
-                "  Run `socket-patch unlock` to inspect, or rerun with --break-lock if you're sure no holder exists."
-            );
+        match hint {
+            Hint::None => {}
+            Hint::UnlockOnly => {
+                eprintln!("  Run `socket-patch unlock` to inspect.");
+            }
+            Hint::UnlockOrBreakLock => {
+                eprintln!(
+                    "  Run `socket-patch unlock` to inspect, or rerun with --break-lock if you're sure no holder exists."
+                );
+            }
         }
     }
 }
@@ -384,10 +392,10 @@ mod tests {
     }
 
     /// `break_lock=true` against a pre-existing lock file with no
-    /// holder removes the file and acquires fresh. `broke_lock` flag
-    /// surfaces so callers can attach the warning event.
+    /// holder reclaims the file in place and acquires. `broke_lock`
+    /// flag surfaces so callers can attach the warning event.
     #[test]
-    fn acquire_or_emit_break_lock_removes_and_acquires() {
+    fn acquire_or_emit_break_lock_reclaims_stale_file_and_acquires() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-stage a lock file with no holder — simulates the
         // post-crash leftover scenario.
@@ -405,9 +413,9 @@ mod tests {
         .unwrap();
         assert!(
             acquired.broke_lock,
-            "broke_lock should be true when a lock file existed and was removed"
+            "broke_lock should be true when a stale lock file existed and was reclaimed"
         );
-        // Lock file has been re-created by `acquire` and we hold it.
+        // The lock file persists (never unlinked) and we hold it.
         assert!(dir.path().join("apply.lock").is_file());
     }
 
@@ -494,6 +502,87 @@ mod tests {
             acquire(dir.path(), Duration::ZERO),
             Err(LockError::Held)
         ));
+    }
+
+    /// Regression: the break-lock sequence must not open a window in
+    /// which a competitor can be robbed of a lock it legitimately
+    /// acquired. The buggy shape probed, then `remove_file`d the lock
+    /// file, then re-acquired: a competitor that flocked (or had merely
+    /// *opened*) the file before the unlink kept a valid lock on the
+    /// orphaned inode while the re-acquire locked a fresh one — two
+    /// live holders at once, the exact double-hold the probe exists to
+    /// prevent. The fixed shape never unlinks: the probe guard is the
+    /// lock.
+    ///
+    /// The competitor thread increments a shared holder count only
+    /// while it genuinely holds the OS lock, as does the main thread
+    /// for the guard `acquire_or_emit` hands back. With real mutual
+    /// exclusion the count can never exceed 1, so the test is
+    /// deterministic-green on correct code; under the buggy window the
+    /// hammer lands in the gap within a handful of iterations.
+    #[test]
+    fn break_lock_window_cannot_defeat_mutual_exclusion() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_dir = dir.path().to_path_buf();
+        let holders = Arc::new(AtomicUsize::new(0));
+        let violated = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Competitor: grabs the lock the instant it is free, holds it
+        // briefly, releases, retries. Mirrors a concurrent
+        // `socket-patch apply` racing a `--break-lock` invocation.
+        let hammer = {
+            let lock_dir = lock_dir.clone();
+            let holders = Arc::clone(&holders);
+            let violated = Arc::clone(&violated);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Ok(guard) = acquire(&lock_dir, Duration::ZERO) {
+                        if holders.fetch_add(1, Ordering::SeqCst) != 0 {
+                            violated.store(true, Ordering::SeqCst);
+                        }
+                        std::thread::sleep(Duration::from_micros(500));
+                        holders.fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                    }
+                }
+            })
+        };
+
+        for _ in 0..2000 {
+            if violated.load(Ordering::SeqCst) {
+                break;
+            }
+            // silent=true so refused iterations stay quiet; refusal
+            // (the hammer currently holds) is a correct outcome here.
+            if let Ok(acquired) = acquire_or_emit(
+                &lock_dir,
+                Command::Apply,
+                false,
+                true,
+                false,
+                Duration::ZERO,
+                true, // break_lock
+            ) {
+                if holders.fetch_add(1, Ordering::SeqCst) != 0 {
+                    violated.store(true, Ordering::SeqCst);
+                }
+                holders.fetch_sub(1, Ordering::SeqCst);
+                drop(acquired);
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        hammer.join().unwrap();
+
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "--break-lock let two processes hold the apply lock at once: \
+             the lock file must never be unlinked"
+        );
     }
 
     /// Whole-second budgets read naturally in the contention message.

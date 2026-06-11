@@ -2446,6 +2446,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
+ "libc",
  "once_cell",
  "qbsdiff",
  "regex",

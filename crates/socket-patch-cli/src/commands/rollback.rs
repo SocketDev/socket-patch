@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, LOCK_BROKEN_CODE};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
@@ -28,7 +28,19 @@ pub struct RollbackArgs {
     pub common: GlobalArgs,
 
     /// Rollback a patch by fetching beforeHash blobs from API (no manifest required).
-    #[arg(long = "one-off", env = "SOCKET_ONE_OFF", default_value_t = false)]
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_ONE_OFF=1` (or an
+    /// exported-but-empty `SOCKET_ONE_OFF=`) aborted every `rollback`
+    /// invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
+    /// `main`'s empty-var scrub never rescues it.
+    #[arg(
+        long = "one-off",
+        env = "SOCKET_ONE_OFF",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
     pub one_off: bool,
 }
 
@@ -103,8 +115,18 @@ async fn try_rollback_local_go(
         package_path: pkg_path.display().to_string(),
         success: true,
         files_verified: Vec::new(),
-        files_rolled_back: patch.files.keys().cloned().collect(),
+        // The engine leaves `files_rolled_back` empty on dry-run (verify
+        // only); match it so the JSON `rolledBack` count never claims a dry
+        // run mutated anything.
+        files_rolled_back: if common.dry_run {
+            Vec::new()
+        } else {
+            patch.files.keys().cloned().collect()
+        },
         error: None,
+        // The go redirect leaves the module cache pristine — no in-place
+        // bytes changed, so there is no sidecar state to resync.
+        sidecar: None,
     };
     if let Err(e) = remove_go_redirect(
         purl,
@@ -177,7 +199,12 @@ fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
     let mut blobs = HashSet::new();
     for patch in manifest.patches.values() {
         for file_info in patch.files.values() {
-            blobs.insert(file_info.before_hash.clone());
+            // An empty beforeHash is the "file created by the patch" sentinel,
+            // not a blob: rollback deletes the file instead of restoring
+            // content, so there is nothing to download or gate on.
+            if !file_info.before_hash.is_empty() {
+                blobs.insert(file_info.before_hash.clone());
+            }
         }
     }
     blobs
@@ -244,6 +271,11 @@ fn result_to_json(result: &RollbackResult) -> serde_json::Value {
         "success": result.success,
         "error": result.error,
         "filesRolledBack": result.files_rolled_back,
+        // Rollback-side sidecar resync record (e.g. cargo's
+        // `.cargo-checksum.json` rewritten back to original hashes), or
+        // an error-severity advisory when the resync failed. Null when
+        // no sidecar applied — same serialization as `error` above.
+        "sidecar": result.sidecar,
         "filesVerified": result.files_verified.iter().map(|f| {
             serde_json::json!({
                 "file": f.file,
@@ -294,7 +326,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .unwrap()
             );
         } else {
-            eprintln!("One-off rollback mode: fetching patch data...");
+            eprintln!("Error: One-off rollback mode is not yet implemented");
         }
         return 1;
     }
@@ -360,7 +392,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     warnings.push(serde_json::json!({
                         "code": LOCK_BROKEN_CODE,
                         "message": format!(
-                            "--break-lock removed {}/apply.lock before acquisition",
+                            "--break-lock reclaimed stale {}/apply.lock (no live holder)",
                             socket_dir.display()
                         ),
                     }));
@@ -580,11 +612,28 @@ async fn rollback_patches_inner(
         setup: None,
     };
 
+    // Partition PURLs by ecosystem up front. The before-blob gate and the
+    // download below must only consider patches this run can actually roll
+    // back — the `--ecosystems` filter plus the ecosystems compiled into this
+    // build. An out-of-scope patch with an absent before-blob must not abort
+    // (or trigger fetches for) a run that will never restore it. Mirrors
+    // apply's `scoped_manifest`.
+    let rollback_purls: Vec<String> = patches_to_rollback.iter().map(|p| p.purl.clone()).collect();
+    let partitioned = partition_purls(&rollback_purls, args.common.ecosystems.as_deref());
+    let in_scope: HashSet<String> = partitioned
+        .values()
+        .flat_map(|purls| purls.iter().cloned())
+        .collect();
+    let mut scoped_manifest = filtered_manifest.clone();
+    scoped_manifest
+        .patches
+        .retain(|purl, _| in_scope.contains(purl));
+
     // Check for missing beforeHash blobs. Local-redirect PURLs (local-mode go)
     // are excluded: their rollback just drops the project-local redirect + copy
     // and reads no blobs, so a missing before-blob must not block an offline
     // redirect rollback.
-    let gate_manifest = exclude_local_redirects(&filtered_manifest, &args.common);
+    let gate_manifest = exclude_local_redirects(&scoped_manifest, &args.common);
     let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.common.offline {
@@ -625,10 +674,6 @@ async fn rollback_patches_inner(
             return Ok((false, Vec::new(), vendored_skipped));
         }
     }
-
-    // Partition PURLs by ecosystem
-    let rollback_purls: Vec<String> = patches_to_rollback.iter().map(|p| p.purl.clone()).collect();
-    let partitioned = partition_purls(&rollback_purls, args.common.ecosystems.as_deref());
 
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
@@ -936,6 +981,7 @@ mod tests {
             files_verified,
             files_rolled_back: rolled_back.iter().map(|s| s.to_string()).collect(),
             error: None,
+            sidecar: None,
         }
     }
 
@@ -1022,11 +1068,6 @@ mod tests {
     // manifest re-introduces local-go before-hashes that were never
     // downloaded, spuriously aborting a mixed rollback.
 
-    #[cfg(any(feature = "cargo", feature = "golang"))]
-    use socket_patch_core::manifest::schema::PatchFileInfo;
-
-    // Only the cargo/golang-gated before-blob gate tests use this helper.
-    #[cfg(any(feature = "cargo", feature = "golang"))]
     fn record_with_file(uuid: &str, path: &str, before_hash: &str) -> PatchRecord {
         let mut rec = make_record(uuid);
         let mut files = HashMap::new();
@@ -1039,6 +1080,37 @@ mod tests {
         );
         rec.files = files;
         rec
+    }
+
+    /// Regression: an empty `beforeHash` (the "file created by the patch"
+    /// sentinel) is not a blob. The missing-before-blob gate must ignore it:
+    /// `blobs_path.join("")` resolves to the blobs directory itself, so when
+    /// the blobs dir does not exist yet (fresh checkout of a committed
+    /// manifest, or a cache that was cleaned) the phantom "" counted as a
+    /// missing blob -- an `--offline` rollback of a new-file-only patch
+    /// aborted with "1 blob(s) are missing" even though it needs zero blobs,
+    /// and an online rollback fired a pointless download of blob "".
+    #[tokio::test]
+    async fn missing_before_blobs_ignores_new_file_sentinel() {
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "created.js", ""),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+
+        // Blobs dir does NOT exist (nothing ever downloaded).
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = tmp.path().join("blobs");
+
+        let missing = get_missing_before_blobs(&manifest, &blobs).await;
+        assert!(
+            missing.is_empty(),
+            "a new-file-only patch needs no before-blobs, got {missing:?}"
+        );
     }
 
     /// Cargo now patches in place (vendored or registry cache) and rolls back
@@ -1239,6 +1311,74 @@ mod tests {
         );
     }
 
+    /// Regression: a dry-run local-go rollback must not CLAIM files were
+    /// rolled back. The engine leaves `files_rolled_back` empty on dry-run
+    /// (verify only — `rollback_package_patch` pushes into it only on the
+    /// mutating path), and the JSON envelope counts `rolledBack` from a
+    /// non-empty `files_rolled_back`. Before the fix the go backend populated
+    /// it unconditionally, so `rollback --dry-run --json` reported
+    /// `rolledBack: 1` (with the files listed in `filesRolledBack`) for a run
+    /// that mutated nothing.
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn try_rollback_local_go_dry_run_reports_no_files_rolled_back() {
+        use socket_patch_core::patch::go_mod_edit::{
+            ensure_replace_entry, read_replace_entries, GO_PATCHES_DIR,
+        };
+
+        const MODULE: &str = "github.com/foo/bar";
+        const VERSION: &str = "v1.4.2";
+        const PURL: &str = "pkg:golang/github.com/foo/bar@v1.4.2";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("go.mod"),
+            "module myproj\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n",
+        )
+        .await
+        .unwrap();
+        assert!(
+            ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false)
+                .await
+                .unwrap()
+        );
+        let copy_dir = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+        tokio::fs::create_dir_all(&copy_dir).await.unwrap();
+
+        let patch = record_with_file("uuid-go", "errors.go", "go_before");
+        let common = crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            dry_run: true,
+            ..crate::args::GlobalArgs::default()
+        };
+        let result = try_rollback_local_go(PURL, root, &patch, &common)
+            .await
+            .expect("go PURL in local mode must be handled by the go backend");
+
+        assert!(
+            result.success,
+            "dry-run rollback failed: {:?}",
+            result.error
+        );
+        assert!(
+            result.files_rolled_back.is_empty(),
+            "dry-run must not claim files were rolled back (the JSON \
+             `rolledBack` count is derived from this), got {:?}",
+            result.files_rolled_back
+        );
+        // And dry-run must not have mutated anything: the redirect and the
+        // patched copy both survive.
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .any(|e| e.module == MODULE && e.socket_owned()),
+            "dry-run must leave the replace directive in place"
+        );
+        assert!(copy_dir.exists(), "dry-run must leave the patched copy");
+    }
+
     /// A go PURL under `--global` is an in-place module-cache rollback, NOT a
     /// redirect — `try_rollback_local_go` must decline it so the caller falls
     /// through to `rollback_package_patch`.
@@ -1260,6 +1400,119 @@ mod tests {
         assert!(
             result.is_none(),
             "global go must not use the redirect backend"
+        );
+    }
+
+    // --- Before-blob gate `--ecosystems` scoping --------------------------
+    //
+    // Twin of apply's (fixed) "offline guard unscoped" bug: the gate must
+    // only consider patches this run can actually roll back — the
+    // `--ecosystems` filter plus the ecosystems compiled into this build.
+
+    /// Regression: an out-of-scope patch's missing before-blob must not abort
+    /// an `--ecosystems`-scoped rollback. Before the fix the gate ran on the
+    /// identifier-filtered manifest BEFORE `partition_purls`, so
+    /// `rollback --ecosystems npm --offline` aborted the whole run because a
+    /// pypi patch — which this run would never touch — was missing its
+    /// before-blob (and online, the gate triggered needless downloads for it).
+    #[tokio::test]
+    async fn before_blob_gate_ignores_ecosystem_filtered_patches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        let blobs = socket.join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        // npm patch (in scope): before-blob present.
+        // pypi patch (filtered out by `--ecosystems npm`): before-blob ABSENT.
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "package/index.js", "npm_before_hash"),
+        );
+        patches.insert(
+            "pkg:pypi/six@1.16.0".to_string(),
+            record_with_file("uuid-pypi", "six.py", "pypi_before_hash"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(blobs.join("npm_before_hash"), b"x")
+            .await
+            .unwrap();
+
+        // With no npm package installed under the tempdir the run finds
+        // nothing to do — but it must get past the gate and report success,
+        // not abort over a blob it would never read.
+        let (success, results, _vendored_skipped) = rollback_patches(
+            root,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            true,  // offline
+            false, // global
+            None,
+            Some(vec!["npm".to_string()]),
+        )
+        .await
+        .expect("rollback must not error");
+        assert!(results.is_empty(), "nothing installed, nothing rolled back");
+        assert!(
+            success,
+            "an out-of-scope patch's missing before-blob must not abort an \
+             --ecosystems-scoped offline rollback"
+        );
+    }
+
+    /// The scoped gate still protects in-scope patches: with no
+    /// `--ecosystems` filter, a missing before-blob for an in-scope npm patch
+    /// must abort the offline run exactly as before.
+    #[tokio::test]
+    async fn before_blob_gate_still_blocks_in_scope_missing_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        let blobs = socket.join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut patches = HashMap::new();
+        patches.insert(
+            "pkg:npm/foo@1.0.0".to_string(),
+            record_with_file("uuid-npm", "package/index.js", "npm_before_hash"),
+        );
+        let manifest = PatchManifest {
+            patches,
+            setup: None,
+        };
+        let manifest_path = socket.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+        // The npm before-blob is deliberately absent.
+
+        let (success, results, _vendored_skipped) = rollback_patches(
+            root,
+            &manifest_path,
+            None,
+            false, // dry_run
+            true,  // silent
+            true,  // offline
+            false, // global
+            None,
+            None, // no ecosystem filter — the npm patch is in scope
+        )
+        .await
+        .expect("rollback must not error");
+        assert!(results.is_empty());
+        assert!(
+            !success,
+            "an in-scope missing before-blob must still abort the offline run"
         );
     }
 }

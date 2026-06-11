@@ -23,7 +23,8 @@ pub fn format_severity(s: &str, use_color: bool) -> String {
     match s.to_lowercase().as_str() {
         "critical" => format!("\x1b[91m{s}\x1b[0m"),
         "high" => format!("\x1b[31m{s}\x1b[0m"),
-        "medium" => format!("\x1b[33m{s}\x1b[0m"),
+        // GHSA emits `moderate`; same tier as medium (see get.rs severity_rank).
+        "medium" | "moderate" => format!("\x1b[33m{s}\x1b[0m"),
         "low" => format!("\x1b[36m{s}\x1b[0m"),
         _ => s.to_string(),
     }
@@ -50,7 +51,8 @@ pub enum SelectError {
 ///
 /// - `skip_prompt` (from `-y` flag) or `is_json`: return `default_yes` immediately.
 /// - Non-TTY stdin: return `default_yes` with a stderr warning.
-/// - Interactive: print prompt to stderr, read line; empty = `default_yes`.
+/// - Interactive: print prompt to stderr, read line; empty = `default_yes`;
+///   unreadable input (e.g. non-UTF-8 bytes) = no.
 pub fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_json: bool) -> bool {
     if skip_prompt || is_json {
         return default_yes;
@@ -63,7 +65,12 @@ pub fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_json: bool
     eprint!("{prompt} {hint} ");
     io::stderr().flush().unwrap();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).unwrap();
+    if io::stdin().read_line(&mut answer).is_err() {
+        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
+        // `read_line` reports those as InvalidData. Treat any read
+        // failure like an unrecognized answer (decline), not a panic.
+        return false;
+    }
     let answer = answer.trim().to_lowercase();
     if answer.is_empty() {
         return default_yes;
@@ -224,6 +231,18 @@ mod tests {
         assert_eq!(format_severity("high", true), "\x1b[31mhigh\x1b[0m");
         assert_eq!(format_severity("medium", true), "\x1b[33mmedium\x1b[0m");
         assert_eq!(format_severity("low", true), "\x1b[36mlow\x1b[0m");
+    }
+
+    #[test]
+    fn format_severity_moderate_is_medium_tier_yellow() {
+        // Regression: GHSA emits `moderate` for the medium tier (see
+        // get.rs `severity_rank`), and both scan.rs call sites pass raw
+        // API severities straight through. Dropping `moderate` into the
+        // unknown arm rendered a medium-tier vuln with no color at all —
+        // less prominent than `low` (cyan).
+        assert_eq!(format_severity("moderate", true), "\x1b[33mmoderate\x1b[0m");
+        assert_eq!(format_severity("MODERATE", true), "\x1b[33mMODERATE\x1b[0m");
+        assert_eq!(format_severity("moderate", false), "moderate");
     }
 
     #[test]

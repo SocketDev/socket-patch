@@ -116,6 +116,18 @@ impl DenoCrawler {
             let Some(((scope, name), version)) = crate::utils::purl::parse_jsr_purl(purl) else {
                 continue;
             };
+            // SECURITY: scope/name/version come straight from the (untrusted)
+            // manifest PURL and are joined onto the cache root below. A real
+            // JSR coordinate is a single path segment, so reject any that
+            // could traverse out of the cache (`..`/`.`, a separator, NUL).
+            // Unlike the cargo/npm crawlers there is no content check to catch
+            // a bogus path, and jsr patches in place — so fail closed here.
+            if !(is_safe_jsr_component(scope)
+                && is_safe_jsr_component(name)
+                && is_safe_jsr_component(version))
+            {
+                continue;
+            }
             // Cache layout: <root>/<scope>/<name>/<version>/
             let pkg_dir = jsr_cache_path.join(scope).join(name).join(version);
             if !is_dir(&pkg_dir).await {
@@ -186,6 +198,21 @@ async fn scan_jsr_cache(root: &Path, seen: &mut HashSet<String>, out: &mut Vec<C
             }
         }
     }
+}
+
+/// Whether a PURL-derived path component is safe to join onto the JSR cache
+/// root. A JSR scope (`@std`), package name (`path`), and version (`0.220.0`)
+/// are each a single path segment, so a real one never contains a separator,
+/// a `.`/`..` segment, a backslash, or a NUL. Rejecting those fail-closed
+/// blocks a tampered manifest PURL from traversing out of the cache via
+/// `find_by_purls` (which does no content verification and patches in place).
+fn is_safe_jsr_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains('/')
+        && !component.contains('\\')
+        && !component.contains('\0')
 }
 
 /// Returns true if `cwd` looks like a Deno project.
@@ -497,6 +524,68 @@ mod tests {
             batch_size: 100,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_by_purls_rejects_traversal_in_version() {
+        // SECURITY: `find_by_purls` joins the PURL's scope/name/version
+        // straight onto the cache root and (unlike the cargo/npm crawlers)
+        // does NO content verification — only an `is_dir` check — and jsr
+        // has no redirect backend, so the resolved dir is patched in place.
+        // A tampered manifest PURL whose version walks `..` must therefore
+        // be refused: otherwise it resolves to a real directory OUTSIDE the
+        // cache and `apply` writes into it.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        // Real intermediate dirs so the OS resolves the `..` segments —
+        // path resolution requires every prefix component to exist.
+        tokio::fs::create_dir_all(cache.join("@x").join("y"))
+            .await
+            .unwrap();
+        // The escape target lives OUTSIDE the cache root.
+        let outside = tmp.path().join("outside").join("leak");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // version = `../../../outside/leak` walks cache/@x/y -> tmp, then
+        // back down into outside/leak.
+        let purl = "pkg:jsr/@x/y@../../../outside/leak";
+        let crawler = DenoCrawler;
+        let result = crawler
+            .find_by_purls(&cache, &[purl.to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a traversing version must not resolve outside the cache, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_purls_rejects_traversal_in_name() {
+        // Twin of the version case: the package name is also untrusted and
+        // joined directly. A name containing `..`/separators must be
+        // refused before any disk access.
+        let tmp = tempfile::tempdir().unwrap();
+        // Nest the cache two levels down so the `..` escape lands on a real
+        // dir we control rather than walking above the tempdir.
+        let cache = tmp.path().join("a").join("b").join("cache");
+        tokio::fs::create_dir_all(cache.join("@x")).await.unwrap();
+        let outside = tmp.path().join("a").join("leak").join("1.0.0");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // name = `../../../leak` walks cache/@x -> a, then into leak/1.0.0.
+        let purl = "pkg:jsr/@x/../../../leak@1.0.0";
+        let crawler = DenoCrawler;
+        let result = crawler
+            .find_by_purls(&cache, &[purl.to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a traversing name must not resolve outside the cache, got {result:?}"
+        );
     }
 
     #[tokio::test]

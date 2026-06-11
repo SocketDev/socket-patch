@@ -468,6 +468,47 @@ mod tests {
         assert_eq!(fs::read_to_string(&pkg).await.unwrap(), original);
     }
 
+    /// npm and Node tolerate (and strip) a UTF-8 BOM in package.json — files
+    /// saved by Windows editors commonly carry one. serde_json does not, so
+    /// without stripping it a perfectly npm-valid manifest errors out with
+    /// "Invalid package.json" instead of being configured.
+    #[tokio::test]
+    async fn test_update_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(
+            &pkg,
+            "\u{feff}{\"name\":\"x\",\"scripts\":{\"build\":\"tsc\"}}",
+        )
+        .await
+        .unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+        assert_eq!(
+            result.status,
+            UpdateStatus::Updated,
+            "BOM'd package.json is valid for npm and must be updatable, got error: {:?}",
+            result.error
+        );
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed["scripts"]["postinstall"].is_string());
+        assert!(parsed["scripts"]["dependencies"].is_string());
+        assert_eq!(parsed["scripts"]["build"], "tsc");
+    }
+
+    /// A BOM'd file that is already fully configured must report
+    /// `AlreadyConfigured` (and stay untouched), not `Error`.
+    #[tokio::test]
+    async fn test_update_bom_already_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        let original = "\u{feff}{\"scripts\":{\"postinstall\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\",\"dependencies\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"}}";
+        fs::write(&pkg, original).await.unwrap();
+        let result = update_package_json(&pkg, false, PackageManager::Npm).await;
+        assert_eq!(result.status, UpdateStatus::AlreadyConfigured);
+        assert_eq!(fs::read_to_string(&pkg).await.unwrap(), original);
+    }
+
     /// An empty file is invalid JSON and must error without writing.
     #[tokio::test]
     async fn test_update_empty_file_errors() {
@@ -628,6 +669,32 @@ mod tests {
         assert_eq!(r1.status, RemoveStatus::Removed);
         let r2 = remove_package_json(&pkg, false).await;
         assert_eq!(r2.status, RemoveStatus::NotConfigured);
+    }
+
+    /// Remove must tolerate a UTF-8 BOM the same way npm does: a BOM'd,
+    /// configured package.json must be cleanly reverted, not rejected as
+    /// invalid JSON.
+    #[tokio::test]
+    async fn test_remove_tolerates_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("package.json");
+        fs::write(
+            &pkg,
+            "\u{feff}{\"name\":\"x\",\"scripts\":{\"build\":\"tsc\",\"postinstall\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"}}",
+        )
+        .await
+        .unwrap();
+        let result = remove_package_json(&pkg, false).await;
+        assert_eq!(
+            result.status,
+            RemoveStatus::Removed,
+            "BOM'd package.json is valid for npm and must be removable, got error: {:?}",
+            result.error
+        );
+        let content = fs::read_to_string(&pkg).await.unwrap();
+        assert!(!content.contains("socket-patch"));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["scripts"]["build"], "tsc");
     }
 
     #[tokio::test]

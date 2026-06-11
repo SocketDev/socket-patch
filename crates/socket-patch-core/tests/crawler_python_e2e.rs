@@ -776,6 +776,34 @@ async fn find_by_purls_strips_qualifiers() {
     assert_eq!(pkg.path, tmp.path());
 }
 
+/// A bare `#subpath` (no `?qualifier`) is valid PURL grammar and must be
+/// stripped the same way qualifiers are — cutting only at `?` leaks the
+/// subpath into the version (`2.28.0#src/requests`), so the installed
+/// package silently fails to match. Twin of the strip_purl_qualifiers
+/// subpath fix in utils::purl.
+#[tokio::test]
+async fn find_by_purls_strips_subpath() {
+    let tmp = tempfile::tempdir().unwrap();
+    stage_dist_info(tmp.path(), "requests", "2.28.0").await;
+
+    let crawler = PythonCrawler;
+    let result = crawler
+        .find_by_purls(
+            tmp.path(),
+            &["pkg:pypi/requests@2.28.0#src/requests".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1, "subpath must be stripped before lookup");
+    // Same keying contract as the qualifier test: the original PURL.
+    let pkg = result
+        .get("pkg:pypi/requests@2.28.0#src/requests")
+        .expect("result must be keyed by the original subpath PURL");
+    assert_eq!(pkg.name, "requests");
+    assert_eq!(pkg.version, "2.28.0");
+    assert_eq!(pkg.path, tmp.path());
+}
+
 #[tokio::test]
 async fn find_by_purls_empty_purls_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();

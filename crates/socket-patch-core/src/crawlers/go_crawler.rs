@@ -179,6 +179,17 @@ impl GoCrawler {
 
         for purl in purls {
             if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
+                // SECURITY: `module_path`/`version` come straight from the
+                // (untrusted) manifest PURL and are joined onto the cache root
+                // below. In global mode the resolved directory is patched IN
+                // PLACE (no `replace`-redirect backend stands between the
+                // crawler and disk), so a tampered PURL with a `..` segment
+                // must not be able to escape the cache. Reject fail-closed
+                // before the `is_dir` probe — the twin of the deno crawler's
+                // `is_safe_jsr_component` gate.
+                if !is_safe_module_coordinate(module_path, version) {
+                    continue;
+                }
                 // Encode the module path AND the version for the filesystem.
                 // Go case-escapes both halves of the directory name, so a
                 // version like `v1.0.0-RC1` must be looked up as
@@ -368,6 +379,33 @@ fn split_module_path(module_path: &str) -> (&str, &str) {
         Some(idx) => (&module_path[..idx], &module_path[idx + 1..]),
         None => ("", module_path),
     }
+}
+
+/// Whether a `(module_path, version)` pair parsed from an untrusted PURL is
+/// safe to join onto the module-cache root in [`GoCrawler::find_by_purls`].
+///
+/// A Go module path legitimately contains `/` separators
+/// (`github.com/foo/bar`), so the path is validated **per segment** rather
+/// than rejecting all separators — but a real path never has an empty, `.`,
+/// or `..` segment (a leading `/` yields an empty first segment, so absolute
+/// paths are rejected here too). A version is a single segment with no
+/// separator. Backslashes and NULs are rejected outright. This mirrors the
+/// `go_redirect` coordinate guard and fails closed so a tampered manifest PURL
+/// cannot traverse out of the cache.
+fn is_safe_module_coordinate(module_path: &str, version: &str) -> bool {
+    let module_ok = !module_path.is_empty()
+        && !module_path.contains('\\')
+        && !module_path.contains('\0')
+        && module_path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
+    let version_ok = !version.is_empty()
+        && version != "."
+        && version != ".."
+        && !version.contains('/')
+        && !version.contains('\\')
+        && !version.contains('\0');
+    module_ok && version_ok
 }
 
 /// Check whether a path is a directory.
@@ -922,6 +960,35 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result.contains_key(&qualified));
         assert_eq!(result[&qualified].name, "gin");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_module_path_traversal() {
+        // SECURITY: `module_path`/`version` come straight from the (untrusted)
+        // manifest PURL and are joined onto the module-cache root. In global
+        // mode the resolved directory is patched IN PLACE (no `replace`
+        // redirect backend guards it), so a `..` segment must be rejected
+        // fail-closed — otherwise a tampered PURL escapes the cache. Twin of
+        // the deno crawler's `is_safe_jsr_component` gate.
+        let parent = tempfile::tempdir().unwrap();
+        let cache = parent.path().join("cache");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+
+        // A real directory one level ABOVE the cache root. With no guard,
+        // `cache.join("../outside/evil@v1.0.0")` resolves straight to it, and
+        // every intermediate component exists so the `is_dir` probe succeeds.
+        let outside = parent.path().join("outside").join("evil@v1.0.0");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let purls = vec!["pkg:golang/../outside/evil@v1.0.0".to_string()];
+        let result = crawler.find_by_purls(&cache, &purls).await.unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a `..` segment in the module path must be rejected, not resolved \
+             to a directory outside the cache root"
+        );
     }
 
     #[tokio::test]

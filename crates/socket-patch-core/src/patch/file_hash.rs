@@ -22,10 +22,23 @@ use crate::hash::git_sha256::compute_git_sha256_from_reader;
 /// special file (FIFO, device, …) and hashing it is never meaningful here, and
 /// on some platforms a directory can read as zero bytes — which would otherwise
 /// be silently reported as the empty-blob hash.
+///
+/// On Unix the open itself is non-blocking (`O_NONBLOCK`): a plain `open(2)`
+/// of a FIFO with `O_RDONLY` waits for a writer that may never come, which
+/// would hang the patch engine forever *before* the regular-file guard below
+/// ever runs. With `O_NONBLOCK` the open returns immediately (it has no effect
+/// on reads of regular files) and the guard rejects the FIFO with an error.
 pub async fn compute_file_git_sha256(filepath: impl AsRef<Path>) -> Result<String, std::io::Error> {
     let filepath = filepath.as_ref();
 
     // Open the file once; everything below operates on this single descriptor.
+    #[cfg(unix)]
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(filepath)
+        .await?;
+    #[cfg(not(unix))]
     let file = tokio::fs::File::open(filepath).await?;
 
     // Size comes from the open handle (fstat), so it and the bytes we hash are
@@ -162,6 +175,42 @@ mod tests {
 
         let result = compute_file_git_sha256(&link).await;
         let err = result.expect_err("symlink to a directory must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A FIFO at the hashed path must be rejected promptly with an error, not
+    /// block forever. A plain `open(2)` with `O_RDONLY` on a FIFO waits for a
+    /// writer that never comes, so without a non-blocking open the `is_file`
+    /// guard is unreachable for exactly the special-file case it documents —
+    /// a FIFO planted at a manifest-listed path would hang apply/rollback
+    /// verification indefinitely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_compute_file_git_sha256_rejects_fifo_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success(), "mkfifo failed");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            compute_file_git_sha256(&fifo),
+        )
+        .await;
+
+        let Ok(result) = result else {
+            // The open is wedged in a `spawn_blocking` thread that the runtime
+            // waits for on shutdown; connect a writer to release it so this
+            // test can FAIL instead of hanging the whole suite.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("hashing a FIFO must error promptly, not hang");
+        };
+
+        let err = result.expect_err("FIFO must be rejected, never hashed");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 

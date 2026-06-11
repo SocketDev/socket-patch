@@ -243,18 +243,22 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--ecosystems", "pypi"]);
-    // Filtering out npm leaves nothing in scope: apply reports this as a
-    // partial-failure (exit 1, status "partialFailure", all-zero summary).
-    // Pin the exact contract — a disjoint `0 || 1` accept would let a
-    // regression that flipped the exit code (or started "succeeding" while
-    // silently doing nothing) slip through.
+    // Filtering out npm leaves nothing in scope: there is genuinely no
+    // work this run can do, so apply is a clean no-op SUCCESS (exit 0) —
+    // the same documented contract as an empty manifest (npm `postinstall`
+    // runs `apply` on every install). This test previously pinned exit
+    // 1/partialFailure, but that outcome was an artifact of a scoping bug:
+    // the excluded npm patch's missing artifacts were fetched (and failed,
+    // against this route-less mock) BEFORE the `--ecosystems` filter was
+    // applied, so the run never reached the no-in-scope success path. The
+    // filter now scopes the source probes and download planner up front.
     assert_eq!(
-        code, 1,
-        "ecosystem filter with nothing in scope must exit 1; stdout={stdout}; stderr={stderr}"
+        code, 0,
+        "ecosystem filter with nothing in scope is a clean no-op success; stdout={stdout}; stderr={stderr}"
     );
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["command"], "apply");
-    assert_eq!(v["status"], "partialFailure");
+    assert_eq!(v["status"], "success");
     assert_eq!(v["summary"]["applied"], 0);
     // Nothing in the npm ecosystem may even be discovered/downloaded once
     // it's filtered out — guards against the filter being applied only at
@@ -270,6 +274,18 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     assert_eq!(
         v["summary"]["failed"], 0,
         "skipping out-of-scope is not a failure"
+    );
+    // The excluded patch's artifacts must not be fetched AT ALL — the
+    // filter scopes the download planner itself, not just the write step.
+    // (Only artifact endpoints are checked; telemetry may ping the API.)
+    let requests = mock.received_requests().await.unwrap_or_default();
+    let artifact_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().contains("/patches/"))
+        .collect();
+    assert!(
+        artifact_requests.is_empty(),
+        "no patch artifacts may be fetched for a filtered-out ecosystem; got {artifact_requests:?}"
     );
     // The excluded npm patch must not appear as an applied/patched event —
     // an empty `events` array or one without our purl is fine, but a

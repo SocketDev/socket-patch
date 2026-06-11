@@ -95,6 +95,17 @@ impl RubyCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) {
+                // SECURITY: name/version come straight from the (untrusted)
+                // manifest PURL and are formatted into a `<name>-<version>`
+                // dir name joined onto `gem_path` below. A real gem
+                // coordinate is a single path segment, so reject any that
+                // could traverse out of the gem root (`..`/`.`, a separator,
+                // an absolute path, NUL). `verify_gem_at_path` only checks
+                // for `lib/`/`.gemspec` and gems patch in place, so fail
+                // closed here — same as the deno/go/maven/npm/nuget guards.
+                if !is_safe_gem_coordinate(name, version) {
+                    continue;
+                }
                 // The purl is the base PURL (qualifiers stripped upstream).
                 // Resolve it to the installed gem dir, which may carry a
                 // `-<platform>` suffix for platform gems.
@@ -391,6 +402,26 @@ fn gem_homes_to_gems_dirs(gempath: &str) -> Vec<PathBuf> {
         .filter(|segment| !segment.as_os_str().is_empty())
         .map(|segment| segment.join("gems"))
         .collect()
+}
+
+/// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
+/// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
+/// directory name joined onto `gem_path`, and a real gem name/version is
+/// dash/dot/word characters only — never a separator, NUL, or bare dot
+/// segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and gems
+/// are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
+/// an absolute name, a `/`-bearing version) must be rejected here, fail
+/// closed. Mirrors the deno/go/maven/npm/nuget crawler coordinate guards.
+fn is_safe_gem_coordinate(name: &str, version: &str) -> bool {
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+    };
+    safe(name) && safe(version)
 }
 
 /// Check whether a path is a directory.
@@ -853,6 +884,101 @@ mod tests {
             paths.is_empty(),
             "non-Ruby project must yield no gem paths: {paths:?}"
         );
+    }
+
+    // ── PURL coordinate traversal (untrusted manifest input) ──────
+
+    /// A tampered manifest PURL whose name carries `..` must not resolve
+    /// to a directory outside the gem root. `locate_gem_dir` joins
+    /// `<name>-<version>` straight onto `gem_path`, and
+    /// `verify_gem_at_path` only checks for `lib/`/`.gemspec`, so without
+    /// a coordinate gate `pkg:gem/../outside@1.0.0` escapes the gem store
+    /// and the patch applies in place out of tree.
+    #[tokio::test]
+    async fn find_by_purls_rejects_traversal_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems = dir.path().join("gems");
+        tokio::fs::create_dir_all(&gems).await.unwrap();
+        // A verifying "gem" OUTSIDE the gem root that `..` escapes to.
+        tokio::fs::create_dir_all(dir.path().join("outside-1.0.0").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/../outside@1.0.0".to_string()];
+        let result = crawler.find_by_purls(&gems, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "`..` name must not escape the gem root: {result:?}"
+        );
+    }
+
+    /// An absolute path smuggled in as the gem name replaces the gem root
+    /// wholesale in `Path::join` — must be rejected fail-closed.
+    #[tokio::test]
+    async fn find_by_purls_rejects_absolute_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems = dir.path().join("gems");
+        tokio::fs::create_dir_all(&gems).await.unwrap();
+        let outside = dir.path().join("abs");
+        tokio::fs::create_dir_all(outside.join("evil-1.0.0").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purl = format!("pkg:gem/{}@1.0.0", outside.join("evil").display());
+        let result = crawler.find_by_purls(&gems, &[purl]).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "absolute name must not replace the gem root: {result:?}"
+        );
+    }
+
+    /// A separator smuggled into the *version* half of the coordinate is
+    /// just as dangerous as one in the name — both halves are formatted
+    /// into the joined `<name>-<version>` segment.
+    #[tokio::test]
+    async fn find_by_purls_rejects_separator_in_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems = dir.path().join("gems");
+        tokio::fs::create_dir_all(&gems).await.unwrap();
+        // `foo-1.0/../../outside-1.0.0` needs `foo-1.0` to traverse through.
+        tokio::fs::create_dir_all(gems.join("foo-1.0"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join("outside-1.0.0").join("lib"))
+            .await
+            .unwrap();
+
+        let crawler = RubyCrawler::new();
+        let purls = vec!["pkg:gem/foo@1.0/../../outside-1.0.0".to_string()];
+        let result = crawler.find_by_purls(&gems, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "version with separators must not escape the gem root: {result:?}"
+        );
+    }
+
+    /// Unit contract for the coordinate gate: real gem names/versions pass,
+    /// anything with a separator, NUL, or bare dot segment fails closed.
+    #[test]
+    fn test_is_safe_gem_coordinate() {
+        assert!(is_safe_gem_coordinate("rails", "7.1.0"));
+        assert!(is_safe_gem_coordinate("aws-sdk-s3", "1.143.0"));
+        assert!(is_safe_gem_coordinate("ruby2_keywords", "0.0.5"));
+        assert!(is_safe_gem_coordinate("nokogiri", "1.16.5.pre.rc1"));
+
+        assert!(!is_safe_gem_coordinate("", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("rails", ""));
+        assert!(!is_safe_gem_coordinate("..", "1.0.0"));
+        assert!(!is_safe_gem_coordinate(".", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("rails", ".."));
+        assert!(!is_safe_gem_coordinate("../outside", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("a/b", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("rails", "1.0/../../x"));
+        assert!(!is_safe_gem_coordinate("a\\b", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("a\0b", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("/abs/evil", "1.0.0"));
     }
 
     /// Gem names with embedded underscores/digits and multi-dash names

@@ -1052,7 +1052,11 @@ pub async fn run(args: ScanArgs) -> i32 {
         "packages"
     };
 
-    let show_progress = !args.common.json && stderr_is_tty();
+    // `--silent` is "errors only" (CLI_CONTRACT.md): progress, the crawl
+    // summary, the results table, and the per-patch listing are all
+    // suppressed below, mirroring `list`/`get`/`repair`/`remove`. Errors
+    // and the JSON envelope are unaffected.
+    let show_progress = !args.common.json && !args.common.silent && stderr_is_tty();
 
     if show_progress {
         eprint!("Scanning {scan_target}...");
@@ -1137,6 +1141,8 @@ pub async fn run(args: ScanArgs) -> i32 {
                 embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
             return code;
+        } else if args.common.silent {
+            // Errors only: the empty-scan hint is informational.
         } else if args.common.global || args.common.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
@@ -1177,7 +1183,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         format!(" ({})", eco_parts.join(", "))
     };
 
-    if !args.common.json {
+    if !args.common.json && !args.common.silent {
         if show_progress {
             eprintln!("\rFound {package_count} packages{eco_summary}");
         } else {
@@ -1297,7 +1303,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         .map(|p| p.patches.len())
         .sum();
 
-    if !args.common.json {
+    if !args.common.json && !args.common.silent {
         if total_patches_found > 0 {
             if show_progress {
                 eprintln!(
@@ -1578,139 +1584,146 @@ pub async fn run(args: ScanArgs) -> i32 {
     let use_color = stdout_is_tty();
 
     if all_packages_with_patches.is_empty() {
-        println!("\nNo patches available for installed packages.");
+        if !args.common.silent {
+            println!("\nNo patches available for installed packages.");
+        }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    let mut updates_available = 0usize;
+    // The whole table + summary section is presentational only (nothing
+    // computed inside is consumed downstream), so `--silent` skips it
+    // wholesale.
+    if !args.common.silent {
+        let mut updates_available = 0usize;
 
-    // Canonical set of PURLs with a newer patch available, computed once via
-    // `detect_updates` (the same source the JSON `updates` array uses). The
-    // table path MUST agree with the JSON path, so reuse that result rather
-    // than re-deriving it: comparing against *any* batch patch (instead of the
-    // first/candidate one `select_patches` would resolve to) over-reports
-    // updates whenever the manifest already holds the newest patch but older
-    // patches also appear in the batch.
-    let update_purls: HashSet<&str> = updates.iter().map(|u| u.purl.as_str()).collect();
+        // Canonical set of PURLs with a newer patch available, computed once via
+        // `detect_updates` (the same source the JSON `updates` array uses). The
+        // table path MUST agree with the JSON path, so reuse that result rather
+        // than re-deriving it: comparing against *any* batch patch (instead of the
+        // first/candidate one `select_patches` would resolve to) over-reports
+        // updates whenever the manifest already holds the newest patch but older
+        // patches also appear in the batch.
+        let update_purls: HashSet<&str> = updates.iter().map(|u| u.purl.as_str()).collect();
 
-    // Print table
-    println!("\n{}", "=".repeat(100));
-    println!(
-        "{}  {}  {}  VULNERABILITIES",
-        "PACKAGE".to_string() + &" ".repeat(33),
-        "PATCHES".to_string() + " ",
-        "SEVERITY".to_string() + &" ".repeat(8),
-    );
-    println!("{}", "=".repeat(100));
+        // Print table
+        println!("\n{}", "=".repeat(100));
+        println!(
+            "{}  {}  {}  VULNERABILITIES",
+            "PACKAGE".to_string() + &" ".repeat(33),
+            "PATCHES".to_string() + " ",
+            "SEVERITY".to_string() + &" ".repeat(8),
+        );
+        println!("{}", "=".repeat(100));
 
-    for pkg in &all_packages_with_patches {
-        // Char-safe truncation: a byte slice (`&pkg.purl[..37]`) panics
-        // when the cut lands mid-codepoint. PURLs can carry non-ASCII
-        // names/qualifiers, so route through the shared helper.
-        let display_purl = truncate_with_ellipsis(&pkg.purl, 40);
+        for pkg in &all_packages_with_patches {
+            // Char-safe truncation: a byte slice (`&pkg.purl[..37]`) panics
+            // when the cut lands mid-codepoint. PURLs can carry non-ASCII
+            // names/qualifiers, so route through the shared helper.
+            let display_purl = truncate_with_ellipsis(&pkg.purl, 40);
 
-        let pkg_free = pkg.patches.iter().filter(|p| p.tier == "free").count();
-        let pkg_paid = pkg.patches.iter().filter(|p| p.tier == "paid").count();
+            let pkg_free = pkg.patches.iter().filter(|p| p.tier == "free").count();
+            let pkg_paid = pkg.patches.iter().filter(|p| p.tier == "paid").count();
 
-        let count_str = if pkg_paid > 0 {
-            if can_access_paid_patches {
-                format!("{}+{}", pkg_free, pkg_paid)
+            let count_str = if pkg_paid > 0 {
+                if can_access_paid_patches {
+                    format!("{}+{}", pkg_free, pkg_paid)
+                } else {
+                    format!(
+                        "{}+{}",
+                        pkg_free,
+                        color(&pkg_paid.to_string(), "33", use_color)
+                    )
+                }
             } else {
-                format!(
-                    "{}+{}",
-                    pkg_free,
-                    color(&pkg_paid.to_string(), "33", use_color)
-                )
+                format!("{}", pkg_free)
+            };
+
+            // Get highest severity
+            let severity = pkg
+                .patches
+                .iter()
+                .filter_map(|p| p.severity.as_deref())
+                .min_by_key(|s| severity_order(s))
+                .unwrap_or("unknown");
+
+            // Collect vuln IDs (deterministic: deduped, CVEs then GHSAs,
+            // each group sorted — see collect_vuln_ids).
+            let vuln_ids = collect_vuln_ids(pkg);
+            let vuln_str = if vuln_ids.len() > 2 {
+                format!("{} (+{})", vuln_ids[..2].join(", "), vuln_ids.len() - 2)
+            } else if vuln_ids.is_empty() {
+                "-".to_string()
+            } else {
+                vuln_ids.join(", ")
+            };
+
+            // Check for updates — consult the canonical `detect_updates` result
+            // (mirrored into `update_purls`) so the human table and JSON `updates`
+            // array never disagree.
+            let has_update = update_purls.contains(pkg.purl.as_str());
+            if has_update {
+                updates_available += 1;
             }
-        } else {
-            format!("{}", pkg_free)
-        };
 
-        // Get highest severity
-        let severity = pkg
-            .patches
-            .iter()
-            .filter_map(|p| p.severity.as_deref())
-            .min_by_key(|s| severity_order(s))
-            .unwrap_or("unknown");
+            let update_marker = if has_update {
+                color(" [UPDATE]", "33", use_color)
+            } else {
+                String::new()
+            };
 
-        // Collect vuln IDs (deterministic: deduped, CVEs then GHSAs,
-        // each group sorted — see collect_vuln_ids).
-        let vuln_ids = collect_vuln_ids(pkg);
-        let vuln_str = if vuln_ids.len() > 2 {
-            format!("{} (+{})", vuln_ids[..2].join(", "), vuln_ids.len() - 2)
-        } else if vuln_ids.is_empty() {
-            "-".to_string()
-        } else {
-            vuln_ids.join(", ")
-        };
-
-        // Check for updates — consult the canonical `detect_updates` result
-        // (mirrored into `update_purls`) so the human table and JSON `updates`
-        // array never disagree.
-        let has_update = update_purls.contains(pkg.purl.as_str());
-        if has_update {
-            updates_available += 1;
+            println!(
+                "{:<40}  {:>8}  {:<16}  {}{}",
+                display_purl,
+                count_str,
+                format_severity(severity, use_color),
+                vuln_str,
+                update_marker,
+            );
         }
 
-        let update_marker = if has_update {
-            color(" [UPDATE]", "33", use_color)
-        } else {
-            String::new()
-        };
+        println!("{}", "=".repeat(100));
 
-        println!(
-            "{:<40}  {:>8}  {:<16}  {}{}",
-            display_purl,
-            count_str,
-            format_severity(severity, use_color),
-            vuln_str,
-            update_marker,
-        );
-    }
-
-    println!("{}", "=".repeat(100));
-
-    // Summary
-    if can_access_paid_patches {
-        println!(
-            "\nSummary: {} package(s) with {} available patch(es)",
-            all_packages_with_patches.len(),
-            total_patches,
-        );
-    } else {
-        println!(
-            "\nSummary: {} package(s) with {} free patch(es)",
-            all_packages_with_patches.len(),
-            free_patches,
-        );
-        if paid_patches > 0 {
+        // Summary
+        if can_access_paid_patches {
             println!(
-                "{}",
-                color(
-                    &format!(
-                        "         + {} additional patch(es) available with paid subscription",
-                        paid_patches
+                "\nSummary: {} package(s) with {} available patch(es)",
+                all_packages_with_patches.len(),
+                total_patches,
+            );
+        } else {
+            println!(
+                "\nSummary: {} package(s) with {} free patch(es)",
+                all_packages_with_patches.len(),
+                free_patches,
+            );
+            if paid_patches > 0 {
+                println!(
+                    "{}",
+                    color(
+                        &format!(
+                            "         + {} additional patch(es) available with paid subscription",
+                            paid_patches
+                        ),
+                        "33",
+                        use_color,
                     ),
+                );
+                println!(
+                    "\nUpgrade to Socket's paid plan to access all patches: https://socket.dev/pricing"
+                );
+            }
+        }
+
+        if updates_available > 0 {
+            println!(
+                "\n{}",
+                color(
+                    &format!("{updates_available} package(s) have newer patches available."),
                     "33",
                     use_color,
                 ),
             );
-            println!(
-                "\nUpgrade to Socket's paid plan to access all patches: https://socket.dev/pricing"
-            );
         }
-    }
-
-    if updates_available > 0 {
-        println!(
-            "\n{}",
-            color(
-                &format!("{updates_available} package(s) have newer patches available."),
-                "33",
-                use_color,
-            ),
-        );
     }
 
     // Count downloadable patches
@@ -1724,7 +1737,9 @@ pub async fn run(args: ScanArgs) -> i32 {
     };
 
     if downloadable_count == 0 {
-        println!("\nNo downloadable patches (paid subscription required).");
+        if !args.common.silent {
+            println!("\nNo downloadable patches (paid subscription required).");
+        }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
@@ -1750,7 +1765,9 @@ pub async fn run(args: ScanArgs) -> i32 {
                 all_search_results.extend(response.patches);
             }
             Err(e) => {
-                eprintln!("\n  Warning: could not fetch details for {}: {e}", pkg.purl);
+                if !args.common.silent {
+                    eprintln!("\n  Warning: could not fetch details for {}: {e}", pkg.purl);
+                }
             }
         }
     }
@@ -1783,76 +1800,83 @@ pub async fn run(args: ScanArgs) -> i32 {
     } else {
         selected.into_iter().partition(|p| is_vendored(&p.purl))
     };
-    for p in &vendored_selected {
-        println!(
-            "  [skip] {} (vendored — run scan --vendor to update)",
-            p.purl
-        );
+    if !args.common.silent {
+        for p in &vendored_selected {
+            println!(
+                "  [skip] {} (vendored — run scan --vendor to update)",
+                p.purl
+            );
+        }
     }
 
     if selected.is_empty() && !args.vendor {
-        println!("No patches selected.");
+        if !args.common.silent {
+            println!("No patches selected.");
+        }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Display detailed summary of selected patches before confirming
-    if args.vendor {
-        println!("\nPatches to vendor:\n");
-    } else {
-        println!("\nPatches to apply:\n");
-    }
-    for patch in &selected {
-        // Collect CVE/GHSA IDs and highest severity from vulnerabilities
-        let mut vuln_ids: Vec<String> = Vec::new();
-        let mut highest_severity: Option<&str> = None;
-        for (id, vuln) in &patch.vulnerabilities {
-            if vuln.cves.is_empty() {
-                vuln_ids.push(id.clone());
-            } else {
-                for cve in &vuln.cves {
-                    vuln_ids.push(cve.clone());
+    // (presentational only — skipped wholesale under --silent).
+    if !args.common.silent {
+        if args.vendor {
+            println!("\nPatches to vendor:\n");
+        } else {
+            println!("\nPatches to apply:\n");
+        }
+        for patch in &selected {
+            // Collect CVE/GHSA IDs and highest severity from vulnerabilities
+            let mut vuln_ids: Vec<String> = Vec::new();
+            let mut highest_severity: Option<&str> = None;
+            for (id, vuln) in &patch.vulnerabilities {
+                if vuln.cves.is_empty() {
+                    vuln_ids.push(id.clone());
+                } else {
+                    for cve in &vuln.cves {
+                        vuln_ids.push(cve.clone());
+                    }
+                }
+                let sev = vuln.severity.as_str();
+                if highest_severity.is_none_or(|cur| severity_order(sev) < severity_order(cur)) {
+                    highest_severity = Some(sev);
                 }
             }
-            let sev = vuln.severity.as_str();
-            if highest_severity.is_none_or(|cur| severity_order(sev) < severity_order(cur)) {
-                highest_severity = Some(sev);
+
+            let sev_display = highest_severity.unwrap_or("unknown");
+            let sev_colored = format_severity(sev_display, use_color);
+
+            // Char-safe: descriptions come straight from the API and routinely
+            // contain non-ASCII text; a `&desc[..69]` byte slice would panic.
+            let desc = truncate_with_ellipsis(&patch.description, 72);
+
+            println!(
+                "  {} [{}] {}",
+                patch.purl,
+                patch.tier.to_uppercase(),
+                sev_colored,
+            );
+            if !vuln_ids.is_empty() {
+                println!("    Fixes: {}", vuln_ids.join(", "));
             }
-        }
-
-        let sev_display = highest_severity.unwrap_or("unknown");
-        let sev_colored = format_severity(sev_display, use_color);
-
-        // Char-safe: descriptions come straight from the API and routinely
-        // contain non-ASCII text; a `&desc[..69]` byte slice would panic.
-        let desc = truncate_with_ellipsis(&patch.description, 72);
-
-        println!(
-            "  {} [{}] {}",
-            patch.purl,
-            patch.tier.to_uppercase(),
-            sev_colored,
-        );
-        if !vuln_ids.is_empty() {
-            println!("    Fixes: {}", vuln_ids.join(", "));
-        }
-        // Show per-vulnerability summaries
-        for vuln in patch.vulnerabilities.values() {
-            if !vuln.summary.is_empty() {
-                // Char-safe: vulnerability summaries are API-sourced free
-                // text; a `&summary[..73]` byte slice would panic mid-codepoint.
-                let summary = truncate_with_ellipsis(&vuln.summary, 76);
-                let cve_label = if vuln.cves.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}: ", vuln.cves.join(", "))
-                };
-                println!("    - {cve_label}{summary}");
+            // Show per-vulnerability summaries
+            for vuln in patch.vulnerabilities.values() {
+                if !vuln.summary.is_empty() {
+                    // Char-safe: vulnerability summaries are API-sourced free
+                    // text; a `&summary[..73]` byte slice would panic mid-codepoint.
+                    let summary = truncate_with_ellipsis(&vuln.summary, 76);
+                    let cve_label = if vuln.cves.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}: ", vuln.cves.join(", "))
+                    };
+                    println!("    - {cve_label}{summary}");
+                }
             }
+            if !desc.is_empty() {
+                println!("    {desc}");
+            }
+            println!();
         }
-        if !desc.is_empty() {
-            println!("    {desc}");
-        }
-        println!();
     }
 
     // `--dry-run` is a non-mutating preview (see the global flag's doc and
@@ -1861,15 +1885,17 @@ pub async fn run(args: ScanArgs) -> i32 {
     // before the confirm prompt, the download/apply, and the prune GC — all
     // of which mutate the manifest and `.socket/` on disk.
     if args.common.dry_run {
-        let action = if args.vendor {
-            "download and vendor"
-        } else {
-            "download and apply"
-        };
-        println!(
-            "\n[dry-run] Would {action} {} patch(es). No changes made.",
-            selected.len()
-        );
+        if !args.common.silent {
+            let action = if args.vendor {
+                "download and vendor"
+            } else {
+                "download and apply"
+            };
+            println!(
+                "\n[dry-run] Would {action} {} patch(es). No changes made.",
+                selected.len()
+            );
+        }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
@@ -1877,9 +1903,11 @@ pub async fn run(args: ScanArgs) -> i32 {
     let verb = if args.vendor { "vendor" } else { "apply" };
     let prompt = format!("Download and {verb} {} patch(es)?", selected.len());
     if !confirm(&prompt, true, args.common.yes, args.common.json) {
-        println!("\nTo apply a patch, run:");
-        println!("  socket-patch get <package-name-or-purl>");
-        println!("  socket-patch get <CVE-ID>");
+        if !args.common.silent {
+            println!("\nTo apply a patch, run:");
+            println!("  socket-patch get <package-name-or-purl>");
+            println!("  socket-patch get <CVE-ID>");
+        }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
@@ -1893,7 +1921,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
         json: false,
-        silent: false,
+        silent: args.common.silent,
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
@@ -1928,7 +1956,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     if prune && !args.vendor {
         let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await;
         let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
-        if !gc.pruned.is_empty() || total > 0 {
+        if !args.common.silent && (!gc.pruned.is_empty() || total > 0) {
             println!(
                 "\nGC: pruned {} manifest entr{} and removed {} orphan file{} ({}).",
                 gc.pruned.len(),

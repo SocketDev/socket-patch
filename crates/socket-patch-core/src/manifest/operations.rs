@@ -31,12 +31,18 @@ pub fn get_after_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
 
 /// Get only beforeHash blobs referenced by a manifest.
 /// Used for rollback operations -- we need the original file content to restore.
+///
+/// An empty `beforeHash` is the "file created by the patch" sentinel, not a
+/// blob reference (rollback deletes the file instead of restoring content),
+/// so it is excluded from the set.
 pub fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
     let mut blobs = HashSet::new();
 
     for record in manifest.patches.values() {
         for file_info in record.files.values() {
-            blobs.insert(file_info.before_hash.clone());
+            if !file_info.before_hash.is_empty() {
+                blobs.insert(file_info.before_hash.clone());
+            }
         }
     }
 
@@ -258,6 +264,37 @@ mod tests {
         let manifest = PatchManifest::new();
         let blobs = get_before_hash_blobs(&manifest);
         assert_eq!(blobs.len(), 0);
+    }
+
+    // Regression: an empty `beforeHash` is the documented "file created by the
+    // patch" sentinel (get records it, apply/rollback branch on it) -- it is
+    // valid manifest data, not a blob reference. The before-blob set must skip
+    // it: a caller that treats every entry as fetchable would try to download
+    // blob "", and an existence probe via `blobs_path.join("")` resolves to
+    // the blobs directory itself, turning "is this blob on disk" into "does
+    // the directory exist".
+    #[test]
+    fn test_get_before_hash_blobs_skips_new_file_sentinel() {
+        let mut manifest = create_test_manifest();
+        let record = manifest.patches.get_mut("pkg:npm/pkg-a@1.0.0").unwrap();
+        record.files.insert(
+            "package/created-by-patch.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(), // new-file sentinel
+                after_hash: AFTER_HASH_1.to_string(),
+            },
+        );
+
+        let blobs = get_before_hash_blobs(&manifest);
+        assert!(
+            !blobs.contains(""),
+            "the empty new-file sentinel is not a blob and must not be in the set"
+        );
+        // The real before-hashes all survive.
+        assert_eq!(blobs.len(), 3);
+        for b in [BEFORE_HASH_1, BEFORE_HASH_2, BEFORE_HASH_3] {
+            assert!(blobs.contains(b));
+        }
     }
 
     #[test]

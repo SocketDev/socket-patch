@@ -413,6 +413,144 @@ fn unlock_human_mode_release_reports_noop_when_no_leftover() {
     );
 }
 
+/// `--silent` ("Suppress non-error output") must blank the human-mode
+/// free line. Regression guard: `emit_free` gated its human output on
+/// `!json` alone — `unlock --silent` printed "Lock is free." to stdout
+/// while the rest of the file (held branch, `emit_error`) honored the
+/// flag. Same bug class previously fixed in `list`, `repair`, `get`,
+/// `remove`, `scan`, and `setup`.
+#[test]
+fn unlock_silent_suppresses_free_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--silent"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout on a free probe, got:\n{stdout}"
+    );
+
+    // Control run: the same probe WITHOUT --silent must print the free
+    // line — otherwise the assertion above passes vacuously.
+    let (loud_code, loud_stdout, _) = run(dir.path(), &["unlock"]);
+    assert_eq!(loud_code, 0);
+    assert!(
+        loud_stdout.contains("Lock is free."),
+        "non-silent free probe must print the free line, got:\n{loud_stdout}"
+    );
+}
+
+/// `--silent --release` suppresses the output, not the mutation: the
+/// leftover lock file must still be deleted, with nothing on stdout.
+#[test]
+fn unlock_silent_release_still_deletes_but_stays_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    std::fs::write(&lock_file, b"").unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--silent", "--release"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent --release must produce no stdout, got:\n{stdout}"
+    );
+    assert!(
+        !lock_file.exists(),
+        "--silent must not suppress the release itself"
+    );
+}
+
+/// `--silent` must NOT blank the JSON envelope — `--json --silent` is
+/// the standard scripting combination and the machine output is the
+/// whole point of it.
+#[test]
+fn unlock_silent_keeps_json_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--json", "--silent"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        json_string(&env, "status"),
+        Some("free"),
+        "--silent must not suppress the JSON envelope: {stdout}"
+    );
+}
+
+/// `unlock` must probe the SAME lock the mutating subcommands take.
+/// Every mutating command derives the lock directory from
+/// `--manifest-path` (`resolved_manifest_path().parent()`); `unlock`
+/// hardcoded `<cwd>/.socket` instead, so with a custom manifest path it
+/// probed a directory nobody locks — reporting `free` (exit 0) while
+/// `apply`/`remove` held their lock. For the CI-gating use case this
+/// command exists for, that's the worst possible wrong answer.
+#[test]
+fn unlock_honors_manifest_path_when_probing() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom_dir = dir.path().join("custom");
+    let _external = take_external_lock(&custom_dir);
+
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &[
+            "unlock",
+            "--json",
+            "--manifest-path",
+            "custom/manifest.json",
+        ],
+    );
+    assert_eq!(
+        code, 1,
+        "a held custom-manifest-path lock must read as held; stdout={stdout}\nstderr={stderr}"
+    );
+    let env = parse_json_envelope(&stdout);
+    let code_field = env
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    assert_eq!(code_field, Some("lock_held"), "envelope: {stdout}");
+}
+
+/// Companion free-side guard: `--release` with a custom
+/// `--manifest-path` must remove the leftover next to THAT manifest,
+/// not silently no-op because `<cwd>/.socket` doesn't exist.
+#[test]
+fn unlock_release_honors_manifest_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let custom_dir = dir.path().join("custom");
+    std::fs::create_dir_all(&custom_dir).unwrap();
+    let lock_file = custom_dir.join("apply.lock");
+    std::fs::write(&lock_file, b"crashed-run-leftover").unwrap();
+
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &[
+            "unlock",
+            "--json",
+            "--release",
+            "--manifest-path",
+            "custom/manifest.json",
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(true),
+        "the custom-path leftover was removed, so released must be true: {stdout}"
+    );
+    assert!(
+        !lock_file.exists(),
+        "--release must delete the leftover next to the resolved manifest path"
+    );
+}
+
 /// Human-mode (`unlock` without `--json`) emits a stderr hint
 /// pointing the user at `--break-lock` when the lock is held.
 /// Pinned at the substring level so the helpful guidance survives

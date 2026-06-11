@@ -31,7 +31,8 @@ fn get_severity_order(severity: Option<&str>) -> u8 {
     match severity.map(|s| s.to_lowercase()).as_deref() {
         Some("critical") => 0,
         Some("high") => 1,
-        Some("medium") => 2,
+        // GHSA emits `moderate` for the medium tier.
+        Some("medium") | Some("moderate") => 2,
         Some("low") => 3,
         _ => 4,
     }
@@ -1165,6 +1166,24 @@ mod tests {
     }
 
     #[test]
+    fn test_severity_order_moderate_is_medium_tier() {
+        // Regression: GHSA emits `moderate` for the medium tier (the same
+        // convention output.rs `format_severity` and get.rs `severity_rank`
+        // already follow). The moderate-blind ordering lumped it in with
+        // "unknown" (rank 4), ranking it *below* low.
+        assert_eq!(
+            get_severity_order(Some("moderate")),
+            get_severity_order(Some("medium"))
+        );
+        assert!(get_severity_order(Some("moderate")) < get_severity_order(Some("low")));
+        // Case-insensitive like every other tier.
+        assert_eq!(
+            get_severity_order(Some("MODERATE")),
+            get_severity_order(Some("medium"))
+        );
+    }
+
+    #[test]
     fn test_convert_search_result_to_batch_info() {
         let mut vulns = HashMap::new();
         vulns.insert(
@@ -1284,6 +1303,46 @@ mod tests {
         let patch = make_patch(vulns, "desc");
         let info = convert_search_result_to_batch_info(patch);
         assert_eq!(info.severity, Some("critical".into()));
+    }
+
+    #[test]
+    fn test_convert_all_moderate_vulns_report_moderate_severity() {
+        // Regression: a patch whose vulns are all GHSA-`moderate` reported
+        // `severity: None` — the moderate-blind order gave it rank 4, equal
+        // to the `None` starting point, so the highest-severity tracker
+        // never fired. Tokenless `scan` (public-proxy batch fallback) then
+        // showed these patches with no severity at all.
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("Moderate vuln", "MODERATE", vec!["CVE-2024-0001"]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        assert_eq!(
+            info.severity,
+            Some("MODERATE".into()),
+            "all-moderate patch must report moderate, not None"
+        );
+    }
+
+    #[test]
+    fn test_convert_moderate_outranks_low() {
+        // Regression: `moderate` (GHSA medium tier) used to rank below
+        // `low`, so a moderate+low patch reported `low` as its highest
+        // severity.
+        let mut vulns = HashMap::new();
+        vulns.insert(
+            "GHSA-1111".into(),
+            make_vuln("Low vuln", "low", vec!["CVE-2024-0001"]),
+        );
+        vulns.insert(
+            "GHSA-2222".into(),
+            make_vuln("Moderate vuln", "moderate", vec!["CVE-2024-0002"]),
+        );
+        let patch = make_patch(vulns, "desc");
+        let info = convert_search_result_to_batch_info(patch);
+        assert_eq!(info.severity, Some("moderate".into()));
     }
 
     #[test]

@@ -265,8 +265,19 @@ fn pyproject_add(content: &str) -> Result<Option<String>, String> {
 
     let changed = if has_poetry && !real_pep621 {
         poetry_add(&mut doc)?
-    } else {
+    } else if real_pep621 {
         pep621_add(&mut doc)?
+    } else {
+        // Neither surface exists (e.g. a `[build-system]`-only or tool-config-only
+        // pyproject.toml of a setup.py/setup.cfg project). Synthesizing a
+        // `[project]` table with only `dependencies` would make the manifest
+        // invalid — PEP 621 requires `name` and forbids declaring it dynamic — so
+        // pip/setuptools/uv would refuse to build. Fail closed instead.
+        return Err(
+            "pyproject.toml has no `[project]` or `[tool.poetry]` table to host the hook \
+             dependency; declare project dependencies (or use requirements.txt) first"
+                .to_string(),
+        );
     };
     Ok(if changed { Some(doc.to_string()) } else { None })
 }
@@ -362,12 +373,16 @@ fn poetry_add(doc: &mut DocumentMut) -> Result<bool, String> {
                 .unwrap_or_default();
             extras.push("hook");
             tbl.insert("extras", Item::Value(Value::Array(extras)));
-        } else {
-            let version = item
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| "*".to_string());
+        } else if let Some(version) = item.as_str().map(str::to_string) {
             deps.insert("socket-patch", Item::Value(hook_inline_table(&version)));
+        } else {
+            // Any other shape (e.g. Poetry's multiple-constraints array of
+            // tables) carries spec data a blanket replacement would destroy.
+            return Err(
+                "`tool.poetry.dependencies.socket-patch` has an unsupported shape; \
+                 add the `hook` extra to it manually"
+                    .to_string(),
+            );
         }
         return Ok(true);
     }
@@ -658,6 +673,40 @@ mod tests {
     #[test]
     fn test_invalid_toml_errors() {
         assert!(pyproject_add("this is = = not toml [[[").is_err());
+    }
+
+    #[test]
+    fn test_pyproject_add_without_dep_surface_refuses() {
+        // A pyproject.toml with neither `[project]` nor `[tool.poetry]` (the
+        // classic setup.py/setup.cfg project that only carries `[build-system]`
+        // or tool config) has no dependency surface to host the hook.
+        // Synthesizing a `[project]` table with only `dependencies` makes the
+        // manifest invalid — PEP 621 requires `name` and forbids making it
+        // dynamic — so pip/setuptools/uv would refuse to build afterwards.
+        // The edit must error, not break the user's build.
+        let build_only =
+            "[build-system]\nrequires = [\"setuptools\"]\nbuild-backend = \"setuptools.build_meta\"\n";
+        assert!(
+            pyproject_add(build_only).is_err(),
+            "must not synthesize a name-less [project] table"
+        );
+        let tool_only = "[tool.black]\nline-length = 100\n";
+        assert!(pyproject_add(tool_only).is_err());
+    }
+
+    #[test]
+    fn test_poetry_add_multiconstraint_dep_not_clobbered() {
+        // Poetry's multiple-constraints form declares one dep as an ARRAY of
+        // constraint tables. That item is neither table-like nor a string, so
+        // the replace-fallback would silently overwrite the user's whole
+        // constraint set with `{version = "*", extras = ["hook"]}` — destroying
+        // their version pins and python markers. Refuse instead.
+        let toml = "[tool.poetry]\nname = \"x\"\n\n[tool.poetry.dependencies]\n\
+                    socket-patch = [{version = \"^1.0\", python = \"^2.7\"}, {version = \"^2.0\", python = \"^3.7\"}]\n";
+        assert!(
+            pyproject_add(toml).is_err(),
+            "a multi-constraint socket-patch dep must not be silently replaced"
+        );
     }
 
     #[test]

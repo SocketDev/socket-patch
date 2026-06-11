@@ -51,10 +51,40 @@ pub(crate) async fn fixup(
     pkg_path: &Path,
     patched: &[String],
 ) -> Result<Option<SidecarPayload>, SidecarError> {
+    sync_checksum(pkg_path, patched, false).await
+}
+
+/// Resync `<pkg_path>/.cargo-checksum.json` after a rollback restored
+/// the listed files to their original bytes (and deleted patch-added
+/// ones). Apply's [`fixup`] rewrote the checksum to the *patched*
+/// hashes, so without this resync the rolled-back (original) sources
+/// verify against patched hashes and the next `cargo build` of the
+/// crate refuses with "checksum ... has changed".
+///
+/// Same contract as [`fixup`], except a listed file that no longer
+/// exists on disk has its checksum entry *removed* — rollback deletes
+/// patch-added files, and a stale entry for a missing file is exactly
+/// as build-breaking as a wrong hash.
+pub(crate) async fn resync_after_rollback(
+    pkg_path: &Path,
+    rolled_back: &[String],
+) -> Result<Option<SidecarPayload>, SidecarError> {
+    sync_checksum(pkg_path, rolled_back, true).await
+}
+
+/// Shared driver for [`fixup`] / [`resync_after_rollback`] — see their
+/// docs for the `Ok(None)` / `Err` contract. `remove_missing` selects
+/// the rollback semantics for files absent on disk (remove the entry)
+/// over apply's (fail — apply just wrote the file, so absence is a bug).
+async fn sync_checksum(
+    pkg_path: &Path,
+    patched: &[String],
+    remove_missing: bool,
+) -> Result<Option<SidecarPayload>, SidecarError> {
     let checksum_path = pkg_path.join(CHECKSUM_FILE);
 
     // Read the existing file. NotFound is fine — no checksums to update.
-    let raw = match tokio::fs::read_to_string(&checksum_path).await {
+    let raw = match read_regular_file(&checksum_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
@@ -67,7 +97,7 @@ pub(crate) async fn fixup(
         }
     };
 
-    let mut json: Value = serde_json::from_str(&raw).map_err(|e| SidecarError::Malformed {
+    let mut json: Value = serde_json::from_slice(&raw).map_err(|e| SidecarError::Malformed {
         path: checksum_path.display().to_string(),
         detail: e.to_string(),
     })?;
@@ -80,7 +110,7 @@ pub(crate) async fn fixup(
             detail: "missing or non-object `files` field".to_string(),
         })?;
 
-    update_entries(files, pkg_path, patched).await?;
+    update_entries(files, pkg_path, patched, remove_missing).await?;
 
     // Pretty-print with two-space indent — matches what cargo
     // itself writes. Not strictly required (cargo accepts any
@@ -145,11 +175,14 @@ pub(crate) async fn fixup(
 /// Entries in the patch list may include the `package/` prefix used
 /// by the API; the on-disk file lives at `pkg_path.join(normalized)`,
 /// and the cargo-checksum key is the same `normalized` path. New
-/// files added by a patch get a fresh entry.
+/// files added by a patch get a fresh entry. With `remove_missing`
+/// (the rollback resync), a listed file absent on disk has its entry
+/// removed instead of failing — rollback deletes patch-added files.
 async fn update_entries(
     files: &mut Map<String, Value>,
     pkg_path: &Path,
     patched: &[String],
+    remove_missing: bool,
 ) -> Result<(), SidecarError> {
     for file_name in patched {
         let normalized = normalize_file_path(file_name).to_string();
@@ -176,12 +209,23 @@ async fn update_entries(
         }
 
         let on_disk = pkg_path.join(&normalized);
-        let hash = sha256_file(&on_disk)
-            .await
-            .map_err(|source| SidecarError::Io {
-                path: on_disk.display().to_string(),
-                source,
-            })?;
+        let hash = match sha256_file(&on_disk).await {
+            Ok(hash) => hash,
+            Err(e) if remove_missing && e.kind() == std::io::ErrorKind::NotFound => {
+                // Rollback deleted this patch-added file; drop the entry
+                // apply's fixup inserted for it. Only NotFound qualifies —
+                // any other failure (EACCES, a FIFO, …) is an unverifiable
+                // state and must still fail closed.
+                files.remove(&normalized);
+                continue;
+            }
+            Err(source) => {
+                return Err(SidecarError::Io {
+                    path: on_disk.display().to_string(),
+                    source,
+                });
+            }
+        };
         files.insert(normalized, Value::String(hash));
     }
     Ok(())
@@ -192,15 +236,50 @@ async fn update_entries(
 /// Loads the whole file into memory and hashes in one go.
 /// Cargo source files are bounded (the registry rejects crates
 /// whose `.crate` tarball exceeds ~10MB unpacked), so a single
-/// `read()` is cheaper than the streaming-loop dance and
-/// collapses the open + read into one `?` arm — which the
+/// read is cheaper than the streaming-loop dance — and the open
+/// error passes through untouched, which the
 /// `dispatch_fixup_cargo_sha256_file_failure_arm` integration
 /// test drives via a non-existent path.
 async fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let bytes = tokio::fs::read(path).await?;
+    let bytes = read_regular_file(path).await?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Read a whole file, refusing anything that isn't a regular file.
+///
+/// Both call sites read paths inside the (untrusted) package tree. A
+/// plain `open(2)` with `O_RDONLY` on a FIFO planted at one of those
+/// paths waits for a writer that may never come — hanging the patch
+/// engine forever before any guard runs. As in
+/// [`compute_file_git_sha256`](crate::patch::file_hash::compute_file_git_sha256),
+/// the open is non-blocking on Unix (a no-op for regular files) and the
+/// `is_file` check on the open handle rejects FIFOs/devices/directories
+/// instead of reading them.
+async fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    #[cfg(unix)]
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await?;
+    #[cfg(not(unix))]
+    let mut file = tokio::fs::File::open(path).await?;
+
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -586,6 +665,192 @@ mod tests {
                 "stage/cow litter leaked into package dir: {name}"
             );
         }
+    }
+
+    /// Rollback resync: restored files get their on-disk (original)
+    /// hash back, and the entry for a patch-added file that rollback
+    /// deleted is removed — a stale entry for a missing file is as
+    /// build-breaking as a wrong hash. Untouched entries survive.
+    #[tokio::test]
+    async fn resync_after_rollback_updates_and_removes_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        // src/lib.rs is back to its original bytes; src/new.rs (added by
+        // the patch) was deleted by rollback and does not exist.
+        tokio::fs::write(pkg.join("src/lib.rs"), b"original lib")
+            .await
+            .unwrap();
+
+        let starting = serde_json::json!({
+            "files": {
+                "src/lib.rs": expected_sha256(b"patched lib"),
+                "src/new.rs": expected_sha256(b"brand new"),
+                "Cargo.toml": "11".repeat(32),
+            },
+            "package": "preserved",
+        });
+        tokio::fs::write(
+            pkg.join(CHECKSUM_FILE),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let out = resync_after_rollback(pkg, &["src/lib.rs".to_string(), "src/new.rs".to_string()])
+            .await
+            .unwrap();
+        let payload = out.expect("checksum file existed, resync should return a payload");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].path, CHECKSUM_FILE);
+        assert_eq!(payload.files[0].action, SidecarFileAction::Rewritten);
+
+        let post: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let files = post["files"].as_object().unwrap();
+        assert_eq!(
+            files["src/lib.rs"].as_str().unwrap(),
+            expected_sha256(b"original lib")
+        );
+        assert!(files.get("src/new.rs").is_none());
+        assert_eq!(files["Cargo.toml"].as_str().unwrap(), "11".repeat(32));
+        assert_eq!(post["package"].as_str().unwrap(), "preserved");
+    }
+
+    /// The remove-missing leniency is strictly rollback-side: apply's
+    /// `fixup` must still fail on a listed file that is absent on disk
+    /// (apply just wrote it — absence is a bug, not a deletion).
+    #[tokio::test]
+    async fn fixup_still_errors_on_missing_file() {
+        let d = tempfile::tempdir().unwrap();
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(
+            d.path().join(CHECKSUM_FILE),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = fixup(d.path(), &["src/lib.rs".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SidecarError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    /// The resync shares apply's fail-closed path guard: an escaping
+    /// rolled-back key must be refused, never hashed or removed.
+    #[tokio::test]
+    async fn resync_refuses_dotdot_escape_path() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        let starting = serde_json::json!({
+            "files": { "Cargo.toml": "ff".repeat(32) },
+            "package": "x",
+        });
+        let original = serde_json::to_string_pretty(&starting).unwrap();
+        tokio::fs::write(pkg.join(CHECKSUM_FILE), &original)
+            .await
+            .unwrap();
+
+        let err = resync_after_rollback(&pkg, &["../secret.txt".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SidecarError::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidData
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(pkg.join(CHECKSUM_FILE))
+                .await
+                .unwrap(),
+            original,
+            "checksum must not be rewritten on refusal"
+        );
+    }
+
+    /// DoS regression (FIFO checksum file): the checksum file is read
+    /// straight out of the (untrusted) package tree on every cargo
+    /// apply. A FIFO planted at `.cargo-checksum.json` made the plain
+    /// `open(2)` wait for a writer that never comes — wedging apply
+    /// forever *after* the patch bytes were committed. Same DoS class
+    /// already fixed in `file_hash.rs` and `package.rs`: the open must
+    /// be non-blocking and non-regular files must be rejected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_checksum_file_errors_promptly() {
+        let d = tempfile::tempdir().unwrap();
+        let fifo = d.path().join(CHECKSUM_FILE);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success(), "mkfifo failed");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixup(d.path(), &["src/lib.rs".to_string()]),
+        )
+        .await;
+
+        let Ok(result) = result else {
+            // The open is wedged in a `spawn_blocking` thread that the
+            // runtime waits for on shutdown; connect a writer to release
+            // it so this test can FAIL instead of hanging the suite.
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("a FIFO checksum file must error promptly, not hang apply");
+        };
+        assert!(matches!(result, Err(SidecarError::Io { .. })));
+    }
+
+    /// DoS regression (FIFO patched-file target): `update_entries`
+    /// hashes each patched path from disk; a FIFO at that path hung the
+    /// rehash the same way. Must error promptly instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_patched_file_errors_promptly() {
+        let d = tempfile::tempdir().unwrap();
+        let starting = serde_json::json!({
+            "files": { "src/lib.rs": "00".repeat(32) },
+            "package": "x",
+        });
+        tokio::fs::write(
+            d.path().join(CHECKSUM_FILE),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(d.path().join("src"))
+            .await
+            .unwrap();
+        let fifo = d.path().join("src/lib.rs");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be runnable");
+        assert!(status.success(), "mkfifo failed");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixup(d.path(), &["src/lib.rs".to_string()]),
+        )
+        .await;
+
+        let Ok(result) = result else {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+            panic!("a FIFO patched file must error promptly, not hang the rehash");
+        };
+        assert!(matches!(result, Err(SidecarError::Io { .. })));
     }
 
     /// Copy-on-write safety: when `.cargo-checksum.json` is hardlinked
