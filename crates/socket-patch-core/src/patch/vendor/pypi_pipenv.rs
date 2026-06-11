@@ -668,6 +668,8 @@ mod tests {
             wiring,
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: Some("pipenv".into()),
             uv: None,
             pnpm: None,

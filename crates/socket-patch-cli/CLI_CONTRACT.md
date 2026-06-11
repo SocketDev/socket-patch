@@ -60,6 +60,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `apply`, `scan`, `vendor` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
 | `apply`, `scan`, `vendor` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
 | `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune) |
+| `scan` | `--vendor` / `--detached` | — | Vendor every patched dependency instead of applying in place (`--vendor`; conflicts with `--apply`/`--sync`, combines with `--prune`); `--detached` additionally skips all manifest writes — the vendor ledger embeds the patch records (requires `--vendor`) |
 | `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size (default `100`) |
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
 | `remove` | positional `identifier`; `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Manifest entry removal |
@@ -75,6 +76,10 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 `scan` queries the patch API in `--batch-size` chunks. Authenticated runs POST `/v0/orgs/{slug}/patches/batch`; token-less runs POST `{proxy}/patch/batch` on the public proxy and degrade to per-package `GET /patch/by-package/:purl` requests in two cases: the deployed proxy predates the batch endpoint (legacy proxies answer the POST with their `400 "Unsupported endpoint"` catch-all), or the all-or-nothing batch validation rejects the chunk (e.g. a crawled PURL type the server doesn't recognize, such as `pkg:jsr/…` — the per-package path tolerates those individually, preserving the pre-batch scan semantics). Rate limits and over-capacity 503s surface instead of silently degrading.
 
 `scan --sync` is sugar for `--apply --prune` — the canonical single-flag bot invocation. `scan --json --sync --yes` discovers, applies, and reconciles state in one pass.
+
+`scan --vendor` swaps the in-place apply for the vendor pipeline: discover → download (manifest written, as `--apply`) → vendor every patched dependency via the same engine as the `vendor` command (under the same lock). The whole manifest is vendored, so a package vendored at an older patch uuid is **re-vendored automatically** (its old uuid dir is removed — `vendor_stale_artifact_removed`); same-uuid re-runs are `already_vendored` skips. With `--prune`, GC runs **before** the vendor step so stale manifest entries don't fail vendoring with `package_not_installed`. JSON output gains a `download` sub-object (the download phase; no `applied` field — nothing is applied in place) and a `vendor` sub-object (a full vendor Envelope). `--dry-run` previews per-patch `would_vendor` | `would_revendor` (+`oldUuid`) | `already_vendored` without network downloads or disk writes. Interactive mode prompts "Download and vendor N patch(es)?".
+
+`scan --vendor --detached` performs the same vendoring **without ever writing `.socket/manifest.json`**: records are fetched into memory (`download.detached: true`), the artifacts are built + wired, and the ledger entry carries `detached: true` plus an embedded copy of the patch record (`record`) as the verification source. Detached patches are invisible to apply/rollback/repair (nothing is in the manifest), exempt from `vendor`'s manifest reconcile, and exit via `remove <purl>` (which reverts them) or `vendor --revert`. Idempotent re-runs reuse the embedded record and skip the patch-view fetch entirely.
 
 `--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts.
 
@@ -399,18 +404,50 @@ worse, lets a warm cache silently serve unpatched bytes):
   `source`/`checksum`, requirement lines, uv specifiers). Those are not recoverable offline, so
   `--revert` never guesses at unrecorded fragments: a missing ledger is an empty ledger (clean
   no-op plus the orphan-dir sweep), and entries whose recorded fragments no longer match are left
-  alone with warnings.
+  alone with warnings. Entries written by `scan --vendor --detached` additionally carry
+  `detached: true` and `record` (an embedded copy of the patch record — same committed-file trust
+  class as the manifest; artifact verification still re-hashes against its afterHashes and the
+  uuid-in-path cross-checks).
+* **Re-vendor carries originals forward**: re-vendoring under a newer patch uuid rewrites the
+  previous run's own wiring (`original: None` from the backend — it must never record a dangling
+  `.socket/vendor/` pointer as pre-vendor state); the engine merges the TRUE pre-vendor originals
+  from the replaced ledger entry by wiring identity, so `--revert` after any number of re-vendors
+  still restores the registry fragments byte-for-byte. The old uuid's now-orphaned artifact dir is
+  removed (`vendor_stale_artifact_removed`) unless another entry still references it.
 * `vendor --revert` restores the originals (fragments that no longer match — a user re-resolved —
   are left alone with a `vendor_lock_entry_drifted` warning), removes the artifacts, prunes the
   ledger, and sweeps orphan uuid dirs. It works without a manifest.
 * Re-running `vendor` is idempotent (byte-stable lockfiles, deterministic artifacts →
   `already_vendored` skips). Patches dropped from the manifest are auto-reverted at the start of
   the next `vendor` run (`vendor_reconciled` events).
-* `rollback` and `remove` are **vendoring-unaware by design**: `remove <purl>` deletes the manifest
-  entry but the vendoring stays until the next `vendor` run reconciles it (or `--revert`).
-* **apply yields to vendor**: a purl recorded in the ledger is skipped by `apply` with reason
-  `vendored` (golang especially — apply never repoints a vendor-owned `replace` back at
-  `.socket/go-patches/`), and `apply --check` excludes vendored modules from its drift audit.
+* **remove reverts vendoring**: `remove <purl|uuid>` on a vendored patch restores the recorded
+  lockfile fragments, deletes the artifact, and drops the ledger entry (envelope events
+  `removed`/`vendor_reverted`, which do NOT bump `summary.removed` — that count stays "manifest
+  entries deleted") before deleting the manifest entry; a revert failure (`vendor_revert_failed`)
+  aborts with the manifest intact. `--skip-rollback` ("don't touch my tree") skips the revert too
+  (`skipped`/`vendor_state_retained`) — the wiring then stays until the next `vendor` run
+  reconciles the dropped entry. Detached entries are removable by purl/uuid through the same
+  command even though they have no manifest record (`--skip-rollback` is refused there: reverting
+  IS the removal).
+* **rollback excludes vendored purls**: their patch lives in the committed artifact, not the
+  installed tree, so in-place restore is meaningless. The benign skip is surfaced in rollback's
+  JSON as the additive `vendored: [purls]` array (exit 0; an identifier matching only vendored
+  purls is a success, not `not_found`).
+* **apply yields to vendor — every ecosystem**: a purl recorded in the ledger is skipped by
+  `apply` with reason `vendored`, even when the installed tree is absent entirely (never
+  `package_not_installed`; a vendored variant also accounts for its qualified release-variant
+  siblings). Golang especially — apply never repoints a vendor-owned `replace` back at
+  `.socket/go-patches/` — and `apply --check` excludes vendored modules from its drift audit.
+* **scan skips vendored purls before download** (plain `--apply`/`--sync`): the manifest is never
+  moved past the vendored uuid (that would break VEX verification with `vendor_uuid_mismatch`
+  until a vendor run). The skip rides `apply.patches[]` as `skipped`/`vendored`; a newer available
+  patch still surfaces in `updates[]` — the signal to run `scan --vendor`. `scan --prune` exempts
+  vendored purls (an absent installed copy is their NORMAL state, not grounds to prune). An
+  explicit `get` is allowed to move the manifest past the vendored uuid and warns
+  (`warnings[]` + stderr) that a `vendor` run must refresh the artifact.
+* **Old-binary skew caveat**: a pre-detached `socket-patch` binary running `vendor` against a
+  checkout with detached entries cannot see the `detached` flag and will reconcile-revert them.
+  The ledger schema itself stays parseable both ways (additive optional fields).
 
 ### Caveats (documented behavior, not bugs)
 
@@ -551,7 +588,11 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `paid_required`           | `failed` / status=`paidRequired` | get/scan: patch needs a paid plan and the caller's token isn't entitled. |
 | `download_failed`         | `failed`         | repair/get: network or 404 on patch fetch. |
 | `rollback_failed`         | `failed`         | remove/rollback: file restore could not complete. |
-| `vendored`                | `skipped`        | apply: the package is managed by `socket-patch vendor`; apply yields ownership. |
+| `vendored`                | `skipped`        | apply (every ecosystem) + scan `--apply`: the package is managed by `socket-patch vendor`; the command yields ownership (scan also skips the download). Rollback surfaces the same skip via its `vendored: []` array. |
+| `vendor_reverted`         | `removed`        | remove: vendoring reverted (lock fragments restored, artifact + ledger entry gone) as part of removing the patch. |
+| `vendor_revert_failed`    | top-level error  | remove: the vendor revert failed; the manifest was NOT modified. |
+| `vendor_state_retained`   | `skipped`        | remove `--skip-rollback`: vendor wiring + artifact deliberately left in place (the next `vendor` run reconciles the dropped entry). Also the top-level error code when `--skip-rollback` targets a detached-only patch. |
+| `vendor_stale_artifact_removed` | `removed`  | vendor / scan `--vendor`: re-vendor under a newer patch uuid removed the previous uuid's orphaned artifact dir. |
 | `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (maven/nuget/jsr, or compiled out). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |

@@ -2,6 +2,7 @@ use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::patch::vendor::{load_state, save_state, VendorEntry, VendorState};
 use socket_patch_core::utils::cleanup_blobs::{cleanup_unused_blobs, format_cleanup_result};
 use socket_patch_core::utils::purl::purl_matches_identifier;
 use socket_patch_core::utils::telemetry::{track_patch_remove_failed, track_patch_removed};
@@ -9,10 +10,33 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::rollback::{all_files_already_original, rollback_patches};
+use super::vendor::dispatch_revert_one;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
+
+/// Vendor-ledger entries matching a remove identifier: by ledger key or
+/// base purl for `pkg:` identifiers (a base PURL matches every release
+/// variant, mirroring the manifest matching), or by patch uuid otherwise.
+/// Sorted by key for deterministic event order.
+fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
+    let mut matches: Vec<(String, VendorEntry)> = state
+        .entries
+        .iter()
+        .filter(|(key, entry)| {
+            if identifier.starts_with("pkg:") {
+                purl_matches_identifier(key, identifier)
+                    || purl_matches_identifier(&entry.base_purl, identifier)
+            } else {
+                entry.uuid == identifier
+            }
+        })
+        .map(|(k, e)| (k.clone(), e.clone()))
+        .collect();
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches
+}
 
 /// Emit a `remove` error envelope and return. Used by the many error
 /// paths in `run` so they all share the same JSON shape.
@@ -118,6 +142,29 @@ pub async fn run(args: RemoveArgs) -> i32 {
         };
 
     if matching.is_empty() {
+        // Detached vendored patches (`scan --vendor --detached`) have no
+        // manifest entry — `remove` is their per-purl exit path (alongside
+        // `vendor --revert`'s all-at-once). An unreadable ledger falls
+        // through to `not_found`: nothing is mutated on that path.
+        let detached_state = load_state(&args.common.cwd).await.unwrap_or_default();
+        let detached: Vec<(String, VendorEntry)> =
+            vendor_entries_matching(&detached_state, &args.identifier)
+                .into_iter()
+                .filter(|(_, e)| e.detached)
+                .collect();
+        if !detached.is_empty() {
+            return remove_detached_only(
+                &args,
+                detached,
+                detached_state,
+                lock_was_broken,
+                socket_dir,
+                api_token.as_deref(),
+                org_slug.as_deref(),
+            )
+            .await;
+        }
+
         let msg = format!("No patch found matching identifier: {}", args.identifier);
         track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
         if args.common.json {
@@ -189,7 +236,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         )
         .await
         {
-            Ok((success, results)) => {
+            Ok((success, results, _vendored_skipped)) => {
                 if !success {
                     track_patch_remove_failed(
                         "Rollback failed during patch removal",
@@ -245,6 +292,103 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
+    // Vendor-owned purls: removing the patch means reverting the vendoring
+    // (restore the recorded lockfile fragments, delete the artifact, drop
+    // the ledger entry) — otherwise the lockfile keeps consuming the
+    // patched artifact after the manifest forgot the patch. Runs AFTER the
+    // file rollback above (which benignly skips still-vendored purls and
+    // must not see them dropped from the ledger — its before-blob gate
+    // would demand blobs the vendor flow never downloaded) and BEFORE the
+    // manifest mutation, so a revert failure aborts with the manifest
+    // intact (mirroring the `rollback_failed` contract). A corrupt ledger
+    // is a hard error: we are about to mutate and cannot know what we
+    // would leave wired. `--skip-rollback` ("don't touch my tree") skips
+    // the revert too — the wiring stays until the next `vendor` run
+    // reconciles the then-dropped entry.
+    let mut vendor_state = match load_state(&args.common.cwd).await {
+        Ok(s) => s,
+        Err(e) => {
+            emit_error_envelope(
+                args.common.json,
+                "vendor_state_unreadable",
+                format!("cannot read .socket/vendor/state.json: {e}"),
+            );
+            return 1;
+        }
+    };
+    let vendored_matches = vendor_entries_matching(&vendor_state, &args.identifier);
+    // Reverted entries ride the final envelope as Removed/vendor_reverted
+    // events WITHOUT bumping summary.removed (that count stays "manifest
+    // entries deleted", same as the blob-sweep carrier). Retained/warning
+    // events are Skipped and bump normally.
+    let mut vendor_reverted_events: Vec<PatchEvent> = Vec::new();
+    let mut vendor_skipped_events: Vec<PatchEvent> = Vec::new();
+    if !vendored_matches.is_empty() {
+        if args.skip_rollback {
+            for (key, _) in &vendored_matches {
+                if !args.common.json {
+                    eprintln!(
+                        "Note: {key} is vendored; --skip-rollback leaves the vendor wiring and \
+                         artifact in place (the next `vendor` run will reconcile-revert it)."
+                    );
+                }
+                vendor_skipped_events.push(
+                    PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
+                        "vendor_state_retained",
+                        "vendor wiring and artifact left in place (--skip-rollback)",
+                    ),
+                );
+            }
+        } else {
+            for (key, entry) in &vendored_matches {
+                let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+                for w in &outcome.warnings {
+                    if !args.common.json {
+                        eprintln!("Warning ({}): {}", w.code, w.detail);
+                    }
+                    vendor_skipped_events.push(
+                        PatchEvent::new(PatchAction::Skipped, key.clone())
+                            .with_reason(w.code, w.detail.clone()),
+                    );
+                }
+                if !outcome.success {
+                    track_patch_remove_failed(
+                        "vendor revert failed during patch removal",
+                        api_token.as_deref(),
+                        org_slug.as_deref(),
+                    )
+                    .await;
+                    emit_error_envelope(
+                        args.common.json,
+                        "vendor_revert_failed",
+                        format!(
+                            "could not revert vendoring for {key}: {}. The manifest was not \
+                             modified.",
+                            outcome.error.as_deref().unwrap_or("unknown error")
+                        ),
+                    );
+                    return 1;
+                }
+                vendor_state.entries.remove(key);
+                if let Err(e) = save_state(&args.common.cwd, &vendor_state).await {
+                    emit_error_envelope(
+                        args.common.json,
+                        "vendor_state_write_failed",
+                        e.to_string(),
+                    );
+                    return 1;
+                }
+                if !args.common.json {
+                    println!("Reverted vendoring for {key}");
+                }
+                vendor_reverted_events.push(
+                    PatchEvent::new(PatchAction::Removed, key.clone())
+                        .with_reason("vendor_reverted", "vendoring reverted on remove"),
+                );
+            }
+        }
+    }
+
     // Now remove from manifest
     match remove_patch_from_manifest(&args.identifier, &manifest_path).await {
         Ok((removed, manifest)) => {
@@ -286,6 +430,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 if lock_was_broken {
                     env.record(lock_broken_event(socket_dir));
                 }
+                // Chronological: the vendor revert ran before the rollback
+                // and the manifest mutation. Reverted events bypass
+                // `record` so `summary.removed` stays equal to the number
+                // of manifest entries deleted (same rule as the blob-sweep
+                // carrier below); retained/warning Skipped events bump
+                // `summary.skipped` normally.
+                for ev in vendor_reverted_events {
+                    env.events.push(ev);
+                }
+                for ev in vendor_skipped_events {
+                    env.record(ev);
+                }
                 // One Removed event per purl whose manifest entry was deleted.
                 for purl in &removed {
                     env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
@@ -326,6 +482,106 @@ pub async fn run(args: RemoveArgs) -> i32 {
             1
         }
     }
+}
+
+/// Remove path for identifiers that match ONLY detached vendored entries
+/// (no manifest record): confirm, revert each entry's wiring + artifact,
+/// drop it from the ledger, and report `Removed`/`vendor_reverted` events.
+/// Unlike the manifest path, the reverts here ARE the removal, so they go
+/// through `env.record` and bump `summary.removed`. `--skip-rollback` is
+/// refused: with no manifest entry to delete, removing a detached patch
+/// can only mean reverting its vendoring.
+async fn remove_detached_only(
+    args: &RemoveArgs,
+    detached: Vec<(String, VendorEntry)>,
+    mut state: VendorState,
+    lock_was_broken: bool,
+    socket_dir: &Path,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> i32 {
+    if args.skip_rollback {
+        emit_error_envelope(
+            args.common.json,
+            "vendor_state_retained",
+            format!(
+                "{} matches only detached vendored patch(es); removing one means reverting \
+                 its vendoring, which --skip-rollback prevents",
+                args.identifier
+            ),
+        );
+        return 1;
+    }
+
+    if !args.common.json {
+        eprintln!("The following detached vendored patch(es) will be reverted and removed:");
+        for (key, entry) in &detached {
+            let short_uuid = entry.uuid.get(..8).unwrap_or(entry.uuid.as_str());
+            eprintln!("  - {key} (UUID: {short_uuid})");
+        }
+        eprintln!();
+    }
+    let prompt = format!(
+        "Remove {} vendored patch(es) and revert their vendoring?",
+        detached.len()
+    );
+    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+        if !args.common.json {
+            println!("Removal cancelled.");
+        }
+        return 0;
+    }
+
+    let mut env = Envelope::new(Command::Remove);
+    if lock_was_broken {
+        env.record(lock_broken_event(socket_dir));
+    }
+    for (key, entry) in &detached {
+        let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+        for w in &outcome.warnings {
+            if !args.common.json {
+                eprintln!("Warning ({}): {}", w.code, w.detail);
+            }
+            env.record(
+                PatchEvent::new(PatchAction::Skipped, key.clone())
+                    .with_reason(w.code, w.detail.clone()),
+            );
+        }
+        if !outcome.success {
+            track_patch_remove_failed(
+                "vendor revert failed during patch removal",
+                api_token,
+                org_slug,
+            )
+            .await;
+            emit_error_envelope(
+                args.common.json,
+                "vendor_revert_failed",
+                format!(
+                    "could not revert vendoring for {key}: {}",
+                    outcome.error.as_deref().unwrap_or("unknown error")
+                ),
+            );
+            return 1;
+        }
+        state.entries.remove(key);
+        if let Err(e) = save_state(&args.common.cwd, &state).await {
+            emit_error_envelope(args.common.json, "vendor_state_write_failed", e.to_string());
+            return 1;
+        }
+        if !args.common.json {
+            println!("Reverted vendoring for {key}");
+        }
+        env.record(
+            PatchEvent::new(PatchAction::Removed, key.clone())
+                .with_reason("vendor_reverted", "vendoring reverted on remove"),
+        );
+    }
+    if args.common.json {
+        println!("{}", env.to_pretty_json());
+    }
+    track_patch_removed(detached.len(), api_token, org_slug).await;
+    0
 }
 
 async fn remove_patch_from_manifest(

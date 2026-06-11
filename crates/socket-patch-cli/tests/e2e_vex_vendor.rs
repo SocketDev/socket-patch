@@ -127,6 +127,8 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: None,
             uv: None,
             pnpm: None,
@@ -461,4 +463,159 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
         !impact.contains("(vendored)"),
         "a go-patches redirect is not a vendored artifact: {impact}"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 5. detached entries (scan --vendor --detached): no manifest at all
+// ──────────────────────────────────────────────────────────────────────
+
+/// Ledger writer for the detached shape: `detached: true` plus the
+/// embedded record that replaces the manifest as verification source.
+fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: PatchRecord) {
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        VendorEntry {
+            ecosystem: "cargo".to_string(),
+            base_purl: purl.to_string(),
+            uuid: UUID.to_string(),
+            artifact: VendorArtifact {
+                path: rel_path.to_string(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: true,
+            record: Some(record),
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        },
+    );
+    let dir = cwd.join(".socket/vendor");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A detached vendored patch has NO manifest record — `vex` must attest it
+/// from the ledger's embedded record + the committed artifact, even when
+/// `.socket/manifest.json` does not exist at all. The vendored property-7
+/// exemption applies (no setup/manual declaration anywhere).
+#[test]
+fn detached_entry_attested_without_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+
+    let patched = b"patched detached source\n";
+    let after_hash = compute_git_sha256_from_bytes(patched);
+    let rel = write_vendored_dir(cwd, patched);
+    let record = make_record(
+        UUID,
+        "src/lib.rs",
+        &after_hash,
+        "GHSA-deta-aaaa",
+        &["CVE-2026-3"],
+    );
+    write_detached_vendor_state(cwd, purl, &rel, record);
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "fixture sanity: detached-only project has no manifest"
+    );
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "detached vendored patch must attest with no manifest. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "the detached patch must be attested: {doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-deta-aaaa");
+    assert_eq!(stmts[0]["status"], "not_affected");
+    let subs = stmts[0]["products"][0]["subcomponents"].as_array().unwrap();
+    assert_eq!(subs[0]["@id"], purl);
+    assert_eq!(
+        stmts[0]["impact_statement"].as_str().unwrap(),
+        format!("Patched via Socket patch {UUID} (vendored)"),
+        "detached attestation carries the (vendored) marker"
+    );
+}
+
+/// Fail-closed parity with the manifest-tracked flow: a tampered detached
+/// artifact is OMITTED (the embedded record's afterHashes are the oracle),
+/// and with nothing else to attest the command reports
+/// no_applicable_patches.
+#[test]
+fn tampered_detached_artifact_omitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+
+    let after_hash = compute_git_sha256_from_bytes(b"what the patch should contain\n");
+    let rel = write_vendored_dir(cwd, b"tampered detached bytes\n");
+    let record = make_record(
+        UUID,
+        "src/lib.rs",
+        &after_hash,
+        "GHSA-deta-bbbb",
+        &["CVE-2026-4"],
+    );
+    write_detached_vendor_state(cwd, purl, &rel, record);
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "tampered-only ⇒ no_applicable_patches (exit 1). stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let env: Value = serde_json::from_slice(&out.stdout).expect("vex --json emits an envelope");
+    assert_eq!(env["status"], "error", "{env}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    // Same surfacing shape as the manifest-tracked tamper test: a skipped
+    // event whose errorCode carries the vendor verification reason.
+    let events = env["events"].as_array().unwrap();
+    let skipped = events
+        .iter()
+        .find(|e| e["action"] == "skipped" && e["purl"] == purl)
+        .unwrap_or_else(|| panic!("expected a skipped event for the tampered purl: {env}"));
+    assert_eq!(
+        skipped["errorCode"], "vendor_hash_mismatch",
+        "tamper must surface as vendor_hash_mismatch: {skipped}"
+    );
+    assert!(!vex_path.exists(), "no document for an all-failed run");
 }

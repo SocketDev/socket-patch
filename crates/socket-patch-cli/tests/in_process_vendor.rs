@@ -557,9 +557,10 @@ async fn reconcile_drops_stale_entries() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     assert!(fx.tgz_path().is_file());
 
-    // The patch is dropped from the manifest (e.g. `remove` ran, which is
-    // vendoring-unaware by design). The next vendor run must revert the
-    // now-stale entry even though zero in-scope patches remain.
+    // The patch is dropped from the manifest (e.g. `remove --skip-rollback`
+    // ran, which deliberately leaves the vendoring in place, or the manifest
+    // was hand-edited). The next vendor run must revert the now-stale entry
+    // even though zero in-scope patches remain.
     std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
 
     let (code, env) = vendor_cli(fx.root(), &[]);
@@ -576,6 +577,114 @@ async fn reconcile_drops_stale_entries() {
         fx.original_lock,
         "the lock must be restored to the pre-vendor registry fragment"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8b. reconcile: detached entries are exempt
+// ─────────────────────────────────────────────────────────────────────
+
+/// A detached entry (`scan --vendor --detached`) is never manifest-tracked,
+/// so "absent from the manifest" is its normal state — reconcile must leave
+/// it alone. Only `vendor --revert` or `remove` may undo it.
+#[tokio::test]
+async fn reconcile_leaves_detached_entries_alone() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let wired_lock = fx.lock_bytes();
+
+    // Mark the entry detached (the shape `scan --vendor --detached` writes)
+    // and drop the patch from the manifest.
+    let mut state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap())
+        .expect("state.json is JSON");
+    state["entries"][PURL]["detached"] = json!(true);
+    std::fs::write(fx.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "detached-only run must exit 0: {env:#}");
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_reconciled"),
+        "a detached entry must never be reconcile-reverted: {env:#}"
+    );
+    assert!(fx.tgz_path().is_file(), "artifact must survive");
+    assert_eq!(fx.lock_bytes(), wired_lock, "wiring must survive");
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(
+        state["entries"][PURL].is_object(),
+        "ledger entry must survive: {state:#}"
+    );
+
+    // `--revert` is still the detached entry's exit path.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert must undo detached entries: {env:#}");
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(!fx.vendor_dir().exists(), "vendor tree removed");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8c. re-vendor under a new patch uuid
+// ─────────────────────────────────────────────────────────────────────
+
+/// Re-vendoring after the manifest moved to a newer patch uuid (the
+/// `scan --vendor` auto-update path) must (a) rewire the lock at the new
+/// uuid, (b) remove the old uuid's now-orphaned artifact dir, and (c) carry
+/// the pre-vendor lock fragment forward so a later `--revert` still
+/// restores the registry spelling byte-for-byte.
+#[tokio::test]
+async fn revendor_new_uuid_cleans_stale_artifact_and_still_reverts() {
+    const UUID2: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let old_uuid_dir = fx.root().join(format!(".socket/vendor/npm/{UUID}"));
+    assert!(old_uuid_dir.is_dir());
+
+    // The manifest record moves to a newer patch uuid (same files/hashes —
+    // the staged blob is keyed by content hash, not uuid).
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = json!(UUID2);
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "re-vendor must succeed: {env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    let stale = find_event(&env, "removed", Some("vendor_stale_artifact_removed"));
+    assert_eq!(stale["purl"], PURL);
+
+    assert!(
+        !old_uuid_dir.exists(),
+        "the old uuid's artifact dir is an orphan and must be removed"
+    );
+    let new_tgz = fx
+        .root()
+        .join(format!(".socket/vendor/npm/{UUID2}/left-pad-1.3.0.tgz"));
+    assert!(new_tgz.is_file(), "artifact re-vendored under the new uuid");
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(state["entries"][PURL]["uuid"], UUID2);
+    let lock_text = String::from_utf8(fx.lock_bytes()).unwrap();
+    assert!(
+        lock_text.contains(UUID2) && !lock_text.contains(UUID),
+        "lock must point at the new uuid only"
+    );
+
+    // The pre-vendor registry fragment was recorded by the FIRST vendor run;
+    // the re-vendor rewrote our own wiring (original: None from the backend)
+    // and must have carried the true original forward.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert after re-vendor must succeed: {env:#}");
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "revert must restore the pre-vendor registry fragment byte-for-byte"
+    );
+    assert!(!fx.vendor_dir().exists(), "vendor tree fully pruned");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -601,46 +710,47 @@ async fn offline_missing_source_fails() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// 10a. apply after vendor — npm (documented in-place behavior)
+// 10a. apply after vendor — npm yields with skipped/vendored
 // ─────────────────────────────────────────────────────────────────────
 
-/// DOCUMENTED BEHAVIOR, deliberately pinned: for npm, `apply` does NOT
-/// consult the vendor ledger (only the golang path calls
-/// `is_purl_vendored`, because a go re-apply would repoint the vendor-owned
-/// `replace` directive). An npm apply after vendor simply patches
-/// node_modules in place — harmless: the lockfile still consumes the
-/// vendored tarball, and the in-place edit makes the installed tree match
-/// the patched bytes. The vendored artifact and the lock wiring are
-/// untouched.
+/// Apply yields to vendor for EVERY ecosystem (CLI_CONTRACT.md): a purl
+/// recorded in `.socket/vendor/state.json` is skipped with reason
+/// `vendored` — the committed artifact + lock wiring are the patch, so an
+/// in-place re-patch of node_modules is redundant at best and fights the
+/// vendor lifecycle at worst. Installed tree, lock, and artifact must all
+/// be byte-untouched.
 #[tokio::test]
-async fn vendored_npm_purl_apply_patches_in_place() {
-    use socket_patch_cli::commands::apply::{run as apply_run, ApplyArgs};
-
+async fn vendored_npm_purl_skipped_by_apply() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     let lock_after_vendor = fx.lock_bytes();
     let tgz_after_vendor = std::fs::read(fx.tgz_path()).unwrap();
     assert_eq!(std::fs::read(fx.installed_index()).unwrap(), ORIG_INDEX);
 
-    let apply_args = ApplyArgs {
-        common: GlobalArgs {
-            cwd: fx.root().to_path_buf(),
-            json: true,
-            silent: true,
-            offline: true,
-            ..GlobalArgs::default()
-        },
-        force: false,
-        check: false,
-        vex: Default::default(),
-    };
-    assert_eq!(apply_run(apply_args).await, 0, "apply after vendor exits 0");
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "apply after vendor exits 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    let skipped = find_event(&env, "skipped", Some("vendored"));
+    assert_eq!(skipped["purl"], PURL);
+    assert_eq!(env["summary"]["applied"], 0);
 
     assert_eq!(
         std::fs::read(fx.installed_index()).unwrap(),
-        PATCHED_INDEX,
-        "npm apply patches node_modules in place even when the purl is vendored \
-         (apply consults the vendor ledger for golang only)"
+        ORIG_INDEX,
+        "apply must not re-patch a vendor-owned installed tree"
     );
     assert_eq!(
         fx.lock_bytes(),
@@ -652,6 +762,241 @@ async fn vendored_npm_purl_apply_patches_in_place() {
         tgz_after_vendor,
         "apply must not touch the vendored artifact"
     );
+}
+
+/// The wiped-tree variant: with node_modules gone entirely, a vendored
+/// purl must STILL surface as `skipped`/`vendored` (exit 0) — never as
+/// `package_not_installed` — because the committed artifact is the source
+/// of truth, not the installed tree.
+#[tokio::test]
+async fn vendored_npm_purl_skipped_even_without_installed_tree() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    std::fs::remove_dir_all(fx.root().join("node_modules")).unwrap();
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "apply",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("apply --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(
+        code, 0,
+        "vendored purl with no installed tree must exit 0: {env:#}"
+    );
+    assert_eq!(env["status"], "success");
+    let skipped = find_event(&env, "skipped", Some("vendored"));
+    assert_eq!(skipped["purl"], PURL);
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "package_not_installed"),
+        "vendored must win over package_not_installed: {env:#}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 10a′. rollback after vendor — vendored purls are excluded
+// ─────────────────────────────────────────────────────────────────────
+
+/// `rollback` excludes vendor-owned purls from in-place restoration: the
+/// patch lives in the committed artifact + lock wiring, so before-blob
+/// restoration has nothing to restore (and would only hash-mismatch).
+/// The skip is benign (exit 0) and surfaced in the JSON `vendored` array;
+/// an identifier that targets ONLY a vendored purl is still exit 0, not
+/// `not_found`.
+#[tokio::test]
+async fn vendored_purl_excluded_from_rollback() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let lock_after_vendor = fx.lock_bytes();
+
+    for extra in [&[][..], &[PURL][..]] {
+        let mut argv = vec![
+            "rollback",
+            "--json",
+            "--offline",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, stderr) = run_cli(fx.root(), &argv, &[]);
+        let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("rollback --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        });
+        assert_eq!(code, 0, "vendored-only rollback exits 0: {out:#}");
+        assert_eq!(out["status"], "success", "{out:#}");
+        assert_eq!(
+            out["vendored"],
+            json!([PURL]),
+            "vendored skip must be surfaced: {out:#}"
+        );
+        assert_eq!(out["rolledBack"], 0, "{out:#}");
+        assert_eq!(out["failed"], 0, "{out:#}");
+    }
+
+    assert_eq!(
+        std::fs::read(fx.installed_index()).unwrap(),
+        ORIG_INDEX,
+        "rollback must not touch the installed tree of a vendored purl"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        lock_after_vendor,
+        "rollback must not disturb the vendored lock wiring"
+    );
+    assert!(fx.tgz_path().is_file(), "artifact untouched");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 10a″. remove after vendor — vendoring is reverted
+// ─────────────────────────────────────────────────────────────────────
+
+/// `remove` on a vendored purl reverts the vendoring (lock restored
+/// byte-for-byte, artifact + ledger entry gone) in addition to deleting
+/// the manifest entry — one command, patch fully gone. The reverted purl
+/// rides the envelope as `removed`/`vendor_reverted` WITHOUT bumping
+/// `summary.removed` (that count stays "manifest entries deleted").
+#[tokio::test]
+async fn remove_reverts_vendoring() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("remove --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "remove of a vendored purl exits 0: {env:#}");
+    assert_eq!(env["status"], "success");
+    let reverted = find_event(&env, "removed", Some("vendor_reverted"));
+    assert_eq!(reverted["purl"], PURL);
+    assert_eq!(
+        env["summary"]["removed"], 1,
+        "summary.removed counts manifest entries only: {env:#}"
+    );
+
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "remove must restore the pre-vendor lock byte-for-byte"
+    );
+    assert!(!fx.vendor_dir().exists(), "vendor tree fully removed");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    assert!(
+        manifest["patches"].as_object().unwrap().is_empty(),
+        "manifest entry removed: {manifest:#}"
+    );
+}
+
+/// `--skip-rollback` promises "don't touch my tree": the vendor wiring and
+/// artifact stay in place (surfaced as `skipped`/`vendor_state_retained`),
+/// only the manifest entry goes. The next plain `vendor` run then
+/// reconcile-reverts the dropped entry.
+#[tokio::test]
+async fn remove_skip_rollback_retains_vendoring() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+    let wired_lock = fx.lock_bytes();
+
+    let (code, stdout, _stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--skip-rollback",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).expect("envelope");
+    assert_eq!(code, 0, "{env:#}");
+    let retained = find_event(&env, "skipped", Some("vendor_state_retained"));
+    assert_eq!(retained["purl"], PURL);
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_reverted"),
+        "--skip-rollback must not revert: {env:#}"
+    );
+
+    assert_eq!(fx.lock_bytes(), wired_lock, "wiring untouched");
+    assert!(fx.tgz_path().is_file(), "artifact untouched");
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(state["entries"][PURL].is_object(), "ledger entry retained");
+
+    // The dropped-from-manifest entry is now reconcile-reverted by the
+    // next plain vendor run (completing the two-step lifecycle).
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "removed", Some("vendor_reconciled"));
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+}
+
+/// A detached vendored patch has no manifest entry; `remove <purl>` must
+/// still find it in the ledger, revert it, and exit 0 — not `not_found`.
+/// Here the revert IS the removal, so it bumps `summary.removed`.
+#[tokio::test]
+async fn remove_detached_only_purl_reverts() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
+
+    // Detach the entry and drop the manifest record (the state a
+    // `scan --vendor --detached` run leaves behind).
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    state["entries"][PURL]["detached"] = json!(true);
+    std::fs::write(fx.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &[
+            "remove",
+            PURL,
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            fx.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("remove --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    assert_eq!(code, 0, "detached purl must be removable: {env:#}");
+    assert_eq!(env["status"], "success");
+    let reverted = find_event(&env, "removed", Some("vendor_reverted"));
+    assert_eq!(reverted["purl"], PURL);
+    assert_eq!(env["summary"]["removed"], 1, "{env:#}");
+
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+    assert!(!fx.vendor_dir().exists(), "vendor tree removed");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -736,6 +1081,8 @@ async fn vendored_golang_purl_skipped_by_apply() {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: None,
             uv: None,
             pnpm: None,

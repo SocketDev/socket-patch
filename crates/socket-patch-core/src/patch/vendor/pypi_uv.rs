@@ -1267,6 +1267,8 @@ wheels = [
             wiring,
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: Some("uv".into()),
             uv: Some(meta),
             pnpm: None,

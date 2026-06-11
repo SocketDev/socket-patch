@@ -881,6 +881,8 @@ distribution = false
             wiring,
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: Some("pdm".into()),
             uv: None,
             pnpm: None,

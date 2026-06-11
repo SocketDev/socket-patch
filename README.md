@@ -193,11 +193,13 @@ socket-patch scan [options]
 | Flag | Description |
 |------|-------------|
 | `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. |
-| `--prune` | Garbage-collect after the scan: remove manifest entries for uninstalled packages and orphan blob/diff/package-archive files. Off by default. |
+| `--prune` | Garbage-collect after the scan: remove manifest entries for uninstalled packages and orphan blob/diff/package-archive files. Off by default. [Vendored](#vendor) packages are never pruned. |
 | `--sync` | Sugar for `--apply --prune`. The canonical bot-mode flag. |
+| `--vendor` | [Vendor](#vendor) every patched dependency instead of applying in place: discover, download, and build + wire the committable `.socket/vendor/` artifacts in one pass. Re-vendors automatically when a newer patch is selected. Conflicts with `--apply`/`--sync`; combine with `--prune`. |
+| `--detached` | With `--vendor`: skip all `.socket/manifest.json` writes — the vendor ledger embeds the patch records instead. For projects that want the vendored patches *only* in the lockfile + `.socket/vendor/`. |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
 | `--all-releases` | Store patches for every release/distribution variant, not just the installed one — makes the manifest portable across environments (e.g. cross-platform CI caches) |
-| `--vex <path>` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan). (env: `SOCKET_VEX`) |
+| `--vex <path>` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan--vendor). (env: `SOCKET_VEX`) |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 > Use `--dry-run` to preview what `--apply`/`--prune`/`--sync` would do without mutating disk.
@@ -230,7 +232,20 @@ socket-patch scan -g
 
 # Scan + apply + emit an OpenVEX attestation in one pass
 socket-patch scan --json --sync --yes --vex socket.vex.json
+
+# Vendor every patched dependency (committable; see the vendor command)
+socket-patch scan --json --vendor --yes
+
+# Same, but keep the manifest out of it entirely
+socket-patch scan --json --vendor --detached --yes
+
+# Preview what --vendor would do (would_vendor / would_revendor / already_vendored)
+socket-patch scan --json --vendor --yes --dry-run
 ```
+
+> Already-vendored packages are **skipped by plain `--apply`/`--sync`** (the committed artifact
+> is the patch); a newer available patch still appears in the JSON `updates[]` array — re-run
+> `scan --vendor` to take it.
 
 ### `apply`
 
@@ -245,7 +260,7 @@ socket-patch apply [options]
 | Flag | Description |
 |------|-------------|
 | `-f, --force` | Skip pre-application hash verification (apply even if package version differs) |
-| `--vex <path>` | On a successful apply, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan). (env: `SOCKET_VEX`) |
+| `--vex <path>` | On a successful apply, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan--vendor). (env: `SOCKET_VEX`) |
 | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | Passthrough to the embedded VEX builder; mirror the standalone [`vex`](#vex) knobs. Inert unless `--vex` is set. |
 
 **Examples:**
@@ -269,9 +284,75 @@ socket-patch apply --json
 socket-patch apply --vex socket.vex.json
 ```
 
+> Packages managed by [`vendor`](#vendor) are skipped (`skipped`/`vendored` in JSON): the
+> committed vendored artifact is the patch, so there is nothing for `apply` to do — even when
+> the installed tree (e.g. `node_modules/`) is absent.
+
+### `vendor`
+
+`apply`'s **committable** sibling. Instead of patching installed packages in place
+(machine-local state), `vendor` ejects each patched package into
+`.socket/vendor/<ecosystem>/<patch-uuid>/…` and rewires your lockfile so the project consumes
+the vendored copy. Commit `.socket/vendor/` plus the lockfile edits and **every fresh checkout
+builds with the patched dependency** — no `socket-patch` binary, no Socket API access, no
+install hook required on the consuming machine.
+
+Supported ecosystems: **npm** (package-lock / yarn classic / pnpm / bun), **PyPI**
+(uv / poetry / pdm / pipenv / requirements.txt), **RubyGems**, **Cargo**, **Go**, and
+**Composer**. Vendoring is per-patch: only dependencies with a Socket patch are vendored.
+
+**Usage:**
+```bash
+socket-patch vendor [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `-f, --force` | Skip pre-vendor hash verification (vendor even if the installed files differ from the patch's `beforeHash`) |
+| `--revert` | Undo vendoring: restore the recorded original lockfile fragments byte-for-byte and remove the `.socket/vendor/` artifacts. Works without a manifest |
+| `--vex <path>` | On a successful vendor, also write an OpenVEX 0.2.0 document to this path (env: `SOCKET_VEX`) |
+| `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | Passthrough to the embedded VEX builder. Inert unless `--vex` is set. |
+
+**How it interacts with the rest of the CLI** — once a package is vendored, `vendor` owns it:
+
+- [`apply`](#apply) and [`rollback`](#rollback) skip vendored packages (they never touch a
+  vendor-owned tree or lockfile entry).
+- [`remove`](#remove) **reverts the vendoring** as part of removing the patch — lockfile
+  restored, artifact deleted — so one command fully undoes it.
+- [`scan`](#scan) skips downloading/applying patches for vendored packages and never prunes
+  their manifest entries; newer patches show up in `updates[]` as the signal to re-run
+  `scan --vendor`.
+- [`vex`](#vex) attests vendored patches by verifying the **committed artifact** (marked
+  `(vendored)` in the impact statement) — no `setup` install hook needed, because the lockfile
+  wiring *is* the persistence mechanism.
+- Re-running `vendor` is idempotent; patches dropped from the manifest are auto-reverted on the
+  next run.
+
+**Examples:**
+```bash
+# Vendor every patched dependency listed in the manifest
+socket-patch vendor
+
+# Preview without writing anything
+socket-patch vendor --dry-run
+
+# Then make it stick: commit the artifacts and the rewired lockfile
+git add .socket/vendor package-lock.json && git commit -m "vendor Socket patches"
+
+# Undo everything (restores the original lockfile byte-for-byte)
+socket-patch vendor --revert
+
+# JSON output for scripting
+socket-patch vendor --json
+```
+
+> Prefer one command? [`scan --vendor`](#scan) discovers, downloads, *and* vendors in a single
+> pass.
+
 ### `rollback`
 
-Rollback patches to restore original files. If no identifier is given, all patches are rolled back.
+Rollback patches to restore original files. If no identifier is given, all patches are rolled back. Packages managed by [`vendor`](#vendor) are excluded — their patch lives in the committed artifact, not the installed tree — and are listed in the JSON output's `vendored` array (use `remove` or `vendor --revert` to undo them).
 
 **Usage:**
 ```bash
@@ -339,7 +420,7 @@ Package: pkg:npm/lodash@4.17.20
 
 ### `remove`
 
-Remove a patch from the manifest (rolls back files first by default).
+Remove a patch from the manifest (rolls back files first by default). If the package is [vendored](#vendor), `remove` also **reverts the vendoring** — the lockfile is restored byte-for-byte and the `.socket/vendor/` artifact is deleted — so the patch is fully gone in one command. Detached-vendored patches (from `scan --vendor --detached`) are removable by PURL or UUID too, even though they have no manifest entry.
 
 **Usage:**
 ```bash
@@ -352,7 +433,7 @@ socket-patch remove <identifier> [options]
 **Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `--skip-rollback` | Only update manifest, do not restore original files |
+| `--skip-rollback` | Only update manifest, do not restore original files (for vendored packages this also leaves the vendor wiring + artifact in place) |
 
 **Examples:**
 ```bash
@@ -500,7 +581,7 @@ socket-patch vex --no-verify --output socket.vex.json
 
 **How it works**
 
-1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each patched file's hash on disk so the attestation only covers patches that are actually applied.
+1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each patched file's hash on disk so the attestation only covers patches that are actually applied. [Vendored](#vendor) patches are verified against the **committed artifact** instead of the installed tree (their impact statement carries a `(vendored)` marker), and need no `setup` install hook to be attested — the lockfile wiring is the persistence mechanism. Detached-vendored patches (`scan --vendor --detached`) attest from the vendor ledger's embedded records, so `vex` works even with no manifest file at all.
 2. Auto-detects the top-level **product** identifier (override with `--product`), probing in order:
    - `.git/config` `[remote "origin"]` → `pkg:github/<owner>/<repo>` (similar for GitLab/Bitbucket; raw URL otherwise)
    - `package.json` → `pkg:npm/<name>@<version>`
@@ -531,11 +612,11 @@ grype <image-or-dir> --vex socket.vex.json
 trivy image --vex socket.vex.json <image>
 ```
 
-Run `socket-patch get` or `socket-patch scan --sync` first — `vex` errors with `no_patches` against an empty manifest.
+Run `socket-patch get` or `socket-patch scan --sync` first — `vex` errors with `no_patches` when there is nothing to attest (an empty manifest and no detached-vendored patches).
 
-### Inline VEX on `apply` / `scan`
+### Inline VEX on `apply` / `scan` / `vendor`
 
-You don't need a separate `vex` invocation: pass `--vex <path>` to `apply` or `scan` and the same OpenVEX document is generated as a side-effect of a successful run.
+You don't need a separate `vex` invocation: pass `--vex <path>` to `apply`, `scan`, or `vendor` and the same OpenVEX document is generated as a side-effect of a successful run.
 
 ```bash
 # Patch and attest in one step
@@ -543,6 +624,9 @@ socket-patch apply --vex socket.vex.json
 
 # Discover, apply, prune, and attest — the full bot-mode pass
 socket-patch scan --json --sync --yes --vex socket.vex.json
+
+# Vendor and attest — works manifest-less with --detached too
+socket-patch scan --json --vendor --yes --vex socket.vex.json
 ```
 
 The `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, and `--vex-compact` flags mirror the standalone command's `--product` / `--no-verify` / `--doc-id` / `--compact` knobs.

@@ -265,6 +265,8 @@ pub async fn vendor_bun(
         wiring,
         lock: None,
         took_over_go_patches: false,
+        detached: false,
+        record: None,
         flavor: Some("bun".to_string()),
         uv: None,
         pnpm: None,

@@ -1,0 +1,15 @@
+# Windows main threads get a 1 MiB stack reserve by default (Unix mains get
+# 8 MiB). The CLI's async command futures poll deeply nested state machines
+# — scan → download → in-process apply, or scan --vendor → the vendor engine
+# — and in debug builds (no stack-slot reuse) the summed poll frames exceed
+# 1 MiB, aborting with "thread 'main' has overflowed its stack" on Windows
+# only. Raise the PE stack reserve to the Unix default; spawned threads are
+# unaffected (Rust std and tokio request their own sizes explicitly).
+#
+# Reserve is virtual address space, not committed memory — pages are
+# committed on touch, so this costs nothing at runtime.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.'cfg(all(windows, target_env = "gnu"))']
+rustflags = ["-C", "link-args=-Wl,--stack,8388608"]
