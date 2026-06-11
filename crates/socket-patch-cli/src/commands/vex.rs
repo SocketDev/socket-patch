@@ -182,9 +182,26 @@ pub async fn run(args: VexArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
-    let manifest = match read_manifest(&manifest_path).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
+    // `None` ⇒ no manifest file. That is no longer terminal by itself:
+    // a `scan --vendor --detached` project carries its patch records in
+    // the vendor ledger instead, and those must still be attestable.
+    let manifest_file = match read_manifest(&manifest_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            emit_envelope_error_and_track(&args, "manifest_unreadable", &e.to_string()).await;
+            return 2;
+        }
+    };
+    let had_manifest_file = manifest_file.is_some();
+    let manifest = augment_with_detached(
+        &args.common,
+        manifest_file.unwrap_or_else(PatchManifest::new),
+    )
+    .await;
+
+    if manifest.patches.is_empty() {
+        if !had_manifest_file {
+            // No manifest AND nothing detached — the original contract.
             emit_envelope_error_and_track(
                 &args,
                 "manifest_not_found",
@@ -193,13 +210,6 @@ pub async fn run(args: VexArgs) -> i32 {
             .await;
             return 2;
         }
-        Err(e) => {
-            emit_envelope_error_and_track(&args, "manifest_unreadable", &e.to_string()).await;
-            return 2;
-        }
-    };
-
-    if manifest.patches.is_empty() {
         emit_envelope_error_and_track(
             &args,
             "no_patches",
@@ -437,19 +447,24 @@ pub(crate) async fn generate_vex_from_manifest_path(
     params: &VexBuildParams,
     manifest_path: &Path,
 ) -> Result<VexWriteSummary, VexGenError> {
-    let manifest = match read_manifest(manifest_path).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
+    let manifest_file = match read_manifest(manifest_path).await {
+        Ok(m) => m,
+        Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
+    };
+    let had_manifest_file = manifest_file.is_some();
+    // Detached vendored patches (`scan --vendor --detached`) have no
+    // manifest record; the ledger's embedded copies must still attest.
+    let manifest =
+        augment_with_detached(common, manifest_file.unwrap_or_else(PatchManifest::new)).await;
+    if manifest.patches.is_empty() {
+        if !had_manifest_file {
             return Err(fail(
                 common,
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
             )
-            .await)
+            .await);
         }
-        Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
-    };
-    if manifest.patches.is_empty() {
         return Err(fail(
             common,
             "no_patches",
@@ -458,6 +473,27 @@ pub(crate) async fn generate_vex_from_manifest_path(
         .await);
     }
     generate_vex(common, params, &manifest).await
+}
+
+/// Fold detached vendor entries' embedded records into a manifest view so
+/// verification and document building see them — `scan --vendor
+/// --detached` patches have no manifest record by design. Keyed by the
+/// ledger key; an existing manifest entry wins a collision (that purl is
+/// manifest-owned and verifies against the manifest's record). An
+/// unreadable ledger leaves the manifest unchanged here — verification
+/// still fails closed per-entry downstream, and `load_vendor_context`
+/// already warns about the unreadable state.
+async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest) -> PatchManifest {
+    if let Ok(state) = socket_patch_core::patch::vendor::load_state(&common.cwd).await {
+        for (key, entry) in state.entries {
+            if !entry.detached {
+                continue;
+            }
+            let Some(record) = entry.record else { continue };
+            manifest.patches.entry(key).or_insert(record);
+        }
+    }
+    manifest
 }
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].

@@ -877,6 +877,8 @@ content-hash = "09f98227642bff952b3df8f8fcc74f1538c091a3ac3ed0031500188347ecb3ca
             wiring,
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: Some("poetry".into()),
             uv: None,
             pnpm: None,

@@ -130,6 +130,8 @@ fn defaults_match_contract() {
         "--prune default is false (GC is opt-in in v3.0)"
     );
     assert!(!args.sync, "--sync default is false");
+    assert!(!args.vendor, "--vendor default is false");
+    assert!(!args.detached, "--detached default is false");
     assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
         !args.all_releases,

@@ -233,6 +233,8 @@ fn scan_args(cwd: &Path, api_url: String, all_releases: bool) -> ScanArgs {
         apply: true,
         prune: false,
         sync: false,
+        vendor: false,
+        detached: false,
         all_releases,
         vex: Default::default(),
     }

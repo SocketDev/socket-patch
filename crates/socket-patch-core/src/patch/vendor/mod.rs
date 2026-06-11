@@ -29,9 +29,13 @@
 //!
 //! `.socket/vendor/state.json` (committed) records the verbatim original
 //! lockfile fragments every wire replaced; `vendor --revert` restores them
-//! and removes the artifacts. `rollback`/`remove` stay vendoring-unaware by
-//! design. The path-level UUID makes "is this Socket-vendored, by which
-//! patch" recoverable from the lockfile string alone ([`path`]).
+//! and removes the artifacts. The rest of the CLI yields ownership of
+//! ledger-recorded purls (`apply`/`rollback` skip them, `scan --prune`
+//! exempts them) and `remove` reverts vendoring as part of removing a
+//! patch. Detached entries (`scan --vendor --detached`) carry an embedded
+//! patch record instead of a manifest entry. The path-level UUID makes "is
+//! this Socket-vendored, by which patch" recoverable from the lockfile
+//! string alone ([`path`]).
 //!
 //! [`ReplaceOwner::Vendor`]: crate::patch::go_mod_edit::ReplaceOwner
 
@@ -154,5 +158,32 @@ pub async fn is_purl_vendored(project_root: &std::path::Path, purl: &str) -> boo
             state.entries.contains_key(purl) || state.entries.values().any(|e| e.base_purl == purl)
         }
         Err(_) => false,
+    }
+}
+
+/// Every purl spelling under which the ledger's entries are addressable:
+/// each entry's map key (the manifest purl, possibly qualified), its
+/// resolved base purl, and the qualifier-stripped key. The one-load,
+/// many-lookups companion to [`is_purl_vendored`] for callers that match
+/// whole purl sets against vendor ownership (apply / rollback / scan
+/// prune). An unreadable ledger degrades to the empty set — the same
+/// fail-open contract as `is_purl_vendored`; mutating callers that need
+/// fail-closed semantics use [`load_state`] directly.
+pub async fn vendored_purl_keys(
+    project_root: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    match load_state(project_root).await {
+        Ok(state) => state
+            .entries
+            .iter()
+            .flat_map(|(key, entry)| {
+                [
+                    key.clone(),
+                    entry.base_purl.clone(),
+                    crate::utils::purl::strip_purl_qualifiers(key).to_string(),
+                ]
+            })
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
     }
 }

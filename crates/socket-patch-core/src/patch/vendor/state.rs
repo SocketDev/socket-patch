@@ -232,6 +232,19 @@ pub struct VendorEntry {
     /// pypi/pipenv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipenv: Option<PipenvMeta>,
+    /// True when vendored without a manifest record (`scan --vendor
+    /// --detached`). The manifest reconcile must not revert such an entry —
+    /// it is never "dropped from the manifest" because it was never in it;
+    /// [`VendorEntry::record`] is the verification source instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+    /// The embedded patch record for detached entries (afterHashes,
+    /// vulnerabilities, description, tier) — present iff `detached`. Trust
+    /// class: the same committed-file trust as `.socket/manifest.json`; the
+    /// artifact is still re-verified against these afterHashes and
+    /// `checked_artifact_path`'s uuid cross-checks before any disk access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<crate::manifest::schema::PatchRecord>,
 }
 
 /// The ledger.
@@ -374,6 +387,8 @@ mod tests {
             }],
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: None,
             uv: None,
             pnpm: None,
@@ -406,13 +421,89 @@ mod tests {
         let text = String::from_utf8(bytes1).unwrap();
         assert!(!text.contains("tookOverGoPatches"));
         assert!(!text.contains("\"flavor\""));
-        for absent in ["\"uv\"", "\"pnpm\"", "\"poetry\"", "\"pdm\"", "\"pipenv\""] {
+        for absent in [
+            "\"uv\"",
+            "\"pnpm\"",
+            "\"poetry\"",
+            "\"pdm\"",
+            "\"pipenv\"",
+            "\"detached\"",
+            "\"record\"",
+        ] {
             assert!(
                 !text.contains(absent),
                 "{absent} must not serialize when None"
             );
         }
         assert!(text.contains("\"basePurl\""), "camelCase keys: {text}");
+    }
+
+    #[tokio::test]
+    async fn detached_entry_round_trips_with_embedded_record() {
+        use crate::manifest::schema::{PatchFileInfo, PatchRecord, VulnerabilityInfo};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut entry = sample_entry();
+        entry.detached = true;
+        entry.record = Some(PatchRecord {
+            uuid: UUID.into(),
+            exported_at: "2026-06-10T00:00:00Z".into(),
+            files: HashMap::from([(
+                "lodash.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "aa".repeat(32),
+                    after_hash: "bb".repeat(32),
+                },
+            )]),
+            vulnerabilities: HashMap::from([(
+                "GHSA-xxxx-yyyy-zzzz".to_string(),
+                VulnerabilityInfo {
+                    cves: vec!["CVE-2026-0001".into()],
+                    summary: "prototype pollution".into(),
+                    severity: "high".into(),
+                    description: "details".into(),
+                },
+            )]),
+            description: "fixes prototype pollution".into(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        });
+        let mut state = VendorState::new();
+        state
+            .entries
+            .insert("pkg:npm/lodash@4.17.21".into(), entry.clone());
+
+        save_state(root, &state).await.unwrap();
+        let loaded = load_state(root).await.unwrap();
+        assert_eq!(loaded, state, "detached entry + record survive round trip");
+
+        let text = tokio::fs::read_to_string(root.join(VENDOR_STATE_REL))
+            .await
+            .unwrap();
+        assert!(text.contains("\"detached\": true"), "wire form: {text}");
+        // The embedded record keeps the manifest's camelCase wire shape.
+        for key in [
+            "\"record\"",
+            "\"beforeHash\"",
+            "\"afterHash\"",
+            "\"exportedAt\"",
+        ] {
+            assert!(text.contains(key), "{key} missing from wire form: {text}");
+        }
+
+        // A pre-detached ledger (no `detached`/`record` keys) deserializes to
+        // the defaults — the additive-fields forward-compat contract.
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        let legacy_entry = legacy["entries"]["pkg:npm/lodash@4.17.21"]
+            .as_object_mut()
+            .unwrap();
+        legacy_entry.remove("detached");
+        legacy_entry.remove("record");
+        let back: VendorState = serde_json::from_value(legacy).unwrap();
+        let back_entry = &back.entries["pkg:npm/lodash@4.17.21"];
+        assert!(!back_entry.detached);
+        assert!(back_entry.record.is_none());
     }
 
     #[tokio::test]

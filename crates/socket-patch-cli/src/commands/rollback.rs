@@ -338,7 +338,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let lock_was_broken = acquired.broke_lock;
 
     match rollback_patches_inner(&args, &manifest_path).await {
-        Ok((success, results)) => {
+        Ok((success, results, vendored)) => {
             let rolled_back_count = results
                 .iter()
                 .filter(|r| r.success && !r.files_rolled_back.is_empty())
@@ -374,6 +374,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "failed": failed_count,
                         "dryRun": args.common.dry_run,
                         "warnings": warnings,
+                        // Vendor-owned purls excluded from in-place rollback
+                        // (benign — `remove` or `vendor --revert` undo them).
+                        "vendored": vendored,
                         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
                     }))
                     .unwrap()
@@ -457,6 +460,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
             }
 
+            if !args.common.json && !args.common.silent && !vendored.is_empty() {
+                println!(
+                    "\n{} vendored package(s) skipped (managed by socket-patch vendor; \
+                     use `remove` or `vendor --revert`):",
+                    vendored.len()
+                );
+                for purl in &vendored {
+                    println!("  {purl}");
+                }
+            }
+
             if success {
                 track_patch_rolled_back(
                     rolled_back_count,
@@ -491,6 +505,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                         "alreadyOriginal": 0,
                         "failed": 0,
                         "dryRun": args.common.dry_run,
+                        "vendored": [],
                         "results": [],
                     }))
                     .unwrap()
@@ -506,7 +521,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 async fn rollback_patches_inner(
     args: &RollbackArgs,
     manifest_path: &Path,
-) -> Result<(bool, Vec<RollbackResult>), String> {
+) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
     let manifest = read_manifest(manifest_path)
         .await
         .map_err(|e| e.to_string())?
@@ -530,7 +545,29 @@ async fn rollback_patches_inner(
         if !args.common.silent && !args.common.json {
             println!("No patches found in manifest");
         }
-        return Ok((true, Vec::new()));
+        return Ok((true, Vec::new(), Vec::new()));
+    }
+
+    // Vendor-owned purls are excluded from in-place rollback: their patch
+    // lives in the committed `.socket/vendor/` artifact + lock wiring, not
+    // in the installed tree, so before-blob restoration is meaningless
+    // there (and would only hash-mismatch). `remove` reverts vendoring;
+    // `vendor --revert` undoes it wholesale. Matching mirrors apply's
+    // ledger-key / base-purl / qualifier-stripped triple; unreadable state
+    // degrades to "nothing vendored".
+    let vendored_keys =
+        socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let is_vendored =
+        |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
+    let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
+        .into_iter()
+        .partition(|p| is_vendored(&p.purl));
+    let mut vendored_skipped: Vec<String> = vendored_targets.into_iter().map(|p| p.purl).collect();
+    vendored_skipped.sort();
+    if patches_to_rollback.is_empty() {
+        // Everything targeted is vendor-owned: a benign skip, not an error
+        // (and not `not_found` — the identifier did match).
+        return Ok((true, Vec::new(), vendored_skipped));
     }
 
     // Create filtered manifest (a synthetic rollback-target subset, never
@@ -558,7 +595,7 @@ async fn rollback_patches_inner(
                 );
                 eprintln!("Run \"socket-patch repair\" to download missing blobs.");
             }
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), vendored_skipped));
         }
 
         if !args.common.silent && !args.common.json {
@@ -585,7 +622,7 @@ async fn rollback_patches_inner(
                     still_missing.len()
                 );
             }
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), vendored_skipped));
         }
     }
 
@@ -611,7 +648,7 @@ async fn rollback_patches_inner(
         if !args.common.silent && !args.common.json {
             println!("No packages found that match patches to rollback");
         }
-        return Ok((true, Vec::new()));
+        return Ok((true, Vec::new(), vendored_skipped));
     }
 
     // Group discovered packages by base PURL. A release-variant
@@ -707,10 +744,11 @@ async fn rollback_patches_inner(
         }
     }
 
-    Ok((!has_errors, results))
+    Ok((!has_errors, results, vendored_skipped))
 }
 
-// Export for use by remove command
+// Export for use by remove command. The third tuple element lists
+// vendor-owned purls that were excluded from in-place rollback (benign).
 #[allow(clippy::too_many_arguments)]
 pub async fn rollback_patches(
     cwd: &Path,
@@ -722,7 +760,7 @@ pub async fn rollback_patches(
     global: bool,
     global_prefix: Option<PathBuf>,
     ecosystems: Option<Vec<String>>,
-) -> Result<(bool, Vec<RollbackResult>), String> {
+) -> Result<(bool, Vec<RollbackResult>, Vec<String>), String> {
     let args = RollbackArgs {
         identifier: identifier.map(String::from),
         common: crate::args::GlobalArgs {

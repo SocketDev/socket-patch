@@ -522,3 +522,173 @@ async fn scan_apply_with_no_patches_emits_empty_apply_object() {
         "batch discovery must be called"
     );
 }
+
+#[tokio::test]
+async fn scan_apply_skips_vendored_purl_without_downloading() {
+    // A purl recorded in the vendor ledger is skipped BEFORE download —
+    // even when a NEWER patch uuid is available. The manifest must stay at
+    // the vendored uuid (moving past it would break VEX verification with
+    // `vendor_uuid_mismatch`), the patch view must never be fetched, and
+    // the newer uuid still surfaces in `updates[]` as the operator's
+    // signal to run `scan --vendor` / `vendor`.
+    const NEW_UUID: &str = "22222222-2222-4222-8222-222222222222";
+    let before = b"before\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(b"after\n");
+    let purl = "pkg:npm/sync-target@1.0.0";
+    let encoded = "pkg%3Anpm%2Fsync-target%401.0.0";
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": NEW_UUID,
+                    "purl": purl,
+                    "tier": "free",
+                    "cveIds": [],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "newer patch"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{encoded}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": NEW_UUID,
+                "purl": purl,
+                "publishedAt": "2024-06-01T00:00:00Z",
+                "description": "Newer patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    // The full view endpoint exists but MUST NOT be hit for a vendored purl.
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{NEW_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root(tmp.path());
+    write_npm_package(tmp.path(), "sync-target", "1.0.0", before);
+
+    // Manifest already records the patch at the VENDORED uuid…
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(socket.join("vendor")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "patches": { purl: {
+                "uuid": UUID,
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": before_hash, "afterHash": after_hash } },
+                "vulnerabilities": {},
+                "description": "vendored patch", "license": "MIT", "tier": "free"
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // …and the vendor ledger owns it.
+    std::fs::write(
+        socket.join("vendor/state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "entries": { purl: {
+                "ecosystem": "npm",
+                "basePurl": purl,
+                "uuid": UUID,
+                "artifact": {
+                    "path": format!(".socket/vendor/npm/{UUID}/sync-target-1.0.0.tgz"),
+                },
+                "wiring": []
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--apply",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+
+    let apply = v["apply"].as_object().expect("apply sub-object");
+    assert_eq!(apply["found"], 1, "apply={apply:?}");
+    assert_eq!(apply["skipped"], 1, "apply={apply:?}");
+    assert_eq!(
+        apply["downloaded"], 0,
+        "vendored purl must not download; apply={apply:?}"
+    );
+    assert_eq!(apply["applied"], 0, "apply={apply:?}");
+    assert_eq!(apply["failed"], 0, "apply={apply:?}");
+    let patches = apply["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "apply={apply:?}");
+    assert_eq!(patches[0]["purl"], purl);
+    assert_eq!(patches[0]["action"], "skipped", "record={:?}", patches[0]);
+    assert_eq!(
+        patches[0]["errorCode"], "vendored",
+        "record={:?}",
+        patches[0]
+    );
+
+    // The newer uuid still surfaces as an available update.
+    let updates = v["updates"].as_array().expect("updates array");
+    assert_eq!(updates.len(), 1, "envelope={v}");
+    assert_eq!(updates[0]["purl"], purl);
+    assert_eq!(updates[0]["oldUuid"], UUID);
+    assert_eq!(updates[0]["newUuid"], NEW_UUID);
+
+    // The manifest must STILL record the vendored uuid.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["patches"][purl]["uuid"], UUID,
+        "manifest must not move past the vendored uuid; manifest={manifest}"
+    );
+    // And the installed tree is untouched (no in-place apply happened).
+    let on_disk = std::fs::read(tmp.path().join("node_modules/sync-target/index.js")).unwrap();
+    assert_eq!(on_disk, before, "installed tree must stay untouched");
+
+    // Load-bearing: the full patch view was NEVER fetched.
+    let reqs = mock.received_requests().await.expect("recorded requests");
+    assert!(
+        !reqs.iter().any(|r| r.url.path().contains("/patches/view/")),
+        "no patch view fetch for a vendored purl"
+    );
+}

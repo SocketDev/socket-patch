@@ -227,6 +227,8 @@ mod tests {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: None,
             uv: None,
             pnpm: None,

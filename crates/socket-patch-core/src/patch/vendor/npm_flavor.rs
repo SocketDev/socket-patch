@@ -743,6 +743,8 @@ mod tests {
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
+            detached: false,
+            record: None,
             flavor: Some("future-pm".into()),
             uv: None,
             pnpm: None,
