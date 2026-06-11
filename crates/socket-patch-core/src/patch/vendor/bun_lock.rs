@@ -136,6 +136,7 @@ pub async fn vendor_bun(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {

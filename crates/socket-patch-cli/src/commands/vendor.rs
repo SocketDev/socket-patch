@@ -49,8 +49,12 @@ pub struct VendorArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Skip pre-vendor hash verification (vendor even if the installed
-    /// package's files differ from the patch's beforeHash).
+    /// Tolerate MISSING patch-target files in the staged copy (they are
+    /// skipped instead of failing the vendor) and bypass the variant
+    /// probe for multi-release ecosystems. A plain beforeHash mismatch
+    /// no longer needs this: vendor staging always overwrites mismatched
+    /// content with the verified patched bytes (surfaced as a
+    /// `vendor_content_mismatch_overwritten` warning).
     #[arg(
         short = 'f',
         long,
@@ -586,16 +590,38 @@ pub(crate) async fn vendor_records(
                     }
                     let mut event = result_to_event(&result, common.dry_run);
                     // The shared translator's in-sync classification reads
-                    // `already_patched`; under `vendor` the contract tag is
-                    // `already_vendored` (artifact + wiring already in sync).
+                    // `already_patched`. Two distinct cases land there:
+                    //
+                    // * `entry` is None — the TRUE in-sync rerun (the backend
+                    //   synthesized AlreadyPatched and recorded nothing);
+                    //   under `vendor` the contract tag is `already_vendored`.
+                    // * `entry` is Some — the FIRST vendor of a package
+                    //   already patched in place by `apply`: every file
+                    //   verified AlreadyPatched, but THIS run packed the
+                    //   artifact and rewired the lock. That is an Applied
+                    //   (`summary.applied` must count it), not a skip.
                     if event.action == PatchAction::Skipped
                         && event.error_code.as_deref() == Some("already_patched")
                     {
-                        event = PatchEvent::new(PatchAction::Skipped, candidate.clone())
-                            .with_reason(
-                                "already_vendored",
-                                "artifact and lockfile wiring already in sync",
-                            );
+                        if entry.is_none() {
+                            event = PatchEvent::new(PatchAction::Skipped, candidate.clone())
+                                .with_reason(
+                                    "already_vendored",
+                                    "artifact and lockfile wiring already in sync",
+                                );
+                        } else {
+                            let files = result
+                                .files_verified
+                                .iter()
+                                .map(|f| crate::json_envelope::PatchEventFile {
+                                    path: f.file.clone(),
+                                    verified: true,
+                                    applied_via: None,
+                                })
+                                .collect();
+                            event = PatchEvent::new(PatchAction::Applied, candidate.clone())
+                                .with_files(files);
+                        }
                     }
                     env.record(event);
                     for w in &warnings {

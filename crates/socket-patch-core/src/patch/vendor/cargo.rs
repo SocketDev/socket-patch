@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
+    normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
 };
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::file_hash::compute_file_git_sha256;
@@ -269,22 +269,27 @@ pub async fn vendor_cargo_crate(
     }
 
     if dry_run {
-        // Verify (read-only) against the pristine source — apply_package_patch
-        // never writes when dry_run — for an accurate "would patch" report,
-        // without creating the copy or editing config/lock.
-        let mut result = apply_package_patch(
+        // Verify (read-only) against the pristine source — the apply
+        // pipeline never writes when dry_run — for an accurate "would
+        // patch" report (including the auto-force overwrite warnings the
+        // real run would emit), without creating the copy or editing
+        // config/lock.
+        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        let mut result = super::force_apply_staged(
             purl,
             pristine_src,
-            &record.files,
+            record,
             sources,
-            Some(&record.uuid),
             true,
             force,
+            name,
+            version,
+            &mut dry_warnings,
         )
         .await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None;
-        return done(result, None, Vec::new());
+        return done(result, None, dry_warnings);
     }
 
     // Hot path: already in sync → touch nothing (entry stays with the caller's
@@ -333,15 +338,19 @@ pub async fn vendor_cargo_crate(
         );
     }
 
-    // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result = apply_package_patch(
+    // Delegate to the hardened pipeline (vendor auto-force policy — see
+    // `force_apply_staged`), pointed at the copy.
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut result = super::force_apply_staged(
         purl,
         &copy_dir,
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         false,
         force,
+        name,
+        version,
+        &mut warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
@@ -350,7 +359,7 @@ pub async fn vendor_cargo_crate(
         // Don't leave a half-built copy (or an empty uuid husk) that
         // verify/sweep would misjudge.
         let _ = remove_tree(&uuid_dir).await;
-        return done(result, None, Vec::new());
+        return done(result, None, warnings);
     }
 
     // A path-dep copy must never carry a checksum sidecar. The fresh copy
@@ -370,10 +379,9 @@ pub async fn vendor_cargo_crate(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to update .cargo/config.toml: {e}"));
-        return done(result, None, Vec::new());
+        return done(result, None, warnings);
     }
 
-    let mut warnings = Vec::new();
     let prior_path = prior_entry.as_ref().and_then(|i| i.path.clone());
     if prior_path.as_deref().is_some_and(is_legacy_redirect_path) {
         warnings.push(VendorWarning::new(

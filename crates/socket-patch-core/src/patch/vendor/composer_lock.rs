@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
+    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
     VerifyResult, VerifyStatus,
 };
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
@@ -193,21 +193,24 @@ pub async fn vendor_composer(
 
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut result = apply_package_patch(
+        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        let mut result = super::force_apply_staged(
             purl,
             installed_dir,
-            &record.files,
+            record,
             sources,
-            Some(&record.uuid),
             true,
             force,
+            &pkg,
+            version,
+            &mut dry_warnings,
         )
         .await;
         result.package_path = copy_dir.display().to_string();
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings: dry_warnings,
         };
     }
 
@@ -225,14 +228,17 @@ pub async fn vendor_composer(
             warnings: Vec::new(),
         };
     }
-    let mut result = apply_package_patch(
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut result = super::force_apply_staged(
         purl,
         &copy_dir,
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         false,
         force,
+        &pkg,
+        version,
+        &mut warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
@@ -242,7 +248,7 @@ pub async fn vendor_composer(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
 
@@ -256,7 +262,7 @@ pub async fn vendor_composer(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     };
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
@@ -272,12 +278,11 @@ pub async fn vendor_composer(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
 
     // ── marker + ledger entry ────────────────────────────────────────────
-    let mut warnings = Vec::new();
     let base_purl = build_composer_purl(&vendor, &name, version);
     let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
     vulnerabilities.sort();

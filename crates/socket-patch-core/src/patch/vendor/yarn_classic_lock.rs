@@ -135,6 +135,7 @@ pub async fn vendor_yarn_classic(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {

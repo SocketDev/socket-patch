@@ -163,6 +163,7 @@ pub async fn vendor_pnpm(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {

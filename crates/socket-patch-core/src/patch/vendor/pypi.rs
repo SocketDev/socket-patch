@@ -405,6 +405,7 @@ pub async fn vendor_pypi(
         &dest,
         dry_run,
         force,
+        &mut warnings,
     )
     .await;
     let (result, artifact) = match built {

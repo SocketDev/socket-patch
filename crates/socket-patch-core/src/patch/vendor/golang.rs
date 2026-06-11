@@ -101,6 +101,29 @@ pub async fn vendor_go_module(
         .is_some_and(|e| e.owner == Some(ReplaceOwner::GoPatches));
     let prior_path = prior.as_ref().and_then(|e| e.path.clone());
 
+    // Vendor auto-force policy (the engine's copy is staged from the
+    // pristine source, never the user's tree — see `force_apply_staged`):
+    // missing patch targets still fail closed unless the caller's own
+    // `--force` asked for the skip tolerance, then the engine apply runs
+    // forced so a beforeHash mismatch (already-applied module, or a patch
+    // built against different bytes) overwrites with the verified patched
+    // content. The engine is shared with the in-place `apply` redirect
+    // path, whose strict semantics stay unchanged.
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    if !force {
+        let missing = super::missing_existing_patch_files(pristine_src, &record.files).await;
+        if let Some(first) = missing.first() {
+            return VendorOutcome::Done {
+                result: super::failed_apply_result(
+                    purl,
+                    format!("Cannot apply patch: {first} - File not found"),
+                ),
+                entry: None,
+                warnings,
+            };
+        }
+    }
+
     // The engine does the heavy lifting: fresh copy → hardened apply pipeline
     // → `replace` upsert (which refuses a user-authored same-version pin).
     let result = apply_go_redirect(
@@ -114,15 +137,18 @@ pub async fn vendor_go_module(
         sources,
         Some(&record.uuid),
         dry_run,
-        force,
+        /*force=*/ true,
     )
     .await;
+    if result.success {
+        warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
+    }
 
     if dry_run {
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
     if !result.success {
@@ -134,7 +160,7 @@ pub async fn vendor_go_module(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
     // A patch with no files is a no-op success: the engine wrote no copy and
@@ -143,11 +169,9 @@ pub async fn vendor_go_module(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
-
-    let mut warnings = Vec::new();
 
     if takeover {
         // The `replace` line was already atomically repointed by the upsert;

@@ -12,20 +12,19 @@
 //! the project byte-untouched (a dry run stops after verification and
 //! creates nothing on disk).
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{apply_package_patch, normalize_file_path, ApplyResult, PatchSources};
+use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
-use super::VendorOutcome;
+use super::{VendorOutcome, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
 /// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
@@ -130,6 +129,7 @@ pub(super) async fn stage_patch_pack(
     sources: &PatchSources<'_>,
     dry_run: bool,
     force: bool,
+    warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
     let coords = guard_coordinates(purl, record)?;
 
@@ -179,18 +179,21 @@ pub(super) async fn stage_patch_pack(
         }
     }
 
-    // Delegate to the hardened apply pipeline, pointed at the stage (which
+    // Delegate to the hardened apply pipeline (with the vendor auto-force
+    // policy — see `force_apply_staged`), pointed at the stage (which
     // plays the role of the installed package dir — manifest npm keys carry
     // the `package/` prefix and `apply` strips it via `normalize_file_path`,
     // exactly as it does for an in-place npm apply).
-    let result = apply_package_patch(
+    let result = super::force_apply_staged(
         purl,
         &stage,
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         dry_run,
         force,
+        &coords.name,
+        &coords.version,
+        warnings,
     )
     .await;
     // A failed patch never packs (wiring is last — the caller returns with
@@ -331,16 +334,7 @@ pub(super) fn refused(code: &'static str, detail: String) -> VendorOutcome {
 /// results.
 pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
     VendorOutcome::Done {
-        result: ApplyResult {
-            package_key: purl.to_string(),
-            package_path: String::new(),
-            success: false,
-            files_verified: Vec::new(),
-            files_patched: Vec::new(),
-            applied_via: HashMap::new(),
-            error: Some(error),
-            sidecar: None,
-        },
+        result: super::failed_apply_result(purl, error),
         entry: None,
         warnings: Vec::new(),
     }
@@ -350,6 +344,7 @@ pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
 mod tests {
     use super::*;
     use crate::manifest::schema::PatchFileInfo;
+    use std::collections::HashMap;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 

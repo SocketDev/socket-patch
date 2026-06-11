@@ -254,6 +254,7 @@ pub async fn vendor_yarn_berry(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {

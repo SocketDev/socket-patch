@@ -225,6 +225,56 @@ pub(crate) fn detect_prunable(
         .collect()
 }
 
+/// Vendor-mode pre-prompt check: uuids of selected patches whose installed
+/// files match NEITHER beforeHash nor afterHash — the patch was built
+/// against different bytes than the installed artifact. Vendoring still
+/// succeeds for these (the vendor stage force-applies the verified patched
+/// content; see `force_apply_staged`), but the user should learn it BEFORE
+/// the confirm prompt, not from a post-hoc warning event.
+///
+/// Best-effort and read-only: a detail-fetch failure or an unresolvable
+/// installed path just skips the annotation — it never blocks the flow and
+/// writes nothing (unlike `download_patch_records`, which stages blobs).
+async fn preverify_vendor_baselines(
+    api_client: &socket_patch_core::api::client::ApiClient,
+    org_slug: Option<&str>,
+    selected: &[PatchSearchResult],
+    crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+) -> HashSet<String> {
+    use socket_patch_core::manifest::schema::PatchFileInfo;
+    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
+    use socket_patch_core::utils::purl::purl_eq;
+
+    let mut mismatched: HashSet<String> = HashSet::new();
+    for patch in selected {
+        // API purls come percent-encoded, crawler purls literal — purl_eq
+        // bridges the two spellings.
+        let base = strip_purl_qualifiers(&patch.purl);
+        let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
+            continue;
+        };
+        let Ok(Some(detail)) = api_client.fetch_patch(org_slug, &patch.uuid).await else {
+            continue;
+        };
+        for (file, info) in &detail.files {
+            let info = PatchFileInfo {
+                before_hash: info.before_hash.clone().unwrap_or_default(),
+                after_hash: info.after_hash.clone().unwrap_or_default(),
+            };
+            if info.before_hash.is_empty() {
+                continue; // a new file has no baseline to compare
+            }
+            if verify_file_patch(&pkg.path, file, &info).await.status
+                == VerifyStatus::HashMismatch
+            {
+                mismatched.insert(patch.uuid.clone());
+                break;
+            }
+        }
+    }
+    mismatched
+}
+
 /// Cross-reference an existing manifest against discovery results to find
 /// PURLs whose newest available patch UUID differs from the locally-recorded
 /// one. Used by both the discovery JSON path and the table-print path.
@@ -1822,6 +1872,21 @@ pub async fn run(args: ScanArgs) -> i32 {
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
+    // Vendor mode: pre-verify baselines so a content mismatch surfaces
+    // BEFORE the confirm prompt (vendoring still proceeds for these —
+    // the stage force-applies the verified patched content).
+    let mismatched_baselines: HashSet<String> = if args.vendor && !args.common.silent {
+        preverify_vendor_baselines(
+            &api_client,
+            effective_org_slug,
+            &selected,
+            &filtered_crawled,
+        )
+        .await
+    } else {
+        HashSet::new()
+    };
+
     // Display detailed summary of selected patches before confirming
     // (presentational only — skipped wholesale under --silent).
     if !args.common.silent {
@@ -1864,6 +1929,11 @@ pub async fn run(args: ScanArgs) -> i32 {
                 patch.tier.to_uppercase(),
                 sev_colored,
             );
+            if mismatched_baselines.contains(&patch.uuid) {
+                println!(
+                    "    (installed content differs from patch baseline — will vendor patched content)"
+                );
+            }
             if !vuln_ids.is_empty() {
                 println!("    Fixes: {}", vuln_ids.join(", "));
             }

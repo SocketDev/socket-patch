@@ -75,7 +75,14 @@ pub mod yarn_classic_lock;
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
 pub use state::{load_state, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
 
-use crate::patch::apply::ApplyResult;
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
+use crate::patch::apply::{
+    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
+    VerifyStatus,
+};
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -92,6 +99,141 @@ impl VendorWarning {
             detail: detail.into(),
         }
     }
+}
+
+/// One warning per staged file whose pre-patch content matched NEITHER
+/// `beforeHash` nor `afterHash` and was overwritten with the verified
+/// patched content (vendor staging always force-applies — the stage is a
+/// private copy, and every apply write path is hash-gated to exactly
+/// `afterHash`).
+///
+/// Detection rides the verify signature `apply_package_patch` leaves
+/// behind: a force-promoted file keeps `status: Ready` WITH
+/// `expected_hash: Some(..)` and a differing `current_hash`, whereas a
+/// cleanly-verified file carries `expected_hash: None` (see
+/// `verify_file_patch`).
+pub(crate) fn mismatch_overwrite_warnings(
+    result: &ApplyResult,
+    name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let mut warnings: Vec<VendorWarning> = result
+        .files_verified
+        .iter()
+        .filter(|v| {
+            v.status == VerifyStatus::Ready
+                && v.expected_hash.is_some()
+                && v.current_hash != v.expected_hash
+        })
+        .map(|v| {
+            VendorWarning::new(
+                "vendor_content_mismatch_overwritten",
+                format!(
+                    "installed {name}@{version} does not match this patch's expected original \
+                     ({}); vendored the patched content anyway",
+                    v.file
+                ),
+            )
+        })
+        .collect();
+    // HashMap-driven verify order is randomized; keep warning order stable.
+    warnings.sort_by(|a, b| a.detail.cmp(&b.detail));
+    warnings
+}
+
+/// Patch-target files (non-empty `beforeHash`) absent from the staged
+/// copy. Vendor staging force-applies (see [`force_apply_staged`]), and
+/// force silently SKIPS missing files — which would pack an artifact
+/// without the fix. This pre-check restores the strict apply's
+/// fail-closed behavior for the non-`--force` path. Unsafe keys are
+/// skipped here: the apply pipeline itself rejects them fail-closed.
+pub(crate) async fn missing_existing_patch_files(
+    staged_dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for (file_name, info) in files {
+        if info.before_hash.is_empty() {
+            continue; // a new file is expected to not exist yet
+        }
+        let normalized = normalize_file_path(file_name);
+        if !is_safe_relative_subpath(normalized) {
+            continue;
+        }
+        if tokio::fs::metadata(staged_dir.join(normalized)).await.is_err() {
+            missing.push(file_name.clone());
+        }
+    }
+    missing.sort();
+    missing
+}
+
+/// A failed synthesized [`ApplyResult`] in the shape the strict apply
+/// pipeline would have produced (success=false, `error` set, no files).
+pub(crate) fn failed_apply_result(purl: &str, error: String) -> ApplyResult {
+    ApplyResult {
+        package_key: purl.to_string(),
+        package_path: String::new(),
+        success: false,
+        files_verified: Vec::new(),
+        files_patched: Vec::new(),
+        applied_via: HashMap::new(),
+        error: Some(error),
+        sidecar: None,
+    }
+}
+
+/// Run the hardened apply pipeline against a vendor stage/copy with the
+/// vendor auto-force policy:
+///
+/// * Missing patch-target files fail closed unless the caller's own
+///   `--force` asked for that skip tolerance.
+/// * The apply itself ALWAYS forces: the stage is a private copy (never
+///   the user's tree), and every apply write path is hash-gated to
+///   exactly `afterHash` (the archive and blob paths verify content
+///   BEFORE writing; the diff path self-disables on a base mismatch) —
+///   forcing can only produce the verified patched content or fail
+///   closed. This is what lets vendor succeed on a package already
+///   patched in place by `apply`, or on a patch whose `beforeHash` was
+///   built against different bytes than the installed artifact.
+/// * Every force-overwritten file (content matched NEITHER hash) emits a
+///   `vendor_content_mismatch_overwritten` warning — including on dry
+///   runs, so previews predict the real outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn force_apply_staged(
+    purl: &str,
+    staged_dir: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    force: bool,
+    name: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> ApplyResult {
+    if !force {
+        let missing = missing_existing_patch_files(staged_dir, &record.files).await;
+        if let Some(first) = missing.first() {
+            return failed_apply_result(
+                purl,
+                format!("Cannot apply patch: {first} - File not found"),
+            );
+        }
+    }
+    let result = apply_package_patch(
+        purl,
+        staged_dir,
+        &record.files,
+        sources,
+        Some(&record.uuid),
+        dry_run,
+        /*force=*/ true,
+    )
+    .await;
+    if result.success {
+        warnings.extend(mismatch_overwrite_warnings(&result, name, version));
+    }
+    result
 }
 
 /// The result of one backend `vendor_*` call.
@@ -185,5 +327,65 @@ pub async fn vendored_purl_keys(
             })
             .collect(),
         Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::patch::apply::VerifyResult;
+
+    fn verify(status: VerifyStatus, expected: Option<&str>, current: Option<&str>) -> VerifyResult {
+        VerifyResult {
+            file: "package/index.js".to_string(),
+            status,
+            message: None,
+            current_hash: current.map(str::to_string),
+            expected_hash: expected.map(str::to_string),
+            target_hash: None,
+        }
+    }
+
+    fn result_with(files_verified: Vec<VerifyResult>) -> ApplyResult {
+        ApplyResult {
+            package_key: "pkg:npm/x@1.0.0".to_string(),
+            package_path: String::new(),
+            success: true,
+            files_verified,
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        }
+    }
+
+    /// Only the force-promoted signature (`Ready` + `expected_hash: Some` +
+    /// differing `current_hash`) flags an overwrite; clean verifies and
+    /// AlreadyPatched files never do.
+    #[test]
+    fn mismatch_overwrite_warnings_detects_promoted_ready() {
+        // Force-promoted mismatch: flagged.
+        let r = result_with(vec![verify(VerifyStatus::Ready, Some("aa"), Some("bb"))]);
+        let w = mismatch_overwrite_warnings(&r, "left-pad", "1.3.0");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, "vendor_content_mismatch_overwritten");
+        assert!(w[0].detail.contains("left-pad@1.3.0"));
+        assert!(w[0].detail.contains("package/index.js"));
+
+        // Clean Ready (verify matched beforeHash): expected_hash is None.
+        let r = result_with(vec![verify(VerifyStatus::Ready, None, Some("aa"))]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+
+        // AlreadyPatched (afterHash content): not a mismatch.
+        let r = result_with(vec![verify(
+            VerifyStatus::AlreadyPatched,
+            None,
+            Some("after"),
+        )]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+
+        // NotFound (force-skipped): not an overwrite.
+        let r = result_with(vec![verify(VerifyStatus::NotFound, None, None)]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
     }
 }
