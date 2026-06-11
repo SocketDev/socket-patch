@@ -120,16 +120,21 @@ impl DenoCrawler {
             // manifest PURL and are joined onto the cache root below. A real
             // JSR coordinate is a single path segment, so reject any that
             // could traverse out of the cache (`..`/`.`, a separator, NUL).
+            // The parser percent-decodes components, so these guards see the
+            // decoded form — `%2e%2e` cannot smuggle a traversal past them.
             // Unlike the cargo/npm crawlers there is no content check to catch
             // a bogus path, and jsr patches in place — so fail closed here.
-            if !(is_safe_jsr_component(scope)
-                && is_safe_jsr_component(name)
-                && is_safe_jsr_component(version))
+            if !(is_safe_jsr_component(&scope)
+                && is_safe_jsr_component(&name)
+                && is_safe_jsr_component(&version))
             {
                 continue;
             }
             // Cache layout: <root>/<scope>/<name>/<version>/
-            let pkg_dir = jsr_cache_path.join(scope).join(name).join(version);
+            let pkg_dir = jsr_cache_path
+                .join(&*scope)
+                .join(&*name)
+                .join(&*version);
             if !is_dir(&pkg_dir).await {
                 continue;
             }

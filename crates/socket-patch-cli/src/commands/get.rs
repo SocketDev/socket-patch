@@ -13,7 +13,7 @@ use socket_patch_core::manifest::schema::{
 };
 use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
-use socket_patch_core::utils::purl::{is_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
@@ -1030,7 +1030,7 @@ pub async fn download_and_apply_patches(
                 let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
                 if let PatchAction::Skipped = action {
                     if !params.json && !params.silent {
-                        eprintln!("  [skip] {} (already in manifest)", patch.purl);
+                        eprintln!("  [skip] {} (already in manifest)", normalize_purl(&patch.purl));
                     }
                     downloaded_patches.push(serde_json::json!({
                         "purl": patch.purl,

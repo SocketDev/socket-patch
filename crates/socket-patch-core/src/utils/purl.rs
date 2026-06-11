@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
 /// leaving the canonical `pkg:type/namespace/name@version` base.
 ///
@@ -16,6 +18,94 @@ pub fn strip_purl_qualifiers(purl: &str) -> &str {
         Some(idx) => &purl[..idx],
         None => purl,
     }
+}
+
+/// Strictly percent-decode ONE purl path component (a scope, namespace
+/// segment, name, or version) AFTER it has been split out of the purl.
+///
+/// The patches API serves purls in canonical percent-encoded form
+/// (`pkg:npm/%40scope/name@1.0.0`), while crawlers build purls from the
+/// literal on-disk names (`pkg:npm/@scope/name@1.0.0`). Parsers must
+/// decode the API form to find installed packages.
+///
+/// SECURITY: this must only ever be called on a component AFTER the purl
+/// has been split on `/` and the version `@` — so an encoded separator
+/// (`%2f`) cannot create new path segments at parse time; it surfaces as
+/// a literal `/` *inside* one component — and BEFORE the path-safety
+/// guards run, so `%2e%2e`, `%2f`, `%5c`, `%00` are rejected post-decode
+/// by the same `is_safe_*` gates that reject their literal forms.
+/// Guarding the encoded form instead would be a traversal bypass.
+///
+/// Decoding is all-or-nothing: an invalid escape (`%G1`, trailing `%4`)
+/// or a non-UTF8 decode returns the input unchanged (fail-safe — the
+/// undecoded form contains no separators, and `%` is not a legal
+/// character in any real package name). Zero-alloc when no `%`.
+pub fn percent_decode_purl_component(component: &str) -> Cow<'_, str> {
+    if !component.contains('%') {
+        return Cow::Borrowed(component);
+    }
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = component.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex_val),
+                bytes.get(i + 2).copied().and_then(hex_val),
+            ) else {
+                // Invalid escape: leave the whole component verbatim.
+                return Cow::Borrowed(component);
+            };
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    match String::from_utf8(out) {
+        Ok(s) => Cow::Owned(s),
+        // Decoded bytes are not UTF-8: leave the component verbatim.
+        Err(_) => Cow::Borrowed(component),
+    }
+}
+
+/// Canonical string form for purl-to-purl comparison and display:
+/// percent-decode each `/`-separated component of the
+/// `pkg:type/...@version` base; qualifiers/subpath are appended verbatim.
+///
+/// Used ONLY for string equality (`purl_eq`) and human output — never to
+/// build filesystem paths (a `%2f` decoding into a name can at worst make
+/// two distinct purls compare equal, not change a write location).
+pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
+    if !purl.contains('%') {
+        return Cow::Borrowed(purl);
+    }
+    let split = purl.find(['?', '#']).unwrap_or(purl.len());
+    let (base, suffix) = purl.split_at(split);
+    let mut out = String::with_capacity(purl.len());
+    for (i, seg) in base.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&percent_decode_purl_component(seg));
+    }
+    out.push_str(suffix);
+    Cow::Owned(out)
+}
+
+/// Purl equality up to percent-encoding of the base components
+/// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`).
+pub fn purl_eq(a: &str, b: &str) -> bool {
+    normalize_purl(a) == normalize_purl(b)
 }
 
 /// Parse a PyPI PURL to extract name and version.
@@ -155,7 +245,7 @@ pub fn build_composer_purl(namespace: &str, name: &str, version: &str) -> String
 /// have a `<scope>/<name>` namespace structure. The leading `@` on
 /// the scope is preserved (matching npm's `@scope/name` convention).
 #[cfg(feature = "deno")]
-pub fn parse_jsr_purl(purl: &str) -> Option<((&str, &str), &str)> {
+pub fn parse_jsr_purl(purl: &str) -> Option<((Cow<'_, str>, Cow<'_, str>), Cow<'_, str>)> {
     let base = strip_purl_qualifiers(purl);
     let rest = base.strip_prefix("pkg:jsr/")?;
     let at_idx = rest.rfind('@')?;
@@ -167,8 +257,12 @@ pub fn parse_jsr_purl(purl: &str) -> Option<((&str, &str), &str)> {
     }
 
     let slash_idx = name_part.find('/')?;
-    let scope = &name_part[..slash_idx];
-    let name = &name_part[slash_idx + 1..];
+    // Decode AFTER splitting on `/`/`@` and BEFORE the shape checks below
+    // (and the caller's `is_safe_jsr_component` gate) — see
+    // `percent_decode_purl_component`. The API serves `%40scope`.
+    let scope = percent_decode_purl_component(&name_part[..slash_idx]);
+    let name = percent_decode_purl_component(&name_part[slash_idx + 1..]);
+    let version = percent_decode_purl_component(version);
 
     // Scope must be `@<non-empty>`. The bare `@` (length 1) is
     // invalid — there's no actual scope after the marker.
@@ -248,15 +342,22 @@ pub fn is_purl(s: &str) -> bool {
 ///
 /// Non-PyPI keys never carry a `?`, so for them this reduces to plain
 /// equality.
+///
+/// Comparison is encoding-tolerant (`purl_eq`): manifest keys come from
+/// the API in percent-encoded form (`pkg:npm/%40scope/x@1`) while users
+/// type the literal form — both spellings must match either way around.
 pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     if identifier.contains('?') {
-        manifest_key == identifier
+        purl_eq(manifest_key, identifier)
     } else {
         // Base identifier: compare bases. Strip both sides so a subpath
         // (`#...`) carried by either the key or the identifier doesn't
         // defeat the match — `strip_purl_qualifiers(identifier)` is a no-op
         // for a plain base PURL, so existing behaviour is unchanged.
-        strip_purl_qualifiers(manifest_key) == strip_purl_qualifiers(identifier)
+        purl_eq(
+            strip_purl_qualifiers(manifest_key),
+            strip_purl_qualifiers(identifier),
+        )
     }
 }
 
@@ -505,24 +606,30 @@ mod tests {
     }
 
     #[cfg(feature = "deno")]
+    fn jsr_parts(purl: &str) -> Option<(String, String, String)> {
+        parse_jsr_purl(purl)
+            .map(|((s, n), v)| (s.into_owned(), n.into_owned(), v.into_owned()))
+    }
+
+    #[cfg(feature = "deno")]
     #[test]
     fn test_parse_jsr_purl() {
         assert_eq!(
-            parse_jsr_purl("pkg:jsr/@std/path@0.220.0"),
-            Some((("@std", "path"), "0.220.0"))
+            jsr_parts("pkg:jsr/@std/path@0.220.0"),
+            Some(("@std".into(), "path".into(), "0.220.0".into()))
         );
         assert_eq!(
-            parse_jsr_purl("pkg:jsr/@luca/flag@1.0.0"),
-            Some((("@luca", "flag"), "1.0.0"))
+            jsr_parts("pkg:jsr/@luca/flag@1.0.0"),
+            Some(("@luca".into(), "flag".into(), "1.0.0".into()))
         );
         // Scope must start with `@`.
-        assert_eq!(parse_jsr_purl("pkg:jsr/std/path@0.220.0"), None);
+        assert_eq!(jsr_parts("pkg:jsr/std/path@0.220.0"), None);
         // Empty pieces.
-        assert_eq!(parse_jsr_purl("pkg:jsr/@/path@0.220.0"), None);
-        assert_eq!(parse_jsr_purl("pkg:jsr/@std/@0.220.0"), None);
-        assert_eq!(parse_jsr_purl("pkg:jsr/@std/path@"), None);
+        assert_eq!(jsr_parts("pkg:jsr/@/path@0.220.0"), None);
+        assert_eq!(jsr_parts("pkg:jsr/@std/@0.220.0"), None);
+        assert_eq!(jsr_parts("pkg:jsr/@std/path@"), None);
         // Wrong scheme.
-        assert_eq!(parse_jsr_purl("pkg:npm/@std/path@0.220.0"), None);
+        assert_eq!(jsr_parts("pkg:npm/@std/path@0.220.0"), None);
     }
 
     #[cfg(feature = "deno")]
@@ -661,8 +768,8 @@ mod tests {
         // Scope `@` + version `@` + qualifier `@` all coexist; only the
         // version `@` should be honored.
         assert_eq!(
-            parse_jsr_purl("pkg:jsr/@std/path@0.220.0?download_url=x@y"),
-            Some((("@std", "path"), "0.220.0"))
+            jsr_parts("pkg:jsr/@std/path@0.220.0?download_url=x@y"),
+            Some(("@std".into(), "path".into(), "0.220.0".into()))
         );
     }
 
@@ -746,6 +853,88 @@ mod tests {
             "pkg:golang/github.com/foo/bar@v2.0.0#cmd/tool",
             "pkg:golang/github.com/foo/bar@v1.0.0"
         ));
+    }
+
+    // --- Percent-decoding: API purls carry %-encoded components --------------
+
+    #[test]
+    fn test_percent_decode_purl_component() {
+        // The canonical case: an encoded npm scope marker.
+        assert_eq!(
+            percent_decode_purl_component("%40modelcontextprotocol"),
+            "@modelcontextprotocol"
+        );
+        // Traversal sequences decode — the post-decode safety guards are
+        // what reject them, not this helper.
+        assert_eq!(percent_decode_purl_component("%2e%2e"), "..");
+        assert_eq!(percent_decode_purl_component("a%2fb"), "a/b");
+        assert_eq!(percent_decode_purl_component("%00"), "\0");
+        // Invalid escapes leave the WHOLE component verbatim (all-or-nothing).
+        assert_eq!(percent_decode_purl_component("%G1abc"), "%G1abc");
+        assert_eq!(percent_decode_purl_component("abc%4"), "abc%4");
+        assert_eq!(percent_decode_purl_component("abc%"), "abc%");
+        // Non-UTF8 decode (lone continuation byte) leaves it verbatim.
+        assert_eq!(percent_decode_purl_component("%FF"), "%FF");
+        // No '%' is zero-alloc (borrowed).
+        assert!(matches!(
+            percent_decode_purl_component("plain-name"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_normalize_purl_and_purl_eq() {
+        assert_eq!(
+            normalize_purl("pkg:npm/%40modelcontextprotocol/sdk@1.12.0"),
+            "pkg:npm/@modelcontextprotocol/sdk@1.12.0"
+        );
+        assert!(purl_eq(
+            "pkg:npm/%40scope/x@1.0.0",
+            "pkg:npm/@scope/x@1.0.0"
+        ));
+        assert!(purl_eq(
+            "pkg:npm/@scope/x@1.0.0",
+            "pkg:npm/%40scope/x@1.0.0"
+        ));
+        assert!(!purl_eq("pkg:npm/%40scope/x@1.0.0", "pkg:npm/@scope/x@2.0.0"));
+        // Qualifiers/subpath are preserved verbatim (not decoded).
+        assert_eq!(
+            normalize_purl("pkg:npm/%40s/x@1?artifact_id=a%2Fb"),
+            "pkg:npm/@s/x@1?artifact_id=a%2Fb"
+        );
+        // Unencoded input is unchanged (and borrowed).
+        assert!(matches!(
+            normalize_purl("pkg:npm/lodash@4.17.21"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_purl_matches_identifier_decodes_encoded_key() {
+        // Encoded manifest key vs literal identifier — and vice versa.
+        assert!(purl_matches_identifier(
+            "pkg:npm/%40scope/x@1.0.0",
+            "pkg:npm/@scope/x@1.0.0"
+        ));
+        assert!(purl_matches_identifier(
+            "pkg:npm/@scope/x@1.0.0",
+            "pkg:npm/%40scope/x@1.0.0"
+        ));
+        assert!(!purl_matches_identifier(
+            "pkg:npm/%40scope/x@1.0.0",
+            "pkg:npm/@scope/y@1.0.0"
+        ));
+    }
+
+    #[cfg(feature = "deno")]
+    #[test]
+    fn test_parse_jsr_purl_percent_encoded_scope() {
+        let ((scope, name), version) = parse_jsr_purl("pkg:jsr/%40std/path@0.220.0").unwrap();
+        assert_eq!(scope, "@std");
+        assert_eq!(name, "path");
+        assert_eq!(version, "0.220.0");
+        // The encoded bare `@` is still rejected post-decode.
+        assert_eq!(jsr_parts("pkg:jsr/%40/path@0.220.0"), None);
     }
 
     // --- Regression: name must not absorb the version separator -------------

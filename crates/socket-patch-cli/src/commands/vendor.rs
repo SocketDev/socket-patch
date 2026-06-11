@@ -27,7 +27,7 @@ use socket_patch_core::patch::vendor::{
     self, ecosystem_dir_for_purl, load_state, save_state, RevertOutcome, VendorEntry,
     VendorOutcome, VendorWarning,
 };
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -566,7 +566,7 @@ pub(crate) async fn vendor_records(
                         );
                     }
                     if !common.silent && !common.json {
-                        eprintln!("Cannot vendor {candidate}: {detail}");
+                        eprintln!("Cannot vendor {}: {detail}", normalize_purl(candidate));
                     }
                 }
                 Some(VendorOutcome::Done {
@@ -579,7 +579,7 @@ pub(crate) async fn vendor_records(
                         if !common.silent && !common.json {
                             eprintln!(
                                 "Failed to vendor {}: {}",
-                                candidate,
+                                normalize_purl(candidate),
                                 result.error.as_deref().unwrap_or("unknown error")
                             );
                         }
@@ -702,7 +702,7 @@ pub(crate) async fn vendor_records(
                     .with_reason("package_not_installed", "no installed package found"),
             );
             if !common.silent && !common.json {
-                eprintln!("Cannot vendor {purl}: package not installed");
+                eprintln!("Cannot vendor {}: package not installed", normalize_purl(purl));
             }
         }
     }

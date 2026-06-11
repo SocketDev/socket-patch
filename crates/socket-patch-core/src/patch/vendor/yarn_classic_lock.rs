@@ -68,7 +68,7 @@ pub async fn vendor_yarn_classic(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel;
     let base_purl = coords.base_purl;
 

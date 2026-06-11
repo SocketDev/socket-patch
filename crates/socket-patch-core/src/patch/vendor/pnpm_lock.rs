@@ -93,7 +93,7 @@ pub async fn vendor_pnpm(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
     // pnpm spells the override target `file:<root-relative path>` with NO
     // `./` (spike P1 fixtures, verbatim).

@@ -10,7 +10,7 @@ use socket_patch_core::patch::apply_lock;
 use socket_patch_core::utils::cleanup_blobs::{
     cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
 };
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{
     track_patch_scan_failed, track_patch_scanned, track_patch_vendor_failed, track_patch_vendored,
 };
@@ -197,23 +197,29 @@ async fn preview_apply_gc(
 /// copy is its NORMAL state, not "no longer installed". Without this, a
 /// wiped node_modules would prune the manifest entry — and the next
 /// `vendor` run would then reconcile-revert the vendoring itself.
+///
+/// Both sides are compared in percent-DECODED form (`normalize_purl`):
+/// manifest keys come from the API encoded (`pkg:npm/%40scope/x@1`) while
+/// crawler purls carry the literal `@scope` — comparing the raw strings
+/// would make every encoded scoped entry look prunable and `--prune`/
+/// `--sync` would GC the very patch it just downloaded.
 pub(crate) fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> Vec<String> {
-    let scanned_bases: HashSet<&str> = scanned_purls
+    let scanned_bases: HashSet<String> = scanned_purls
         .iter()
-        .map(|p| strip_purl_qualifiers(p))
+        .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
         .collect();
     manifest
         .patches
         .keys()
         .filter(|p| {
-            let base = strip_purl_qualifiers(p);
-            !scanned_bases.contains(base)
+            let base = normalize_purl(strip_purl_qualifiers(p));
+            !scanned_bases.contains(base.as_ref())
                 && !vendored.contains(p.as_str())
-                && !vendored.contains(base)
+                && !vendored.contains(strip_purl_qualifiers(p))
         })
         .cloned()
         .collect()
@@ -1804,7 +1810,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         for p in &vendored_selected {
             println!(
                 "  [skip] {} (vendored — run scan --vendor to update)",
-                p.purl
+                normalize_purl(&p.purl)
             );
         }
     }
@@ -1851,7 +1857,10 @@ pub async fn run(args: ScanArgs) -> i32 {
 
             println!(
                 "  {} [{}] {}",
-                patch.purl,
+                // Human display only: show the decoded form of an
+                // API-encoded purl (`%40scope` → `@scope`). JSON output
+                // keeps the verbatim key.
+                normalize_purl(&patch.purl),
                 patch.tier.to_uppercase(),
                 sev_colored,
             );
@@ -2242,6 +2251,23 @@ mod tests {
             vec!["pkg:npm/bar@2.0".to_string()],
             "vendored foo exempt, non-vendored bar prunable"
         );
+    }
+
+    #[test]
+    fn detect_prunable_encoded_manifest_key_not_pruned() {
+        // The API serves scoped purls percent-encoded and they land in the
+        // manifest verbatim; the crawler reports the literal `@scope` form.
+        // Comparing raw strings would make every encoded scoped entry look
+        // prunable — `scan --prune` would GC the patch it just downloaded.
+        let m = manifest_with(&[("pkg:npm/%40scope/x@1.0.0", "uuid-a")]);
+        let s = scanned(&["pkg:npm/@scope/x@1.0.0"]);
+        assert!(
+            detect_prunable(&m, &s, &no_vendored()).is_empty(),
+            "encoded manifest key must match the decoded scanned purl"
+        );
+        // A genuinely-gone encoded entry still prunes.
+        let out = detect_prunable(&m, &scanned(&[]), &no_vendored());
+        assert_eq!(out, vec!["pkg:npm/%40scope/x@1.0.0".to_string()]);
     }
 
     #[test]

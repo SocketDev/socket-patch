@@ -91,7 +91,7 @@ pub async fn vendor_npm(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel;
     let base_purl = coords.base_purl;
 
@@ -1633,11 +1633,11 @@ mod tests {
     fn purl_and_name_helpers() {
         assert_eq!(
             parse_npm_purl("pkg:npm/left-pad@1.3.0"),
-            Some(("left-pad", "1.3.0"))
+            Some(("left-pad".into(), "1.3.0".into()))
         );
         assert_eq!(
             parse_npm_purl("pkg:npm/@scope/pkg@1.0.0?foo=bar"),
-            Some(("@scope/pkg", "1.0.0"))
+            Some(("@scope/pkg".into(), "1.0.0".into()))
         );
         assert_eq!(parse_npm_purl("pkg:npm/@scope/pkg"), None, "no version");
         assert_eq!(

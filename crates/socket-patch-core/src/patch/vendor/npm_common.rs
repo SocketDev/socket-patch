@@ -21,21 +21,25 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{apply_package_patch, normalize_file_path, ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety;
-use crate::utils::purl::strip_purl_qualifiers;
+use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::VendorOutcome;
 
 /// Validated npm vendoring coordinates (the output of
-/// [`guard_coordinates`]). `name`/`version` borrow from the purl.
+/// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
+/// components (the API serves scoped purls as `%40scope/name`; the
+/// lockfile and node_modules carry the literal `@scope/name`).
 #[derive(Debug)]
-pub(super) struct NpmCoords<'a> {
-    pub name: &'a str,
-    pub version: &'a str,
+pub(super) struct NpmCoords {
+    pub name: String,
+    pub version: String,
     /// `.socket/vendor/npm/<uuid>` (validated, forward slashes).
     pub uuid_dir_rel: String,
-    /// Qualifier-free base PURL.
+    /// Qualifier-free base PURL — VERBATIM (still encoded when the API
+    /// encoded it): the ledger's `base_purl`/entry keys must keep
+    /// matching the manifest keys, which store the purl as-served.
     pub base_purl: String,
 }
 
@@ -49,17 +53,17 @@ pub(super) struct NpmCoords<'a> {
 /// vendor, arbitrary delete on revert) — reject fail-closed before any disk
 /// access. `Err` carries a ready [`VendorOutcome::Refused`] to bubble
 /// verbatim.
-pub(super) fn guard_coordinates<'a>(
-    purl: &'a str,
+pub(super) fn guard_coordinates(
+    purl: &str,
     record: &PatchRecord,
-) -> Result<NpmCoords<'a>, Box<VendorOutcome>> {
+) -> Result<NpmCoords, Box<VendorOutcome>> {
     let Some((name, version)) = parse_npm_purl(purl) else {
         return Err(Box::new(refused(
             "unsafe_coordinates",
             format!("cannot parse an npm name@version out of `{purl}`"),
         )));
     };
-    if !is_safe_npm_name(name) || !path_safety::is_safe_single_segment(version) {
+    if !is_safe_npm_name(&name) || !path_safety::is_safe_single_segment(&version) {
         return Err(Box::new(refused(
             "unsafe_coordinates",
             format!(
@@ -199,7 +203,7 @@ pub(super) async fn stage_patch_pack(
     let rel_tgz = format!(
         "{}/{}",
         coords.uuid_dir_rel,
-        tgz_rel_leaf(coords.name, coords.version)
+        tgz_rel_leaf(&coords.name, &coords.version)
     );
     let dest = project_root.join(&rel_tgz);
     if let Some(parent) = dest.parent() {
@@ -236,8 +240,8 @@ pub(super) async fn stage_patch_pack(
 
     Ok((
         Some(NpmStagedPack {
-            name: coords.name.to_string(),
-            version: coords.version.to_string(),
+            name: coords.name,
+            version: coords.version,
             rel_tgz,
             packed,
             staged_pkg_json,
@@ -251,14 +255,27 @@ pub(super) async fn stage_patch_pack(
 /// `pkg:npm/[@scope/]name@version` → `(name, version)`; scoped names keep
 /// the `@scope/` prefix. The LAST `@` separates the version (a leading
 /// scope-`@` is at index 0 and never the last `@` of a versioned purl).
-pub(super) fn parse_npm_purl(purl: &str) -> Option<(&str, &str)> {
+///
+/// Components are percent-DECODED (the API serves `pkg:npm/%40scope/...`).
+/// SECURITY: each segment decodes independently AFTER the `/`/`@` splits,
+/// and the post-decode `is_safe_npm_name`/`is_safe_single_segment` gates in
+/// [`guard_coordinates`] reject any separator or traversal sequence a
+/// decode may have surfaced (`%2e%2e`, `%2f`, ...) — decoding never runs
+/// after the guards.
+pub(super) fn parse_npm_purl(purl: &str) -> Option<(String, String)> {
     let base = strip_purl_qualifiers(purl);
     let rest = base.strip_prefix("pkg:npm/")?;
     let at = rest.rfind('@').filter(|&i| i > 0)?;
-    let (name, version) = (&rest[..at], &rest[at + 1..]);
-    if name.is_empty() || version.is_empty() {
+    let (name_raw, version_raw) = (&rest[..at], &rest[at + 1..]);
+    if name_raw.is_empty() || version_raw.is_empty() {
         return None;
     }
+    let name = name_raw
+        .split('/')
+        .map(percent_decode_purl_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let version = percent_decode_purl_component(version_raw).into_owned();
     Some((name, version))
 }
 
@@ -369,15 +386,39 @@ mod tests {
     fn guard_coordinates_accepts_plain_and_scoped_names() {
         let record = record_with_uuid(UUID);
         let coords = guard_coordinates("pkg:npm/left-pad@1.3.0", &record).unwrap();
-        assert_eq!((coords.name, coords.version), ("left-pad", "1.3.0"));
+        assert_eq!((coords.name.as_str(), coords.version.as_str()), ("left-pad", "1.3.0"));
         assert_eq!(coords.uuid_dir_rel, format!(".socket/vendor/npm/{UUID}"));
         assert_eq!(coords.base_purl, "pkg:npm/left-pad@1.3.0");
 
         let coords = guard_coordinates("pkg:npm/@scope/pkg@1.0.0?artifact_id=x", &record).unwrap();
-        assert_eq!((coords.name, coords.version), ("@scope/pkg", "1.0.0"));
+        assert_eq!((coords.name.as_str(), coords.version.as_str()), ("@scope/pkg", "1.0.0"));
         assert_eq!(
             coords.base_purl, "pkg:npm/@scope/pkg@1.0.0",
             "qualifiers stripped"
+        );
+    }
+
+    /// The API serves scoped purls percent-encoded; the coordinates must
+    /// decode to the literal `@scope/name` (which keys the lockfile and
+    /// the artifact path), while `base_purl` stays verbatim — the ledger
+    /// must keep matching the manifest key as-served.
+    #[test]
+    fn guard_coordinates_decodes_percent_encoded_scope() {
+        let record = record_with_uuid(UUID);
+        let coords =
+            guard_coordinates("pkg:npm/%40modelcontextprotocol/sdk@1.12.0", &record).unwrap();
+        assert_eq!(
+            (coords.name.as_str(), coords.version.as_str()),
+            ("@modelcontextprotocol/sdk", "1.12.0")
+        );
+        assert_eq!(
+            coords.base_purl, "pkg:npm/%40modelcontextprotocol/sdk@1.12.0",
+            "base_purl stays verbatim-encoded (manifest/ledger key parity)"
+        );
+        assert_eq!(
+            tgz_rel_leaf(&coords.name, &coords.version),
+            "@modelcontextprotocol/sdk-1.12.0.tgz",
+            "artifact leaf is built from the decoded name"
         );
     }
 
@@ -397,6 +438,20 @@ mod tests {
         // Traversal version.
         expect_refusal(
             guard_coordinates("pkg:npm/x@../1.0.0", &record).unwrap_err(),
+            "unsafe_coordinates",
+        );
+        // SECURITY: percent-encoded traversal must be rejected POST-decode —
+        // guarding the encoded form would be a bypass (`%2e%2e` → `..`).
+        expect_refusal(
+            guard_coordinates("pkg:npm/%2e%2e/escape@1.0.0", &record).unwrap_err(),
+            "unsafe_coordinates",
+        );
+        expect_refusal(
+            guard_coordinates("pkg:npm/@scope/%2e%2e%2f%2e%2e@1.0.0", &record).unwrap_err(),
+            "unsafe_coordinates",
+        );
+        expect_refusal(
+            guard_coordinates("pkg:npm/x@%2e%2e%2f1.0.0", &record).unwrap_err(),
             "unsafe_coordinates",
         );
         // Tampered uuid.

@@ -83,7 +83,7 @@ pub async fn vendor_yarn_berry(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel.clone();
     let base_purl = coords.base_purl.clone();
     let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));

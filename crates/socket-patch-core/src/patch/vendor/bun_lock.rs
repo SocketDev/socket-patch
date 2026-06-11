@@ -82,7 +82,7 @@ pub async fn vendor_bun(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
     let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
 
