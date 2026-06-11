@@ -5,9 +5,115 @@ use socket_patch_core::crawlers::{
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::patch::apply::{
+use socket_patch_core::patch::apply::{MismatchPolicy, 
     apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
 };
+/// Files whose pre-apply content matched NEITHER hash and were (or would
+/// be) overwritten with the verified patched content — the promoted
+/// verify signature `apply_package_patch` leaves behind under the default
+/// mismatch policy.
+pub(crate) fn mismatch_overwritten_files(result: &ApplyResult) -> Vec<String> {
+    result
+        .files_verified
+        .iter()
+        .filter(|v| {
+            v.status == VerifyStatus::Ready
+                && v.expected_hash.is_some()
+                && v.current_hash != v.expected_hash
+        })
+        .map(|v| v.file.clone())
+        .collect()
+}
+
+/// Surface one mismatch-overwrite per file on stderr (human mode).
+fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
+    if common.json || common.silent {
+        return;
+    }
+    for file in mismatch_overwritten_files(result) {
+        eprintln!(
+            "Warning (content_mismatch_overwritten): {} {file} did not match the patch's \
+             expected original content; applied the full verified patched content instead \
+             (pass --strict to fail on mismatches)",
+            socket_patch_core::utils::purl::normalize_purl(&result.package_key)
+        );
+    }
+}
+
+/// The default mismatch policy applies the FULL patched content for
+/// mismatched files — and the full content lives in the afterHash blob,
+/// which the default `--download-mode diff` may not have staged. Probe the
+/// in-scope packages for mismatches and fetch the missing afterHash blobs
+/// by hash (online only) so the apply below can fall through diff → blob.
+async fn ensure_blobs_for_mismatches(
+    args: &ApplyArgs,
+    manifest: &socket_patch_core::manifest::schema::PatchManifest,
+    all_packages: &HashMap<String, std::path::PathBuf>,
+    blobs_path: &Path,
+) {
+    if args.common.strict && !args.force {
+        return; // strict fails on mismatch — nothing to fetch
+    }
+    let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (purl, pkg_path) in all_packages {
+        let Some(record) = manifest.patches.get(purl) else {
+            continue;
+        };
+        for (file_name, info) in &record.files {
+            if info.before_hash.is_empty() {
+                continue;
+            }
+            let verify = verify_file_patch(pkg_path, file_name, info).await;
+            if verify.status == socket_patch_core::patch::apply::VerifyStatus::HashMismatch
+                && tokio::fs::metadata(blobs_path.join(&info.after_hash))
+                    .await
+                    .is_err()
+            {
+                needed.insert(info.after_hash.clone());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return;
+    }
+    if args.common.offline {
+        if !args.common.silent && !args.common.json {
+            eprintln!(
+                "Warning: {} mismatched file(s) need their full patched blob, but --offline \
+                 prevents fetching; those files will fail to apply",
+                needed.len()
+            );
+        }
+        return;
+    }
+    if !args.common.silent && !args.common.json {
+        eprintln!(
+            "Downloading {} full patched blob(s) for mismatched file(s)...",
+            needed.len()
+        );
+    }
+    let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let _ = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
+        &needed,
+        blobs_path,
+        &client,
+        None,
+    )
+    .await;
+}
+
+/// The mismatch policy this run applies with: `--force` ⊃ default
+/// (adds the missing-file skip), `--strict` restores fail-closed.
+pub(crate) fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
+    if force {
+        MismatchPolicy::Force
+    } else if strict {
+        MismatchPolicy::Strict
+    } else {
+        MismatchPolicy::Warn
+    }
+}
+
 #[cfg(feature = "golang")]
 use socket_patch_core::patch::go_redirect::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
@@ -102,7 +208,7 @@ async fn try_local_go_apply(
     patch: &PatchRecord,
     sources: &PatchSources<'_>,
     common: &GlobalArgs,
-    force: bool,
+    policy: MismatchPolicy,
 ) -> Option<ApplyResult> {
     if !is_local_go(purl, common) {
         return None;
@@ -126,7 +232,7 @@ async fn try_local_go_apply(
             sources,
             Some(&patch.uuid),
             common.dry_run,
-            force,
+            policy,
         )
         .await,
     )
@@ -139,7 +245,7 @@ async fn try_local_go_apply(
     _patch: &PatchRecord,
     _sources: &PatchSources<'_>,
     _common: &GlobalArgs,
-    _force: bool,
+    _policy: MismatchPolicy,
 ) -> Option<ApplyResult> {
     None
 }
@@ -538,6 +644,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 }
                 for result in &results {
                     env.record(result_to_event(result, args.common.dry_run));
+                    // Mismatch overwrites ride as Skipped warning events
+                    // (same pattern as the vendor warnings): the package's
+                    // Applied event stands, the warning is per-file.
+                    for file in mismatch_overwritten_files(result) {
+                        env.record(
+                            PatchEvent::new(PatchAction::Skipped, result.package_key.clone())
+                                .with_reason(
+                                    "content_mismatch_overwritten",
+                                    format!(
+                                        "{file} did not match the patch's expected original \
+                                         content; the full verified patched content was applied"
+                                    ),
+                                ),
+                        );
+                    }
                     // Sidecar records live on the envelope, not on
                     // individual events. Consumers iterate
                     // `envelope.sidecars[]` and JOIN against
@@ -888,6 +1009,7 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
+    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &blobs_path).await;
     let mut has_errors = false;
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
@@ -977,10 +1099,11 @@ async fn apply_patches_inner(
                     &sources,
                     Some(&patch.uuid),
                     args.common.dry_run,
-                    args.force,
+                    mismatch_policy(args.force, args.common.strict),
                 )
                 .await;
 
+                warn_mismatch_overwrites(&result, &args.common);
                 // A variant that reached apply is the installed distribution
                 // (it passed the first-file check, or `--force` bypassed it),
                 // so record it as matched whether or not the patch succeeded.
@@ -1060,7 +1183,14 @@ async fn apply_patches_inner(
             // cache) — patches in place via `apply_package_patch`. Without the
             // `golang` feature `try_local_go_apply` is an inert `None`.
             let result =
-                match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, args.force)
+                match try_local_go_apply(
+                    purl,
+                    pkg_path,
+                    patch,
+                    &sources,
+                    &args.common,
+                    mismatch_policy(args.force, args.common.strict),
+                )
                     .await
                 {
                     Some(r) => r,
@@ -1072,12 +1202,13 @@ async fn apply_patches_inner(
                             &sources,
                             Some(&patch.uuid),
                             args.common.dry_run,
-                            args.force,
+                            mismatch_policy(args.force, args.common.strict),
                         )
                         .await
                     }
                 };
 
+            warn_mismatch_overwrites(&result, &args.common);
             if !result.success {
                 has_errors = true;
                 if !args.common.silent && !args.common.json {

@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchFileInfo, PatchManifest};
 use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
+    apply_package_patch, normalize_file_path, ApplyResult, MismatchPolicy, PatchSources,
+    VerifyResult, VerifyStatus,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
@@ -164,7 +165,7 @@ pub async fn apply_go_redirect(
     sources: &PatchSources<'_>,
     uuid: Option<&str>,
     dry_run: bool,
-    force: bool,
+    policy: MismatchPolicy,
 ) -> ApplyResult {
     // SECURITY: refuse coordinates that would escape the copy base.
     // A `..`/separator-laden `module`/`version` (a tampered manifest PURL) would
@@ -195,7 +196,7 @@ pub async fn apply_go_redirect(
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.
         let mut result =
-            apply_package_patch(purl, pristine_src, files, sources, uuid, true, force).await;
+            apply_package_patch(purl, pristine_src, files, sources, uuid, true, policy).await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None; // a replace copy is not the cache (no go.sum advisory)
         return result;
@@ -235,7 +236,7 @@ pub async fn apply_go_redirect(
     }
 
     // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result = apply_package_patch(purl, &copy_dir, files, sources, uuid, false, force).await;
+    let mut result = apply_package_patch(purl, &copy_dir, files, sources, uuid, false, policy).await;
     result.package_path = copy_dir.display().to_string();
     // The golang sidecar advisory ("go mod verify will fail against go.sum")
     // is about in-cache patching; a `replace` copy bypasses go.sum entirely, so
@@ -761,7 +762,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -810,7 +811,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -830,7 +831,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success);
@@ -866,7 +867,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -884,7 +885,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success);
@@ -910,7 +911,7 @@ mod tests {
             &sources,
             None,
             true,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success);
@@ -945,7 +946,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(!result.success);
@@ -980,7 +981,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -1016,7 +1017,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -1056,7 +1057,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1090,7 +1091,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1119,7 +1120,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         // Add a user-authored replace.
@@ -1157,7 +1158,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1209,7 +1210,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         // Drop the directive but keep the copy.
@@ -1243,7 +1244,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1287,7 +1288,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1328,7 +1329,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1365,7 +1366,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success);
@@ -1446,7 +1447,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(result.success, "apply failed: {:?}", result.error);
@@ -1495,7 +1496,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1536,7 +1537,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(!result.success);

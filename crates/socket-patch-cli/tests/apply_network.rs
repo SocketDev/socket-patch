@@ -449,49 +449,98 @@ async fn apply_with_force_overrides_hash_mismatch() {
 }
 
 #[tokio::test]
-async fn apply_without_force_hash_mismatch_emits_failed_event() {
+async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
     let after = b"after\n";
     let after_hash = git_sha256(after);
     let expected_before = b"expected-before\n";
     let actual_before = b"DIFFERENT-CONTENT\n";
     let expected_before_hash = git_sha256(expected_before);
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "mismatch", "1.0.0", "index.js", actual_before);
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/mismatch@1.0.0",
-        "11111111-1111-4111-8111-111111111111",
-        &expected_before_hash,
-        &after_hash,
-    );
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), after).unwrap();
+    let fixture = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "mismatch", "1.0.0", "index.js", actual_before);
+        let socket = tmp.path().join(".socket");
+        write_manifest_with_patch(
+            &socket,
+            "pkg:npm/mismatch@1.0.0",
+            "11111111-1111-4111-8111-111111111111",
+            &expected_before_hash,
+            &after_hash,
+        );
+        let blobs = socket.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(&after_hash), after).unwrap();
+        tmp
+    };
 
+    // DEFAULT: the mismatch is overwritten with the full verified patched
+    // content (the diff strategy would self-skip; the blob is hash-gated to
+    // afterHash) and surfaced as a warning event — exit 0.
+    let tmp = fixture();
     let out = Command::new(binary())
         .args(["apply", "--json", "--offline"])
         .current_dir(tmp.path())
         .env_remove("SOCKET_API_TOKEN")
         .output()
         .expect("run socket-patch");
-    let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    assert_eq!(code, 1, "hash mismatch w/o --force must exit 1");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(v["status"], "partialFailure");
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "default mismatch is a warning, not an error: {v:#}"
+    );
+    assert_eq!(v["status"], "success", "{v:#}");
     let events = v["events"].as_array().expect("events array");
-    let has_failed = events.iter().any(|e| e["action"] == "failed");
     assert!(
-        has_failed,
-        "must emit a failed event on hash mismatch; got events={events:?}"
+        events.iter().any(|e| e["action"] == "applied"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["errorCode"] == "content_mismatch_overwritten"),
+        "the overwrite is surfaced as a warning event: {events:?}"
+    );
+    let content = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
+    assert_eq!(content, after, "the file carries the verified patched bytes");
+
+    // The human run logs the warning to stderr.
+    let tmp = fixture();
+    let out = Command::new(binary())
+        .args(["apply", "--offline", "--yes"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("content_mismatch_overwritten"),
+        "stderr warning present: {stderr}"
     );
 
-    // File must be UNCHANGED.
+    // --strict: the old fail-closed contract — exit 1, failed event, file
+    // untouched.
+    let tmp = fixture();
+    let out = Command::new(binary())
+        .args(["apply", "--json", "--offline", "--strict"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(out.status.code().unwrap_or(-1), 1, "{v:#}");
+    assert_eq!(v["status"], "partialFailure", "{v:#}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["action"] == "failed"),
+        "strict emits a failed event: {events:?}"
+    );
     let content = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
-    assert_eq!(content, actual_before, "hash mismatch must not modify file");
+    assert_eq!(content, actual_before, "strict must not modify the file");
 }
 
 // ---------------------------------------------------------------------------
@@ -649,4 +698,88 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
         blobs.join(&after_hash).exists(),
         "cached blob must survive apply"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Mismatch + diff-mode sources: the full blob is redownloaded on demand.
+// ---------------------------------------------------------------------------
+
+/// A mismatched file cannot be patched from a partial source (the diff
+/// strategy needs the exact before-bytes), so the default mismatch policy
+/// redownloads the FULL afterHash blob and applies that — even when a
+/// local source archive made the stage step skip downloading.
+#[tokio::test]
+async fn apply_mismatch_redownloads_full_blob_and_applies() {
+    let after = b"after\n";
+    let after_hash = git_sha256(after);
+    let expected_before_hash = git_sha256(b"expected-before\n");
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let uuid = "11111111-1111-4111-8111-111111111111";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_npm_package(
+        tmp.path(),
+        "mismatch",
+        "1.0.0",
+        "index.js",
+        b"DIFFERENT-CONTENT\n",
+    );
+    let socket = tmp.path().join(".socket");
+    write_manifest_with_patch(
+        &socket,
+        "pkg:npm/mismatch@1.0.0",
+        uuid,
+        &expected_before_hash,
+        &after_hash,
+    );
+    // A LOCAL package archive exists (so the stage step downloads nothing)
+    // but carries no entry for index.js — only the blob can produce the
+    // patched bytes, and no blob is staged.
+    let packages = socket.join("packages");
+    std::fs::create_dir_all(&packages).unwrap();
+    {
+        use std::io::Write as _;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(packages.join(format!("{uuid}.tar.gz"))).unwrap(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        let bytes = b"unrelated";
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, "other.js", &bytes[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap().flush().unwrap();
+    }
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(code, 0, "stdout={v:#}\nstderr={stderr}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["errorCode"] == "content_mismatch_overwritten"),
+        "{events:?}"
+    );
+
+    // The blob was fetched on demand…
+    let requests = mock.received_requests().await.unwrap();
+    let blob_path = format!("/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}");
+    assert!(
+        requests.iter().any(|r| r.url.path() == blob_path),
+        "the full blob must be redownloaded for the mismatched file"
+    );
+    // …and the file carries the verified patched bytes.
+    let content = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
+    assert_eq!(content, after);
 }

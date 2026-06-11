@@ -580,6 +580,9 @@ pub struct DownloadParams {
     /// `true` (`--all-releases`), every variant is downloaded. No effect
     /// on ecosystems without per-release artifact_id variants.
     pub all_releases: bool,
+    /// `--strict` forwarded to the nested apply (a beforeHash mismatch
+    /// fails instead of warn-and-overwrite).
+    pub strict: bool,
 }
 
 /// Narrow a selection of patches down to the release variant(s) present
@@ -1193,6 +1196,7 @@ pub async fn download_and_apply_patches(
                 global_prefix: params.global_prefix.clone(),
                 silent: params.json || params.silent,
                 download_mode: params.download_mode.clone(),
+                strict: params.strict,
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
@@ -1621,6 +1625,7 @@ pub async fn run(args: GetArgs) -> i32 {
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
+        strict: args.common.strict,
     };
 
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
@@ -1810,6 +1815,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
                 global_prefix: args.common.global_prefix.clone(),
                 silent: quiet,
                 download_mode: args.common.download_mode.clone(),
+                strict: args.common.strict,
                 ..crate::args::GlobalArgs::default()
             },
             force: false,

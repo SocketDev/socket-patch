@@ -137,7 +137,7 @@ pub async fn vendor_go_module(
         sources,
         Some(&record.uuid),
         dry_run,
-        /*force=*/ true,
+        crate::patch::apply::MismatchPolicy::Force,
     )
     .await;
     if result.success {
@@ -335,6 +335,7 @@ pub async fn revert_go_vendor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patch::apply::MismatchPolicy;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
@@ -556,7 +557,7 @@ mod tests {
             &sources,
             Some(UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
@@ -720,7 +721,7 @@ mod tests {
             &sources,
             Some(UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         let (_result, entry, _warnings) =

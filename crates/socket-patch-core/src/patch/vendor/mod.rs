@@ -229,7 +229,10 @@ pub(crate) async fn force_apply_staged(
         sources,
         Some(&record.uuid),
         dry_run,
-        /*force=*/ true,
+        // The stage is private and every write path is afterHash-gated;
+        // Force additionally covers the caller's --force NotFound-skip
+        // (the missing-file pre-check above handles the default case).
+        crate::patch::apply::MismatchPolicy::Force,
     )
     .await;
     if result.success {

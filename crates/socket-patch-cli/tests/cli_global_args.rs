@@ -202,6 +202,7 @@ fn global_flag_cases_cover_every_global_field() {
         break_lock: _,
         debug: _,
         no_telemetry: _,
+        strict: _,
     } = common;
 
     // 20 fields ↔ 20 long-flag cases. Bump both this count and add a case when

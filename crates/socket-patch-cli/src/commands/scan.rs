@@ -864,6 +864,7 @@ async fn run_vendor_json_path(
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
+        strict: args.common.strict,
     };
     let mut has_errors = false;
     let detached_records: Option<HashMap<String, PatchRecord>> = if args.detached {
@@ -1821,6 +1822,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                     download_mode: args.common.download_mode.clone(),
                     api_overrides: args.common.api_client_overrides(),
                     all_releases: args.all_releases,
+                    strict: args.common.strict,
                 };
                 let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
                 apply_code = code;
@@ -2304,6 +2306,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
+        strict: args.common.strict,
     };
 
     let code = if args.vendor {
