@@ -303,38 +303,28 @@ async fn lockfile_supplement(
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
 ) -> LockfileSupplement {
     use socket_patch_core::patch::vendor::lock_inventory;
-    use socket_patch_core::patch::vendor::npm_flavor::NpmLockFlavor;
 
-    let mut out = LockfileSupplement::default();
+    let mut out = LockfileSupplement {
+        source: "project lockfiles",
+        ..Default::default()
+    };
     if common.global || common.global_prefix.is_some() {
         return out;
     }
-    let Some((flavor, entries)) = lock_inventory::inventory_npm_lock(&common.cwd).await else {
+    let entries = lock_inventory::inventory_project(&common.cwd).await;
+    if entries.is_empty() {
         return out;
-    };
-    out.source = match flavor {
-        NpmLockFlavor::PackageLock => "package-lock.json",
-        NpmLockFlavor::Pnpm => "pnpm-lock.yaml",
-        NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => "yarn.lock",
-        NpmLockFlavor::Bun => "bun.lock",
-    };
+    }
     let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
     for entry in entries {
         if crawled_purls.contains(entry.purl.as_str()) {
             continue;
         }
-        let (namespace, name) = match entry.name.split_once('/') {
-            Some((scope, bare)) => (Some(scope.to_string()), bare.to_string()),
-            None => (None, entry.name.clone()),
+        let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
+            continue;
         };
         out.purls.insert(entry.purl.clone());
-        out.packages.push(socket_patch_core::crawlers::types::CrawledPackage {
-            name,
-            version: entry.version.clone(),
-            namespace,
-            purl: entry.purl.clone(),
-            path: common.cwd.join("node_modules").join(&entry.name),
-        });
+        out.packages.push(pkg);
     }
     out
 }
@@ -1348,7 +1338,11 @@ pub async fn run(args: ScanArgs) -> i32 {
     // are flagged "not yet installed" everywhere a user could act on them.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
     if !lockfile_only.packages.is_empty() {
-        *eco_counts.entry(Ecosystem::Npm).or_insert(0) += lockfile_only.packages.len();
+        for pkg in &lockfile_only.packages {
+            if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
+                *eco_counts.entry(eco).or_insert(0) += 1;
+            }
+        }
         all_crawled.extend(lockfile_only.packages.iter().cloned());
     }
     let ledger_supplement = vendored_ledger_supplement(&args.common, &all_crawled).await;

@@ -555,10 +555,7 @@ pub(crate) async fn vendor_records(
         if !missing.is_empty() {
             // The inventory is a local file read — fine offline; only the
             // fetch itself needs the network.
-            let inventory = lock_inventory::inventory_npm_lock(&common.cwd)
-                .await
-                .map(|(_, entries)| entries)
-                .unwrap_or_default();
+            let inventory = lock_inventory::inventory_project(&common.cwd).await;
             let client = registry_fetch::build_registry_client();
             // Pre-loaded vendor ledger for the artifact-staging path: an
             // already-vendored purl with no installed copy (fresh clone)
@@ -909,12 +906,9 @@ pub(crate) async fn vendor_records(
         // Offline runs name the packages the lockfile COULD have fetched —
         // the inventory is a local file read, allowed offline.
         let lock_resolvable: HashSet<String> = if common.offline {
-            let entries = socket_patch_core::patch::vendor::lock_inventory::inventory_npm_lock(
-                &common.cwd,
-            )
-            .await
-            .map(|(_, e)| e)
-            .unwrap_or_default();
+            let entries =
+                socket_patch_core::patch::vendor::lock_inventory::inventory_project(&common.cwd)
+                    .await;
             unmatched
                 .iter()
                 .filter(|p| {

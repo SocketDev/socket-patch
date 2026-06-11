@@ -233,7 +233,10 @@ socket-patch scan -g
 # Scan + apply + emit an OpenVEX attestation in one pass
 socket-patch scan --json --sync --yes --vex socket.vex.json
 
-# Vendor every patched dependency (committable; see the vendor command)
+# Vendor every patched dependency (committable; see the vendor command).
+# Works on a completely fresh clone: dependencies listed in the lockfile
+# but not yet installed are fetched pristine from their registry and
+# integrity-verified against the lockfile before vendoring.
 socket-patch scan --json --vendor --yes
 
 # Same, but keep the manifest out of it entirely
