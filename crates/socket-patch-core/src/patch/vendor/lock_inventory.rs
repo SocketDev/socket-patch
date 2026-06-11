@@ -130,6 +130,12 @@ pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a Lockfi
     };
     let at = rest.rfind('@').filter(|&i| i > 0)?;
     let (name, version) = (&rest[..at], &rest[at + 1..]);
+    // pypi names compare in PEP 503 normalized form.
+    let name = if eco == "pypi" {
+        pep503(name)
+    } else {
+        name.to_string()
+    };
     entries
         .iter()
         .find(|e| e.ecosystem == eco && e.name == name && e.version == version)
@@ -148,6 +154,16 @@ pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
     }
     #[cfg(feature = "golang")]
     if let Some(entries) = inventory_go_sum(project_root).await {
+        out.extend(entries);
+    }
+    #[cfg(feature = "composer")]
+    if let Some(entries) = inventory_composer_lock(project_root).await {
+        out.extend(entries);
+    }
+    if let Some(entries) = inventory_gemfile_lock(project_root).await {
+        out.extend(entries);
+    }
+    if let Some(entries) = inventory_pypi_locks(project_root).await {
         out.extend(entries);
     }
     out
@@ -201,10 +217,11 @@ pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEnt
     let text = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
         .await
         .ok()?;
+    /// One in-flight `[[package]]` block: name, version, source, checksum.
+    type CargoBlock = (Option<String>, Option<String>, Option<String>, Option<String>);
     let mut out = Vec::new();
-    let mut cur: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = None;
-    let flush = |cur: &mut Option<(Option<String>, Option<String>, Option<String>, Option<String>)>,
-                     out: &mut Vec<LockfileEntry>| {
+    let mut cur: Option<CargoBlock> = None;
+    let flush = |cur: &mut Option<CargoBlock>, out: &mut Vec<LockfileEntry>| {
         if let Some((Some(name), Some(version), source, checksum)) = cur.take() {
             let Some(source) = source else {
                 return; // workspace member
@@ -550,6 +567,390 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
         ));
     }
     Some(out)
+}
+
+// ────────────────────────────── composer.lock ──────────────────────────────
+
+/// Inventory `composer.lock` `packages`/`packages-dev`. The `dist.shasum`
+/// (sha1 of the dist zip) is frequently empty — such entries stay
+/// discovery-only. Names lowercase to the canonical packagist form;
+/// versions drop the pretty leading `v`.
+#[cfg(feature = "composer")]
+pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let bytes = tokio::fs::read(project_root.join("composer.lock")).await.ok()?;
+    let doc: Value = serde_json::from_slice(&bytes).ok()?;
+    let mut out = Vec::new();
+    for section in ["packages", "packages-dev"] {
+        let Some(list) = doc.get(section).and_then(Value::as_array) else {
+            continue;
+        };
+        for pkg in list {
+            let Some(name) = pkg.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(version) = pkg.get("version").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = name.to_ascii_lowercase();
+            let version = version
+                .strip_prefix('v')
+                .filter(|r| r.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                .unwrap_or(version)
+                .to_string();
+            if !path_safety::is_safe_multi_segment(&name)
+                || name.split('/').count() != 2
+                || !path_safety::is_safe_single_segment(&version)
+            {
+                continue;
+            }
+            let dist = pkg.get("dist");
+            let dist_url = dist
+                .and_then(|d| d.get("url"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Our own vendored entries use a path dist — skip.
+            if dist
+                .and_then(|d| d.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "path")
+                || parse_vendor_path(dist_url).is_some()
+            {
+                continue;
+            }
+            let is_zip = dist
+                .and_then(|d| d.get("type"))
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "zip");
+            let shasum = dist
+                .and_then(|d| d.get("shasum"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let integrity = if is_zip
+                && shasum.len() == 40
+                && shasum.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase())
+            } else {
+                LockIntegrity::None
+            };
+            let purl = format!("pkg:composer/{name}@{version}");
+            out.push(LockfileEntry {
+                ecosystem: "composer",
+                name,
+                version,
+                purl,
+                resolved: is_zip.then(|| http_url(dist_url)).flatten(),
+                integrity,
+            });
+        }
+    }
+    Some(dedup_prefer_integrity(out))
+}
+
+// ────────────────────────────── Gemfile.lock ──────────────────────────────
+
+/// Inventory `Gemfile.lock`: `GEM`-section `specs:` entries (4-space
+/// indent; deeper lines are dependency ranges) plus the bundler ≥ 2.6
+/// `CHECKSUMS` section's sha256 values when present (older locks stay
+/// discovery-only). Platform-suffixed specs (`nokogiri (1.16.5-arm64-…)`)
+/// are skipped — platform gems are unsupported for vendoring anyway.
+pub async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
+        .await
+        .ok()?;
+    let mut remote: Option<String> = None;
+    let mut checksums: HashMap<(String, String), String> = HashMap::new();
+    let mut specs: Vec<(String, String)> = Vec::new();
+
+    let mut section = "";
+    let mut in_specs = false;
+    for line in text.lines() {
+        if !line.starts_with(' ') {
+            section = line.trim();
+            in_specs = false;
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        match section {
+            "GEM" => {
+                if indent == 2 {
+                    if let Some(r) = trimmed.strip_prefix("remote:") {
+                        let r = r.trim().trim_end_matches('/');
+                        if remote.is_none() && !r.is_empty() {
+                            remote = Some(r.to_string());
+                        }
+                    }
+                    in_specs = trimmed == "specs:";
+                } else if in_specs && indent == 4 {
+                    if let Some((name, version)) = parse_gem_spec_line(trimmed) {
+                        specs.push((name, version));
+                    }
+                }
+            }
+            "CHECKSUMS" => {
+                // `  name (version) sha256=hex`
+                if let Some((spec_part, hash_part)) =
+                    trimmed.rsplit_once(" sha256=").map(|(s, h)| (s, h.trim()))
+                {
+                    if let Some((name, version)) = parse_gem_spec_line(spec_part) {
+                        if hash_part.len() == 64
+                            && hash_part.bytes().all(|b| b.is_ascii_hexdigit())
+                        {
+                            checksums
+                                .insert((name, version), hash_part.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if specs.is_empty() {
+        return None;
+    }
+    let base = remote.unwrap_or_else(|| "https://rubygems.org".to_string());
+    let mut out = Vec::new();
+    for (name, version) in specs {
+        if !path_safety::is_safe_single_segment(&name)
+            || !path_safety::is_safe_single_segment(&version)
+        {
+            continue;
+        }
+        let integrity = checksums
+            .get(&(name.clone(), version.clone()))
+            .map(|h| LockIntegrity::Sha256Hex(h.clone()))
+            .unwrap_or(LockIntegrity::None);
+        out.push(LockfileEntry {
+            ecosystem: "gem",
+            purl: format!("pkg:gem/{name}@{version}"),
+            resolved: http_url(&format!("{base}/downloads/{name}-{version}.gem")),
+            name,
+            version,
+            integrity,
+        });
+    }
+    Some(dedup_prefer_integrity(out))
+}
+
+/// `name (version)` → parts; platform-suffixed versions (`1.2.3-x86_64…`)
+/// and dependency lines (no parens / range operators) yield `None`.
+fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
+    let (name, rest) = line.split_once(" (")?;
+    let version = rest.strip_suffix(')')?;
+    if name.is_empty()
+        || version.is_empty()
+        || version.contains(' ')
+        || version.contains('-')
+        || !version.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+// ─────────────────────────────── pypi locks ───────────────────────────────
+
+/// PEP 503 name normalization (`Foo._Bar` → `foo-bar`) — pypi purls and
+/// lock entries must compare in this form.
+fn pep503(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = false;
+    for c in name.chars() {
+        let c = c.to_ascii_lowercase();
+        if c == '-' || c == '_' || c == '.' {
+            if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.push(c);
+            last_dash = false;
+        }
+    }
+    out
+}
+
+/// Inventory the pypi lock the project carries. Fetchable resolution
+/// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
+/// `poetry.lock` and `--hash`-pinned `requirements.txt` contribute
+/// DISCOVERY-only entries (no recorded URL; platform-independent wheel
+/// choice is not derivable offline). Pipenv/pdm locks: not yet read.
+pub async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    if let Some(out) = inventory_uv_lock(project_root).await {
+        return Some(out);
+    }
+    if let Some(out) = inventory_poetry_lock(project_root).await {
+        return Some(out);
+    }
+    inventory_requirements_txt(project_root).await
+}
+
+/// uv.lock: TOML `[[package]]` blocks with `name`/`version` and
+/// `wheels = [{ url, hash = "sha256:…" }, …]` entries.
+async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("uv.lock"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    // Line-oriented: uv emits `[[package]]` blocks; wheels live either as
+    // inline `{ url = "…", hash = "sha256:…" }` table rows or one-line
+    // arrays. A pure-python wheel ends `py3-none-any.whl`.
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut sourced_registry = true;
+    let mut wheel: Option<(String, String)> = None;
+    let flush = |name: &mut Option<String>,
+                     version: &mut Option<String>,
+                     sourced_registry: &mut bool,
+                     wheel: &mut Option<(String, String)>,
+                     out: &mut Vec<LockfileEntry>| {
+        if let (Some(n), Some(v)) = (name.take(), version.take()) {
+            let canonical = pep503(&n);
+            if *sourced_registry
+                && path_safety::is_safe_single_segment(&canonical)
+                && path_safety::is_safe_single_segment(&v)
+            {
+                let (resolved, integrity) = match wheel.take() {
+                    Some((url, sha)) => (http_url(&url), LockIntegrity::Sha256Hex(sha)),
+                    None => (None, LockIntegrity::None),
+                };
+                out.push(LockfileEntry {
+                    ecosystem: "pypi",
+                    purl: format!("pkg:pypi/{canonical}@{v}"),
+                    name: canonical,
+                    version: v,
+                    resolved,
+                    integrity,
+                });
+            }
+        }
+        *sourced_registry = true;
+        *wheel = None;
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            flush(&mut name, &mut version, &mut sourced_registry, &mut wheel, &mut out);
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name = ") {
+            name = Some(v.trim_matches('"').to_string());
+        } else if let Some(v) = t.strip_prefix("version = ") {
+            version = Some(v.trim_matches('"').to_string());
+        } else if t.starts_with("source = ") {
+            // Registry packages: `source = { registry = "…" }`; editable/
+            // virtual/path/git sources are not fetchable artifacts.
+            sourced_registry = t.contains("registry");
+        } else if wheel.is_none() && t.contains("py3-none-any.whl") {
+            // `{ url = "…py3-none-any.whl", hash = "sha256:…" }`
+            let url = t
+                .split("url = \"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .unwrap_or("");
+            let sha = t
+                .split("hash = \"sha256:")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .unwrap_or("");
+            if !url.is_empty() && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                wheel = Some((url.to_string(), sha.to_ascii_lowercase()));
+            }
+        }
+    }
+    flush(&mut name, &mut version, &mut sourced_registry, &mut wheel, &mut out);
+    Some(dedup_prefer_integrity(out))
+}
+
+/// poetry.lock: `[[package]]` blocks with `name`/`version` — discovery
+/// only (file hashes exist but carry no URLs and no platform choice).
+async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("poetry.lock"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    let mut in_package = false;
+    let mut name: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            in_package = true;
+            name = None;
+            continue;
+        }
+        if t.starts_with('[') && t != "[[package]]" {
+            in_package = false;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name = ") {
+            name = Some(pep503(v.trim_matches('"')));
+        } else if let Some(v) = t.strip_prefix("version = ") {
+            if let Some(n) = name.take() {
+                let v = v.trim_matches('"').to_string();
+                if path_safety::is_safe_single_segment(&n)
+                    && path_safety::is_safe_single_segment(&v)
+                {
+                    out.push(LockfileEntry {
+                        ecosystem: "pypi",
+                        purl: format!("pkg:pypi/{n}@{v}"),
+                        name: n,
+                        version: v,
+                        resolved: None,
+                        integrity: LockIntegrity::None,
+                    });
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(dedup_prefer_integrity(out))
+}
+
+/// requirements.txt with exact `==` pins — discovery only.
+async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("requirements.txt"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with('-') {
+            continue;
+        }
+        // `name==version` (strip extras, env markers, hash continuations).
+        let spec = t.split(';').next().unwrap_or(t).trim();
+        let spec = spec.split_whitespace().next().unwrap_or(spec);
+        let Some((raw_name, version)) = spec.split_once("==") else {
+            continue;
+        };
+        let name = pep503(raw_name.split('[').next().unwrap_or(raw_name).trim());
+        let version = version.trim().to_string();
+        if name.is_empty()
+            || !path_safety::is_safe_single_segment(&name)
+            || !path_safety::is_safe_single_segment(&version)
+            || !version.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        out.push(LockfileEntry {
+            ecosystem: "pypi",
+            purl: format!("pkg:pypi/{name}@{version}"),
+            name,
+            version,
+            resolved: None,
+            integrity: LockIntegrity::None,
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(dedup_prefer_integrity(out))
 }
 
 #[cfg(test)]
@@ -999,6 +1400,160 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             lookup(&entries, "pkg:npm/serde@1.0.200").is_none(),
             "ecosystem tags must match, not just name@version"
         );
+    }
+
+    #[cfg(feature = "composer")]
+    #[tokio::test]
+    async fn composer_lock_inventories_dist_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "composer.lock",
+            r#"{
+  "packages": [
+    {
+      "name": "Monolog/Monolog",
+      "version": "v3.5.0",
+      "dist": {
+        "type": "zip",
+        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc",
+        "shasum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    },
+    {
+      "name": "vendored/pkg",
+      "version": "1.0.0",
+      "dist": { "type": "path", "url": ".socket/vendor/composer/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/vendored/pkg@1.0.0" }
+    }
+  ],
+  "packages-dev": [
+    {
+      "name": "symfony/console",
+      "version": "v6.4.1",
+      "dist": { "type": "zip", "url": "https://example.com/console.zip", "shasum": "" }
+    }
+  ]
+}"#,
+        )
+        .await;
+
+        let entries = inventory_composer_lock(tmp.path()).await.unwrap();
+        let monolog = entry(&entries, "monolog/monolog");
+        assert_eq!(monolog.version, "3.5.0", "leading v dropped, name lowercased");
+        assert_eq!(monolog.purl, "pkg:composer/monolog/monolog@3.5.0");
+        assert!(matches!(monolog.integrity, LockIntegrity::Sha1Hex(_)));
+        assert!(monolog.resolved.as_deref().unwrap().contains("zipball"));
+        // Empty shasum → discovery-only; path dist (ours) excluded.
+        assert_eq!(
+            entry(&entries, "symfony/console").integrity,
+            LockIntegrity::None
+        );
+        assert!(!entries.iter().any(|e| e.name == "vendored/pkg"));
+    }
+
+    #[tokio::test]
+    async fn gemfile_lock_inventories_specs_and_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Gemfile.lock",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.1.0)\n      \
+             actionpack (= 7.1.0)\n    rack (3.0.8)\n    nokogiri (1.16.5-arm64-darwin)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails\n\nCHECKSUMS\n  \
+             rails (7.1.0) sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n\
+             BUNDLED WITH\n   2.6.0\n",
+        )
+        .await;
+
+        let entries = inventory_gemfile_lock(tmp.path()).await.unwrap();
+        let rails = entry(&entries, "rails");
+        assert_eq!(rails.version, "7.1.0");
+        assert_eq!(rails.purl, "pkg:gem/rails@7.1.0");
+        assert!(matches!(rails.integrity, LockIntegrity::Sha256Hex(_)));
+        assert_eq!(
+            rails.resolved.as_deref(),
+            Some("https://rubygems.org/downloads/rails-7.1.0.gem")
+        );
+        // No CHECKSUMS entry → discovery-only; platform gem skipped;
+        // dependency range lines never parse as specs.
+        assert_eq!(entry(&entries, "rack").integrity, LockIntegrity::None);
+        assert!(!entries.iter().any(|e| e.name == "nokogiri"));
+        assert!(!entries.iter().any(|e| e.name == "actionpack"));
+    }
+
+    #[tokio::test]
+    async fn uv_lock_inventories_pure_wheels() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "uv.lock",
+            r#"version = 1
+
+[[package]]
+name = "Requests"
+version = "2.28.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/requests-2.28.0-py3-none-any.whl", hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+]
+
+[[package]]
+name = "native-only"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bb/native_only-1.0.0-cp312-macosx.whl", hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+]
+
+[[package]]
+name = "local-proj"
+version = "0.0.1"
+source = { editable = "." }
+"#,
+        )
+        .await;
+
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let requests = entry(&entries, "requests");
+        assert_eq!(requests.purl, "pkg:pypi/requests@2.28.0", "PEP 503 name");
+        assert!(matches!(requests.integrity, LockIntegrity::Sha256Hex(_)));
+        assert!(requests
+            .resolved
+            .as_deref()
+            .unwrap()
+            .ends_with("py3-none-any.whl"));
+        // Platform-only wheels → discovery-only; editable sources excluded.
+        assert_eq!(
+            entry(&entries, "native-only").integrity,
+            LockIntegrity::None
+        );
+        assert!(!entries.iter().any(|e| e.name == "local-proj"));
+    }
+
+    #[tokio::test]
+    async fn poetry_and_requirements_are_discovery_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "poetry.lock",
+            "[[package]]\nname = \"Flask_Login\"\nversion = \"0.6.3\"\n\n[metadata]\nlock-version = \"2.0\"\n",
+        )
+        .await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let fl = entry(&entries, "flask-login");
+        assert_eq!(fl.purl, "pkg:pypi/flask-login@0.6.3");
+        assert_eq!(fl.integrity, LockIntegrity::None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "requirements.txt",
+            "# pinned\nrequests[security]==2.28.0 --hash=sha256:abc \\\n    --hash=sha256:def\nflask>=2.0\n-e .\n",
+        )
+        .await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].purl, "pkg:pypi/requests@2.28.0");
     }
 
     #[tokio::test]

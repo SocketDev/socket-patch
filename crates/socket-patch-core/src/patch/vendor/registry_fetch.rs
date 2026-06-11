@@ -116,10 +116,196 @@ pub async fn fetch_and_stage(
         "cargo" => fetch_cargo(entry, client).await,
         #[cfg(feature = "golang")]
         "golang" => fetch_golang(entry, client).await,
+        #[cfg(feature = "composer")]
+        "composer" => fetch_composer(entry, client).await,
+        "gem" => fetch_gem(entry, client).await,
+        "pypi" => fetch_pypi(entry, client).await,
         other => Err(FetchError::Unverifiable(format!(
             "no registry fetcher for ecosystem `{other}`"
         ))),
     }
+}
+
+/// Traversal-guarded zip extraction. `strip_first` mirrors the tar
+/// behavior (composer dist zips carry a variable top dir; wheels carry
+/// content at the root).
+fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable zip: {e}"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("zip exceeds {MAX_ENTRIES} entries"));
+    }
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("unreadable zip entry: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let raw = PathBuf::from(file.name());
+        let rel = if strip_first {
+            match strip_first_component(&raw) {
+                Some(rel) => rel,
+                None => continue,
+            }
+        } else {
+            raw.clone()
+        };
+        let rel_str = rel.to_string_lossy().into_owned();
+        if !is_safe_relative_subpath(&rel_str) {
+            return Err(format!(
+                "zip entry `{}` escapes the extraction dir — refusing the artifact",
+                raw.display()
+            ));
+        }
+        if file.size() > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "zip entry `{rel_str}` is {} bytes (cap {MAX_ENTRY_BYTES})",
+                file.size()
+            ));
+        }
+        total += file.size();
+        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            ));
+        }
+        let target = dest.join(&rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&target)
+            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+        std::io::copy(&mut file, &mut out)
+            .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
+            let perms = if exec { 0o755 } else { 0o644 };
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perms));
+        }
+    }
+    Ok(())
+}
+
+/// Composer dist zips (packagist/GitHub zipballs): sha1-verified, variable
+/// top dir stripped. The extracted dir plays the installed package dir.
+#[cfg(feature = "composer")]
+async fn fetch_composer(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let Some(url) = entry.resolved.clone() else {
+        return Err(FetchError::Unverifiable(format!(
+            "composer.lock records no dist URL for {}@{}",
+            entry.name, entry.version
+        )));
+    };
+    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
+    verify_integrity(&bytes, &entry.integrity)?;
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
+    let dir = tmp.path().join("package");
+    extract_zip(&bytes, &dir, /*strip_first=*/ true).map_err(FetchError::Failed)?;
+    if tokio::fs::metadata(dir.join("composer.json")).await.is_err() {
+        return Err(FetchError::Failed(format!(
+            "fetched dist for {}@{} carries no composer.json",
+            entry.name, entry.version
+        )));
+    }
+    Ok(FetchedPackage {
+        dir,
+        url,
+        _tmp: tmp,
+    })
+}
+
+/// `.gem` files are plain tar containers holding `data.tar.gz` (the
+/// package content, no prefix dir) + metadata. The whole `.gem` is
+/// sha256-verified against the Gemfile.lock CHECKSUMS entry first.
+async fn fetch_gem(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let Some(url) = entry.resolved.clone() else {
+        return Err(FetchError::Unverifiable(format!(
+            "no download URL for {}@{}",
+            entry.name, entry.version
+        )));
+    };
+    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
+    verify_integrity(&bytes, &entry.integrity)?;
+
+    // Locate data.tar.gz inside the (uncompressed) outer tar.
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let mut data: Option<Vec<u8>> = None;
+    for e in archive
+        .entries()
+        .map_err(|e| FetchError::Failed(format!("unreadable .gem: {e}")))?
+    {
+        use std::io::Read as _;
+        let mut e = e.map_err(|err| FetchError::Failed(format!("unreadable .gem entry: {err}")))?;
+        let is_data = e
+            .path()
+            .ok()
+            .is_some_and(|p| p.as_os_str() == "data.tar.gz");
+        if !is_data {
+            continue;
+        }
+        if e.header().size().unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
+            return Err(FetchError::Failed("data.tar.gz exceeds the size cap".into()));
+        }
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf)
+            .map_err(|err| FetchError::Failed(format!("cannot read data.tar.gz: {err}")))?;
+        data = Some(buf);
+        break;
+    }
+    let Some(data) = data else {
+        return Err(FetchError::Failed(format!(
+            "fetched .gem for {}@{} carries no data.tar.gz",
+            entry.name, entry.version
+        )));
+    };
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
+    let dir = tmp.path().join("gem");
+    extract_tgz_no_strip(&data, &dir).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage {
+        dir,
+        url,
+        _tmp: tmp,
+    })
+}
+
+/// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
+/// wheel IS a site-packages layout (package dirs + `.dist-info/RECORD` at
+/// the root), which is exactly the shape the pypi vendor backend stages
+/// from.
+async fn fetch_pypi(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let Some(url) = entry.resolved.clone() else {
+        return Err(FetchError::Unverifiable(format!(
+            "the lockfile records no platform-independent wheel URL for {}@{} (only uv.lock              carries fetchable wheel resolutions today)",
+            entry.name, entry.version
+        )));
+    };
+    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
+    verify_integrity(&bytes, &entry.integrity)?;
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
+    let dir = tmp.path().join("site-packages");
+    extract_zip(&bytes, &dir, /*strip_first=*/ false).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage {
+        dir,
+        url,
+        _tmp: tmp,
+    })
 }
 
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
@@ -576,6 +762,17 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// Fails CLOSED on any traversal-shaped entry — a malicious tarball must
 /// not half-extract.
 fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_tar_gz(bytes, dest, /*strip_first=*/ true)
+}
+
+/// Like [`extract_tgz`] but keeps entry paths verbatim (gem `data.tar.gz`
+/// archives carry package content at the root, no prefix dir).
+#[allow(dead_code)] // used by the gem fetcher (feature-independent helper)
+fn extract_tgz_no_strip(bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_tar_gz(bytes, dest, /*strip_first=*/ false)
+}
+
+fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
     use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(gz);
@@ -598,8 +795,13 @@ fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
             .path()
             .map_err(|e| format!("tarball entry has an undecodable path: {e}"))?
             .into_owned();
-        let Some(rel) = strip_first_component(&raw) else {
-            continue; // a bare prefix-level file — not package content
+        let rel = if strip_first {
+            match strip_first_component(&raw) {
+                Some(rel) => rel,
+                None => continue, // a bare prefix-level file — not package content
+            }
+        } else {
+            raw.clone()
         };
         let rel_str = rel.to_string_lossy();
         if !is_safe_relative_subpath(&rel_str) {
@@ -1049,6 +1251,159 @@ mod tests {
         let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), "github.com/OTHER@v1/")
             .unwrap_err();
         assert!(err.contains("outside"), "{err}");
+    }
+
+    /// Build a zip with the given `(path, bytes)` entries.
+    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in files {
+            writer
+                .start_file(
+                    name.to_string(),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[cfg(feature = "composer")]
+    #[tokio::test]
+    async fn composer_dist_fetch_verifies_sha1_and_strips_top_dir() {
+        // GitHub zipballs carry an `owner-repo-sha/` top dir.
+        let zip_bytes = make_zip(&[
+            ("Seldaek-monolog-abc123/composer.json", br#"{"name":"monolog/monolog"}"#),
+            ("Seldaek-monolog-abc123/src/Logger.php", b"<?php\n"),
+        ]);
+        let sha1 = hex::encode(Sha1::digest(&zip_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/zipball/abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "composer",
+            name: "monolog/monolog".into(),
+            version: "3.5.0".into(),
+            purl: "pkg:composer/monolog/monolog@3.5.0".into(),
+            resolved: Some(format!("{}/zipball/abc123", mock.uri())),
+            integrity: LockIntegrity::Sha1Hex(sha1),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        assert!(fetched.dir().join("composer.json").is_file());
+        assert!(fetched.dir().join("src/Logger.php").is_file());
+
+        let entry = LockfileEntry {
+            integrity: LockIntegrity::Sha1Hex("0".repeat(40)),
+            ..entry
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gem_fetch_verifies_sha256_and_extracts_data_tar() {
+        // .gem = plain tar holding data.tar.gz (content at the ROOT — no
+        // prefix dir) + metadata.gz.
+        let data_tgz = make_tgz(&[
+            ("lib/rails.rb", b"module Rails; end\n", false),
+            ("README.md", b"# rails\n", false),
+        ]);
+        let mut outer = tar::Builder::new(Vec::new());
+        for (name, bytes) in [("metadata.gz", b"meta".as_slice()), ("data.tar.gz", &data_tgz)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            outer.append_data(&mut header, name, bytes).unwrap();
+        }
+        let gem_bytes = outer.into_inner().unwrap();
+        let sha = hex::encode(Sha256::digest(&gem_bytes));
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/downloads/rails-7.1.0.gem"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gem_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "gem",
+            name: "rails".into(),
+            version: "7.1.0".into(),
+            purl: "pkg:gem/rails@7.1.0".into(),
+            resolved: Some(format!("{}/downloads/rails-7.1.0.gem", mock.uri())),
+            integrity: LockIntegrity::Sha256Hex(sha),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        assert!(
+            fetched.dir().join("lib/rails.rb").is_file(),
+            "data.tar.gz content extracts at the root (no strip)"
+        );
+        assert!(fetched.dir().join("README.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn pypi_wheel_fetch_extracts_site_packages_layout() {
+        let wheel = make_zip(&[
+            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
+            (
+                "requests-2.28.0.dist-info/RECORD",
+                b"requests/__init__.py,sha256=abc,24\n",
+            ),
+            ("requests-2.28.0.dist-info/WHEEL", b"Wheel-Version: 1.0\n"),
+        ]);
+        let sha = hex::encode(Sha256::digest(&wheel));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "pypi",
+            name: "requests".into(),
+            version: "2.28.0".into(),
+            purl: "pkg:pypi/requests@2.28.0".into(),
+            resolved: Some(format!(
+                "{}/packages/requests-2.28.0-py3-none-any.whl",
+                mock.uri()
+            )),
+            integrity: LockIntegrity::Sha256Hex(sha),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        // Wheel content at the root: a site-packages-shaped dir with the
+        // dist-info RECORD the pypi vendor backend stages from.
+        assert!(fetched.dir().join("requests/__init__.py").is_file());
+        assert!(fetched
+            .dir()
+            .join("requests-2.28.0.dist-info/RECORD")
+            .is_file());
+
+        // No recorded wheel URL (poetry/requirements) → Unverifiable.
+        let entry = LockfileEntry {
+            resolved: None,
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+            ..entry
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("wheel"), "{msg}"),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
     }
 
     #[test]
