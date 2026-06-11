@@ -389,6 +389,51 @@ mod host_guard {
         );
     }
 
+    /// Regression: a commented-out hook line is NOT a configured project.
+    ///
+    /// pip never installs a `# socket-patch[hook]` comment, and plain `setup`
+    /// (whose `requirements_add` strips comments before probing) would still
+    /// append the hook — but the `--check` probe read the raw file and saw the
+    /// marker inside the comment, reporting `configured` (exit 0) for a
+    /// project with no hook at all. Check and setup must agree on the same
+    /// bytes.
+    #[test]
+    fn pypi_check_ignores_commented_out_hook_host() {
+        const REQ_COMMENTED: &str = "requests==2.31.0\n# socket-patch[hook]\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let root_s = root.to_str().unwrap();
+        std::fs::write(root.join("requirements.txt"), REQ_COMMENTED).unwrap();
+        assert!(
+            !has_hook_line(REQ_COMMENTED),
+            "fixture: the commented-out line must not count as a hook line"
+        );
+
+        let (code, out, err) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);
+        assert_eq!(
+            code, 1,
+            "setup --check must FAIL (exit 1): a commented-out hook dep is not \
+             configured.\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        let v = parse_json(&out, "check (commented-out)");
+        assert_eq!(
+            json_str(&v, "status", "check (commented-out)"),
+            "needs_configuration",
+            "a commented-out hook line must report needs_configuration:\n{v}"
+        );
+        assert_eq!(
+            json_str(
+                &pth_entry(&v, "check (commented-out)"),
+                "status",
+                "check (commented-out) pth"
+            ),
+            "needs_configuration",
+            "the requirements.txt pth entry must read needs_configuration:\n{v}"
+        );
+        // --check must NEVER write.
+        assert_requirements(root, REQ_COMMENTED, "after check (commented-out)");
+    }
+
     /// Regression: classic-Poetry projects.
     ///
     /// `setup` writes the hook into a Poetry manifest as the *structural*

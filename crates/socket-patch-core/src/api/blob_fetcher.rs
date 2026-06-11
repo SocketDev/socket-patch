@@ -409,11 +409,10 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
             result.results.iter().filter(|r| !r.success).collect();
 
         for r in failed_results.iter().take(5) {
-            let short_hash = if r.hash.len() >= 12 {
-                &r.hash[..12]
-            } else {
-                &r.hash
-            };
+            // Truncate by characters, not bytes: the hash field carries
+            // arbitrary manifest strings, and a byte slice panics when index
+            // 12 lands inside a multibyte char.
+            let short_hash: String = r.hash.chars().take(12).collect();
             let err = r.error.as_deref().unwrap_or("unknown error");
             lines.push(format!("  - {}...: {}", short_hash, err));
         }
@@ -775,6 +774,34 @@ mod tests {
         let output = format_fetch_result(&result);
         // Hash is < 12 chars, should show full hash
         assert!(output.contains("abc..."));
+    }
+
+    #[test]
+    fn test_format_multibyte_hash_does_not_panic() {
+        // Regression: the failed-blob detail line truncated `hash` with a
+        // byte slice (`&r.hash[..12]`). The hash field carries arbitrary
+        // manifest strings (afterHash / patch uuid); when byte 12 falls
+        // inside a multibyte char the slice panicked ("byte index 12 is not
+        // a char boundary"), crashing apply/repair/rollback human output
+        // instead of reporting the failed download.
+        let hash = format!("{}→tail-of-corrupted-hash", "a".repeat(11));
+        let result = FetchMissingBlobsResult {
+            total: 1,
+            downloaded: 0,
+            failed: 1,
+            skipped: 0,
+            results: vec![BlobFetchResult {
+                hash,
+                success: false,
+                error: Some("Invalid hash format".into()),
+            }],
+        };
+        let output = format_fetch_result(&result);
+        assert!(output.contains("Failed to download 1 blob(s)"));
+        assert!(
+            output.contains("aaaaaaaaaaa→..."),
+            "12-char prefix expected: {output:?}"
+        );
     }
 
     #[test]

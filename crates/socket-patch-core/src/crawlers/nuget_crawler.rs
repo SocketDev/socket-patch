@@ -110,6 +110,16 @@ impl NuGetCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) {
+                // SECURITY: the coordinates are untrusted manifest input
+                // joined onto the package root and then patched IN PLACE
+                // (NuGet has no redirect backend). Reject anything that
+                // could traverse out of the root before touching the
+                // filesystem — `verify_nuget_package` only checks for
+                // `lib/` or a `.nuspec`, so it is no defense.
+                if !is_safe_nuget_coordinate(name, version) {
+                    continue;
+                }
+
                 // Try global cache layout: <lowercase-name>/<lowercase-version>/.
                 // NuGet lowercases BOTH the id and the version when it lays
                 // out the global packages folder, so a prerelease tag like
@@ -337,12 +347,40 @@ impl Default for NuGetCrawler {
     }
 }
 
+/// Whether the PURL-derived NuGet coordinates are safe to join onto the
+/// package root in [`NuGetCrawler::find_by_purls`].
+///
+/// The name and version come straight from the (untrusted) manifest PURL.
+/// Each is used as a single path segment in the global-cache layout and as
+/// part of the `<Name>.<Version>` directory name in the legacy layout, after
+/// which the resolved directory is patched IN PLACE (NuGet has no redirect
+/// backend) — so a tampered PURL must not be able to traverse out of the
+/// root. A real NuGet id/version never contains a separator, a `.`/`..`
+/// segment, a backslash, or a NUL. Fails closed. Mirrors the
+/// maven/go/deno/npm crawler coordinate guards.
+fn is_safe_nuget_coordinate(name: &str, version: &str) -> bool {
+    let safe_segment = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+    };
+    safe_segment(name) && safe_segment(version)
+}
+
 /// Get the NuGet global packages folder.
 ///
 /// Checks `NUGET_PACKAGES` env var, falls back to `~/.nuget/packages/`.
 fn nuget_home() -> PathBuf {
+    // NuGet itself treats an empty NUGET_PACKAGES as unset and falls back
+    // to the default folder; honoring "" here would make global discovery
+    // probe `is_dir("")` and silently scan nothing.
     if let Ok(custom) = std::env::var("NUGET_PACKAGES") {
-        return PathBuf::from(custom);
+        if !custom.is_empty() {
+            return PathBuf::from(custom);
+        }
     }
 
     let home = std::env::var("HOME")
@@ -911,6 +949,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_nuget_home_env_var() {
         // Test that NUGET_PACKAGES env var is respected
         let custom = "/tmp/test-nuget-packages";
@@ -918,6 +957,86 @@ mod tests {
         let home = nuget_home();
         assert_eq!(home, PathBuf::from(custom));
         std::env::remove_var("NUGET_PACKAGES");
+    }
+
+    /// Regression: NuGet itself treats an empty `NUGET_PACKAGES` as unset
+    /// and falls back to `~/.nuget/packages` (its settings layer checks
+    /// IsNullOrEmpty). Honoring the empty string here produced
+    /// `PathBuf::from("")`, which fails the `is_dir` probe — so global-mode
+    /// discovery silently scanned nothing instead of the real cache.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_nuget_home_empty_env_var_falls_back_to_default() {
+        let prev = std::env::var("NUGET_PACKAGES").ok();
+        std::env::set_var("NUGET_PACKAGES", "");
+        let home = nuget_home();
+        match prev {
+            Some(v) => std::env::set_var("NUGET_PACKAGES", v),
+            None => std::env::remove_var("NUGET_PACKAGES"),
+        }
+        assert!(
+            home.ends_with(Path::new(".nuget").join("packages")),
+            "empty NUGET_PACKAGES must fall back to ~/.nuget/packages, got {home:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_nuget_coordinate() {
+        // Real coordinates pass, including dotted ids and prerelease tags.
+        assert!(is_safe_nuget_coordinate("Newtonsoft.Json", "13.0.3"));
+        assert!(is_safe_nuget_coordinate("Contoso.Widgets", "2.0.0-RC1"));
+        assert!(is_safe_nuget_coordinate("xunit", "2.6.2+build.5"));
+
+        // Traversal / separator smuggling fails closed.
+        assert!(!is_safe_nuget_coordinate("..", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("../escaped", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a/b", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a\\b", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a\0b", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a", ".."));
+        assert!(!is_safe_nuget_coordinate("a", "../../escaped/1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a", "1/0"));
+        assert!(!is_safe_nuget_coordinate("a", "."));
+        assert!(!is_safe_nuget_coordinate("", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a", ""));
+    }
+
+    /// SECURITY regression: a tampered manifest PURL whose name or version
+    /// carries a `..`/separator must NOT resolve to a directory outside the
+    /// scanned package root. NuGet patches are applied IN PLACE at the
+    /// directory the crawler returns (no redirect backend stands between
+    /// resolution and disk), so an escape means an arbitrary out-of-tree
+    /// write. `verify_nuget_package` only checks for `lib/` or a `.nuspec`,
+    /// which does nothing to stop traversal — hence the fail-closed
+    /// coordinate guard. Twin of the maven/go/deno/npm crawler guards.
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_coordinate() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        // The intermediate name dir must exist for the OS to resolve the
+        // `..` in the version-traversal probe below.
+        tokio::fs::create_dir_all(cache.join("foo")).await.unwrap();
+
+        // An out-of-tree directory that DOES verify (has `lib/`), so the
+        // only thing standing between the attacker and a match is the guard.
+        let escaped = root.path().join("escaped").join("1.0.0");
+        tokio::fs::create_dir_all(escaped.join("lib"))
+            .await
+            .unwrap();
+
+        let purls = vec![
+            // name traversal: cache/../escaped/1.0.0 == root/escaped/1.0.0
+            "pkg:nuget/../escaped@1.0.0".to_string(),
+            // version traversal: cache/foo/../../escaped/1.0.0
+            "pkg:nuget/foo@../../escaped/1.0.0".to_string(),
+        ];
+
+        let crawler = NuGetCrawler::new();
+        let result = crawler.find_by_purls(&cache, &purls).await.unwrap();
+        assert!(
+            result.is_empty(),
+            "traversal PURL must not resolve to an out-of-tree directory, got {result:?}"
+        );
     }
 
     /// `".1.0.0"` — first match-index of `.` is `i=0` (followed by

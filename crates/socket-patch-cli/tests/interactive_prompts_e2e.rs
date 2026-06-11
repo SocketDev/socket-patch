@@ -39,6 +39,12 @@ fn binary() -> PathBuf {
 /// before sending input — the PTY buffers the input until the
 /// child reads it, so timing-coupling isn't needed.
 fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
+    run_in_pty_bytes(args, cwd, input.as_bytes(), timeout)
+}
+
+/// Byte-level variant of [`run_in_pty`] for input that is not valid
+/// UTF-8 (e.g. a Latin-1 paste at an interactive prompt).
+fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) -> (i32, String) {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -92,7 +98,7 @@ fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32
     // no pre-sleep is needed — dialoguer/rustyline will read it when
     // their prompt loop polls stdin.
     let mut writer = pair.master.take_writer().expect("take writer");
-    let _ = writer.write_all(input.as_bytes());
+    let _ = writer.write_all(input);
     let _ = writer.flush();
     drop(writer);
 
@@ -344,6 +350,58 @@ fn remove_interactive_n_cancels() {
     assert_eq!(
         manifest, original,
         "remove 'n' must not mutate the manifest at all"
+    );
+}
+
+#[test]
+fn remove_interactive_non_utf8_answer_declines_without_panic() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_remove_manifest(tmp.path());
+
+    // A terminal can deliver non-UTF-8 bytes at the prompt (e.g. a
+    // Latin-1 paste: `é` = 0xE9); `read_line` reports them as an
+    // InvalidData error. Regression: `confirm()` unwrapped that error
+    // and panicked (exit 101) instead of treating the garbage like any
+    // other unrecognized answer (decline).
+    let (code, output) = run_in_pty_bytes(
+        &[
+            "remove",
+            "pkg:npm/__interactive_remove__@1.0.0",
+            "--skip-rollback",
+        ],
+        tmp.path(),
+        b"\xE9\n",
+        Duration::from_secs(15),
+    );
+    assert!(
+        !output.contains("panicked"),
+        "non-UTF-8 answer must not panic the CLI; got: {output}"
+    );
+    assert_eq!(
+        code, 0,
+        "non-UTF-8 answer must decline cleanly, not crash; got: {output}"
+    );
+    // The interactive confirm MUST have run (same vacuity guard as the
+    // y/n tests above), and the unreadable answer must land on "no".
+    assert!(
+        output.contains("Remove 1 patch(es) and rollback files?"),
+        "remove must have shown the interactive confirm prompt; got: {output}"
+    );
+    assert!(
+        !output.contains("Non-interactive mode"),
+        "remove must NOT have taken the non-interactive branch in a PTY; got: {output}"
+    );
+    assert!(
+        output.contains("Removal cancelled"),
+        "non-UTF-8 answer must be treated as 'no'; got: {output}"
+    );
+    // Declined: the manifest entry must be intact.
+    let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let original: serde_json::Value = serde_json::from_str(REMOVE_MANIFEST).unwrap();
+    assert_eq!(
+        manifest, original,
+        "declined remove must not mutate the manifest"
     );
 }
 

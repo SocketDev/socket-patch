@@ -120,6 +120,10 @@ pub async fn run(args: ListArgs) -> i32 {
 
             if args.common.json {
                 println!("{}", build_list_envelope(&manifest).to_pretty_json());
+            } else if args.common.silent {
+                // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the
+                // entire human-readable listing, mirroring `get`/`repair`.
+                // The exit code still distinguishes the manifest states.
             } else if patch_entries.is_empty() {
                 println!("No patches found in manifest.");
             } else {

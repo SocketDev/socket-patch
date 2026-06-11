@@ -380,6 +380,46 @@ fn repair_gc_alias_accepts_flags() {
     assert_eq!(snapshot(&args), expected);
 }
 
+/// Regression: an exported-but-empty `SOCKET_DOWNLOAD_ONLY=` — the shell/CI
+/// idiom for blanking a variable without unsetting it — must mean "unset,
+/// fall back to the default (false)", not abort every `repair` invocation
+/// with a ValueValidation error. The flattened `GlobalArgs` bool flags
+/// already have this semantic via `parse_bool_flag`; `repair`'s own
+/// `--download-only` env binding must match (it is also outside
+/// `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var scrub never rescues it).
+#[test]
+#[serial_test::serial]
+fn empty_download_only_env_var_parses_as_false_not_crash() {
+    let _scrub = EnvScrub::new();
+    std::env::set_var("SOCKET_DOWNLOAD_ONLY", "");
+    let parsed = Cli::try_parse_from(["socket-patch", "repair"]);
+    std::env::remove_var("SOCKET_DOWNLOAD_ONLY");
+    let cli = parsed.expect("empty SOCKET_DOWNLOAD_ONLY must not abort the parse");
+    match cli.command {
+        Commands::Repair(a) => assert!(
+            !a.download_only,
+            "empty SOCKET_DOWNLOAD_ONLY must resolve to false"
+        ),
+        _ => panic!("expected Repair"),
+    }
+}
+
+/// The truthy env spellings keep working through the empty-string fix:
+/// `SOCKET_DOWNLOAD_ONLY=1` must set the flag exactly like `--download-only`.
+#[test]
+#[serial_test::serial]
+fn truthy_download_only_env_var_sets_flag() {
+    let _scrub = EnvScrub::new();
+    std::env::set_var("SOCKET_DOWNLOAD_ONLY", "1");
+    let parsed = Cli::try_parse_from(["socket-patch", "repair"]);
+    std::env::remove_var("SOCKET_DOWNLOAD_ONLY");
+    let cli = parsed.expect("SOCKET_DOWNLOAD_ONLY=1 must parse");
+    match cli.command {
+        Commands::Repair(a) => assert!(a.download_only),
+        _ => panic!("expected Repair"),
+    }
+}
+
 #[test]
 #[serial_test::serial]
 fn repair_unknown_flag_is_unknown_argument_error() {

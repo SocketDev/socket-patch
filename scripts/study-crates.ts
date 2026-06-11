@@ -41,9 +41,11 @@
  *                             {abspath}, {crate}, {name}, {stem}, {relInCrate}.
  *   --prompt-file <path>      TS/JS module whose default export is
  *                             (ctx: FileCtx) => string (or { render(ctx) }).
- *                             Takes precedence over --prompt.
+ *                             Takes precedence over --prompt. May also
+ *                             `export const model = "..."` to pin a model.
  *   --out <dir>               Output dir (default: study-output).
- *   --model <model>           Model passed to claude --model.
+ *   --model <model>           Model passed to claude --model. Overrides a
+ *                             prompt-file's `model` export.
  *   --filter <regex>          Only files whose repo-relative path matches.
  *   --crate <name>            Limit to a single crate dir name.
  *   --target <src|tests|all>  Which files to study (default: src). `tests`
@@ -51,7 +53,8 @@
  *                             harnesses, shared setup modules); `all` does both.
  *   --tests                   Shorthand for --target tests.
  *   --concurrency <n>         Parallel sessions (default: 1 = sequential).
- *   --timeout <sec>           Per-file timeout in seconds (default: 1800).
+ *   --timeout <sec>           Per-file timeout in seconds (default: none —
+ *                             sessions run until completion).
  *   --dry-run                 List files + rendered prompts; run nothing.
  *   -h, --help                Show this help.
  *
@@ -166,7 +169,7 @@ function parseArgs(argv: string[]): Args {
     out: "study-output",
     target: "src",
     concurrency: 1,
-    timeoutSec: 1800,
+    timeoutSec: Infinity,
     offset: 0,
     dryRun: false,
     help: false,
@@ -213,9 +216,14 @@ function parseArgs(argv: string[]): Args {
       case "--concurrency":
         a.concurrency = Math.max(1, parseInt(next(), 10) || 1);
         break;
-      case "--timeout":
-        a.timeoutSec = Math.max(1, parseInt(next(), 10) || 1800);
+      case "--timeout": {
+        const v = parseInt(next(), 10);
+        if (!Number.isFinite(v) || v < 1) {
+          fail(`--timeout must be a positive number of seconds`);
+        }
+        a.timeoutSec = v;
         break;
+      }
       case "--offset":
         a.offset = Math.max(0, parseInt(next(), 10) || 0);
         break;
@@ -245,8 +253,10 @@ Usage: npx tsx scripts/study-crates.ts [options]
   -p, --prompt <template>   Prompt template. Placeholders: {file} {abspath}
                             {crate} {name} {stem} {relInCrate}.
   --prompt-file <path>      TS/JS module exporting default (ctx) => string.
+                            May also export const model = "..." to pin a model.
   --out <dir>               Output dir (default: study-output).
-  --model <model>           Model passed to claude --model.
+  --model <model>           Model passed to claude --model (overrides a
+                            prompt-file's model export).
   --filter <regex>          Only files whose repo-relative path matches.
   --crate <name>            Limit to a single crate dir name.
   --target <src|tests|all>  Which files to study (default: src).
@@ -257,7 +267,8 @@ Usage: npx tsx scripts/study-crates.ts [options]
                             all   = both src and tests.
   --tests                   Shorthand for --target tests.
   --concurrency <n>         Parallel sessions (default: 1).
-  --timeout <sec>           Per-file timeout in seconds (default: 1800).
+  --timeout <sec>           Per-file timeout in seconds (default: none —
+                            sessions run until completion).
   --offset <n>              Skip the first <n> files in the deterministic order
                             (default: 0). Use to resume after a crash.
   --dry-run                 List files + rendered prompts; run nothing.
@@ -354,6 +365,8 @@ async function loadRenderer(args: Args): Promise<PromptRenderer> {
   if (args.promptFile) {
     const modPath = resolve(process.cwd(), args.promptFile);
     const mod = await import(pathToFileURL(modPath).href);
+    // Prompt modules may pin a model via `export const model = "..."`.
+    if (!args.model && typeof mod.model === "string") args.model = mod.model;
     const candidate = mod.default ?? mod.render ?? mod;
     if (typeof candidate === "function") return candidate as PromptRenderer;
     if (candidate && typeof candidate.render === "function") {
@@ -418,10 +431,12 @@ function runOne(
     let timedOut = false;
     const start = Date.now();
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, args.timeoutSec * 1000);
+    const timer = Number.isFinite(args.timeoutSec)
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, args.timeoutSec * 1000)
+      : undefined;
 
     const rl = createInterface({ input: child.stdout });
     rl.on("line", (line) => {
@@ -724,6 +739,7 @@ async function main(): Promise<void> {
         : args.target === "all"
           ? "source + test"
           : "non-test source";
+    if (args.model) console.log(`Model: ${args.model}\n`);
     console.log(`Discovered ${files.length} ${label} file(s):\n`);
     files.forEach((ctx, i) => {
       // Global index (incl. --offset) so the printed number is the value to
@@ -759,7 +775,9 @@ async function main(): Promise<void> {
 
   console.log(
     `Studying ${files.length} file(s) with ${CLAUDE_BIN} ` +
-      `(concurrency ${args.concurrency}, timeout ${args.timeoutSec}s).`,
+      `(concurrency ${args.concurrency}, timeout ${
+        Number.isFinite(args.timeoutSec) ? `${args.timeoutSec}s` : "none"
+      }).`,
   );
   console.log(`Output → ${outDir}`);
 

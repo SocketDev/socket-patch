@@ -84,11 +84,15 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
         return Ok(CowAction::BrokeSymlink);
     }
 
-    // Regular file. Hardlink defense is Unix-only — see module docs.
+    // Hardlink defense is Unix-only — see module docs. The break only
+    // makes sense for regular files: a directory always has nlink >= 2
+    // (read() would fail EISDIR), and read() on a hardlinked FIFO blocks
+    // forever waiting for a writer. Non-regular inodes are not cow's
+    // problem — leave them untouched.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if lstat.nlink() > 1 {
+        if lstat.is_file() && lstat.nlink() > 1 {
             // Atomic-rename-over-self pattern: copy our content into
             // a fresh inode, then rename over the original. The other
             // links keep pointing at the original inode (which now
@@ -348,6 +352,53 @@ mod tests {
             CowAction::AlreadyPrivate
         );
         assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// Non-regular inodes must never be routed into the hardlink
+    /// break: `read()` on a FIFO blocks forever waiting for a writer,
+    /// so a hardlinked FIFO (`nlink == 2`) at a patched path would
+    /// hang the whole apply. It must come back promptly as
+    /// `AlreadyPrivate` — content-copying only makes sense for
+    /// regular files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardlinked_fifo_is_not_routed_into_hardlink_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let link = dir.path().join("pipe-link");
+        tokio::fs::hard_link(&fifo, &link).await.unwrap();
+
+        let action = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            break_hardlink_if_needed(&link),
+        )
+        .await
+        .expect("must not block reading the FIFO")
+        .unwrap();
+        assert_eq!(action, CowAction::AlreadyPrivate);
+        assert_eq!(leftover_stage_count(dir.path()), 0);
+    }
+
+    /// A directory always has `nlink >= 2` on Unix, which a bare
+    /// `nlink > 1` check misreads as a hardlinked file — `read()` then
+    /// fails EISDIR instead of the documented no-op. Directories are
+    /// not cow's problem; report `AlreadyPrivate` and leave them
+    /// untouched.
+    #[tokio::test]
+    async fn directory_is_not_routed_into_hardlink_break() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("pkg-subdir");
+        tokio::fs::create_dir(&d).await.unwrap();
+        tokio::fs::create_dir(d.join("child")).await.unwrap();
+
+        let action = break_hardlink_if_needed(&d).await.unwrap();
+        assert_eq!(action, CowAction::AlreadyPrivate);
+        assert!(tokio::fs::metadata(&d).await.unwrap().is_dir());
     }
 
     /// Idempotency: calling twice in a row on a regular file is fine

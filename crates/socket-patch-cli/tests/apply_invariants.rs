@@ -150,6 +150,147 @@ fn assert_summary_all_zero(summary: &serde_json::Value) {
     }
 }
 
+const SCOPED_NPM_PURL: &str = "pkg:npm/scopedpkg@1.0.0";
+const SCOPED_ORIGINAL: &[u8] = b"module.exports = function vulnerable() { return 'pwn'; };\n";
+const SCOPED_PATCHED: &[u8] = b"module.exports = function safe() { return 'ok'; };\n";
+
+/// Git SHA-256: `SHA256("blob <len>\0" ++ content)`. Computed
+/// independently here so the manifest hashes are NOT derived from the
+/// code under test (no circular oracle).
+fn git_sha256(content: &[u8]) -> String {
+    let header = format!("blob {}\0", content.len());
+    let mut hasher = Sha256::new();
+    hasher.update(header.as_bytes());
+    hasher.update(content);
+    hex::encode(hasher.finalize())
+}
+
+/// Lay down a project with TWO manifest patches:
+///   - an npm patch that is fully applicable offline (package installed,
+///     patched blob present in `.socket/blobs/`), and
+///   - a pypi patch whose blob is missing from `.socket/` entirely.
+///
+/// Used to prove the offline no-local-source guard is scoped to the
+/// patches the run can actually apply (`--ecosystems` filter).
+fn write_mixed_scope_project(root: &Path) {
+    let before = git_sha256(SCOPED_ORIGINAL);
+    let after = git_sha256(SCOPED_PATCHED);
+
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"scope-test","version":"0.0.0"}"#,
+    )
+    .expect("write package.json");
+
+    let pkg = root.join("node_modules").join("scopedpkg");
+    std::fs::create_dir_all(&pkg).expect("create package dir");
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"scopedpkg","version":"1.0.0"}"#,
+    )
+    .expect("write pkg package.json");
+    std::fs::write(pkg.join("index.js"), SCOPED_ORIGINAL).expect("write index.js");
+
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).expect("create blobs");
+    std::fs::write(socket.join("blobs").join(&after), SCOPED_PATCHED).expect("write blob");
+    let manifest = format!(
+        r#"{{
+  "patches": {{
+    "{SCOPED_NPM_PURL}": {{
+      "uuid": "33333333-3333-4333-8333-333333333333",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "in-scope npm patch with local sources",
+      "license": "MIT",
+      "tier": "free"
+    }},
+    "pkg:pypi/__ghost_pkg__@9.9.9": {{
+      "uuid": "44444444-4444-4444-8444-444444444444",
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {{
+        "ghost.py": {{
+          "beforeHash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "afterHash":  "3333333333333333333333333333333333333333333333333333333333333333"
+        }}
+      }},
+      "vulnerabilities": {{}},
+      "description": "out-of-scope pypi patch with NO local source",
+      "license": "MIT",
+      "tier": "free"
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(socket.join("manifest.json"), manifest).expect("write manifest");
+}
+
+/// Regression: the `--offline` no-local-source guard (and the download
+/// planner feeding it) must only consider patches that are in scope for
+/// THIS run. A patch filtered out by `--ecosystems` — or belonging to an
+/// ecosystem this build can't apply at all — will never be applied, so
+/// its missing `.socket/` sources must not fail a run whose in-scope
+/// patches are all locally applicable.
+///
+/// Before the fix, the guard scanned the WHOLE manifest: here the
+/// out-of-scope pypi patch (no blob on disk) tripped the offline bail and
+/// the fully-applicable npm patch was never applied (exit 1, no events).
+#[test]
+fn offline_ecosystems_filter_ignores_out_of_scope_missing_source() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_mixed_scope_project(tmp.path());
+
+    let (code, stdout) = run_apply(
+        tmp.path(),
+        &["--offline", "--silent", "--ecosystems", "npm"],
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("apply --json must emit valid JSON");
+    assert_eq!(
+        code, 0,
+        "all in-scope (npm) patches have local sources; the out-of-scope pypi \
+         patch must not trip the offline bail. envelope:\n{v}"
+    );
+    assert_eq!(v["status"], "success", "expected a clean apply, got {v}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == SCOPED_NPM_PURL),
+        "the in-scope npm patch must actually be applied; got {events:?}"
+    );
+    // The patched bytes really landed on disk.
+    assert_eq!(
+        std::fs::read(
+            tmp.path()
+                .join("node_modules")
+                .join("scopedpkg")
+                .join("index.js")
+        )
+        .expect("read patched file"),
+        SCOPED_PATCHED,
+        "in-scope npm patch must be written to disk"
+    );
+
+    // CONTROL: the same fixture WITHOUT the `--ecosystems` filter puts the
+    // sourceless pypi patch in scope, so the documented offline bail must
+    // still fire — the fix scopes the guard, it does not disable it.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    write_mixed_scope_project(tmp2.path());
+    let (code2, stdout2) = run_apply(tmp2.path(), &["--offline", "--silent"]);
+    assert_eq!(
+        code2, 1,
+        "with no ecosystem filter the sourceless pypi patch is in scope and \
+         must still trip the offline bail; stdout=\n{stdout2}"
+    );
+    let v2: serde_json::Value =
+        serde_json::from_str(&stdout2).expect("apply --json must emit valid JSON");
+    assert_eq!(v2["status"], "partialFailure", "{v2}");
+}
+
 #[test]
 fn offline_with_missing_source_emits_partial_failure() {
     let tmp = tempfile::tempdir().expect("tempdir");

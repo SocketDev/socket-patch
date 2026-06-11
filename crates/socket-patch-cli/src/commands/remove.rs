@@ -71,7 +71,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         socket_dir,
         Command::Remove,
         args.common.json,
-        false, // remove has no --silent on its own; use false
+        args.common.silent,
         false, // remove has no --dry-run
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
         args.common.break_lock,
@@ -135,7 +135,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // to multiple manifest entries (PyPI release variants), make the
     // blast radius explicit so the user understands why a single
     // `remove pkg:pypi/foo@1.0` is removing several variants.
-    if !args.common.json {
+    if !args.common.json && !args.common.silent {
         if args.identifier.starts_with("pkg:")
             && !args.identifier.contains('?')
             && matching.len() > 1
@@ -164,7 +164,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     let prompt = format!("Remove {} patch(es) and rollback files?", matching.len());
     if !confirm(&prompt, true, args.common.yes, args.common.json) {
-        if !args.common.json {
+        if !args.common.json && !args.common.silent {
             println!("Removal cancelled.");
         }
         return 0;
@@ -173,7 +173,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // First, rollback the patch if not skipped
     let mut rollback_count = 0;
     if !args.skip_rollback {
-        if !args.common.json {
+        if !args.common.json && !args.common.silent {
             println!("Rolling back patch before removal...");
         }
         match rollback_patches(
@@ -181,7 +181,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             &manifest_path,
             Some(&args.identifier),
             false,
-            args.common.json, // silent when JSON
+            args.common.json || args.common.silent,
             args.common.offline,
             args.common.global,
             args.common.global_prefix.clone(),
@@ -220,7 +220,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .filter(|r| r.success && all_files_already_original(r))
                     .count();
 
-                if !args.common.json {
+                if !args.common.json && !args.common.silent {
                     if rollback_count > 0 {
                         println!("Rolled back {rollback_count} package(s)");
                     }
@@ -262,7 +262,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 return 1;
             }
 
-            if !args.common.json {
+            if !args.common.json && !args.common.silent {
                 println!("Removed {} patch(es) from manifest:", removed.len());
                 for purl in &removed {
                     println!("  - {purl}");
@@ -276,7 +276,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             let mut blobs_removed = 0;
             if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
                 blobs_removed = cleanup_result.blobs_removed;
-                if !args.common.json && cleanup_result.blobs_removed > 0 {
+                if !args.common.json && !args.common.silent && cleanup_result.blobs_removed > 0 {
                     println!("\n{}", format_cleanup_result(&cleanup_result, false));
                 }
             }

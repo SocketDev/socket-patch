@@ -26,7 +26,7 @@ use socket_patch_core::vex::{
     VendorContext, VerifyOutcome,
 };
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
@@ -55,10 +55,18 @@ pub struct VexArgs {
     /// emitted; this flag flips that off — useful when generating a
     /// VEX doc on a build machine that doesn't have the patched files
     /// laid out yet.
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1` (or
+    /// an exported-but-empty `SOCKET_VEX_NO_VERIFY=`) aborted the parse.
+    /// This var is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var
+    /// scrub never rescues it.
     #[arg(
         long = "no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = parse_bool_flag,
     )]
     pub no_verify: bool,
 
@@ -69,7 +77,12 @@ pub struct VexArgs {
     pub doc_id: Option<String>,
 
     /// Emit compact JSON instead of pretty-printed.
-    #[arg(long = "compact", env = "SOCKET_VEX_COMPACT", default_value_t = false)]
+    #[arg(
+        long = "compact",
+        env = "SOCKET_VEX_COMPACT",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
     pub compact: bool,
 }
 
@@ -96,10 +109,16 @@ pub struct VexEmbedArgs {
 
     /// Skip the on-disk file-hash check when building the VEX document and
     /// trust the manifest. See `socket-patch vex --no-verify`.
+    ///
+    /// `value_parser = parse_bool_flag`: these embedded flags share their
+    /// env vars with the standalone `vex` flags, so without it an ambient
+    /// `SOCKET_VEX_NO_VERIFY=1` (or `=`) aborted every host command parse —
+    /// including `apply` running from a postinstall hook.
     #[arg(
         long = "vex-no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = parse_bool_flag,
     )]
     pub vex_no_verify: bool,
 
@@ -111,7 +130,8 @@ pub struct VexEmbedArgs {
     #[arg(
         long = "vex-compact",
         env = "SOCKET_VEX_COMPACT",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = parse_bool_flag,
     )]
     pub vex_compact: bool,
 }
@@ -304,7 +324,12 @@ pub(crate) async fn generate_vex(
             ..Default::default()
         }
     } else {
-        let package_paths = resolve_package_paths(common, manifest).await;
+        // stdout belongs to machine output here: the envelope in `--json`
+        // mode, or the VEX document itself when `output` is None. Silence
+        // the dispatch's human chrome ("Using <X> at: ...") in both,
+        // mirroring apply/rollback's `silent || json` gating.
+        let quiet = common.silent || common.json || params.output.is_none();
+        let package_paths = resolve_package_paths(common, manifest, quiet).await;
         let vendor = load_vendor_context(common, manifest).await;
         socket_patch_core::vex::applied_patches_with_vendor(
             manifest,
@@ -624,6 +649,7 @@ fn are_safe_go_redirect_coords(module: &str, version: &str) -> bool {
 async fn resolve_package_paths(
     common: &GlobalArgs,
     manifest: &PatchManifest,
+    quiet: bool,
 ) -> HashMap<String, PathBuf> {
     let purls: Vec<String> = manifest.patches.keys().cloned().collect();
     let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
@@ -644,7 +670,7 @@ async fn resolve_package_paths(
     // as `package_not_found`. The rollback variant fans each base path
     // back out to every qualified manifest PURL — the same mapping the
     // manifest was written with (`get` uses the same resolver).
-    find_packages_for_rollback(&partitioned, &crawler_options, common.silent).await
+    find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
 fn emit_envelope_error(args: &VexArgs, code: &str, message: &str) {

@@ -154,7 +154,7 @@ fn report_no_files(args: &SetupArgs, status: &str, counts: &[(&str, i64)]) -> i3
             "{}",
             serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
         );
-    } else {
+    } else if !args.common.silent {
         println!("No package.json, Python, Bundler, or Composer project found");
     }
     0
@@ -828,8 +828,11 @@ async fn append_patch_consistency_entries(
         global_prefix: common.global_prefix.clone(),
         batch_size: 0, // unused for find_packages_for_rollback
     };
+    // `--json` reserves stdout for the check report: silence the dispatch's
+    // human chrome ("Using <X> at: ...") like apply/rollback do.
     let package_paths =
-        find_packages_for_rollback(&partitioned, &crawler_options, common.silent).await;
+        find_packages_for_rollback(&partitioned, &crawler_options, common.silent || common.json)
+            .await;
 
     let outcome = applied_patches(&manifest, &package_paths).await;
     for failed in &outcome.failed {
@@ -875,7 +878,10 @@ enum CheckState {
 /// (so `--dry-run` is a harmless no-op here). Exits 0 only when all are
 /// configured and none failed to parse.
 async fn run_check(args: &SetupArgs) -> i32 {
-    if !args.common.json {
+    // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the entire
+    // human-readable report, mirroring `list`/`repair`/`get`/`remove`/`scan`.
+    // The exit code still distinguishes the configuration states.
+    if !args.common.json && !args.common.silent {
         println!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
@@ -987,7 +993,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
             }))
             .unwrap()
         );
-    } else {
+    } else if !args.common.silent {
         println!("\nConfiguration status:\n");
         for (_, path, state, err) in &entries {
             let rel = pathdiff(path, &args.common.cwd);
@@ -1032,7 +1038,11 @@ fn render_removed(new: &Option<String>) -> String {
 /// Python `socket-patch-hook` dependency). Honors `--dry-run`, `--yes`, `--json`.
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
-    if !common.json {
+    // `--silent` is "errors only" (CLI_CONTRACT.md): mute the human-readable
+    // chatter just like `--json` does; the mutation and exit code are
+    // unaffected, and prompting follows the shared `confirm()` semantics.
+    let quiet = common.json || common.silent;
+    if !quiet {
         println!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
@@ -1067,7 +1077,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         None => Vec::new(),
     };
 
-    if !common.json {
+    if !quiet {
         print_remove_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
@@ -1104,10 +1114,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 &extra_preview,
                 &[],
             );
-        } else if preview_errs > 0 {
-            println!("Nothing removed; {preview_errs} item(s) could not be processed (see errors above).");
-        } else {
-            println!("No socket-patch install hooks found to remove.");
+        } else if !common.silent {
+            if preview_errs > 0 {
+                println!("Nothing removed; {preview_errs} item(s) could not be processed (see errors above).");
+            } else {
+                println!("No socket-patch install hooks found to remove.");
+            }
         }
         return if preview_errs > 0 { 1 } else { 0 };
     }
@@ -1116,7 +1128,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     if common.dry_run {
         if common.json {
             print_remove_envelope("dry_run", &npm_preview, &py_preview, &extra_preview, &[]);
-        } else {
+        } else if !common.silent {
             println!("\nSummary:");
             println!("  {n_remove} item(s) would have socket-patch removed");
         }
@@ -1140,7 +1152,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         }
     }
 
-    if !common.json {
+    if !quiet {
         println!("\nRemoving changes...");
     }
     let mut npm_results = Vec::new();
@@ -1182,7 +1194,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
             &extra_results,
             &warnings,
         );
-    } else {
+    } else if !common.silent {
         let removed = npm_results
             .iter()
             .filter(|r| r.status == RemoveStatus::Removed)
@@ -1379,7 +1391,11 @@ fn print_remove_envelope(
 
 async fn run_setup(args: &SetupArgs) -> i32 {
     let common = &args.common;
-    if !common.json {
+    // `--silent` is "errors only" (CLI_CONTRACT.md): mute the human-readable
+    // chatter just like `--json` does; the mutation and exit code are
+    // unaffected, and prompting follows the shared `confirm()` semantics.
+    let quiet = common.json || common.silent;
+    if !quiet {
         println!("Configuring socket-patch install hooks...");
     }
 
@@ -1414,7 +1430,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 }))
                 .unwrap()
             );
-        } else {
+        } else if !common.silent {
             println!("No package.json, Python, Bundler, or Composer project found");
         }
         return 0;
@@ -1450,7 +1466,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         None => Vec::new(),
     };
 
-    if !common.json {
+    if !quiet {
         print_setup_preview(&npm_preview, &py_preview, &extra_preview, common);
     }
 
@@ -1488,10 +1504,12 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 py_plan.as_ref(),
                 &[],
             );
-        } else if preview_errors > 0 {
-            println!("No hooks were changed; {preview_errors} item(s) could not be processed (see errors above).");
-        } else {
-            println!("All install hooks are already configured with socket-patch!");
+        } else if !common.silent {
+            if preview_errors > 0 {
+                println!("No hooks were changed; {preview_errors} item(s) could not be processed (see errors above).");
+            } else {
+                println!("All install hooks are already configured with socket-patch!");
+            }
         }
         return if preview_errors > 0 { 1 } else { 0 };
     }
@@ -1507,7 +1525,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 py_plan.as_ref(),
                 &[],
             );
-        } else {
+        } else if !common.silent {
             println!("\nSummary (dry run):");
             println!("  {n_changes} item(s) would be updated");
         }
@@ -1530,7 +1548,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         }
     }
 
-    if !common.json {
+    if !quiet {
         println!("\nApplying changes...");
     }
 
@@ -1581,7 +1599,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             py_plan.as_ref(),
             &warnings,
         );
-    } else {
+    } else if !common.silent {
         let updated = npm_results
             .iter()
             .filter(|r| r.status == UpdateStatus::Updated)

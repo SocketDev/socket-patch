@@ -167,6 +167,92 @@ fn rollback_one_off_with_identifier_reports_not_implemented() {
     );
 }
 
+/// Regression: `SOCKET_ONE_OFF=1` must set `--one-off` exactly like the flag.
+/// clap's default bool parser accepts only the literal strings `true`/`false`
+/// from an env binding, so any other truthy spelling aborted every `rollback`
+/// invocation with a clap usage error (exit 2) before it could do any work.
+/// `value_parser = parse_bool_flag` gives the flag the same env vocabulary as
+/// the `GlobalArgs` bools. Reaching the one-off stub's "not yet implemented"
+/// envelope proves the env var landed as `true`.
+#[test]
+fn truthy_one_off_env_var_sets_flag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = rollback_cmd(tmp.path())
+        .env("SOCKET_ONE_OFF", "1")
+        .args(["--json", "33333333-3333-4333-8333-333333333333"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "SOCKET_ONE_OFF=1 must parse, not abort with a usage error; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("JSON envelope (a clap usage error means the env var aborted the parse)");
+    assert_eq!(v["status"], "error");
+    let err = v["error"].as_str().expect("error message string");
+    assert!(
+        err.contains("not yet implemented"),
+        "expected the one-off stub (proving one_off=true), got: {err}"
+    );
+}
+
+/// Regression: an exported-but-empty `SOCKET_ONE_OFF=` — the shell/CI idiom
+/// for blanking a variable without unsetting it — must mean "unset, fall back
+/// to false", not abort the run. (This flag is outside `GLOBAL_ARG_ENV_VARS`,
+/// so `main`'s empty-var scrub never rescues it; the parser itself must
+/// tolerate the empty string.) With one-off correctly off, a manifest-less
+/// rollback reaches the normal "Manifest not found" error.
+#[test]
+fn empty_one_off_env_var_parses_as_false_not_crash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = rollback_cmd(tmp.path())
+        .env("SOCKET_ONE_OFF", "")
+        .args(["--json"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "empty SOCKET_ONE_OFF must parse, not abort with a usage error; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("JSON envelope (a clap usage error means the env var aborted the parse)");
+    assert_eq!(v["status"], "error");
+    let err = v["error"].as_str().expect("error message string");
+    assert!(
+        err.contains("Manifest not found"),
+        "empty SOCKET_ONE_OFF must resolve to false (normal rollback path), got: {err}"
+    );
+}
+
+/// Human (non-JSON) one-off must surface the same not-implemented error the
+/// JSON envelope carries. Before the fix the human branch printed a
+/// misleading "One-off rollback mode: fetching patch data..." progress line
+/// — for work that never happens — and exited 1 with no error at all.
+#[test]
+fn rollback_one_off_human_reports_not_implemented_error() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = rollback_cmd(tmp.path())
+        .args(["--one-off", "33333333-3333-4333-8333-333333333333"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(1), "one-off mode must exit 1 today");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "human one-off must state the not-implemented error; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("fetching patch data"),
+        "must not print a progress line for work that never happens; stderr=\n{stderr}"
+    );
+}
+
 #[test]
 fn rollback_unknown_identifier_emits_error() {
     let tmp = tempfile::tempdir().expect("tempdir");

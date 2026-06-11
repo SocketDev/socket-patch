@@ -120,7 +120,18 @@ pub fn deps_contain_hook(text: &str) -> bool {
     // `setup`'s state probe), turning a trailing `socket-patch` plus a following
     // `[hook]` into a phantom marker — a false positive.
     text.lines().any(|line| {
-        let normalized: String = line
+        // Drop a `#` comment first (requirements.txt and TOML both comment
+        // with `#`): a commented-out `# socket-patch[hook]` declares nothing —
+        // pip never installs it — and a marker mentioned inside a trailing
+        // comment must not read as configured. Same first-`#` rule as
+        // `edit::strip_requirement_comment`, so the `setup --check` / state
+        // probes (which call this on raw file content) agree with the editors
+        // (which pre-strip) on identical bytes.
+        let spec = match line.find('#') {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let normalized: String = spec
             .to_lowercase()
             .chars()
             .filter(|c| !c.is_whitespace())
@@ -177,6 +188,26 @@ mod tests {
         assert!(deps_contain_hook(requirements));
         let pyproject = "dependencies = [\n  \"requests\",\n  \"socket-patch[hook]>=3.3.0\",\n]\n";
         assert!(deps_contain_hook(pyproject));
+    }
+
+    #[test]
+    fn test_deps_contain_hook_commented_out_is_not_declared() {
+        // A commented-out spec declares nothing: pip never installs it, and
+        // the edit path (`requirements_add` strips comments before probing)
+        // would still add the hook — so the state probe / `setup --check`
+        // must not read it as configured.
+        assert!(!deps_contain_hook(
+            "# socket-patch[hook]\nrequests==2.31.0\n"
+        ));
+        // A marker mentioned inside another dep's trailing comment is not a
+        // declaration either.
+        assert!(!deps_contain_hook(
+            "requests==2.31.0  # TODO: add socket-patch[hook]\n"
+        ));
+        // But a real spec WITH a trailing comment is still declared.
+        assert!(deps_contain_hook(
+            "socket-patch[hook]  # the .pth carrier\n"
+        ));
     }
 
     #[test]

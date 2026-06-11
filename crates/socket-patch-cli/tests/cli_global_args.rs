@@ -641,6 +641,67 @@ const GLOBAL_ENV_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
 ];
 
+/// An exported-but-**empty** non-bool env var must mean "unset", not crash.
+///
+/// `parse_bool_flag` gave the *bool* globals the empty-means-false semantic,
+/// but `SOCKET_CWD=`, `SOCKET_GLOBAL_PREFIX=`, `SOCKET_LOCK_TIMEOUT=` and
+/// `SOCKET_ECOSYSTEMS=` (the same blank-without-unsetting shell/CI idiom)
+/// still aborted every subcommand at clap-parse time ("a value is required" /
+/// "cannot parse integer from empty string"), and empty
+/// `SOCKET_DOWNLOAD_MODE=` / `SOCKET_MANIFEST_PATH=` leaked `""` past the
+/// documented defaults. The binary now scrubs empty `GlobalArgs` env vars
+/// before clap parses (`args::scrub_empty_global_env_vars` in `main`),
+/// restoring the documented CLI > env > default precedence for blank vars.
+/// This spawns the real binary because the scrub is `main` wiring.
+#[test]
+#[serial_test::serial]
+fn empty_nonbool_env_vars_do_not_crash_the_binary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.current_dir(tmp.path());
+    // Start from a clean slate (no ambient SOCKET_* bleed into the child)…
+    for var in GLOBAL_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    // …then export every non-bool global blank, the way `VAR=` does.
+    for var in [
+        "SOCKET_CWD",
+        "SOCKET_MANIFEST_PATH",
+        "SOCKET_GLOBAL_PREFIX",
+        "SOCKET_LOCK_TIMEOUT",
+        "SOCKET_ECOSYSTEMS",
+        "SOCKET_DOWNLOAD_MODE",
+    ] {
+        cmd.env(var, "");
+    }
+    // Keep the spawned process from attempting telemetry network calls.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+
+    let out = cmd
+        .args(["list", "--json"])
+        .output()
+        .expect("spawn socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "blank env vars must not abort the clap parse.\nstderr: {stderr}",
+    );
+    // The command must reach normal execution: with the blanks treated as
+    // unset, `list --json` in an empty temp dir resolves the default manifest
+    // path and emits the manifest_not_found envelope (exit 1).
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("expected a JSON envelope on stdout, got {e}.\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        envelope["error"]["code"], "manifest_not_found",
+        "blank env vars must fall back to defaults: {envelope}",
+    );
+    assert_eq!(out.status.code(), Some(1), "manifest_not_found exits 1");
+}
+
 fn save_and_clear_global_env() -> Vec<(&'static str, Option<String>)> {
     let saved: Vec<(&'static str, Option<String>)> = GLOBAL_ENV_VARS
         .iter()

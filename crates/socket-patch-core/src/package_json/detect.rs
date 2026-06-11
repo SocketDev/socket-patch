@@ -67,9 +67,17 @@ pub fn is_setup_configured(package_json: &serde_json::Value) -> ScriptSetupStatu
     }
 }
 
+/// Strip a leading UTF-8 BOM. npm and Node tolerate (and strip) a BOM in
+/// package.json — files saved by Windows editors commonly carry one — but
+/// serde_json rejects it, so every parse of user-supplied package.json content
+/// must go through this first or npm-valid manifests error out.
+fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}
+
 /// Check if a package.json content string is properly configured.
 pub fn is_setup_configured_str(content: &str) -> ScriptSetupStatus {
-    match serde_json::from_str::<serde_json::Value>(content) {
+    match serde_json::from_str::<serde_json::Value>(strip_bom(content)) {
         Ok(val) => is_setup_configured(&val),
         Err(_) => ScriptSetupStatus {
             postinstall_configured: false,
@@ -303,8 +311,8 @@ pub fn remove_package_json_object(package_json: &mut serde_json::Value) -> Scrip
 pub fn remove_package_json_content(
     content: &str,
 ) -> Result<(bool, String, ScriptRemoveStatus), String> {
-    let mut package_json: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("Invalid package.json: {e}"))?;
+    let mut package_json: serde_json::Value = serde_json::from_str(strip_bom(content))
+        .map_err(|e| format!("Invalid package.json: {e}"))?;
 
     if !package_json.is_object() {
         return Err("Invalid package.json: root is not a JSON object".to_string());
@@ -334,8 +342,8 @@ pub fn update_package_json_content(
     content: &str,
     pm: PackageManager,
 ) -> Result<(bool, String, String, String, String, String), String> {
-    let mut package_json: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("Invalid package.json: {e}"))?;
+    let mut package_json: serde_json::Value = serde_json::from_str(strip_bom(content))
+        .map_err(|e| format!("Invalid package.json: {e}"))?;
 
     // A package.json must be a JSON object; otherwise there is nowhere to add
     // lifecycle scripts.
@@ -470,6 +478,18 @@ mod tests {
         let status = is_setup_configured_str("not json");
         assert!(!status.postinstall_configured);
         assert!(status.needs_update);
+    }
+
+    #[test]
+    fn test_configured_str_utf8_bom() {
+        // npm strips a leading BOM when reading package.json; a BOM'd,
+        // configured manifest must read as configured, not as unparseable
+        // (which would mis-report it as needing setup).
+        let content = "\u{feff}{\"scripts\":{\"postinstall\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\",\"dependencies\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"}}";
+        let status = is_setup_configured_str(content);
+        assert!(status.postinstall_configured);
+        assert!(status.dependencies_configured);
+        assert!(!status.needs_update);
     }
 
     #[test]

@@ -329,16 +329,18 @@ fn helper_lock_is_actually_exclusive() {
 }
 
 /// `apply --break-lock` against a pre-staged lock file (no live
-/// holder) removes the file before acquisition and proceeds with
-/// the apply pass. The JSON envelope must surface the
-/// `lock_broken` warning event so the action is auditable.
+/// holder) reclaims the file and proceeds with the apply pass. The
+/// JSON envelope must surface the `lock_broken` warning event so the
+/// action is auditable.
 ///
 /// Setup mirrors the OS-level scenario: a previous run crashed and
 /// left `apply.lock` behind, but the OS-level flock was released
 /// (so a fresh acquire would succeed even without --break-lock).
-/// The --break-lock path is the safe-by-design version of `rm`.
+/// The --break-lock path is the safe-by-design version of `rm` —
+/// it never actually unlinks (that would defeat mutual exclusion),
+/// it verifies no live holder and records the audit event.
 #[test]
-fn break_lock_removes_stale_file_and_records_warning() {
+fn break_lock_reclaims_stale_file_and_records_warning() {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
@@ -403,7 +405,46 @@ fn break_lock_removes_stale_file_and_records_warning() {
     // The inode is kept for subsequent acquires.
     assert!(
         socket_dir.join("apply.lock").is_file(),
-        "apply.lock should be re-created after --break-lock acquires"
+        "apply.lock should still exist after --break-lock acquires"
+    );
+}
+
+/// Regression: when `--break-lock` itself is refused because a LIVE
+/// holder owns the lock, the stderr hint must not advise rerunning
+/// with `--break-lock` — the user just did exactly that, and the
+/// probe refused precisely because a holder exists, so the advice
+/// can only loop. (The plain-contention hint, with no --break-lock
+/// passed, rightly keeps suggesting the flag — see
+/// `lock_held_human_mode_mentions_other_process`.)
+#[test]
+fn break_lock_refusal_does_not_advise_break_lock_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    setup_socket_dir(&socket_dir);
+    let _external = take_external_lock(&socket_dir);
+
+    let (code, stdout, stderr) = run(dir.path(), &["apply", "--break-lock"]);
+    assert_eq!(
+        code, 1,
+        "--break-lock against a live holder must refuse with exit 1.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "human mode must not print a JSON envelope to stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Error: another socket-patch process is operating in this directory"),
+        "stderr should carry the lock_held error line, got:\n{stderr}"
+    );
+    // Still actionable: the inspect path remains valid.
+    assert!(
+        stderr.contains("socket-patch unlock"),
+        "stderr should still point at `socket-patch unlock`, got:\n{stderr}"
+    );
+    // The regression: no self-defeating "rerun with --break-lock".
+    assert!(
+        !stderr.contains("rerun with --break-lock"),
+        "a refused --break-lock must not advise rerunning with --break-lock, got:\n{stderr}"
     );
 }
 

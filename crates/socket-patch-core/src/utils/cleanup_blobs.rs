@@ -40,7 +40,10 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         if file_name_str.starts_with('.') {
             continue;
         }
-        let path = dir.join(&file_name_str);
+        // Use the entry's real path: joining the lossy display name back onto
+        // `dir` breaks for names that are not valid UTF-8 (the mangled path
+        // does not exist on disk), silently exempting such files from cleanup.
+        let path = entry.path();
         // Use symlink_metadata (lstat) rather than metadata (stat) so we never
         // follow symlinks: a symlink is not a real socket-patch blob, and a
         // dangling symlink would otherwise return an error. Tolerate any stat
@@ -709,6 +712,41 @@ mod tests {
                 .is_ok()
         );
         assert!(tokio::fs::metadata(&outside).await.is_ok());
+    }
+
+    // Linux-only: APFS/HFS+ (macOS) and NTFS reject file names that are not
+    // valid Unicode, so the scenario can only arise on byte-string
+    // filesystems like ext4.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_cleanup_removes_non_utf8_named_orphan() {
+        // Regression: a stray file whose name is not valid UTF-8 must still
+        // be considered and removed as an orphan. Joining the *lossy*
+        // display name back onto the directory produced a path that does not
+        // exist on disk, so the stat failed and the file was silently
+        // skipped -- leaked forever despite the "any regular non-hidden file
+        // is considered for removal" contract.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let manifest = create_test_manifest();
+
+        // 0xFF can never appear in valid UTF-8, so to_string_lossy() mangles
+        // this name into something that does not exist on disk.
+        let bad_path = blobs_dir.join(OsStr::from_bytes(b"orphan-\xff\xfe"));
+        tokio::fs::write(&bad_path, "junk").await.unwrap();
+
+        let result = cleanup_unused_blobs(&manifest, &blobs_dir, false)
+            .await
+            .unwrap();
+
+        assert_eq!(result.blobs_checked, 1);
+        assert_eq!(result.blobs_removed, 1);
+        assert!(tokio::fs::symlink_metadata(&bad_path).await.is_err());
     }
 
     #[test]

@@ -96,9 +96,13 @@ pub(crate) fn advisory_only_payload(
 /// the error case into an `Error`-severity record.
 ///
 /// `package_key` is the PURL. `pkg_path` is the package directory
-/// on disk. `patched` lists the patch-file keys that were actually
-/// written (same convention as `apply_package_patch.files_patched`).
-/// `files` is reserved for future use (currently unread).
+/// on disk. `patched` lists the patch-file keys now at their patched
+/// content: the ones written this run (`apply_package_patch.
+/// files_patched`) plus any verified `AlreadyPatched` — an earlier
+/// apply that failed partway wrote those but never reached this
+/// boundary, so their sidecar entries are still stale and the retry
+/// must resync them. `files` is reserved for future use (currently
+/// unread).
 #[allow(unused_variables)] // `pkg_path` is feature-gated below
 pub async fn dispatch_fixup(
     package_key: &str,
@@ -140,6 +144,50 @@ pub async fn dispatch_fixup(
             "Go: `go mod verify` will report a checksum mismatch against \
              go.sum. `go build` works as long as the module cache stays warm.",
         )),
+        _ => None,
+    };
+
+    Ok(payload.map(|p| SidecarRecord {
+        purl: package_key.to_string(),
+        ecosystem: ecosystem.cli_name().to_string(),
+        files: p.files,
+        advisory: p.advisory,
+    }))
+}
+
+/// Run the post-*rollback* integrity resync for the package's ecosystem.
+///
+/// Apply's [`dispatch_fixup`] rewrote ecosystem sidecars to match the
+/// patched bytes; once rollback restores the original bytes those
+/// sidecars are stale in the other direction (e.g. `.cargo-checksum.json`
+/// carrying patched hashes over original sources wedges `cargo build`).
+/// Cargo is the only ecosystem with reversible sidecar state today:
+/// NuGet's `.nupkg.metadata` was *deleted* by apply and its
+/// `contentHash` cannot be recomputed without the original `.nupkg`,
+/// and the PyPI / gem / Go advisories are apply-oriented — a completed
+/// rollback needs none. `rolled_back` lists the patch-file keys now at
+/// their original state: the ones restored this run plus any verified
+/// `AlreadyOriginal` (restored by an earlier partial rollback that
+/// never reached this boundary). Same return contract as
+/// [`dispatch_fixup`].
+#[allow(unused_variables)] // `pkg_path` is feature-gated below
+pub async fn dispatch_rollback_fixup(
+    package_key: &str,
+    pkg_path: &Path,
+    rolled_back: &[String],
+) -> Result<Option<SidecarRecord>, SidecarError> {
+    if rolled_back.is_empty() {
+        return Ok(None);
+    }
+
+    let ecosystem = match Ecosystem::from_purl(package_key) {
+        Some(eco) => eco,
+        None => return Ok(None),
+    };
+
+    let payload: Option<SidecarPayload> = match ecosystem {
+        #[cfg(feature = "cargo")]
+        Ecosystem::Cargo => cargo::resync_after_rollback(pkg_path, rolled_back).await?,
         _ => None,
     };
 
@@ -409,6 +457,82 @@ mod tests {
         let advisory = record.advisory.expect("golang must carry an advisory");
         assert_eq!(advisory.code, SidecarAdvisoryCode::GoModVerifyFails);
         assert_eq!(advisory.severity, SidecarSeverity::Warning);
+    }
+
+    /// Rollback dispatcher: a cargo PURL routes to the checksum resync
+    /// and the record carries the rewritten-file entry; a deleted
+    /// (patch-added) file's entry is dropped from the map.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_rollback_dispatch_resyncs_checksum() {
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        tokio::fs::write(pkg.join("lib.rs"), b"original")
+            .await
+            .unwrap();
+        let starting = serde_json::json!({
+            "files": {
+                "lib.rs": "00".repeat(32),
+                "added.rs": "22".repeat(32),
+            },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(".cargo-checksum.json"),
+            serde_json::to_string_pretty(&starting).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let out = dispatch_rollback_fixup(
+            "pkg:cargo/mycrate@1.0.0",
+            pkg,
+            &["lib.rs".to_string(), "added.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let record = out.expect("cargo rollback dispatch must produce a record");
+        assert_eq!(record.ecosystem, "cargo");
+        assert_eq!(record.purl, "pkg:cargo/mycrate@1.0.0");
+        assert_eq!(record.files.len(), 1);
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+        assert_eq!(record.files[0].action, SidecarFileAction::Rewritten);
+
+        let post: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(pkg.join(".cargo-checksum.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(post["files"]["lib.rs"].is_string());
+        assert_ne!(post["files"]["lib.rs"].as_str().unwrap(), "00".repeat(32));
+        assert!(post["files"].get("added.rs").is_none());
+    }
+
+    /// Rollback dispatcher: advisory-only ecosystems have nothing to
+    /// resync — no record, no spurious apply-oriented advisory.
+    #[tokio::test]
+    async fn pypi_rollback_dispatch_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_rollback_fixup(
+            "pkg:pypi/requests@2.28.0",
+            d.path(),
+            &["package/foo.py".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    /// Rollback dispatcher: empty rolled-back list short-circuits.
+    #[tokio::test]
+    async fn empty_rolled_back_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let out = dispatch_rollback_fixup("pkg:cargo/mycrate@1.0.0", d.path(), &[])
+            .await
+            .unwrap();
+        assert!(out.is_none());
     }
 
     /// When the `cargo` feature is disabled, a `pkg:cargo/` PURL is

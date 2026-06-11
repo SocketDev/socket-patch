@@ -702,13 +702,12 @@ impl PythonCrawler {
     }
 
     /// Parse a PyPI PURL string to extract name and version.
-    /// Strips qualifiers before parsing.
+    /// Strips qualifiers and subpath before parsing.
     fn parse_pypi_purl(purl: &str) -> Option<(String, String)> {
-        // Strip qualifiers
-        let base = match purl.find('?') {
-            Some(idx) => &purl[..idx],
-            None => purl,
-        };
+        // A `#subpath` can appear without a preceding `?qualifier`, so the
+        // shared helper cuts at whichever comes first — a `?`-only cut would
+        // leak the subpath into the version and miss the installed package.
+        let base = crate::utils::purl::strip_purl_qualifiers(purl);
 
         let rest = base.strip_prefix("pkg:pypi/")?;
         let at_idx = rest.rfind('@')?;
@@ -779,6 +778,24 @@ mod tests {
     fn test_parse_pypi_purl_with_qualifiers() {
         let (name, ver) =
             PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc").unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(ver, "2.28.0");
+    }
+
+    /// The PURL grammar is `pkg:type/ns/name@version?qualifiers#subpath`;
+    /// a subpath can appear WITHOUT a preceding qualifier. Cutting only at
+    /// `?` lets a bare `#subpath` leak into the version (`2.28.0#src/...`),
+    /// silently failing the installed-package match.
+    #[test]
+    fn test_parse_pypi_purl_with_subpath() {
+        let (name, ver) =
+            PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0#src/requests").unwrap();
+        assert_eq!(name, "requests");
+        assert_eq!(ver, "2.28.0");
+
+        // Qualifier + subpath together (subpath follows qualifiers).
+        let (name, ver) =
+            PythonCrawler::parse_pypi_purl("pkg:pypi/requests@2.28.0?artifact_id=abc#src").unwrap();
         assert_eq!(name, "requests");
         assert_eq!(ver, "2.28.0");
     }

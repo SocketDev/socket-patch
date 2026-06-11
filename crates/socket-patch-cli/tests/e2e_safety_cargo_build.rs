@@ -368,6 +368,83 @@ fn apply_then_cargo_check_succeeds() {
     let _ = after;
 }
 
+/// Rollback twin of the headline test: after apply rewrote both the
+/// source and `.cargo-checksum.json`, `socket-patch rollback` must
+/// restore BOTH — the original bytes AND the original checksum entry.
+/// Before the rollback-side sidecar resync, rollback restored only the
+/// bytes, leaving the patched hash in the checksum file — and the
+/// negative control above proves cargo then refuses to build the
+/// rolled-back crate ("checksum ... has changed").
+#[test]
+#[ignore]
+fn rollback_after_apply_then_cargo_check_succeeds() {
+    if !has_command("cargo") {
+        eprintln!("SKIP: cargo not on PATH");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    let cargo_home = root.path().join(".cargo-home");
+    generate_lockfile(&consumer, &cargo_home);
+
+    // Baseline must build.
+    assert!(cargo_check(&consumer, &cargo_home).status.success());
+
+    let (before, _after) = stage_socket_manifest(&consumer);
+    // Rollback restores from the before-hash blob; stage it alongside
+    // the after-blob exactly as apply's snapshot would have left it.
+    write_blob(
+        &consumer.join(".socket"),
+        &before,
+        ORIGINAL_LIB_RS.as_bytes(),
+    );
+
+    let (_stdout, _stderr) = assert_run_ok(
+        &consumer,
+        &["apply", "--cwd", consumer.to_str().unwrap()],
+        "socket-patch apply",
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        PATCHED_LIB_RS,
+        "apply must land the patched content first"
+    );
+
+    let (_stdout, _stderr) = assert_run_ok(
+        &consumer,
+        &["rollback", "--cwd", consumer.to_str().unwrap()],
+        "socket-patch rollback",
+    );
+
+    // Bytes are back to the original...
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        ORIGINAL_LIB_RS,
+        "rollback must restore the original source"
+    );
+    // ...and the checksum entry was resynced to the original hash.
+    let post_checksum: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(consumer.join("vendor/safety-fixture/.cargo-checksum.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let expected_lib_hash = sha256_hex(ORIGINAL_LIB_RS.as_bytes());
+    assert_eq!(
+        post_checksum["files"]["src/lib.rs"].as_str(),
+        Some(expected_lib_hash.as_str()),
+        "rollback must resync .cargo-checksum.json to the original SHA256.\npost: {post_checksum}"
+    );
+
+    // The whole point: the rolled-back vendored crate still builds.
+    let out = cargo_check(&consumer, &cargo_home);
+    assert!(
+        out.status.success(),
+        "cargo check should succeed after rollback resynced the sidecar.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 /// JSON envelope sanity check on the same scenario: assert apply
 /// reports the cargo sidecar in the new top-level `envelope.sidecars[]`
 /// list with the structured shape.

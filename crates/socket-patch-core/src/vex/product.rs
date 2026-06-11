@@ -100,9 +100,17 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     result
 }
 
+/// Strip a leading UTF-8 BOM. npm/Node strip one from package.json and
+/// cargo accepts one in Cargo.toml, but serde_json and the line scanner
+/// both reject it — without this, manifests the user's own toolchain
+/// accepts yield no PURL. Mirrors `package_json/detect.rs`.
+fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}
+
 async fn read_package_json(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let v: serde_json::Value = serde_json::from_str(strip_bom(&content)).ok()?;
     let name = v.get("name")?.as_str()?;
     let version = v.get("version")?.as_str()?;
     if name.is_empty() || version.is_empty() {
@@ -115,6 +123,9 @@ async fn read_package_json(path: &Path) -> Option<String> {
 
 async fn read_pyproject(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
+    // No BOM strip here, unlike npm/cargo: tomllib (and pip's vendored
+    // tomli) reject a BOM'd pyproject.toml outright, so such a file is
+    // not a buildable Python project and must keep yielding None.
     // PEP 621 `[project]` takes precedence (newer projects favor it),
     // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
     let (name, version) = scan_toml_section(&content, "project")
@@ -124,7 +135,7 @@ async fn read_pyproject(path: &Path) -> Option<String> {
 
 async fn read_cargo_toml(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
-    let (name, version) = scan_toml_section(&content, "package")?;
+    let (name, version) = scan_toml_section(strip_bom(&content), "package")?;
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
@@ -150,7 +161,17 @@ fn scan_toml_section(content: &str, section: &str) -> Option<(String, String)> {
             continue;
         }
         if line.starts_with('[') {
-            in_section = line == header;
+            // A header may carry a trailing comment (`[package] # x`) —
+            // valid TOML that cargo and tomllib both accept. Anything
+            // else after the closing bracket means a different (or
+            // malformed) section.
+            in_section = match line.strip_prefix(header.as_str()) {
+                Some(rest) => {
+                    let rest = rest.trim_start();
+                    rest.is_empty() || rest.starts_with('#')
+                }
+                None => false,
+            };
             continue;
         }
         if !in_section {
@@ -221,9 +242,20 @@ fn scan_remote_origin_url(content: &str) -> Option<String> {
     let mut in_section = false;
     for raw in content.lines() {
         let line = raw.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_section = line == "[remote \"origin\"]";
-            continue;
+        if line.starts_with('[') {
+            // git permits a `;`/`#` comment after the closing bracket;
+            // such a line is still a section header. Recognizing it
+            // matters BOTH ways: a commented `[remote "origin"]` must
+            // open the section, and a commented foreign header must
+            // CLOSE it — otherwise the next remote's url is
+            // misattributed to origin.
+            if let Some(close) = line.find(']') {
+                let rest = line[close + 1..].trim_start();
+                if rest.is_empty() || rest.starts_with('#') || rest.starts_with(';') {
+                    in_section = &line[..=close] == "[remote \"origin\"]";
+                    continue;
+                }
+            }
         }
         if !in_section {
             continue;
@@ -1229,6 +1261,138 @@ mod tests {
     #[test]
     fn parse_toml_kv_bare_number_still_rejected() {
         assert!(parse_toml_string_kv("version = 42", "version").is_none());
+    }
+
+    // ── Regression: UTF-8 BOM tolerance ───────────────────────────
+    // npm/Node strip a leading BOM from package.json and cargo accepts
+    // one in Cargo.toml (verified against `npm pkg get` and
+    // `cargo metadata`), but serde_json and the line scanner both choke
+    // on it — so a manifest its own toolchain accepts yielded no PURL.
+
+    #[tokio::test]
+    async fn detect_package_json_with_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"name\":\"bom-app\",\"version\":\"1.0.0\"}",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/bom-app@1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn detect_cargo_toml_with_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "\u{feff}[package]\nname = \"bom-rust\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/bom-rust@1.0.0"));
+    }
+
+    /// pyproject.toml is deliberately NOT BOM-stripped: tomllib (and
+    /// pip's vendored tomli) reject a BOM outright, so a BOM'd
+    /// pyproject.toml is not a buildable Python project and detection
+    /// must keep returning None for it.
+    #[tokio::test]
+    async fn detect_pyproject_with_bom_stays_none() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "\u{feff}[project]\nname = \"bom-py\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert!(r.purl.is_none());
+    }
+
+    // ── Regression: trailing comments on TOML table headers ───────
+    // `[package] # comment` is valid TOML (cargo and tomllib both
+    // accept it), but the exact `line == header` match treated the
+    // commented header as a foreign section, so name/version were
+    // never read.
+
+    #[test]
+    fn scan_toml_section_header_with_trailing_comment() {
+        let toml = "[package] # package metadata\nname = \"x\"\nversion = \"1.0\"\n";
+        let (n, v) = scan_toml_section(toml, "package").unwrap();
+        assert_eq!(n, "x");
+        assert_eq!(v, "1.0");
+    }
+
+    /// A commented header for a DIFFERENT section must still close the
+    /// current one — `version` below belongs to `[dependencies]`, not
+    /// `[package]`.
+    #[test]
+    fn scan_toml_commented_foreign_header_still_closes_section() {
+        let toml = "[package]\nname = \"x\"\n[dependencies] # noted\nversion = \"9.9\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    /// The prefix match must not over-match: `[packages]` and
+    /// `[package.metadata]` are different sections, comment or not.
+    #[test]
+    fn scan_toml_header_prefix_lookalikes_do_not_match() {
+        let toml = "[packages] # close but no\nname = \"a\"\nversion = \"1\"\n[package.metadata] # also no\nname = \"b\"\nversion = \"2\"\n";
+        assert!(scan_toml_section(toml, "package").is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_cargo_toml_header_with_trailing_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package] # the crate\nname = \"cmt-rust\"\nversion = \"1.0.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:cargo/cmt-rust@1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn detect_pyproject_header_with_trailing_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]  # PEP 621\nname = \"cmt-py\"\nversion = \"0.4.0\"\n",
+        )
+        .await
+        .unwrap();
+        let r = detect_product(dir.path()).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:pypi/cmt-py@0.4.0"));
+    }
+
+    // ── Regression: trailing comments on git config headers ───────
+    // git permits `;`/`#` comments after a section header (verified
+    // with `git config -f`), but the `ends_with(']')` check refused to
+    // recognize such a line as a header at all. Two failure modes:
+    // a commented `[remote "origin"]` header was skipped (URL missed),
+    // and a commented FOREIGN header failed to close an open origin
+    // section, misattributing the next remote's url to origin.
+
+    #[test]
+    fn scan_origin_url_header_with_trailing_comment() {
+        let cfg = "[remote \"origin\"] ; my main remote\n\turl = git@github.com:me/repo.git\n";
+        assert_eq!(
+            scan_remote_origin_url(cfg).as_deref(),
+            Some("git@github.com:me/repo.git")
+        );
+    }
+
+    /// git resolves this config to NO origin url (the url belongs to
+    /// `upstream`); returning upstream's url as origin's is a wrong
+    /// product identity, not just a missed one.
+    #[test]
+    fn scan_origin_url_commented_foreign_header_closes_section() {
+        let cfg = "[remote \"origin\"]\n[remote \"upstream\"] # backup\n\turl = git@github.com:other/repo.git\n";
+        assert!(scan_remote_origin_url(cfg).is_none());
     }
 
     #[tokio::test]

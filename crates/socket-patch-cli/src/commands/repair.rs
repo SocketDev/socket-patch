@@ -13,7 +13,7 @@ use socket_patch_core::utils::telemetry::{track_patch_repair_failed, track_patch
 use std::path::Path;
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 
@@ -24,10 +24,18 @@ pub struct RepairArgs {
 
     /// Only download missing artifacts; skip the cleanup phase.
     /// Incompatible with `--offline`.
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_DOWNLOAD_ONLY=1` (or
+    /// an exported-but-empty `SOCKET_DOWNLOAD_ONLY=`) aborted every `repair`
+    /// invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
+    /// `main`'s empty-var scrub never rescues it.
     #[arg(
         long = "download-only",
         env = "SOCKET_DOWNLOAD_ONLY",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = parse_bool_flag,
     )]
     pub download_only: bool,
 }

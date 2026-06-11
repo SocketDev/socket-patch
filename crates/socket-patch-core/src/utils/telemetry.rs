@@ -293,12 +293,16 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
                 .ok()
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| DEFAULT_SOCKET_API_URL.to_string());
+            // Trim trailing slashes like `ApiClient::new` does, so a base URL
+            // of `https://host/` doesn't produce a malformed `//v0/...` path.
+            let api_url = api_url.trim_end_matches('/');
             (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
         }
         _ => {
             let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            let proxy_url = proxy_url.trim_end_matches('/');
             (format!("{proxy_url}/patch/telemetry"), false)
         }
     }
@@ -1249,6 +1253,37 @@ mod tests {
         // Missing token -> proxy.
         let (_url, auth) = resolve_telemetry_endpoint(None, Some("acme"));
         assert!(!auth);
+    }
+
+    /// Regression: a trailing slash on `SOCKET_API_URL` / `SOCKET_PROXY_URL`
+    /// must not yield a double-slash telemetry path. `ApiClient::new`
+    /// normalizes its base with `trim_end_matches('/')`, so the same user
+    /// config works for every API call — telemetry must match, or the
+    /// fire-and-forget POST silently lands on a malformed `//v0/...` /
+    /// `//patch/...` path (same malformed-URL class as `/v0/orgs//telemetry`).
+    #[test]
+    fn test_resolve_telemetry_endpoint_trims_trailing_slash() {
+        let orig_api = std::env::var("SOCKET_API_URL").ok();
+        let orig_proxy = std::env::var("SOCKET_PROXY_URL").ok();
+
+        std::env::set_var("SOCKET_API_URL", "https://api.example.test/sub/");
+        let (url, auth) = resolve_telemetry_endpoint(Some("tok"), Some("acme"));
+        assert!(auth);
+        assert_eq!(url, "https://api.example.test/sub/v0/orgs/acme/telemetry");
+
+        std::env::set_var("SOCKET_PROXY_URL", "https://proxy.example.test/sub/");
+        let (url, auth) = resolve_telemetry_endpoint(None, None);
+        assert!(!auth);
+        assert_eq!(url, "https://proxy.example.test/sub/patch/telemetry");
+
+        match orig_api {
+            Some(v) => std::env::set_var("SOCKET_API_URL", v),
+            None => std::env::remove_var("SOCKET_API_URL"),
+        }
+        match orig_proxy {
+            Some(v) => std::env::set_var("SOCKET_PROXY_URL", v),
+            None => std::env::remove_var("SOCKET_PROXY_URL"),
+        }
     }
 
     /// Regression: an empty-string token or slug must be treated as absent,

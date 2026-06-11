@@ -341,6 +341,16 @@ impl NpmCrawler {
 
         for purl in purls {
             if let Some((ns, name, version)) = Self::parse_purl_components(purl) {
+                // SECURITY: `ns`/`name` come straight from the (untrusted)
+                // manifest PURL and are joined onto `node_modules_path` below,
+                // then patched in place. A real npm scope/name is a single
+                // path segment, so reject any that could traverse out of the
+                // tree (`pkg:npm/../../evil@1.0.0`). Fail closed — twin of the
+                // deno/go/maven coordinate gates.
+                let ns_safe = ns.as_deref().map(is_safe_npm_component).unwrap_or(true);
+                if !ns_safe || !is_safe_npm_component(&name) {
+                    continue;
+                }
                 let dir_key = match &ns {
                     Some(ns_str) => format!("{ns_str}/{name}"),
                     None => name.clone(),
@@ -723,6 +733,24 @@ async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a PURL-derived path component is safe to join onto the
+/// `node_modules` root. An npm package's scope (`@types`) and bare name
+/// (`node`) are each a single path segment, so a real one never contains a
+/// separator, a `.`/`..` segment, a backslash, or a NUL. `find_by_purls`
+/// joins these straight from the (untrusted) manifest PURL onto the
+/// `node_modules` root and then patches the resolved package in place, so a
+/// tampered PURL like `pkg:npm/../../evil@1.0.0` would otherwise read (and
+/// later write) out of tree. Reject those fail-closed. Twin of the deno
+/// (`is_safe_jsr_component`), go, and maven coordinate gates.
+fn is_safe_npm_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains('/')
+        && !component.contains('\\')
+        && !component.contains('\0')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,6 +1110,95 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.get(&q1).unwrap().path, foo_dir);
         assert_eq!(result.get(&q2).unwrap().path, foo_dir);
+    }
+
+    /// SECURITY regression: a tampered manifest PURL whose *name* carries a
+    /// `..` traversal must not let `find_by_purls` resolve a package outside
+    /// the `node_modules` root. The crawler joins the PURL-derived directory
+    /// key straight onto `node_modules_path` and the resolved path is then
+    /// patched in place, so an unguarded join would read (and later write)
+    /// out of tree. Twin of the deno/go/maven `is_safe_*_coordinate` gates.
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_in_name() {
+        let root = tempfile::tempdir().unwrap();
+        let nm = root.path().join("node_modules");
+        tokio::fs::create_dir_all(&nm).await.unwrap();
+
+        // A victim package living OUTSIDE node_modules, reachable only via
+        // `..`. `node_modules/../evil` == `<root>/evil`.
+        let evil_dir = root.path().join("evil");
+        tokio::fs::create_dir_all(&evil_dir).await.unwrap();
+        tokio::fs::write(
+            evil_dir.join("package.json"),
+            r#"{"name": "evil", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let traversal = "pkg:npm/../evil@1.0.0".to_string();
+        let result = crawler
+            .find_by_purls(&nm, &[traversal.clone()])
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a `..` in the PURL name must not escape node_modules; got {result:?}"
+        );
+    }
+
+    /// SECURITY regression: a `..` smuggled through the *name* half of a
+    /// scoped PURL must also be rejected. `@x/../../evil` parses to scope
+    /// `@x` + name `../../evil`; with a real `@x` dir on disk for the kernel
+    /// to walk, the join climbs clean out of node_modules to `<root>/evil`.
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_traversal_via_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let nm = root.path().join("node_modules");
+        // A real scope dir so the kernel can resolve the leading `@x` before
+        // the `..` segments climb — otherwise the walk would ENOENT and the
+        // test would pass vacuously.
+        tokio::fs::create_dir_all(nm.join("@x")).await.unwrap();
+
+        let evil_dir = root.path().join("evil");
+        tokio::fs::create_dir_all(&evil_dir).await.unwrap();
+        tokio::fs::write(
+            evil_dir.join("package.json"),
+            r#"{"name": "evil", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let traversal = "pkg:npm/@x/../../evil@1.0.0".to_string();
+        let result = crawler
+            .find_by_purls(&nm, &[traversal.clone()])
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a `..` smuggled through the scope must not escape node_modules; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_npm_component() {
+        // Legitimate components.
+        assert!(is_safe_npm_component("lodash"));
+        assert!(is_safe_npm_component("@types"));
+        assert!(is_safe_npm_component("node"));
+        assert!(is_safe_npm_component("some.pkg"));
+
+        // Traversal / separator / NUL / empty.
+        assert!(!is_safe_npm_component(""));
+        assert!(!is_safe_npm_component("."));
+        assert!(!is_safe_npm_component(".."));
+        assert!(!is_safe_npm_component("../evil"));
+        assert!(!is_safe_npm_component("a/b"));
+        assert!(!is_safe_npm_component("a\\b"));
+        assert!(!is_safe_npm_component("a\0b"));
     }
 
     /// A PURL whose version is not the one on disk must be skipped, while a

@@ -5,26 +5,33 @@
 //! directories (`.socket/go-patches/…`, `.socket/vendor/…`) and the
 //! lockfile/config entries that point at them. Those files are committed and
 //! tamper-able, so every coordinate must be validated **fail-closed before any
-//! disk access**: a `..`/`.` segment, an absolute path, a backslash, or a NUL
-//! would otherwise let a poisoned manifest copy, write, or delete a tree at an
-//! arbitrary filesystem location outside the project.
+//! disk access**: a `..`/`.` segment, an absolute path, a backslash, a colon,
+//! or a NUL would otherwise let a poisoned manifest copy, write, or delete a
+//! tree at an arbitrary filesystem location outside the project.
+//!
+//! Colons are rejected because a leading `C:` makes the coordinate an
+//! absolute Windows path that `Path::join` substitutes wholesale for the
+//! base; no legitimate package name, version, or Go module path contains one.
 
 /// A single path segment (cargo crate name, version string, gem name, …):
-/// no separators, not `.`/`..`, no backslash/NUL, non-empty.
+/// no separators, not `.`/`..`, no backslash/colon/NUL, non-empty.
 pub(crate) fn is_safe_single_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
         && !s.contains('/')
         && !s.contains('\\')
+        && !s.contains(':')
         && !s.contains('\0')
 }
 
 /// A multi-segment relative path (Go module path `github.com/foo/bar`, npm
 /// scoped name `@scope/name`, composer `vendor/name`): `/`-separated segments,
-/// each non-empty and not `.`/`..`; no leading `/`, no backslash, no NUL.
+/// each non-empty and not `.`/`..`; no leading `/`, no backslash, no colon,
+/// no NUL.
 pub(crate) fn is_safe_multi_segment(s: &str) -> bool {
-    if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains('\0') {
+    if s.is_empty() || s.starts_with('/') || s.contains('\\') || s.contains(':') || s.contains('\0')
+    {
         return false;
     }
     s.split('/')
@@ -79,6 +86,9 @@ mod tests {
         assert!(!is_safe_single_segment("a/b"));
         assert!(!is_safe_single_segment("a\\b"));
         assert!(!is_safe_single_segment("a\0b"));
+        // A leading `C:` is an absolute Windows path under `Path::join`.
+        assert!(!is_safe_single_segment("C:evil"));
+        assert!(!is_safe_single_segment("c:"));
     }
 
     #[test]
@@ -100,6 +110,10 @@ mod tests {
         assert!(!is_safe_multi_segment("foo/./bar"));
         assert!(!is_safe_multi_segment("foo\\bar"));
         assert!(!is_safe_multi_segment("foo\0bar"));
+        // Windows drive-letter escapes: `C:/…` joins as an absolute path.
+        assert!(!is_safe_multi_segment("C:/evil"));
+        assert!(!is_safe_multi_segment("c:/evil"));
+        assert!(!is_safe_multi_segment("C:"));
     }
 
     #[test]

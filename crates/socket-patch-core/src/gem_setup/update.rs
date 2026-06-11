@@ -59,6 +59,57 @@ impl GemEditResult {
     }
 }
 
+/// Atomically write `content` to `path`.
+///
+/// A bare `fs::write` truncates the target before writing, so a crash, power
+/// loss, or interrupted process mid-write would leave the user's committed
+/// `Gemfile` truncated or empty — destroying the file we only meant to
+/// append a three-line block to. Instead we write to a sibling stage file,
+/// fsync it, then rename over the target (rename is atomic on the same
+/// filesystem) so a reader ever sees either the old bytes or the complete new
+/// bytes. Mirrors the hardened writer in `composer_setup` / `package_json`.
+async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Gemfile".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stage)
+        .await?;
+
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(content.as_bytes()).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    if let Err(e) = file.sync_all().await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&stage, path).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+
+    // The rename only updated the parent directory entry; fsync the directory
+    // so the rename itself survives a crash. Best-effort, Unix only.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = tokio::fs::File::open(parent).await {
+            let _ = dir.sync_all().await;
+        }
+    }
+
+    Ok(())
+}
+
 /// Stable substring identifying our managed block — `setup --check` and the
 /// add/remove edits all key on it, so a user-authored `plugin` line is never
 /// mistaken for ours.
@@ -128,7 +179,9 @@ async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    fs::write(gemfile, &new).await.map_err(|e| e.to_string())?;
+                    atomic_write(gemfile, &new)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(true)
             }
@@ -151,7 +204,9 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    fs::write(gemfile, &new).await.map_err(|e| e.to_string())?;
+                    atomic_write(gemfile, &new)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok(true)
             }
@@ -368,6 +423,77 @@ mod tests {
             GEMFILE,
             "dry-run must not write"
         );
+    }
+
+    // ── atomic-write contract (no truncation / no stage litter) ──────
+    //
+    // The Gemfile edit must go through stage+fsync+rename, never a bare
+    // truncating write, so a crash can't leave the user's committed Gemfile
+    // truncated or empty.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_add_replaces_readonly_gemfile_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        // Oracle for the truncating-write bug: rename needs only directory
+        // write permission, while a bare `fs::write` must open the target
+        // itself for writing — so a read-only Gemfile distinguishes the two
+        // (EACCES under truncate, clean replace under stage+rename, same as
+        // the composer/npm/pypi/cargo/go manifest writers).
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::write(&gemfile, GEMFILE).await.unwrap();
+        std::fs::set_permissions(&gemfile, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let res = edit_gemfile_add(&gemfile, false).await;
+        assert_eq!(res.status, GemSetupStatus::Updated, "err: {:?}", res.error);
+        assert!(is_plugin_directive_present(
+            &fs::read_to_string(&gemfile).await.unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_remove_replaces_readonly_gemfile_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::write(&gemfile, gemfile_add(GEMFILE).unwrap())
+            .await
+            .unwrap();
+        std::fs::set_permissions(&gemfile, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let res = edit_gemfile_remove(&gemfile, false).await;
+        assert_eq!(res.status, GemSetupStatus::Updated, "err: {:?}", res.error);
+        assert_eq!(
+            fs::read_to_string(&gemfile).await.unwrap(),
+            GEMFILE,
+            "read-only Gemfile restored byte-for-byte via stage+rename"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_leaves_no_stage_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemfile = dir.path().join("Gemfile");
+        fs::write(&gemfile, GEMFILE).await.unwrap();
+
+        assert_eq!(
+            edit_gemfile_add(&gemfile, false).await.status,
+            GemSetupStatus::Updated
+        );
+        assert_eq!(
+            edit_gemfile_remove(&gemfile, false).await.status,
+            GemSetupStatus::Updated
+        );
+        assert_eq!(fs::read_to_string(&gemfile).await.unwrap(), GEMFILE);
+
+        // No half-written `.socket-stage-*` sibling left behind.
+        let mut rd = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
+        }
     }
 
     #[tokio::test]

@@ -738,9 +738,31 @@ async fn apply_patches_inner(
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
     // tempdir + download the gap). Shared with `vendor` via fetch_stage.
     let socket_dir = manifest_path.parent().unwrap();
+    // Partition manifest PURLs by ecosystem up front. The source probes,
+    // the offline guard, and the download planner in `fetch_stage` must only
+    // consider patches this run can actually apply — the `--ecosystems`
+    // filter plus the ecosystems compiled into this build. An out-of-scope
+    // patch with no local source must not fail (or trigger fetches for) a
+    // run that will never apply it.
+    let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
+    let partitioned = partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
+
+    let target_manifest_purls: HashSet<String> = partitioned
+        .values()
+        .flat_map(|purls| purls.iter().cloned())
+        .collect();
+
+    // In-scope view of the manifest for source probing and fetching. The
+    // apply loop keeps using the full `manifest` for per-PURL lookups —
+    // those are already scoped by `partitioned`.
+    let mut scoped_manifest = manifest.clone();
+    scoped_manifest
+        .patches
+        .retain(|purl, _| target_manifest_purls.contains(purl));
+
     let staged = match crate::commands::fetch_stage::stage_patch_sources(
         &args.common,
-        &manifest,
+        &scoped_manifest,
         socket_dir,
     )
     .await?
@@ -753,15 +775,6 @@ async fn apply_patches_inner(
     let blobs_path = staged.blobs.clone();
     let diffs_path = staged.diffs.clone();
     let packages_path = staged.packages.clone();
-
-    // Partition manifest PURLs by ecosystem
-    let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned = partition_purls(&manifest_purls, args.common.ecosystems.as_deref());
-
-    let target_manifest_purls: HashSet<String> = partitioned
-        .values()
-        .flat_map(|purls| purls.iter().cloned())
-        .collect();
 
     // Local go: prune `replace`-redirects whose patches were dropped from the
     // manifest (orphans). Done here — before the crawl + the "no packages

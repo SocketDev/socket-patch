@@ -860,3 +860,98 @@ fn absolute_manifest_path_content_wins_over_cwd_via_binary() {
         "cwd decoy manifest must NOT be listed when absolute path is given: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `--silent` contract — CLI_CONTRACT.md defines `--silent` as "Errors only".
+// Regression guard: `run()` gated the human-readable listing on `!json`
+// alone, so `list --silent` still printed the full patch table (and the
+// "No patches found in manifest." line for an empty manifest). Mirrors the
+// `get --silent` / `repair --silent` regressions fixed earlier.
+// ---------------------------------------------------------------------------
+
+/// Like [`run_list_binary`] but with every `GlobalArgs` env var scrubbed,
+/// so ambient developer/CI configuration (SOCKET_SILENT, SOCKET_JSON,
+/// tokens…) can't change the branch under test, and telemetry disabled so
+/// the test stays offline.
+fn run_list_binary_scrubbed(cwd: &Path, extra: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.arg("list").arg("--cwd").arg(cwd).args(extra);
+    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    cmd.output().expect("failed to execute socket-patch binary")
+}
+
+#[test]
+fn silent_suppresses_human_listing_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "list --silent must still exit 0"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must produce no stdout for a populated manifest; got {stdout:?}"
+    );
+
+    // Control run: the same manifest WITHOUT --silent must print the table —
+    // otherwise the assertion above passes vacuously.
+    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    assert_eq!(loud.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&loud.stdout).contains("Package: pkg:npm/test-pkg@1.0.0"),
+        "non-silent run must print the listing"
+    );
+}
+
+#[test]
+fn silent_suppresses_no_patches_message_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &PatchManifest::new());
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "empty list --silent must exit 0"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must suppress the no-patches message; got {stdout:?}"
+    );
+}
+
+#[test]
+fn silent_does_not_mute_json_envelope_via_binary() {
+    // `--json` output is the machine-readable result, not human chatter:
+    // `--silent --json` must still emit the envelope (matching `get`/`repair`).
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("--silent --json must still print the JSON envelope");
+    assert_eq!(v["command"], "list");
+    assert_eq!(v["summary"]["discovered"], 1);
+}
+
+#[test]
+fn silent_keeps_missing_manifest_error_on_stderr_via_binary() {
+    // "Errors only": the missing-manifest diagnostic must survive --silent.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    assert_eq!(out.status.code(), Some(1), "missing manifest must exit 1");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Manifest not found"),
+        "error output must NOT be muted by --silent"
+    );
+}

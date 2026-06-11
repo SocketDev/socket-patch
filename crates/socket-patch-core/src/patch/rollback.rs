@@ -39,6 +39,14 @@ pub struct RollbackResult {
     pub files_verified: Vec<VerifyRollbackResult>,
     pub files_rolled_back: Vec<String>,
     pub error: Option<String>,
+    /// Ecosystem sidecar resync outcome — the rollback-side twin of
+    /// [`ApplyResult::sidecar`](crate::patch::apply::ApplyResult::sidecar).
+    /// `Some` when the ecosystem's integrity sidecar was resynced after
+    /// the restore (today: cargo's `.cargo-checksum.json`) or when that
+    /// resync failed (an `Error`-severity advisory; the files themselves
+    /// are still rolled back). `None` when no sidecar applied or no
+    /// files were rolled back (dry run, already original).
+    pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
 }
 
 /// Normalize file path by removing the "package/" prefix if present.
@@ -90,16 +98,36 @@ pub async fn verify_file_rollback(
 
     // For new files (empty beforeHash), rollback means deleting the file.
     if is_new_file {
-        if tokio::fs::metadata(&filepath).await.is_err() {
-            // File already doesn't exist — already rolled back.
-            return VerifyRollbackResult {
-                file: file_name.to_string(),
-                status: VerifyRollbackStatus::AlreadyOriginal,
-                message: None,
-                current_hash: None,
-                expected_hash: None,
-                target_hash: None,
-            };
+        // Probe the directory ENTRY (`symlink_metadata`), not the symlink
+        // target: a dangling symlink left where the patch-added file was
+        // makes `metadata` report ENOENT, which mis-classified the entry
+        // as already rolled back — the package rollback claimed success
+        // while silently leaving the stray entry behind. Only a true
+        // NotFound means already-gone; any other stat error (ELOOP,
+        // EACCES) is an unverifiable state and must fail closed.
+        match tokio::fs::symlink_metadata(&filepath).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already doesn't exist — already rolled back.
+                return VerifyRollbackResult {
+                    file: file_name.to_string(),
+                    status: VerifyRollbackStatus::AlreadyOriginal,
+                    message: None,
+                    current_hash: None,
+                    expected_hash: None,
+                    target_hash: None,
+                };
+            }
+            Err(e) => {
+                return VerifyRollbackResult {
+                    file: file_name.to_string(),
+                    status: VerifyRollbackStatus::NotFound,
+                    message: Some(format!("Failed to stat file: {}", e)),
+                    current_hash: None,
+                    expected_hash: None,
+                    target_hash: None,
+                };
+            }
+            Ok(_) => {}
         }
         let current_hash = compute_file_git_sha256(&filepath).await.unwrap_or_default();
         if current_hash == file_info.after_hash {
@@ -161,6 +189,28 @@ pub async fn verify_file_rollback(
             file: file_name.to_string(),
             status: VerifyRollbackStatus::AlreadyOriginal,
             message: None,
+            current_hash: Some(current_hash),
+            expected_hash: None,
+            target_hash: None,
+        };
+    }
+
+    // SECURITY: `beforeHash` comes from the same untrusted manifest as the
+    // file keys, but is used as a path component under the blobs directory.
+    // `Path::join` discards the base on an absolute "hash" and `..` walks
+    // out, so an unvalidated value would turn the blob probe — and the
+    // rollback loop's blob read — into an out-of-tree existence oracle, a
+    // content-hash leak via the mismatch error, or an unbounded-read DoS
+    // (`/dev/zero`, FIFO hang). Real blob hashes are plain hex and always
+    // pass; anything path-unsafe is refused fail-closed.
+    if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
+        return VerifyRollbackResult {
+            file: file_name.to_string(),
+            status: VerifyRollbackStatus::MissingBlob,
+            message: Some(format!(
+                "Unsafe before-blob hash (escapes blobs directory): {}",
+                file_info.before_hash
+            )),
             current_hash: Some(current_hash),
             expected_hash: None,
             target_hash: None,
@@ -267,6 +317,7 @@ pub async fn rollback_package_patch(
         files_verified: Vec::new(),
         files_rolled_back: Vec::new(),
         error: None,
+        sidecar: None,
     };
 
     // First, verify all files
@@ -349,6 +400,18 @@ pub async fn rollback_package_patch(
             continue;
         }
 
+        // SECURITY: defense-in-depth twin of the verify-time guard — never
+        // join an unvalidated manifest hash onto the blobs directory at the
+        // read syscall either (mirrors the delete branch above). Verify
+        // already blocks unsafe hashes, but this read must not depend on it.
+        if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
+            result.error = Some(format!(
+                "Unsafe before-blob hash (escapes blobs directory): {}",
+                file_info.before_hash
+            ));
+            return result;
+        }
+
         // Read original content from blobs
         let blob_path = blobs_path.join(&file_info.before_hash);
         let original_content = match tokio::fs::read(&blob_path).await {
@@ -376,6 +439,61 @@ pub async fn rollback_package_patch(
         }
 
         result.files_rolled_back.push(file_name.clone());
+    }
+
+    // Ecosystem sidecar resync — the rollback-side twin of apply's
+    // `dispatch_fixup` boundary. Apply rewrote integrity sidecars to the
+    // patched hashes; with the original bytes now restored those hashes
+    // are stale in the other direction (cargo refuses to build a vendored
+    // crate whose `.cargo-checksum.json` disagrees with its sources).
+    // Best-effort, exactly like apply: a failing resync does NOT undo the
+    // rollback — the restored bytes are already committed — it surfaces
+    // as an `Error`-severity `sidecar_fixup_failed` advisory instead.
+    if !result.files_rolled_back.is_empty() {
+        use crate::patch::sidecars::{
+            dispatch_rollback_fixup, SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord,
+            SidecarSeverity,
+        };
+        // Include files verified `AlreadyOriginal` alongside the ones
+        // restored this run: a previous rollback that failed partway
+        // restored them but returned before this boundary, so their
+        // sidecar entries still carry the PATCHED hashes apply's fixup
+        // wrote — and this retry is the only chance to resync them.
+        // They exist at their before-hash (or, for patch-added files,
+        // are already deleted, which the resync handles by dropping the
+        // entry), so the rehash is a no-op rewrite in the common
+        // already-synced case.
+        let resync_files: Vec<String> = result
+            .files_rolled_back
+            .iter()
+            .cloned()
+            .chain(
+                result
+                    .files_verified
+                    .iter()
+                    .filter(|v| v.status == VerifyRollbackStatus::AlreadyOriginal)
+                    .map(|v| v.file.clone()),
+            )
+            .collect();
+        match dispatch_rollback_fixup(package_key, pkg_path, &resync_files).await {
+            Ok(Some(record)) => result.sidecar = Some(record),
+            Ok(None) => {}
+            Err(e) => {
+                let ecosystem = crate::crawlers::Ecosystem::from_purl(package_key)
+                    .map(|eco| eco.cli_name().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                result.sidecar = Some(SidecarRecord {
+                    purl: package_key.to_string(),
+                    ecosystem,
+                    files: Vec::new(),
+                    advisory: Some(SidecarAdvisory {
+                        code: SidecarAdvisoryCode::SidecarFixupFailed,
+                        severity: SidecarSeverity::Error,
+                        message: format!("sidecar resync failed (files still rolled back): {}", e),
+                    }),
+                });
+            }
+        }
     }
 
     result.success = true;
@@ -1198,5 +1316,431 @@ mod tests {
         tokio::fs::set_permissions(pkg_dir.path(), std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
+    }
+
+    /// SECURITY (before-blob hash path-escape at verify): `beforeHash`
+    /// comes from the same untrusted manifest as the file keys, but is
+    /// joined onto the blobs directory as a path component. A traversal
+    /// (`../x`) or absolute "hash" must be refused at verification —
+    /// `Path::join` discards the base on an absolute string and `..`
+    /// walks out, so an escaping hash that resolved to any existing file
+    /// verified `Ready` and the rollback loop then read an arbitrary
+    /// out-of-tree path (existence oracle, unbounded read of `/dev/zero`,
+    /// FIFO hang).
+    #[tokio::test]
+    async fn test_verify_file_rollback_rejects_blob_hash_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        // An out-of-tree file the escaping "hash" resolves to.
+        let secret = root.path().join("secret.txt");
+        tokio::fs::write(&secret, b"out of tree").await.unwrap();
+
+        let patched = b"patched content";
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let escapes = [
+            "../secret.txt".to_string(),
+            // Absolute path: Path::join discards the blobs-dir base entirely.
+            secret.to_string_lossy().into_owned(),
+        ];
+        for before_hash in escapes {
+            let file_info = PatchFileInfo {
+                before_hash: before_hash.clone(),
+                after_hash: compute_git_sha256_from_bytes(patched),
+            };
+            let result = verify_file_rollback(&pkg_dir, "index.js", &file_info, &blobs_dir).await;
+            assert_ne!(
+                result.status,
+                VerifyRollbackStatus::Ready,
+                "hash: {before_hash}"
+            );
+            assert_ne!(
+                result.status,
+                VerifyRollbackStatus::AlreadyOriginal,
+                "hash: {before_hash}"
+            );
+        }
+    }
+
+    /// SECURITY (before-blob escape at the read site): a poisoned manifest
+    /// whose `beforeHash` escapes the blobs directory must fail the
+    /// package rollback with the path-safety error. Regression: the
+    /// unguarded code read the out-of-tree file and leaked its git-sha256
+    /// into the error message ("Got: <hash>") — an existence +
+    /// content-hash oracle over any host file readable by the user.
+    #[tokio::test]
+    async fn test_rollback_package_patch_blob_hash_escape_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+
+        let secret_content = b"top secret contents\n";
+        tokio::fs::write(root.path().join("secret.txt"), secret_content)
+            .await
+            .unwrap();
+
+        let patched = b"patched content";
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "../secret.txt".to_string(),
+                after_hash: compute_git_sha256_from_bytes(patched),
+            },
+        );
+
+        let result =
+            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+
+        assert!(!result.success, "escaping blob hash must be refused");
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        let secret_hash = compute_git_sha256_from_bytes(secret_content);
+        assert!(
+            !err.contains(&secret_hash),
+            "error must not leak the out-of-tree file's content hash: {err}"
+        );
+        assert!(
+            err.contains("Unsafe before-blob hash"),
+            "unexpected error: {err}"
+        );
+        // The patched file must be untouched.
+        assert_eq!(
+            tokio::fs::read(pkg_dir.join("index.js")).await.unwrap(),
+            patched
+        );
+    }
+
+    /// Regression (new-file dangling symlink): `metadata()` follows
+    /// symlinks, so a dangling symlink left where the patch-added file
+    /// was reported ENOENT → `AlreadyOriginal`, and the package rollback
+    /// claimed success while silently leaving the stray entry behind.
+    /// The entry probe must be `symlink_metadata`: a path occupied by
+    /// something that is neither the added file nor absent is a modified
+    /// state and must fail closed, like every other modified state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_package_patch_new_file_dangling_symlink_blocks() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let path = pkg_dir.path().join("added.js");
+        std::os::unix::fs::symlink("does-not-exist", &path).unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "added.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(b"added by patch\n"),
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(
+            !result.success,
+            "a dangling symlink at the added path is a modified state and must block"
+        );
+        assert!(result.files_rolled_back.is_empty());
+        // The stray entry is still there — it must not be silently ignored.
+        assert!(tokio::fs::symlink_metadata(&path).await.is_ok());
+    }
+
+    /// Regression (cargo sidecar resync): apply rewrites
+    /// `.cargo-checksum.json` to the *patched* SHA256s (and inserts
+    /// entries for patch-added files). Rolling the package back restores
+    /// the original bytes but used to leave the checksum file untouched —
+    /// original sources verified against patched hashes, so the very next
+    /// `cargo build` of the vendored crate refused with "checksum ...
+    /// has changed" (proven by `cargo_check_fails_without_sidecar_fixup`
+    /// in the cargo-build e2e). Rollback must resync the sidecar:
+    /// restored files get their original hash back, and the entry for a
+    /// patch-added (now deleted) file is removed entirely.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_rollback_package_patch_cargo_resyncs_checksum_sidecar() {
+        use sha2::{Digest, Sha256};
+        fn sha256_hex(bytes: &[u8]) -> String {
+            let mut h = Sha256::new();
+            h.update(bytes);
+            format!("{:x}", h.finalize())
+        }
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+
+        let original = b"pub fn hello() {}\n";
+        let patched = b"pub fn hello() { /* patched */ }\n";
+        let added = b"pub fn added() {}\n";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        // On-disk state is post-apply: patched source + patch-added file.
+        tokio::fs::create_dir_all(pkg.join("src")).await.unwrap();
+        tokio::fs::write(pkg.join("src/lib.rs"), patched)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.join("src/new.rs"), added)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&before_hash), original)
+            .await
+            .unwrap();
+
+        // `.cargo-checksum.json` as apply's sidecar fixup left it: patched
+        // hashes for the patched file, a fresh entry for the added file,
+        // untouched entries and the `package` field preserved.
+        let checksum_path = pkg.join(".cargo-checksum.json");
+        let post_apply_checksum = serde_json::json!({
+            "files": {
+                "src/lib.rs": sha256_hex(patched),
+                "src/new.rs": sha256_hex(added),
+                "Cargo.toml": "ff".repeat(32),
+            },
+            "package": "tarball-hash-preserved",
+        });
+        tokio::fs::write(
+            &checksum_path,
+            serde_json::to_string_pretty(&post_apply_checksum).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "src/lib.rs".to_string(),
+            PatchFileInfo {
+                before_hash: before_hash.clone(),
+                after_hash,
+            },
+        );
+        files.insert(
+            "src/new.rs".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: compute_git_sha256_from_bytes(added),
+            },
+        );
+
+        let result =
+            rollback_package_patch("pkg:cargo/demo@1.0.0", pkg, &files, blobs_dir.path(), false)
+                .await;
+
+        assert!(result.success, "rollback failed: {:?}", result.error);
+        assert_eq!(result.files_rolled_back.len(), 2);
+        assert_eq!(
+            tokio::fs::read(pkg.join("src/lib.rs")).await.unwrap(),
+            original
+        );
+        assert!(tokio::fs::metadata(pkg.join("src/new.rs")).await.is_err());
+
+        // The sidecar must reflect the rolled-back (original) state.
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum_path).await.unwrap())
+                .unwrap();
+        let entries = post["files"].as_object().unwrap();
+        assert_eq!(
+            entries["src/lib.rs"].as_str().unwrap(),
+            sha256_hex(original),
+            "rollback must restore the original hash in .cargo-checksum.json \
+             or cargo refuses to build the rolled-back crate"
+        );
+        assert!(
+            entries.get("src/new.rs").is_none(),
+            "the entry apply added for the patch-added file must be removed \
+             once rollback deletes that file"
+        );
+        // Untouched entries and the package field survive the resync.
+        assert_eq!(entries["Cargo.toml"].as_str().unwrap(), "ff".repeat(32));
+        assert_eq!(post["package"].as_str().unwrap(), "tarball-hash-preserved");
+
+        // And the result reports the resync as a sidecar record, the
+        // rollback-side twin of `ApplyResult::sidecar`.
+        let sidecar = result
+            .sidecar
+            .expect("cargo rollback must report a sidecar resync");
+        assert_eq!(sidecar.ecosystem, "cargo");
+        assert_eq!(sidecar.purl, "pkg:cargo/demo@1.0.0");
+        assert_eq!(sidecar.files.len(), 1);
+        assert_eq!(sidecar.files[0].path, ".cargo-checksum.json");
+        assert!(sidecar.advisory.is_none());
+    }
+
+    /// Best-effort boundary: a malformed `.cargo-checksum.json` must not
+    /// fail the rollback (the bytes are already restored) — it surfaces
+    /// as an `Error`-severity `sidecar_fixup_failed` advisory, mirroring
+    /// apply's boundary in `apply_package_patch`.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_rollback_package_patch_cargo_sidecar_failure_is_best_effort() {
+        use crate::patch::sidecars::{SidecarAdvisoryCode, SidecarSeverity};
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+
+        let original = b"original content";
+        let patched = b"patched content";
+        let before_hash = compute_git_sha256_from_bytes(original);
+
+        tokio::fs::write(pkg.join("lib.rs"), patched).await.unwrap();
+        tokio::fs::write(blobs_dir.path().join(&before_hash), original)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.join(".cargo-checksum.json"), b"not json")
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "lib.rs".to_string(),
+            PatchFileInfo {
+                before_hash: before_hash.clone(),
+                after_hash: compute_git_sha256_from_bytes(patched),
+            },
+        );
+
+        let result =
+            rollback_package_patch("pkg:cargo/demo@1.0.0", pkg, &files, blobs_dir.path(), false)
+                .await;
+
+        assert!(
+            result.success,
+            "sidecar resync failure must not fail the rollback"
+        );
+        assert_eq!(
+            tokio::fs::read(pkg.join("lib.rs")).await.unwrap(),
+            original,
+            "the file restore itself must have happened"
+        );
+        let sidecar = result
+            .sidecar
+            .expect("failure must surface as a sidecar record");
+        let advisory = sidecar
+            .advisory
+            .expect("failure record carries an advisory");
+        assert_eq!(advisory.code, SidecarAdvisoryCode::SidecarFixupFailed);
+        assert_eq!(advisory.severity, SidecarSeverity::Error);
+    }
+
+    /// Regression (retried partial rollback wedges cargo): a previous
+    /// rollback that failed partway restored a.rs to its ORIGINAL bytes
+    /// but returned before the resync boundary, leaving a.rs's
+    /// `.cargo-checksum.json` entry at the PATCHED hash apply's fixup
+    /// wrote. On the retry a.rs verifies `AlreadyOriginal` and is skipped
+    /// by the restore loop — but it must still be included in the sidecar
+    /// resync, or its entry stays patched-hash over original bytes and
+    /// `cargo build` refuses the crate even though the retry reported
+    /// success.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_rollback_retry_resyncs_already_original_checksum_entries() {
+        fn plain_sha256(b: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b);
+            format!("{:x}", h.finalize())
+        }
+
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+
+        // State left by the interrupted run: a.rs already restored to its
+        // original bytes (no before-blob needed — AlreadyOriginal
+        // short-circuits), b.rs still patched. The checksum carries the
+        // PATCHED hashes apply's fixup wrote for both.
+        tokio::fs::write(pkg.join("a.rs"), b"original a")
+            .await
+            .unwrap();
+        tokio::fs::write(pkg.join("b.rs"), b"patched b")
+            .await
+            .unwrap();
+        let checksum = serde_json::json!({
+            "files": {
+                "a.rs": plain_sha256(b"patched a"),
+                "b.rs": plain_sha256(b"patched b"),
+            },
+            "package": "x",
+        });
+        tokio::fs::write(
+            pkg.join(".cargo-checksum.json"),
+            serde_json::to_string_pretty(&checksum).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // The retry has b's before-blob available.
+        let b_before = compute_git_sha256_from_bytes(b"original b");
+        tokio::fs::write(blobs_dir.path().join(&b_before), b"original b")
+            .await
+            .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "a.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original a"),
+                after_hash: compute_git_sha256_from_bytes(b"patched a"),
+            },
+        );
+        files.insert(
+            "b.rs".to_string(),
+            PatchFileInfo {
+                before_hash: b_before,
+                after_hash: compute_git_sha256_from_bytes(b"patched b"),
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:cargo/mycrate@1.0.0",
+            pkg,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(result.success, "retry must succeed: {:?}", result.error);
+        assert_eq!(result.files_rolled_back, vec!["b.rs".to_string()]);
+
+        let post: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(pkg.join(".cargo-checksum.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            post["files"]["b.rs"].as_str().unwrap(),
+            plain_sha256(b"original b"),
+            "the freshly restored file's entry must be resynced"
+        );
+        assert_eq!(
+            post["files"]["a.rs"].as_str().unwrap(),
+            plain_sha256(b"original a"),
+            "an AlreadyOriginal file from the interrupted run must be \
+             resynced too — a stale patched-hash entry wedges cargo build"
+        );
     }
 }
