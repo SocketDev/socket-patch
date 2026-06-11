@@ -25,7 +25,7 @@ use serde_json::Value;
 use crate::patch::path_safety;
 use crate::utils::purl::strip_purl_qualifiers;
 
-use super::npm_common::{is_safe_npm_name, parse_npm_purl};
+use super::npm_common::is_safe_npm_name;
 use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
 use super::path::parse_vendor_path;
 use super::{bun_lock, pnpm_lock, yarn_berry_lock, yarn_classic_lock};
@@ -111,32 +111,67 @@ pub async fn inventory_npm_lock(
 }
 
 /// Match a manifest/API purl (possibly percent-encoded, possibly carrying
-/// qualifiers) against the inventory. npm purls decode via
-/// [`parse_npm_purl`] so `pkg:npm/%40scope/x@1` matches the literal entry.
+/// qualifiers) against the inventory: components decode via
+/// [`crate::utils::purl::normalize_purl`], so `pkg:npm/%40scope/x@1`
+/// matches the literal entry.
 pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a LockfileEntry> {
-    let base = strip_purl_qualifiers(purl);
-    if base.starts_with("pkg:npm/") {
-        let (name, version) = parse_npm_purl(base)?;
-        return entries
-            .iter()
-            .find(|e| e.ecosystem == "npm" && e.name == name && e.version == version);
+    let decoded = crate::utils::purl::normalize_purl(strip_purl_qualifiers(purl)).into_owned();
+    let rest = decoded.strip_prefix("pkg:")?;
+    let (purl_type, rest) = rest.split_once('/')?;
+    // purl type → vendor-ecosystem tag (same mapping the dispatcher uses).
+    let eco = match purl_type {
+        "npm" => "npm",
+        "cargo" => "cargo",
+        "golang" => "golang",
+        "pypi" => "pypi",
+        "gem" => "gem",
+        "composer" => "composer",
+        _ => return None,
+    };
+    let at = rest.rfind('@').filter(|&i| i > 0)?;
+    let (name, version) = (&rest[..at], &rest[at + 1..]);
+    entries
+        .iter()
+        .find(|e| e.ecosystem == eco && e.name == name && e.version == version)
+}
+
+/// Everything every recognized lockfile in the project resolves — the
+/// union the scan supplement and the vendor auto-fetch consume.
+pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
+    let mut out: Vec<LockfileEntry> = Vec::new();
+    if let Some((_, entries)) = inventory_npm_lock(project_root).await {
+        out.extend(entries);
     }
-    // Other ecosystems route here as their fetchers land.
-    None
+    #[cfg(feature = "cargo")]
+    if let Some(entries) = inventory_cargo_lock(project_root).await {
+        out.extend(entries);
+    }
+    #[cfg(feature = "golang")]
+    if let Some(entries) = inventory_go_sum(project_root).await {
+        out.extend(entries);
+    }
+    out
 }
 
 /// Guard + dedup the raw npm entries: unsafe names/versions are dropped
 /// fail-closed; duplicate (name, version) instances collapse to one,
 /// preferring the instance that carries a verifier.
 fn finalize_npm(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
+    dedup_prefer_integrity(
+        raw.into_iter()
+            .filter(|e| {
+                is_safe_npm_name(&e.name) && path_safety::is_safe_single_segment(&e.version)
+            })
+            .collect(),
+    )
+}
+
+/// Collapse duplicate (name, version) instances, preferring one that
+/// carries a verifier.
+fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
     let mut out: Vec<LockfileEntry> = Vec::new();
     for entry in raw {
-        if !is_safe_npm_name(&entry.name)
-            || !path_safety::is_safe_single_segment(&entry.version)
-        {
-            continue;
-        }
         let key = (entry.name.clone(), entry.version.clone());
         match seen.get(&key) {
             Some(&i) => {
@@ -153,6 +188,117 @@ fn finalize_npm(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
         }
     }
     out
+}
+
+// ──────────────────────────────── Cargo.lock ────────────────────────────────
+
+/// Inventory `Cargo.lock` `[[package]]` blocks. Only crates.io-sourced
+/// entries are fetchable (their `checksum` is the sha256 of the `.crate`
+/// file); workspace members (no `source`) are skipped, and git/custom-
+/// registry sources stay listed for discovery without a verifier.
+#[cfg(feature = "cargo")]
+pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    let mut cur: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = None;
+    let flush = |cur: &mut Option<(Option<String>, Option<String>, Option<String>, Option<String>)>,
+                     out: &mut Vec<LockfileEntry>| {
+        if let Some((Some(name), Some(version), source, checksum)) = cur.take() {
+            let Some(source) = source else {
+                return; // workspace member
+            };
+            if !path_safety::is_safe_single_segment(&name)
+                || !path_safety::is_safe_single_segment(&version)
+            {
+                return;
+            }
+            let crates_io = source.contains("github.com/rust-lang/crates.io-index")
+                || source.contains("index.crates.io");
+            let integrity = match checksum {
+                Some(c) if crates_io && c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    LockIntegrity::Sha256Hex(c)
+                }
+                _ => LockIntegrity::None,
+            };
+            let purl = format!("pkg:cargo/{name}@{version}");
+            out.push(LockfileEntry {
+                ecosystem: "cargo",
+                name,
+                version,
+                purl,
+                resolved: None,
+                integrity,
+            });
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "[[package]]" {
+            flush(&mut cur, &mut out);
+            cur = Some((None, None, None, None));
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&mut cur, &mut out);
+            continue;
+        }
+        let Some(slot) = cur.as_mut() else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim() {
+            "name" => slot.0 = Some(value),
+            "version" => slot.1 = Some(value),
+            "source" => slot.2 = Some(value),
+            "checksum" => slot.3 = Some(value),
+            _ => {}
+        }
+    }
+    flush(&mut cur, &mut out);
+    Some(dedup_prefer_integrity(out))
+}
+
+// ────────────────────────────────── go.sum ──────────────────────────────────
+
+/// Inventory `go.sum` module-zip lines (`<module> <version> h1:<b64>`); the
+/// `/go.mod`-suffixed lines hash only the manifest and are skipped. go.sum
+/// may list more modules than the final build graph — acceptable for
+/// discovery, and the manifest decides what actually gets vendored.
+#[cfg(feature = "golang")]
+pub async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(project_root.join("go.sum"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(module), Some(version), Some(hash)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if version.ends_with("/go.mod") || !hash.starts_with("h1:") {
+            continue;
+        }
+        // SECURITY: module path segments and the version feed paths/URLs.
+        if !path_safety::is_safe_multi_segment(module)
+            || !path_safety::is_safe_single_segment(version)
+        {
+            continue;
+        }
+        out.push(LockfileEntry {
+            ecosystem: "golang",
+            name: module.to_string(),
+            version: version.to_string(),
+            purl: format!("pkg:golang/{module}@{version}"),
+            resolved: None,
+            integrity: LockIntegrity::GoH1(hash.to_string()),
+        });
+    }
+    Some(dedup_prefer_integrity(out))
 }
 
 /// Keep a lock-recorded URL only when it is a plain http(s) artifact URL
@@ -747,6 +893,112 @@ __metadata:
         let out = finalize_npm(raw);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].integrity, LockIntegrity::Sri("sha512-x==".into()));
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_lock_inventories_crates_io_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.lock",
+            r#"# This file is automatically @generated by Cargo.
+version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddc6f9cc94d67c0e21aaf7eda3a010fd3af78ebf6e096aa6e2e13c79749cce4f"
+
+[[package]]
+name = "git-dep"
+version = "0.5.0"
+source = "git+https://github.com/x/git-dep?rev=abc#abc"
+
+[[package]]
+name = "sparse-crate"
+version = "2.0.0"
+source = "sparse+https://index.crates.io/"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .await;
+
+        let entries = inventory_cargo_lock(tmp.path()).await.unwrap();
+        let serde_entry = entry(&entries, "serde");
+        assert_eq!(serde_entry.version, "1.0.200");
+        assert_eq!(serde_entry.purl, "pkg:cargo/serde@1.0.200");
+        assert_eq!(
+            serde_entry.integrity,
+            LockIntegrity::Sha256Hex(
+                "ddc6f9cc94d67c0e21aaf7eda3a010fd3af78ebf6e096aa6e2e13c79749cce4f".into()
+            )
+        );
+        assert!(matches!(
+            entry(&entries, "sparse-crate").integrity,
+            LockIntegrity::Sha256Hex(_)
+        ));
+        // Workspace member (no source) excluded; git source unverifiable.
+        assert!(!entries.iter().any(|e| e.name == "fixture"));
+        assert_eq!(entry(&entries, "git-dep").integrity, LockIntegrity::None);
+    }
+
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn go_sum_inventories_module_zip_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "go.sum",
+            "github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=\n\
+             github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL7YrpYKXt5YId3A/Tnip5kqbEAP+KLuI3SUcPTeU=\n\
+             golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=\n",
+        )
+        .await;
+
+        let entries = inventory_go_sum(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 2, "the /go.mod line is skipped: {entries:?}");
+        let gin = entry(&entries, "github.com/gin-gonic/gin");
+        assert_eq!(gin.version, "v1.9.1");
+        assert_eq!(gin.purl, "pkg:golang/github.com/gin-gonic/gin@v1.9.1");
+        assert_eq!(
+            gin.integrity,
+            LockIntegrity::GoH1("h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_matches_cargo_and_golang_purls() {
+        let entries = vec![
+            LockfileEntry {
+                ecosystem: "cargo",
+                name: "serde".into(),
+                version: "1.0.200".into(),
+                purl: "pkg:cargo/serde@1.0.200".into(),
+                resolved: None,
+                integrity: LockIntegrity::None,
+            },
+            LockfileEntry {
+                ecosystem: "golang",
+                name: "github.com/x/y".into(),
+                version: "v1.0.0".into(),
+                purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
+                resolved: None,
+                integrity: LockIntegrity::None,
+            },
+        ];
+        assert!(lookup(&entries, "pkg:cargo/serde@1.0.200").is_some());
+        assert!(lookup(&entries, "pkg:golang/github.com/x/y@v1.0.0").is_some());
+        assert!(lookup(&entries, "pkg:cargo/serde@9.9.9").is_none());
+        assert!(
+            lookup(&entries, "pkg:npm/serde@1.0.200").is_none(),
+            "ecosystem tags must match, not just name@version"
+        );
     }
 
     #[tokio::test]

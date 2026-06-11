@@ -112,10 +112,248 @@ pub async fn fetch_and_stage(
     }
     match entry.ecosystem {
         "npm" => fetch_npm(entry, client).await,
+        #[cfg(feature = "cargo")]
+        "cargo" => fetch_cargo(entry, client).await,
+        #[cfg(feature = "golang")]
+        "golang" => fetch_golang(entry, client).await,
         other => Err(FetchError::Unverifiable(format!(
             "no registry fetcher for ecosystem `{other}`"
         ))),
     }
+}
+
+/// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
+#[cfg(feature = "cargo")]
+pub const DEFAULT_CRATES_REGISTRY: &str = "https://static.crates.io/crates";
+
+#[cfg(feature = "cargo")]
+fn crates_registry_base() -> String {
+    std::env::var("SOCKET_CRATES_REGISTRY")
+        .ok()
+        .map(|v| v.trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_CRATES_REGISTRY.to_string())
+}
+
+/// `.crate` files are tar.gz with a `{name}-{version}/` top dir — the same
+/// extraction path as npm tarballs. The Cargo.lock `checksum` is the sha256
+/// of the `.crate` bytes.
+#[cfg(feature = "cargo")]
+async fn fetch_cargo(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let url = entry.resolved.clone().unwrap_or_else(|| {
+        format!(
+            "{}/{}/{}-{}.crate",
+            crates_registry_base(),
+            entry.name,
+            entry.name,
+            entry.version
+        )
+    });
+    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
+    verify_integrity(&bytes, &entry.integrity)?;
+
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
+    let dir = tmp.path().join("crate");
+    extract_tgz(&bytes, &dir).map_err(FetchError::Failed)?;
+    if tokio::fs::metadata(dir.join("Cargo.toml")).await.is_err() {
+        return Err(FetchError::Failed(format!(
+            "fetched .crate for {}@{} carries no Cargo.toml — not a crate",
+            entry.name, entry.version
+        )));
+    }
+    Ok(FetchedPackage {
+        dir,
+        url,
+        _tmp: tmp,
+    })
+}
+
+/// Default Go module proxy; `SOCKET_GOPROXY` wins, else the standard
+/// `GOPROXY` env (first element that isn't `direct`/`off`).
+#[cfg(feature = "golang")]
+pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
+
+#[cfg(feature = "golang")]
+fn goproxy_base() -> String {
+    if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
+        let v = v.trim_end_matches('/').to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(v) = std::env::var("GOPROXY") {
+        for part in v.split(',') {
+            let part = part.trim().trim_end_matches('/');
+            if !part.is_empty() && part != "direct" && part != "off" {
+                return part.to_string();
+            }
+        }
+    }
+    DEFAULT_GOPROXY.to_string()
+}
+
+/// Go's module-path case encoding for proxy URLs: an uppercase letter `X`
+/// becomes `!x` (applies to the module path and the version).
+#[cfg(feature = "golang")]
+fn go_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('!');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// go.sum's `h1:` dirhash over a module zip: sha256 of the sorted
+/// `"{sha256hex(content)}  {entry name}\n"` lines, base64-encoded
+/// (golang.org/x/mod/sumdb/dirhash Hash1/HashZip). Computed in memory
+/// BEFORE extraction.
+#[cfg(feature = "golang")]
+fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable module zip: {e}"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(format!("module zip exceeds {MAX_ENTRIES} entries"));
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("unreadable module zip entry: {e}"))?;
+        if file.is_dir() {
+            continue; // go module zips carry files only
+        }
+        let name = file.name().to_string();
+        if name.contains('\n') {
+            return Err("module zip entry name contains a newline".to_string());
+        }
+        if file.size() > MAX_ENTRY_BYTES {
+            return Err(format!(
+                "module zip entry `{name}` is {} bytes (cap {MAX_ENTRY_BYTES})",
+                file.size()
+            ));
+        }
+        total += file.size();
+        if total > MAX_TOTAL_DECOMPRESSED_BYTES {
+            return Err(format!(
+                "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            ));
+        }
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| format!("cannot read module zip entry `{name}`: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        files.push((name, hex::encode(hasher.finalize())));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (name, content_hex) in &files {
+        h.update(format!("{content_hex}  {name}\n").as_bytes());
+    }
+    Ok(format!(
+        "h1:{}",
+        base64::engine::general_purpose::STANDARD.encode(h.finalize())
+    ))
+}
+
+/// Traversal-guarded zip extraction with an EXPLICIT required prefix
+/// (`<module>@<version>/` — go module paths contain slashes, so a
+/// first-component strip would be wrong). Same guard family as
+/// [`extract_tgz`]; an entry outside the prefix fails the whole artifact.
+#[cfg(feature = "golang")]
+fn extract_zip_with_prefix(bytes: &[u8], dest: &Path, prefix: &str) -> Result<(), String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("unreadable module zip: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("unreadable module zip entry: {e}"))?;
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().to_string();
+        let Some(rel) = name.strip_prefix(prefix) else {
+            return Err(format!(
+                "module zip entry `{name}` lies outside `{prefix}` — refusing the artifact"
+            ));
+        };
+        if !is_safe_relative_subpath(rel) {
+            return Err(format!(
+                "module zip entry `{name}` escapes the extraction dir — refusing the artifact"
+            ));
+        }
+        let target = dest.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&target)
+            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+        std::io::copy(&mut file, &mut out).map_err(|e| format!("cannot extract `{rel}`: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
+            let perms = if exec { 0o755 } else { 0o644 };
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perms));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "golang")]
+async fn fetch_golang(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let LockIntegrity::GoH1(expected) = &entry.integrity else {
+        return Err(FetchError::Unverifiable(
+            "go module entries verify via the go.sum h1 dirhash only".to_string(),
+        ));
+    };
+    let url = entry.resolved.clone().unwrap_or_else(|| {
+        format!(
+            "{}/{}/@v/{}.zip",
+            goproxy_base(),
+            go_escape(&entry.name),
+            go_escape(&entry.version)
+        )
+    });
+    let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
+    let actual = go_h1_of_zip(&bytes).map_err(FetchError::Failed)?;
+    if &actual != expected {
+        return Err(FetchError::Failed(format!(
+            "go.sum dirhash mismatch: lockfile records {expected}, the fetched module zip \
+             hashes to {actual}"
+        )));
+    }
+    let tmp = tempfile::tempdir()
+        .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
+    let dir = tmp.path().join("module");
+    let prefix = format!("{}@{}/", entry.name, entry.version);
+    extract_zip_with_prefix(&bytes, &dir, &prefix).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage {
+        dir,
+        url,
+        _tmp: tmp,
+    })
 }
 
 async fn fetch_npm(
@@ -665,6 +903,152 @@ mod tests {
             Err(FetchError::Unverifiable(_)) => {}
             other => panic!("expected Unverifiable for empty hash, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn cargo_crate_fetch_verifies_sha256_and_extracts() {
+        // .crate = tar.gz with a {name}-{version}/ top dir.
+        let crate_bytes = make_tgz(&[
+            ("left-pad-1.3.0/Cargo.toml", b"[package]\nname = \"left-pad\"\n", false),
+            ("left-pad-1.3.0/src/lib.rs", b"pub fn pad() {}\n", false),
+        ]);
+        let sha = hex::encode(Sha256::digest(&crate_bytes));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/left-pad/left-pad-1.3.0.crate"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "cargo",
+            name: "left-pad".into(),
+            version: "1.3.0".into(),
+            purl: "pkg:cargo/left-pad@1.3.0".into(),
+            resolved: Some(format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri())),
+            integrity: LockIntegrity::Sha256Hex(sha),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        assert!(fetched.dir().join("Cargo.toml").is_file());
+        assert!(fetched.dir().join("src/lib.rs").is_file());
+
+        // Tampered checksum fails closed.
+        let entry = LockfileEntry {
+            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+            ..entry
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    /// Build a go module zip in memory (files only, `module@version/`
+    /// prefix — the go zip layout).
+    #[cfg(feature = "golang")]
+    fn make_module_zip(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in files {
+            writer
+                .start_file(
+                    format!("{prefix}{name}"),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// Independent spec-mirror of dirhash Hash1/HashZip, structured
+    /// differently from the production fn to catch encoding slips.
+    #[cfg(feature = "golang")]
+    fn spec_h1(files: &[(&str, &[u8])], prefix: &str) -> String {
+        // dirhash.Hash1 sorts the FILE NAMES, then emits one line per file.
+        let mut named: Vec<(String, &[u8])> = files
+            .iter()
+            .map(|(name, bytes)| (format!("{prefix}{name}"), *bytes))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let lines: Vec<String> = named
+            .iter()
+            .map(|(name, bytes)| format!("{}  {name}\n", hex::encode(Sha256::digest(bytes))))
+            .collect();
+        let digest = Sha256::digest(lines.concat().as_bytes());
+        format!(
+            "h1:{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        )
+    }
+
+    #[cfg(feature = "golang")]
+    #[tokio::test]
+    async fn golang_module_fetch_verifies_h1_dirhash_and_extracts() {
+        // Out-of-order files prove the sort; nested module path proves the
+        // explicit-prefix strip (a first-component strip would be wrong).
+        let prefix = "github.com/x/y@v1.0.0/";
+        let files: [(&str, &[u8]); 3] = [
+            ("go.mod", b"module github.com/x/y\n"),
+            ("a/b.go", b"package a\n"),
+            ("README.md", b"# y\n"),
+        ];
+        let zip_bytes = make_module_zip(prefix, &files);
+        let expected = spec_h1(&files, prefix);
+        assert_eq!(
+            go_h1_of_zip(&zip_bytes).unwrap(),
+            expected,
+            "production dirhash matches the spec mirror"
+        );
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/github.com/x/y/@v/v1.0.0.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&mock)
+            .await;
+
+        let entry = LockfileEntry {
+            ecosystem: "golang",
+            name: "github.com/x/y".into(),
+            version: "v1.0.0".into(),
+            purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
+            resolved: Some(format!("{}/github.com/x/y/@v/v1.0.0.zip", mock.uri())),
+            integrity: LockIntegrity::GoH1(expected),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client())
+            .await
+            .unwrap();
+        assert!(fetched.dir().join("go.mod").is_file());
+        assert!(fetched.dir().join("a/b.go").is_file());
+
+        // Tampered h1 fails closed.
+        let entry = LockfileEntry {
+            integrity: LockIntegrity::GoH1("h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+            ..entry
+        };
+        match fetch_and_stage(&entry, &build_registry_client()).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "golang")]
+    #[test]
+    fn go_escape_uppercase_and_zip_prefix_guards() {
+        assert_eq!(go_escape("github.com/Azure/azure-sdk"), "github.com/!azure/azure-sdk");
+        assert_eq!(go_escape("v1.0.0-RC1"), "v1.0.0-!r!c1");
+
+        // An entry outside the module prefix fails the whole artifact.
+        let zip_bytes = make_module_zip("github.com/x/y@v1.0.0/", &[("go.mod", b"m\n")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), "github.com/OTHER@v1/")
+            .unwrap_err();
+        assert!(err.contains("outside"), "{err}");
     }
 
     #[test]
