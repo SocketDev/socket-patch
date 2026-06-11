@@ -71,7 +71,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 `scan --apply` opts JSON callers into the full discover → select → apply pipeline. Without it, `scan --json` stays read-only (discovery + `updates` array only). No effect outside `--json` mode — the non-JSON path always prompts the user interactively.
 
-`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state.
+`scan --prune` opts into garbage collection. When set, `scan` removes manifest entries for packages no longer present in the crawl, then deletes orphan blob, diff, and package-archive files from `.socket/`. Off by default (v3.0) so a temporary uninstall doesn't silently destroy manifest state. The pass also reconciles vendored state (runs FIRST, under the apply lock — lock contention skips it without failing the scan): vendored entries whose patch is gone from the manifest are reverted, vendored entries whose dependency is no longer in the lockfile graph are reverted AND their manifest entries dropped (detached entries are exempt from both — they are manifest- and lockfile-invisible by design; a missing or undeterminable lockfile keeps the entry, fail-safe), and orphan `.socket/vendor/<eco>/<uuid>` dirs with no ledger entry are swept. The JSON `gc` sub-object gains `revertedVendoredEntries` + `removedVendorOrphanDirs` (wet) / `revertableVendoredEntries` + `vendorOrphanDirs` (preview).
 
 `scan` queries the patch API in `--batch-size` chunks. Authenticated runs POST `/v0/orgs/{slug}/patches/batch`; token-less runs POST `{proxy}/patch/batch` on the public proxy and degrade to per-package `GET /patch/by-package/:purl` requests in two cases: the deployed proxy predates the batch endpoint (legacy proxies answer the POST with their `400 "Unsupported endpoint"` catch-all), or the all-or-nothing batch validation rejects the chunk (e.g. a crawled PURL type the server doesn't recognize, such as `pkg:jsr/…` — the per-package path tolerates those individually, preserving the pre-batch scan semantics). Rate limits and over-capacity 503s surface instead of silently degrading.
 
@@ -442,7 +442,8 @@ worse, lets a warm cache silently serve unpatched bytes):
   moved past the vendored uuid (that would break VEX verification with `vendor_uuid_mismatch`
   until a vendor run). The skip rides `apply.patches[]` as `skipped`/`vendored`; a newer available
   patch still surfaces in `updates[]` — the signal to run `scan --vendor`. `scan --prune` exempts
-  vendored purls (an absent installed copy is their NORMAL state, not grounds to prune). An
+  vendored purls from the crawl-based manifest prune (an absent installed copy is their NORMAL
+  state) but reconciles vendored state via the lockfile instead — see the `--prune` section. An
   explicit `get` is allowed to move the manifest past the vendored uuid and warns
   (`warnings[]` + stderr) that a `vendor` run must refresh the artifact.
 * **Old-binary skew caveat**: a pre-detached `socket-patch` binary running `vendor` against a

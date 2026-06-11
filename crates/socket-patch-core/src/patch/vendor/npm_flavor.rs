@@ -366,6 +366,54 @@ pub async fn vendor_npm_any(
     outcome
 }
 
+/// Is this npm-vendored entry still consumed by its lockfile's dependency
+/// graph?
+///
+/// `Some(true)`: the lockfile still resolves something to the entry's
+/// artifact. `Some(false)`: the lockfile is present and parses but no
+/// resolution references `.socket/vendor/npm/<uuid>/` — the dependency
+/// was removed and re-locked, so the vendoring is unused (an override/
+/// resolutions DECLARATION alone does not count: pnpm's mirrored
+/// `overrides:` section is excluded by the flavor probe, and the other
+/// flavors carry no declaration inside the lock at all). `None`: cannot
+/// determine (missing lock, unknown flavor) — callers keep the entry,
+/// fail-safe. Detached entries are lockfile-invisible BY DESIGN and must
+/// never be routed here (the probe would always call them unused).
+pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    match entry.flavor.as_deref() {
+        Some("pnpm") => super::pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
+        // The remaining flavors wire resolutions into the lock itself
+        // (resolved URLs / file: ranges / package tuples), so a textual
+        // probe for the uuid dir is exact: the path appears iff some
+        // resolution still points at the artifact. shrinkwrap wins over
+        // package-lock, mirroring the vendor/revert lockfile selection.
+        None | Some("package-lock") => {
+            lock_text_mentions_uuid(
+                project_root,
+                &["npm-shrinkwrap.json", "package-lock.json"],
+                &entry.uuid,
+            )
+            .await
+        }
+        Some("yarn-classic") | Some("yarn-berry") => {
+            lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
+        }
+        Some("bun") => lock_text_mentions_uuid(project_root, &["bun.lock"], &entry.uuid).await,
+        Some(_) => None, // unknown flavor: cannot determine
+    }
+}
+
+/// First readable lockfile from `names`, probed for the uuid artifact dir.
+async fn lock_text_mentions_uuid(project_root: &Path, names: &[&str], uuid: &str) -> Option<bool> {
+    let needle = format!(".socket/vendor/npm/{uuid}/");
+    for name in names {
+        if let Ok(text) = tokio::fs::read_to_string(project_root.join(name)).await {
+            return Some(text.contains(&needle));
+        }
+    }
+    None
+}
+
 /// Revert one recorded npm vendor entry through the flavor that wired it.
 /// Entries from before the flavor field existed (`None`) are package-lock
 /// wirings; an unknown flavor fails CLOSED (an older binary must not guess
@@ -772,5 +820,86 @@ mod tests {
             let outcome = revert_npm_any(&entry, tmp.path(), false).await;
             assert!(outcome.success, "flavor {flavor:?}: {:?}", outcome.error);
         }
+    }
+
+    /// One minimal entry per flavor for the in-use probe.
+    fn probe_entry(flavor: Option<&str>) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: "pkg:npm/left-pad@1.3.0".into(),
+            uuid: UUID.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: flavor.map(str::to_string),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// The textual flavors: a resolution pointing at the uuid dir means in
+    /// use; a clean lock means unused; a missing lock or unknown flavor
+    /// cannot be determined (keep, fail-safe).
+    #[tokio::test]
+    async fn vendored_entry_in_use_textual_flavors() {
+        let entry = probe_entry(Some("package-lock"));
+
+        // Missing lock: undeterminable.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+
+        // Lock resolves to our artifact: in use.
+        touch(
+            tmp.path(),
+            "package-lock.json",
+            &format!(
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+            ),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+
+        // Dep removed + re-locked (no reference left): unused.
+        touch(tmp.path(), "package-lock.json", "{\"packages\":{}}").await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+
+        // shrinkwrap wins over package-lock (same precedence as vendoring).
+        touch(
+            tmp.path(),
+            "npm-shrinkwrap.json",
+            &format!(
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+            ),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+
+        // yarn flavors probe yarn.lock.
+        let entry = probe_entry(Some("yarn-classic"));
+        let tmp = tempfile::tempdir().unwrap();
+        touch(
+            tmp.path(),
+            "yarn.lock",
+            &format!("left-pad@1.3.0:\n  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#abc\"\n"),
+        )
+        .await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        touch(tmp.path(), "yarn.lock", "# yarn lockfile v1\n").await;
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(false));
+
+        // Unknown flavor: undeterminable, fail-safe keep.
+        let entry = probe_entry(Some("future-pm"));
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
     }
 }

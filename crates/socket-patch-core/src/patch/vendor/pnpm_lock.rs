@@ -314,6 +314,46 @@ pub async fn vendor_pnpm(
     }
 }
 
+/// Is this pnpm-vendored entry still consumed by the lock's dependency
+/// graph?
+///
+/// `Some(true)`: a `packages:`/`snapshots:` block resolves to the entry's
+/// artifact (`<name>@file:.socket/vendor/npm/<uuid>/...`) — some importer
+/// still depends on the package. `Some(false)`: the lock parses cleanly
+/// and carries NO such block — the dependency was removed and re-locked
+/// (the `overrides:` declaration alone does NOT count as usage: pnpm
+/// keeps it mirrored from package.json even when nothing matches it).
+/// `None`: cannot determine (missing/unreadable/unsupported lock) —
+/// callers must keep the entry, fail-safe.
+pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    let text = tokio::fs::read_to_string(project_root.join(PNPM_LOCK))
+        .await
+        .ok()?;
+    if check_lock_version(&text).is_err() {
+        return None;
+    }
+    let lines = split_lines(&text);
+    for section in ["packages", "snapshots"] {
+        let Some((start, end)) = section_bounds(&lines, section) else {
+            continue;
+        };
+        let mut i = start + 1;
+        while let Some(block) = next_block(&lines, i, end) {
+            let resolved_to_ours = block
+                .key
+                .find("@file:")
+                .map(|at| &block.key[at + 1..])
+                .and_then(parse_vendor_path)
+                .is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid);
+            if resolved_to_ours {
+                return Some(true);
+            }
+            i = block.end;
+        }
+    }
+    Some(false)
+}
+
 /// Undo one pnpm-vendored package: restore the recorded pair fragments and
 /// remove the artifact dir. Reverse application order; per-record ownership
 /// is re-checked against the live fragment (drift ⇒ warning, left alone).
@@ -2246,6 +2286,52 @@ snapshots:
         assert!(live["pnpm"]["overrides"].get("left-pad@1.3.0").is_none());
         let live_lock = fx.read(PNPM_LOCK).await;
         assert!(live_lock.contains("overrides:\n  other-pkg: 2.0.0\n\nimporters:"));
+    }
+
+    // ── in-use probe ───────────────────────────────────────────────────────
+
+    /// The prune-time in-use probe: a packages/snapshots block resolving to
+    /// the artifact means in use; an overrides declaration ALONE (the state
+    /// pnpm leaves after the dependency is removed and re-locked) does not;
+    /// a missing or unsupported-version lock is undeterminable (keep).
+    #[tokio::test]
+    async fn pnpm_entry_in_use_reflects_lock_graph() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Freshly vendored: the rekeyed file: blocks are in the graph.
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, Some(true));
+
+        // Dep removed + re-locked: pnpm prunes the file: blocks but keeps
+        // the overrides declaration mirrored from package.json.
+        let removed_lock = format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n\
+             \noverrides:\n  left-pad@1.3.0: file:{}\n\nimporters:\n\n  .:\n    \
+             dependencies:\n      consumer:\n        specifier: file:./consumer\n        \
+             version: file:consumer\n\npackages:\n\n  consumer@file:consumer:\n    \
+             resolution: {{directory: consumer, type: directory}}\n\nsnapshots:\n\n  \
+             consumer@file:consumer: {{}}\n",
+            fx.rel_tgz()
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &removed_lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            pnpm_entry_in_use(&entry, fx.root()).await,
+            Some(false),
+            "the lingering overrides declaration alone is not usage"
+        );
+
+        // Unsupported lock version: undeterminable.
+        tokio::fs::write(fx.root().join(PNPM_LOCK), "lockfileVersion: '6.0'\n")
+            .await
+            .unwrap();
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
+
+        // Missing lock: undeterminable.
+        tokio::fs::remove_file(fx.root().join(PNPM_LOCK)).await.unwrap();
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
     }
 
     // ── exact-version pin takeover ─────────────────────────────────────────

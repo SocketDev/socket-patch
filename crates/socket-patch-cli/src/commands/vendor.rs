@@ -239,6 +239,62 @@ pub(crate) async fn dispatch_revert_one(
     }
 }
 
+/// Is this vendored entry still consumed by its project's lockfile
+/// dependency graph? `None` = cannot determine — callers must keep the
+/// entry (fail-safe): non-npm ecosystems have no in-use probe yet, and a
+/// missing/unreadable lockfile proves nothing.
+pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    match entry.ecosystem.as_str() {
+        "npm" => {
+            socket_patch_core::patch::vendor::npm_flavor::vendored_entry_in_use(
+                entry,
+                project_root,
+            )
+            .await
+        }
+        _ => None,
+    }
+}
+
+/// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
+/// ledger entry (a hand-edited state file, or artifacts left by an
+/// interrupted run). The lockfile wiring for these is already gone or
+/// owned by a recorded entry, so removal is safe; removed unless
+/// `dry_run`. Unparseable dirs are never returned (and never deleted).
+/// Returns the orphans so callers can emit events / counts.
+pub(crate) async fn sweep_orphan_vendor_dirs(
+    cwd: &Path,
+    state: &socket_patch_core::patch::vendor::VendorState,
+    dry_run: bool,
+) -> Vec<socket_patch_core::patch::vendor::path::SweptVendorDir> {
+    let recorded_units: HashSet<(&str, &str)> = state
+        .entries
+        .values()
+        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
+        .collect();
+    let mut orphans = Vec::new();
+    for unit in vendor::path::sweep_vendor_dirs(cwd).await {
+        if recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
+            continue;
+        }
+        if !dry_run {
+            let _ = remove_tree(&unit.dir).await;
+        }
+        orphans.push(unit);
+    }
+    orphans
+}
+
+/// Does `eco` fall inside this run's `--ecosystems` scope?
+pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
+    match common.ecosystems.as_deref() {
+        None => true,
+        Some(list) => list.iter().any(|e| {
+            e.eq_ignore_ascii_case(eco) || (eco == "golang" && e.eq_ignore_ascii_case("go"))
+        }),
+    }
+}
+
 /// Surface a backend warning: stderr line for humans, a Skipped event with
 /// the stable code for JSON consumers (Skipped never flips the status).
 fn record_warning(env: &mut Envelope, purl: &str, warning: &VendorWarning, common: &GlobalArgs) {
@@ -767,12 +823,6 @@ pub(crate) async fn reconcile_dropped(
     // Respect this run's --ecosystems scope: a `vendor --ecosystems npm`
     // invocation must not silently revert a cargo/go entry (restoring its
     // lockfile and deleting its artifact) as a cross-ecosystem side effect.
-    let in_scope = |eco: &str| match common.ecosystems.as_deref() {
-        None => true,
-        Some(list) => list.iter().any(|e| {
-            e.eq_ignore_ascii_case(eco) || (eco == "golang" && e.eq_ignore_ascii_case("go"))
-        }),
-    };
     let stale: Vec<String> = state
         .entries
         .iter()
@@ -782,7 +832,7 @@ pub(crate) async fn reconcile_dropped(
             // normal state, not a drop — only `vendor --revert` or
             // `remove` may undo them.
             !entry.detached
-                && in_scope(&entry.ecosystem)
+                && ecosystem_in_scope(common, &entry.ecosystem)
                 && !manifest.patches.contains_key(*purl)
                 && !manifest.patches.contains_key(&entry.base_purl)
         })
@@ -875,19 +925,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     // state file, or artifacts left by an interrupted run). The lockfile
     // wiring for these is already gone or owned by a recorded entry, so
     // removal is safe; unparseable dirs are reported, never deleted.
-    let swept = vendor::path::sweep_vendor_dirs(&common.cwd).await;
-    let recorded_units: HashSet<(&str, &str)> = state
-        .entries
-        .values()
-        .map(|e| (e.ecosystem.as_str(), e.uuid.as_str()))
-        .collect();
-    for unit in swept {
-        if recorded_units.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
-            continue;
-        }
-        if !common.dry_run {
-            let _ = remove_tree(&unit.dir).await;
-        }
+    for unit in sweep_orphan_vendor_dirs(&common.cwd, &state, common.dry_run).await {
         let label = unit
             .purls
             .first()
@@ -923,5 +961,383 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         1
     } else {
         0
+    }
+}
+
+// ───────────────────────── prune-time vendored GC ─────────────────────────
+
+/// Summary of the vendored-state GC pass `scan --prune` runs (wet or
+/// preview). Purls are the state-ledger keys (manifest spelling).
+#[derive(Debug, Default)]
+pub(crate) struct VendorGcSummary {
+    /// (a) entries whose patch is gone from the manifest — reverted.
+    pub dropped_reverted: Vec<String>,
+    /// (b) entries whose package left the lockfile dependency graph —
+    /// reverted, and their manifest entries dropped.
+    pub unused_reverted: Vec<String>,
+    /// (c) orphan uuid dirs (no owning ledger entry) swept.
+    pub orphan_dirs: usize,
+    /// Entries that could not be reverted (kept in the ledger), plus any
+    /// pass-level skip marker (e.g. lock contention).
+    pub failed: Vec<String>,
+}
+
+/// The vendored-state GC behind `scan --prune`:
+///
+/// (a) revert entries whose patch was dropped from the manifest (same
+///     stale test as [`reconcile_dropped`], shared with the vendor flows);
+/// (b) revert entries whose dependency is no longer in the lockfile graph
+///     ([`dispatch_in_use_one`] == `Some(false)`; `None` keeps, fail-safe)
+///     and drop their manifest entries so the caller's manifest prune +
+///     blob sweep reclaims the rest in the same pass;
+/// (c) sweep orphan uuid dirs.
+///
+/// Detached entries are exempt from BOTH (a) (never manifest-tracked) and
+/// (b) (lockfile-invisible by design — the probe would always call them
+/// unused). A missing/unreadable manifest skips (a) only (a prune must
+/// not mass-revert on a deleted manifest — that is `vendor --revert`'s
+/// explicit contract).
+///
+/// Wet runs take the apply lock (lockfiles + the manifest are rewritten);
+/// contention records a skip marker and returns — it never fails the
+/// scan. Dry runs are read-only, lock-free, and list-only.
+pub(crate) async fn run_vendor_gc(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    dry_run: bool,
+) -> VendorGcSummary {
+    let mut out = VendorGcSummary::default();
+    let mut state = match load_state(&common.cwd).await {
+        Ok(s) if !s.entries.is_empty() => s,
+        // No ledger (or unreadable): only the orphan sweep could apply, and
+        // without a trustworthy ledger it must not delete anything.
+        _ => return out,
+    };
+
+    let socket_dir = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| common.cwd.clone());
+    let _guard = if dry_run {
+        None
+    } else {
+        match socket_patch_core::patch::apply_lock::acquire(&socket_dir, Duration::from_secs(0)) {
+            Ok(g) => Some(g),
+            Err(_) => {
+                out.failed.push(
+                    "vendor GC skipped: another socket-patch run holds the apply lock".to_string(),
+                );
+                return out;
+            }
+        }
+    };
+
+    // (a) manifest-dropped entries.
+    let mut manifest = socket_patch_core::manifest::operations::read_manifest(manifest_path)
+        .await
+        .ok()
+        .flatten();
+    if let Some(m) = &manifest {
+        let stale: Vec<String> = state
+            .entries
+            .iter()
+            .filter(|(purl, entry)| {
+                !entry.detached
+                    && ecosystem_in_scope(common, &entry.ecosystem)
+                    && !m.patches.contains_key(*purl)
+                    && !m.patches.contains_key(&entry.base_purl)
+            })
+            .map(|(purl, _)| purl.clone())
+            .collect();
+        for purl in stale {
+            if dry_run {
+                out.dropped_reverted.push(purl);
+                continue;
+            }
+            let entry = state.entries.get(&purl).cloned().expect("listed above");
+            if dispatch_revert_one(&entry, &common.cwd, false).await.success {
+                state.entries.remove(&purl);
+                out.dropped_reverted.push(purl);
+            } else {
+                out.failed.push(purl);
+            }
+        }
+    }
+
+    // (b) lockfile-unused entries.
+    let mut manifest_dirty = false;
+    let candidates: Vec<String> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| !entry.detached && ecosystem_in_scope(common, &entry.ecosystem))
+        .map(|(purl, _)| purl.clone())
+        .collect();
+    for purl in candidates {
+        let entry = state.entries.get(&purl).cloned().expect("listed above");
+        if dispatch_in_use_one(&entry, &common.cwd).await != Some(false) {
+            continue; // in use, or cannot determine — keep
+        }
+        if dry_run {
+            out.unused_reverted.push(purl);
+            continue;
+        }
+        if !dispatch_revert_one(&entry, &common.cwd, false).await.success {
+            out.failed.push(purl);
+            continue;
+        }
+        state.entries.remove(&purl);
+        if let Some(m) = manifest.as_mut() {
+            let base = strip_purl_qualifiers(&entry.base_purl).to_string();
+            let dropped: Vec<String> = m
+                .patches
+                .keys()
+                .filter(|k| *k == &purl || strip_purl_qualifiers(k) == base)
+                .cloned()
+                .collect();
+            for k in dropped {
+                m.patches.remove(&k);
+                manifest_dirty = true;
+            }
+        }
+        out.unused_reverted.push(purl);
+    }
+
+    if !dry_run {
+        let _ = save_state(&common.cwd, &state).await;
+        if manifest_dirty {
+            if let Some(m) = &manifest {
+                let _ =
+                    socket_patch_core::manifest::operations::write_manifest(manifest_path, m).await;
+            }
+        }
+    }
+
+    // (c) orphan uuid dirs, against the post-removal ledger.
+    out.orphan_dirs = sweep_orphan_vendor_dirs(&common.cwd, &state, dry_run)
+        .await
+        .len();
+    out
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
+    use socket_patch_core::patch::vendor::state::VendorArtifact;
+    use socket_patch_core::patch::vendor::VendorState;
+    use std::path::PathBuf;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+    const PURL: &str = "pkg:npm/left-pad@1.3.0";
+
+    fn entry(detached: bool) -> VendorEntry {
+        VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: PURL.into(),
+            uuid: UUID.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached,
+            record: None,
+            flavor: Some("package-lock".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    /// Tempdir with: a manifest carrying PURL, a ledger with one entry,
+    /// the artifact on disk, and a package-lock that resolves to it.
+    async fn gc_fixture(detached: bool) -> (tempfile::TempDir, GlobalArgs, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let socket = root.join(".socket");
+        tokio::fs::create_dir_all(socket.join(format!("vendor/npm/{UUID}")))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            socket.join(format!("vendor/npm/{UUID}/left-pad-1.3.0.tgz")),
+            b"tgz",
+        )
+        .await
+        .unwrap();
+
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            PURL.to_string(),
+            socket_patch_core::manifest::schema::PatchRecord {
+                uuid: UUID.to_string(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            },
+        );
+        let manifest_path = socket.join("manifest.json");
+        write_manifest(&manifest_path, &manifest).await.unwrap();
+
+        let mut state = VendorState::default();
+        state.entries.insert(PURL.to_string(), entry(detached));
+        save_state(root, &state).await.unwrap();
+
+        tokio::fs::write(
+            root.join("package-lock.json"),
+            format!(
+                "{{\"packages\":{{\"node_modules/left-pad\":{{\"resolved\":\"file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz\"}}}}}}"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let common = GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            silent: true,
+            ..GlobalArgs::default()
+        };
+        (tmp, common, manifest_path)
+    }
+
+    /// In-manifest + in-lock: the GC keeps everything.
+    #[tokio::test]
+    async fn vendor_gc_keeps_in_use_entries() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert_eq!(out.orphan_dirs, 0);
+        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+    }
+
+    /// (a) the patch is gone from the manifest: revert + drop the entry.
+    #[tokio::test]
+    async fn vendor_gc_reverts_manifest_dropped_entry() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.dropped_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        assert!(
+            !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "artifact dir removed by the revert"
+        );
+    }
+
+    /// (b) the dependency left the lockfile graph: revert + drop BOTH the
+    /// ledger entry and the manifest entry.
+    #[tokio::test]
+    async fn vendor_gc_reverts_unused_entry_and_drops_manifest_entry() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        // Re-lock without the dependency (no reference to the artifact).
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
+        let manifest = read_manifest(&manifest_path).await.unwrap().unwrap();
+        assert!(
+            !manifest.patches.contains_key(PURL),
+            "the unused entry's manifest record is dropped too"
+        );
+    }
+
+    /// Dry run lists without mutating anything.
+    #[tokio::test]
+    async fn vendor_gc_dry_run_is_read_only() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+        let state_before = tokio::fs::read(tmp.path().join(".socket/vendor/state.json"))
+            .await
+            .unwrap();
+        let manifest_before = tokio::fs::read(&manifest_path).await.unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, true).await;
+        assert_eq!(out.unused_reverted, vec![PURL.to_string()], "{out:?}");
+        assert_eq!(
+            tokio::fs::read(tmp.path().join(".socket/vendor/state.json"))
+                .await
+                .unwrap(),
+            state_before,
+            "dry run must not touch the ledger"
+        );
+        assert_eq!(
+            tokio::fs::read(&manifest_path).await.unwrap(),
+            manifest_before,
+            "dry run must not touch the manifest"
+        );
+        assert!(
+            tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            "dry run must not remove artifacts"
+        );
+    }
+
+    /// A missing/undeterminable lockfile keeps the entry (fail-safe), and a
+    /// DETACHED entry is exempt from both (a) and (b).
+    #[tokio::test]
+    async fn vendor_gc_keeps_undeterminable_and_detached_entries() {
+        // Lock removed entirely: probe says None → keep.
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        tokio::fs::remove_file(tmp.path().join("package-lock.json"))
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+
+        // Detached entry: absent from the manifest AND lockfile-invisible —
+        // exactly its normal state. Never reverted by the GC.
+        let (tmp, common, manifest_path) = gc_fixture(true).await;
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(out.dropped_reverted.is_empty(), "{out:?}");
+        assert!(out.unused_reverted.is_empty(), "{out:?}");
+        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+    }
+
+    /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
+    /// (dry).
+    #[tokio::test]
+    async fn vendor_gc_sweeps_orphan_uuid_dirs() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        let orphan_uuid = "1a2b3c4d-5e6f-4a1b-8c2d-9e0f1a2b3c4d";
+        let orphan_dir = tmp.path().join(format!(".socket/vendor/npm/{orphan_uuid}"));
+        tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
+        tokio::fs::write(orphan_dir.join("left-pad-1.3.0.tgz"), b"tgz")
+            .await
+            .unwrap();
+
+        let out = run_vendor_gc(&common, &manifest_path, true).await;
+        assert_eq!(out.orphan_dirs, 1, "{out:?}");
+        assert!(orphan_dir.exists(), "dry run keeps the orphan");
+
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(out.orphan_dirs, 1, "{out:?}");
+        assert!(!orphan_dir.exists(), "wet run sweeps the orphan");
+        // The recorded entry's dir survives the sweep.
+        assert!(tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists());
     }
 }

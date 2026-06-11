@@ -54,6 +54,12 @@ pub(crate) struct GcSummary {
     pub blobs: CleanupResult,
     pub diffs: CleanupResult,
     pub packages: CleanupResult,
+    /// Vendored entries reverted (or revertable, preview mode) because
+    /// their patch is gone from the manifest or their dependency left the
+    /// lockfile graph — see `vendor::run_vendor_gc`. Sorted.
+    pub vendored_reverted: Vec<String>,
+    /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
+    pub vendor_orphan_dirs: usize,
     /// `true` when `--no-prune` was set; the sub-object only carries the
     /// `skipped: true` field in that case.
     pub skipped: bool,
@@ -62,6 +68,17 @@ pub(crate) struct GcSummary {
 impl GcSummary {
     fn total_bytes(&self) -> u64 {
         self.blobs.bytes_freed + self.diffs.bytes_freed + self.packages.bytes_freed
+    }
+
+    /// Fold a vendored-state GC pass into this summary.
+    fn absorb_vendor_gc(&mut self, v: super::vendor::VendorGcSummary) {
+        self.vendored_reverted = v
+            .dropped_reverted
+            .into_iter()
+            .chain(v.unused_reverted)
+            .collect();
+        self.vendored_reverted.sort();
+        self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
     /// Serialize for a *mutating* GC pass (post-apply).
@@ -74,6 +91,8 @@ impl GcSummary {
             "removedBlobs": self.blobs.blobs_removed,
             "removedDiffArchives": self.diffs.blobs_removed,
             "removedPackageArchives": self.packages.blobs_removed,
+            "revertedVendoredEntries": self.vendored_reverted,
+            "removedVendorOrphanDirs": self.vendor_orphan_dirs,
             "bytesFreed": self.total_bytes(),
         })
     }
@@ -88,6 +107,8 @@ impl GcSummary {
             "orphanBlobs": self.blobs.blobs_removed,
             "orphanDiffArchives": self.diffs.blobs_removed,
             "orphanPackageArchives": self.packages.blobs_removed,
+            "revertableVendoredEntries": self.vendored_reverted,
+            "vendorOrphanDirs": self.vendor_orphan_dirs,
             "bytesReclaimable": self.total_bytes(),
         })
     }
@@ -118,6 +139,7 @@ async fn run_gc(
         diffs,
         packages,
         skipped: false,
+        ..Default::default()
     }
 }
 
@@ -127,16 +149,28 @@ async fn run_gc(
 /// `prune` flag — when GC isn't requested, simply don't call this function and
 /// don't emit a `gc` sub-object.
 async fn run_apply_gc(
+    common: &crate::args::GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> GcSummary {
+    // Vendored-state GC FIRST: it reverts manifest-dropped and
+    // lockfile-unused vendored entries, dropping the latter's manifest
+    // entries — so the manifest prune + blob sweep below reclaims their
+    // blobs in this same pass (and the stale `vendored` exemption set is
+    // harmless: the entries it would exempt are already gone).
+    let vendor_gc = super::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
+
     // Re-read the just-written manifest (the apply step may have added
     // or updated entries we now want to consider for pruning).
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
-        _ => return GcSummary::default(),
+        _ => {
+            let mut gc = GcSummary::default();
+            gc.absorb_vendor_gc(vendor_gc);
+            return gc;
+        }
     };
     let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     for purl in &prunable {
@@ -147,22 +181,42 @@ async fn run_apply_gc(
         // file-level cleanup below still operates on the in-memory copy.
         let _ = write_manifest(manifest_path, &manifest).await;
     }
-    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await
+    let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
+    gc.absorb_vendor_gc(vendor_gc);
+    gc
 }
 
 /// Dry-run preview of the apply-mode GC pass. Same shape as
 /// [`run_apply_gc`] but emits `prunable*`/`orphan*` field names and
 /// performs no mutation.
 async fn preview_apply_gc(
+    common: &crate::args::GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> GcSummary {
+    // Read-only preview of the vendored-state GC (lists, never reverts).
+    let vendor_gc = super::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
+
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
-        _ => return GcSummary::default(),
+        _ => {
+            let mut gc = GcSummary::default();
+            gc.absorb_vendor_gc(vendor_gc);
+            return gc;
+        }
     };
+    // Mirror the wet pass: an unused vendored entry's manifest keys are
+    // dropped before the blob sweep, so drop them from the in-memory copy
+    // too — otherwise the preview under-reports orphan blobs/bytes
+    // relative to what the real `--prune` run frees.
+    for purl in &vendor_gc.unused_reverted {
+        let base = strip_purl_qualifiers(purl).to_string();
+        manifest
+            .patches
+            .retain(|k, _| k != purl && strip_purl_qualifiers(k) != base);
+    }
     let prunable = detect_prunable(&manifest, scanned_purls, vendored);
     // Mirror `run_apply_gc`: drop the prunable entries from the manifest
     // *before* computing orphans (no write — this is the preview). The
@@ -174,7 +228,9 @@ async fn preview_apply_gc(
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
-    run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ true).await
+    let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ true).await;
+    gc.absorb_vendor_gc(vendor_gc);
+    gc
 }
 
 /// PURL strings present in the manifest but absent from `scanned_purls`.
@@ -669,7 +725,7 @@ async fn run_vendor_json_path(
         result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
         if prune {
             let gc =
-                preview_apply_gc(manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+                preview_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
             result["gc"] = gc.to_preview_json();
         }
         let final_code =
@@ -730,7 +786,7 @@ async fn run_vendor_json_path(
     //    package_not_installed; vendored entries are exempt from
     //    the prune itself.
     if prune {
-        let gc = run_apply_gc(manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+        let gc = run_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
         result["gc"] = gc.to_apply_json();
     }
 
@@ -816,7 +872,7 @@ async fn run_vendor_interactive_path(
     // GC before the vendor step (see the JSON path): stale manifest
     // entries would fail vendoring with package_not_installed.
     if prune {
-        let gc = run_apply_gc(manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+        let gc = run_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
         if !gc.pruned.is_empty() {
             println!("GC: pruned {} manifest entr{}.", gc.pruned.len(), {
                 if gc.pruned.len() == 1 {
@@ -825,6 +881,15 @@ async fn run_vendor_interactive_path(
                     "ies"
                 }
             });
+        }
+        if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
+            println!(
+                "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
+                gc.vendored_reverted.len(),
+                if gc.vendored_reverted.len() == 1 { "y" } else { "ies" },
+                gc.vendor_orphan_dirs,
+                if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
+            );
         }
     }
     match boxed_scan_vendor_step(
@@ -1567,10 +1632,10 @@ pub async fn run(args: ScanArgs) -> i32 {
             // --- GC (if requested) --------------------------------------
             if prune {
                 let gc = if dry {
-                    preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
+                    preview_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
                         .await
                 } else {
-                    run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                    run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
                 };
                 result["gc"] = if dry {
                     gc.to_preview_json()
@@ -1620,9 +1685,9 @@ pub async fn run(args: ScanArgs) -> i32 {
         // --- GC-only path (no --apply, just --prune) --------------------
         if prune {
             let gc = if dry {
-                preview_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                preview_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
             } else {
-                run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
             };
             result["gc"] = if dry {
                 gc.to_preview_json()
@@ -2033,7 +2098,7 @@ pub async fn run(args: ScanArgs) -> i32 {
     // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode
     // already ran its GC before the vendor step.)
     if prune && !args.vendor {
-        let gc = run_apply_gc(&manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await;
+        let gc = run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await;
         let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
         if !args.common.silent && (!gc.pruned.is_empty() || total > 0) {
             println!(
@@ -2043,6 +2108,15 @@ pub async fn run(args: ScanArgs) -> i32 {
                 total,
                 if total == 1 { "" } else { "s" },
                 socket_patch_core::utils::cleanup_blobs::format_bytes(gc.total_bytes()),
+            );
+        }
+        if !args.common.silent && (!gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0) {
+            println!(
+                "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
+                gc.vendored_reverted.len(),
+                if gc.vendored_reverted.len() == 1 { "y" } else { "ies" },
+                gc.vendor_orphan_dirs,
+                if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
             );
         }
     }
@@ -2235,6 +2309,16 @@ mod tests {
         HashSet::new()
     }
 
+    /// GlobalArgs rooted at the test project dir (the vendored-state GC
+    /// loads `.socket/vendor/state.json` from `cwd`; these fixtures have
+    /// none, so the vendor pass is a no-op).
+    fn gc_common(cwd: &Path) -> crate::args::GlobalArgs {
+        crate::args::GlobalArgs {
+            cwd: cwd.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn detect_prunable_empty_manifest_empty_scanned() {
         let m = PatchManifest::new();
@@ -2415,7 +2499,14 @@ mod tests {
             seed_manifest_with_blob(tmp.path(), "pkg:npm/gone@1.0.0", &after_hash);
 
         let scanned: HashSet<String> = HashSet::new();
-        let preview = preview_apply_gc(&manifest_path, &socket_dir, &scanned, &no_vendored()).await;
+        let preview = preview_apply_gc(
+            &gc_common(tmp.path()),
+            &manifest_path,
+            &socket_dir,
+            &scanned,
+            &no_vendored(),
+        )
+        .await;
 
         assert_eq!(
             preview.pruned,
@@ -2452,13 +2543,20 @@ mod tests {
         let (mp_p, sd_p, blob_p) =
             seed_manifest_with_blob(tmp_preview.path(), "pkg:npm/gone@1.0.0", &after_hash);
         let scanned: HashSet<String> = HashSet::new();
-        let preview = preview_apply_gc(&mp_p, &sd_p, &scanned, &no_vendored()).await;
+        let preview = preview_apply_gc(
+            &gc_common(tmp_preview.path()),
+            &mp_p,
+            &sd_p,
+            &scanned,
+            &no_vendored(),
+        )
+        .await;
         assert!(blob_p.exists(), "preview must not mutate");
 
         let tmp_wet = tempfile::tempdir().unwrap();
         let (mp_w, sd_w, blob_w) =
             seed_manifest_with_blob(tmp_wet.path(), "pkg:npm/gone@1.0.0", &after_hash);
-        let wet = run_apply_gc(&mp_w, &sd_w, &scanned, &no_vendored()).await;
+        let wet = run_apply_gc(&gc_common(tmp_wet.path()), &mp_w, &sd_w, &scanned, &no_vendored()).await;
 
         assert_eq!(
             preview.blobs.blobs_removed, wet.blobs.blobs_removed,
