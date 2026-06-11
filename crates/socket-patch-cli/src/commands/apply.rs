@@ -730,9 +730,20 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             } else {
                                 format!(" (via {})", tags.join("+"))
                             };
-                            println!("  {}{}", result.package_key, suffix);
+                            println!(
+                                "  {}{}",
+                                socket_patch_core::utils::purl::normalize_purl(
+                                    &result.package_key
+                                ),
+                                suffix
+                            );
                         } else if all_files_already_patched(result) {
-                            println!("  {} (already patched)", result.package_key);
+                            println!(
+                                "  {} (already patched)",
+                                socket_patch_core::utils::purl::normalize_purl(
+                                    &result.package_key
+                                )
+                            );
                         }
                     }
                 }
@@ -1242,7 +1253,10 @@ async fn apply_patches_inner(
             unmatched.len()
         );
         for purl in &unmatched {
-            eprintln!("  - {}", purl);
+            eprintln!(
+                "  - {}",
+                socket_patch_core::utils::purl::normalize_purl(purl)
+            );
         }
     }
 
