@@ -244,8 +244,12 @@ pub fn build_composer_purl(namespace: &str, name: &str, version: &str) -> String
 /// We follow the same shape as `parse_composer_purl` since both
 /// have a `<scope>/<name>` namespace structure. The leading `@` on
 /// the scope is preserved (matching npm's `@scope/name` convention).
+/// `((scope, name), version)` from a JSR purl, percent-decoded.
 #[cfg(feature = "deno")]
-pub fn parse_jsr_purl(purl: &str) -> Option<((Cow<'_, str>, Cow<'_, str>), Cow<'_, str>)> {
+pub type JsrPurlParts<'a> = ((Cow<'a, str>, Cow<'a, str>), Cow<'a, str>);
+
+#[cfg(feature = "deno")]
+pub fn parse_jsr_purl(purl: &str) -> Option<JsrPurlParts<'_>> {
     let base = strip_purl_qualifiers(purl);
     let rest = base.strip_prefix("pkg:jsr/")?;
     let at_idx = rest.rfind('@')?;

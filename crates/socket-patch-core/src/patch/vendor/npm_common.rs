@@ -121,6 +121,7 @@ pub(super) struct NpmStagedPack {
 ///   verification — no pack, no dirs created).
 /// * `Ok((Some(staged), result))` — full success: the tarball is on disk at
 ///   `staged.rel_tgz` and the caller proceeds to its lockfile wiring.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
     installed_dir: &Path,

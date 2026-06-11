@@ -412,3 +412,328 @@ async fn scan_vendor_flag_conflicts_are_clap_errors() {
         );
     }
 }
+
+// ───────────── percent-encoded scoped purls (API canonical form) ─────────────
+
+const SCOPED_CRAWLER_PURL: &str = "pkg:npm/@scope/left-pad@1.3.0";
+const SCOPED_API_PURL: &str = "pkg:npm/%40scope/left-pad@1.3.0";
+
+/// Like `write_fixture`, but the installed package is the SCOPED
+/// `@scope/left-pad` (the crawler reports the literal `@scope` form).
+fn write_scoped_fixture(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "scan-vendor-test", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": {
+                "name": "scan-vendor-test",
+                "version": "0.0.0",
+                "dependencies": { "@scope/left-pad": "^1.3.0" }
+            },
+            "node_modules/@scope/left-pad": {
+                "version": "1.3.0",
+                "resolved": "https://registry.npmjs.org/@scope/left-pad/-/left-pad-1.3.0.tgz",
+                "integrity": "sha512-orig==",
+                "license": "WTFPL"
+            }
+        }
+    });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(root.join("package-lock.json"), lock_bytes).unwrap();
+
+    let pkg = root.join("node_modules/@scope/left-pad");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        br#"{"name":"@scope/left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), BEFORE).unwrap();
+}
+
+/// Mock API that serves the patch under the percent-ENCODED purl (the
+/// canonical form the production patches API returns for scoped packages),
+/// while the batch request/response is keyed by the crawler's literal form.
+async fn mount_scoped_patch_api(mock: &MockServer, uuid: &str) {
+    let before_hash = git_sha256(BEFORE);
+    let after_hash = git_sha256(AFTER);
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": SCOPED_CRAWLER_PURL,
+                "patches": [{
+                    "uuid": uuid,
+                    "purl": SCOPED_API_PURL,
+                    "tier": "free",
+                    "cveIds": ["CVE-2026-0001"],
+                    "ghsaIds": [],
+                    "severity": "high",
+                    "title": "vendor target"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    // Per-package search: the crawler purl, urlencoded.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/pkg%3Anpm%2F%40scope%2Fleft-pad%401.3.0"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": uuid,
+                "purl": SCOPED_API_PURL,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "Vendor patch",
+                "license": "MIT",
+                "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": uuid,
+            "purl": SCOPED_API_PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {
+                "package/index.js": {
+                    "beforeHash": before_hash,
+                    "afterHash":  after_hash,
+                    "blobContent": AFTER_B64,
+                }
+            },
+            "vulnerabilities": {},
+            "description": "Vendor patch",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// The production patches API serves scoped purls percent-encoded
+/// (`pkg:npm/%40scope/...`) and scan stores them verbatim as manifest keys.
+/// The whole pipeline — download, vendor lookup against the literal
+/// `node_modules/@scope/...` install, lock rewiring, prune exemption — must
+/// bridge the two spellings. (Flowise regression: `%40modelcontextprotocol`
+/// failed with `package not installed`.)
+#[tokio::test]
+async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
+    let mock = MockServer::start().await;
+    mount_scoped_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_scoped_fixture(tmp.path());
+
+    // --prune in the same run: the freshly-downloaded ENCODED manifest
+    // entry must not be GC'd against the literal crawler purl.
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+
+    // Manifest keyed by the verbatim encoded purl — and NOT pruned.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["patches"][SCOPED_API_PURL]["uuid"], UUID,
+        "manifest={manifest}"
+    );
+    assert_eq!(
+        v["gc"]["prunedManifestEntries"],
+        serde_json::json!([]),
+        "the encoded entry must not look prunable: {v}"
+    );
+
+    // Vendored: artifact under the DECODED scope dir, lock rewired.
+    assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+    let tgz = tmp.path().join(format!(
+        ".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
+    ));
+    assert!(tgz.is_file(), "tarball at the decoded scoped path");
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(&format!(".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz")),
+        "lock consumes the vendored tarball; lock={lock}"
+    );
+    // Ledger keyed by the verbatim encoded purl.
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["entries"][SCOPED_API_PURL]["uuid"], UUID, "{state}");
+}
+
+// ───────────────────── prune reconciles vendored state ─────────────────────
+
+/// After a dependency is removed and re-locked, `scan --prune` (without
+/// `--vendor`) reverts the now-unused vendored entry: lock restored, ledger
+/// entry + manifest entry dropped, artifact dir removed.
+#[tokio::test]
+async fn scan_prune_reverts_unused_vendored_entry() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    // A second installed package so the later prune run's crawl is
+    // non-empty (left-pad itself gets removed below).
+    let other = tmp.path().join("node_modules/keeper");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("package.json"),
+        br#"{"name":"keeper","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+
+    // Simulate `npm uninstall left-pad` + re-lock: drop the dep from the
+    // lock graph and remove the installed copy. The override-free npm
+    // wiring leaves nothing else behind.
+    let lock = serde_json::json!({
+        "name": "scan-vendor-test",
+        "version": "0.0.0",
+        "lockfileVersion": 3,
+        "requires": true,
+        "packages": {
+            "": { "name": "scan-vendor-test", "version": "0.0.0" }
+        }
+    });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(tmp.path().join("package-lock.json"), &lock_bytes).unwrap();
+    std::fs::remove_dir_all(tmp.path().join("node_modules/left-pad")).unwrap();
+
+    // Plain prune scan (read-only discovery + GC; no --vendor, no --apply).
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--json",
+            "--prune",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(code, 0, "stdout={stdout}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([PURL]),
+        "gc must report the reverted entry: {v}"
+    );
+
+    // Ledger empty (an emptied state file may be removed outright),
+    // manifest entry dropped, artifact gone.
+    match std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")) {
+        Ok(text) => {
+            let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                state["entries"].as_object().is_none_or(|m| m.is_empty()),
+                "ledger entry removed: {state}"
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("unexpected state.json read error: {e}"),
+    }
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        manifest["patches"]
+            .as_object()
+            .is_none_or(|m| !m.contains_key(PURL)),
+        "manifest entry dropped: {manifest}"
+    );
+    assert!(
+        !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        "artifact dir removed"
+    );
+    // The (already left-pad-free) lock stays exactly as the user re-locked
+    // it — the revert had nothing to restore there.
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_bytes
+    );
+}
+
+/// Interactive (non-JSON) `scan --vendor` pre-verifies patch baselines:
+/// installed content matching NEITHER hash is annotated BEFORE the
+/// confirm prompt, and the run still vendors (auto-force) with the
+/// `vendor_content_mismatch_overwritten` warning on stderr.
+#[tokio::test]
+async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    // Divergent installed bytes: neither BEFORE nor AFTER.
+    std::fs::write(
+        tmp.path().join("node_modules/left-pad/index.js"),
+        b"divergent\n",
+    )
+    .unwrap();
+
+    let out = Command::new(binary())
+        .args([
+            "scan",
+            "--vendor",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("installed content differs from patch baseline"),
+        "pre-prompt annotation present; stdout={stdout}"
+    );
+    assert!(
+        stderr.contains("vendor_content_mismatch_overwritten"),
+        "overwrite warning surfaced; stderr={stderr}"
+    );
+    // Vendored despite the mismatch.
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
+}
