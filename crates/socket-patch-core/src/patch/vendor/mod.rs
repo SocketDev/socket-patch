@@ -54,6 +54,7 @@ pub mod cargo_lock;
 pub mod composer_lock;
 pub mod gem;
 pub mod lock_inventory;
+pub mod registry_fetch;
 #[cfg(feature = "golang")]
 pub mod golang;
 mod npm_common;

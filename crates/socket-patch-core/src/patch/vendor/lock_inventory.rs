@@ -342,7 +342,7 @@ async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
         // Registry resolutions are `name@npm:<version>` (a `::binding`
         // suffix may follow). Anything else (workspace:/patch:/file:/link:)
         // is skipped — including our own vendored file: resolutions.
-        let Some((name, reference)) = yarn_classic_lock::split_pattern(&resolution) else {
+        let Some((name, reference)) = yarn_classic_lock::split_pattern(resolution) else {
             continue;
         };
         let Some(reference) = reference.strip_prefix("npm:") else {
