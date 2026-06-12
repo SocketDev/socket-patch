@@ -198,7 +198,7 @@ echo "===SCAN VERIFIED===" >&2
 #    because the fixture's placeholder beforeHash doesn't match the real
 #    installed bytes. That's expected — the separate forced apply below
 #    is what actually writes the patch, so we only log sync's exit code.
-socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+socket-patch scan --json --sync --strict --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
@@ -326,7 +326,7 @@ echo "===SCAN VERIFIED===" >&2
 # 2. scan --sync. May exit non-zero (un-forced sync-apply HashMismatch
 #    against the fixture's placeholder beforeHash); the forced apply
 #    below is what writes the patch, so only log sync's exit code.
-socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+socket-patch scan --json --sync --strict --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true

@@ -190,7 +190,7 @@ chmod u+w "$POM_FILE" || true
 # gated (scan's own apply pass matches 0 files because the all-zeros
 # beforeHash doesn't match the real .pom bytes); the gate is the exact
 # content-hash check at the end.
-socket-patch scan --json --sync --yes --global \
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems maven > /tmp/sync.out 2>/tmp/sync.err
 SCAN_RC=$?

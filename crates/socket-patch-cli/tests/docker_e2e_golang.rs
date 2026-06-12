@@ -166,7 +166,7 @@ chmod u+w "$GIN_GO" || true
 # exits non-zero (partial_failure) BY DESIGN — the dedicated `apply
 # --force` step below does the real patching. Exit code is logged for
 # diagnostics, not gated; the gate is the exact content-hash check below.
-socket-patch scan --json --sync --yes --global \
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems golang > /tmp/sync.out 2>/tmp/sync.err
 SCAN_RC=$?
