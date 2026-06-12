@@ -550,10 +550,15 @@ impl EditCtx<'_> {
         format!("{}@{}", self.name, self.spec)
     }
 
-    /// Does `value` point into `.socket/vendor/npm/` (ours — any uuid; a
-    /// stale uuid is rewritten to the current one with `original: None`)?
+    /// Does `value` point at OUR vendored tarball for THIS name@version
+    /// (any uuid — a stale uuid is rewritten to the current one with
+    /// `original: None`)? The leaf binding is load-bearing: a project can
+    /// vendor the SAME package at several versions, and a name-only match
+    /// would let one version's edit clobber another's entries.
     fn is_ours(&self, value: &str) -> bool {
-        parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
+        parse_vendor_path(value).is_some_and(|p| {
+            p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(self.name, self.version)
+        })
     }
 
     /// The per-importer `specifier:` spelling: re-relativized for nested
@@ -617,6 +622,15 @@ fn is_vendor_value(value: &str) -> bool {
     parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
 }
 
+/// A vendor value belonging to THIS `name@version`'s tarball (any uuid).
+/// The leaf binding matters: a project can vendor the same package at
+/// several versions, and edits must never treat a SIBLING version's
+/// override/entry as their own.
+fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
+    parse_vendor_path(value)
+        .is_some_and(|p| p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(name, version))
+}
+
 /// How the package.json `pnpm.overrides` table relates to the package
 /// being vendored. The lock's `overrides:` section must mirror this map
 /// key-for-key (pnpm hard-checks the two and fails
@@ -673,13 +687,18 @@ fn classify_pkg_override(
         if override_key_name(key) != name {
             continue;
         }
+        let value_str = value.as_str().unwrap_or("");
+        // A SIBLING version's vendored override coexists — not ours to
+        // touch (and not a conflict): skip it entirely.
+        if is_vendor_value(value_str) && !vendor_value_is_for(value_str, name, version) {
+            continue;
+        }
         if found.is_some() {
             return Err(format!(
                 "package.json carries more than one pnpm override for `{name}`; vendoring \
                  cannot pick one — remove the extras first"
             ));
         }
-        let value_str = value.as_str().unwrap_or("");
         let classified = if key.contains('>') {
             None
         } else if is_vendor_value(value_str) {
@@ -725,6 +744,10 @@ fn check_lock_override(
     for line in &lines[start + 1..end] {
         if let Some((key, _repr, rest)) = parse_key_line(line, 2) {
             if override_key_name(&key) != name {
+                continue;
+            }
+            // A sibling version's vendored override coexists — skip it.
+            if is_vendor_value(&rest) && !vendor_value_is_for(&rest, name, version) {
                 continue;
             }
             if key != effective_key {
@@ -1018,7 +1041,7 @@ fn edit_packages(
             } else if block
                 .key
                 .strip_prefix(&ours_prefix)
-                .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"))
+                .is_some_and(|rest| ctx.is_ours(rest))
             {
                 has_ours = true;
             }
@@ -1038,7 +1061,7 @@ fn edit_packages(
         let is_ours_key = block
             .key
             .strip_prefix(&ours_prefix)
-            .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"));
+            .is_some_and(|rest| ctx.is_ours(rest));
         if !is_registry && !is_ours_key {
             i = block.end;
             continue;
@@ -1125,7 +1148,7 @@ fn edit_snapshot_rekey(
             } else if block
                 .key
                 .strip_prefix(&ours_prefix)
-                .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"))
+                .is_some_and(|rest| ctx.is_ours(rest))
             {
                 has_ours = true;
             }
@@ -1144,7 +1167,7 @@ fn edit_snapshot_rekey(
         let is_ours_key = block
             .key
             .strip_prefix(&ours_prefix)
-            .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"));
+            .is_some_and(|rest| ctx.is_ours(rest));
         if !is_registry && !is_ours_key {
             i = block.end;
             continue;
@@ -2695,6 +2718,130 @@ snapshots:
         assert!(entry.is_none());
         assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "lock untouched");
         assert_eq!(fx.read(PACKAGE_JSON).await, pkg_before, "pkg untouched");
+    }
+
+    /// Two VERSIONS of the same package vendored in sequence: each edit
+    /// must bind to its own version's entries — a name-only "ours" match
+    /// would let the second vendor clobber/rekey the first one's blocks
+    /// (live-debugged on Flowise: identical duplicated mapping keys).
+    #[tokio::test]
+    async fn multi_version_vendor_does_not_clobber_sibling_entries() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (r1, e1, _) = expect_done(fx.vendor(false).await);
+        assert!(r1.success);
+        assert!(e1.is_some());
+        let tgz_13 = fx.rel_tgz();
+
+        // Vendor left-pad@1.2.0 under a DIFFERENT uuid (the `left-pad-old`
+        // npm: alias resolves it in the same lock).
+        let uuid2 = "22222222-3333-4444-8555-666666666666";
+        let installed2 = fx.root().join("node_modules/left-pad-old");
+        tokio::fs::create_dir_all(&installed2).await.unwrap();
+        tokio::fs::write(
+            installed2.join("package.json"),
+            br#"{"name":"left-pad","version":"1.2.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed2.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut record2 = fx.record.clone();
+        record2.uuid = uuid2.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_pnpm(
+            "pkg:npm/left-pad@1.2.0",
+            &installed2,
+            fx.root(),
+            &record2,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+        )
+        .await;
+        let (r2, e2, _) = expect_done(outcome);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_some());
+
+        let lock = fx.read(PNPM_LOCK).await;
+        let key13 = format!("  left-pad@file:{tgz_13}:");
+        let key12 = format!("  left-pad@file:.socket/vendor/npm/{uuid2}/left-pad-1.2.0.tgz:");
+        // Both versions' packages + snapshots blocks exist exactly once
+        // each (snapshot entries may be inline `key: {}`).
+        for (key, label) in [(&key13, "1.3.0"), (&key12, "1.2.0")] {
+            assert_eq!(
+                lock.lines().filter(|l| l.starts_with(key.as_str())).count(),
+                2, // packages + snapshots
+                "{label} entries intact:\n{lock}"
+            );
+        }
+        // No duplicated mapping keys within a section (what pnpm
+        // hard-rejects): each section's 2-space keys are unique.
+        for section in ["overrides", "packages", "snapshots"] {
+            let Some((start, end)) = section_bounds(&split_lines(&lock), section) else {
+                continue;
+            };
+            let lines = split_lines(&lock);
+            let mut keys: Vec<String> = lines[start + 1..end]
+                .iter()
+                .filter_map(|l| parse_key_line(l, 2).map(|(k, _, _)| k))
+                .collect();
+            let total = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(total, keys.len(), "duplicated keys in {section}:\n{lock}");
+        }
+    }
+
+    /// Re-vendor over a wired lock whose recorded integrity DRIFTED (e.g.
+    /// the artifact was rebuilt from a differently-shaped source): the
+    /// stale-ours refresh must REPLACE the file:-keyed blocks, never
+    /// duplicate them.
+    #[tokio::test]
+    async fn integrity_drift_refresh_never_duplicates_keys() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(entry.is_some());
+
+        // Simulate drift: the lock records a DIFFERENT integrity for OUR
+        // file: entry (only) than the tarball the next run will pack.
+        let lock = fx.read(PNPM_LOCK).await;
+        let drifted = lock
+            .lines()
+            .map(|l| {
+                if l.contains("tarball: file:.socket") {
+                    l.replace("integrity: sha512-", "integrity: sha512-DRIFT")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(drifted, lock);
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &drifted)
+            .await
+            .unwrap();
+
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let healed = fx.read(PNPM_LOCK).await;
+        let ours_key = format!("  left-pad@file:{}:", fx.rel_tgz());
+        let count = healed.lines().filter(|l| *l == ours_key.as_str()).count();
+        assert_eq!(
+            count, 1,
+            "exactly one file:-keyed packages/snapshots block per section; lock:
+{healed}"
+        );
+        let snap_count = healed
+            .matches(&format!("left-pad@file:{}", fx.rel_tgz()))
+            .count();
+        assert!(
+            !healed.contains("sha512-DRIFT"),
+            "drifted integrity healed: {snap_count} refs
+{healed}"
+        );
     }
 
     #[tokio::test]
