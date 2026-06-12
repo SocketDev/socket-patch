@@ -2330,7 +2330,9 @@ snapshots:
         assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
 
         // Missing lock: undeterminable.
-        tokio::fs::remove_file(fx.root().join(PNPM_LOCK)).await.unwrap();
+        tokio::fs::remove_file(fx.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
         assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
     }
 

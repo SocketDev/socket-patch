@@ -241,6 +241,7 @@ pub(crate) async fn repair_inner(
                     blobs_path: &blobs_path,
                     packages_path: Some(&packages_path),
                     diffs_path: Some(&diffs_path),
+                    mem_blobs: None,
                 };
                 let fetch_result =
                     fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;

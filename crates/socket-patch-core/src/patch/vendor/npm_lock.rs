@@ -1141,10 +1141,7 @@ mod tests {
         let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
             .await
             .unwrap();
-        assert_eq!(
-            tgz_member(&tgz, "package/index.js").unwrap(),
-            PATCHED_INDEX
-        );
+        assert_eq!(tgz_member(&tgz, "package/index.js").unwrap(), PATCHED_INDEX);
 
         // The installed tree keeps its (divergent) bytes — only the stage
         // was overwritten.
@@ -1250,10 +1247,7 @@ mod tests {
         let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
             .await
             .unwrap();
-        assert_eq!(
-            tgz_member(&tgz, "package/index.js").unwrap(),
-            PATCHED_INDEX
-        );
+        assert_eq!(tgz_member(&tgz, "package/index.js").unwrap(), PATCHED_INDEX);
         let lock = fx.read_lock().await;
         assert_eq!(
             lock["packages"]["node_modules/left-pad"]["resolved"],

@@ -35,8 +35,8 @@ use serde_json::{json, Map, Value};
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
-    VerifyResult, VerifyStatus,
+    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
+    VerifyStatus,
 };
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::file_hash::compute_file_git_sha256;

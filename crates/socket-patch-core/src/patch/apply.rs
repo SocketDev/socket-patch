@@ -94,6 +94,11 @@ pub struct PatchSources<'a> {
     pub blobs_path: &'a Path,
     pub packages_path: Option<&'a Path>,
     pub diffs_path: Option<&'a Path>,
+    /// In-memory blob overlay (`afterHash` → patched bytes), consulted
+    /// BEFORE the on-disk blob dir. The vendor flows stage their patch
+    /// content here so vendoring writes no `.socket/blobs` entries and no
+    /// temporary files — the bytes live only for the run.
+    pub mem_blobs: Option<&'a HashMap<String, Vec<u8>>>,
 }
 
 impl<'a> PatchSources<'a> {
@@ -105,6 +110,7 @@ impl<'a> PatchSources<'a> {
             blobs_path,
             packages_path: None,
             diffs_path: None,
+            mem_blobs: None,
         }
     }
 }
@@ -877,16 +883,27 @@ pub async fn apply_package_patch(
             continue;
         }
 
-        // ── Strategy 3: per-file blob (legacy fallback) ──────────────
-        let blob_path = sources.blobs_path.join(&file_info.after_hash);
-        let patched_content = match tokio::fs::read(&blob_path).await {
-            Ok(content) => content,
-            Err(e) => {
-                result.error = Some(format!(
-                    "Failed to read blob {}: {}",
-                    file_info.after_hash, e
-                ));
-                return result;
+        // ── Strategy 3: per-file blob ────────────────────────────────
+        // The in-memory overlay wins (vendor flows stage there — no
+        // `.socket/blobs` writes); the on-disk dir is the fallback.
+        let mem_hit = sources
+            .mem_blobs
+            .and_then(|m| m.get(&file_info.after_hash))
+            .cloned();
+        let patched_content = match mem_hit {
+            Some(content) => content,
+            None => {
+                let blob_path = sources.blobs_path.join(&file_info.after_hash);
+                match tokio::fs::read(&blob_path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        result.error = Some(format!(
+                            "Failed to read blob {}: {}",
+                            file_info.after_hash, e
+                        ));
+                        return result;
+                    }
+                }
             }
         };
 
@@ -2112,6 +2129,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2147,6 +2165,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2181,6 +2200,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2210,6 +2230,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2247,6 +2268,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2287,6 +2309,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2317,6 +2340,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",

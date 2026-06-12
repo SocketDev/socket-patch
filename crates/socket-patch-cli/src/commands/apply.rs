@@ -5,8 +5,8 @@ use socket_patch_core::crawlers::{
 };
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::patch::apply::{MismatchPolicy, 
-    apply_package_patch, verify_file_patch, ApplyResult, PatchSources, VerifyStatus,
+use socket_patch_core::patch::apply::{
+    apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
 /// Files whose pre-apply content matched NEITHER hash and were (or would
 /// be) overwritten with the verified patched content — the promoted
@@ -94,10 +94,7 @@ async fn ensure_blobs_for_mismatches(
     }
     let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let _ = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
-        &needed,
-        blobs_path,
-        &client,
-        None,
+        &needed, blobs_path, &client, None,
     )
     .await;
 }
@@ -732,17 +729,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             };
                             println!(
                                 "  {}{}",
-                                socket_patch_core::utils::purl::normalize_purl(
-                                    &result.package_key
-                                ),
+                                socket_patch_core::utils::purl::normalize_purl(&result.package_key),
                                 suffix
                             );
                         } else if all_files_already_patched(result) {
                             println!(
                                 "  {} (already patched)",
-                                socket_patch_core::utils::purl::normalize_purl(
-                                    &result.package_key
-                                )
+                                socket_patch_core::utils::purl::normalize_purl(&result.package_key)
                             );
                         }
                     }
@@ -1102,6 +1095,7 @@ async fn apply_patches_inner(
                     blobs_path: &blobs_path,
                     packages_path: Some(&packages_path),
                     diffs_path: Some(&diffs_path),
+                    mem_blobs: None,
                 };
                 let result = apply_package_patch(
                     variant_purl,
@@ -1186,6 +1180,7 @@ async fn apply_patches_inner(
                 blobs_path: &blobs_path,
                 packages_path: Some(&packages_path),
                 diffs_path: Some(&diffs_path),
+                mem_blobs: None,
             };
             // Local go redirects to a project-local patched copy under
             // `.socket/go-patches/` wired via a `go.mod` `replace` (the module
@@ -1193,31 +1188,30 @@ async fn apply_patches_inner(
             // Everything else — npm/pypi/gem and cargo (vendored or registry
             // cache) — patches in place via `apply_package_patch`. Without the
             // `golang` feature `try_local_go_apply` is an inert `None`.
-            let result =
-                match try_local_go_apply(
-                    purl,
-                    pkg_path,
-                    patch,
-                    &sources,
-                    &args.common,
-                    mismatch_policy(args.force, args.common.strict),
-                )
+            let result = match try_local_go_apply(
+                purl,
+                pkg_path,
+                patch,
+                &sources,
+                &args.common,
+                mismatch_policy(args.force, args.common.strict),
+            )
+            .await
+            {
+                Some(r) => r,
+                None => {
+                    apply_package_patch(
+                        purl,
+                        pkg_path,
+                        &patch.files,
+                        &sources,
+                        Some(&patch.uuid),
+                        args.common.dry_run,
+                        mismatch_policy(args.force, args.common.strict),
+                    )
                     .await
-                {
-                    Some(r) => r,
-                    None => {
-                        apply_package_patch(
-                            purl,
-                            pkg_path,
-                            &patch.files,
-                            &sources,
-                            Some(&patch.uuid),
-                            args.common.dry_run,
-                            mismatch_policy(args.force, args.common.strict),
-                        )
-                        .await
-                    }
-                };
+                }
+            };
 
             warn_mismatch_overwrites(&result, &args.common);
             if !result.success {
@@ -1434,7 +1428,7 @@ mod tests {
             .enumerate()
             .map(|(i, status)| VerifyResult {
                 file: format!("package/f{i}.js"),
-                status: status.clone(),
+                status: *status,
                 message: None,
                 current_hash: None,
                 expected_hash: None,

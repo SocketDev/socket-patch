@@ -53,10 +53,9 @@ pub mod cargo_lock;
 #[cfg(feature = "composer")]
 pub mod composer_lock;
 pub mod gem;
-pub mod lock_inventory;
-pub mod registry_fetch;
 #[cfg(feature = "golang")]
 pub mod golang;
+pub mod lock_inventory;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
@@ -69,6 +68,7 @@ pub mod pypi_poetry;
 pub mod pypi_requirements;
 pub mod pypi_uv;
 pub mod pypi_wheel;
+pub mod registry_fetch;
 mod toml_surgery;
 pub mod verify;
 pub mod yarn_berry_lock;
@@ -162,7 +162,10 @@ pub(crate) async fn missing_existing_patch_files(
         if !is_safe_relative_subpath(normalized) {
             continue;
         }
-        if tokio::fs::metadata(staged_dir.join(normalized)).await.is_err() {
+        if tokio::fs::metadata(staged_dir.join(normalized))
+            .await
+            .is_err()
+        {
             missing.push(file_name.clone());
         }
     }
@@ -183,6 +186,135 @@ pub(crate) fn failed_apply_result(purl: &str, error: String) -> ApplyResult {
         error: Some(error),
         sidecar: None,
     }
+}
+
+/// Patched-content blobs harvested from the committed vendor artifacts:
+/// for every manifest record whose patch uuid matches its ledger entry,
+/// hash the artifact's files (git-sha256, the manifest hash) and keep the
+/// ones matching the record's `afterHash`es.
+///
+/// This is what lets vendor RE-RUNS (in-sync verification, re-vendor) run
+/// with no network and no `.socket/blobs` — the committed artifact IS the
+/// patched content. Artifact shapes: npm/pypi tarball-or-wheel files and
+/// the dir-shaped ecosystems (cargo/golang/composer/gem copies). Fail-soft
+/// per entry; tampered/oversized artifacts contribute nothing (the apply
+/// pipeline's afterHash gate decides correctness either way).
+pub async fn harvest_artifact_blobs(
+    project_root: &Path,
+    manifest_patches: &HashMap<String, crate::manifest::schema::PatchRecord>,
+) -> HashMap<String, Vec<u8>> {
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    let Ok(state) = load_state(project_root).await else {
+        return out;
+    };
+    if state.entries.is_empty() {
+        return out;
+    }
+
+    for (purl, record) in manifest_patches {
+        let needed: std::collections::HashSet<&str> = record
+            .files
+            .values()
+            .map(|f| f.after_hash.as_str())
+            .filter(|h| !h.is_empty() && !out.contains_key(*h))
+            .collect();
+        if needed.is_empty() {
+            continue;
+        }
+        let Some(entry) = state.entries.get(purl).or_else(|| {
+            state
+                .entries
+                .values()
+                .find(|e| e.base_purl == crate::utils::purl::strip_purl_qualifiers(purl))
+        }) else {
+            continue;
+        };
+        if entry.uuid != record.uuid {
+            continue; // stale artifact: a re-vendor is pending, don't trust it
+        }
+        // SECURITY: the artifact path comes from the committed, tamperable
+        // ledger and is joined onto the project root for READING only —
+        // still, never follow an escaping path.
+        if !crate::patch::apply::is_safe_relative_subpath(&entry.artifact.path) {
+            continue;
+        }
+        let artifact = project_root.join(&entry.artifact.path);
+
+        // Tarball/wheel artifacts: read entries in memory.
+        let lower = entry.artifact.path.to_ascii_lowercase();
+        if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
+            if let Ok(map) = crate::patch::package::read_archive_to_map(&artifact) {
+                for bytes in map.into_values() {
+                    let h = compute_git_sha256_from_bytes(&bytes);
+                    if needed.contains(h.as_str()) {
+                        out.insert(h, bytes);
+                    }
+                }
+            }
+            continue;
+        }
+        if lower.ends_with(".whl") || lower.ends_with(".zip") {
+            let Ok(bytes) = tokio::fs::read(&artifact).await else {
+                continue;
+            };
+            if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+                continue;
+            }
+            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+                continue;
+            };
+            for i in 0..archive.len() {
+                use std::io::Read as _;
+                let Ok(mut file) = archive.by_index(i) else {
+                    continue;
+                };
+                if file.is_dir() || file.size() > MAX_FILE_BYTES {
+                    continue;
+                }
+                let mut content = Vec::with_capacity(file.size() as usize);
+                if file.read_to_end(&mut content).is_err() {
+                    continue;
+                }
+                let h = compute_git_sha256_from_bytes(&content);
+                if needed.contains(h.as_str()) {
+                    out.insert(h, content);
+                }
+            }
+            continue;
+        }
+        // Dir-shaped artifacts (cargo/golang/composer/gem copies): the
+        // record keys are package-relative, so resolve each needed file
+        // directly instead of walking the whole tree.
+        if tokio::fs::metadata(&artifact)
+            .await
+            .is_ok_and(|m| m.is_dir())
+        {
+            for (file_name, info) in &record.files {
+                if !needed.contains(info.after_hash.as_str()) {
+                    continue;
+                }
+                let rel = crate::patch::apply::normalize_file_path(file_name);
+                if !crate::patch::apply::is_safe_relative_subpath(rel) {
+                    continue;
+                }
+                if let Ok(content) = tokio::fs::read(artifact.join(rel)).await {
+                    if content.len() as u64 > MAX_FILE_BYTES {
+                        continue;
+                    }
+                    let h = compute_git_sha256_from_bytes(&content);
+                    if h == info.after_hash {
+                        out.insert(h, content);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Run the hardened apply pipeline against a vendor stage/copy with the
@@ -392,5 +524,154 @@ mod policy_tests {
         // NotFound (force-skipped): not an overwrite.
         let r = result_with(vec![verify(VerifyStatus::NotFound, None, None)]);
         assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod harvest_tests {
+    use super::*;
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::{PatchFileInfo, PatchRecord};
+    use std::collections::HashMap;
+    use std::io::Write as _;
+
+    const UUID: &str = "11111111-2222-4333-8444-555555555555";
+    const PATCHED: &[u8] = b"module.exports = patched;\n";
+
+    fn record(purl: &str, uuid: &str, file: &str, after: &[u8]) -> (String, PatchRecord) {
+        let mut files = HashMap::new();
+        files.insert(
+            file.to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        );
+        (
+            purl.to_string(),
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        )
+    }
+
+    fn write_ledger(root: &Path, purl: &str, uuid: &str, artifact_path: &str) {
+        let vendor_dir = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let state = serde_json::json!({
+            "version": 1,
+            "entries": {
+                purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": uuid,
+                    "artifact": { "path": artifact_path },
+                    "wiring": [],
+                }
+            }
+        });
+        std::fs::write(
+            vendor_dir.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_tgz(path: &Path, entry_name: &str, content: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, entry_name, content).unwrap();
+        tar.into_inner().unwrap().finish().unwrap().flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn harvests_after_blobs_from_committed_tgz() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "tgz artifact must yield its afterHash blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_uuid_artifact_contributes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        // Ledger still points at an OLD patch uuid: a re-vendor is pending
+        // and the artifact's content must not be trusted for the new record.
+        write_ledger(
+            tmp.path(),
+            purl,
+            "99999999-aaaa-4bbb-8ccc-dddddddddddd",
+            &rel,
+        );
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(harvest_artifact_blobs(tmp.path(), &patches)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn escaping_artifact_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        // The artifact CONTENT would match — only the committed, tamperable
+        // ledger path escapes the project. Must contribute nothing.
+        let project = tmp.path().join("project");
+        write_tgz(&tmp.path().join("outside.tgz"), "package/index.js", PATCHED);
+        write_ledger(&project, purl, UUID, "../outside.tgz");
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(harvest_artifact_blobs(&project, &patches).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dir_shaped_artifact_resolves_record_relative_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        let file_dir = tmp.path().join(&rel).join("src");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join("lib.rs"), PATCHED).unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "src/lib.rs", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "dir-shaped artifact must yield its afterHash blob"
+        );
     }
 }

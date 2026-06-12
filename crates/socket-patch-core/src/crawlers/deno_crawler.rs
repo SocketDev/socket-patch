@@ -131,10 +131,7 @@ impl DenoCrawler {
                 continue;
             }
             // Cache layout: <root>/<scope>/<name>/<version>/
-            let pkg_dir = jsr_cache_path
-                .join(&*scope)
-                .join(&*name)
-                .join(&*version);
+            let pkg_dir = jsr_cache_path.join(&*scope).join(&*name).join(&*version);
             if !is_dir(&pkg_dir).await {
                 continue;
             }

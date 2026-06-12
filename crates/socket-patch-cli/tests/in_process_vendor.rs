@@ -1292,7 +1292,10 @@ fn mismatched_baseline_vendors_with_warning_event() {
             .contains("left-pad@1.3.0"),
         "warning names the package: {env:#}"
     );
-    assert!(fx.tgz_path().exists(), "artifact packed despite the mismatch");
+    assert!(
+        fx.tgz_path().exists(),
+        "artifact packed despite the mismatch"
+    );
     // The installed tree keeps its divergent bytes (only the stage changed).
     assert_eq!(
         std::fs::read(fx.installed_index()).unwrap(),
@@ -1374,9 +1377,9 @@ fn vendor_resolves_percent_encoded_scope_purl() {
     assert_eq!(applied["purl"], "pkg:npm/%40scope/left-pad@1.3.0");
 
     // Artifact lands under the DECODED scope dir.
-    let tgz = fx
-        .root()
-        .join(format!(".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"));
+    let tgz = fx.root().join(format!(
+        ".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
+    ));
     assert!(tgz.exists(), "tarball at the decoded scoped path");
 
     // Lock rewired to the vendored artifact.
@@ -1389,8 +1392,7 @@ fn vendor_resolves_percent_encoded_scope_purl() {
     );
 
     // Ledger keyed by the VERBATIM encoded purl (manifest key parity).
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert!(
         state["entries"]["pkg:npm/%40scope/left-pad@1.3.0"].is_object(),
         "state keyed by the encoded manifest purl: {state:#}"

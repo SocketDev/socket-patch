@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{result_to_event, variant_matches_installed};
-use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
+use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
@@ -246,11 +246,8 @@ pub(crate) async fn dispatch_revert_one(
 pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
         "npm" => {
-            socket_patch_core::patch::vendor::npm_flavor::vendored_entry_in_use(
-                entry,
-                project_root,
-            )
-            .await
+            socket_patch_core::patch::vendor::npm_flavor::vendored_entry_in_use(entry, project_root)
+                .await
         }
         _ => None,
     }
@@ -433,20 +430,24 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
     let mut has_errors = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let staged = match stage_patch_sources(common, &manifest, socket_dir).await {
-        Ok(StageOutcome::Ready(s)) => s,
-        Ok(StageOutcome::Unavailable) => {
-            env.mark_error(EnvelopeError::new(
-                "no_local_source",
-                "patch artifacts unavailable (offline or download failure)",
-            ));
-            return 1;
-        }
-        Err(e) => {
-            env.mark_error(EnvelopeError::new("stage_failed", e));
-            return 1;
-        }
-    };
+    // Vendor stages patch content IN MEMORY: existing .socket artifacts are
+    // read in place, missing content is fetched per patch — vendoring never
+    // writes blobs or temp files (the committed artifact is the patch).
+    let staged =
+        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
+            Ok(MemStageOutcome::Ready(s)) => s,
+            Ok(MemStageOutcome::Unavailable) => {
+                env.mark_error(EnvelopeError::new(
+                    "no_local_source",
+                    "patch artifacts unavailable (offline or download failure)",
+                ));
+                return 1;
+            }
+            Err(e) => {
+                env.mark_error(EnvelopeError::new("stage_failed", e));
+                return 1;
+            }
+        };
     let sources = staged.as_patch_sources();
 
     has_errors |= vendor_records(common, &manifest.patches, &sources, false, args.force, env).await;
@@ -570,9 +571,7 @@ pub(crate) async fn vendor_records(
                     .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
                 {
                     let tgz = common.cwd.join(&entry.artifact.path);
-                    match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
-                        .await
-                    {
+                    match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256).await {
                         Ok(staged) => {
                             all_packages.insert(purl.clone(), staged.dir().to_path_buf());
                             fetched_holders.push(staged);
@@ -588,10 +587,7 @@ pub(crate) async fn vendor_records(
                                     .with_error("vendor_fetch_failed", detail.clone()),
                             );
                             if !common.silent && !common.json {
-                                eprintln!(
-                                    "Cannot vendor {}: {detail}",
-                                    normalize_purl(purl)
-                                );
+                                eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
                             }
                             continue;
                         }
@@ -912,8 +908,7 @@ pub(crate) async fn vendor_records(
             unmatched
                 .iter()
                 .filter(|p| {
-                    socket_patch_core::patch::vendor::lock_inventory::lookup(&entries, p)
-                        .is_some()
+                    socket_patch_core::patch::vendor::lock_inventory::lookup(&entries, p).is_some()
                 })
                 .cloned()
                 .collect()
@@ -1203,7 +1198,10 @@ pub(crate) async fn run_vendor_gc(
                 continue;
             }
             let entry = state.entries.get(&purl).cloned().expect("listed above");
-            if dispatch_revert_one(&entry, &common.cwd, false).await.success {
+            if dispatch_revert_one(&entry, &common.cwd, false)
+                .await
+                .success
+            {
                 state.entries.remove(&purl);
                 out.dropped_reverted.push(purl);
             } else {
@@ -1229,7 +1227,10 @@ pub(crate) async fn run_vendor_gc(
             out.unused_reverted.push(purl);
             continue;
         }
-        if !dispatch_revert_one(&entry, &common.cwd, false).await.success {
+        if !dispatch_revert_one(&entry, &common.cwd, false)
+            .await
+            .success
+        {
             out.failed.push(purl);
             continue;
         }
@@ -1365,7 +1366,11 @@ mod gc_tests {
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(out.unused_reverted.is_empty(), "{out:?}");
         assert_eq!(out.orphan_dirs, 0);
-        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
     }
 
     /// (a) the patch is gone from the manifest: revert + drop the entry.
@@ -1381,7 +1386,9 @@ mod gc_tests {
         assert!(out.failed.is_empty(), "{out:?}");
         assert!(load_state(tmp.path()).await.unwrap().entries.is_empty());
         assert!(
-            !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "artifact dir removed by the revert"
         );
     }
@@ -1433,7 +1440,9 @@ mod gc_tests {
             "dry run must not touch the manifest"
         );
         assert!(
-            tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "dry run must not remove artifacts"
         );
     }
@@ -1449,7 +1458,11 @@ mod gc_tests {
             .unwrap();
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert!(out.unused_reverted.is_empty(), "{out:?}");
-        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
 
         // Detached entry: absent from the manifest AND lockfile-invisible —
         // exactly its normal state. Never reverted by the GC.
@@ -1463,7 +1476,11 @@ mod gc_tests {
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(out.unused_reverted.is_empty(), "{out:?}");
-        assert!(load_state(tmp.path()).await.unwrap().entries.contains_key(PURL));
+        assert!(load_state(tmp.path())
+            .await
+            .unwrap()
+            .entries
+            .contains_key(PURL));
     }
 
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
@@ -1486,6 +1503,9 @@ mod gc_tests {
         assert_eq!(out.orphan_dirs, 1, "{out:?}");
         assert!(!orphan_dir.exists(), "wet run sweeps the orphan");
         // The recorded entry's dir survives the sweep.
-        assert!(tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists());
+        assert!(tmp
+            .path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
     }
 }

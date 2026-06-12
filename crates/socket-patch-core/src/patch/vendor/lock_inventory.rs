@@ -191,8 +191,7 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
         let key = (entry.name.clone(), entry.version.clone());
         match seen.get(&key) {
             Some(&i) => {
-                if out[i].integrity == LockIntegrity::None
-                    && entry.integrity != LockIntegrity::None
+                if out[i].integrity == LockIntegrity::None && entry.integrity != LockIntegrity::None
                 {
                     out[i] = entry;
                 }
@@ -218,7 +217,12 @@ pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEnt
         .await
         .ok()?;
     /// One in-flight `[[package]]` block: name, version, source, checksum.
-    type CargoBlock = (Option<String>, Option<String>, Option<String>, Option<String>);
+    type CargoBlock = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     let mut out = Vec::new();
     let mut cur: Option<CargoBlock> = None;
     let flush = |cur: &mut Option<CargoBlock>, out: &mut Vec<LockfileEntry>| {
@@ -234,7 +238,9 @@ pub async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEnt
             let crates_io = source.contains("github.com/rust-lang/crates.io-index")
                 || source.contains("index.crates.io");
             let integrity = match checksum {
-                Some(c) if crates_io && c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Some(c)
+                    if crates_io && c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
                     LockIntegrity::Sha256Hex(c)
                 }
                 _ => LockIntegrity::None,
@@ -292,8 +298,7 @@ pub async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>>
     let mut out = Vec::new();
     for line in text.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(module), Some(version), Some(hash)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(module), Some(version), Some(hash)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -349,7 +354,10 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
             continue;
         };
         if node.get("link").and_then(Value::as_bool).unwrap_or(false)
-            || node.get("inBundle").and_then(Value::as_bool).unwrap_or(false)
+            || node
+                .get("inBundle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         {
             continue;
         }
@@ -432,7 +440,10 @@ async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
             }
         }
         // Our own vendored spec: not a registry dependency.
-        if tarball.as_deref().is_some_and(|t| parse_vendor_path(t).is_some()) {
+        if tarball
+            .as_deref()
+            .is_some_and(|t| parse_vendor_path(t).is_some())
+        {
             continue;
         }
         out.push(LockfileEntry::npm(
@@ -448,7 +459,9 @@ async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
 // ───────────────────────────── yarn.lock (classic) ─────────────────────────────
 
 async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("yarn.lock")).await.ok()?;
+    let text = tokio::fs::read_to_string(root.join("yarn.lock"))
+        .await
+        .ok()?;
     let mut out = Vec::new();
     for block in yarn_classic_lock::scan_blocks(&text) {
         // Our own vendored block: not a registry dependency.
@@ -490,7 +503,9 @@ async fn inventory_yarn_classic(root: &Path) -> Option<Vec<LockfileEntry>> {
 // ───────────────────────────── yarn.lock (berry) ─────────────────────────────
 
 async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("yarn.lock")).await.ok()?;
+    let text = tokio::fs::read_to_string(root.join("yarn.lock"))
+        .await
+        .ok()?;
     let mut out = Vec::new();
     // Berry reuses classic's block grammar (same scanner the berry backend
     // imports); `__metadata` and workspace/patch/file resolutions are not
@@ -512,8 +527,8 @@ async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
             continue;
         };
         let version_from_res = reference.split("::").next().unwrap_or(reference);
-        let version = yarn_berry_lock::berry_field(&block.lines, "version")
-            .unwrap_or(version_from_res);
+        let version =
+            yarn_berry_lock::berry_field(&block.lines, "version").unwrap_or(version_from_res);
         let integrity = yarn_berry_lock::berry_field(&block.lines, "checksum")
             .map(|c| LockIntegrity::BerryChecksum(c.to_string()))
             .unwrap_or(LockIntegrity::None);
@@ -525,7 +540,9 @@ async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
 // ──────────────────────────────── bun.lock ────────────────────────────────
 
 async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("bun.lock")).await.ok()?;
+    let text = tokio::fs::read_to_string(root.join("bun.lock"))
+        .await
+        .ok()?;
     bun_lock::check_lock_version(&text).ok()?;
     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     let entries = bun_lock::parse_packages_section(&lines).ok()?;
@@ -537,7 +554,10 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
         if entry.elems.len() != 4 || !entry.elems[2].starts_with('{') {
             continue;
         }
-        let Some(spec) = entry.elems.first().and_then(|e| bun_lock::decode_json_string(e))
+        let Some(spec) = entry
+            .elems
+            .first()
+            .and_then(|e| bun_lock::decode_json_string(e))
         else {
             continue;
         };
@@ -577,7 +597,9 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// versions drop the pretty leading `v`.
 #[cfg(feature = "composer")]
 pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let bytes = tokio::fs::read(project_root.join("composer.lock")).await.ok()?;
+    let bytes = tokio::fs::read(project_root.join("composer.lock"))
+        .await
+        .ok()?;
     let doc: Value = serde_json::from_slice(&bytes).ok()?;
     let mut out = Vec::new();
     for section in ["packages", "packages-dev"] {
@@ -625,14 +647,12 @@ pub async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<Lockfile
                 .and_then(|d| d.get("shasum"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let integrity = if is_zip
-                && shasum.len() == 40
-                && shasum.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase())
-            } else {
-                LockIntegrity::None
-            };
+            let integrity =
+                if is_zip && shasum.len() == 40 && shasum.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase())
+                } else {
+                    LockIntegrity::None
+                };
             let purl = format!("pkg:composer/{name}@{version}");
             out.push(LockfileEntry {
                 ecosystem: "composer",
@@ -694,11 +714,9 @@ pub async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileE
                     trimmed.rsplit_once(" sha256=").map(|(s, h)| (s, h.trim()))
                 {
                     if let Some((name, version)) = parse_gem_spec_line(spec_part) {
-                        if hash_part.len() == 64
-                            && hash_part.bytes().all(|b| b.is_ascii_hexdigit())
+                        if hash_part.len() == 64 && hash_part.bytes().all(|b| b.is_ascii_hexdigit())
                         {
-                            checksums
-                                .insert((name, version), hash_part.to_ascii_lowercase());
+                            checksums.insert((name, version), hash_part.to_ascii_lowercase());
                         }
                     }
                 }
@@ -801,10 +819,10 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut sourced_registry = true;
     let mut wheel: Option<(String, String)> = None;
     let flush = |name: &mut Option<String>,
-                     version: &mut Option<String>,
-                     sourced_registry: &mut bool,
-                     wheel: &mut Option<(String, String)>,
-                     out: &mut Vec<LockfileEntry>| {
+                 version: &mut Option<String>,
+                 sourced_registry: &mut bool,
+                 wheel: &mut Option<(String, String)>,
+                 out: &mut Vec<LockfileEntry>| {
         if let (Some(n), Some(v)) = (name.take(), version.take()) {
             let canonical = pep503(&n);
             if *sourced_registry
@@ -831,7 +849,13 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     for line in text.lines() {
         let t = line.trim();
         if t == "[[package]]" {
-            flush(&mut name, &mut version, &mut sourced_registry, &mut wheel, &mut out);
+            flush(
+                &mut name,
+                &mut version,
+                &mut sourced_registry,
+                &mut wheel,
+                &mut out,
+            );
             continue;
         }
         if let Some(v) = t.strip_prefix("name = ") {
@@ -859,7 +883,13 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
             }
         }
     }
-    flush(&mut name, &mut version, &mut sourced_registry, &mut wheel, &mut out);
+    flush(
+        &mut name,
+        &mut version,
+        &mut sourced_registry,
+        &mut wheel,
+        &mut out,
+    );
     Some(dedup_prefer_integrity(out))
 }
 
@@ -1187,7 +1217,8 @@ aliased@npm:real-name@^3.0.0:
 
     // ── yarn berry ────────────────────────────────────────────────────────
 
-    const YARN_BERRY: &str = "# This file is generated by running \"yarn install\" inside your project.
+    const YARN_BERRY: &str =
+        "# This file is generated by running \"yarn install\" inside your project.
 # Manifest files (package.json) are also used.
 
 __metadata:
@@ -1288,7 +1319,12 @@ __metadata:
     async fn dedup_prefers_integrity_bearing_instance() {
         let raw = vec![
             LockfileEntry::npm("dup", "1.0.0", None, LockIntegrity::None),
-            LockfileEntry::npm("dup", "1.0.0", None, LockIntegrity::Sri("sha512-x==".into())),
+            LockfileEntry::npm(
+                "dup",
+                "1.0.0",
+                None,
+                LockIntegrity::Sri("sha512-x==".into()),
+            ),
             LockfileEntry::npm("dup", "1.0.0", None, LockIntegrity::None),
         ];
         let out = finalize_npm(raw);
@@ -1439,7 +1475,10 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
         let entries = inventory_composer_lock(tmp.path()).await.unwrap();
         let monolog = entry(&entries, "monolog/monolog");
-        assert_eq!(monolog.version, "3.5.0", "leading v dropped, name lowercased");
+        assert_eq!(
+            monolog.version, "3.5.0",
+            "leading v dropped, name lowercased"
+        );
         assert_eq!(monolog.purl, "pkg:composer/monolog/monolog@3.5.0");
         assert!(matches!(monolog.integrity, LockIntegrity::Sha1Hex(_)));
         assert!(monolog.resolved.as_deref().unwrap().contains("zipball"));

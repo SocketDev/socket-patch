@@ -335,10 +335,10 @@ pub async fn revert_go_vendor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch::apply::MismatchPolicy;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
+    use crate::patch::apply::MismatchPolicy;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;

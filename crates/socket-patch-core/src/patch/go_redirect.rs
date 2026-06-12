@@ -236,7 +236,8 @@ pub async fn apply_go_redirect(
     }
 
     // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result = apply_package_patch(purl, &copy_dir, files, sources, uuid, false, policy).await;
+    let mut result =
+        apply_package_patch(purl, &copy_dir, files, sources, uuid, false, policy).await;
     result.package_path = copy_dir.display().to_string();
     // The golang sidecar advisory ("go mod verify will fail against go.sum")
     // is about in-cache patching; a `replace` copy bypasses go.sum entirely, so

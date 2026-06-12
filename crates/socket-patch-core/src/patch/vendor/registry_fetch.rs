@@ -210,7 +210,10 @@ async fn fetch_composer(
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("package");
     extract_zip(&bytes, &dir, /*strip_first=*/ true).map_err(FetchError::Failed)?;
-    if tokio::fs::metadata(dir.join("composer.json")).await.is_err() {
+    if tokio::fs::metadata(dir.join("composer.json"))
+        .await
+        .is_err()
+    {
         return Err(FetchError::Failed(format!(
             "fetched dist for {}@{} carries no composer.json",
             entry.name, entry.version
@@ -256,7 +259,9 @@ async fn fetch_gem(
             continue;
         }
         if e.header().size().unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
-            return Err(FetchError::Failed("data.tar.gz exceeds the size cap".into()));
+            return Err(FetchError::Failed(
+                "data.tar.gz exceeds the size cap".into(),
+            ));
         }
         let mut buf = Vec::new();
         e.read_to_end(&mut buf)
@@ -546,9 +551,10 @@ async fn fetch_npm(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
-    let url = entry.resolved.clone().unwrap_or_else(|| {
-        npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version)
-    });
+    let url = entry
+        .resolved
+        .clone()
+        .unwrap_or_else(|| npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version));
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
     match &entry.integrity {
         // yarn berry locks never hash the tarball itself — the checksum is
@@ -698,11 +704,9 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
                 )))
             }
         }
-        LockIntegrity::BerryChecksum(_) | LockIntegrity::GoH1(_) => {
-            Err(FetchError::Unverifiable(
-                "verifier handled by a dedicated ecosystem fetcher".to_string(),
-            ))
-        }
+        LockIntegrity::BerryChecksum(_) | LockIntegrity::GoH1(_) => Err(FetchError::Unverifiable(
+            "verifier handled by a dedicated ecosystem fetcher".to_string(),
+        )),
         LockIntegrity::None => Err(FetchError::Unverifiable(
             "no integrity recorded".to_string(),
         )),
@@ -900,7 +904,10 @@ mod tests {
         assert!(verify_sri(bytes, &multi).is_ok());
         let bad = sri_of(b"other");
         assert!(verify_sri(bytes, &bad).is_err());
-        assert!(verify_sri(bytes, "md5-abc=").is_err(), "unknown algos refuse");
+        assert!(
+            verify_sri(bytes, "md5-abc=").is_err(),
+            "unknown algos refuse"
+        );
     }
 
     #[tokio::test]
@@ -1112,7 +1119,11 @@ mod tests {
     async fn cargo_crate_fetch_verifies_sha256_and_extracts() {
         // .crate = tar.gz with a {name}-{version}/ top dir.
         let crate_bytes = make_tgz(&[
-            ("left-pad-1.3.0/Cargo.toml", b"[package]\nname = \"left-pad\"\n", false),
+            (
+                "left-pad-1.3.0/Cargo.toml",
+                b"[package]\nname = \"left-pad\"\n",
+                false,
+            ),
             ("left-pad-1.3.0/src/lib.rs", b"pub fn pad() {}\n", false),
         ]);
         let sha = hex::encode(Sha256::digest(&crate_bytes));
@@ -1230,7 +1241,9 @@ mod tests {
 
         // Tampered h1 fails closed.
         let entry = LockfileEntry {
-            integrity: LockIntegrity::GoH1("h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+            integrity: LockIntegrity::GoH1(
+                "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            ),
             ..entry
         };
         match fetch_and_stage(&entry, &build_registry_client()).await {
@@ -1242,14 +1255,17 @@ mod tests {
     #[cfg(feature = "golang")]
     #[test]
     fn go_escape_uppercase_and_zip_prefix_guards() {
-        assert_eq!(go_escape("github.com/Azure/azure-sdk"), "github.com/!azure/azure-sdk");
+        assert_eq!(
+            go_escape("github.com/Azure/azure-sdk"),
+            "github.com/!azure/azure-sdk"
+        );
         assert_eq!(go_escape("v1.0.0-RC1"), "v1.0.0-!r!c1");
 
         // An entry outside the module prefix fails the whole artifact.
         let zip_bytes = make_module_zip("github.com/x/y@v1.0.0/", &[("go.mod", b"m\n")]);
         let tmp = tempfile::tempdir().unwrap();
-        let err = extract_zip_with_prefix(&zip_bytes, tmp.path(), "github.com/OTHER@v1/")
-            .unwrap_err();
+        let err =
+            extract_zip_with_prefix(&zip_bytes, tmp.path(), "github.com/OTHER@v1/").unwrap_err();
         assert!(err.contains("outside"), "{err}");
     }
 
@@ -1275,7 +1291,10 @@ mod tests {
     async fn composer_dist_fetch_verifies_sha1_and_strips_top_dir() {
         // GitHub zipballs carry an `owner-repo-sha/` top dir.
         let zip_bytes = make_zip(&[
-            ("Seldaek-monolog-abc123/composer.json", br#"{"name":"monolog/monolog"}"#),
+            (
+                "Seldaek-monolog-abc123/composer.json",
+                br#"{"name":"monolog/monolog"}"#,
+            ),
             ("Seldaek-monolog-abc123/src/Logger.php", b"<?php\n"),
         ]);
         let sha1 = hex::encode(Sha1::digest(&zip_bytes));
@@ -1319,7 +1338,10 @@ mod tests {
             ("README.md", b"# rails\n", false),
         ]);
         let mut outer = tar::Builder::new(Vec::new());
-        for (name, bytes) in [("metadata.gz", b"meta".as_slice()), ("data.tar.gz", &data_tgz)] {
+        for (name, bytes) in [
+            ("metadata.gz", b"meta".as_slice()),
+            ("data.tar.gz", &data_tgz),
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);

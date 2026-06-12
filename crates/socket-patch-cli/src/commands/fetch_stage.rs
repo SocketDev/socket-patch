@@ -7,6 +7,7 @@
 //! cache is `repair`'s job, keeping these commands read-only against
 //! `.socket/`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::blob_fetcher::{
@@ -36,6 +37,7 @@ impl StagedSources {
             blobs_path: &self.blobs,
             packages_path: Some(&self.packages),
             diffs_path: Some(&self.diffs),
+            mem_blobs: None,
         }
     }
 }
@@ -199,6 +201,7 @@ pub async fn stage_patch_sources(
         blobs_path: &stage_blobs,
         packages_path: Some(&stage_packages),
         diffs_path: Some(&stage_diffs),
+        mem_blobs: None,
     };
     let fetch_result =
         fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
@@ -242,5 +245,193 @@ pub async fn stage_patch_sources(
         diffs: stage_diffs,
         packages: stage_packages,
         _stage: Some(stage),
+    }))
+}
+
+/// In-memory staged sources for the VENDOR flows.
+///
+/// Existing `.socket/` artifacts are read in place (never copied, never
+/// rewritten); patch content that is missing locally is fetched into
+/// MEMORY via the patch view endpoint — vendoring writes no
+/// `.socket/blobs` entries and no temporary files. The committed
+/// `.socket/vendor/` artifact is the patch; nothing else should land on
+/// disk.
+pub struct MemStagedSources {
+    blobs: PathBuf,
+    diffs: PathBuf,
+    packages: PathBuf,
+    mem: HashMap<String, Vec<u8>>,
+}
+
+impl MemStagedSources {
+    /// Borrow as the core pipeline's source set (memory overlay first,
+    /// on-disk artifacts as the read-only fallback).
+    pub fn as_patch_sources(&self) -> PatchSources<'_> {
+        PatchSources {
+            blobs_path: &self.blobs,
+            packages_path: Some(&self.packages),
+            diffs_path: Some(&self.diffs),
+            mem_blobs: Some(&self.mem),
+        }
+    }
+}
+
+/// The in-memory staging outcome (mirror of [`StageOutcome`]).
+pub enum MemStageOutcome {
+    Ready(MemStagedSources),
+    Unavailable,
+}
+
+/// Stage patch sources for a VENDOR run without writing anything:
+/// per-record availability follows the same rule as
+/// [`stage_patch_sources`] (all after-blobs on disk, or a diff/package
+/// archive on disk), and records with no usable local source have their
+/// full per-file content fetched into memory from the patch view
+/// endpoint (`blobContent`). Offline runs with missing sources are
+/// `Unavailable` with the same diagnostics as the disk stager.
+pub async fn stage_vendor_sources_in_memory(
+    common: &GlobalArgs,
+    manifest: &PatchManifest,
+    socket_dir: &Path,
+    project_root: &Path,
+) -> Result<MemStageOutcome, String> {
+    let blobs = socket_dir.join("blobs");
+    let diffs = socket_dir.join("diffs");
+    let packages = socket_dir.join("packages");
+
+    let missing_blobs = get_missing_blobs(manifest, &blobs).await;
+    let missing_diff_archives = get_missing_archives(manifest, &diffs).await;
+    let missing_package_archives = get_missing_archives(manifest, &packages).await;
+
+    let mut to_fetch: Vec<(&str, &str)> = manifest
+        .patches
+        .iter()
+        .filter_map(|(purl, record)| {
+            let all_blobs_present = record
+                .files
+                .values()
+                .all(|f| !missing_blobs.contains(&f.after_hash));
+            let diff_present = !missing_diff_archives.contains(&record.uuid);
+            let pkg_present = !missing_package_archives.contains(&record.uuid);
+            if all_blobs_present || diff_present || pkg_present {
+                None
+            } else {
+                Some((purl.as_str(), record.uuid.as_str()))
+            }
+        })
+        .collect();
+
+    if to_fetch.is_empty() {
+        return Ok(MemStageOutcome::Ready(MemStagedSources {
+            blobs,
+            diffs,
+            packages,
+            mem: HashMap::new(),
+        }));
+    }
+
+    // The committed vendor artifact IS the patched content: harvest its
+    // afterHash blobs into memory so in-sync re-runs and fresh clones of
+    // already-vendored projects stage with no network and no disk blobs.
+    let mut mem =
+        socket_patch_core::patch::vendor::harvest_artifact_blobs(project_root, &manifest.patches)
+            .await;
+    if !mem.is_empty() {
+        to_fetch.retain(|(purl, _)| {
+            manifest.patches.get(*purl).is_none_or(|record| {
+                !record.files.values().all(|f| {
+                    !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash)
+                })
+            })
+        });
+        if to_fetch.is_empty() {
+            return Ok(MemStageOutcome::Ready(MemStagedSources {
+                blobs,
+                diffs,
+                packages,
+                mem,
+            }));
+        }
+    }
+
+    if common.offline {
+        if !common.silent && !common.json {
+            eprintln!(
+                "Error: {} patch(es) have no local source and --offline is set:",
+                to_fetch.len()
+            );
+            for (purl, _) in to_fetch.iter().take(5) {
+                eprintln!("  - {}", purl);
+            }
+            if to_fetch.len() > 5 {
+                eprintln!("  ... and {} more", to_fetch.len() - 5);
+            }
+            eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
+        }
+        return Ok(MemStageOutcome::Unavailable);
+    }
+
+    if !common.silent && !common.json {
+        println!(
+            "Fetching {} patch(es)' content (kept in memory)...",
+            to_fetch.len()
+        );
+    }
+
+    let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
+    let mut failed: Vec<&str> = Vec::new();
+    for (purl, uuid) in &to_fetch {
+        match client.fetch_patch(common.org.as_deref(), uuid).await {
+            Ok(Some(patch)) => {
+                let mut complete = true;
+                for (file, info) in &patch.files {
+                    let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
+                        if !common.silent && !common.json {
+                            eprintln!("  [error] {purl}: no blob content served for {file}");
+                        }
+                        complete = false;
+                        break;
+                    };
+                    // Same key guard as the disk writer: the hash names the
+                    // lookup key the apply pipeline gates writes on.
+                    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        complete = false;
+                        break;
+                    }
+                    match super::get::base64_decode(b64) {
+                        Ok(bytes) => {
+                            mem.insert(hash.clone(), bytes);
+                        }
+                        Err(_) => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !complete {
+                    failed.push(purl);
+                }
+            }
+            _ => failed.push(purl),
+        }
+    }
+    if !failed.is_empty() {
+        if !common.silent && !common.json {
+            eprintln!(
+                "Error: could not fetch patch content for {} patch(es):",
+                failed.len()
+            );
+            for purl in failed.iter().take(5) {
+                eprintln!("  - {}", purl);
+            }
+        }
+        return Ok(MemStageOutcome::Unavailable);
+    }
+
+    Ok(MemStageOutcome::Ready(MemStagedSources {
+        blobs,
+        diffs,
+        packages,
+        mem,
     }))
 }

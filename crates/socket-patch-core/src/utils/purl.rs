@@ -611,8 +611,7 @@ mod tests {
 
     #[cfg(feature = "deno")]
     fn jsr_parts(purl: &str) -> Option<(String, String, String)> {
-        parse_jsr_purl(purl)
-            .map(|((s, n), v)| (s.into_owned(), n.into_owned(), v.into_owned()))
+        parse_jsr_purl(purl).map(|((s, n), v)| (s.into_owned(), n.into_owned(), v.into_owned()))
     }
 
     #[cfg(feature = "deno")]
@@ -900,7 +899,10 @@ mod tests {
             "pkg:npm/@scope/x@1.0.0",
             "pkg:npm/%40scope/x@1.0.0"
         ));
-        assert!(!purl_eq("pkg:npm/%40scope/x@1.0.0", "pkg:npm/@scope/x@2.0.0"));
+        assert!(!purl_eq(
+            "pkg:npm/%40scope/x@1.0.0",
+            "pkg:npm/@scope/x@2.0.0"
+        ));
         // Qualifiers/subpath are preserved verbatim (not decoded).
         assert_eq!(
             normalize_purl("pkg:npm/%40s/x@1?artifact_id=a%2Fb"),

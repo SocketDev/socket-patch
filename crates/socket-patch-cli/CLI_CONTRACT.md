@@ -82,7 +82,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 `scan --sync` is sugar for `--apply --prune` — the canonical single-flag bot invocation. `scan --json --sync --yes` discovers, applies, and reconciles state in one pass.
 
-`scan --vendor` swaps the in-place apply for the vendor pipeline: discover → download (manifest written, as `--apply`) → vendor every patched dependency via the same engine as the `vendor` command (under the same lock). The whole manifest is vendored, so a package vendored at an older patch uuid is **re-vendored automatically** (its old uuid dir is removed — `vendor_stale_artifact_removed`); same-uuid re-runs are `already_vendored` skips. With `--prune`, GC runs **before** the vendor step so stale manifest entries don't fail vendoring with `package_not_installed`. JSON output gains a `download` sub-object (the download phase; no `applied` field — nothing is applied in place) and a `vendor` sub-object (a full vendor Envelope). `--dry-run` previews per-patch `would_vendor` | `would_revendor` (+`oldUuid`) | `already_vendored` without network downloads or disk writes. Interactive mode prompts "Download and vendor N patch(es)?".
+`scan --vendor` swaps the in-place apply for the vendor pipeline: discover → download (manifest written, as `--apply`) → vendor every patched dependency via the same engine as the `vendor` command (under the same lock). The whole manifest is vendored, so a package vendored at an older patch uuid is **re-vendored automatically** (its old uuid dir is removed — `vendor_stale_artifact_removed`); same-uuid re-runs are `already_vendored` skips. With `--prune`, GC runs **before** the vendor step so stale manifest entries don't fail vendoring with `package_not_installed`. JSON output gains a `download` sub-object (the download phase; no `applied` field — nothing is applied in place) and a `vendor` sub-object (a full vendor Envelope). The download phase writes only `.socket/manifest.json`; patch blobs are held in memory (see "Patch sources stay in memory" under the vendor contract). `--dry-run` previews per-patch `would_vendor` | `would_revendor` (+`oldUuid`) | `already_vendored` without network downloads or disk writes. Interactive mode prompts "Download and vendor N patch(es)?".
 
 `scan --vendor --detached` performs the same vendoring **without ever writing `.socket/manifest.json`**: records are fetched into memory (`download.detached: true`), the artifacts are built + wired, and the ledger entry carries `detached: true` plus an embedded copy of the patch record (`record`) as the verification source. Detached patches are invisible to apply/rollback/repair (nothing is in the manifest), exempt from `vendor`'s manifest reconcile, and exit via `remove <purl>` (which reverts them) or `vendor --revert`. Idempotent re-runs reuse the embedded record and skip the patch-view fetch entirely.
 
@@ -325,6 +325,14 @@ ecosystem's lockfile/config so the project consumes the vendored copy. After com
 machines with **no socket-patch installed and no Socket API access** (registry access for other,
 unvendored dependencies may still be needed). Every mechanism below was validated against the real
 package managers (`spikes/PHASE0-FINDINGS.txt`).
+
+**Patch sources stay in memory (v3.4)**: vendoring never writes `.socket/blobs/`, `.socket/diffs/`,
+or temporary patch files. Pre-existing `.socket/` artifacts (from a prior `apply`/`get`/`repair`)
+are read in place; already-vendored purls re-stage patch content from the committed artifact itself
+(uuid-matched against the ledger, every harvested blob self-verified by its afterHash — so in-sync
+re-runs and fresh clones of vendored projects need no network); anything still missing is fetched
+into memory via the patch-view endpoint. A vendored project's `.socket/` holds only
+`manifest.json` (omitted in detached mode) and `vendor/`.
 
 ### Path convention + patch-UUID recovery (stable)
 

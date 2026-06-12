@@ -171,6 +171,23 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
     )
 }
 
+/// Vendor flows hold patch content in MEMORY: `.socket/` must end up with
+/// nothing beyond the manifest and the committed vendor artifacts — no
+/// `blobs/`, `diffs/`, `packages/`, or stray temp files.
+fn assert_socket_dir_lean(root: &Path) {
+    let entries: Vec<String> = std::fs::read_dir(root.join(".socket"))
+        .expect(".socket exists")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "apply.lock")
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .all(|n| n == "manifest.json" || n == "vendor"),
+        "vendoring must not write blobs or temp files into .socket; found: {entries:?}"
+    );
+}
+
 #[tokio::test]
 async fn scan_vendor_manifest_mode_end_to_end() {
     // scan --vendor: discover → download (manifest written) → vendor.
@@ -231,6 +248,7 @@ async fn scan_vendor_manifest_mode_end_to_end() {
         BEFORE,
         "installed tree stays pristine"
     );
+    assert_socket_dir_lean(tmp.path());
 
     // Idempotent re-run: already_vendored skip, zero new applies.
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
@@ -328,6 +346,10 @@ async fn scan_vendor_detached_mode_writes_no_manifest() {
             .iter()
             .any(|r| r.url.path().contains("/patches/view/")),
         "idempotent detached re-run must not re-fetch the patch view"
+    );
+    assert!(
+        !tmp.path().join(".socket/blobs").exists(),
+        "detached vendoring must never persist blobs"
     );
 }
 
@@ -568,7 +590,9 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
     assert!(tgz.is_file(), "tarball at the decoded scoped path");
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
-        lock.contains(&format!(".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz")),
+        lock.contains(&format!(
+            ".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
+        )),
         "lock consumes the vendored tarball; lock={lock}"
     );
     // Ledger keyed by the verbatim encoded purl.
@@ -673,7 +697,9 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         "manifest entry dropped: {manifest}"
     );
     assert!(
-        !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
         "artifact dir removed"
     );
     // The (already left-pad-free) lock stays exactly as the user re-locked
@@ -883,7 +909,9 @@ async fn vendor_auto_fetches_missing_package_from_lockfile() {
     assert_eq!(code, 0, "{v:#}");
     let events = v["events"].as_array().unwrap();
     assert!(
-        events.iter().any(|e| e["action"] == "applied" && e["purl"] == PURL),
+        events
+            .iter()
+            .any(|e| e["action"] == "applied" && e["purl"] == PURL),
         "{v:#}"
     );
     assert!(
@@ -1039,6 +1067,7 @@ async fn scan_vendor_works_on_a_completely_fresh_clone() {
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
         .is_file());
     assert!(!tmp.path().join("node_modules").exists());
+    assert_socket_dir_lean(tmp.path());
 
     // Second run: in sync.
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
@@ -1046,11 +1075,10 @@ async fn scan_vendor_works_on_a_completely_fresh_clone() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let events = v["vendor"]["events"].as_array().unwrap();
     assert!(
-        events
-            .iter()
-            .any(|e| e["errorCode"] == "already_vendored"),
+        events.iter().any(|e| e["errorCode"] == "already_vendored"),
         "{v}"
     );
+    assert_socket_dir_lean(tmp.path());
 }
 
 /// Read-only discovery flags lockfile-only packages in JSON and the human
@@ -1069,8 +1097,14 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     // JSON shape.
     let out = Command::new(binary())
         .args([
-            "scan", "--json", "--api-url", &mock.uri(), "--api-token", "fake-token",
-            "--org", ORG_SLUG,
+            "scan",
+            "--json",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
         ])
         .current_dir(tmp.path())
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -1085,8 +1119,15 @@ async fn scan_discovers_lockfile_only_packages_with_warning() {
     // Human output: the table marker + the note.
     let out = Command::new(binary())
         .args([
-            "scan", "--api-url", &mock.uri(), "--api-token", "fake-token",
-            "--org", ORG_SLUG, "--dry-run", "--yes",
+            "scan",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+            "--dry-run",
+            "--yes",
         ])
         .current_dir(tmp.path())
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -1119,8 +1160,16 @@ async fn scan_apply_skips_lockfile_only_without_error() {
 
     let out = Command::new(binary())
         .args([
-            "scan", "--json", "--apply", "--yes", "--api-url", &mock.uri(),
-            "--api-token", "fake-token", "--org", ORG_SLUG,
+            "scan",
+            "--json",
+            "--apply",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
         ])
         .current_dir(tmp.path())
         .env("SOCKET_TELEMETRY_DISABLED", "1")
@@ -1133,8 +1182,9 @@ async fn scan_apply_skips_lockfile_only_without_error() {
     assert_eq!(v["status"], "success", "{v}");
     let patches = v["apply"]["patches"].as_array().unwrap();
     assert!(
-        patches.iter().any(|p| p["action"] == "skipped"
-            && p["errorCode"] == "package_not_installed"),
+        patches
+            .iter()
+            .any(|p| p["action"] == "skipped" && p["errorCode"] == "package_not_installed"),
         "{v}"
     );
     assert!(

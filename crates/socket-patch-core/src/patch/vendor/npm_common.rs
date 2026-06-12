@@ -382,12 +382,18 @@ mod tests {
     fn guard_coordinates_accepts_plain_and_scoped_names() {
         let record = record_with_uuid(UUID);
         let coords = guard_coordinates("pkg:npm/left-pad@1.3.0", &record).unwrap();
-        assert_eq!((coords.name.as_str(), coords.version.as_str()), ("left-pad", "1.3.0"));
+        assert_eq!(
+            (coords.name.as_str(), coords.version.as_str()),
+            ("left-pad", "1.3.0")
+        );
         assert_eq!(coords.uuid_dir_rel, format!(".socket/vendor/npm/{UUID}"));
         assert_eq!(coords.base_purl, "pkg:npm/left-pad@1.3.0");
 
         let coords = guard_coordinates("pkg:npm/@scope/pkg@1.0.0?artifact_id=x", &record).unwrap();
-        assert_eq!((coords.name.as_str(), coords.version.as_str()), ("@scope/pkg", "1.0.0"));
+        assert_eq!(
+            (coords.name.as_str(), coords.version.as_str()),
+            ("@scope/pkg", "1.0.0")
+        );
         assert_eq!(
             coords.base_purl, "pkg:npm/@scope/pkg@1.0.0",
             "qualifiers stripped"

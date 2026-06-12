@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
+use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
@@ -433,8 +433,7 @@ async fn preverify_vendor_baselines(
             if info.before_hash.is_empty() {
                 continue; // a new file has no baseline to compare
             }
-            if verify_file_patch(&pkg.path, file, &info).await.status
-                == VerifyStatus::HashMismatch
+            if verify_file_patch(&pkg.path, file, &info).await.status == VerifyStatus::HashMismatch
             {
                 mismatched.insert(patch.uuid.clone());
                 break;
@@ -734,16 +733,18 @@ async fn run_scan_vendor_step(
                 patches: records.clone(),
                 setup: None,
             };
-            let staged = match stage_patch_sources(common, &synth, socket_dir).await {
-                Ok(StageOutcome::Ready(s)) => s,
-                Ok(StageOutcome::Unavailable) => {
-                    return Err((
-                        "no_local_source",
-                        "patch artifacts unavailable (offline or download failure)".to_string(),
-                    ))
-                }
-                Err(e) => return Err(("stage_failed", e)),
-            };
+            let staged =
+                match stage_vendor_sources_in_memory(common, &synth, socket_dir, &common.cwd).await
+                {
+                    Ok(MemStageOutcome::Ready(s)) => s,
+                    Ok(MemStageOutcome::Unavailable) => {
+                        return Err((
+                            "no_local_source",
+                            "patch artifacts unavailable (offline or download failure)".to_string(),
+                        ))
+                    }
+                    Err(e) => return Err(("stage_failed", e)),
+                };
             let sources = staged.as_patch_sources();
             boxed_vendor_records(common, records, &sources, true, &mut env).await
         }
@@ -761,16 +762,19 @@ async fn run_scan_vendor_step(
             // Same placement as the `vendor` command: dropped entries
             // are reverted even when zero in-scope patches remain.
             let mut has_errors = reconcile_dropped(&manifest, common, &mut env).await;
-            let staged = match stage_patch_sources(common, &manifest, socket_dir).await {
-                Ok(StageOutcome::Ready(s)) => s,
-                Ok(StageOutcome::Unavailable) => {
-                    return Err((
-                        "no_local_source",
-                        "patch artifacts unavailable (offline or download failure)".to_string(),
-                    ))
-                }
-                Err(e) => return Err(("stage_failed", e)),
-            };
+            let staged =
+                match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd)
+                    .await
+                {
+                    Ok(MemStageOutcome::Ready(s)) => s,
+                    Ok(MemStageOutcome::Unavailable) => {
+                        return Err((
+                            "no_local_source",
+                            "patch artifacts unavailable (offline or download failure)".to_string(),
+                        ))
+                    }
+                    Err(e) => return Err(("stage_failed", e)),
+                };
             let sources = staged.as_patch_sources();
             has_errors |=
                 boxed_vendor_records(common, &manifest.patches, &sources, false, &mut env).await;
@@ -837,8 +841,14 @@ async fn run_vendor_json_path(
         // and preview the GC, exactly like `--apply`'s dry run.
         result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
         if prune {
-            let gc =
-                preview_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+            let gc = preview_apply_gc(
+                &args.common,
+                manifest_path,
+                socket_dir,
+                scanned_purls,
+                vendored_purls,
+            )
+            .await;
             result["gc"] = gc.to_preview_json();
         }
         let final_code =
@@ -865,6 +875,7 @@ async fn run_vendor_json_path(
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
+        persist_blobs: !args.vendor,
     };
     let mut has_errors = false;
     let detached_records: Option<HashMap<String, PatchRecord>> = if args.detached {
@@ -900,7 +911,14 @@ async fn run_vendor_json_path(
     //    package_not_installed; vendored entries are exempt from
     //    the prune itself.
     if prune {
-        let gc = run_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+        let gc = run_apply_gc(
+            &args.common,
+            manifest_path,
+            socket_dir,
+            scanned_purls,
+            vendored_purls,
+        )
+        .await;
         result["gc"] = gc.to_apply_json();
     }
 
@@ -986,7 +1004,14 @@ async fn run_vendor_interactive_path(
     // GC before the vendor step (see the JSON path): stale manifest
     // entries would fail vendoring with package_not_installed.
     if prune {
-        let gc = run_apply_gc(&args.common, manifest_path, socket_dir, scanned_purls, vendored_purls).await;
+        let gc = run_apply_gc(
+            &args.common,
+            manifest_path,
+            socket_dir,
+            scanned_purls,
+            vendored_purls,
+        )
+        .await;
         if !gc.pruned.is_empty() {
             println!("GC: pruned {} manifest entr{}.", gc.pruned.len(), {
                 if gc.pruned.len() == 1 {
@@ -1000,7 +1025,11 @@ async fn run_vendor_interactive_path(
             println!(
                 "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
                 gc.vendored_reverted.len(),
-                if gc.vendored_reverted.len() == 1 { "y" } else { "ies" },
+                if gc.vendored_reverted.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
                 gc.vendor_orphan_dirs,
                 if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
             );
@@ -1079,9 +1108,8 @@ fn partition_not_installed_selected(
     if lockfile_only.is_empty() {
         return (selected, Vec::new());
     }
-    let is_lockfile_only = |p: &str| {
-        lockfile_only.contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
-    };
+    let is_lockfile_only =
+        |p: &str| lockfile_only.contains(normalize_purl(strip_purl_qualifiers(p)).as_ref());
     let (not_installed, kept): (Vec<_>, Vec<_>) = selected
         .into_iter()
         .partition(|p| is_lockfile_only(&p.purl));
@@ -1823,6 +1851,7 @@ pub async fn run(args: ScanArgs) -> i32 {
                     api_overrides: args.common.api_client_overrides(),
                     all_releases: args.all_releases,
                     strict: args.common.strict,
+                    persist_blobs: !args.vendor,
                 };
                 let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
                 apply_code = code;
@@ -1837,10 +1866,23 @@ pub async fn run(args: ScanArgs) -> i32 {
             // --- GC (if requested) --------------------------------------
             if prune {
                 let gc = if dry {
-                    preview_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls)
-                        .await
+                    preview_apply_gc(
+                        &args.common,
+                        &manifest_path,
+                        &socket_dir,
+                        &scanned_purls,
+                        &vendored_purls,
+                    )
+                    .await
                 } else {
-                    run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                    run_apply_gc(
+                        &args.common,
+                        &manifest_path,
+                        &socket_dir,
+                        &scanned_purls,
+                        &vendored_purls,
+                    )
+                    .await
                 };
                 result["gc"] = if dry {
                     gc.to_preview_json()
@@ -1890,9 +1932,23 @@ pub async fn run(args: ScanArgs) -> i32 {
         // --- GC-only path (no --apply, just --prune) --------------------
         if prune {
             let gc = if dry {
-                preview_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                preview_apply_gc(
+                    &args.common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned_purls,
+                    &vendored_purls,
+                )
+                .await
             } else {
-                run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await
+                run_apply_gc(
+                    &args.common,
+                    &manifest_path,
+                    &socket_dir,
+                    &scanned_purls,
+                    &vendored_purls,
+                )
+                .await
             };
             result["gc"] = if dry {
                 gc.to_preview_json()
@@ -2307,6 +2363,7 @@ pub async fn run(args: ScanArgs) -> i32 {
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
+        persist_blobs: !args.vendor,
     };
 
     let code = if args.vendor {
@@ -2336,7 +2393,14 @@ pub async fn run(args: ScanArgs) -> i32 {
     // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode
     // already ran its GC before the vendor step.)
     if prune && !args.vendor {
-        let gc = run_apply_gc(&args.common, &manifest_path, &socket_dir, &scanned_purls, &vendored_purls).await;
+        let gc = run_apply_gc(
+            &args.common,
+            &manifest_path,
+            &socket_dir,
+            &scanned_purls,
+            &vendored_purls,
+        )
+        .await;
         let total = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
         if !args.common.silent && (!gc.pruned.is_empty() || total > 0) {
             println!(
@@ -2352,7 +2416,11 @@ pub async fn run(args: ScanArgs) -> i32 {
             println!(
                 "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
                 gc.vendored_reverted.len(),
-                if gc.vendored_reverted.len() == 1 { "y" } else { "ies" },
+                if gc.vendored_reverted.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
                 gc.vendor_orphan_dirs,
                 if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
             );
@@ -2794,7 +2862,14 @@ mod tests {
         let tmp_wet = tempfile::tempdir().unwrap();
         let (mp_w, sd_w, blob_w) =
             seed_manifest_with_blob(tmp_wet.path(), "pkg:npm/gone@1.0.0", &after_hash);
-        let wet = run_apply_gc(&gc_common(tmp_wet.path()), &mp_w, &sd_w, &scanned, &no_vendored()).await;
+        let wet = run_apply_gc(
+            &gc_common(tmp_wet.path()),
+            &mp_w,
+            &sd_w,
+            &scanned,
+            &no_vendored(),
+        )
+        .await;
 
         assert_eq!(
             preview.blobs.blobs_removed, wet.blobs.blobs_removed,

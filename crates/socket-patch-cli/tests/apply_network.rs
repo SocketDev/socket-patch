@@ -504,7 +504,10 @@ async fn apply_hash_mismatch_default_warns_and_applies_strict_fails() {
         "the overwrite is surfaced as a warning event: {events:?}"
     );
     let content = std::fs::read(tmp.path().join("node_modules/mismatch/index.js")).unwrap();
-    assert_eq!(content, after, "the file carries the verified patched bytes");
+    assert_eq!(
+        content, after,
+        "the file carries the verified patched bytes"
+    );
 
     // The human run logs the warning to stderr.
     let tmp = fixture();
@@ -757,8 +760,16 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
         header.set_size(bytes.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, "other.js", &bytes[..]).unwrap();
-        builder.into_inner().unwrap().finish().unwrap().flush().unwrap();
+        builder
+            .append_data(&mut header, "other.js", &bytes[..])
+            .unwrap();
+        builder
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap()
+            .flush()
+            .unwrap();
     }
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
