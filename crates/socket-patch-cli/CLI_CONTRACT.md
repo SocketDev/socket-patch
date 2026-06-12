@@ -15,7 +15,7 @@ This document defines the **public surface** of the `socket-patch` binary. Anyth
 | `list` | — | Print patches in the local manifest |
 | `remove` | — | Remove patch from manifest (rolls back first); requires positional `identifier` |
 | `setup` | — | Wire automatic-patching install hooks (npm/pypi/gem) |
-| `repair` | `gc` | Download missing blobs + clean up unused ones |
+| `repair` | `gc` | Download missing blobs, rebuild missing/corrupt vendored artifacts, clean up unused ones |
 | `vendor` | — | Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles |
 | `vex` | — | Emit an OpenVEX 0.2.0 attestation derived from the local manifest |
 
@@ -334,6 +334,37 @@ re-runs and fresh clones of vendored projects need no network); anything still m
 into memory via the patch-view endpoint. A vendored project's `.socket/` holds only
 `manifest.json` (omitted in detached mode) and `vendor/`.
 
+**Vendored artifact repair (v3.5)**: `repair` health-checks every ledger entry — per-file
+afterHashes inside the artifact plus, for file-shaped artifacts (`.tgz`/`.whl`), the whole file
+against the ledger's recorded sha256 (the rewired lock integrity references those exact bytes) —
+and REBUILDS missing/corrupt artifacts through the normal vendor backends. The wired hot paths
+rebuild the artifact only: lockfiles stay byte-identical and the ledger entry is not re-recorded
+(the first run's entry holds the only pre-vendor originals). Pristine sources follow the same
+ladder as vendor: the installed copy first (works under `--offline`), then a lockfile-verified
+registry fetch, then the pre-vendor registry fragment recovered from the ledger's wiring
+`original`s (`recover_lock_entry`) — always integrity-verified fail-closed, and the rebuilt
+artifact is re-verified against the recorded fingerprint before the run counts it (`rebuilt`
+event; a mismatch removes the artifact and fails with `vendor_artifact_rebuild_failed`).
+Lockfile references to `.socket/vendor/<eco>/<uuid>/...` with NO ledger coverage (the ledger was
+deleted wholesale) are RECONSTRUCTED: the uuid comes from the path (the recovery rule above), the
+record from the manifest — or the patch API, yielding a *detached* entry with the record embedded
+— and a fresh ledger entry is persisted with the rebuilt artifact's fingerprint. When nothing is
+installed and the ledger is gone, npm-family reconstruction has one more rung: the REWIRED
+lockfile still records the integrity of the packed vendored tarball, so the pristine copy is
+fetched (unverified, conventional registry URL, `SOCKET_NPM_REGISTRY` honored) and the
+deterministically REBUILT artifact must reproduce that wired integrity — a tampered pristine
+source changes the rebuilt bytes and fails closed (`vendor_artifact_rebuild_failed`, nothing
+kept). Reconstructed entries carry no pre-vendor wiring originals, so a later `--revert` degrades
+to the documented `vendor_lock_entry_drifted` guidance (re-resolve with the package manager). Because of this
+phase, `repair` no longer errors with `manifest_not_found` when the project has a vendor ledger
+or vendor-path lockfile references — it runs the vendored phase alone. Step 1's source download
+likewise skips vendored-in-sync manifest entries (their content lives in the committed artifact),
+so repairing a vendored project never re-litters `.socket/blobs`. `--dry-run` previews
+(`details.wouldRebuild`); `--offline` rebuilds only from fully local sources and fails per-entry
+otherwise; `vendor`/`scan --vendor` re-runs get the same rebuild for wired-but-broken artifacts
+(`vendor_artifact_rebuilt` warning) and recover registry resolutions for missing committed
+artifacts instead of failing.
+
 ### Path convention + patch-UUID recovery (stable)
 
 ```text
@@ -590,6 +621,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `failed`     | every command                         | A specific patch attempt failed. `errorCode` + `error` set. |
 | `removed`    | `gc`/`repair`, `remove`, `rollback`   | Data was removed from `.socket/` (or files rolled back). `bytes` optional. |
 | `verified`   | `apply --dry-run`, `scan --dry-run`   | The patch *would* apply cleanly. `files` lists previewed changes. |
+| `rebuilt`    | `repair`                              | A missing/corrupt vendored artifact was rebuilt in place (or its lost ledger entry restored — `details.ledgerRestored`). `summary.rebuilt` counts these (the field is omitted while zero). |
 
 ### Stable `errorCode` tags
 
@@ -618,8 +650,14 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_integrity_unverified` | `skipped` (warning) | vendor (pipenv): the lockfile format does not hash-check file entries; the committed wheel bytes are the protection. |
 | `vendor_content_mismatch_overwritten` | `skipped` (warning) | vendor: a staged file matched NEITHER beforeHash nor afterHash (patch built against different bytes, or local edits); the stage was overwritten with the verified patched content and the vendor succeeded. |
 | `vendor_fetched_missing` | `skipped` (warning) | vendor: the package was not installed; its pristine artifact was fetched per the lockfile resolution (or staged from the committed vendor artifact), integrity-verified, and vendored — the project tree was not touched. |
-| `vendor_fetch_failed` | `failed` | vendor: the lockfile-resolved fetch was attempted and failed (HTTP error, size cap, integrity mismatch, or a corrupt committed artifact). Suppresses the duplicate `package_not_installed` skip. |
+| `vendor_fetch_failed` | `failed` | vendor: the lockfile-resolved fetch was attempted and failed (HTTP error, size cap, integrity mismatch, or a PRESENT-but-corrupt committed artifact — pointed at `socket-patch repair`). A MISSING committed artifact no longer lands here: it falls through to the ledger-recovered registry fetch. Suppresses the duplicate `package_not_installed` skip. |
 | `vendor_fetch_unverifiable` | `skipped` (warning) | vendor: the lockfile records no usable integrity for the missing package; nothing was fetched (fail-closed) and the `package_not_installed` skip follows. |
+| `vendor_artifact_missing` | `skipped` (warning) / `failed` | vendor: the committed artifact is gone — the registry resolution is recovered from the ledger and the artifact rebuilt (warning); repair `--offline` with no local source surfaces it as the per-entry failure instead. |
+| `vendor_artifact_corrupt` | `failed` | repair `--offline`: the committed artifact fails verification (member afterHashes or the ledger's whole-file sha256) and no local source can rebuild it. Online repairs rebuild instead. |
+| `vendor_artifact_rebuilt` | `skipped` (warning) | vendor / scan `--vendor`: a wired-but-missing/stale artifact was rebuilt in place; lockfiles and the ledger entry untouched. (Under `repair` the `rebuilt` event carries this signal.) |
+| `vendor_artifact_rebuild_failed` | `failed` | repair: the rebuild ran but the result failed verification against the recorded fingerprint (e.g. an edited state.json sha); the unverifiable artifact was removed. |
+| `vendor_artifact_unrepairable` | `failed` | repair: no verifiable pristine source exists (not installed + lockfile rewired + no recoverable ledger fragment), the wheel is platform-locked with no installed copy, or the ledger entry itself cannot be trusted. |
+| `vendor_uuid_mismatch` | `skipped` | repair: the manifest's patch uuid moved past the vendored artifact — a re-vendor (`vendor` / `scan --vendor`) is pending; repair does not cross patch generations. |
 | `content_mismatch_overwritten` | `skipped` (warning) | apply (default policy): a file matched NEITHER beforeHash nor afterHash and was overwritten with the full verified patched content. `--strict` turns this case into a `failed` event instead. |
 | `vendor_lock_checksums_unsupported` / `vendor_stale_lock_checksum` | `failed` | vendor (gem): an ambiguous/platform CHECKSUMS entry, or a v1-wired lock whose stale token blocks the hot path (run `vendor --revert` + re-vendor). |
 | `pypi_{poetry,pdm,pipenv}_no_lockfile` | `failed` | vendor (pypi): a lock-less tool marker with no `requirements.txt` fallback — run `<tool> lock`. |
@@ -629,7 +667,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Code                  | Subcommands                      | Meaning |
 |-----------------------|----------------------------------|---------|
-| `manifest_not_found`  | list, remove, repair, rollback   | `.socket/manifest.json` doesn't exist. |
+| `manifest_not_found`  | list, remove, repair, rollback   | `.socket/manifest.json` doesn't exist. v3.5: `repair` proceeds anyway (vendored phase only) when a vendor ledger or vendor-path lockfile references exist. |
 | `manifest_invalid`    | list, remove                     | Manifest exists but is unparseable. |
 | `manifest_unreadable` | list, remove                     | I/O error reading manifest. |
 | `apply_failed`        | apply                            | apply pipeline error before any patch ran. |
@@ -643,7 +681,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `apply`      | `Applied` · `Updated` · `Skipped` (already_patched / package_not_installed / vendored) · `Failed` · `Verified` (dry-run) |
 | `vendor`     | `Applied` (= vendored; `command` routes) · `Skipped` (refusals, warnings, unsupported ecosystems) · `Failed` · `Removed` (reconcile + `--revert`) · `Verified` (dry-run) |
 | `list`       | `Discovered` (with `details.vulnerabilities`, `details.tier`, `details.license`, `details.description`, `details.exportedAt`) |
-| `repair`/`gc`| `Downloaded` (or `Verified` on dry-run) · `Removed` (or `Verified`) · `Failed` artifact events |
+| `repair`/`gc`| `Downloaded` (or `Verified` on dry-run) · `Rebuilt` (vendored artifacts; `Verified` previews on dry-run) · `Skipped` (vendor_uuid_mismatch) · `Removed` (or `Verified`) · `Failed` events |
 | `remove`     | `Removed` (per purl) · artifact-level `Removed` event (with `details.blobsRemoved`, `details.rolledBack`) |
 
 ### Migration status (v3.0)

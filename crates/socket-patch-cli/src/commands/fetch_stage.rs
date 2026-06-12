@@ -283,11 +283,12 @@ pub enum MemStageOutcome {
 }
 
 /// Stage patch sources for a VENDOR run without writing anything:
-/// per-record availability follows the same rule as
-/// [`stage_patch_sources`] (all after-blobs on disk, or a diff/package
-/// archive on disk), and records with no usable local source have their
-/// full per-file content fetched into memory from the patch view
-/// endpoint (`blobContent`). Offline runs with missing sources are
+/// a record is locally satisfied when all its after-blobs are on disk or
+/// a package archive is (a diff archive is NOT sufficient — vendor's
+/// auto-force policy can need the full after-blob for files a diff cannot
+/// reproduce); anything else has its full per-file content fetched into
+/// memory from the patch view endpoint (`blobContent`), preceded by the
+/// committed-artifact harvest. Offline runs with missing sources are
 /// `Unavailable` with the same diagnostics as the disk stager.
 pub async fn stage_vendor_sources_in_memory(
     common: &GlobalArgs,
@@ -300,9 +301,14 @@ pub async fn stage_vendor_sources_in_memory(
     let packages = socket_dir.join("packages");
 
     let missing_blobs = get_missing_blobs(manifest, &blobs).await;
-    let missing_diff_archives = get_missing_archives(manifest, &diffs).await;
     let missing_package_archives = get_missing_archives(manifest, &packages).await;
 
+    // A diff archive alone is NOT a sufficient source here, unlike the disk
+    // stager: vendoring runs the auto-force policy, where a beforeHash
+    // mismatch (already-applied tree, patch built against different bytes)
+    // is overwritten with the FULL after-blob — which a diff cannot
+    // produce. On-disk diffs still serve Strategy 2 for clean files; the
+    // after-blob content must additionally exist (disk, harvest, or fetch).
     let mut to_fetch: Vec<(&str, &str)> = manifest
         .patches
         .iter()
@@ -311,9 +317,8 @@ pub async fn stage_vendor_sources_in_memory(
                 .files
                 .values()
                 .all(|f| !missing_blobs.contains(&f.after_hash));
-            let diff_present = !missing_diff_archives.contains(&record.uuid);
             let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || diff_present || pkg_present {
+            if all_blobs_present || pkg_present {
                 None
             } else {
                 Some((purl.as_str(), record.uuid.as_str()))

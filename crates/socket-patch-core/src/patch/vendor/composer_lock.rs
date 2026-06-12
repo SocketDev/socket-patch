@@ -176,19 +176,76 @@ pub async fn vendor_composer(
     // at the uuid path → touch nothing, report AlreadyPatched. `entry` stays
     // `None`: the first run's ledger entry holds the only copy of the
     // verbatim pre-vendor original, and re-recording here would clobber it.
-    if entry_is_wired(&lock[section][idx], &copy_rel)
-        && copy_matches_after_hashes(&copy_dir, &record.files).await
-    {
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &copy_dir, verified, true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+    if entry_is_wired(&lock[section][idx], &copy_rel) {
+        if copy_matches_after_hashes(&copy_dir, &record.files).await {
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
+            return VendorOutcome::Done {
+                result: synthesized_result(purl, &copy_dir, verified, true, None),
+                entry: None,
+                warnings: Vec::new(),
+            };
+        }
+        // Wired but the committed copy is missing/stale: rebuild the
+        // ARTIFACT only. The lock is already correct and the first run's
+        // ledger entry holds the only pre-vendor original — running the
+        // full path here would re-record the live VENDORED fragment as
+        // `original`, breaking a later `--revert`.
+        if !dry_run {
+            if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
+                return VendorOutcome::Done {
+                    result: synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy installed package: {e}")),
+                    ),
+                    entry: None,
+                    warnings: Vec::new(),
+                };
+            }
+            let mut warnings: Vec<VendorWarning> = Vec::new();
+            let mut result = super::force_apply_staged(
+                purl,
+                &copy_dir,
+                record,
+                sources,
+                false,
+                force,
+                &pkg,
+                version,
+                &mut warnings,
+            )
+            .await;
+            result.package_path = copy_dir.display().to_string();
+            if !result.success {
+                // Don't leave a half-built copy; the pre-state was already
+                // broken, so removing restores the (missing) status quo.
+                let _ = remove_tree(&uuid_dir).await;
+                return VendorOutcome::Done {
+                    result,
+                    entry: None,
+                    warnings,
+                };
+            }
+            warnings.push(VendorWarning::new(
+                "vendor_artifact_rebuilt",
+                format!(
+                    "the committed vendored copy for {pkg}@{version} was missing or stale; \
+                     rebuilt at {copy_rel} (composer.lock untouched)"
+                ),
+            ));
+            return VendorOutcome::Done {
+                result,
+                entry: None,
+                warnings,
+            };
+        }
+        // Dry runs fall through to the verify-only preview below.
     }
 
     // ── dry run: verify-only against the installed dir, no writes ────────
@@ -1075,6 +1132,51 @@ mod tests {
                 .await
                 .unwrap(),
             copy_bytes
+        );
+    }
+
+    /// Wired lock + deleted/corrupt copy: the artifact is rebuilt in place,
+    /// the lock stays byte-identical, no ledger entry is re-recorded.
+    #[tokio::test]
+    async fn test_wired_missing_copy_rebuilds_artifact_only() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        let (r1, e1, _) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r1.success);
+        assert!(e1.is_some());
+        let lock_bytes = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let patched = root.join(copy_rel()).join("src/LoggerInterface.php");
+        let patched_bytes = tokio::fs::read(&patched).await.unwrap();
+
+        // Simulate the fresh-clone hole: the committed copy is gone.
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_none(),
+            "artifact-only rebuild must not re-record (the live vendored \
+             fragment would clobber the pre-vendor original)"
+        );
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&patched).await.unwrap(),
+            patched_bytes,
+            "rebuilt copy carries the patched bytes"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_bytes,
+            "composer.lock untouched by the rebuild"
         );
     }
 

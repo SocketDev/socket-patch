@@ -71,7 +71,11 @@ pub enum FetchError {
 }
 
 /// One shared client for all fetches in a run.
-pub fn build_registry_client() -> reqwest::Client {
+/// The registry HTTP client type, nameable by callers that don't depend on
+/// reqwest directly (the CLI's pristine-source ladder).
+pub type RegistryClient = reqwest::Client;
+
+pub fn build_registry_client() -> RegistryClient {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(60))
@@ -551,33 +555,45 @@ async fn fetch_npm(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
+    fetch_npm_inner(entry, client, true).await
+}
+
+async fn fetch_npm_inner(
+    entry: &LockfileEntry,
+    client: &reqwest::Client,
+    verify: bool,
+) -> Result<FetchedPackage, FetchError> {
     let url = entry
         .resolved
         .clone()
         .unwrap_or_else(|| npm_tarball_url(&npm_registry_base(), &entry.name, &entry.version));
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    match &entry.integrity {
-        // yarn berry locks never hash the tarball itself — the checksum is
-        // sha512 of the deterministic cache zip. Rebuild it from the fetched
-        // bytes (the same spike-pinned recipe the berry wiring uses) and
-        // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
-        LockIntegrity::BerryChecksum(expected) => {
-            if !expected.starts_with("10c0/") {
-                return Err(FetchError::Unverifiable(format!(
-                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; the \
-                     cache-zip recipe is not reproducible for it"
-                )));
+    if !verify {
+        // fetch_npm_unverified: the caller owns end-to-end verification.
+    } else {
+        match &entry.integrity {
+            // yarn berry locks never hash the tarball itself — the checksum is
+            // sha512 of the deterministic cache zip. Rebuild it from the fetched
+            // bytes (the same spike-pinned recipe the berry wiring uses) and
+            // compare. Only cacheKey 10c0 (yarn 4 default) is reproducible.
+            LockIntegrity::BerryChecksum(expected) => {
+                if !expected.starts_with("10c0/") {
+                    return Err(FetchError::Unverifiable(format!(
+                        "yarn berry checksum `{expected}` uses a cacheKey other than 10c0; \
+                         the cache-zip recipe is not reproducible for it"
+                    )));
+                }
+                let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
+                    .map_err(FetchError::Failed)?;
+                if &actual != expected {
+                    return Err(FetchError::Failed(format!(
+                        "yarn berry cache checksum mismatch: lockfile records {expected}, \
+                         the fetched tarball rebuilds to {actual}"
+                    )));
+                }
             }
-            let actual = super::berry_zip::berry_cache_checksum_10c0(&bytes, &entry.name)
-                .map_err(FetchError::Failed)?;
-            if &actual != expected {
-                return Err(FetchError::Failed(format!(
-                    "yarn berry cache checksum mismatch: lockfile records {expected}, the \
-                     fetched tarball rebuilds to {actual}"
-                )));
-            }
+            other => verify_integrity(&bytes, other)?,
         }
-        other => verify_integrity(&bytes, other)?,
     }
 
     let tmp = tempfile::tempdir()
@@ -681,6 +697,62 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String
 /// Verify downloaded bytes against the lock-recorded verifier. Runs BEFORE
 /// any disk write. Berry cache-zip checksums and go.sum dirhashes have
 /// dedicated verifiers in their ecosystems' fetchers.
+/// Fetch + stage an npm package from its conventional registry URL WITHOUT
+/// content verification. The download/extract caps still apply.
+///
+/// SECURITY: callers MUST end-to-end verify whatever they derive from the
+/// staged copy against an independent trust anchor before committing it —
+/// repair's ledger reconstruction verifies the deterministically REBUILT
+/// vendored tarball against the integrity the rewired lockfile records
+/// (`artifact_matches_integrity`); a tampered pristine source then changes
+/// the rebuilt bytes and fails closed.
+pub async fn fetch_npm_unverified(
+    name: &str,
+    version: &str,
+    client: &reqwest::Client,
+) -> Result<FetchedPackage, FetchError> {
+    let entry = LockfileEntry {
+        ecosystem: "npm",
+        name: name.to_string(),
+        version: version.to_string(),
+        purl: format!("pkg:npm/{name}@{version}"),
+        resolved: None,
+        integrity: LockIntegrity::None,
+    };
+    fetch_npm_inner(&entry, client, false).await
+}
+
+/// Whole-artifact verification against a lock-recorded integrity (the same
+/// verifiers the fetch path uses, including the berry cache-zip rebuild).
+/// `name` feeds the berry cache-zip recipe; ignored otherwise.
+pub fn artifact_matches_integrity(
+    bytes: &[u8],
+    name: &str,
+    integrity: &LockIntegrity,
+) -> Result<(), String> {
+    match integrity {
+        LockIntegrity::BerryChecksum(expected) => {
+            if !expected.starts_with("10c0/") {
+                return Err(format!(
+                    "yarn berry checksum `{expected}` uses a cacheKey other than 10c0"
+                ));
+            }
+            let actual = super::berry_zip::berry_cache_checksum_10c0(bytes, name)?;
+            if &actual == expected {
+                Ok(())
+            } else {
+                Err(format!(
+                    "yarn berry cache checksum mismatch: lockfile records {expected}, the \
+                     artifact rebuilds to {actual}"
+                ))
+            }
+        }
+        other => verify_integrity(bytes, other).map_err(|e| match e {
+            FetchError::Failed(d) | FetchError::Unverifiable(d) => d,
+        }),
+    }
+}
+
 fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), FetchError> {
     match integrity {
         LockIntegrity::Sri(sri) => verify_sri(bytes, sri).map_err(FetchError::Failed),

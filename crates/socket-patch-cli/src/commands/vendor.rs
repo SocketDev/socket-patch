@@ -82,7 +82,7 @@ pub struct VendorArgs {
 
 /// Refusal codes that are expected skips, not command failures: the user's
 /// request is still fully satisfied when these are the only non-successes.
-fn refusal_is_benign(code: &str) -> bool {
+pub(crate) fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
 }
 
@@ -90,7 +90,7 @@ fn refusal_is_benign(code: &str) -> bool {
 /// installed location (site-packages root for pypi, the package dir
 /// otherwise). Returns `None` for purls with no vendor backend in this build.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_vendor_one(
+pub(crate) async fn dispatch_vendor_one(
     purl: &str,
     pkg_path: &Path,
     project_root: &Path,
@@ -294,7 +294,12 @@ pub(crate) fn ecosystem_in_scope(common: &GlobalArgs, eco: &str) -> bool {
 
 /// Surface a backend warning: stderr line for humans, a Skipped event with
 /// the stable code for JSON consumers (Skipped never flips the status).
-fn record_warning(env: &mut Envelope, purl: &str, warning: &VendorWarning, common: &GlobalArgs) {
+pub(crate) fn record_warning(
+    env: &mut Envelope,
+    purl: &str,
+    warning: &VendorWarning,
+    common: &GlobalArgs,
+) {
     if !common.silent && !common.json {
         eprintln!("Warning ({}): {}", warning.code, warning.detail);
     }
@@ -469,6 +474,140 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
 ///
 /// Does NOT lock, read the manifest, or print the envelope — callers own all
 /// three. Returns whether any non-benign failure occurred.
+/// Persist one backend-returned ledger entry: detached flagging, wiring
+/// `original` carry-forward from the entry being replaced, per-package save
+/// (crash-consistent with what is already wired), and the stale-uuid-dir
+/// sweep on re-vendors. Returns `true` when the save failed (has_errors).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn persist_vendor_entry(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    state: &mut socket_patch_core::patch::vendor::VendorState,
+    candidate: &str,
+    mut entry: socket_patch_core::patch::vendor::VendorEntry,
+    detached: bool,
+    record: &PatchRecord,
+) -> bool {
+    let mut has_errors = false;
+    let candidate = candidate.to_string();
+    entry.detached = detached;
+    entry.record = detached.then(|| record.clone());
+    // A re-vendor run re-derives the entry from current
+    // disk state, where the takeover already happened —
+    // preserve the prior flag or the revert-time
+    // "takeover_not_restored" hint is lost.
+    let prev = state.entries.get(&candidate).cloned();
+    if let Some(prev) = &prev {
+        entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
+        // A re-vendor (new patch uuid) rewrites our own
+        // stale wiring, so the backend records
+        // `original: None` (it must never record a
+        // dangling `.socket/vendor/` pointer as the
+        // pre-vendor fragment). The TRUE pre-vendor
+        // original lives in the entry being replaced —
+        // carry it forward by wiring identity, or a
+        // later `--revert` can only shrug
+        // (`vendor_lock_entry_drifted`) instead of
+        // restoring the registry fragment.
+        for rec in &mut entry.wiring {
+            if rec.action == socket_patch_core::patch::vendor::state::WiringAction::Rewritten
+                && rec.original.is_none()
+            {
+                if let Some(prev_rec) = prev
+                    .wiring
+                    .iter()
+                    .find(|p| p.file == rec.file && p.kind == rec.kind && p.key == rec.key)
+                {
+                    rec.original = prev_rec.original.clone();
+                }
+            }
+        }
+    }
+    let new_uuid = entry.uuid.clone();
+    state.entries.insert(candidate.clone(), entry);
+    // Persist per-package so a crash mid-run leaves a
+    // ledger that matches what's already wired.
+    if let Err(e) = save_state(&common.cwd, state).await {
+        has_errors = true;
+        env.record(
+            PatchEvent::new(PatchAction::Failed, candidate.clone())
+                .with_error("vendor_state_write_failed", e.to_string()),
+        );
+    } else if let Some(prev) = prev.filter(|p| p.uuid != new_uuid) {
+        // Re-vendor under a newer patch uuid: the old
+        // uuid's dir is an orphan now — the wiring and
+        // ledger both point at the new uuid — unless
+        // another entry still shares it (the same
+        // `(eco, uuid)` ownership test as `--revert`'s
+        // orphan sweep). Only the live entry would
+        // otherwise reclaim it, and that never happens.
+        let still_referenced = state
+            .entries
+            .values()
+            .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
+        let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
+        if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
+            if !common.dry_run {
+                let _ = remove_tree(&common.cwd.join(rel)).await;
+            }
+            env.record(
+                PatchEvent::new(PatchAction::Removed, candidate.clone()).with_reason(
+                    "vendor_stale_artifact_removed",
+                    "previous patch uuid's vendored artifact removed",
+                ),
+            );
+        }
+    }
+    has_errors
+}
+
+/// One registry-fetch attempt through the pristine-source ladder's network
+/// half: the lockfile inventory first, then the ledger-recovered pre-vendor
+/// registry fragment (the live lockfile is rewired to `.socket/vendor/...`
+/// for vendored packages, so only `--revert`'s restore data still knows the
+/// registry resolution). Always integrity-verified fail-closed.
+pub(crate) enum PristineFetch {
+    Fetched(socket_patch_core::patch::vendor::registry_fetch::FetchedPackage),
+    /// Neither the lockfile nor the ledger can name a verifiable source.
+    NoSource,
+    Unverifiable(String),
+    Failed(String),
+}
+
+pub(crate) async fn fetch_pristine_package(
+    project_root: &Path,
+    inventory: &[socket_patch_core::patch::vendor::lock_inventory::LockfileEntry],
+    client: &socket_patch_core::patch::vendor::registry_fetch::RegistryClient,
+    purl: &str,
+    ledger_entry: Option<&socket_patch_core::patch::vendor::VendorEntry>,
+) -> PristineFetch {
+    use socket_patch_core::patch::vendor::{lock_inventory, registry_fetch};
+
+    let entry = match lock_inventory::lookup(inventory, purl) {
+        Some(e) => e.clone(),
+        None => {
+            let Some(le) = ledger_entry else {
+                return PristineFetch::NoSource;
+            };
+            match lock_inventory::recover_lock_entry(project_root, le).await {
+                Ok(rec) => rec,
+                Err(e) => {
+                    return PristineFetch::Unverifiable(format!(
+                        "the lockfile no longer records a registry resolution for {purl} \
+                         (rewired to the vendored artifact) and the ledger cannot recover \
+                         one: {e}"
+                    ))
+                }
+            }
+        }
+    };
+    match registry_fetch::fetch_and_stage(&entry, client).await {
+        Ok(fetched) => PristineFetch::Fetched(fetched),
+        Err(registry_fetch::FetchError::Unverifiable(d)) => PristineFetch::Unverifiable(d),
+        Err(registry_fetch::FetchError::Failed(d)) => PristineFetch::Failed(d),
+    }
+}
+
 pub(crate) async fn vendor_records(
     common: &GlobalArgs,
     records: &HashMap<String, PatchRecord>,
@@ -564,60 +703,86 @@ pub(crate) async fn vendor_records(
             // against the ledger — offline-safe, no registry traffic.
             let ledger = load_state(&common.cwd).await.unwrap_or_default();
             for purl in &missing {
-                if let Some(entry) = ledger
+                let ledger_entry = ledger
                     .entries
                     .get(purl)
-                    .or_else(|| ledger.entries.values().find(|e| &e.base_purl == purl))
+                    .or_else(|| ledger.entries.values().find(|e| &e.base_purl == purl));
+                if let Some(entry) = ledger_entry
                     .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
                 {
                     let tgz = common.cwd.join(&entry.artifact.path);
-                    match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256).await {
-                        Ok(staged) => {
-                            all_packages.insert(purl.clone(), staged.dir().to_path_buf());
-                            fetched_holders.push(staged);
-                            continue;
-                        }
-                        Err(registry_fetch::FetchError::Failed(detail)) => {
-                            // A corrupt committed artifact is worth a loud
-                            // failure — re-vendoring over it would mask the
-                            // corruption.
-                            fetch_failed.insert(purl.clone());
-                            env.record(
-                                PatchEvent::new(PatchAction::Failed, purl.clone())
-                                    .with_error("vendor_fetch_failed", detail.clone()),
-                            );
-                            if !common.silent && !common.json {
-                                eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
+                    if tokio::fs::metadata(&tgz).await.is_err() {
+                        // The committed artifact is GONE (gitignored or
+                        // deleted): not corruption — fall through to the
+                        // registry ladder, which recovers the pre-vendor
+                        // resolution from the ledger and rebuilds.
+                        record_warning(
+                            env,
+                            purl,
+                            &VendorWarning::new(
+                                "vendor_artifact_missing",
+                                format!(
+                                    "the committed vendored artifact {} is missing; \
+                                     recovering the registry resolution to rebuild it",
+                                    entry.artifact.path
+                                ),
+                            ),
+                            common,
+                        );
+                    } else {
+                        match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
+                            .await
+                        {
+                            Ok(staged) => {
+                                all_packages.insert(purl.clone(), staged.dir().to_path_buf());
+                                fetched_holders.push(staged);
+                                continue;
                             }
-                            continue;
-                        }
-                        Err(registry_fetch::FetchError::Unverifiable(_)) => {
-                            // No recorded hash (legacy ledger) — fall
-                            // through to the lockfile/registry path.
+                            Err(registry_fetch::FetchError::Failed(detail)) => {
+                                // A PRESENT-but-corrupt committed artifact is
+                                // worth a loud failure — silently re-vendoring
+                                // over it would mask the corruption.
+                                fetch_failed.insert(purl.clone());
+                                let detail = format!(
+                                    "{detail}; run `socket-patch repair` to rebuild the \
+                                     vendored artifact"
+                                );
+                                env.record(
+                                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                                        .with_error("vendor_fetch_failed", detail.clone()),
+                                );
+                                if !common.silent && !common.json {
+                                    eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
+                                }
+                                continue;
+                            }
+                            Err(registry_fetch::FetchError::Unverifiable(_)) => {
+                                // No recorded hash (legacy ledger) — fall
+                                // through to the lockfile/registry path.
+                            }
                         }
                     }
                 }
-                let Some(entry) = lock_inventory::lookup(&inventory, purl) else {
-                    continue; // not lockfile-resolvable → package_not_installed
-                };
                 if common.offline {
                     // The enriched skip detail lands below in the unmatched
                     // pass (the purl stays unmatched).
                     continue;
                 }
-                match registry_fetch::fetch_and_stage(entry, &client).await {
-                    Ok(fetched) => {
+                match fetch_pristine_package(&common.cwd, &inventory, &client, purl, ledger_entry)
+                    .await
+                {
+                    PristineFetch::Fetched(fetched) => {
                         record_warning(
                             env,
                             purl,
                             &VendorWarning::new(
                                 "vendor_fetched_missing",
                                 format!(
-                                    "{}@{} is not installed; fetched the pristine artifact \
-                                     from {} (integrity verified against the lockfile) and \
-                                     vendored from that copy — the project tree was not \
-                                     touched",
-                                    entry.name, entry.version, fetched.url
+                                    "{} is not installed; fetched the pristine artifact \
+                                     from {} (integrity verified) and vendored from that \
+                                     copy — the project tree was not touched",
+                                    normalize_purl(purl),
+                                    fetched.url
                                 ),
                             ),
                             common,
@@ -625,7 +790,11 @@ pub(crate) async fn vendor_records(
                         all_packages.insert(purl.clone(), fetched.dir().to_path_buf());
                         fetched_holders.push(fetched);
                     }
-                    Err(registry_fetch::FetchError::Unverifiable(detail)) => {
+                    PristineFetch::NoSource => {
+                        // Plain not-installed package → the calm
+                        // package_not_installed skip below.
+                    }
+                    PristineFetch::Unverifiable(detail) => {
                         record_warning(
                             env,
                             purl,
@@ -634,7 +803,7 @@ pub(crate) async fn vendor_records(
                         );
                         // Falls through to package_not_installed below.
                     }
-                    Err(registry_fetch::FetchError::Failed(detail)) => {
+                    PristineFetch::Failed(detail) => {
                         fetch_failed.insert(purl.clone());
                         env.record(
                             PatchEvent::new(PatchAction::Failed, purl.clone())
@@ -803,79 +972,11 @@ pub(crate) async fn vendor_records(
                     for w in &warnings {
                         record_warning(env, candidate, w, common);
                     }
-                    if let Some(mut entry) = entry {
-                        entry.detached = detached;
-                        entry.record = detached.then(|| record.clone());
-                        // A re-vendor run re-derives the entry from current
-                        // disk state, where the takeover already happened —
-                        // preserve the prior flag or the revert-time
-                        // "takeover_not_restored" hint is lost.
-                        let prev = state.entries.get(candidate).cloned();
-                        if let Some(prev) = &prev {
-                            entry.took_over_go_patches =
-                                entry.took_over_go_patches || prev.took_over_go_patches;
-                            // A re-vendor (new patch uuid) rewrites our own
-                            // stale wiring, so the backend records
-                            // `original: None` (it must never record a
-                            // dangling `.socket/vendor/` pointer as the
-                            // pre-vendor fragment). The TRUE pre-vendor
-                            // original lives in the entry being replaced —
-                            // carry it forward by wiring identity, or a
-                            // later `--revert` can only shrug
-                            // (`vendor_lock_entry_drifted`) instead of
-                            // restoring the registry fragment.
-                            for rec in &mut entry.wiring {
-                                if rec.action
-                                    == socket_patch_core::patch::vendor::state::WiringAction::Rewritten
-                                    && rec.original.is_none()
-                                {
-                                    if let Some(prev_rec) = prev.wiring.iter().find(|p| {
-                                        p.file == rec.file
-                                            && p.kind == rec.kind
-                                            && p.key == rec.key
-                                    }) {
-                                        rec.original = prev_rec.original.clone();
-                                    }
-                                }
-                            }
-                        }
-                        let new_uuid = entry.uuid.clone();
-                        state.entries.insert(candidate.clone(), entry);
-                        // Persist per-package so a crash mid-run leaves a
-                        // ledger that matches what's already wired.
-                        if let Err(e) = save_state(&common.cwd, &state).await {
-                            has_errors = true;
-                            env.record(
-                                PatchEvent::new(PatchAction::Failed, candidate.clone())
-                                    .with_error("vendor_state_write_failed", e.to_string()),
-                            );
-                        } else if let Some(prev) = prev.filter(|p| p.uuid != new_uuid) {
-                            // Re-vendor under a newer patch uuid: the old
-                            // uuid's dir is an orphan now — the wiring and
-                            // ledger both point at the new uuid — unless
-                            // another entry still shares it (the same
-                            // `(eco, uuid)` ownership test as `--revert`'s
-                            // orphan sweep). Only the live entry would
-                            // otherwise reclaim it, and that never happens.
-                            let still_referenced = state
-                                .entries
-                                .values()
-                                .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
-                            let stale_rel =
-                                vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
-                            if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
-                                if !common.dry_run {
-                                    let _ = remove_tree(&common.cwd.join(rel)).await;
-                                }
-                                env.record(
-                                    PatchEvent::new(PatchAction::Removed, candidate.clone())
-                                        .with_reason(
-                                            "vendor_stale_artifact_removed",
-                                            "previous patch uuid's vendored artifact removed",
-                                        ),
-                                );
-                            }
-                        }
+                    if let Some(entry) = entry {
+                        has_errors |= persist_vendor_entry(
+                            common, env, &mut state, candidate, entry, detached, record,
+                        )
+                        .await;
                     }
                 }
             }

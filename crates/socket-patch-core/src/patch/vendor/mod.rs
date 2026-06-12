@@ -76,6 +76,7 @@ pub mod yarn_classic_lock;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
 pub use state::{load_state, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
+pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
 
 use std::collections::HashMap;
 use std::path::Path;

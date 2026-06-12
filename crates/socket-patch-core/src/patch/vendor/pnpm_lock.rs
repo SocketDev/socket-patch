@@ -1004,6 +1004,34 @@ fn edit_packages(
     let new_key = ctx.new_key();
     let ours_prefix = format!("{}@file:", ctx.name);
 
+    // Fail closed on a half-drifted lock: when BOTH the registry-keyed
+    // entry and a socket file:-keyed entry for this package exist, a rekey
+    // would splice a DUPLICATE mapping key (pnpm refuses to parse those)
+    // and surgery cannot decide which block carries the truth.
+    {
+        let mut has_registry = false;
+        let mut has_ours = false;
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if block.key == reg_key {
+                has_registry = true;
+            } else if block
+                .key
+                .strip_prefix(&ours_prefix)
+                .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"))
+            {
+                has_ours = true;
+            }
+            j = block.end;
+        }
+        if has_registry && has_ours {
+            return Err(format!(
+                "packages section carries BOTH `{reg_key}` and a `{ours_prefix}…` entry (a \
+                 half-edited lock); run `pnpm install` to re-resolve it, then re-vendor"
+            ));
+        }
+    }
+
     let mut i = start + 1;
     while let Some(block) = next_block(lines, i, end) {
         let is_registry = block.key == reg_key;
@@ -1086,6 +1114,30 @@ fn edit_snapshot_rekey(
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
     let ours_prefix = format!("{}@file:", ctx.name);
+    // Same duplicate-key fail-closed guard as edit_packages.
+    {
+        let mut has_registry = false;
+        let mut has_ours = false;
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if block.key == reg_key {
+                has_registry = true;
+            } else if block
+                .key
+                .strip_prefix(&ours_prefix)
+                .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"))
+            {
+                has_ours = true;
+            }
+            j = block.end;
+        }
+        if has_registry && has_ours {
+            return Err(format!(
+                "snapshots section carries BOTH `{reg_key}` and a `{ours_prefix}…` entry (a \
+                 half-edited lock); run `pnpm install` to re-resolve it, then re-vendor"
+            ));
+        }
+    }
     let mut i = start + 1;
     while let Some(block) = next_block(lines, i, end) {
         let is_registry = block.key == reg_key;
@@ -2611,6 +2663,38 @@ snapshots:
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    /// A half-edited lock carrying BOTH the registry-keyed packages entry
+    /// AND a socket file:-keyed one: a rekey would splice a DUPLICATE
+    /// mapping key (pnpm refuses to parse those) — fail closed, nothing
+    /// written.
+    #[tokio::test]
+    async fn half_drifted_duplicate_keys_fail_closed() {
+        let dup_lock = P1_BEFORE_LOCK.replace(
+            "  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}\n    deprecated: use String.prototype.padStart()",
+            &format!(
+                "  left-pad@1.3.0:\n    resolution: {{integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}}\n    deprecated: use String.prototype.padStart()\n\n  left-pad@file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:\n    resolution: {{integrity: sha512-stale==, tarball: file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz}}\n    version: 1.3.0"
+            ),
+        );
+        assert_ne!(dup_lock, P1_BEFORE_LOCK, "fixture edit must apply");
+        let fx = fixture_with(P1_BEFORE_PKG, &dup_lock).await;
+        let lock_before = fx.read(PNPM_LOCK).await;
+        let pkg_before = fx.read(PACKAGE_JSON).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "half-drifted lock must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("half-edited lock")),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_before, "pkg untouched");
     }
 
     #[tokio::test]

@@ -164,6 +164,101 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     Ok(out)
 }
 
+/// Hard cap on whole-artifact bytes hashed by the health check — committed
+/// artifacts are small (a package tarball/wheel); a tampered multi-GiB file
+/// must not stall `repair`.
+const MAX_HEALTH_HASH_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Classified health of one ledger entry's committed artifact, for
+/// `repair`-style callers that need a DECISION (rebuild or not), not just a
+/// routing tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactHealth {
+    /// Exists and every record file hashes to its afterHash (and, for
+    /// file-shaped artifacts, the whole file matches the ledger sha256).
+    Healthy,
+    /// Nothing at the artifact path: rebuildable.
+    Missing,
+    /// Present but failing verification: rebuildable. `reason` is the
+    /// stable routing tag (`vendor_hash_mismatch`, `file_not_found`,
+    /// `vendor_artifact_unreadable`, `vendor_sha256_mismatch`).
+    Corrupt { reason: String },
+    /// The ledger/artifact uuid doesn't match the record: a re-vendor is
+    /// pending — not repair's job.
+    StaleUuid,
+    /// The entry can't be judged (poisoned path, empty record): fail
+    /// closed, never rebuild from it.
+    Unverifiable { reason: String },
+}
+
+/// Health-check one vendored artifact against its patch record: the
+/// per-file afterHash verification of [`verify_vendored_patch_record`]
+/// plus, for file-shaped artifacts (`.tgz`/`.tar.gz`/`.whl`) with a
+/// recorded ledger sha256, a whole-file hash cross-check — the rewired
+/// lockfile integrity references those exact bytes, so silent drift breaks
+/// the package manager even when the patched members still verify.
+pub async fn check_vendored_artifact(
+    project_root: &Path,
+    entry: &VendorEntry,
+    record: &PatchRecord,
+) -> ArtifactHealth {
+    match verify_vendored_patch_record(project_root, entry, record).await {
+        Err(tag) => match tag.as_str() {
+            "vendor_artifact_missing" => ArtifactHealth::Missing,
+            "vendor_uuid_mismatch" => ArtifactHealth::StaleUuid,
+            "vendor_hash_mismatch" | "file_not_found" | "vendor_artifact_unreadable" => {
+                ArtifactHealth::Corrupt { reason: tag }
+            }
+            _ => ArtifactHealth::Unverifiable { reason: tag },
+        },
+        Ok(()) => {
+            let norm = entry.artifact.path.replace('\\', "/");
+            let file_shaped =
+                norm.ends_with(".tgz") || norm.ends_with(".tar.gz") || norm.ends_with(".whl");
+            if !file_shaped || entry.artifact.sha256.is_empty() {
+                return ArtifactHealth::Healthy;
+            }
+            // The path already passed checked_artifact_path inside the
+            // verification above.
+            match file_sha256_hex(&project_root.join(&norm)).await {
+                Some(hex) if hex.eq_ignore_ascii_case(&entry.artifact.sha256) => {
+                    ArtifactHealth::Healthy
+                }
+                Some(_) => ArtifactHealth::Corrupt {
+                    reason: "vendor_sha256_mismatch".to_string(),
+                },
+                None => ArtifactHealth::Corrupt {
+                    reason: "vendor_artifact_unreadable".to_string(),
+                },
+            }
+        }
+    }
+}
+
+/// Plain sha256 hex of a regular file, size-capped; `None` on any read
+/// failure or cap breach. Public for repair's ledger re-synthesis (the
+/// rebuilt artifact's recorded sha).
+pub async fn file_sha256_hex(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if !meta.is_file() || meta.len() > MAX_HEALTH_HASH_BYTES {
+        return None;
+    }
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
 fn verify_member_map(
     members: &HashMap<String, Vec<u8>>,
     record: &PatchRecord,
@@ -419,6 +514,91 @@ mod tests {
                 .await
                 .unwrap_err(),
             "vendor_artifact_missing"
+        );
+    }
+
+    /// Full classification matrix for the repair-facing health check.
+    #[tokio::test]
+    async fn artifact_health_classification_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/x-1.0.0.tgz");
+        let rec = record(UUID, "package/index.js");
+
+        // Missing.
+        let ent = entry("npm", UUID, &rel);
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Missing
+        );
+
+        // Healthy (no ledger sha recorded → member verification only).
+        tokio::fs::create_dir_all(root.join(format!(".socket/vendor/npm/{UUID}")))
+            .await
+            .unwrap();
+        write_tgz(&root.join(&rel), "package/index.js", PATCHED);
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        // Healthy with a MATCHING ledger sha256.
+        let tgz_bytes = tokio::fs::read(root.join(&rel)).await.unwrap();
+        let mut ent_sha = entry("npm", UUID, &rel);
+        ent_sha.artifact.sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&tgz_bytes))
+        };
+        assert_eq!(
+            check_vendored_artifact(root, &ent_sha, &rec).await,
+            ArtifactHealth::Healthy
+        );
+
+        // Whole-file drift the member check can't see: members verify, but
+        // the bytes differ from what the lockfile integrity references
+        // (re-compressed archive → different sha).
+        ent_sha.artifact.sha256 = "0".repeat(64);
+        assert_eq!(
+            check_vendored_artifact(root, &ent_sha, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_sha256_mismatch".to_string()
+            }
+        );
+
+        // Member tamper.
+        write_tgz(&root.join(&rel), "package/index.js", b"tampered");
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_hash_mismatch".to_string()
+            }
+        );
+
+        // Unreadable.
+        tokio::fs::write(root.join(&rel), b"\x1f\x8b00garbage")
+            .await
+            .unwrap();
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_artifact_unreadable".to_string()
+            }
+        );
+
+        // Stale uuid → not repair's job.
+        let rec_new = record("11111111-2222-4333-8444-555555555555", "package/index.js");
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec_new).await,
+            ArtifactHealth::StaleUuid
+        );
+
+        // Poisoned path → fail closed.
+        let ent_bad = entry("npm", UUID, "../../outside.tgz");
+        assert_eq!(
+            check_vendored_artifact(root, &ent_bad, &rec).await,
+            ArtifactHealth::Unverifiable {
+                reason: "vendor_path_unsafe".to_string()
+            }
         );
     }
 }

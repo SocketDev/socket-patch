@@ -346,6 +346,25 @@ fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInf
     }
 }
 
+/// `(purl, manifest record)` from a fetched patch view — the both-hashes
+/// file rule shared with the download flows (new files with no beforeHash
+/// are not part of the record).
+pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
+    let mut files = HashMap::new();
+    for (file_path, file_info) in &patch.files {
+        if let (Some(before), Some(after)) = (&file_info.before_hash, &file_info.after_hash) {
+            files.insert(
+                file_path.clone(),
+                PatchFileInfo {
+                    before_hash: before.clone(),
+                    after_hash: after.clone(),
+                },
+            );
+        }
+    }
+    (patch.purl.clone(), build_patch_record(patch, files))
+}
+
 #[derive(Args)]
 pub struct GetArgs {
     /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name).

@@ -983,6 +983,430 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
     Some(dedup_prefer_integrity(out))
 }
 
+// ──────────────── registry-fragment recovery from the ledger ────────────────
+
+/// Recover the PRE-VENDOR registry resolution of a vendored package from its
+/// ledger entry's wiring `original` fragments (and `entry.lock` for cargo),
+/// as a fetchable [`LockfileEntry`].
+///
+/// This is the rebuild path for artifacts that are referenced by the rewired
+/// lockfile but missing on disk: the live lockfile no longer carries the
+/// registry resolution (it points at `.socket/vendor/...`), but `--revert`'s
+/// restore data does. golang is deliberately absent — go.sum is never
+/// rewired, so the standard [`inventory_project`]/[`lookup`] path covers it.
+///
+/// SECURITY: state.json is committed and tamper-able. Recovered URLs go
+/// through the same http(s)-only gate as inventoried ones, recovered hashes
+/// are shape-validated here and verified against the fetched bytes
+/// fail-closed by the fetch layer — a poisoned fragment can at worst make
+/// the fetch fail, never land unverified content.
+pub async fn recover_lock_entry(
+    project_root: &Path,
+    entry: &super::state::VendorEntry,
+) -> Result<LockfileEntry, String> {
+    let (name, version) = parse_base_purl_coords(&entry.base_purl)
+        .ok_or_else(|| format!("unparseable base purl `{}`", entry.base_purl))?;
+
+    match entry.ecosystem.as_str() {
+        "npm" => recover_npm_fragment(entry, &name, &version),
+        "cargo" => {
+            let checksum = entry
+                .lock
+                .as_ref()
+                .and_then(|l| l.checksum.clone())
+                .filter(|c| is_hex_of_len(c, 64))
+                .ok_or_else(|| {
+                    "the ledger records no pre-vendor Cargo.lock checksum".to_string()
+                })?;
+            Ok(LockfileEntry {
+                ecosystem: "cargo",
+                purl: format!("pkg:cargo/{name}@{version}"),
+                name,
+                version,
+                resolved: None,
+                integrity: LockIntegrity::Sha256Hex(checksum.to_ascii_lowercase()),
+            })
+        }
+        "composer" => {
+            let original = wiring_original(entry, &["composer_lock_package"])
+                .ok_or_else(|| "no pre-vendor composer.lock fragment recorded".to_string())?;
+            let dist = original
+                .get("dist")
+                .ok_or_else(|| "the pre-vendor composer.lock fragment has no dist".to_string())?;
+            let url = dist
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .and_then(http_url)
+                .ok_or_else(|| "the pre-vendor dist has no http(s) url".to_string())?;
+            let shasum = dist
+                .get("shasum")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| is_hex_of_len(s, 40))
+                .ok_or_else(|| {
+                    "the pre-vendor dist records no shasum; refusing an unverifiable fetch"
+                        .to_string()
+                })?;
+            Ok(LockfileEntry {
+                ecosystem: "composer",
+                purl: format!("pkg:composer/{name}@{version}"),
+                name,
+                version,
+                resolved: Some(url),
+                integrity: LockIntegrity::Sha1Hex(shasum.to_ascii_lowercase()),
+            })
+        }
+        "gem" => {
+            let line = wiring_original(entry, &["gemfile_lock_checksum"])
+                .and_then(|v| v.as_str().map(str::to_string))
+                .ok_or_else(|| "no pre-vendor Gemfile.lock checksum recorded".to_string())?;
+            let sha = line
+                .split("sha256=")
+                .nth(1)
+                .map(|rest| {
+                    rest.trim_end_matches(',')
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect::<String>()
+                })
+                .filter(|s| is_hex_of_len(s, 64))
+                .ok_or_else(|| {
+                    "the pre-vendor checksum line has no sha256; refusing an unverifiable fetch"
+                        .to_string()
+                })?;
+            let base = gem_remote_base(project_root)
+                .await
+                .unwrap_or_else(|| "https://rubygems.org".to_string());
+            Ok(LockfileEntry {
+                ecosystem: "gem",
+                purl: format!("pkg:gem/{name}@{version}"),
+                resolved: http_url(&format!(
+                    "{}/downloads/{name}-{version}.gem",
+                    base.trim_end_matches('/')
+                )),
+                name,
+                version,
+                integrity: LockIntegrity::Sha256Hex(sha.to_ascii_lowercase()),
+            })
+        }
+        "pypi" => {
+            if entry.artifact.platform_locked == Some(true) {
+                return Err(
+                    "the vendored wheel is platform-locked (compiled); it cannot be rebuilt                      from the registry"
+                        .to_string(),
+                );
+            }
+            let unit = wiring_original(entry, &["uv_lock_package"])
+                .and_then(|v| v.as_str().map(str::to_string))
+                .ok_or_else(|| "no pre-vendor uv.lock fragment recorded".to_string())?;
+            let (url, sha) = pure_wheel_from_uv_unit(&unit).ok_or_else(|| {
+                "the pre-vendor uv.lock fragment lists no verifiable pure wheel".to_string()
+            })?;
+            Ok(LockfileEntry {
+                ecosystem: "pypi",
+                purl: format!("pkg:pypi/{name}@{version}"),
+                name,
+                version,
+                resolved: Some(url),
+                integrity: LockIntegrity::Sha256Hex(sha),
+            })
+        }
+        other => Err(format!(
+            "no ledger-based registry recovery for ecosystem `{other}`"
+        )),
+    }
+}
+
+/// The integrity the REWIRED npm-family lockfile records for a vendored
+/// artifact at `artifact_rel` (forward-slashed, no `./` prefix). This is
+/// the integrity of OUR deterministically packed tarball — the trust
+/// anchor for repair's no-ledger reconstruction: a rebuilt tarball that
+/// matches it is exactly what the package manager would have installed.
+///
+/// package-lock/shrinkwrap are parsed as JSON; the text formats (pnpm,
+/// yarn classic/berry, bun) are scanned with a bounded forward window from
+/// each reference line.
+pub async fn wired_vendor_integrity(
+    project_root: &Path,
+    artifact_rel: &str,
+) -> Option<LockIntegrity> {
+    let rel = artifact_rel.trim_start_matches("./");
+
+    // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
+    for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
+        let Ok(bytes) = tokio::fs::read(project_root.join(lock)).await else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if let Some(pkgs) = v.get("packages").and_then(serde_json::Value::as_object) {
+            for entry in pkgs.values() {
+                let resolved = entry.get("resolved").and_then(serde_json::Value::as_str);
+                if resolved.is_some_and(|r| r.trim_start_matches("file:") == rel) {
+                    if let Some(sri) = entry
+                        .get("integrity")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| looks_like_sri(s))
+                    {
+                        return Some(LockIntegrity::Sri(sri.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Text locks: any line referencing the artifact path, integrity within
+    // a short forward window (the same block).
+    for lock in ["pnpm-lock.yaml", "yarn.lock", "bun.lock"] {
+        let Ok(text) = tokio::fs::read_to_string(project_root.join(lock)).await else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(rel) {
+                continue;
+            }
+            for probe in lines.iter().take((i + 6).min(lines.len())).skip(i) {
+                // pnpm `resolution: {integrity: …}` / classic `integrity …`
+                // / bun tuple `"sha512-…"`.
+                if let Some(v) = inline_yaml_field(probe, "integrity:") {
+                    if looks_like_sri(&v) {
+                        return Some(LockIntegrity::Sri(v));
+                    }
+                }
+                if let Some(rest) = probe.trim().strip_prefix("integrity ") {
+                    let v = rest.trim().trim_matches('"');
+                    if looks_like_sri(v) {
+                        return Some(LockIntegrity::Sri(v.to_string()));
+                    }
+                }
+                if let Some(sri) = probe.split('"').rev().find(|tok| looks_like_sri(tok)) {
+                    return Some(LockIntegrity::Sri(sri.to_string()));
+                }
+                // yarn berry: `checksum: 10c0/…`.
+                if let Some(v) = inline_yaml_field(probe, "checksum:") {
+                    if v.split_once('/')
+                        .is_some_and(|(k, b)| !k.is_empty() && !b.is_empty())
+                    {
+                        return Some(LockIntegrity::BerryChecksum(v));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `pkg:<eco>/<name>@<version>` → (name, version). The name may itself
+/// contain `/` (npm scopes, go modules); the version is after the LAST `@`.
+fn parse_base_purl_coords(base_purl: &str) -> Option<(String, String)> {
+    let rest = base_purl.strip_prefix("pkg:")?;
+    let (_, name_ver) = rest.split_once('/')?;
+    let (name, version) = name_ver.rsplit_once('@')?;
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
+/// First wiring record of one of `kinds` carrying an `original` payload.
+fn wiring_original<'a>(
+    entry: &'a super::state::VendorEntry,
+    kinds: &[&str],
+) -> Option<&'a serde_json::Value> {
+    entry
+        .wiring
+        .iter()
+        .find(|r| kinds.contains(&r.kind.as_str()) && r.original.is_some())
+        .and_then(|r| r.original.as_ref())
+}
+
+fn is_hex_of_len(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Per-flavor npm recovery: the wiring kinds disambiguate the lock flavor,
+/// each fragment yields (resolved?, integrity).
+fn recover_npm_fragment(
+    entry: &super::state::VendorEntry,
+    name: &str,
+    version: &str,
+) -> Result<LockfileEntry, String> {
+    let mk = |resolved: Option<String>, integrity: LockIntegrity| LockfileEntry {
+        ecosystem: "npm",
+        purl: format!("pkg:npm/{name}@{version}"),
+        name: name.to_string(),
+        version: version.to_string(),
+        resolved,
+        integrity,
+    };
+
+    // package-lock / shrinkwrap: the original is the full lock entry object.
+    if let Some(obj) = wiring_original(entry, &["npm_lock_entry", "npm_lock_legacy_entry"]) {
+        let resolved = obj
+            .get("resolved")
+            .and_then(serde_json::Value::as_str)
+            .and_then(http_url);
+        if let Some(sri) = obj
+            .get("integrity")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| looks_like_sri(s))
+        {
+            return Ok(mk(resolved, LockIntegrity::Sri(sri.to_string())));
+        }
+    }
+    // pnpm: the original is the packages block's lines; pull
+    // `resolution: {integrity: …, tarball: …}`.
+    if let Some(lines) = wiring_original(entry, &["pnpm_lock_package"]).and_then(lines_of) {
+        let mut sri = None;
+        let mut tarball = None;
+        for line in &lines {
+            if let Some(v) = inline_yaml_field(line, "integrity:") {
+                sri = sri.or(Some(v));
+            }
+            if let Some(v) = inline_yaml_field(line, "tarball:") {
+                tarball = tarball.or(http_url(&v));
+            }
+        }
+        if let Some(sri) = sri.filter(|s| looks_like_sri(s)) {
+            return Ok(mk(tarball, LockIntegrity::Sri(sri)));
+        }
+    }
+    // yarn classic: block lines carry `integrity <sri>` (preferred) and/or
+    // `resolved "<url>#<sha1>"`.
+    if let Some(lines) = wiring_original(entry, &["yarn_lock_block"]).and_then(lines_of) {
+        let mut url = None;
+        let mut sha1 = None;
+        let mut sri = None;
+        for line in &lines {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("integrity ") {
+                let v = rest.trim().trim_matches('"');
+                if looks_like_sri(v) {
+                    sri = Some(v.to_string());
+                }
+            }
+            if let Some(rest) = t.strip_prefix("resolved ") {
+                let v = rest.trim().trim_matches('"');
+                let (u, frag) = v.split_once('#').unwrap_or((v, ""));
+                url = http_url(u);
+                if is_hex_of_len(frag, 40) {
+                    sha1 = Some(frag.to_ascii_lowercase());
+                }
+            }
+        }
+        if let Some(sri) = sri {
+            return Ok(mk(url, LockIntegrity::Sri(sri)));
+        }
+        if let Some(sha1) = sha1 {
+            return Ok(mk(url, LockIntegrity::Sha1Hex(sha1)));
+        }
+    }
+    // yarn berry: block lines carry `checksum: <cacheKey>/<b64>`.
+    if let Some(lines) = wiring_original(entry, &["yarn_berry_lock_entry"]).and_then(lines_of) {
+        for line in &lines {
+            if let Some(v) = inline_yaml_field(line, "checksum:") {
+                if v.split_once('/')
+                    .is_some_and(|(k, b)| !k.is_empty() && !b.is_empty())
+                {
+                    return Ok(mk(None, LockIntegrity::BerryChecksum(v)));
+                }
+            }
+        }
+    }
+    // bun: the original is the raw tuple line; the integrity is its last
+    // quoted SRI string.
+    if let Some(line) =
+        wiring_original(entry, &["bun_lock_package"]).and_then(|v| v.as_str().map(str::to_string))
+    {
+        if let Some(sri) = line
+            .split('"')
+            .rev()
+            .find(|tok| looks_like_sri(tok))
+            .map(str::to_string)
+        {
+            return Ok(mk(None, LockIntegrity::Sri(sri)));
+        }
+    }
+    Err("no pre-vendor npm registry fragment with a verifiable integrity recorded".to_string())
+}
+
+fn looks_like_sri(s: &str) -> bool {
+    ["sha512-", "sha384-", "sha256-", "sha1-"]
+        .iter()
+        .any(|p| s.starts_with(p) && s.len() > p.len())
+}
+
+/// A wiring `original` recorded as an array of text lines.
+fn lines_of(v: &serde_json::Value) -> Option<Vec<String>> {
+    v.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|l| l.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// `… field: value` (optionally inside an inline `{…}` map) → value, with
+/// trailing `,`/`}` and quotes stripped.
+fn inline_yaml_field(line: &str, field: &str) -> Option<String> {
+    let idx = line.find(field)?;
+    let rest = &line[idx + field.len()..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    let v = rest[..end].trim().trim_matches(['\'', '"']).to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The `GEM remote:` base of the (unrewired) Gemfile.lock.
+async fn gem_remote_base(project_root: &Path) -> Option<String> {
+    let text = tokio::fs::read_to_string(project_root.join("Gemfile.lock"))
+        .await
+        .ok()?;
+    let mut in_gem = false;
+    for line in text.lines() {
+        if line.trim_end() == "GEM" {
+            in_gem = true;
+            continue;
+        }
+        if in_gem {
+            if let Some(rest) = line.trim().strip_prefix("remote:") {
+                return http_url(rest.trim());
+            }
+            if !line.starts_with(' ') && !line.trim().is_empty() {
+                in_gem = false;
+            }
+        }
+    }
+    None
+}
+
+/// First `{ url = "…", hash = "sha256:…" }` wheel in a uv.lock `[[package]]`
+/// unit whose filename is a PURE wheel (`-none-any.whl`).
+fn pure_wheel_from_uv_unit(unit: &str) -> Option<(String, String)> {
+    let mut search = unit;
+    while let Some(uidx) = search.find("url = \"") {
+        let after = &search[uidx + 7..];
+        let uend = after.find('"')?;
+        let url = &after[..uend];
+        let rest = &after[uend..];
+        let advance = uidx + 7 + uend;
+        if url.ends_with("-none-any.whl") {
+            if let Some(hidx) = rest.find("hash = \"sha256:") {
+                let hafter = &rest[hidx + 15..];
+                let hend = hafter.find('"')?;
+                let sha = &hafter[..hend];
+                if is_hex_of_len(sha, 64) {
+                    if let Some(url) = http_url(url) {
+                        return Some((url, sha.to_ascii_lowercase()));
+                    }
+                }
+            }
+        }
+        search = &search[advance..];
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,5 +2035,274 @@ source = { editable = "." }
         // No lockfile at all.
         let tmp = tempfile::tempdir().unwrap();
         assert!(inventory_npm_lock(tmp.path()).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::super::state::WiringAction;
+    use super::super::state::{CargoLockOriginal, VendorArtifact, VendorEntry, WiringRecord};
+    use super::*;
+
+    const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn entry(eco: &str, base_purl: &str, wiring: Vec<WiringRecord>) -> VendorEntry {
+        VendorEntry {
+            ecosystem: eco.into(),
+            base_purl: base_purl.into(),
+            uuid: UUID.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/{eco}/{UUID}/x"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+            },
+            wiring,
+            lock: None,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        }
+    }
+
+    fn rec(kind: &str, original: serde_json::Value) -> WiringRecord {
+        WiringRecord {
+            file: "lock".into(),
+            kind: kind.into(),
+            action: WiringAction::Rewritten,
+            key: Some("k".into()),
+            original: Some(original),
+            new: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn npm_lock_entry_fragment_recovers_sri_and_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = entry(
+            "npm",
+            "pkg:npm/@scope/x@1.2.3",
+            vec![rec(
+                "npm_lock_entry",
+                serde_json::json!({
+                    "resolved": "https://registry.npmjs.org/@scope/x/-/x-1.2.3.tgz",
+                    "integrity": "sha512-AAAA",
+                }),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.ecosystem, "npm");
+        assert_eq!(got.name, "@scope/x");
+        assert_eq!(got.version, "1.2.3");
+        assert_eq!(
+            got.resolved.as_deref(),
+            Some("https://registry.npmjs.org/@scope/x/-/x-1.2.3.tgz")
+        );
+        assert_eq!(got.integrity, LockIntegrity::Sri("sha512-AAAA".into()));
+    }
+
+    #[tokio::test]
+    async fn pnpm_package_lines_recover_integrity_and_tarball() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = entry(
+            "npm",
+            "pkg:npm/left-pad@1.3.0",
+            vec![rec(
+                "pnpm_lock_package",
+                serde_json::json!([
+                    "  left-pad@1.3.0:",
+                    "    resolution: {integrity: sha512-BBBB, tarball: https://npm.corp/left-pad-1.3.0.tgz}",
+                ]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sri("sha512-BBBB".into()));
+        assert_eq!(
+            got.resolved.as_deref(),
+            Some("https://npm.corp/left-pad-1.3.0.tgz")
+        );
+    }
+
+    #[tokio::test]
+    async fn yarn_classic_block_prefers_sri_else_sha1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha1 = "a".repeat(40);
+        let with_both = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![rec(
+                "yarn_lock_block",
+                serde_json::json!([
+                    "x@^1.0.0:",
+                    "  version \"1.0.0\"",
+                    format!("  resolved \"https://registry.yarnpkg.com/x/-/x-1.0.0.tgz#{sha1}\""),
+                    "  integrity sha512-CCCC",
+                ]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &with_both).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sri("sha512-CCCC".into()));
+        assert_eq!(
+            got.resolved.as_deref(),
+            Some("https://registry.yarnpkg.com/x/-/x-1.0.0.tgz")
+        );
+
+        let sha1_only = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![rec(
+                "yarn_lock_block",
+                serde_json::json!([format!(
+                    "  resolved \"https://registry.yarnpkg.com/x/-/x-1.0.0.tgz#{sha1}\""
+                )]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &sha1_only).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sha1Hex(sha1));
+    }
+
+    #[tokio::test]
+    async fn berry_checksum_and_bun_tuple_recover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let berry = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![rec(
+                "yarn_berry_lock_entry",
+                serde_json::json!(["x@npm:1.0.0:", "  checksum: 10c0/abcdef"]),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &berry).await.unwrap();
+        assert_eq!(
+            got.integrity,
+            LockIntegrity::BerryChecksum("10c0/abcdef".into())
+        );
+        assert_eq!(got.resolved, None);
+
+        let bun = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![rec(
+                "bun_lock_package",
+                serde_json::json!("    \"x\": [\"x@1.0.0\", \"\", {}, \"sha512-DDDD\"],"),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &bun).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sri("sha512-DDDD".into()));
+    }
+
+    #[tokio::test]
+    async fn cargo_recovers_from_entry_lock_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "b".repeat(64);
+        let mut e = entry("cargo", "pkg:cargo/serde@1.0.0", vec![]);
+        e.lock = Some(CargoLockOriginal {
+            source: "registry+https://github.com/rust-lang/crates.io-index".into(),
+            checksum: Some(sha.clone()),
+        });
+        let got = recover_lock_entry(tmp.path(), &e).await.unwrap();
+        assert_eq!(got.ecosystem, "cargo");
+        assert_eq!(got.integrity, LockIntegrity::Sha256Hex(sha));
+        assert_eq!(got.resolved, None);
+
+        // No checksum recorded → unrecoverable, never an unverified fetch.
+        let mut bare = entry("cargo", "pkg:cargo/serde@1.0.0", vec![]);
+        bare.lock = None;
+        assert!(recover_lock_entry(tmp.path(), &bare).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn composer_gem_uv_fragments_recover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha1 = "c".repeat(40);
+        let composer = entry(
+            "composer",
+            "pkg:composer/monolog/monolog@2.9.1",
+            vec![rec(
+                "composer_lock_package",
+                serde_json::json!({
+                    "name": "monolog/monolog",
+                    "dist": {
+                        "type": "zip",
+                        "url": "https://api.github.com/repos/Seldaek/monolog/zipball/abc",
+                        "shasum": sha1,
+                    },
+                }),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &composer).await.unwrap();
+        assert_eq!(got.name, "monolog/monolog");
+        assert_eq!(got.integrity, LockIntegrity::Sha1Hex(sha1));
+
+        // gem: checksum line + remote read from the unrewired Gemfile.lock.
+        let sha256 = "d".repeat(64);
+        tokio::fs::write(
+            tmp.path().join("Gemfile.lock"),
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n",
+        )
+        .await
+        .unwrap();
+        let gem = entry(
+            "gem",
+            "pkg:gem/rack@3.0.0",
+            vec![rec(
+                "gemfile_lock_checksum",
+                serde_json::json!(format!("  rack (3.0.0) sha256={sha256}")),
+            )],
+        );
+        let got = recover_lock_entry(tmp.path(), &gem).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sha256Hex(sha256.clone()));
+        assert_eq!(
+            got.resolved.as_deref(),
+            Some("https://rubygems.org/downloads/rack-3.0.0.gem")
+        );
+
+        // uv: the original [[package]] unit lists wheels; only the PURE one
+        // is recoverable.
+        let wheel_sha = "e".repeat(64);
+        let unit = format!(
+            "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nwheels = [\n    {{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-cp39-cp39-linux_x86_64.whl\", hash = \"sha256:{}\" }},\n    {{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:{wheel_sha}\" }},\n]\n",
+            "f".repeat(64)
+        );
+        let uv = entry(
+            "pypi",
+            "pkg:pypi/six@1.16.0",
+            vec![rec("uv_lock_package", serde_json::json!(unit))],
+        );
+        let got = recover_lock_entry(tmp.path(), &uv).await.unwrap();
+        assert_eq!(got.integrity, LockIntegrity::Sha256Hex(wheel_sha));
+        assert!(got.resolved.unwrap().ends_with("py2.py3-none-any.whl"));
+
+        // platform-locked wheels are explicitly unrepairable from the registry.
+        let mut locked = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);
+        locked.artifact.platform_locked = Some(true);
+        assert!(recover_lock_entry(tmp.path(), &locked).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_fragments_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No wiring at all.
+        let bare = entry("npm", "pkg:npm/x@1.0.0", vec![]);
+        assert!(recover_lock_entry(tmp.path(), &bare).await.is_err());
+        // golang routes through go.sum, never the ledger.
+        let go = entry("golang", "pkg:golang/golang.org/x/text@v0.14.0", vec![]);
+        assert!(recover_lock_entry(tmp.path(), &go).await.is_err());
+        // Poisoned integrity shapes are rejected.
+        let bad = entry(
+            "npm",
+            "pkg:npm/x@1.0.0",
+            vec![rec(
+                "npm_lock_entry",
+                serde_json::json!({"resolved": "https://x/", "integrity": "lol"}),
+            )],
+        );
+        assert!(recover_lock_entry(tmp.path(), &bad).await.is_err());
     }
 }
