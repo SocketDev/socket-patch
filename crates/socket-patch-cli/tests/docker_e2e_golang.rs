@@ -209,8 +209,16 @@ grep -qE '^[[:space:]]*"failed": 0,[[:space:]]*$' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -qE '^[[:space:]]*"skipped": 0,[[:space:]]*$' /tmp/apply.out || {{
-  echo "FAIL: apply JSON reported a non-zero skipped count" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -qE '^[[:space:]]*"skipped": 1,[[:space:]]*$' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}
