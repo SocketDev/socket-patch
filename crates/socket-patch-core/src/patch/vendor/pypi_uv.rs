@@ -259,10 +259,20 @@ pub fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
 /// Split out of [`load_uv_project`] because they need the target name; the
 /// orchestrator runs them pre-flight so a refusal happens before the wheel
 /// artifact is built.
+/// Pre-flight wiring state for one package (mirrors `PdmTarget`).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum UvTarget {
+    Fresh,
+    /// `[tool.uv.sources]` already routes the package through THIS patch
+    /// uuid's vendored wheel — the in-sync hot path.
+    InSync,
+}
+
 pub(super) fn check_target_guards(
     p: &UvProject,
     canon_name: &str,
-) -> Result<(), (&'static str, String)> {
+    record_uuid: &str,
+) -> Result<UvTarget, (&'static str, String)> {
     // The same name at multiple versions/sources (platform forks) means one
     // surgical [[package]] rewrite would mispin the other forks — refuse.
     let units = p
@@ -309,6 +319,13 @@ pub(super) fn check_target_guards(
                 .and_then(|t| t.get("path"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            // Ours at the SAME patch generation: in sync — the sources and
+            // override entries are our own first-run edits, expected here.
+            if super::path::parse_vendor_path(path)
+                .is_some_and(|parts| parts.eco == "pypi" && parts.uuid == record_uuid)
+            {
+                return Ok(UvTarget::InSync);
+            }
             let detail = if path.contains(".socket/vendor/pypi/") {
                 format!(
                     "[tool.uv.sources] already routes {key} to a socket-patch vendored wheel; \
@@ -345,7 +362,7 @@ pub(super) fn check_target_guards(
             }
         }
     }
-    Ok(())
+    Ok(UvTarget::Fresh)
 }
 
 /// Wire the pair for the vendored wheel. Writes `pyproject.toml` FIRST, then
@@ -362,8 +379,9 @@ pub async fn wire_uv(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
     class: UvDepClass,
+    record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta), (&'static str, String)> {
-    check_target_guards(p, canon_name)?;
+    check_target_guards(p, canon_name, record_uuid)?;
     let mut wiring: Vec<WiringRecord> = Vec::new();
 
     // ── pyproject.toml (computed in memory; committed before the lock) ────
@@ -1296,6 +1314,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();
@@ -1343,6 +1362,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Transitive,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();
@@ -1442,6 +1462,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap_err();
@@ -1459,6 +1480,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Transitive,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap_err();
@@ -1480,13 +1502,15 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("user-authored"), "{}", err.1);
 
-        // an existing SOCKET source refuses too, pointing at --revert
+        // an existing SOCKET source from a STALE patch generation refuses,
+        // pointing at --revert; the SAME generation is the in-sync hot path.
         let tmp = write_pair(
             &format!("{DIRECT_REGISTRY_PYPROJECT}\n[tool.uv.sources]\nsix = {{ path = \"{REL_WHEEL}\" }}\n"),
             DIRECT_REGISTRY_LOCK,
@@ -1502,11 +1526,17 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "11111111-2222-4333-8444-555555555555",
         )
         .await
         .unwrap_err();
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
+        assert_eq!(
+            check_target_guards(&p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
+            Ok(UvTarget::InSync),
+            "the same patch generation is in sync, not a refusal"
+        );
 
         // a user override for the package
         let tmp = write_pair(
@@ -1524,6 +1554,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Transitive,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap_err();
@@ -1567,6 +1598,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap_err();
@@ -1593,6 +1625,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();
@@ -1622,6 +1655,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Transitive,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();
@@ -1654,6 +1688,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();
@@ -1682,6 +1717,7 @@ wheels = [
             WHEEL_NAME,
             WHEEL_SHA,
             UvDepClass::Direct,
+            "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f",
         )
         .await
         .unwrap();

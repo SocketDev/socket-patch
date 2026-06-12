@@ -184,6 +184,7 @@ async fn fetch_missing_sources_package_mode_with_no_packages_path() {
         blobs_path: &blobs,
         packages_path: None,
         diffs_path: None,
+        mem_blobs: None,
     };
     // Non-empty manifest: there IS work to do. So `total == 0` below can
     // only mean the None-packages_path branch short-circuited — not that
@@ -226,6 +227,7 @@ async fn fetch_missing_sources_diff_mode_with_no_diffs_path() {
         blobs_path: &blobs,
         packages_path: None,
         diffs_path: None,
+        mem_blobs: None,
     };
     let manifest = manifest_with_after_hashes(&[&"a".repeat(64)]);
     let client = dummy_client();
@@ -632,6 +634,7 @@ async fn fetch_missing_sources_diff_downloads_and_writes_archive() {
         blobs_path: &blobs,
         packages_path: None,
         diffs_path: Some(&diffs),
+        mem_blobs: None,
     };
     let manifest = manifest_with_uuids(&[uuid]);
     let client = proxy_client(&server.uri());
@@ -688,6 +691,7 @@ async fn fetch_missing_sources_package_downloads_via_package_endpoint() {
         blobs_path: &blobs,
         packages_path: Some(&packages),
         diffs_path: None,
+        mem_blobs: None,
     };
     let manifest = manifest_with_uuids(&[uuid]);
     let client = proxy_client(&server.uri());
@@ -723,6 +727,7 @@ async fn fetch_missing_sources_diff_404_is_failure_with_kind_message() {
         blobs_path: &blobs,
         packages_path: None,
         diffs_path: Some(&diffs),
+        mem_blobs: None,
     };
     let manifest = manifest_with_uuids(&[uuid]);
     let client = proxy_client(&server.uri());
@@ -765,6 +770,7 @@ async fn fetch_missing_sources_diff_invokes_progress_callback() {
         blobs_path: &blobs,
         packages_path: None,
         diffs_path: Some(&diffs),
+        mem_blobs: None,
     };
     let manifest = manifest_with_uuids(&[uuid]);
     let client = proxy_client(&server.uri());

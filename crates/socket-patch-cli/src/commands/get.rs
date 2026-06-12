@@ -13,7 +13,7 @@ use socket_patch_core::manifest::schema::{
 };
 use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::utils::fuzzy_match::fuzzy_match_packages;
-use socket_patch_core::utils::purl::{is_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use std::collections::HashMap;
 use std::fmt;
@@ -346,6 +346,25 @@ fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInf
     }
 }
 
+/// `(purl, manifest record)` from a fetched patch view — the both-hashes
+/// file rule shared with the download flows (new files with no beforeHash
+/// are not part of the record).
+pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
+    let mut files = HashMap::new();
+    for (file_path, file_info) in &patch.files {
+        if let (Some(before), Some(after)) = (&file_info.before_hash, &file_info.after_hash) {
+            files.insert(
+                file_path.clone(),
+                PatchFileInfo {
+                    before_hash: before.clone(),
+                    after_hash: after.clone(),
+                },
+            );
+        }
+    }
+    (patch.purl.clone(), build_patch_record(patch, files))
+}
+
 #[derive(Args)]
 pub struct GetArgs {
     /// Patch identifier (UUID, CVE ID, GHSA ID, PURL, or package name).
@@ -580,6 +599,14 @@ pub struct DownloadParams {
     /// `true` (`--all-releases`), every variant is downloaded. No effect
     /// on ecosystems without per-release artifact_id variants.
     pub all_releases: bool,
+    /// `--strict` forwarded to the nested apply (a beforeHash mismatch
+    /// fails instead of warn-and-overwrite).
+    pub strict: bool,
+    /// Persist downloaded blob content into `.socket/blobs` (the apply
+    /// flows need it for later hook/rollback runs). Vendor flows pass
+    /// `false`: their patch content is staged in memory and the committed
+    /// artifact is the patch — nothing should land in `.socket/blobs`.
+    pub persist_blobs: bool,
 }
 
 /// Narrow a selection of patches down to the release variant(s) present
@@ -765,14 +792,16 @@ pub(crate) async fn download_patch_records(
 
     let socket_dir = params.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
-    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        let err = format!("Failed to create blobs directory: {}", e);
-        report_error(params.json, &err);
-        return (
-            1,
-            serde_json::json!({"status": "error", "error": err}),
-            HashMap::new(),
-        );
+    if params.persist_blobs {
+        if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+            let err = format!("Failed to create blobs directory: {}", e);
+            report_error(params.json, &err);
+            return (
+                1,
+                serde_json::json!({"status": "error", "error": err}),
+                HashMap::new(),
+            );
+        }
     }
 
     let mut narrow_warnings: Vec<String> = Vec::new();
@@ -851,9 +880,13 @@ pub(crate) async fn download_patch_records(
                     }
                 }
                 let quiet = params.json || params.silent;
-                if write_all_patch_blobs(&blobs_dir, &patch, quiet)
-                    .await
-                    .is_err()
+                // Vendor flows keep blob content in memory (the vendor
+                // step re-fetches what it needs); persisting blobs here
+                // would litter .socket/blobs for no consumer.
+                if params.persist_blobs
+                    && write_all_patch_blobs(&blobs_dir, &patch, quiet)
+                        .await
+                        .is_err()
                 {
                     failed += 1;
                     patch_records_json.push(serde_json::json!({
@@ -977,10 +1010,12 @@ pub async fn download_and_apply_patches(
         report_error(params.json, &err);
         return (1, serde_json::json!({"status": "error", "error": err}));
     }
-    if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-        let err = format!("Failed to create blobs directory: {}", e);
-        report_error(params.json, &err);
-        return (1, serde_json::json!({"status": "error", "error": err}));
+    if params.persist_blobs {
+        if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
+            let err = format!("Failed to create blobs directory: {}", e);
+            report_error(params.json, &err);
+            return (1, serde_json::json!({"status": "error", "error": err}));
+        }
     }
 
     let mut manifest = match read_manifest(&manifest_path).await {
@@ -1030,7 +1065,10 @@ pub async fn download_and_apply_patches(
                 let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
                 if let PatchAction::Skipped = action {
                     if !params.json && !params.silent {
-                        eprintln!("  [skip] {} (already in manifest)", patch.purl);
+                        eprintln!(
+                            "  [skip] {} (already in manifest)",
+                            normalize_purl(&patch.purl)
+                        );
                     }
                     downloaded_patches.push(serde_json::json!({
                         "purl": patch.purl,
@@ -1060,9 +1098,13 @@ pub async fn download_and_apply_patches(
                 }
 
                 let quiet = params.json || params.silent;
-                if write_all_patch_blobs(&blobs_dir, &patch, quiet)
-                    .await
-                    .is_err()
+                // Vendor flows keep blob content in memory (the vendor
+                // step re-fetches what it needs); persisting blobs here
+                // would litter .socket/blobs for no consumer.
+                if params.persist_blobs
+                    && write_all_patch_blobs(&blobs_dir, &patch, quiet)
+                        .await
+                        .is_err()
                 {
                     patches_failed += 1;
                     downloaded_patches.push(serde_json::json!({
@@ -1193,6 +1235,7 @@ pub async fn download_and_apply_patches(
                 global_prefix: params.global_prefix.clone(),
                 silent: params.json || params.silent,
                 download_mode: params.download_mode.clone(),
+                strict: params.strict,
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
@@ -1621,6 +1664,8 @@ pub async fn run(args: GetArgs) -> i32 {
         download_mode: args.common.download_mode.clone(),
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
+        strict: args.common.strict,
+        persist_blobs: true,
     };
 
     let (code, result_json) = download_and_apply_patches(&selected, &params).await;
@@ -1810,6 +1855,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
                 global_prefix: args.common.global_prefix.clone(),
                 silent: quiet,
                 download_mode: args.common.download_mode.clone(),
+                strict: args.common.strict,
                 ..crate::args::GlobalArgs::default()
             },
             force: false,
@@ -1863,7 +1909,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     exit_code
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [255u8; 256];
     for (i, &c) in chars.iter().enumerate() {

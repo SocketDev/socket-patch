@@ -144,6 +144,19 @@ pub struct GlobalArgs {
     )]
     pub offline: bool,
 
+    /// Treat a beforeHash mismatch as a hard error. By DEFAULT a file whose
+    /// on-disk content matches neither the patch's beforeHash nor its
+    /// afterHash is overwritten with the full verified patched content and
+    /// surfaced as a stderr warning (`content_mismatch_overwritten`); this
+    /// flag restores the fail-closed behavior. `--force` overrides it.
+    #[arg(
+        long,
+        env = "SOCKET_STRICT",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub strict: bool,
+
     /// Operate on globally-installed packages.
     #[arg(
         long = "global",
@@ -378,6 +391,7 @@ impl Default for GlobalArgs {
             ecosystems: None,
             download_mode: "diff".to_string(),
             offline: false,
+            strict: false,
             global: false,
             global_prefix: None,
             json: false,

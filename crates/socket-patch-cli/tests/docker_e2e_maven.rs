@@ -190,7 +190,7 @@ chmod u+w "$POM_FILE" || true
 # gated (scan's own apply pass matches 0 files because the all-zeros
 # beforeHash doesn't match the real .pom bytes); the gate is the exact
 # content-hash check at the end.
-socket-patch scan --json --sync --yes --global \
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems maven > /tmp/sync.out 2>/tmp/sync.err
 SCAN_RC=$?
@@ -235,8 +235,16 @@ grep -q '"failed": 0,' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -q '"skipped": 0,' /tmp/apply.out || {{
-  echo "FAIL: apply JSON did not report skipped:0" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -q '"skipped": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}

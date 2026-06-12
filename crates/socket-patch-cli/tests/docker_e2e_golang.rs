@@ -166,7 +166,7 @@ chmod u+w "$GIN_GO" || true
 # exits non-zero (partial_failure) BY DESIGN — the dedicated `apply
 # --force` step below does the real patching. Exit code is logged for
 # diagnostics, not gated; the gate is the exact content-hash check below.
-socket-patch scan --json --sync --yes --global \
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems golang > /tmp/sync.out 2>/tmp/sync.err
 SCAN_RC=$?
@@ -209,8 +209,16 @@ grep -qE '^[[:space:]]*"failed": 0,[[:space:]]*$' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -qE '^[[:space:]]*"skipped": 0,[[:space:]]*$' /tmp/apply.out || {{
-  echo "FAIL: apply JSON reported a non-zero skipped count" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -qE '^[[:space:]]*"skipped": 1,[[:space:]]*$' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}

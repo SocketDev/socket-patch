@@ -293,12 +293,14 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
 }
 
 /// Safety gate: when the patch's advertised `beforeHash` does NOT match the
-/// on-disk file, apply must REFUSE to write (it cannot trust that the blob is
-/// a valid successor of whatever is actually on disk). The positive test
-/// above only ever feeds a correct `beforeHash`, so a regression that made
-/// apply blindly clobber the file regardless of its current content would
-/// sail through it. This test pins the refusal: the file must be left
-/// byte-for-byte untouched and the run must NOT report success.
+/// on-disk file, `--strict` apply must REFUSE to write (the v3.4 DEFAULT
+/// instead overwrites with the verified afterHash content and warns — see
+/// `apply_hash_mismatch_default_warns_and_applies_strict_fails`). The
+/// positive test above only ever feeds a correct `beforeHash`, so a
+/// regression that made strict mode clobber the file regardless of its
+/// current content would sail through it. This test pins the strict
+/// refusal: the file must be left byte-for-byte untouched and the run must
+/// NOT report success.
 #[tokio::test]
 #[serial]
 async fn cargo_apply_refuses_on_before_hash_mismatch() {
@@ -344,9 +346,10 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
             ecosystems: Some(vec!["cargo".to_string()]),
             download_mode: "diff".to_string(),
             dry_run: false,
-            // force MUST stay false: with --force, a hash mismatch is
-            // deliberately downgraded to "ready" and the file WOULD be
-            // overwritten. We are asserting the safe default refuses.
+            // strict pins the fail-closed contract: the v3.4 default (and
+            // --force) deliberately downgrade a hash mismatch to "ready"
+            // and the file WOULD be overwritten with verified content.
+            strict: true,
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         batch_size: 100,

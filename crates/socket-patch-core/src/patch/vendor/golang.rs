@@ -33,6 +33,24 @@ use super::state::{
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
+/// The committed copy exists and every patched file matches its afterHash.
+async fn copy_hashes_ok(
+    copy_dir: &Path,
+    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
+) -> bool {
+    if tokio::fs::metadata(copy_dir).await.is_err() {
+        return false;
+    }
+    for (file_name, info) in files {
+        let path = copy_dir.join(crate::patch::apply::normalize_file_path(file_name));
+        match crate::patch::file_hash::compute_file_git_sha256(&path).await {
+            Ok(h) if h == info.after_hash => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
 /// `replace` directive + marker, returning the ledger entry to persist.
 ///
@@ -101,6 +119,41 @@ pub async fn vendor_go_module(
         .is_some_and(|e| e.owner == Some(ReplaceOwner::GoPatches));
     let prior_path = prior.as_ref().and_then(|e| e.path.clone());
 
+    // Re-run shape detection: the replace already points at THIS uuid's copy.
+    // The engine rebuilds a missing/stale copy and its replace upsert is a
+    // byte-stable no-op, so a wired re-run must return `entry: None` — the
+    // first run's ledger entry holds the only pre-vendor original, and the
+    // `prior_path` recorded here would be our own vendored pointer.
+    let wired =
+        prior_path.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
+    let copy_dir = project_root
+        .join(&base_rel)
+        .join(format!("{module}@{version}"));
+    let copy_was_ok = wired && copy_hashes_ok(&copy_dir, &record.files).await;
+
+    // Vendor auto-force policy (the engine's copy is staged from the
+    // pristine source, never the user's tree — see `force_apply_staged`):
+    // missing patch targets still fail closed unless the caller's own
+    // `--force` asked for the skip tolerance, then the engine apply runs
+    // forced so a beforeHash mismatch (already-applied module, or a patch
+    // built against different bytes) overwrites with the verified patched
+    // content. The engine is shared with the in-place `apply` redirect
+    // path, whose strict semantics stay unchanged.
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    if !force {
+        let missing = super::missing_existing_patch_files(pristine_src, &record.files).await;
+        if let Some(first) = missing.first() {
+            return VendorOutcome::Done {
+                result: super::failed_apply_result(
+                    purl,
+                    format!("Cannot apply patch: {first} - File not found"),
+                ),
+                entry: None,
+                warnings,
+            };
+        }
+    }
+
     // The engine does the heavy lifting: fresh copy → hardened apply pipeline
     // → `replace` upsert (which refuses a user-authored same-version pin).
     let result = apply_go_redirect(
@@ -114,15 +167,18 @@ pub async fn vendor_go_module(
         sources,
         Some(&record.uuid),
         dry_run,
-        force,
+        crate::patch::apply::MismatchPolicy::Force,
     )
     .await;
+    if result.success {
+        warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
+    }
 
     if dry_run {
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
     if !result.success {
@@ -134,7 +190,7 @@ pub async fn vendor_go_module(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
     // A patch with no files is a no-op success: the engine wrote no copy and
@@ -143,11 +199,48 @@ pub async fn vendor_go_module(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
 
-    let mut warnings = Vec::new();
+    if wired {
+        // Already wired to this uuid: either the engine's in-sync hot path
+        // (copy intact) or an artifact-only rebuild (copy was missing/stale).
+        // Never re-record the ledger entry.
+        if !copy_was_ok {
+            // A wholesale-deleted uuid dir lost the informational marker;
+            // restore it alongside the rebuilt copy (never a trust input —
+            // a failed write only warns).
+            let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
+            vulnerabilities.sort();
+            let marker = VendorMarker {
+                schema_version: 1,
+                purl: strip_purl_qualifiers(purl).to_string(),
+                patch_uuid: record.uuid.clone(),
+                ecosystem: "golang".to_string(),
+                vulnerabilities,
+                vendored_at: vendored_at.to_string(),
+            };
+            if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
+                warnings.push(VendorWarning::new(
+                    "marker_write_failed",
+                    format!("could not write the vendor marker: {e}"),
+                ));
+            }
+            warnings.push(VendorWarning::new(
+                "vendor_artifact_rebuilt",
+                format!(
+                    "the committed vendored copy for {module}@{version} was missing or \
+                     stale; rebuilt under {base_rel} (go.mod untouched)"
+                ),
+            ));
+        }
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
+    }
 
     if takeover {
         // The `replace` line was already atomically repointed by the upsert;
@@ -314,6 +407,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
+    use crate::patch::apply::MismatchPolicy;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -532,7 +626,7 @@ mod tests {
             &sources,
             Some(UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
@@ -571,6 +665,47 @@ mod tests {
         );
     }
 
+    /// Wired go.mod with a deleted committed copy: the module copy is
+    /// rebuilt, go.mod stays byte-identical, no fresh ledger entry.
+    #[tokio::test]
+    async fn test_wired_missing_copy_rebuilds_artifact_only() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        let copy = root.join(copy_rel()).join("bar.go");
+        let gomod = root.join("go.mod");
+        let copy1 = tokio::fs::read(&copy).await.unwrap();
+        let mod1 = tokio::fs::read(&gomod).await.unwrap();
+
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            entry.is_none(),
+            "artifact-only rebuild must not re-record (prior_path is our own \
+             vendored pointer here, not a pre-vendor original)"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "rebuilt copy carries the patched bytes"
+        );
+        assert_eq!(
+            tokio::fs::read(&gomod).await.unwrap(),
+            mod1,
+            "go.mod byte-stable across the rebuild"
+        );
+    }
+
     #[tokio::test]
     async fn test_idempotent_rerun_is_byte_stable() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -589,8 +724,11 @@ mod tests {
             result.files_patched.is_empty(),
             "in-sync re-run patches nothing"
         );
-        assert!(entry.is_some(), "re-run still reports the ledger entry");
-        assert!(!entry.unwrap().took_over_go_patches);
+        assert!(
+            entry.is_none(),
+            "an in-sync re-run records no entry — the first run's ledger \
+             entry holds the only pre-vendor original"
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             tokio::fs::read(&copy).await.unwrap(),
@@ -696,7 +834,7 @@ mod tests {
             &sources,
             Some(UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         let (_result, entry, _warnings) =

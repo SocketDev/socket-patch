@@ -225,7 +225,7 @@ fi
 PRE_SHA=$(sha256sum "$PHP_FILE" | cut -d' ' -f1)
 
 # scan exit code is intentionally not gated (see verify_snippet); capture JSON.
-socket-patch scan --json --sync --yes \
+socket-patch scan --json --sync --strict --yes \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems composer > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2
@@ -264,7 +264,7 @@ PRE_SHA=$(sha256sum "$PHP_FILE" | cut -d' ' -f1)
 mkdir -p /workspace/proj && cd /workspace/proj
 
 # scan exit code is intentionally not gated (see verify_snippet); capture JSON.
-socket-patch scan --json --sync --yes --global \
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems composer > /tmp/scan.json 2>/tmp/sync.err
 cat /tmp/sync.err >&2

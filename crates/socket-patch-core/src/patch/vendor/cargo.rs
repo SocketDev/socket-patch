@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
+    normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
 };
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::file_hash::compute_file_git_sha256;
@@ -77,14 +77,8 @@ async fn lock_entry_detached(project_root: &Path, name: &str, version: &str) -> 
 /// `afterHash`, the config entry points at this copy, and the lock entry is
 /// already detached — i.e. a re-run has nothing to do. Touch nothing then, so
 /// cargo's source fingerprint and the committed bytes stay stable.
-async fn vendor_in_sync(
-    copy_dir: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-    project_root: &Path,
-    name: &str,
-    version: &str,
-    copy_rel: &str,
-) -> bool {
+/// The committed copy exists and every patched file matches its afterHash.
+async fn copy_hashes_ok(copy_dir: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
     if tokio::fs::metadata(copy_dir).await.is_err() {
         return false;
     }
@@ -95,6 +89,12 @@ async fn vendor_in_sync(
             _ => return false,
         }
     }
+    true
+}
+
+/// The config `[patch]` entry points at THIS copy and the lock entry is
+/// already detached — the wiring half of the in-sync test.
+async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel: &str) -> bool {
     let entries = cargo_config::read_patch_entries(project_root).await;
     if entries.get(name).and_then(|i| i.path.as_deref()) != Some(copy_rel) {
         return false;
@@ -269,46 +269,91 @@ pub async fn vendor_cargo_crate(
     }
 
     if dry_run {
-        // Verify (read-only) against the pristine source — apply_package_patch
-        // never writes when dry_run — for an accurate "would patch" report,
-        // without creating the copy or editing config/lock.
-        let mut result = apply_package_patch(
+        // Verify (read-only) against the pristine source — the apply
+        // pipeline never writes when dry_run — for an accurate "would
+        // patch" report (including the auto-force overwrite warnings the
+        // real run would emit), without creating the copy or editing
+        // config/lock.
+        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        let mut result = super::force_apply_staged(
             purl,
             pristine_src,
-            &record.files,
+            record,
             sources,
-            Some(&record.uuid),
             true,
             force,
+            name,
+            version,
+            &mut dry_warnings,
         )
         .await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None;
-        return done(result, None, Vec::new());
+        return done(result, None, dry_warnings);
     }
 
     // Hot path: already in sync → touch nothing (entry stays with the caller's
     // existing ledger record, which holds the unrecoverable lock originals).
-    if vendor_in_sync(
-        &copy_dir,
-        &record.files,
-        project_root,
-        name,
-        version,
-        &copy_rel,
-    )
-    .await
-    {
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
-        return done(
-            synthesized_result(purl, &copy_dir, verified, true, None),
-            None,
-            Vec::new(),
-        );
+    if wiring_in_sync(project_root, name, version, &copy_rel).await {
+        if copy_hashes_ok(&copy_dir, &record.files).await {
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
+            return done(
+                synthesized_result(purl, &copy_dir, verified, true, None),
+                None,
+                Vec::new(),
+            );
+        }
+        // Wired but the committed copy is missing/stale: rebuild the
+        // ARTIFACT only — config + lock are already correct, and the full
+        // path's surgery would re-record live vendored state over the
+        // first run's unrecoverable lock originals.
+        if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
+            let _ = remove_tree(&uuid_dir).await;
+            return done(
+                synthesized_result(
+                    purl,
+                    &copy_dir,
+                    Vec::new(),
+                    false,
+                    Some(format!("failed to copy pristine source: {e}")),
+                ),
+                None,
+                Vec::new(),
+            );
+        }
+        let mut warnings: Vec<VendorWarning> = Vec::new();
+        let mut result = super::force_apply_staged(
+            purl,
+            &copy_dir,
+            record,
+            sources,
+            false,
+            force,
+            name,
+            version,
+            &mut warnings,
+        )
+        .await;
+        result.package_path = copy_dir.display().to_string();
+        if !result.success {
+            let _ = remove_tree(&uuid_dir).await;
+            return done(result, None, warnings);
+        }
+        // Same path-dep invariant as the full path: no checksum sidecar.
+        let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+        result.sidecar = None;
+        warnings.push(VendorWarning::new(
+            "vendor_artifact_rebuilt",
+            format!(
+                "the committed vendored copy for {name}@{version} was missing or stale; \
+                 rebuilt at {copy_rel} (config and lock untouched)"
+            ),
+        ));
+        return done(result, None, warnings);
     }
 
     // ── materialise the patched copy ──────────────────────────────────────
@@ -333,15 +378,19 @@ pub async fn vendor_cargo_crate(
         );
     }
 
-    // Delegate to the hardened pipeline, pointed at the copy.
-    let mut result = apply_package_patch(
+    // Delegate to the hardened pipeline (vendor auto-force policy — see
+    // `force_apply_staged`), pointed at the copy.
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut result = super::force_apply_staged(
         purl,
         &copy_dir,
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         false,
         force,
+        name,
+        version,
+        &mut warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
@@ -350,7 +399,7 @@ pub async fn vendor_cargo_crate(
         // Don't leave a half-built copy (or an empty uuid husk) that
         // verify/sweep would misjudge.
         let _ = remove_tree(&uuid_dir).await;
-        return done(result, None, Vec::new());
+        return done(result, None, warnings);
     }
 
     // A path-dep copy must never carry a checksum sidecar. The fresh copy
@@ -370,10 +419,9 @@ pub async fn vendor_cargo_crate(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to update .cargo/config.toml: {e}"));
-        return done(result, None, Vec::new());
+        return done(result, None, warnings);
     }
 
-    let mut warnings = Vec::new();
     let prior_path = prior_entry.as_ref().and_then(|i| i.path.clone());
     if prior_path.as_deref().is_some_and(is_legacy_redirect_path) {
         warnings.push(VendorWarning::new(
@@ -1031,6 +1079,57 @@ mod tests {
             tokio::fs::read(&lock).await.unwrap(),
             lock1,
             "lock unchanged"
+        );
+    }
+
+    /// Wired config+lock with a deleted committed copy: the artifact is
+    /// rebuilt in place, config and lock stay byte-identical, no fresh entry.
+    #[tokio::test]
+    async fn test_wired_missing_copy_rebuilds_artifact_only() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+
+        let copy = root.join(copy_rel()).join("src/lib.rs");
+        let cfg = root.join(".cargo/config.toml");
+        let lock = root.join("Cargo.lock");
+        let copy1 = tokio::fs::read(&copy).await.unwrap();
+        let cfg1 = tokio::fs::read(&cfg).await.unwrap();
+        let lock1 = tokio::fs::read(&lock).await.unwrap();
+
+        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            entry.is_none(),
+            "artifact-only rebuild must not emit a fresh entry"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&copy).await.unwrap(),
+            copy1,
+            "rebuilt copy carries the patched bytes"
+        );
+        assert!(
+            !root.join(copy_rel()).join(".cargo-checksum.json").exists(),
+            "no checksum sidecar in the rebuilt path-dep copy"
+        );
+        assert_eq!(
+            tokio::fs::read(&cfg).await.unwrap(),
+            cfg1,
+            "config untouched"
+        );
+        assert_eq!(
+            tokio::fs::read(&lock).await.unwrap(),
+            lock1,
+            "lock untouched"
         );
     }
 

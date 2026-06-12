@@ -328,6 +328,10 @@ pub enum PatchAction {
     /// `apply --dry-run` / `scan --dry-run`: patch *would* apply
     /// cleanly. `files` lists what would change.
     Verified,
+    /// `repair`: a missing/corrupt vendored artifact was rebuilt in place
+    /// from verified sources (lockfiles and the vendor ledger untouched
+    /// unless drift was healed).
+    Rebuilt,
 }
 
 /// Patch-source strategy used to apply a file. Mirrors the existing
@@ -402,6 +406,14 @@ pub struct Summary {
     pub failed: u32,
     pub removed: u32,
     pub verified: u32,
+    /// `repair`-only (vendored artifact rebuilds); omitted while zero so
+    /// every other command's summary shape is unchanged.
+    #[serde(skip_serializing_if = "u32_is_zero")]
+    pub rebuilt: u32,
+}
+
+fn u32_is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Summary {
@@ -415,6 +427,7 @@ impl Summary {
             PatchAction::Failed => self.failed += 1,
             PatchAction::Removed => self.removed += 1,
             PatchAction::Verified => self.verified += 1,
+            PatchAction::Rebuilt => self.rebuilt += 1,
         }
     }
 }

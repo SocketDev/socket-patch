@@ -53,8 +53,8 @@ use serde_json::Value;
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
-    VerifyResult, VerifyStatus,
+    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
+    VerifyStatus,
 };
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::file_hash::compute_file_git_sha256;
@@ -244,59 +244,137 @@ pub async fn vendor_gem(
     // the first run's ledger entry holds the only copy of the pre-vendor
     // originals.
     let remote_line = format!("  remote: {copy_rel}");
-    let wired = copy_matches_after_hashes(&copy_dir, &record.files).await
+    let lock_wired =
+        lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
+    let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await
         && tokio::fs::metadata(copy_dir.join(format!("{name}.gemspec")))
             .await
-            .is_ok()
-        && lock_text.split('\n').any(|l| l == remote_line)
-        && gemfile_text.contains(&copy_rel);
-    if wired {
+            .is_ok();
+    if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            return VendorOutcome::Done {
-                result: synthesized_result(purl, &copy_dir, verified, true, None),
-                entry: None,
-                warnings: Vec::new(),
-            };
+            if copy_ok {
+                let verified = record
+                    .files
+                    .keys()
+                    .map(|f| already_patched_verify(f))
+                    .collect();
+                return VendorOutcome::Done {
+                    result: synthesized_result(purl, &copy_dir, verified, true, None),
+                    entry: None,
+                    warnings: Vec::new(),
+                };
+            }
+            // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
+            // missing/stale: rebuild the ARTIFACT only — the pair edit is
+            // already correct and the full path would re-record the live
+            // vendored fragments as `original`, breaking a later --revert.
+            if !dry_run {
+                if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
+                    return VendorOutcome::Done {
+                        result: synthesized_result(
+                            purl,
+                            &copy_dir,
+                            Vec::new(),
+                            false,
+                            Some(format!("failed to copy installed gem: {e}")),
+                        ),
+                        entry: None,
+                        warnings: Vec::new(),
+                    };
+                }
+                if let Err(e) =
+                    tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), &spec_text).await
+                {
+                    let _ = remove_tree(&uuid_dir).await;
+                    return VendorOutcome::Done {
+                        result: synthesized_result(
+                            purl,
+                            &copy_dir,
+                            Vec::new(),
+                            false,
+                            Some(format!(
+                                "failed to copy the stub gemspec into the vendored dir: {e}"
+                            )),
+                        ),
+                        entry: None,
+                        warnings: Vec::new(),
+                    };
+                }
+                let mut warnings: Vec<VendorWarning> = Vec::new();
+                let mut result = super::force_apply_staged(
+                    purl,
+                    &copy_dir,
+                    record,
+                    sources,
+                    false,
+                    force,
+                    name,
+                    version,
+                    &mut warnings,
+                )
+                .await;
+                result.package_path = copy_dir.display().to_string();
+                if !result.success {
+                    let _ = remove_tree(&uuid_dir).await;
+                    return VendorOutcome::Done {
+                        result,
+                        entry: None,
+                        warnings,
+                    };
+                }
+                warnings.push(VendorWarning::new(
+                    "vendor_artifact_rebuilt",
+                    format!(
+                        "the committed vendored copy for {name}@{version} was missing or \
+                         stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                    ),
+                ));
+                return VendorOutcome::Done {
+                    result,
+                    entry: None,
+                    warnings,
+                };
+            }
+            // Dry runs fall through to the verify-only preview below.
+        } else {
+            // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
+            // carries the registry form — a lock wired by a pre-CHECKSUMS-aware
+            // socket-patch. Bundler never repairs this itself (spike G4: install,
+            // frozen install and `bundle lock` all silently preserve a stale
+            // token), and we cannot strip it here: this run records no ledger
+            // entry, so a revert would put back everything EXCEPT the token —
+            // leaving a bare CHECKSUMS entry on a registry-sourced gem, which
+            // hard-fails frozen installs (exit 16). Refuse with the repair path
+            // instead of the generic "already carries `path:`" Gemfile refusal.
+            return refused(
+                "vendor_stale_lock_checksum",
+                format!(
+                    "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
+                ),
+            );
         }
-        // Wired everywhere EXCEPT the lock's CHECKSUMS entry, which still
-        // carries the registry form — a lock wired by a pre-CHECKSUMS-aware
-        // socket-patch. Bundler never repairs this itself (spike G4: install,
-        // frozen install and `bundle lock` all silently preserve a stale
-        // token), and we cannot strip it here: this run records no ledger
-        // entry, so a revert would put back everything EXCEPT the token —
-        // leaving a bare CHECKSUMS entry on a registry-sourced gem, which
-        // hard-fails frozen installs (exit 16). Refuse with the repair path
-        // instead of the generic "already carries `path:`" Gemfile refusal.
-        return refused(
-            "vendor_stale_lock_checksum",
-            format!(
-                "Gemfile.lock already wires `{name}` to {copy_rel} but its CHECKSUMS entry is not bundler's bare path-gem form (an earlier socket-patch left the registry line in place); run `vendor --revert` for {purl} and re-vendor to repair it"
-            ),
-        );
     }
 
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
-        let mut result = apply_package_patch(
+        let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        let mut result = super::force_apply_staged(
             purl,
             installed_dir,
-            &record.files,
+            record,
             sources,
-            Some(&record.uuid),
             true,
             force,
+            name,
+            version,
+            &mut dry_warnings,
         )
         .await;
         result.package_path = copy_dir.display().to_string();
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings: dry_warnings,
         };
     }
 
@@ -338,14 +416,17 @@ pub async fn vendor_gem(
             warnings: Vec::new(),
         };
     }
-    let mut result = apply_package_patch(
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    let mut result = super::force_apply_staged(
         purl,
         &copy_dir,
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         false,
         force,
+        name,
+        version,
+        &mut warnings,
     )
     .await;
     result.package_path = copy_dir.display().to_string();
@@ -355,7 +436,7 @@ pub async fn vendor_gem(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
 
@@ -368,7 +449,7 @@ pub async fn vendor_gem(
         return VendorOutcome::Done {
             result,
             entry: None,
-            warnings: Vec::new(),
+            warnings,
         };
     }
 
@@ -395,13 +476,12 @@ pub async fn vendor_gem(
             return VendorOutcome::Done {
                 result,
                 entry: None,
-                warnings: Vec::new(),
+                warnings,
             };
         }
     };
 
     // ── marker + ledger entry ────────────────────────────────────────────
-    let mut warnings = Vec::new();
     let base_purl = build_gem_purl(name, version);
     let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
     vulnerabilities.sort();
@@ -1780,6 +1860,45 @@ mod tests {
         assert!(
             e2.is_none(),
             "hot path must not re-record (would clobber the originals in the ledger)"
+        );
+        assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
+        assert_eq!(
+            tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap(),
+            lock1
+        );
+    }
+
+    /// Wired Gemfile+lock with a deleted committed copy: the artifact (and
+    /// its stub gemspec) is rebuilt, the pair stays byte-identical, no entry.
+    #[tokio::test]
+    async fn test_wired_missing_copy_rebuilds_artifact_only() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+
+        let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r1.success);
+        assert!(e1.is_some());
+        let gemfile1 = tokio::fs::read(root.join(GEMFILE)).await.unwrap();
+        let lock1 = tokio::fs::read(root.join(GEMFILE_LOCK)).await.unwrap();
+        let copy_root = root.join(format!(".socket/vendor/gem/{UUID}/rack-3.2.6"));
+        assert!(copy_root.exists());
+
+        crate::patch::copy_tree::remove_tree(&copy_root)
+            .await
+            .unwrap();
+
+        let (r2, e2, w2) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_none(),
+            "artifact-only rebuild must not re-record the ledger entry"
+        );
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {w2:?}"
+        );
+        assert!(
+            copy_root.join("rack.gemspec").exists(),
+            "stub gemspec regenerated with the rebuilt copy"
         );
         assert_eq!(tokio::fs::read(root.join(GEMFILE)).await.unwrap(), gemfile1);
         assert_eq!(

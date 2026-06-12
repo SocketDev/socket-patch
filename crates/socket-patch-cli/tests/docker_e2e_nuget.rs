@@ -198,7 +198,7 @@ echo "===SCAN VERIFIED===" >&2
 #    because the fixture's placeholder beforeHash doesn't match the real
 #    installed bytes. That's expected — the separate forced apply below
 #    is what actually writes the patch, so we only log sync's exit code.
-socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+socket-patch scan --json --sync --strict --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
@@ -240,8 +240,16 @@ grep -q '"failed": 0,' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -q '"skipped": 0,' /tmp/apply.out || {{
-  echo "FAIL: apply JSON did not report skipped:0" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -q '"skipped": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}
@@ -326,7 +334,7 @@ echo "===SCAN VERIFIED===" >&2
 # 2. scan --sync. May exit non-zero (un-forced sync-apply HashMismatch
 #    against the fixture's placeholder beforeHash); the forced apply
 #    below is what writes the patch, so only log sync's exit code.
-socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+socket-patch scan --json --sync --strict --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
 echo "sync exit=$?" >&2
 cat /tmp/sync.out >&2 || true
 cat /tmp/sync.err >&2 || true
@@ -362,8 +370,16 @@ grep -q '"failed": 0,' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -q '"skipped": 0,' /tmp/apply.out || {{
-  echo "FAIL: apply JSON did not report skipped:0" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -q '"skipped": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}

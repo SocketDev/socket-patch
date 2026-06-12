@@ -20,7 +20,7 @@ use super::pypi_poetry::{PoetryProject, PoetryTarget};
 use super::pypi_requirements::{preflight_requirements, revert_requirements, wire_requirements};
 use super::pypi_uv::{
     check_target_guards, classify_dependency, load_uv_project, revert_uv, wire_uv, UvDepClass,
-    UvProject,
+    UvProject, UvTarget,
 };
 use super::pypi_wheel::{build_patched_wheel, locate_installed_dist, wheel_file_name};
 use super::state::{
@@ -221,6 +221,9 @@ enum WiringPlan {
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
     Pipenv(Box<PipenvProject>),
+    /// The lock already routes this package through THIS patch uuid's
+    /// vendored wheel: no wiring — verify (or rebuild) the artifact only.
+    InSync,
 }
 
 /// Which `VendorEntry` meta slot a flavor's wiring produced.
@@ -230,6 +233,20 @@ enum MetaSlot {
     Pdm(PdmMeta),
     Pipenv(PipenvMeta),
     None,
+}
+
+/// The uuid dir holds a wheel artifact — the cheap, flavor-agnostic
+/// presence probe for the in-sync hot path (one uuid owns one wheel).
+async fn uuid_dir_has_wheel(uuid_dir: &Path) -> bool {
+    let Ok(mut rd) = tokio::fs::read_dir(uuid_dir).await else {
+        return false;
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        if e.file_name().to_string_lossy().ends_with(".whl") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the synthesized AlreadyPatched outcome for an in-sync re-run: the
@@ -323,12 +340,15 @@ pub async fn vendor_pypi(
                 Ok(p) => p,
                 Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             };
-            if let Err((code, detail)) = check_target_guards(&project, &canon_name) {
-                return VendorOutcome::Refused { code, detail };
+            match check_target_guards(&project, &canon_name, &record.uuid) {
+                Ok(UvTarget::InSync) => WiringPlan::InSync,
+                Ok(UvTarget::Fresh) => {
+                    warnings.extend(project.warnings.iter().cloned());
+                    let class = classify_dependency(&project, &canon_name);
+                    WiringPlan::Uv(Box::new(project), class)
+                }
+                Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
-            warnings.extend(project.warnings.iter().cloned());
-            let class = classify_dependency(&project, &canon_name);
-            WiringPlan::Uv(Box::new(project), class)
         }
         PypiFlavor::Requirements => {
             if let Err((code, detail)) =
@@ -349,12 +369,13 @@ pub async fn vendor_pypi(
                 version,
                 &record.uuid,
             ) {
-                Ok(PoetryTarget::Fresh) => {}
-                Ok(PoetryTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Ok(PoetryTarget::InSync) => WiringPlan::InSync,
+                Ok(PoetryTarget::Fresh) => {
+                    warnings.extend(project.warnings.iter().cloned());
+                    WiringPlan::Poetry(Box::new(project))
+                }
                 Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
-            warnings.extend(project.warnings.iter().cloned());
-            WiringPlan::Poetry(Box::new(project))
         }
         PypiFlavor::Pdm => {
             let project = match super::pypi_pdm::load_pdm_project(project_root).await {
@@ -363,12 +384,13 @@ pub async fn vendor_pypi(
             };
             match super::pypi_pdm::check_target_guards(&project, &canon_name, version, &record.uuid)
             {
-                Ok(PdmTarget::Fresh) => {}
-                Ok(PdmTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Ok(PdmTarget::InSync) => WiringPlan::InSync,
+                Ok(PdmTarget::Fresh) => {
+                    warnings.extend(project.warnings.iter().cloned());
+                    WiringPlan::Pdm(Box::new(project))
+                }
                 Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
-            warnings.extend(project.warnings.iter().cloned());
-            WiringPlan::Pdm(Box::new(project))
         }
         PypiFlavor::Pipenv => {
             let project = match super::pypi_pipenv::load_pipenv_project(project_root).await {
@@ -376,14 +398,27 @@ pub async fn vendor_pypi(
                 Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             };
             match super::pypi_pipenv::check_target_guards(&project, &canon_name, &record.uuid) {
-                Ok(PipenvTarget::Fresh) => {}
-                Ok(PipenvTarget::InSync) => return in_sync_outcome(base, record, warnings),
+                Ok(PipenvTarget::InSync) => WiringPlan::InSync,
+                Ok(PipenvTarget::Fresh) => {
+                    warnings.extend(project.warnings.iter().cloned());
+                    WiringPlan::Pipenv(Box::new(project))
+                }
                 Err((code, detail)) => return VendorOutcome::Refused { code, detail },
             }
-            warnings.extend(project.warnings.iter().cloned());
-            WiringPlan::Pipenv(Box::new(project))
         }
     };
+
+    let in_sync = matches!(plan, WiringPlan::InSync);
+    if in_sync {
+        // Wired to this uuid already. Intact artifact → the classic in-sync
+        // skip (no dist lookup — a not-installed re-run must stay green).
+        // Missing artifact → rebuild the wheel only; the wiring is correct
+        // and re-running it would re-record live vendored fragments as
+        // pre-vendor originals.
+        if uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await || dry_run {
+            return in_sync_outcome(base, record, warnings);
+        }
+    }
 
     let dist = match locate_installed_dist(site_packages, raw_name, version).await {
         Ok(d) => d,
@@ -405,6 +440,7 @@ pub async fn vendor_pypi(
         &dest,
         dry_run,
         force,
+        &mut warnings,
     )
     .await;
     let (result, artifact) = match built {
@@ -457,6 +493,40 @@ pub async fn vendor_pypi(
         ));
     }
 
+    if in_sync {
+        // Artifact rebuilt; wiring untouched, ledger entry stays with the
+        // first run (the only copy of the pre-vendor originals).
+        warnings.push(VendorWarning::new(
+            "vendor_artifact_rebuilt",
+            format!(
+                "the committed vendored wheel for {canon_name}=={version} was missing; \
+                 rebuilt at {rel_wheel} (lockfile untouched)"
+            ),
+        ));
+        // Restore the informational marker the deleted uuid dir lost.
+        let mut vulns: Vec<String> = record.vulnerabilities.keys().cloned().collect();
+        vulns.sort();
+        let marker = VendorMarker {
+            schema_version: 1,
+            purl: base.to_string(),
+            patch_uuid: record.uuid.clone(),
+            ecosystem: "pypi".to_string(),
+            vulnerabilities: vulns,
+            vendored_at: vendored_at.to_string(),
+        };
+        if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
+            warnings.push(VendorWarning::new(
+                "marker_write_failed",
+                format!("could not write the vendor marker: {e}"),
+            ));
+        }
+        return VendorOutcome::Done {
+            result,
+            entry: None,
+            warnings,
+        };
+    }
+
     // Marker: artifact-side breadcrumb in the uuid dir (informational only —
     // sweep/verify key off state.json + the path uuid). Written before the
     // wiring so lockfile edits stay the last mutation.
@@ -494,6 +564,7 @@ pub async fn vendor_pypi(
             &wheel_name,
             &artifact.sha256_hex,
             class,
+            &record.uuid,
         )
         .await
         .map(|(wiring, meta)| (wiring, MetaSlot::Uv(Some(meta)))),
@@ -540,6 +611,8 @@ pub async fn vendor_pypi(
         )
         .await
         .map(|(wiring, meta)| (wiring, MetaSlot::Pipenv(meta))),
+        // Returned right after the wheel build above.
+        WiringPlan::InSync => unreachable!("in-sync rebuilds never reach wiring"),
     };
     let (wiring, meta) = match wired {
         Ok(pair) => pair,
@@ -951,6 +1024,130 @@ mod tests {
             "six==1.16.0\n"
         );
         assert!(!fx.root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+    }
+
+    /// uv flavor, wired pair with a deleted committed wheel: the wheel is
+    /// rebuilt at the recorded path, pyproject + lock stay byte-identical,
+    /// no fresh ledger entry. An INTACT wheel stays the classic in-sync skip.
+    #[tokio::test]
+    async fn uv_wired_missing_wheel_rebuilds_artifact_only() {
+        let fx = e2e_fixture().await;
+        // Swap the requirements flavor for a uv project.
+        tokio::fs::remove_file(fx.root.join("requirements.txt"))
+            .await
+            .unwrap();
+        touch(
+            &fx.root,
+            "pyproject.toml",
+            r#"[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["six==1.16.0"]
+"#,
+        )
+        .await;
+        touch(
+            &fx.root,
+            "uv.lock",
+            r#"version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "proj"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "six" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "six", specifier = "==1.16.0" }]
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
+]
+"#,
+        )
+        .await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let vendor_one = |dry_run: bool| {
+            vendor_pypi(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                dry_run,
+                false,
+            )
+        };
+
+        let VendorOutcome::Done { result, entry, .. } = vendor_one(false).await else {
+            panic!("first vendor must be Done");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let pyproject1 = tokio::fs::read(fx.root.join("pyproject.toml"))
+            .await
+            .unwrap();
+        let lock1 = tokio::fs::read(fx.root.join("uv.lock")).await.unwrap();
+        let uuid_dir = fx.root.join(format!(".socket/vendor/pypi/{UUID}"));
+        let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+        assert!(wheel.is_file());
+
+        // Intact wheel: in-sync skip (no rebuild, no entry).
+        let VendorOutcome::Done {
+            result: r2,
+            entry: e2,
+            warnings: w2,
+        } = vendor_one(false).await
+        else {
+            panic!("re-run must be Done");
+        };
+        assert!(r2.success);
+        assert!(e2.is_none(), "in-sync re-run records nothing");
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "intact wheel must not claim a rebuild: {w2:?}"
+        );
+
+        // Deleted wheel: artifact-only rebuild.
+        tokio::fs::remove_dir_all(&uuid_dir).await.unwrap();
+        let VendorOutcome::Done {
+            result: r3,
+            entry: e3,
+            warnings: w3,
+        } = vendor_one(false).await
+        else {
+            panic!("rebuild run must be Done");
+        };
+        assert!(r3.success, "{:?}", r3.error);
+        assert!(e3.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            w3.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "rebuild is surfaced: {w3:?}"
+        );
+        assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
+        assert_eq!(
+            tokio::fs::read(fx.root.join("pyproject.toml"))
+                .await
+                .unwrap(),
+            pyproject1,
+            "pyproject untouched by the rebuild"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root.join("uv.lock")).await.unwrap(),
+            lock1,
+            "uv.lock untouched by the rebuild"
+        );
     }
 
     #[tokio::test]

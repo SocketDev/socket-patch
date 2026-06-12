@@ -81,6 +81,10 @@ fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
         .args(args)
         .current_dir(cwd)
         .env("CARGO_HOME", cargo_home)
+        // The assertions read `<fixture>/target/debug/...`; an ambient
+        // CARGO_TARGET_DIR (shared-build-cache setups) would redirect the
+        // child build elsewhere and break them.
+        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("failed to run cargo")
 }

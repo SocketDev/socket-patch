@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 /// Default batch size for crawling.
 #[cfg(test)]
@@ -686,11 +687,7 @@ impl NpmCrawler {
 
     /// Parse a PURL string to extract namespace, name, and version.
     fn parse_purl_components(purl: &str) -> Option<(Option<String>, String, String)> {
-        // Strip qualifiers
-        let base = match purl.find('?') {
-            Some(idx) => &purl[..idx],
-            None => purl,
-        };
+        let base = strip_purl_qualifiers(purl);
 
         let rest = base.strip_prefix("pkg:npm/")?;
         let at_idx = rest.rfind('@')?;
@@ -701,16 +698,33 @@ impl NpmCrawler {
             return None;
         }
 
-        if name_part.starts_with('@') {
-            let slash_idx = name_part.find('/')?;
-            let namespace = name_part[..slash_idx].to_string();
-            let name = name_part[slash_idx + 1..].to_string();
-            if name.is_empty() {
+        // SECURITY: components are percent-decoded AFTER the `/`/`@` splits
+        // above (so an encoded `%2f` cannot create a new path segment here)
+        // and BEFORE the `is_safe_npm_component` guards in `find_by_purls`
+        // (so `%2e%2e` cannot smuggle a traversal past them). The API serves
+        // scoped purls as `pkg:npm/%40scope/name@version`, which must match
+        // the literal `node_modules/@scope/name` install.
+        let version = percent_decode_purl_component(version);
+
+        if let Some(slash_idx) = name_part.find('/') {
+            let namespace = percent_decode_purl_component(&name_part[..slash_idx]);
+            let name = percent_decode_purl_component(&name_part[slash_idx + 1..]);
+            // An npm namespace is always an `@scope` (checked post-decode).
+            if name.is_empty() || !namespace.starts_with('@') {
                 return None;
             }
-            Some((Some(namespace), name, version.to_string()))
+            Some((
+                Some(namespace.into_owned()),
+                name.into_owned(),
+                version.into_owned(),
+            ))
         } else {
-            Some((None, name_part.to_string(), version.to_string()))
+            let name = percent_decode_purl_component(name_part);
+            // A bare `@scope` with no `/name` is not a package name.
+            if name.starts_with('@') {
+                return None;
+            }
+            Some((None, name.into_owned(), version.into_owned()))
         }
     }
 }
@@ -1029,6 +1043,93 @@ mod tests {
         assert!(result.contains_key("pkg:npm/foo@1.0.0"));
         assert!(result.contains_key("pkg:npm/@types/node@20.0.0"));
         assert!(!result.contains_key("pkg:npm/not-installed@0.0.1"));
+    }
+
+    /// Regression: the patches API serves scoped purls percent-encoded
+    /// (`pkg:npm/%40scope/name@version`) and `scan` stores them verbatim as
+    /// manifest keys. `find_by_purls` must decode the components to match
+    /// the literal `node_modules/@scope/name` install — while keeping the
+    /// result keyed by the *verbatim* encoded input (downstream contract).
+    #[test]
+    fn test_parse_purl_components_percent_encoded_scope() {
+        let (ns, name, ver) =
+            NpmCrawler::parse_purl_components("pkg:npm/%40modelcontextprotocol/sdk@1.12.0")
+                .unwrap();
+        assert_eq!(ns.as_deref(), Some("@modelcontextprotocol"));
+        assert_eq!(name, "sdk");
+        assert_eq!(ver, "1.12.0");
+        // An encoded bare scope with no `/name` is still not a package.
+        assert!(NpmCrawler::parse_purl_components("pkg:npm/%40scope@1.0.0").is_none());
+        // A `#subpath` without a qualifier must not bleed into the version.
+        let (_, name, ver) =
+            NpmCrawler::parse_purl_components("pkg:npm/foo@1.0.0#lib/util").unwrap();
+        assert_eq!(name, "foo");
+        assert_eq!(ver, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_find_by_purls_percent_encoded_scope_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+
+        let sdk_dir = nm.join("@modelcontextprotocol").join("sdk");
+        tokio::fs::create_dir_all(&sdk_dir).await.unwrap();
+        tokio::fs::write(
+            sdk_dir.join("package.json"),
+            r#"{"name": "@modelcontextprotocol/sdk", "version": "1.12.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let encoded = "pkg:npm/%40modelcontextprotocol/sdk@1.12.0".to_string();
+        let result = crawler
+            .find_by_purls(&nm, std::slice::from_ref(&encoded))
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1, "encoded scope must resolve: {result:?}");
+        let pkg = result
+            .get(&encoded)
+            .expect("result keyed by the verbatim encoded input purl");
+        assert_eq!(pkg.path, sdk_dir);
+        assert_eq!(pkg.name, "sdk");
+        assert_eq!(pkg.namespace.as_deref(), Some("@modelcontextprotocol"));
+    }
+
+    /// SECURITY regression: percent-encoded traversal sequences must be
+    /// rejected by the post-decode guards — `%2e%2e` decodes to `..` and
+    /// `%2f` to `/`, so guarding the *encoded* form would be a bypass.
+    #[tokio::test]
+    async fn test_find_by_purls_rejects_encoded_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let nm = root.path().join("node_modules");
+        // A real scope dir so a scoped traversal's kernel walk could resolve.
+        tokio::fs::create_dir_all(nm.join("@x")).await.unwrap();
+
+        // A victim package OUTSIDE node_modules, reachable only via `..`.
+        let evil_dir = root.path().join("evil");
+        tokio::fs::create_dir_all(&evil_dir).await.unwrap();
+        tokio::fs::write(
+            evil_dir.join("package.json"),
+            r#"{"name": "evil", "version": "1.0.0"}"#,
+        )
+        .await
+        .unwrap();
+
+        let crawler = NpmCrawler::new();
+        let purls = vec![
+            "pkg:npm/%2e%2e/evil@1.0.0".to_string(),
+            "pkg:npm/@x/%2e%2e@1.0.0".to_string(),
+            "pkg:npm/@x/%2e%2e%2f%2e%2e%2fevil@1.0.0".to_string(),
+            "pkg:npm/..%2fevil@1.0.0".to_string(),
+        ];
+        let result = crawler.find_by_purls(&nm, &purls).await.unwrap();
+
+        assert!(
+            result.is_empty(),
+            "encoded traversal must not escape node_modules; got {result:?}"
+        );
     }
 
     /// Regression: a qualified PURL (carrying `?qualifiers`) must resolve and

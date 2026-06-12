@@ -523,6 +523,7 @@ fn scan_json_empty_cwd_emits_updates_key() {
     let expected = serde_json::json!({
         "status": "success",
         "scannedPackages": 0,
+        "lockfileOnlyPackages": 0,
         "packagesWithPatches": 0,
         "totalPatches": 0,
         "freePatches": 0,

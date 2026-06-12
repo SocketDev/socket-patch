@@ -1228,3 +1228,183 @@ fn json_envelope_shape() {
     assert_eq!(env["status"], "noManifest");
     assert!(events(&env).is_empty());
 }
+
+// ──────────────── vendor auto-force + already-applied lifecycle ────────────────
+
+/// A package already patched IN PLACE by `apply` must vendor cleanly on the
+/// first run — and the envelope must report it as `applied` (this run packed
+/// the artifact and rewired the lock), NOT `skipped/already_vendored`. The
+/// second run is the true in-sync rerun and reports `already_vendored`.
+#[test]
+fn vendor_after_in_place_apply_emits_applied_event() {
+    let fx = npm_fixture();
+    // Simulate a prior in-place `socket-patch apply`.
+    std::fs::write(fx.installed_index(), PATCHED_INDEX).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    assert_eq!(
+        env["summary"]["applied"], 1,
+        "first vendor of an applied package counts as applied: {env:#}"
+    );
+    assert!(fx.tgz_path().exists(), "artifact packed");
+    assert!(fx.state_path().exists(), "ledger entry recorded");
+    // No mismatch warning: afterHash content is AlreadyPatched, not divergent.
+    assert!(
+        !events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_content_mismatch_overwritten"),
+        "{env:#}"
+    );
+
+    // Second run: artifact + wiring already in sync.
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "skipped", Some("already_vendored"));
+    assert_eq!(env["summary"]["applied"], 0);
+}
+
+/// Installed content matching NEITHER hash (a patch built against different
+/// bytes than the installed artifact — the flatted@3.3.1 case) still vendors:
+/// the stage is overwritten with the verified patched content, the run exits
+/// 0 with an `applied` event, and the overwrite surfaces as a
+/// `vendor_content_mismatch_overwritten` warning event.
+#[test]
+fn mismatched_baseline_vendors_with_warning_event() {
+    let fx = npm_fixture();
+    std::fs::write(
+        fx.installed_index(),
+        b"module.exports = () => 'divergent';\n",
+    )
+    .unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], PURL);
+    let warning = find_event(&env, "skipped", Some("vendor_content_mismatch_overwritten"));
+    assert!(
+        warning["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("left-pad@1.3.0"),
+        "warning names the package: {env:#}"
+    );
+    assert!(
+        fx.tgz_path().exists(),
+        "artifact packed despite the mismatch"
+    );
+    // The installed tree keeps its divergent bytes (only the stage changed).
+    assert_eq!(
+        std::fs::read(fx.installed_index()).unwrap(),
+        b"module.exports = () => 'divergent';\n"
+    );
+}
+
+/// A patch-target file MISSING from the installed package still fails closed
+/// (auto-force must not inherit `--force`'s silent NotFound skip — the
+/// tarball would ship without the fix); `--force` keeps that tolerance.
+#[test]
+fn vendor_missing_file_fails_closed_without_force() {
+    let fx = npm_fixture();
+    std::fs::remove_file(fx.installed_index()).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_ne!(code, 0, "missing patch target must fail: {env:#}");
+    let failed = find_event(&env, "failed", None);
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("File not found"),
+        "{env:#}"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock byte-untouched");
+    assert!(!fx.vendor_dir().exists(), "no artifacts on failure");
+
+    // --force: the missing file is tolerated (skipped) and the vendor lands.
+    let fx2 = npm_fixture();
+    std::fs::remove_file(fx2.installed_index()).unwrap();
+    let (code, env) = vendor_cli(fx2.root(), &["--force"]);
+    assert_eq!(code, 0, "{env:#}");
+}
+
+// ──────────────── percent-encoded scoped purls (Fix A integration) ────────────────
+
+/// Build a fixture whose installed package is the SCOPED `@scope/left-pad`
+/// while the manifest keys the patch by the API's percent-encoded purl
+/// (`pkg:npm/%40scope/left-pad@1.3.0`) — exactly what `scan` writes.
+fn npm_scoped_fixture() -> NpmFixture {
+    let fx = npm_fixture_with_purls(&["pkg:npm/%40scope/left-pad@1.3.0"]);
+    let root = fx.root();
+
+    // Re-home the installed package under the scope dir.
+    let scoped = root.join("node_modules/@scope/left-pad");
+    std::fs::create_dir_all(scoped.parent().unwrap()).unwrap();
+    std::fs::rename(root.join("node_modules/left-pad"), &scoped).unwrap();
+    std::fs::write(
+        scoped.join("package.json"),
+        br#"{"name":"@scope/left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+
+    // Re-key the lock entry to the scoped install path.
+    let mut lock: Value = serde_json::from_slice(&fx.original_lock).unwrap();
+    let packages = lock["packages"].as_object_mut().unwrap();
+    let entry = packages.remove("node_modules/left-pad").unwrap();
+    packages.insert("node_modules/@scope/left-pad".to_string(), entry);
+    lock["packages"][""]["dependencies"] = json!({ "@scope/left-pad": "^1.3.0" });
+    let mut lock_bytes = serde_json::to_vec_pretty(&lock).unwrap();
+    lock_bytes.push(b'\n');
+    std::fs::write(root.join("package-lock.json"), &lock_bytes).unwrap();
+
+    fx
+}
+
+/// The API serves scoped purls percent-encoded and `scan` stores them
+/// verbatim as manifest keys; vendor must decode them to find the installed
+/// `node_modules/@scope/...` package and wire the lock — while the ledger
+/// stays keyed by the verbatim encoded purl (manifest parity).
+#[test]
+fn vendor_resolves_percent_encoded_scope_purl() {
+    let fx = npm_scoped_fixture();
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let applied = find_event(&env, "applied", None);
+    assert_eq!(applied["purl"], "pkg:npm/%40scope/left-pad@1.3.0");
+
+    // Artifact lands under the DECODED scope dir.
+    let tgz = fx.root().join(format!(
+        ".socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
+    ));
+    assert!(tgz.exists(), "tarball at the decoded scoped path");
+
+    // Lock rewired to the vendored artifact.
+    let lock = fx.lock_value();
+    assert_eq!(
+        lock["packages"]["node_modules/@scope/left-pad"]["resolved"],
+        json!(format!(
+            "file:.socket/vendor/npm/{UUID}/@scope/left-pad-1.3.0.tgz"
+        ))
+    );
+
+    // Ledger keyed by the VERBATIM encoded purl (manifest key parity).
+    let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert!(
+        state["entries"]["pkg:npm/%40scope/left-pad@1.3.0"].is_object(),
+        "state keyed by the encoded manifest purl: {state:#}"
+    );
+
+    // Round-trip: revert restores the original (scoped) lock bytes.
+    let (code, env) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+    let lock = fx.lock_value();
+    assert_eq!(
+        lock["packages"]["node_modules/@scope/left-pad"]["resolved"],
+        json!(REG_RESOLVED)
+    );
+    assert!(!fx.vendor_dir().join("npm").exists(), "artifacts removed");
+}

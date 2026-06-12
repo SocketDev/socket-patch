@@ -177,12 +177,13 @@ chmod u+w "$LIB_RS" || true
 
 # scan --sync writes manifest + blob; the cargo crawler with --global
 # probes $CARGO_HOME/registry/src/. Note: in this fixture scan's own
-# apply pass matches 0 files (the all-zeros beforeHash doesn't match the
-# real cfg-if bytes), so scan exits non-zero (partial_failure) BY DESIGN
-# — the dedicated `apply --force` step below does the real patching.
-# Exit code is logged for diagnostics, not gated; the gate is the exact
-# content-hash check at the end.
-socket-patch scan --json --sync --yes --global \
+# apply pass meets an all-zeros beforeHash that doesn't match the real
+# cfg-if bytes; `--strict` pins the hard-error behavior (the default
+# would warn and apply the full blob) so scan exits non-zero
+# (partial_failure) BY DESIGN and the dedicated `apply --force` step
+# below stays the verified writer. Exit code is logged for diagnostics,
+# not gated; the gate is the exact content-hash check at the end.
+socket-patch scan --json --sync --strict --yes --global \
   --api-url '{api_url}' --api-token fake --org {ORG} \
   --ecosystems cargo > /tmp/sync.out 2>/tmp/sync.err
 SCAN_RC=$?
@@ -227,8 +228,16 @@ grep -q '"failed": 0,' /tmp/apply.out || {{
   cat /tmp/apply.out >&2
   exit 1
 }}
-grep -q '"skipped": 0,' /tmp/apply.out || {{
-  echo "FAIL: apply JSON did not report skipped:0" >&2
+# The --force overwrite of the mismatched baseline surfaces the
+# content_mismatch_overwritten warning as a Skipped event (the
+# mismatch-warn contract) — exactly that one, nothing else skipped.
+grep -q '"skipped": 1,' /tmp/apply.out || {{
+  echo "FAIL: apply JSON did not report skipped:1 (the mismatch-overwrite warning)" >&2
+  cat /tmp/apply.out >&2
+  exit 1
+}}
+grep -q '"errorCode": "content_mismatch_overwritten"' /tmp/apply.out || {{
+  echo "FAIL: apply JSON missing the content_mismatch_overwritten warning event" >&2
   cat /tmp/apply.out >&2
   exit 1
 }}

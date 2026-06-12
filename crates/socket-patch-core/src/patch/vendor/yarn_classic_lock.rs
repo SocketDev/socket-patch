@@ -68,7 +68,7 @@ pub async fn vendor_yarn_classic(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel;
     let base_purl = coords.base_purl;
 
@@ -135,6 +135,7 @@ pub async fn vendor_yarn_classic(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {
@@ -554,7 +555,7 @@ fn rewrite_classic_block(
 
 /// Does this block's `resolved` already point into `.socket/vendor/npm/`
 /// (ours — current or stale uuid)?
-fn block_points_into_vendor(lines: &[String]) -> bool {
+pub(super) fn block_points_into_vendor(lines: &[String]) -> bool {
     classic_field(lines, "resolved")
         .and_then(parse_vendor_path)
         .is_some_and(|p| p.eco == "npm")

@@ -72,6 +72,8 @@ fn params(root: &Path, server: &MockServer) -> DownloadParams {
             org_slug: Some(ORG.to_string()),
             proxy_url: None,
         },
+        strict: false,
+        persist_blobs: true,
         // Skip release-narrowing; npm has no variants anyway.
         all_releases: true,
     }

@@ -20,7 +20,7 @@ use sha2::Digest as _;
 use crate::crawlers::python_crawler::{canonicalize_pypi_name, read_python_metadata};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{
-    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
+    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
 };
 use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
 
@@ -255,6 +255,7 @@ pub async fn build_patched_wheel(
     dest: &Path,
     dry_run: bool,
     force: bool,
+    warnings: &mut Vec<super::VendorWarning>,
 ) -> Result<(ApplyResult, Option<WheelArtifact>), (&'static str, String)> {
     // Editable installs (`pip install -e` / uv tool dev mode) point
     // site-packages at the user's own working tree: the RECORD describes a
@@ -371,15 +372,18 @@ pub async fn build_patched_wheel(
     }
 
     // Patch the stage through the shared apply pipeline (same verify/source
-    // strategy contract as `apply`). The installed tree is never touched.
-    let mut result = apply_package_patch(
+    // strategy contract as `apply`, with the vendor auto-force policy —
+    // see `force_apply_staged`). The installed tree is never touched.
+    let mut result = super::force_apply_staged(
         purl,
         stage.path(),
-        &record.files,
+        record,
         sources,
-        Some(&record.uuid),
         dry_run,
         force,
+        &dist.dist_name,
+        &dist.version,
+        warnings,
     )
     .await;
     if dry_run || !result.success {
@@ -903,6 +907,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -952,6 +957,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap_err();
@@ -977,6 +983,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -994,6 +1001,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1044,6 +1052,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1082,6 +1091,7 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap_err();
@@ -1105,6 +1115,7 @@ mod tests {
             &fx.dest,
             true,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1120,11 +1131,63 @@ mod tests {
         );
     }
 
+    /// Vendor auto-force policy: installed content matching NEITHER hash is
+    /// overwritten with the verified patched content in the STAGE (the
+    /// installed tree is never touched), and the overwrite is surfaced as a
+    /// `vendor_content_mismatch_overwritten` warning.
     #[tokio::test]
-    async fn hash_mismatch_fails_without_touching_install_or_dest() {
+    async fn hash_mismatch_overwrites_in_stage_with_warning() {
         let fx = make_fixture("", None).await;
         // Corrupt the installed six.py so verify sees a HashMismatch.
         tokio::fs::write(fx.site_packages.join("six.py"), b"tampered")
+            .await
+            .unwrap();
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let mut warnings = Vec::new();
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut warnings,
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
+        assert!(fx.dest.exists(), "patched wheel must be written");
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.code == "vendor_content_mismatch_overwritten")
+                .count(),
+            1,
+            "overwrite surfaced as a warning: {warnings:?}"
+        );
+        // Installed tree untouched — only the stage was overwritten.
+        assert_eq!(
+            tokio::fs::read(fx.site_packages.join("six.py"))
+                .await
+                .unwrap(),
+            b"tampered"
+        );
+    }
+
+    /// A patch-target file MISSING from the install still fails closed
+    /// without `--force` — auto-force must not inherit force's silent
+    /// NotFound skip (the wheel would ship without the fix).
+    #[tokio::test]
+    async fn missing_patch_file_fails_without_force() {
+        let fx = make_fixture("", None).await;
+        tokio::fs::remove_file(fx.site_packages.join("six.py"))
             .await
             .unwrap();
         let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
@@ -1141,10 +1204,18 @@ mod tests {
             &fx.dest,
             false,
             false,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
         assert!(!result.success);
+        // The RECORD staging step trips first ("RECORD member ... is
+        // unreadable") — either way the build fails closed rather than
+        // packing a wheel without the fix.
+        assert!(
+            result.error.is_some(),
+            "missing file fails closed with an error"
+        );
         assert!(artifact.is_none());
         assert!(!fx.dest.exists());
     }

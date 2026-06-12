@@ -11,7 +11,7 @@ use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_filtered;
 
 /// Status of a file patch verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyStatus {
     /// File is ready to be patched (current hash matches beforeHash).
     Ready,
@@ -32,6 +32,33 @@ pub struct VerifyResult {
     pub current_hash: Option<String>,
     pub expected_hash: Option<String>,
     pub target_hash: Option<String>,
+}
+
+/// How the apply pipeline treats a file whose on-disk content matches
+/// NEITHER `beforeHash` nor `afterHash` (and a pre-existing file that is
+/// missing).
+///
+/// Mismatch tolerance is safe content-wise in every mode: the diff
+/// strategy self-disables on a wrong base, and the archive/blob
+/// strategies verify their bytes hash to exactly `afterHash` BEFORE any
+/// write — a tolerated mismatch is overwritten with the verified patched
+/// content or fails, never silently corrupted. What tolerance can do is
+/// discard local modifications to the dependency file, which is why
+/// `Strict` exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MismatchPolicy {
+    /// DEFAULT: a beforeHash mismatch is overwritten with the verified
+    /// patched content and surfaced as a warning (the promoted
+    /// [`VerifyResult`] keeps `expected_hash`/`current_hash`, which is
+    /// how callers detect and report it). A MISSING pre-existing file is
+    /// still a hard error.
+    #[default]
+    Warn,
+    /// A beforeHash mismatch is a hard error (`--strict`).
+    Strict,
+    /// [`MismatchPolicy::Warn`] PLUS missing pre-existing files are
+    /// skipped instead of failing (`--force`).
+    Force,
 }
 
 /// Which patch source actually wrote the patched bytes for a file.
@@ -67,6 +94,11 @@ pub struct PatchSources<'a> {
     pub blobs_path: &'a Path,
     pub packages_path: Option<&'a Path>,
     pub diffs_path: Option<&'a Path>,
+    /// In-memory blob overlay (`afterHash` → patched bytes), consulted
+    /// BEFORE the on-disk blob dir. The vendor flows stage their patch
+    /// content here so vendoring writes no `.socket/blobs` entries and no
+    /// temporary files — the bytes live only for the run.
+    pub mem_blobs: Option<&'a HashMap<String, Vec<u8>>>,
 }
 
 impl<'a> PatchSources<'a> {
@@ -78,6 +110,7 @@ impl<'a> PatchSources<'a> {
             blobs_path,
             packages_path: None,
             diffs_path: None,
+            mem_blobs: None,
         }
     }
 }
@@ -682,7 +715,7 @@ pub async fn apply_package_patch(
     sources: &PatchSources<'_>,
     uuid: Option<&str>,
     dry_run: bool,
-    force: bool,
+    policy: MismatchPolicy,
 ) -> ApplyResult {
     let mut result = ApplyResult {
         package_key: package_key.to_string(),
@@ -714,30 +747,32 @@ pub async fn apply_package_patch(
         if verify_result.status != VerifyStatus::Ready
             && verify_result.status != VerifyStatus::AlreadyPatched
         {
-            if force {
-                match verify_result.status {
-                    VerifyStatus::HashMismatch => {
-                        // Force: treat hash mismatch as ready
-                        verify_result.status = VerifyStatus::Ready;
-                    }
-                    VerifyStatus::NotFound => {
-                        // Force: skip files that don't exist (non-new files)
-                        result.files_verified.push(verify_result);
-                        continue;
-                    }
-                    _ => {}
+            match (verify_result.status, policy) {
+                // Mismatch tolerated (default + force): promote to Ready.
+                // The promoted result KEEPS `expected_hash`/`current_hash`
+                // — the signature callers use to surface the warning. The
+                // diff strategy self-disables on the wrong base; the
+                // archive/blob strategies are hash-gated to afterHash.
+                (VerifyStatus::HashMismatch, MismatchPolicy::Warn | MismatchPolicy::Force) => {
+                    verify_result.status = VerifyStatus::Ready;
                 }
-            } else {
-                let msg = verify_result
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| format!("{:?}", verify_result.status));
-                result.error = Some(format!(
-                    "Cannot apply patch: {} - {}",
-                    verify_result.file, msg
-                ));
-                result.files_verified.push(verify_result);
-                return result;
+                // Force only: skip missing pre-existing files.
+                (VerifyStatus::NotFound, MismatchPolicy::Force) => {
+                    result.files_verified.push(verify_result);
+                    continue;
+                }
+                _ => {
+                    let msg = verify_result
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| format!("{:?}", verify_result.status));
+                    result.error = Some(format!(
+                        "Cannot apply patch: {} - {}",
+                        verify_result.file, msg
+                    ));
+                    result.files_verified.push(verify_result);
+                    return result;
+                }
             }
         }
 
@@ -848,16 +883,27 @@ pub async fn apply_package_patch(
             continue;
         }
 
-        // ── Strategy 3: per-file blob (legacy fallback) ──────────────
-        let blob_path = sources.blobs_path.join(&file_info.after_hash);
-        let patched_content = match tokio::fs::read(&blob_path).await {
-            Ok(content) => content,
-            Err(e) => {
-                result.error = Some(format!(
-                    "Failed to read blob {}: {}",
-                    file_info.after_hash, e
-                ));
-                return result;
+        // ── Strategy 3: per-file blob ────────────────────────────────
+        // The in-memory overlay wins (vendor flows stage there — no
+        // `.socket/blobs` writes); the on-disk dir is the fallback.
+        let mem_hit = sources
+            .mem_blobs
+            .and_then(|m| m.get(&file_info.after_hash))
+            .cloned();
+        let patched_content = match mem_hit {
+            Some(content) => content,
+            None => {
+                let blob_path = sources.blobs_path.join(&file_info.after_hash);
+                match tokio::fs::read(&blob_path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        result.error = Some(format!(
+                            "Failed to read blob {}: {}",
+                            file_info.after_hash, e
+                        ));
+                        return result;
+                    }
+                }
             }
         };
 
@@ -1654,7 +1700,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1706,7 +1752,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1743,7 +1789,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             true,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1785,7 +1831,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1818,7 +1864,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -1826,24 +1872,23 @@ mod tests {
         assert!(result.error.is_some());
     }
 
+    /// beforeHash mismatch across the three policies: the DEFAULT (Warn)
+    /// overwrites with the verified patched content and keeps the
+    /// promoted warning signature (`Ready` + `expected_hash: Some` +
+    /// differing `current_hash`); `Strict` is the old hard error; `Force`
+    /// behaves like Warn (its extra tolerance is missing files).
     #[tokio::test]
-    async fn test_apply_package_patch_force_hash_mismatch() {
+    async fn test_apply_package_patch_hash_mismatch_policies() {
         let pkg_dir = tempfile::tempdir().unwrap();
         let blobs_dir = tempfile::tempdir().unwrap();
 
         let patched = b"patched content";
         let after_hash = compute_git_sha256_from_bytes(patched);
+        let divergent = b"something unexpected";
 
-        // Write a file whose hash does NOT match before_hash
-        tokio::fs::write(pkg_dir.path().join("index.js"), b"something unexpected")
-            .await
-            .unwrap();
-
-        // Write blob
         tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
             .await
             .unwrap();
-
         let mut files = HashMap::new();
         files.insert(
             "index.js".to_string(),
@@ -1853,7 +1898,41 @@ mod tests {
             },
         );
 
-        // Without force: should fail
+        for policy in [MismatchPolicy::Warn, MismatchPolicy::Force] {
+            tokio::fs::write(pkg_dir.path().join("index.js"), divergent)
+                .await
+                .unwrap();
+            let result = apply_package_patch(
+                "pkg:npm/test@1.0.0",
+                pkg_dir.path(),
+                &files,
+                &PatchSources::blobs_only(blobs_dir.path()),
+                None,
+                false,
+                policy,
+            )
+            .await;
+            assert!(result.success, "{policy:?}: {:?}", result.error);
+            assert_eq!(result.files_patched.len(), 1, "{policy:?}");
+            // The promoted verify keeps the mismatch signature for the
+            // caller's warning report.
+            let v = &result.files_verified[0];
+            assert_eq!(v.status, VerifyStatus::Ready, "{policy:?}");
+            assert!(
+                v.expected_hash.is_some() && v.current_hash != v.expected_hash,
+                "{policy:?}: promoted signature retained"
+            );
+            // The bytes on disk are EXACTLY the verified patched content.
+            let written = tokio::fs::read(pkg_dir.path().join("index.js"))
+                .await
+                .unwrap();
+            assert_eq!(written, patched, "{policy:?}");
+        }
+
+        // Strict: the old fail-closed behavior, file untouched.
+        tokio::fs::write(pkg_dir.path().join("index.js"), divergent)
+            .await
+            .unwrap();
         let result = apply_package_patch(
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
@@ -1861,34 +1940,38 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Strict,
         )
         .await;
         assert!(!result.success);
-
-        // Reset the file
-        tokio::fs::write(pkg_dir.path().join("index.js"), b"something unexpected")
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("does not match"));
+        let untouched = tokio::fs::read(pkg_dir.path().join("index.js"))
             .await
             .unwrap();
+        assert_eq!(untouched, divergent, "strict never writes");
 
-        // With force: should succeed
-        let result = apply_package_patch(
-            "pkg:npm/test@1.0.0",
-            pkg_dir.path(),
-            &files,
-            &PatchSources::blobs_only(blobs_dir.path()),
-            None,
-            false,
-            true,
-        )
-        .await;
-        assert!(result.success);
-        assert_eq!(result.files_patched.len(), 1);
-
-        let written = tokio::fs::read(pkg_dir.path().join("index.js"))
+        // A missing pre-existing file is STILL an error by default and
+        // under strict — only Force skips it.
+        tokio::fs::remove_file(pkg_dir.path().join("index.js"))
             .await
             .unwrap();
-        assert_eq!(written, patched);
+        for policy in [MismatchPolicy::Warn, MismatchPolicy::Strict] {
+            let result = apply_package_patch(
+                "pkg:npm/test@1.0.0",
+                pkg_dir.path(),
+                &files,
+                &PatchSources::blobs_only(blobs_dir.path()),
+                None,
+                false,
+                policy,
+            )
+            .await;
+            assert!(!result.success, "{policy:?}: missing file fails closed");
+        }
     }
 
     #[tokio::test]
@@ -1913,7 +1996,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
         assert!(!result.success);
@@ -1926,7 +2009,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            true,
+            MismatchPolicy::Force,
         )
         .await;
         assert!(result.success);
@@ -2046,6 +2129,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2054,7 +2138,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2081,6 +2165,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2089,7 +2174,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2115,6 +2200,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2123,7 +2209,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2144,6 +2230,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2152,7 +2239,7 @@ mod tests {
             &sources,
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2181,6 +2268,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2189,7 +2277,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             false,
-            true, // --force
+            MismatchPolicy::Force,
         )
         .await;
 
@@ -2221,6 +2309,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2229,7 +2318,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2251,6 +2340,7 @@ mod tests {
             blobs_path: &blobs_dir,
             packages_path: Some(&packages_dir),
             diffs_path: Some(&diffs_dir),
+            mem_blobs: None,
         };
         let result = apply_package_patch(
             "pkg:npm/x@1.0.0",
@@ -2259,7 +2349,7 @@ mod tests {
             &sources,
             Some(TEST_UUID),
             true, // dry-run
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 
@@ -2553,7 +2643,7 @@ mod tests {
             &PatchSources::blobs_only(blobs_dir.path()),
             None,
             false,
-            false,
+            MismatchPolicy::Warn,
         )
         .await;
 

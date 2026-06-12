@@ -83,7 +83,7 @@ pub async fn vendor_yarn_berry(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel.clone();
     let base_purl = coords.base_purl.clone();
     let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
@@ -195,6 +195,12 @@ pub async fn vendor_yarn_berry(
             format!("{PACKAGE_JSON} root is not an object"),
         );
     };
+    // A user-authored BARE-name pin to the exact version being vendored is
+    // TAKEN OVER (its value is rewritten to our spec — the pin already
+    // forced this exact version, so semantics are preserved — and recorded
+    // as the wiring `original` so revert restores it). Anything else
+    // same-name still refuses.
+    let mut takeover_original: Option<String> = None;
     if let Some(res) = pkg_obj.get("resolutions") {
         let Some(res_obj) = res.as_object() else {
             return refused(
@@ -210,19 +216,26 @@ pub async fn vendor_yarn_berry(
                 continue;
             }
             // Our own (possibly stale-uuid) entry is fine to overwrite; a
-            // user-authored override is never clobbered.
+            // user-authored override is never clobbered silently.
             let ours = value
                 .as_str()
                 .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
-            if !ours {
-                return refused(
-                    "vendor_override_conflict",
-                    format!(
-                        "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
-                         ({value}); vendor will not overwrite a user-authored override"
-                    ),
-                );
+            if ours {
+                continue;
             }
+            if selector == name && value.as_str() == Some(version) {
+                takeover_original = Some(version.to_string());
+                continue;
+            }
+            return refused(
+                "vendor_override_conflict",
+                format!(
+                    "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
+                     ({value}); vendor will not overwrite a user-authored override (an \
+                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
+                     automatically)"
+                ),
+            );
         }
     }
 
@@ -254,6 +267,7 @@ pub async fn vendor_yarn_berry(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {
@@ -393,16 +407,17 @@ pub async fn vendor_yarn_berry(
         WiringRecord {
             file: PACKAGE_JSON.to_string(),
             kind: KIND_RESOLUTION.to_string(),
-            // Rewritten only when replacing our own stale entry — and then
-            // there is deliberately no `original` (never record our own edit
-            // as a pre-vendor fragment).
+            // Rewritten when replacing our own stale entry (no `original` —
+            // never record our own edit as a pre-vendor fragment) or a
+            // taken-over user pin (whose value IS the `original`, restored
+            // verbatim on revert).
             action: if existing_entry {
                 WiringAction::Rewritten
             } else {
                 WiringAction::Added
             },
             key: Some(name.to_string()),
-            original: None,
+            original: takeover_original.map(Value::String),
             new: Some(Value::String(spec)),
         },
         WiringRecord {
@@ -688,6 +703,13 @@ fn revert_resolution_record(
         ));
         return;
     }
+    // A takeover recorded the user's pinned value: restore it in place
+    // (the key and table stay). Otherwise remove our entry as before.
+    if let Some(orig) = rec.original.as_ref().and_then(Value::as_str) {
+        res_obj.insert(key.to_string(), Value::String(orig.to_string()));
+        *changed = true;
+        return;
+    }
     res_obj.shift_remove(key);
     if res_obj.is_empty() {
         obj.shift_remove("resolutions");
@@ -876,7 +898,7 @@ fn carried_sections(lines: &[String]) -> Vec<String> {
 }
 
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
-fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(super) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
         let Some(rest) = body_field_line(line) else {
             continue;
@@ -1354,6 +1376,62 @@ __metadata:
         assert!(detail.contains("left-pad"), "{detail}");
         assert!(!fx.root().join(".socket/vendor").exists());
         assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+    }
+
+    /// A user-authored BARE-name pin to the exact version being vendored is
+    /// taken over: the value moves to our spec, the wiring records the pin
+    /// as `original`, and revert restores it (table kept). Range-keyed
+    /// selectors keep refusing.
+    #[tokio::test]
+    async fn user_exact_pin_resolution_is_taken_over_and_revert_restores_it() {
+        let pkg_before = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}",
+        );
+        let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let pkg: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        let val = pkg["resolutions"]["left-pad"].as_str().unwrap();
+        assert!(
+            parse_vendor_path(val).is_some_and(|p| p.eco == "npm"),
+            "pin value rewritten to our spec: {val}"
+        );
+
+        let rec = entry
+            .wiring
+            .iter()
+            .find(|r| r.kind == KIND_RESOLUTION)
+            .unwrap();
+        assert_eq!(rec.action, WiringAction::Rewritten);
+        assert_eq!(
+            rec.original,
+            Some(Value::String("1.3.0".to_string())),
+            "the user's pin is the original"
+        );
+
+        // Revert restores the pin in place (the resolutions table stays).
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let pkg: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap();
+        assert_eq!(
+            pkg["resolutions"]["left-pad"],
+            Value::String("1.3.0".to_string()),
+            "pin restored"
+        );
+
+        // A range-keyed selector with the same value still refuses.
+        let pkg = B3_BEFORE_PKG.replace(
+            "  }\n}",
+            "  },\n  \"resolutions\": {\n    \"left-pad@npm:1.x\": \"1.3.0\"\n  }\n}",
+        );
+        let fx = fixture_with(&pkg, B3_BEFORE_LOCK).await;
+        expect_refused(fx.vendor(false).await, "vendor_override_conflict");
     }
 
     #[tokio::test]

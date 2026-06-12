@@ -91,7 +91,7 @@ pub async fn vendor_npm(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let uuid_dir_rel = coords.uuid_dir_rel;
     let base_purl = coords.base_purl;
 
@@ -175,6 +175,7 @@ pub async fn vendor_npm(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {
@@ -1090,6 +1091,170 @@ mod tests {
         assert!(found, "package/index.js missing from the tarball");
     }
 
+    /// Read one member's bytes out of the packed tarball.
+    fn tgz_member(tgz: &[u8], member: &str) -> Option<Vec<u8>> {
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
+        for e in archive.entries().unwrap() {
+            let mut e = e.unwrap();
+            if e.path().unwrap().to_string_lossy() == member {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut e, &mut data).unwrap();
+                return Some(data);
+            }
+        }
+        None
+    }
+
+    /// Vendor auto-force policy: installed content matching NEITHER hash
+    /// (e.g. a patch built against different bytes than the registry
+    /// artifact) is overwritten in the STAGE with the verified patched
+    /// content; the run succeeds, wires the lock, and surfaces the
+    /// overwrite as a `vendor_content_mismatch_overwritten` warning. The
+    /// installed tree is never touched.
+    #[tokio::test]
+    async fn vendor_overwrites_mismatched_content_with_warning() {
+        let fx = fixture().await;
+        let divergent: &[u8] = b"module.exports = () => 'divergent';\n";
+        tokio::fs::write(fx.installed().join("index.js"), divergent)
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "first vendor records a ledger entry");
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.code == "vendor_content_mismatch_overwritten")
+                .count(),
+            1,
+            "overwrite surfaced exactly once: {warnings:?}"
+        );
+        assert!(
+            warnings[0].detail.contains("left-pad@1.3.0")
+                && warnings[0].detail.contains("package/index.js"),
+            "warning names the package and file: {warnings:?}"
+        );
+
+        // The tarball carries the VERIFIED patched bytes, not the divergent
+        // ones — every apply write path is hash-gated to afterHash.
+        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        assert_eq!(tgz_member(&tgz, "package/index.js").unwrap(), PATCHED_INDEX);
+
+        // The installed tree keeps its (divergent) bytes — only the stage
+        // was overwritten.
+        assert_eq!(
+            tokio::fs::read(fx.installed().join("index.js"))
+                .await
+                .unwrap(),
+            divergent
+        );
+
+        // The lock was rewired to the vendored artifact.
+        let lock = fx.read_lock().await;
+        assert_eq!(
+            lock["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+    }
+
+    /// Auto-force must NOT inherit force's silent NotFound skip: a missing
+    /// patch-target file still fails closed (a tarball without the fix
+    /// must never be packed), leaving the project byte-untouched.
+    #[tokio::test]
+    async fn vendor_missing_patch_file_fails_without_force() {
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.installed().join("index.js"))
+            .await
+            .unwrap();
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "missing file must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("File not found"),
+            "error names the missing file: {:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock byte-untouched on failure"
+        );
+        assert!(
+            tokio::fs::metadata(fx.root().join(".socket/vendor"))
+                .await
+                .is_err(),
+            "no artifact dir on failure"
+        );
+    }
+
+    /// `vendor --force` keeps its missing-file tolerance (strict superset
+    /// of the auto-force policy).
+    #[tokio::test]
+    async fn vendor_force_still_skips_missing_files() {
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.installed().join("index.js"))
+            .await
+            .unwrap();
+
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_npm(
+            &fx.purl(),
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            /*force=*/ true,
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+    }
+
+    /// A package already patched IN PLACE by `apply` vendors cleanly: the
+    /// staged copy verifies AlreadyPatched (no mismatch warning — the
+    /// content is exactly the patch's afterHash) and the tarball ships the
+    /// patched bytes.
+    #[tokio::test]
+    async fn vendor_of_already_applied_package_succeeds() {
+        let fx = fixture().await;
+        // Simulate a prior in-place `socket-patch apply`.
+        tokio::fs::write(fx.installed().join("index.js"), PATCHED_INDEX)
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some(), "first vendor records a ledger entry");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code != "vendor_content_mismatch_overwritten"),
+            "afterHash content is AlreadyPatched, not a mismatch: {warnings:?}"
+        );
+
+        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        assert_eq!(tgz_member(&tgz, "package/index.js").unwrap(), PATCHED_INDEX);
+        let lock = fx.read_lock().await;
+        assert_eq!(
+            lock["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+    }
+
     #[tokio::test]
     async fn rerun_is_in_sync_and_byte_stable() {
         let fx = fixture().await;
@@ -1633,11 +1798,11 @@ mod tests {
     fn purl_and_name_helpers() {
         assert_eq!(
             parse_npm_purl("pkg:npm/left-pad@1.3.0"),
-            Some(("left-pad", "1.3.0"))
+            Some(("left-pad".into(), "1.3.0".into()))
         );
         assert_eq!(
             parse_npm_purl("pkg:npm/@scope/pkg@1.0.0?foo=bar"),
-            Some(("@scope/pkg", "1.0.0"))
+            Some(("@scope/pkg".into(), "1.0.0".into()))
         );
         assert_eq!(parse_npm_purl("pkg:npm/@scope/pkg"), None, "no version");
         assert_eq!(

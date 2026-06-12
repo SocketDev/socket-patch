@@ -93,7 +93,7 @@ pub async fn vendor_pnpm(
         Ok(coords) => coords,
         Err(outcome) => return *outcome,
     };
-    let (name, version) = (coords.name, coords.version);
+    let (name, version) = (coords.name.as_str(), coords.version.as_str());
     let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
     // pnpm spells the override target `file:<root-relative path>` with NO
     // `./` (spike P1 fixtures, verbatim).
@@ -138,10 +138,15 @@ pub async fn vendor_pnpm(
     let mut lines = split_lines(&lock_text);
 
     // ── 3. Pre-flight refusals (override conflicts, entry present) ───────
-    if let Err(detail) = check_pkg_override_conflict(&pkg, name, &override_key) {
-        return refused("vendor_override_conflict", detail);
-    }
-    if let Err(detail) = check_lock_override_conflict(&lines, name, &override_key) {
+    // A user-authored exact-version pin equal to `version` is TAKEN OVER
+    // (the pin's key is rewritten to our spec on both surfaces and the
+    // original value recorded for revert); anything else same-name refuses.
+    let disposition = match classify_pkg_override(&pkg, name, version, &override_key) {
+        Ok(d) => d,
+        Err(detail) => return refused("vendor_override_conflict", detail),
+    };
+    let effective_key = disposition.effective_key(&override_key).to_string();
+    if let Err(detail) = check_lock_override(&lines, name, version, &effective_key) {
         return refused("vendor_override_conflict", detail);
     }
     if !lock_has_target_package(&lines, name, version) {
@@ -163,6 +168,7 @@ pub async fn vendor_pnpm(
         sources,
         dry_run,
         force,
+        &mut warnings,
     )
     .await
     {
@@ -200,11 +206,12 @@ pub async fn vendor_pnpm(
         rel_tgz: &rel_tgz,
         spec: &spec,
         integrity: &packed.integrity,
+        override_key: &effective_key,
     };
     let mut wiring: Vec<WiringRecord> = Vec::new();
 
     let (pkg_changed, created_pnpm_table, created_overrides_table) =
-        match apply_pkg_override(&mut pkg, &override_key, &spec, &mut wiring) {
+        match apply_pkg_override(&mut pkg, &effective_key, &spec, &mut wiring) {
             Ok(out) => out,
             Err(e) => return done_failure(purl, e),
         };
@@ -305,6 +312,46 @@ pub async fn vendor_pnpm(
         entry: Some(entry),
         warnings,
     }
+}
+
+/// Is this pnpm-vendored entry still consumed by the lock's dependency
+/// graph?
+///
+/// `Some(true)`: a `packages:`/`snapshots:` block resolves to the entry's
+/// artifact (`<name>@file:.socket/vendor/npm/<uuid>/...`) — some importer
+/// still depends on the package. `Some(false)`: the lock parses cleanly
+/// and carries NO such block — the dependency was removed and re-locked
+/// (the `overrides:` declaration alone does NOT count as usage: pnpm
+/// keeps it mirrored from package.json even when nothing matches it).
+/// `None`: cannot determine (missing/unreadable/unsupported lock) —
+/// callers must keep the entry, fail-safe.
+pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+    let text = tokio::fs::read_to_string(project_root.join(PNPM_LOCK))
+        .await
+        .ok()?;
+    if check_lock_version(&text).is_err() {
+        return None;
+    }
+    let lines = split_lines(&text);
+    for section in ["packages", "snapshots"] {
+        let Some((start, end)) = section_bounds(&lines, section) else {
+            continue;
+        };
+        let mut i = start + 1;
+        while let Some(block) = next_block(&lines, i, end) {
+            let resolved_to_ours = block
+                .key
+                .find("@file:")
+                .map(|at| &block.key[at + 1..])
+                .and_then(parse_vendor_path)
+                .is_some_and(|p| p.eco == "npm" && p.uuid == entry.uuid);
+            if resolved_to_ours {
+                return Some(true);
+            }
+            i = block.end;
+        }
+    }
+    Some(false)
 }
 
 /// Undo one pnpm-vendored package: restore the recorded pair fragments and
@@ -485,6 +532,11 @@ struct EditCtx<'a> {
     spec: &'a str,
     /// `sha512-<base64>` of the packed tarball.
     integrity: &'a str,
+    /// The override key BOTH surfaces edit (see
+    /// [`OverrideDisposition::effective_key`]): our canonical
+    /// `name@version` on a fresh insert, or the user's existing key on a
+    /// takeover / re-run over a taken-over key.
+    override_key: &'a str,
 }
 
 impl EditCtx<'_> {
@@ -498,10 +550,15 @@ impl EditCtx<'_> {
         format!("{}@{}", self.name, self.spec)
     }
 
-    /// Does `value` point into `.socket/vendor/npm/` (ours — any uuid; a
-    /// stale uuid is rewritten to the current one with `original: None`)?
+    /// Does `value` point at OUR vendored tarball for THIS name@version
+    /// (any uuid — a stale uuid is rewritten to the current one with
+    /// `original: None`)? The leaf binding is load-bearing: a project can
+    /// vendor the SAME package at several versions, and a name-only match
+    /// would let one version's edit clobber another's entries.
     fn is_ours(&self, value: &str) -> bool {
-        parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
+        parse_vendor_path(value).is_some_and(|p| {
+            p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(self.name, self.version)
+        })
     }
 
     /// The per-importer `specifier:` spelling: re-relativized for nested
@@ -560,46 +617,147 @@ fn override_key_name(key: &str) -> &str {
     }
 }
 
-/// Is this (key, value) override pair OURS for the target package — the
-/// exact versioned selector pointing into `.socket/vendor/npm/`?
-fn override_is_ours(key: &str, value: &str, our_key: &str) -> bool {
-    key == our_key && parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
+/// Does `value` point into `.socket/vendor/npm/` (ours — any uuid)?
+fn is_vendor_value(value: &str) -> bool {
+    parse_vendor_path(value).is_some_and(|p| p.eco == "npm")
 }
 
-/// A user-authored override already steering this package would be
-/// silently fought over by ours; refuse instead (fail-closed).
-fn check_pkg_override_conflict(pkg: &Value, name: &str, our_key: &str) -> Result<(), String> {
+/// A vendor value belonging to THIS `name@version`'s tarball (any uuid).
+/// The leaf binding matters: a project can vendor the same package at
+/// several versions, and edits must never treat a SIBLING version's
+/// override/entry as their own.
+fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
+    parse_vendor_path(value)
+        .is_some_and(|p| p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(name, version))
+}
+
+/// How the package.json `pnpm.overrides` table relates to the package
+/// being vendored. The lock's `overrides:` section must mirror this map
+/// key-for-key (pnpm hard-checks the two and fails
+/// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` on any drift), so whichever key
+/// this classification yields is the one BOTH surfaces edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverrideDisposition {
+    /// No same-name key: insert our canonical `name@version` key.
+    Insert,
+    /// A same-name key already points into `.socket/vendor/npm/` — ours
+    /// (any uuid; possibly a user key an earlier vendor took over).
+    /// Rewrite that key's value in place; our own value is never
+    /// recorded as an `original`.
+    Ours { key: String },
+    /// A user-authored exact-version pin equal to the version being
+    /// vendored (`"tar-fs": "3.1.0"` or `"tar-fs@3.1.0": "3.1.0"`): take
+    /// the key over — rewrite its VALUE to the `file:` spec (the user's
+    /// pin already forces every `tar-fs` to this exact version, so
+    /// redirecting the same key preserves their semantics) and record
+    /// the pin as the wiring `original` so revert restores it exactly.
+    Takeover { key: String, original: String },
+}
+
+impl OverrideDisposition {
+    /// The override key both surfaces edit: the matched existing key, or
+    /// our canonical `name@version` on a fresh insert.
+    fn effective_key<'a>(&'a self, our_key: &'a str) -> &'a str {
+        match self {
+            OverrideDisposition::Insert => our_key,
+            OverrideDisposition::Ours { key } | OverrideDisposition::Takeover { key, .. } => key,
+        }
+    }
+}
+
+/// Classify the package.json override state for `name` (see
+/// [`OverrideDisposition`]). `Err` is a genuine conflict (fail-closed):
+/// a range/different-version value, a `parent>child` selector chain
+/// (scoped to one dependent — our whole-graph rewrite has different
+/// semantics), a non-string value, or several same-name keys.
+fn classify_pkg_override(
+    pkg: &Value,
+    name: &str,
+    version: &str,
+    our_key: &str,
+) -> Result<OverrideDisposition, String> {
     let Some(overrides) = pkg.get("pnpm").and_then(|p| p.get("overrides")) else {
-        return Ok(());
+        return Ok(OverrideDisposition::Insert);
     };
     let Some(map) = overrides.as_object() else {
         return Err("package.json pnpm.overrides is not an object".to_string());
     };
+    let mut found: Option<OverrideDisposition> = None;
     for (key, value) in map {
         if override_key_name(key) != name {
             continue;
         }
         let value_str = value.as_str().unwrap_or("");
-        if override_is_ours(key, value_str, our_key) {
-            continue; // ours (possibly a stale uuid) — the edit handles it
+        // A SIBLING version's vendored override coexists — not ours to
+        // touch (and not a conflict): skip it entirely.
+        if is_vendor_value(value_str) && !vendor_value_is_for(value_str, name, version) {
+            continue;
         }
-        return Err(format!(
-            "package.json already carries a pnpm override for `{key}` ({value}); vendoring \
-             would fight it — remove the override (or vendor --revert) first"
-        ));
+        if found.is_some() {
+            return Err(format!(
+                "package.json carries more than one pnpm override for `{name}`; vendoring \
+                 cannot pick one — remove the extras first"
+            ));
+        }
+        let classified = if key.contains('>') {
+            None
+        } else if is_vendor_value(value_str) {
+            Some(OverrideDisposition::Ours { key: key.clone() })
+        } else if value_str == version && (key == name || key == our_key) {
+            Some(OverrideDisposition::Takeover {
+                key: key.clone(),
+                original: value_str.to_string(),
+            })
+        } else {
+            None
+        };
+        match classified {
+            Some(d) => found = Some(d),
+            None => {
+                return Err(format!(
+                    "package.json already carries a pnpm override for `{key}` ({value}); \
+                     vendoring would fight it — remove the override (or vendor --revert) \
+                     first (an exact-version pin equal to {version} is taken over \
+                     automatically)"
+                ))
+            }
+        }
     }
-    Ok(())
+    Ok(found.unwrap_or(OverrideDisposition::Insert))
 }
 
-/// Same conflict check against the lock's own `overrides:` section (a
-/// desynced lock-side override would be silently clobbered otherwise).
-fn check_lock_override_conflict(lines: &[String], name: &str, our_key: &str) -> Result<(), String> {
+/// Lock-side mirror check against the effective key. Every same-name key
+/// in the lock's `overrides:` section must BE `effective_key` (pnpm
+/// requires the lock's override map to equal package.json's — a key-shape
+/// drift means the pair is already desynced) with a value the edit can
+/// own: ours, the exact pinned `version` (takeover), or already our spec.
+/// A missing section/key is fine — the edit inserts it, restoring parity.
+fn check_lock_override(
+    lines: &[String],
+    name: &str,
+    version: &str,
+    effective_key: &str,
+) -> Result<(), String> {
     let Some((start, end)) = section_bounds(lines, "overrides") else {
         return Ok(());
     };
     for line in &lines[start + 1..end] {
         if let Some((key, _repr, rest)) = parse_key_line(line, 2) {
-            if override_key_name(&key) == name && !override_is_ours(&key, &rest, our_key) {
+            if override_key_name(&key) != name {
+                continue;
+            }
+            // A sibling version's vendored override coexists — skip it.
+            if is_vendor_value(&rest) && !vendor_value_is_for(&rest, name, version) {
+                continue;
+            }
+            if key != effective_key {
+                return Err(format!(
+                    "{PNPM_LOCK} carries an override key `{key}` for `{name}` that does not \
+                     match package.json's `{effective_key}` — the two override maps must \
+                     agree (run `pnpm install` to re-sync them) before vendoring"
+                ));
+            }
+            if !(is_vendor_value(&rest) || rest == version) {
                 return Err(format!(
                     "{PNPM_LOCK} already carries an override for `{key}` ({rest}); vendoring \
                      would fight it — remove the override (or vendor --revert) first"
@@ -665,20 +823,24 @@ fn apply_pkg_override(
     if existing == Some(spec) {
         return Ok((false, false, false)); // in sync, no record
     }
-    // The conflict pre-flight guarantees any existing value here is OURS
-    // (a stale uuid): never record our own edit as the "original".
-    let was_ours = existing.is_some();
+    // The classify pre-flight guarantees an existing value here is either
+    // OURS (a stale uuid — never recorded as an "original") or the user's
+    // exact-version pin being TAKEN OVER (recorded so revert restores it).
+    let was_present = existing.is_some();
+    let original = existing
+        .filter(|v| !is_vendor_value(v))
+        .map(|v| Value::String(v.to_string()));
     overrides.insert(our_key.to_string(), Value::String(spec.to_string()));
     wiring.push(WiringRecord {
         file: PACKAGE_JSON.to_string(),
         kind: KIND_PKG_OVERRIDE.to_string(),
-        action: if was_ours {
+        action: if was_present {
             WiringAction::Rewritten
         } else {
             WiringAction::Added
         },
         key: Some(our_key.to_string()),
-        original: None, // Added has none; Rewritten-over-ours records none by design
+        original,
         new: Some(Value::String(spec.to_string())),
     });
     Ok((true, created_pnpm_table, created_overrides_table))
@@ -694,7 +856,7 @@ fn edit_overrides(
     ctx: &EditCtx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let our_key = ctx.reg_key();
+    let our_key = ctx.override_key.to_string();
     let entry_line = format!("  {}: {}", yaml_key(&our_key), ctx.spec);
     if let Some((start, end)) = section_bounds(lines, "overrides") {
         // Immutable scan first: our line's position (if present) + the last
@@ -702,29 +864,38 @@ fn edit_overrides(
         let mut ours = None;
         let mut last_entry = start;
         for (i, line) in lines.iter().enumerate().take(end).skip(start + 1) {
-            if let Some((key, _repr, rest)) = parse_key_line(line, 2) {
+            if let Some((key, repr, rest)) = parse_key_line(line, 2) {
                 last_entry = i;
                 if key == our_key {
-                    ours = Some((i, rest));
+                    ours = Some((i, repr, rest));
                     break;
                 }
             }
         }
-        if let Some((i, rest)) = ours {
+        if let Some((i, repr, rest)) = ours {
             if rest == ctx.spec {
                 return Ok(false); // in sync
             }
-            // Ours with a stale uuid (conflict pre-flight proved it).
-            lines[i] = entry_line;
+            // Ours with a stale uuid (no original), or the user's pinned
+            // value being TAKEN OVER (recorded as original; the live key
+            // repr/quoting is preserved so revert is byte-faithful).
+            let original = (!is_vendor_value(&rest)).then(|| rest.clone());
+            lines[i] = format!("  {}: {}", yaml_key_like(&our_key, &repr), ctx.spec);
             wiring.push(overrides_record(
                 &our_key,
                 ctx.spec,
                 WiringAction::Rewritten,
+                original,
             ));
             return Ok(true);
         }
         lines.insert(last_entry + 1, entry_line);
-        wiring.push(overrides_record(&our_key, ctx.spec, WiringAction::Added));
+        wiring.push(overrides_record(
+            &our_key,
+            ctx.spec,
+            WiringAction::Added,
+            None,
+        ));
         return Ok(true);
     }
     // No overrides section: insert one right before `importers:` (with the
@@ -735,17 +906,29 @@ fn edit_overrides(
         importers..importers,
         ["overrides:".to_string(), entry_line, String::new()],
     );
-    wiring.push(overrides_record(&our_key, ctx.spec, WiringAction::Added));
+    wiring.push(overrides_record(
+        &our_key,
+        ctx.spec,
+        WiringAction::Added,
+        None,
+    ));
     Ok(true)
 }
 
-fn overrides_record(key: &str, spec: &str, action: WiringAction) -> WiringRecord {
+fn overrides_record(
+    key: &str,
+    spec: &str,
+    action: WiringAction,
+    original: Option<String>,
+) -> WiringRecord {
     WiringRecord {
         file: PNPM_LOCK.to_string(),
         kind: KIND_LOCK_OVERRIDES.to_string(),
         action,
         key: Some(key.to_string()),
-        original: None, // Added, or rewritten-over-ours (never an original)
+        // `Some` only on a takeover (the user's pinned value); Added and
+        // rewritten-over-ours never record an original.
+        original: original.map(Value::String),
         new: Some(Value::String(spec.to_string())),
     }
 }
@@ -844,13 +1027,41 @@ fn edit_packages(
     let new_key = ctx.new_key();
     let ours_prefix = format!("{}@file:", ctx.name);
 
+    // Fail closed on a half-drifted lock: when BOTH the registry-keyed
+    // entry and a socket file:-keyed entry for this package exist, a rekey
+    // would splice a DUPLICATE mapping key (pnpm refuses to parse those)
+    // and surgery cannot decide which block carries the truth.
+    {
+        let mut has_registry = false;
+        let mut has_ours = false;
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if block.key == reg_key {
+                has_registry = true;
+            } else if block
+                .key
+                .strip_prefix(&ours_prefix)
+                .is_some_and(|rest| ctx.is_ours(rest))
+            {
+                has_ours = true;
+            }
+            j = block.end;
+        }
+        if has_registry && has_ours {
+            return Err(format!(
+                "packages section carries BOTH `{reg_key}` and a `{ours_prefix}…` entry (a \
+                 half-edited lock); run `pnpm install` to re-resolve it, then re-vendor"
+            ));
+        }
+    }
+
     let mut i = start + 1;
     while let Some(block) = next_block(lines, i, end) {
         let is_registry = block.key == reg_key;
         let is_ours_key = block
             .key
             .strip_prefix(&ours_prefix)
-            .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"));
+            .is_some_and(|rest| ctx.is_ours(rest));
         if !is_registry && !is_ours_key {
             i = block.end;
             continue;
@@ -926,13 +1137,37 @@ fn edit_snapshot_rekey(
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
     let ours_prefix = format!("{}@file:", ctx.name);
+    // Same duplicate-key fail-closed guard as edit_packages.
+    {
+        let mut has_registry = false;
+        let mut has_ours = false;
+        let mut j = start + 1;
+        while let Some(block) = next_block(lines, j, end) {
+            if block.key == reg_key {
+                has_registry = true;
+            } else if block
+                .key
+                .strip_prefix(&ours_prefix)
+                .is_some_and(|rest| ctx.is_ours(rest))
+            {
+                has_ours = true;
+            }
+            j = block.end;
+        }
+        if has_registry && has_ours {
+            return Err(format!(
+                "snapshots section carries BOTH `{reg_key}` and a `{ours_prefix}…` entry (a \
+                 half-edited lock); run `pnpm install` to re-resolve it, then re-vendor"
+            ));
+        }
+    }
     let mut i = start + 1;
     while let Some(block) = next_block(lines, i, end) {
         let is_registry = block.key == reg_key;
         let is_ours_key = block
             .key
             .strip_prefix(&ours_prefix)
-            .is_some_and(|rest| parse_vendor_path(rest).is_some_and(|p| p.eco == "npm"));
+            .is_some_and(|rest| ctx.is_ours(rest));
         if !is_registry && !is_ours_key {
             i = block.end;
             continue;
@@ -1062,7 +1297,17 @@ fn revert_pkg_record(
         )));
         return;
     }
-    overrides.shift_remove(key);
+    // A takeover recorded the user's pinned value as `original`: restore
+    // it in place (the key stays). A plain Added/Rewritten-over-ours
+    // record has no original — remove the key as before.
+    match rec.original.as_ref().and_then(Value::as_str) {
+        Some(orig) => {
+            overrides.insert(key.to_string(), Value::String(orig.to_string()));
+        }
+        None => {
+            overrides.shift_remove(key);
+        }
+    }
     *dirty = true;
 }
 
@@ -1112,15 +1357,15 @@ fn revert_overrides_line(
     let mut ours_at = None;
     let mut others = 0usize;
     for (i, line) in lines.iter().enumerate().take(end).skip(start + 1) {
-        if let Some((k, _repr, rest)) = parse_key_line(line, 2) {
+        if let Some((k, repr, rest)) = parse_key_line(line, 2) {
             if k == key && ours_at.is_none() {
-                ours_at = Some((i, rest));
+                ours_at = Some((i, repr, rest));
             } else {
                 others += 1;
             }
         }
     }
-    let Some((idx, rest)) = ours_at else {
+    let Some((idx, repr, rest)) = ours_at else {
         warnings.push(drifted(format!("overrides entry `{key}` no longer exists")));
         return;
     };
@@ -1130,6 +1375,13 @@ fn revert_overrides_line(
         warnings.push(drifted(format!(
             "overrides entry `{key}` was changed since vendoring ({rest}); left alone"
         )));
+        return;
+    }
+    // A takeover recorded the user's pinned value: restore it in place
+    // (key + quoting preserved; the section obviously stays).
+    if let Some(orig) = rec.original.as_ref().and_then(Value::as_str) {
+        lines[idx] = format!("  {}: {orig}", yaml_key_like(key, &repr));
+        *dirty = true;
         return;
     }
     lines.remove(idx);
@@ -1404,7 +1656,7 @@ async fn commit_pair(
 // pnpm-lock.yaml is machine-emitted with a fixed 2/4/6/8-space shape; these
 // helpers splice line blocks and never interpret YAML generically.
 
-fn split_lines(text: &str) -> Vec<String> {
+pub(super) fn split_lines(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_string).collect()
 }
 
@@ -1415,7 +1667,7 @@ fn join_lines(lines: &[String]) -> String {
 /// `(header_idx, end_idx)` of a top-level `name:` section; `end` is the
 /// first following column-0 line (exclusive), so trailing blank separator
 /// lines belong to the section.
-fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
+pub(super) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
     let header = format!("{name}:");
     let start = lines.iter().position(|l| l == &header)?;
     let end = lines
@@ -1431,10 +1683,10 @@ fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
 /// One 2-space-keyed block inside a section (`[header, end)`; `end` stops at
 /// the blank separator / next block header, so the captured fragment is the
 /// verbatim entry without surrounding blanks).
-struct YamlBlock {
-    header: usize,
-    end: usize,
-    key: String,
+pub(super) struct YamlBlock {
+    pub(super) header: usize,
+    pub(super) end: usize,
+    pub(super) key: String,
     /// The key exactly as spelled in the file (incl. quotes) — rekeys
     /// preserve the file's quoting style.
     repr: String,
@@ -1454,7 +1706,7 @@ impl YamlBlock {
 }
 
 /// The next block at or after line `i` (within `[i, end)`).
-fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
+pub(super) fn next_block(lines: &[String], mut i: usize, end: usize) -> Option<YamlBlock> {
     while i < end {
         if let Some((key, repr, rest)) = parse_key_line(&lines[i], 2) {
             let mut j = i + 1;
@@ -2111,6 +2363,230 @@ snapshots:
         assert!(live_lock.contains("overrides:\n  other-pkg: 2.0.0\n\nimporters:"));
     }
 
+    // ── in-use probe ───────────────────────────────────────────────────────
+
+    /// The prune-time in-use probe: a packages/snapshots block resolving to
+    /// the artifact means in use; an overrides declaration ALONE (the state
+    /// pnpm leaves after the dependency is removed and re-locked) does not;
+    /// a missing or unsupported-version lock is undeterminable (keep).
+    #[tokio::test]
+    async fn pnpm_entry_in_use_reflects_lock_graph() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        // Freshly vendored: the rekeyed file: blocks are in the graph.
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, Some(true));
+
+        // Dep removed + re-locked: pnpm prunes the file: blocks but keeps
+        // the overrides declaration mirrored from package.json.
+        let removed_lock = format!(
+            "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n\
+             \noverrides:\n  left-pad@1.3.0: file:{}\n\nimporters:\n\n  .:\n    \
+             dependencies:\n      consumer:\n        specifier: file:./consumer\n        \
+             version: file:consumer\n\npackages:\n\n  consumer@file:consumer:\n    \
+             resolution: {{directory: consumer, type: directory}}\n\nsnapshots:\n\n  \
+             consumer@file:consumer: {{}}\n",
+            fx.rel_tgz()
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &removed_lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            pnpm_entry_in_use(&entry, fx.root()).await,
+            Some(false),
+            "the lingering overrides declaration alone is not usage"
+        );
+
+        // Unsupported lock version: undeterminable.
+        tokio::fs::write(fx.root().join(PNPM_LOCK), "lockfileVersion: '6.0'\n")
+            .await
+            .unwrap();
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
+
+        // Missing lock: undeterminable.
+        tokio::fs::remove_file(fx.root().join(PNPM_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(pnpm_entry_in_use(&entry, fx.root()).await, None);
+    }
+
+    // ── exact-version pin takeover ─────────────────────────────────────────
+
+    /// package.json with a user-authored override pin (`key: value`) plus the
+    /// matching lock-side `overrides:` mirror line.
+    fn pin_fixture_inputs(key: &str, value: &str) -> (String, String) {
+        let pkg = format!(
+            "{{\n  \"name\": \"vendor-spike\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"dependencies\": {{\n    \"consumer\": \"file:./consumer\",\n    \"left-pad\": \"1.3.0\",\n    \"left-pad-old\": \"npm:left-pad@1.2.0\"\n  }},\n  \"pnpm\": {{\n    \"overrides\": {{\n      \"{key}\": \"{value}\"\n    }}\n  }}\n}}\n"
+        );
+        let lock = P1_BEFORE_LOCK.replace(
+            "importers:",
+            &format!("overrides:\n  {key}: {value}\n\nimporters:"),
+        );
+        (pkg, lock)
+    }
+
+    /// A user-authored EXACT-version pin equal to the patched version is
+    /// taken over: the user's key keeps its spelling on both surfaces, its
+    /// value moves to our `file:` spec, the wiring records the pin as
+    /// `original`, and a full revert restores both files byte-identically.
+    #[tokio::test]
+    async fn user_exact_pin_bare_key_is_taken_over_and_revert_restores_it() {
+        let (pkg_before, lock_before) = pin_fixture_inputs("left-pad", "1.3.0");
+        let fx = fixture_with(&pkg_before, &lock_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        // package.json: the USER'S key (`left-pad`) now carries our spec;
+        // no `left-pad@1.3.0` key was added; tables pre-existed.
+        let pkg: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        let overrides = &pkg["pnpm"]["overrides"];
+        assert_eq!(
+            overrides["left-pad"],
+            Value::String(format!("file:{}", fx.rel_tgz()))
+        );
+        assert!(overrides.get("left-pad@1.3.0").is_none());
+        assert_eq!(
+            entry.pnpm,
+            Some(PnpmMeta {
+                created_overrides_table: false,
+                created_pnpm_table: false
+            })
+        );
+
+        // Lock: same key, same value (map parity — pnpm hard-checks it).
+        let live_lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            live_lock.contains(&format!("overrides:\n  left-pad: file:{}", fx.rel_tgz())),
+            "{live_lock}"
+        );
+
+        // Wiring: both override records carry the user's key, action
+        // Rewritten, and the pin as `original`.
+        for kind in [KIND_PKG_OVERRIDE, KIND_LOCK_OVERRIDES] {
+            let rec = entry
+                .wiring
+                .iter()
+                .find(|r| r.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} record: {:?}", entry.wiring));
+            assert_eq!(rec.key.as_deref(), Some("left-pad"), "{kind}");
+            assert_eq!(rec.action, WiringAction::Rewritten, "{kind}");
+            assert_eq!(
+                rec.original,
+                Some(Value::String("1.3.0".to_string())),
+                "{kind}: the user's pin is the original"
+            );
+        }
+
+        // Full revert restores the pin on both surfaces byte-identically.
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// The versioned key shape (`left-pad@1.3.0: 1.3.0`) is taken over the
+    /// same way — the key happens to equal our canonical key.
+    #[tokio::test]
+    async fn user_exact_pin_versioned_key_is_taken_over() {
+        let (pkg_before, lock_before) = pin_fixture_inputs("left-pad@1.3.0", "1.3.0");
+        let fx = fixture_with(&pkg_before, &lock_before).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+
+        let pkg: Value = serde_json::from_str(&fx.read(PACKAGE_JSON).await).unwrap();
+        assert_eq!(
+            pkg["pnpm"]["overrides"]["left-pad@1.3.0"],
+            Value::String(format!("file:{}", fx.rel_tgz()))
+        );
+        let rec = entry
+            .wiring
+            .iter()
+            .find(|r| r.kind == KIND_PKG_OVERRIDE)
+            .unwrap();
+        assert_eq!(rec.original, Some(Value::String("1.3.0".to_string())));
+
+        // Revert restores the pin.
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_before);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before);
+    }
+
+    /// A second vendor over a taken-over key is the in-sync hot path:
+    /// AlreadyPatched, no new ledger entry, bytes stable. (Guards the
+    /// `Ours` classification accepting the user-keyed vendor value — the
+    /// old `key == our_key` requirement would refuse its own wiring.)
+    #[tokio::test]
+    async fn takeover_rerun_is_in_sync_and_records_nothing() {
+        let (pkg_before, lock_before) = pin_fixture_inputs("left-pad", "1.3.0");
+        let fx = fixture_with(&pkg_before, &lock_before).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let pkg_after = fx.read(PACKAGE_JSON).await;
+        let lock_after = fx.read(PNPM_LOCK).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in-sync rerun records nothing");
+        assert!(result
+            .files_verified
+            .iter()
+            .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched));
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_after, "bytes stable");
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_after, "bytes stable");
+    }
+
+    /// Selector chains and duplicate same-name keys still refuse — only a
+    /// plain exact pin is taken over. (Range keys and different-version
+    /// values are covered by `existing_user_override_for_the_name_is_refused`.)
+    #[tokio::test]
+    async fn chain_and_duplicate_override_keys_still_refuse() {
+        // `parent>child` chain, even with the exact version value.
+        let (pkg, lock) = pin_fixture_inputs("consumer>left-pad", "1.3.0");
+        let fx = fixture_with(&pkg, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("consumer>left-pad"), "{detail}");
+
+        // Two same-name keys (one ours-shaped pin + one bare pin).
+        let pkg = "{\n  \"name\": \"x\",\n  \"pnpm\": {\n    \"overrides\": {\n      \"left-pad\": \"1.3.0\",\n      \"left-pad@1.3.0\": \"1.3.0\"\n    }\n  }\n}\n".to_string();
+        let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("more than one"), "{detail}");
+    }
+
+    /// pkg↔lock override-key shape drift refuses (pnpm itself would fail
+    /// `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`); a pkg-side pin with NO lock
+    /// mirror is fine — the edit inserts the same key, restoring parity.
+    #[tokio::test]
+    async fn takeover_lock_shape_mismatch_refuses_but_missing_section_inserts() {
+        // Shape drift: pkg keys `left-pad`, lock keys `left-pad@1.3.0`.
+        let (pkg, _) = pin_fixture_inputs("left-pad", "1.3.0");
+        let lock = P1_BEFORE_LOCK.replace(
+            "importers:",
+            "overrides:\n  left-pad@1.3.0: 1.3.0\n\nimporters:",
+        );
+        let fx = fixture_with(&pkg, &lock).await;
+        let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
+        assert!(detail.contains("must"), "{detail}");
+
+        // No lock overrides section at all: takeover inserts the pkg key.
+        let fx = fixture_with(&pkg, P1_BEFORE_LOCK).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let live_lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            live_lock.contains(&format!("overrides:\n  left-pad: file:{}", fx.rel_tgz())),
+            "lock key matches the pkg key: {live_lock}"
+        );
+        assert!(entry.is_some());
+    }
+
     #[tokio::test]
     async fn created_tables_bookkeeping_and_revert_prunes_them() {
         // pnpm table exists (other keys), overrides created by us: revert
@@ -2209,6 +2685,162 @@ snapshots:
             tokio::fs::read(fx.root().join(fx.rel_tgz())).await.unwrap(),
             tgz_first,
             "tarball byte-identical across re-runs"
+        );
+    }
+
+    /// A half-edited lock carrying BOTH the registry-keyed packages entry
+    /// AND a socket file:-keyed one: a rekey would splice a DUPLICATE
+    /// mapping key (pnpm refuses to parse those) — fail closed, nothing
+    /// written.
+    #[tokio::test]
+    async fn half_drifted_duplicate_keys_fail_closed() {
+        let dup_lock = P1_BEFORE_LOCK.replace(
+            "  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}\n    deprecated: use String.prototype.padStart()",
+            &format!(
+                "  left-pad@1.3.0:\n    resolution: {{integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}}\n    deprecated: use String.prototype.padStart()\n\n  left-pad@file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:\n    resolution: {{integrity: sha512-stale==, tarball: file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz}}\n    version: 1.3.0"
+            ),
+        );
+        assert_ne!(dup_lock, P1_BEFORE_LOCK, "fixture edit must apply");
+        let fx = fixture_with(P1_BEFORE_PKG, &dup_lock).await;
+        let lock_before = fx.read(PNPM_LOCK).await;
+        let pkg_before = fx.read(PACKAGE_JSON).await;
+
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(!result.success, "half-drifted lock must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("half-edited lock")),
+            "{:?}",
+            result.error
+        );
+        assert!(entry.is_none());
+        assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, pkg_before, "pkg untouched");
+    }
+
+    /// Two VERSIONS of the same package vendored in sequence: each edit
+    /// must bind to its own version's entries — a name-only "ours" match
+    /// would let the second vendor clobber/rekey the first one's blocks
+    /// (live-debugged on Flowise: identical duplicated mapping keys).
+    #[tokio::test]
+    async fn multi_version_vendor_does_not_clobber_sibling_entries() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (r1, e1, _) = expect_done(fx.vendor(false).await);
+        assert!(r1.success);
+        assert!(e1.is_some());
+        let tgz_13 = fx.rel_tgz();
+
+        // Vendor left-pad@1.2.0 under a DIFFERENT uuid (the `left-pad-old`
+        // npm: alias resolves it in the same lock).
+        let uuid2 = "22222222-3333-4444-8555-666666666666";
+        let installed2 = fx.root().join("node_modules/left-pad-old");
+        tokio::fs::create_dir_all(&installed2).await.unwrap();
+        tokio::fs::write(
+            installed2.join("package.json"),
+            br#"{"name":"left-pad","version":"1.2.0"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(installed2.join("index.js"), ORIG_INDEX)
+            .await
+            .unwrap();
+        let mut record2 = fx.record.clone();
+        record2.uuid = uuid2.to_string();
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_pnpm(
+            "pkg:npm/left-pad@1.2.0",
+            &installed2,
+            fx.root(),
+            &record2,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+        )
+        .await;
+        let (r2, e2, _) = expect_done(outcome);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(e2.is_some());
+
+        let lock = fx.read(PNPM_LOCK).await;
+        let key13 = format!("  left-pad@file:{tgz_13}:");
+        let key12 = format!("  left-pad@file:.socket/vendor/npm/{uuid2}/left-pad-1.2.0.tgz:");
+        // Both versions' packages + snapshots blocks exist exactly once
+        // each (snapshot entries may be inline `key: {}`).
+        for (key, label) in [(&key13, "1.3.0"), (&key12, "1.2.0")] {
+            assert_eq!(
+                lock.lines().filter(|l| l.starts_with(key.as_str())).count(),
+                2, // packages + snapshots
+                "{label} entries intact:\n{lock}"
+            );
+        }
+        // No duplicated mapping keys within a section (what pnpm
+        // hard-rejects): each section's 2-space keys are unique.
+        for section in ["overrides", "packages", "snapshots"] {
+            let Some((start, end)) = section_bounds(&split_lines(&lock), section) else {
+                continue;
+            };
+            let lines = split_lines(&lock);
+            let mut keys: Vec<String> = lines[start + 1..end]
+                .iter()
+                .filter_map(|l| parse_key_line(l, 2).map(|(k, _, _)| k))
+                .collect();
+            let total = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(total, keys.len(), "duplicated keys in {section}:\n{lock}");
+        }
+    }
+
+    /// Re-vendor over a wired lock whose recorded integrity DRIFTED (e.g.
+    /// the artifact was rebuilt from a differently-shaped source): the
+    /// stale-ours refresh must REPLACE the file:-keyed blocks, never
+    /// duplicate them.
+    #[tokio::test]
+    async fn integrity_drift_refresh_never_duplicates_keys() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(entry.is_some());
+
+        // Simulate drift: the lock records a DIFFERENT integrity for OUR
+        // file: entry (only) than the tarball the next run will pack.
+        let lock = fx.read(PNPM_LOCK).await;
+        let drifted = lock
+            .lines()
+            .map(|l| {
+                if l.contains("tarball: file:.socket") {
+                    l.replace("integrity: sha512-", "integrity: sha512-DRIFT")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(drifted, lock);
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &drifted)
+            .await
+            .unwrap();
+
+        let (result, _, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let healed = fx.read(PNPM_LOCK).await;
+        let ours_key = format!("  left-pad@file:{}:", fx.rel_tgz());
+        let count = healed.lines().filter(|l| *l == ours_key.as_str()).count();
+        assert_eq!(
+            count, 1,
+            "exactly one file:-keyed packages/snapshots block per section; lock:
+{healed}"
+        );
+        let snap_count = healed
+            .matches(&format!("left-pad@file:{}", fx.rel_tgz()))
+            .count();
+        assert!(
+            !healed.contains("sha512-DRIFT"),
+            "drifted integrity healed: {snap_count} refs
+{healed}"
         );
     }
 

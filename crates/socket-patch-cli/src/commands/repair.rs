@@ -61,18 +61,37 @@ pub async fn run(args: RepairArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        if args.common.json {
-            let mut env = Envelope::new(Command::Repair);
-            env.dry_run = args.common.dry_run;
-            env.mark_error(EnvelopeError::new(
-                "manifest_not_found",
-                format!("Manifest not found at {}", manifest_path.display()),
-            ));
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("Manifest not found at {}", manifest_path.display());
+        // No manifest is still repairable when the project carries vendored
+        // state: a committed ledger, or lockfiles rewired to
+        // `.socket/vendor/...` paths (the ledger itself may be the thing
+        // that needs repairing). Only a project with neither is an error.
+        let state_file = args
+            .common
+            .cwd
+            .join(socket_patch_core::patch::vendor::VENDOR_STATE_REL);
+        let has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok()
+            || !crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
+                .await
+                .is_empty();
+        if !has_vendor_traces {
+            if args.common.json {
+                let mut env = Envelope::new(Command::Repair);
+                env.dry_run = args.common.dry_run;
+                env.mark_error(EnvelopeError::new(
+                    "manifest_not_found",
+                    format!("Manifest not found at {}", manifest_path.display()),
+                ));
+                println!("{}", env.to_pretty_json());
+            } else {
+                eprintln!("Manifest not found at {}", manifest_path.display());
+            }
+            return 1;
         }
-        return 1;
+        // The vendor-only repair still serializes on the .socket lock; the
+        // lock layer deliberately refuses to mkdir.
+        if let Some(dir) = manifest_path.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
     }
 
     // Serialize against concurrent socket-patch runs targeting the
@@ -165,10 +184,11 @@ pub(crate) async fn repair_inner(
     args: &RepairArgs,
     manifest_path: &Path,
 ) -> Result<(Envelope, RepairCounts), String> {
+    // `Ok(None)` = no manifest (vendor-only repair); present-but-invalid
+    // stays a hard error.
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Invalid manifest".to_string())?;
+        .map_err(|e| e.to_string())?;
 
     let socket_dir = manifest_path.parent().unwrap();
     let blobs_path = socket_dir.join("blobs");
@@ -192,19 +212,69 @@ pub(crate) async fn repair_inner(
     let mut blobs_checked = 0usize;
     let mut bytes_freed = 0u64;
 
+    // The envelope is built up-front: the vendored-artifact phase records
+    // its events inline; the download/cleanup aggregates are appended at
+    // the end (event ordering is documented best-effort).
+    let mut env = Envelope::new(Command::Repair);
+    env.dry_run = args.common.dry_run;
+
     // Step 1: Check for and download missing artifacts in the requested
     // mode. Counts below refer to whatever kind of artifact was requested
     // (file blobs, diff archives, or package archives).
-    let missing_artifacts: Vec<String> = match download_mode {
-        DownloadMode::File => get_missing_blobs(&manifest, &blobs_path)
+    //
+    // VENDORED-in-sync manifest entries are excluded: vendor flows keep
+    // patch content in memory and the committed artifact IS the patch, so
+    // a fully-vendored project legitimately has no `.socket/blobs|diffs|
+    // packages` — repair must not re-litter them (or fail trying). The
+    // cleanup phase below still uses the FULL manifest, so it never sweeps
+    // sources an in-place apply may need for rollback.
+    let vendor_state = socket_patch_core::patch::vendor::load_state(&args.common.cwd)
+        .await
+        .unwrap_or_default();
+    // Lockfile vendor references count as vendored even before the ledger
+    // is reconstructed, so a no-ledger repair doesn't download sources for
+    // entries the vendored phase is about to own.
+    let referenced_uuids: std::collections::HashSet<String> =
+        crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
+            .await
+            .into_iter()
+            .map(|(_, uuid, _)| uuid)
+            .collect();
+    let scoped_manifest = manifest.as_ref().map(|m| {
+        let patches = m
+            .patches
+            .iter()
+            .filter(|(purl, rec)| {
+                !referenced_uuids.contains(&rec.uuid)
+                    && vendor_state
+                        .entries
+                        .get(*purl)
+                        .or_else(|| {
+                            vendor_state
+                                .entries
+                                .values()
+                                .find(|e| &e.base_purl == *purl)
+                        })
+                        .is_none_or(|e| e.uuid != rec.uuid)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        socket_patch_core::manifest::schema::PatchManifest {
+            patches,
+            setup: m.setup.clone(),
+        }
+    });
+    let missing_artifacts: Vec<String> = match (&scoped_manifest, download_mode) {
+        (None, _) => Vec::new(),
+        (Some(m), DownloadMode::File) => get_missing_blobs(m, &blobs_path)
             .await
             .into_iter()
             .collect(),
-        DownloadMode::Diff => get_missing_archives(&manifest, &diffs_path)
+        (Some(m), DownloadMode::Diff) => get_missing_archives(m, &diffs_path)
             .await
             .into_iter()
             .collect(),
-        DownloadMode::Package => get_missing_archives(&manifest, &packages_path)
+        (Some(m), DownloadMode::Package) => get_missing_archives(m, &packages_path)
             .await
             .into_iter()
             .collect(),
@@ -241,9 +311,15 @@ pub(crate) async fn repair_inner(
                     blobs_path: &blobs_path,
                     packages_path: Some(&packages_path),
                     diffs_path: Some(&diffs_path),
+                    mem_blobs: None,
                 };
+                // Step 1 only runs with a manifest (missing_artifacts is
+                // empty otherwise), so the expect is unreachable.
+                let m = scoped_manifest
+                    .as_ref()
+                    .expect("step 1 requires a manifest");
                 let fetch_result =
-                    fetch_missing_sources(&manifest, &sources, download_mode, &client, None).await;
+                    fetch_missing_sources(m, &sources, download_mode, &client, None).await;
                 downloaded_count = fetch_result.downloaded;
                 download_failed_count = fetch_result.failed;
                 if !quiet {
@@ -277,8 +353,24 @@ pub(crate) async fn repair_inner(
         );
     }
 
+    // Step 1.5: vendored artifacts — health-check the ledger (and any
+    // lockfile vendor references with no ledger coverage) and rebuild
+    // missing/corrupt artifacts. Runs under `--download-only` too:
+    // restoring artifacts IS repair's download half.
+    let vendor_counts = crate::commands::repair_vendor::repair_vendored_artifacts(
+        &args.common,
+        manifest.as_ref(),
+        socket_dir,
+        &mut env,
+    )
+    .await;
+    if !quiet && vendor_counts.rebuilt > 0 {
+        println!("Rebuilt {} vendored artifact(s).", vendor_counts.rebuilt);
+    }
+
     // Step 2: Clean up unused artifacts across all three directories.
-    if !args.download_only {
+    if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
+        let manifest = manifest.clone();
         if !quiet {
             println!();
         }
@@ -360,8 +452,6 @@ pub(crate) async fn repair_inner(
     // Translate the aggregate counts into envelope events. `repair`
     // operates on artifacts (not specific patches), so events use the
     // `PatchEvent::artifact` form (no PURL/UUID).
-    let mut env = Envelope::new(Command::Repair);
-    env.dry_run = args.common.dry_run;
     let action_for_repair = if args.common.dry_run {
         PatchAction::Verified
     } else {

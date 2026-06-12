@@ -55,6 +55,7 @@ pub mod composer_lock;
 pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
+pub mod lock_inventory;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
@@ -67,6 +68,7 @@ pub mod pypi_poetry;
 pub mod pypi_requirements;
 pub mod pypi_uv;
 pub mod pypi_wheel;
+pub mod registry_fetch;
 mod toml_surgery;
 pub mod verify;
 pub mod yarn_berry_lock;
@@ -74,8 +76,16 @@ pub mod yarn_classic_lock;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
 pub use state::{load_state, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
+pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
 
-use crate::patch::apply::ApplyResult;
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::manifest::schema::{PatchFileInfo, PatchRecord};
+use crate::patch::apply::{
+    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
+    VerifyStatus,
+};
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -92,6 +102,276 @@ impl VendorWarning {
             detail: detail.into(),
         }
     }
+}
+
+/// One warning per staged file whose pre-patch content matched NEITHER
+/// `beforeHash` nor `afterHash` and was overwritten with the verified
+/// patched content (vendor staging always force-applies — the stage is a
+/// private copy, and every apply write path is hash-gated to exactly
+/// `afterHash`).
+///
+/// Detection rides the verify signature `apply_package_patch` leaves
+/// behind: a force-promoted file keeps `status: Ready` WITH
+/// `expected_hash: Some(..)` and a differing `current_hash`, whereas a
+/// cleanly-verified file carries `expected_hash: None` (see
+/// `verify_file_patch`).
+pub(crate) fn mismatch_overwrite_warnings(
+    result: &ApplyResult,
+    name: &str,
+    version: &str,
+) -> Vec<VendorWarning> {
+    let mut warnings: Vec<VendorWarning> = result
+        .files_verified
+        .iter()
+        .filter(|v| {
+            v.status == VerifyStatus::Ready
+                && v.expected_hash.is_some()
+                && v.current_hash != v.expected_hash
+        })
+        .map(|v| {
+            VendorWarning::new(
+                "vendor_content_mismatch_overwritten",
+                format!(
+                    "installed {name}@{version} does not match this patch's expected original \
+                     ({}); vendored the patched content anyway",
+                    v.file
+                ),
+            )
+        })
+        .collect();
+    // HashMap-driven verify order is randomized; keep warning order stable.
+    warnings.sort_by(|a, b| a.detail.cmp(&b.detail));
+    warnings
+}
+
+/// Patch-target files (non-empty `beforeHash`) absent from the staged
+/// copy. Vendor staging force-applies (see [`force_apply_staged`]), and
+/// force silently SKIPS missing files — which would pack an artifact
+/// without the fix. This pre-check restores the strict apply's
+/// fail-closed behavior for the non-`--force` path. Unsafe keys are
+/// skipped here: the apply pipeline itself rejects them fail-closed.
+pub(crate) async fn missing_existing_patch_files(
+    staged_dir: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for (file_name, info) in files {
+        if info.before_hash.is_empty() {
+            continue; // a new file is expected to not exist yet
+        }
+        let normalized = normalize_file_path(file_name);
+        if !is_safe_relative_subpath(normalized) {
+            continue;
+        }
+        if tokio::fs::metadata(staged_dir.join(normalized))
+            .await
+            .is_err()
+        {
+            missing.push(file_name.clone());
+        }
+    }
+    missing.sort();
+    missing
+}
+
+/// A failed synthesized [`ApplyResult`] in the shape the strict apply
+/// pipeline would have produced (success=false, `error` set, no files).
+pub(crate) fn failed_apply_result(purl: &str, error: String) -> ApplyResult {
+    ApplyResult {
+        package_key: purl.to_string(),
+        package_path: String::new(),
+        success: false,
+        files_verified: Vec::new(),
+        files_patched: Vec::new(),
+        applied_via: HashMap::new(),
+        error: Some(error),
+        sidecar: None,
+    }
+}
+
+/// Patched-content blobs harvested from the committed vendor artifacts:
+/// for every manifest record whose patch uuid matches its ledger entry,
+/// hash the artifact's files (git-sha256, the manifest hash) and keep the
+/// ones matching the record's `afterHash`es.
+///
+/// This is what lets vendor RE-RUNS (in-sync verification, re-vendor) run
+/// with no network and no `.socket/blobs` — the committed artifact IS the
+/// patched content. Artifact shapes: npm/pypi tarball-or-wheel files and
+/// the dir-shaped ecosystems (cargo/golang/composer/gem copies). Fail-soft
+/// per entry; tampered/oversized artifacts contribute nothing (the apply
+/// pipeline's afterHash gate decides correctness either way).
+pub async fn harvest_artifact_blobs(
+    project_root: &Path,
+    manifest_patches: &HashMap<String, crate::manifest::schema::PatchRecord>,
+) -> HashMap<String, Vec<u8>> {
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    let Ok(state) = load_state(project_root).await else {
+        return out;
+    };
+    if state.entries.is_empty() {
+        return out;
+    }
+
+    for (purl, record) in manifest_patches {
+        let needed: std::collections::HashSet<&str> = record
+            .files
+            .values()
+            .map(|f| f.after_hash.as_str())
+            .filter(|h| !h.is_empty() && !out.contains_key(*h))
+            .collect();
+        if needed.is_empty() {
+            continue;
+        }
+        let Some(entry) = state.entries.get(purl).or_else(|| {
+            state
+                .entries
+                .values()
+                .find(|e| e.base_purl == crate::utils::purl::strip_purl_qualifiers(purl))
+        }) else {
+            continue;
+        };
+        if entry.uuid != record.uuid {
+            continue; // stale artifact: a re-vendor is pending, don't trust it
+        }
+        // SECURITY: the artifact path comes from the committed, tamperable
+        // ledger and is joined onto the project root for READING only —
+        // still, never follow an escaping path.
+        if !crate::patch::apply::is_safe_relative_subpath(&entry.artifact.path) {
+            continue;
+        }
+        let artifact = project_root.join(&entry.artifact.path);
+
+        // Tarball/wheel artifacts: read entries in memory.
+        let lower = entry.artifact.path.to_ascii_lowercase();
+        if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
+            if let Ok(map) = crate::patch::package::read_archive_to_map(&artifact) {
+                for bytes in map.into_values() {
+                    let h = compute_git_sha256_from_bytes(&bytes);
+                    if needed.contains(h.as_str()) {
+                        out.insert(h, bytes);
+                    }
+                }
+            }
+            continue;
+        }
+        if lower.ends_with(".whl") || lower.ends_with(".zip") {
+            let Ok(bytes) = tokio::fs::read(&artifact).await else {
+                continue;
+            };
+            if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+                continue;
+            }
+            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+                continue;
+            };
+            for i in 0..archive.len() {
+                use std::io::Read as _;
+                let Ok(mut file) = archive.by_index(i) else {
+                    continue;
+                };
+                if file.is_dir() || file.size() > MAX_FILE_BYTES {
+                    continue;
+                }
+                let mut content = Vec::with_capacity(file.size() as usize);
+                if file.read_to_end(&mut content).is_err() {
+                    continue;
+                }
+                let h = compute_git_sha256_from_bytes(&content);
+                if needed.contains(h.as_str()) {
+                    out.insert(h, content);
+                }
+            }
+            continue;
+        }
+        // Dir-shaped artifacts (cargo/golang/composer/gem copies): the
+        // record keys are package-relative, so resolve each needed file
+        // directly instead of walking the whole tree.
+        if tokio::fs::metadata(&artifact)
+            .await
+            .is_ok_and(|m| m.is_dir())
+        {
+            for (file_name, info) in &record.files {
+                if !needed.contains(info.after_hash.as_str()) {
+                    continue;
+                }
+                let rel = crate::patch::apply::normalize_file_path(file_name);
+                if !crate::patch::apply::is_safe_relative_subpath(rel) {
+                    continue;
+                }
+                if let Ok(content) = tokio::fs::read(artifact.join(rel)).await {
+                    if content.len() as u64 > MAX_FILE_BYTES {
+                        continue;
+                    }
+                    let h = compute_git_sha256_from_bytes(&content);
+                    if h == info.after_hash {
+                        out.insert(h, content);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run the hardened apply pipeline against a vendor stage/copy with the
+/// vendor auto-force policy:
+///
+/// * Missing patch-target files fail closed unless the caller's own
+///   `--force` asked for that skip tolerance.
+/// * The apply itself ALWAYS forces: the stage is a private copy (never
+///   the user's tree), and every apply write path is hash-gated to
+///   exactly `afterHash` (the archive and blob paths verify content
+///   BEFORE writing; the diff path self-disables on a base mismatch) —
+///   forcing can only produce the verified patched content or fail
+///   closed. This is what lets vendor succeed on a package already
+///   patched in place by `apply`, or on a patch whose `beforeHash` was
+///   built against different bytes than the installed artifact.
+/// * Every force-overwritten file (content matched NEITHER hash) emits a
+///   `vendor_content_mismatch_overwritten` warning — including on dry
+///   runs, so previews predict the real outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn force_apply_staged(
+    purl: &str,
+    staged_dir: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    dry_run: bool,
+    force: bool,
+    name: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> ApplyResult {
+    if !force {
+        let missing = missing_existing_patch_files(staged_dir, &record.files).await;
+        if let Some(first) = missing.first() {
+            return failed_apply_result(
+                purl,
+                format!("Cannot apply patch: {first} - File not found"),
+            );
+        }
+    }
+    let result = apply_package_patch(
+        purl,
+        staged_dir,
+        &record.files,
+        sources,
+        Some(&record.uuid),
+        dry_run,
+        // The stage is private and every write path is afterHash-gated;
+        // Force additionally covers the caller's --force NotFound-skip
+        // (the missing-file pre-check above handles the default case).
+        crate::patch::apply::MismatchPolicy::Force,
+    )
+    .await;
+    if result.success {
+        warnings.extend(mismatch_overwrite_warnings(&result, name, version));
+    }
+    result
 }
 
 /// The result of one backend `vendor_*` call.
@@ -185,5 +465,214 @@ pub async fn vendored_purl_keys(
             })
             .collect(),
         Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::patch::apply::VerifyResult;
+
+    fn verify(status: VerifyStatus, expected: Option<&str>, current: Option<&str>) -> VerifyResult {
+        VerifyResult {
+            file: "package/index.js".to_string(),
+            status,
+            message: None,
+            current_hash: current.map(str::to_string),
+            expected_hash: expected.map(str::to_string),
+            target_hash: None,
+        }
+    }
+
+    fn result_with(files_verified: Vec<VerifyResult>) -> ApplyResult {
+        ApplyResult {
+            package_key: "pkg:npm/x@1.0.0".to_string(),
+            package_path: String::new(),
+            success: true,
+            files_verified,
+            files_patched: Vec::new(),
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        }
+    }
+
+    /// Only the force-promoted signature (`Ready` + `expected_hash: Some` +
+    /// differing `current_hash`) flags an overwrite; clean verifies and
+    /// AlreadyPatched files never do.
+    #[test]
+    fn mismatch_overwrite_warnings_detects_promoted_ready() {
+        // Force-promoted mismatch: flagged.
+        let r = result_with(vec![verify(VerifyStatus::Ready, Some("aa"), Some("bb"))]);
+        let w = mismatch_overwrite_warnings(&r, "left-pad", "1.3.0");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].code, "vendor_content_mismatch_overwritten");
+        assert!(w[0].detail.contains("left-pad@1.3.0"));
+        assert!(w[0].detail.contains("package/index.js"));
+
+        // Clean Ready (verify matched beforeHash): expected_hash is None.
+        let r = result_with(vec![verify(VerifyStatus::Ready, None, Some("aa"))]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+
+        // AlreadyPatched (afterHash content): not a mismatch.
+        let r = result_with(vec![verify(
+            VerifyStatus::AlreadyPatched,
+            None,
+            Some("after"),
+        )]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+
+        // NotFound (force-skipped): not an overwrite.
+        let r = result_with(vec![verify(VerifyStatus::NotFound, None, None)]);
+        assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod harvest_tests {
+    use super::*;
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::{PatchFileInfo, PatchRecord};
+    use std::collections::HashMap;
+    use std::io::Write as _;
+
+    const UUID: &str = "11111111-2222-4333-8444-555555555555";
+    const PATCHED: &[u8] = b"module.exports = patched;\n";
+
+    fn record(purl: &str, uuid: &str, file: &str, after: &[u8]) -> (String, PatchRecord) {
+        let mut files = HashMap::new();
+        files.insert(
+            file.to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        );
+        (
+            purl.to_string(),
+            PatchRecord {
+                uuid: uuid.to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        )
+    }
+
+    fn write_ledger(root: &Path, purl: &str, uuid: &str, artifact_path: &str) {
+        let vendor_dir = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        let state = serde_json::json!({
+            "version": 1,
+            "entries": {
+                purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": uuid,
+                    "artifact": { "path": artifact_path },
+                    "wiring": [],
+                }
+            }
+        });
+        std::fs::write(
+            vendor_dir.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_tgz(path: &Path, entry_name: &str, content: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let gz = flate2::write::GzEncoder::new(
+            std::fs::File::create(path).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, entry_name, content).unwrap();
+        tar.into_inner().unwrap().finish().unwrap().flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn harvests_after_blobs_from_committed_tgz() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "tgz artifact must yield its afterHash blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_uuid_artifact_contributes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        write_tgz(&tmp.path().join(&rel), "package/index.js", PATCHED);
+        // Ledger still points at an OLD patch uuid: a re-vendor is pending
+        // and the artifact's content must not be trusted for the new record.
+        write_ledger(
+            tmp.path(),
+            purl,
+            "99999999-aaaa-4bbb-8ccc-dddddddddddd",
+            &rel,
+        );
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(harvest_artifact_blobs(tmp.path(), &patches)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn escaping_artifact_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        // The artifact CONTENT would match — only the committed, tamperable
+        // ledger path escapes the project. Must contribute nothing.
+        let project = tmp.path().join("project");
+        write_tgz(&tmp.path().join("outside.tgz"), "package/index.js", PATCHED);
+        write_ledger(&project, purl, UUID, "../outside.tgz");
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        assert!(harvest_artifact_blobs(&project, &patches).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dir_shaped_artifact_resolves_record_relative_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:cargo/serde@1.0.0";
+        let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+        let file_dir = tmp.path().join(&rel).join("src");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        std::fs::write(file_dir.join("lib.rs"), PATCHED).unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "src/lib.rs", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "dir-shaped artifact must yield its afterHash blob"
+        );
     }
 }
