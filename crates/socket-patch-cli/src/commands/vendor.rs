@@ -102,10 +102,29 @@ pub(crate) async fn dispatch_vendor_one(
     // The patch.socket.dev vendoring-service config. `None` = build-only (the
     // pre-service behavior); used by the `vendor` command, `None` from `scan
     // --vendor` / repair. Per-ecosystem backends consume it as they gain a
-    // service path; today npm does.
+    // service path.
     service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
+
+    // Prebuilt service downloads currently cover npm, pypi, and cargo; the
+    // remaining ecosystems vendor by building locally. Under fail-closed
+    // `service` mode, refuse the not-yet-covered ones with a clear message
+    // rather than silently building (which would violate the contract). Under
+    // `auto`/`build` they fall through to the local build as before.
+    const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo"];
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
+            return Some(VendorOutcome::Refused {
+                code: "vendor_service_unsupported_ecosystem",
+                detail: format!(
+                    "--vendor-source=service is not yet supported for `{eco}` \
+                     (prebuilt downloads currently cover npm, pypi, and cargo); \
+                     use --vendor-source=auto or --vendor-source=build"
+                ),
+            });
+        }
+    }
     Some(match eco {
         "npm" => {
             // The flavor router probes the project's lockfile (package-lock /
