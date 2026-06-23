@@ -161,6 +161,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }

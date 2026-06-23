@@ -854,7 +854,11 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// bytes-only extraction would silently strip bin scripts' exec bits).
 /// Fails CLOSED on any traversal-shaped entry — a malicious tarball must
 /// not half-extract.
-fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
+///
+/// `pub(crate)` so the cargo service-download path can extract a downloaded
+/// `.crate` (tar.gz, single top-level `{name}-{version}/` prefix) into the
+/// vendor copy dir — the same content the local `fresh_copy` produces.
+pub(crate) fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
     extract_tar_gz(bytes, dest, /*strip_first=*/ true)
 }
 
