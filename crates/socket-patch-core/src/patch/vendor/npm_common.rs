@@ -156,7 +156,7 @@ pub(super) async fn stage_patch_pack(
         }
         if cfg.service_enabled() && !dry_run {
             match try_service_pack(purl, project_root, &coords, record, cfg, warnings).await {
-                ServicePackDecision::Used(pair) => return Ok(pair),
+                ServicePackDecision::Used(pair) => return Ok(*pair),
                 ServicePackDecision::HardFail(outcome) => return Err(outcome),
                 ServicePackDecision::FallBack => { /* fall through to local build */ }
             }
@@ -288,7 +288,8 @@ pub(super) async fn stage_patch_pack(
 /// Outcome of attempting the service-download fast path in [`stage_patch_pack`].
 enum ServicePackDecision {
     /// Use the service artifact — the staged pack + a synthesized success.
-    Used((Option<NpmStagedPack>, ApplyResult)),
+    /// Boxed: the pair is large relative to the other (small) variants.
+    Used(Box<(Option<NpmStagedPack>, ApplyResult)>),
     /// Abort vendoring this package (a `service`-mode miss, or a downloaded
     /// artifact we could not turn into a staged pack).
     HardFail(Box<VendorOutcome>),
@@ -330,7 +331,7 @@ async fn try_service_pack(
                     ));
                     let result =
                         synthesized_service_result(purl, &project_root.join(&staged.rel_tgz), record);
-                    ServicePackDecision::Used((Some(staged), result))
+                    ServicePackDecision::Used(Box::new((Some(staged), result)))
                 }
                 Err(outcome) => ServicePackDecision::HardFail(outcome),
             }
