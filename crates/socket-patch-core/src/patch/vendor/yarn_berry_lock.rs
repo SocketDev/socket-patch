@@ -75,6 +75,7 @@ pub async fn vendor_yarn_berry(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -268,6 +269,7 @@ pub async fn vendor_yarn_berry(
         dry_run,
         force,
         &mut warnings,
+        service,
     )
     .await
     {
@@ -1132,6 +1134,7 @@ __metadata:
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
+                None,
             )
             .await
         }

@@ -632,9 +632,337 @@ impl ApiClient {
             text,
         )))
     }
+
+    /// Resolve a published-patch UUID into a prebuilt vendored archive +
+    /// integrity from the patch.socket.dev vendoring service, then download it.
+    ///
+    /// Two HTTP round-trips:
+    /// 1. POST the package-reference endpoint (`/v0/orgs/{slug}/patches/package`
+    ///    when authenticated, else the public proxy's `/patch/package`) to mint
+    ///    / reuse a download grant and learn the artifact URL + integrity.
+    /// 2. GET the returned grant-tokenized serve URL for the archive bytes.
+    ///
+    /// `vendor_url` overrides the step-1 base host; `patch_server_url` rewrites
+    /// the step-2 download host (both for staging / local-dev / testing). The
+    /// returned [`FetchedVendorPackage`] carries the *unverified* bytes plus the
+    /// service-reported integrity — the caller verifies before use.
+    pub async fn fetch_vendor_package(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> VendorServiceOutcome {
+        if !is_valid_uuid(uuid) {
+            return VendorServiceOutcome::Failed(ApiError::InvalidHash(format!(
+                "Invalid patch UUID: {uuid}"
+            )));
+        }
+
+        // ── Step 1: resolve the grant URL + integrity ──────────────────────
+        let result = match self.request_vendor_package(uuid, free_only, vendor_url).await {
+            Ok(r) => r,
+            Err(e) => return VendorServiceOutcome::Failed(e),
+        };
+        // Classify the build/grant status before attempting any download.
+        match result.status.as_str() {
+            "granted" | "reused" => {}
+            "pending_build" => return VendorServiceOutcome::Pending,
+            "build_failed" | "withdrawn" | "not_found" => {
+                return VendorServiceOutcome::Unavailable(result.status.clone())
+            }
+            "forbidden" => {
+                return VendorServiceOutcome::Failed(ApiError::Forbidden(
+                    "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
+                ))
+            }
+            other => {
+                return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`"))
+            }
+        }
+
+        // Select the native tarball artifact and its sha512 (the universal
+        // integrity floor — every ecosystem's tarball carries it). The npm
+        // yarn-berry-zip artifact is intentionally ignored here (v1).
+        let Some(artifact) = result
+            .artifacts
+            .as_ref()
+            .and_then(|arts| arts.iter().find(|a| a.kind == "tarball"))
+        else {
+            return VendorServiceOutcome::Unavailable("no tarball artifact in response".into());
+        };
+        let Some(sha512_raw) = artifact.integrity.sha512.as_deref() else {
+            return VendorServiceOutcome::Unavailable(
+                "tarball artifact has no sha512 integrity".into(),
+            );
+        };
+        let integrity_sri = normalize_sha512_sri(sha512_raw);
+        // The artifact's own URL wins; fall back to the top-level `url`.
+        let Some(download_url) = artifact.url.as_deref().or(result.url.as_deref()) else {
+            return VendorServiceOutcome::Unavailable("granted result has no download url".into());
+        };
+        let download_url = match patch_server_url {
+            Some(base) => match rewrite_url_host(download_url, base) {
+                Ok(u) => u,
+                Err(e) => return VendorServiceOutcome::Failed(e),
+            },
+            None => download_url.to_string(),
+        };
+
+        // ── Step 2: download the prebuilt archive ──────────────────────────
+        match self.download_vendor_archive(&download_url).await {
+            ServeDownload::Ok(bytes) => VendorServiceOutcome::Ready(FetchedVendorPackage {
+                tarball: bytes,
+                integrity_sri,
+                sha1_hex: artifact.integrity.sha1.clone(),
+                dirhash_h1: artifact.integrity.dirhash_h1.clone(),
+                size_bytes: artifact.size_bytes,
+                content_type: artifact.content_type.clone(),
+                source_url: download_url,
+            }),
+            ServeDownload::NotFound => {
+                VendorServiceOutcome::Unavailable("serve returned 404/410".into())
+            }
+            ServeDownload::Pending => VendorServiceOutcome::Pending,
+            ServeDownload::Failed(e) => VendorServiceOutcome::Failed(e),
+        }
+    }
+
+    /// Step 1 of [`Self::fetch_vendor_package`]: POST the package-reference
+    /// endpoint and return the single requested UUID's result.
+    async fn request_vendor_package(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+    ) -> Result<PackageVendorResult, ApiError> {
+        let body = PackageVendorRequest {
+            uuids: vec![uuid.to_string()],
+            // Only send freeOnly when forcing it (the public-proxy contract);
+            // the authenticated endpoint defaults to false.
+            free_only: free_only.then_some(true),
+        };
+        // Authenticated when a token + org slug are configured and we're not
+        // pinned to the public proxy — mirrors `binary_url`'s decision so a
+        // bearer is never sent to the proxy.
+        let use_auth =
+            self.api_token.is_some() && self.org_slug.is_some() && !self.use_public_proxy;
+        let base = vendor_url
+            .unwrap_or(&self.api_url)
+            .trim_end_matches('/')
+            .to_string();
+
+        let resp = if use_auth {
+            let slug = self.org_slug.as_deref().unwrap();
+            let url = format!("{base}/v0/orgs/{slug}/patches/package");
+            debug_log(&format!("POST {url}"));
+            self.client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .await
+        } else {
+            let url = format!("{base}/patch/package");
+            debug_log(&format!("POST {url}"));
+            // Plain (no-auth) client: never leak the bearer to the proxy.
+            plain_client()
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json")
+                .json(&body)
+                .send()
+                .await
+        };
+
+        let resp = resp.map_err(|e| ApiError::Network(format!("Network error: {e}")))?;
+        let status = resp.status();
+        if status == StatusCode::OK {
+            let parsed = resp.json::<PackageVendorResponse>().await.map_err(|e| {
+                ApiError::Parse(format!("Failed to parse package response: {e}"))
+            })?;
+            return parsed.results.get(uuid).cloned().ok_or_else(|| {
+                ApiError::Other(format!("package response missing a result for {uuid}"))
+            });
+        }
+        if let Some(err) = classify_auth_error(status, !use_auth) {
+            return Err(err);
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(ApiError::Other(format!(
+            "package request failed with status {}: {text}",
+            status.as_u16(),
+        )))
+    }
+
+    /// Step 2 of [`Self::fetch_vendor_package`]: GET the grant-tokenized serve
+    /// URL. The grant token in the path is the authorization, so this uses a
+    /// plain (no-auth) client.
+    async fn download_vendor_archive(&self, url: &str) -> ServeDownload {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return ServeDownload::Failed(ApiError::Other(format!(
+                "refusing non-http(s) artifact URL `{url}`"
+            )));
+        }
+        debug_log(&format!("GET vendor package {url}"));
+        let resp = match plain_client()
+            .get(url)
+            .header(header::ACCEPT, "application/octet-stream")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return ServeDownload::Failed(ApiError::Network(format!(
+                    "Network error fetching vendor package: {e}"
+                )))
+            }
+        };
+        let status = resp.status();
+        match status {
+            StatusCode::OK => {}
+            // 404 (build_failed / not stored) and 410 (withdrawn) are terminal
+            // misses; the caller decides build-fallback vs hard-fail.
+            StatusCode::NOT_FOUND | StatusCode::GONE => return ServeDownload::NotFound,
+            // 408 = the archive is still building (Retry-After) — retryable.
+            StatusCode::REQUEST_TIMEOUT => return ServeDownload::Pending,
+            _ => {
+                if let Some(err) = classify_auth_error(status, true) {
+                    return ServeDownload::Failed(err);
+                }
+                let text = resp.text().await.unwrap_or_default();
+                return ServeDownload::Failed(ApiError::Other(format!(
+                    "vendor package download failed with status {}: {text}",
+                    status.as_u16(),
+                )));
+            }
+        }
+        match read_capped(resp, MAX_VENDOR_PACKAGE_BYTES).await {
+            Ok(bytes) => ServeDownload::Ok(bytes),
+            Err(e) => ServeDownload::Failed(ApiError::Network(e)),
+        }
+    }
 }
 
 // ── Free functions ────────────────────────────────────────────────────
+
+/// Cap on a single prebuilt-archive download (defensive bound against a
+/// runaway / hostile serve response). Generous enough for any real package.
+const MAX_VENDOR_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A prebuilt vendored archive downloaded from the patch.socket.dev service,
+/// together with the service-reported integrity. The bytes are **unverified**
+/// here — callers must verify against `integrity_sri` (and, for golang, the
+/// `h1:` dirhash) before writing/extracting.
+#[derive(Debug, Clone)]
+pub struct FetchedVendorPackage {
+    pub tarball: Vec<u8>,
+    /// Normalized Subresource-Integrity string, always `sha512-<b64>`.
+    pub integrity_sri: String,
+    /// Hex sha1 of the archive, when the service reported one.
+    pub sha1_hex: Option<String>,
+    /// golang module-zip dirhash (`h1:<b64>`), when present.
+    pub dirhash_h1: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub content_type: Option<String>,
+    /// The (possibly host-rewritten) URL the bytes were fetched from.
+    pub source_url: String,
+}
+
+/// Outcome of [`ApiClient::fetch_vendor_package`].
+///
+/// The vendor backends map these onto the `auto`/`service`/`build` policy:
+/// `Ready` → use the service archive; `Pending`/`Unavailable`/`Failed` → fall
+/// back to a local build under `auto`, or hard-fail under `service`.
+#[derive(Debug)]
+pub enum VendorServiceOutcome {
+    /// Archive downloaded; integrity carried for the caller to verify.
+    Ready(FetchedVendorPackage),
+    /// The archive is still building (`pending_build` status or serve 408) —
+    /// retryable.
+    Pending,
+    /// A terminal miss for this input (not built, withdrawn, not found, or no
+    /// usable artifact). `String` is a short reason for logging.
+    Unavailable(String),
+    /// A request/transport/auth failure (401/403 grant, 5xx, network, malformed).
+    Failed(ApiError),
+}
+
+/// Internal result of the step-2 archive GET.
+enum ServeDownload {
+    Ok(Vec<u8>),
+    /// 404 / 410 — terminal miss.
+    NotFound,
+    /// 408 — still building, retryable.
+    Pending,
+    Failed(ApiError),
+}
+
+/// Build a plain `reqwest::Client` carrying only the User-Agent — no
+/// Authorization. Used for the public-proxy POST and the grant-tokenized serve
+/// GET, where sending the Socket bearer would leak it to a third party.
+fn plain_client() -> reqwest::Client {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(USER_AGENT_VALUE),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("failed to build plain reqwest client")
+}
+
+/// Stream a response body into memory with a hard byte cap, rejecting both an
+/// over-large declared `Content-Length` and an actual stream that exceeds the
+/// cap mid-flight.
+async fn read_capped(mut resp: reqwest::Response, max: u64) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len > max {
+            return Err(format!(
+                "vendor package too large: declared {len} bytes > {max} cap"
+            ));
+        }
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("error reading vendor package body: {e}"))?
+    {
+        if bytes.len() as u64 + chunk.len() as u64 > max {
+            return Err(format!("vendor package exceeded {max}-byte cap mid-stream"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Normalize a service-reported sha512 into SRI form (`sha512-<b64>`).
+///
+/// The service persists npm SRI form, but tolerate a bare base64 digest by
+/// prefixing it — `verify_sri` (the consumer) expects the `sha512-` prefix.
+fn normalize_sha512_sri(value: &str) -> String {
+    let v = value.trim();
+    if v.starts_with("sha512-") {
+        v.to_string()
+    } else {
+        format!("sha512-{v}")
+    }
+}
+
+/// Rewrite the scheme + host (+ port) of `original` to those of `new_base`,
+/// preserving `original`'s path and query. Used to redirect a server-returned
+/// serve URL at a local-dev / test host (`--patch-server-url`).
+fn rewrite_url_host(original: &str, new_base: &str) -> Result<String, ApiError> {
+    let orig = reqwest::Url::parse(original)
+        .map_err(|e| ApiError::Other(format!("malformed serve URL `{original}`: {e}")))?;
+    let mut base = reqwest::Url::parse(new_base)
+        .map_err(|e| ApiError::Other(format!("malformed --patch-server-url `{new_base}`: {e}")))?;
+    base.set_path(orig.path());
+    base.set_query(orig.query());
+    Ok(base.to_string())
+}
 
 /// Explicit overrides for environment-based API client construction.
 ///
@@ -2009,5 +2337,338 @@ mod tests {
         let patch = make_patch(vulns, "desc");
         let info = convert_search_result_to_batch_info(patch);
         assert_eq!(info.title, "A summary");
+    }
+}
+
+#[cfg(test)]
+mod vendor_package_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    const UUID: &str = "11111111-1111-1111-1111-111111111111";
+    const SERVE_PATH: &str = "/patch/npm/lodash/4.17.21/tok/uuid/lodash-4.17.21.tgz";
+    const TARBALL: &[u8] = b"prebuilt deterministic tarball bytes";
+
+    /// Matches a request that carries NO `Authorization` header — proves the
+    /// proxy POST and the grant-tokenized serve GET never leak the bearer.
+    struct NoAuthorizationHeader;
+    impl Match for NoAuthorizationHeader {
+        fn matches(&self, request: &Request) -> bool {
+            !request.headers.contains_key("authorization")
+        }
+    }
+
+    fn auth_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("acme".into()),
+        })
+    }
+
+    fn proxy_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: None,
+            use_public_proxy: true,
+            org_slug: None,
+        })
+    }
+
+    /// A `granted` body whose tarball artifact points at `serve_url`.
+    fn granted_body(serve_url: &str, sha512: &str) -> serde_json::Value {
+        json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "purl": "pkg:npm/lodash@4.17.21",
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": serve_url,
+                        "contentType": "application/gzip",
+                        "sizeBytes": TARBALL.len(),
+                        "integrity": { "sha512": sha512, "sha1": "deadbeef" }
+                    }]
+                }
+            }
+        })
+    }
+
+    async fn mount_status(server: &MockServer, status: &str) {
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn granted_authenticated_downloads_and_returns_bytes() {
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .and(body_partial_json(json!({ "uuids": [UUID] })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ABC123==")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .and(NoAuthorizationHeader)
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        match outcome {
+            VendorServiceOutcome::Ready(pkg) => {
+                assert_eq!(pkg.tarball, TARBALL);
+                assert_eq!(pkg.integrity_sri, "sha512-ABC123==");
+                assert_eq!(pkg.sha1_hex.as_deref(), Some("deadbeef"));
+                assert_eq!(pkg.source_url, serve_url);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_path_posts_to_patch_route_without_auth_and_forces_free_only() {
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/patch/package"))
+            .and(NoAuthorizationHeader)
+            .and(body_partial_json(json!({ "uuids": [UUID], "freeOnly": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // free_only=true (public-proxy contract).
+        let outcome = proxy_client(server.uri())
+            .fetch_vendor_package(UUID, true, None, None)
+            .await;
+        assert!(matches!(outcome, VendorServiceOutcome::Ready(_)));
+    }
+
+    #[tokio::test]
+    async fn bare_sha512_is_normalized_to_sri() {
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "BAREB64==")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL.to_vec()))
+            .mount(&server)
+            .await;
+
+        match auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await
+        {
+            VendorServiceOutcome::Ready(pkg) => assert_eq!(pkg.integrity_sri, "sha512-BAREB64=="),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_server_url_rewrites_the_download_host() {
+        let server = MockServer::start().await;
+        // The server bakes an UNREACHABLE host into the URL; --patch-server-url
+        // redirects the GET at the mock while preserving the path.
+        let baked = format!("https://patch.socket.dev{SERVE_PATH}");
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(TARBALL.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, Some(&server.uri()))
+            .await;
+        match outcome {
+            VendorServiceOutcome::Ready(pkg) => {
+                assert!(pkg.source_url.starts_with(&server.uri()), "host rewritten");
+                assert!(pkg.source_url.ends_with(SERVE_PATH), "path preserved");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_build_status_skips_download_and_is_pending() {
+        let server = MockServer::start().await;
+        mount_status(&server, "pending_build").await;
+        // No GET mock mounted: a download attempt would 404 the server's
+        // catch-all (no mock) — but more importantly we never get there.
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        assert!(matches!(outcome, VendorServiceOutcome::Pending));
+    }
+
+    #[tokio::test]
+    async fn serve_408_is_pending() {
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(408))
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        assert!(matches!(outcome, VendorServiceOutcome::Pending));
+    }
+
+    #[tokio::test]
+    async fn terminal_statuses_are_unavailable() {
+        for status in ["build_failed", "withdrawn", "not_found"] {
+            let server = MockServer::start().await;
+            mount_status(&server, status).await;
+            let outcome = auth_client(server.uri())
+                .fetch_vendor_package(UUID, false, None, None)
+                .await;
+            assert!(
+                matches!(outcome, VendorServiceOutcome::Unavailable(_)),
+                "status {status} must be Unavailable",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_status_is_failed() {
+        let server = MockServer::start().await;
+        mount_status(&server, "forbidden").await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        assert!(matches!(
+            outcome,
+            VendorServiceOutcome::Failed(ApiError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn serve_404_and_403_and_5xx_map_correctly() {
+        // 404 → Unavailable
+        for (code, expect_failed) in [(404u16, false), (410, false), (403, true), (503, true)] {
+            let server = MockServer::start().await;
+            let serve_url = format!("{}{SERVE_PATH}", server.uri());
+            Mock::given(method("POST"))
+                .and(path("/v0/orgs/acme/patches/package"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(SERVE_PATH))
+                .respond_with(ResponseTemplate::new(code))
+                .mount(&server)
+                .await;
+            let outcome = auth_client(server.uri())
+                .fetch_vendor_package(UUID, false, None, None)
+                .await;
+            if expect_failed {
+                assert!(
+                    matches!(outcome, VendorServiceOutcome::Failed(_)),
+                    "serve {code} must be Failed",
+                );
+            } else {
+                assert!(
+                    matches!(outcome, VendorServiceOutcome::Unavailable(_)),
+                    "serve {code} must be Unavailable",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_tarball_artifact_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": null,
+                    "artifacts": [{ "kind": "yarn-berry-zip", "url": "https://x/y.zip",
+                                    "integrity": { "yarnBerry10c0": "10c0/abc" } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        assert!(matches!(outcome, VendorServiceOutcome::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn tarball_without_sha512_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": "https://x/y.tgz",
+                    "artifacts": [{ "kind": "tarball", "url": "https://x/y.tgz",
+                                    "integrity": { "sha1": "deadbeef" } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        let outcome = auth_client(server.uri())
+            .fetch_vendor_package(UUID, false, None, None)
+            .await;
+        assert!(matches!(outcome, VendorServiceOutcome::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_uuid_is_failed_without_network() {
+        // No server: an early UUID-shape rejection must not make any request.
+        let client = auth_client("http://127.0.0.1:1".into());
+        let outcome = client
+            .fetch_vendor_package("not-a-uuid", false, None, None)
+            .await;
+        assert!(matches!(
+            outcome,
+            VendorServiceOutcome::Failed(ApiError::InvalidHash(_))
+        ));
     }
 }

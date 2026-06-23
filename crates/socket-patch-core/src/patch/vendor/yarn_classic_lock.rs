@@ -60,6 +60,7 @@ pub async fn vendor_yarn_classic(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -136,6 +137,7 @@ pub async fn vendor_yarn_classic(
         dry_run,
         force,
         &mut warnings,
+        service,
     )
     .await
     {
@@ -951,6 +953,7 @@ left-pad@^1.3.0, left-pad@~1.3.0:
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
+                None,
             )
             .await
         }

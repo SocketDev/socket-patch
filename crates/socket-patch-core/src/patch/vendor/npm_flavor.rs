@@ -264,6 +264,7 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 /// surface verbatim; the detected flavor is stamped onto the ledger entry so
 /// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn vendor_npm_any(
     purl: &str,
     installed_dir: &Path,
@@ -273,6 +274,7 @@ pub async fn vendor_npm_any(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let (flavor, probe_warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
@@ -289,6 +291,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -302,6 +305,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -315,6 +319,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -328,6 +333,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -341,6 +347,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -713,6 +720,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
+            None,
         )
         .await
     }

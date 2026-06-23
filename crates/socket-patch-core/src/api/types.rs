@@ -95,6 +95,78 @@ pub struct BatchSearchResponse {
     pub can_access_paid_patches: bool,
 }
 
+/// Request body for the package-vendor endpoint: `POST
+/// /v0/orgs/{slug}/patches/package` (authenticated) and `POST /patch/package`
+/// (public proxy). Resolves published-patch UUIDs into prebuilt vendored-archive
+/// download URLs + integrity. The public proxy forces `free_only`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVendorRequest {
+    pub uuids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_only: Option<bool>,
+}
+
+/// Response from the package-vendor endpoint: one result per requested UUID,
+/// keyed by the UUID string.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PackageVendorResponse {
+    pub results: HashMap<String, PackageVendorResult>,
+}
+
+/// One package-vendor result. `status` is the discriminator; `url` / `purl` /
+/// `artifacts` are populated only for `granted` / `reused`.
+///
+/// `status` values: `granted` | `reused` | `pending_build` | `build_failed`
+/// | `withdrawn` | `forbidden` | `not_found`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVendorResult {
+    pub status: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub purl: Option<String>,
+    #[serde(default)]
+    pub artifacts: Option<Vec<PackageVendorArtifact>>,
+}
+
+/// One served artifact: the native tarball (`kind: "tarball"`), or — npm only —
+/// a yarn-berry cache zip (`kind: "yarn-berry-zip"`). `url` is null only when
+/// the artifact isn't stored yet (e.g. an unbuilt berry zip).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVendorArtifact {
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub integrity: PackageVendorIntegrity,
+}
+
+/// Per-artifact integrity hashes. Every ecosystem's tarball populates `sha512`
+/// (npm SRI form `sha512-<b64>`) + `sha1` + `md5`; golang additionally
+/// `dirhash_h1` (`h1:<b64>`); the npm yarn-berry zip carries only
+/// `yarn_berry10c0` (`10c0/<sha512-hex>`). No ecosystem exposes a plain sha256.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVendorIntegrity {
+    #[serde(default)]
+    pub sha512: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    #[serde(default)]
+    pub md5: Option<String>,
+    #[serde(default)]
+    pub dirhash_h1: Option<String>,
+    #[serde(default)]
+    pub yarn_berry10c0: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

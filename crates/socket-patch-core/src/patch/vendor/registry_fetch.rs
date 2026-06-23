@@ -468,6 +468,23 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     ))
 }
 
+/// Verify a golang module zip's `h1:` dirhash against an expected value.
+///
+/// The vendoring service reports `dirhashH1` for golang artifacts (what
+/// `go mod verify` checks); the service-download path uses this to confirm the
+/// downloaded zip's CONTENTS — not just its bytes — match.
+pub(crate) fn verify_go_h1(bytes: &[u8], expected_h1: &str) -> Result<(), String> {
+    let actual = go_h1_of_zip(bytes)?;
+    if actual == expected_h1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "go module dirhash mismatch: service reports {expected_h1}, the downloaded zip \
+             hashes to {actual}"
+        ))
+    }
+}
+
 /// Traversal-guarded zip extraction with an EXPLICIT required prefix
 /// (`<module>@<version>/` — go module paths contain slashes, so a
 /// first-component strip would be wrong). Same guard family as
