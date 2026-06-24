@@ -112,7 +112,7 @@ pub(crate) async fn dispatch_vendor_one(
     // `service` mode, refuse the not-yet-covered ones with a clear message
     // rather than silently building (which would violate the contract). Under
     // `auto`/`build` they fall through to the local build as before.
-    const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo"];
+    const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo", "golang"];
     if let Some(cfg) = service {
         if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
             return Some(VendorOutcome::Refused {
@@ -195,6 +195,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }

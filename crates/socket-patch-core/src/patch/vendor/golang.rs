@@ -19,19 +19,53 @@
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::PatchSources;
+use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
 };
-use crate::patch::go_redirect::{apply_go_redirect, are_safe_redirect_coords};
+use crate::patch::go_redirect::{apply_go_redirect, are_safe_redirect_coords, ensure_module_go_mod};
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
 use super::path::vendor_uuid_dir_rel;
+use super::registry_fetch::extract_zip_with_prefix;
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
+
+fn already_patched_verify(file: &str) -> VerifyResult {
+    VerifyResult {
+        file: file.to_string(),
+        status: VerifyStatus::AlreadyPatched,
+        message: None,
+        current_hash: None,
+        expected_hash: None,
+        target_hash: None,
+    }
+}
+
+/// A synthesized success [`ApplyResult`] for a service-downloaded module: there
+/// is no local apply to verify (the downloaded zip IS the patched module), so
+/// every patched file reads as `AlreadyPatched` — trust is the verified service
+/// integrity (sha512 + the `h1:` module dirhash).
+fn synthesized_success(
+    purl: &str,
+    copy_dir: &Path,
+    files_verified: Vec<VerifyResult>,
+) -> ApplyResult {
+    ApplyResult {
+        package_key: purl.to_string(),
+        package_path: copy_dir.display().to_string(),
+        success: true,
+        files_verified,
+        files_patched: Vec::new(),
+        applied_via: std::collections::HashMap::new(),
+        error: None,
+        sidecar: None,
+    }
+}
 
 /// The committed copy exists and every patched file matches its afterHash.
 async fn copy_hashes_ok(
@@ -72,6 +106,7 @@ pub async fn vendor_go_module(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
@@ -140,39 +175,79 @@ pub async fn vendor_go_module(
     // content. The engine is shared with the in-place `apply` redirect
     // path, whose strict semantics stay unchanged.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if !force {
-        let missing = super::missing_existing_patch_files(pristine_src, &record.files).await;
-        if let Some(first) = missing.first() {
-            return VendorOutcome::Done {
-                result: super::failed_apply_result(
-                    purl,
-                    format!("Cannot apply patch: {first} - File not found"),
-                ),
-                entry: None,
-                warnings,
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && cfg.offline {
+            return VendorOutcome::Refused {
+                code: "vendor_service_offline_conflict",
+                detail: "--vendor-source=service needs the network but --offline is set"
+                    .to_string(),
             };
         }
     }
 
-    // The engine does the heavy lifting: fresh copy → hardened apply pipeline
-    // → `replace` upsert (which refuses a user-authored same-version pin).
-    let result = apply_go_redirect(
-        purl,
+    // Acquire the patched module: prefer the prebuilt module zip from the patch
+    // service (download → verify → extract → wire the `replace`, no pristine
+    // source needed); else let the engine copy the pristine source, patch it,
+    // and wire the `replace`.
+    let result = match go_service_redirect(
+        service,
+        record,
         module,
         version,
-        pristine_src,
-        project_root,
         &base_rel,
-        &record.files,
-        sources,
-        Some(&record.uuid),
-        dry_run,
-        crate::patch::apply::MismatchPolicy::Force,
+        &copy_dir,
+        project_root,
+        &mut warnings,
     )
-    .await;
-    if result.success {
-        warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
-    }
+    .await
+    {
+        GoServiceRedirect::Used => {
+            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            synthesized_success(purl, &copy_dir, verified)
+        }
+        GoServiceRedirect::HardFail(outcome) => return *outcome,
+        GoServiceRedirect::FallBack => {
+            // Vendor auto-force policy (the engine's copy is staged from the
+            // pristine source, never the user's tree): missing patch targets
+            // still fail closed unless the caller's own `--force` asked for the
+            // skip tolerance.
+            if !force {
+                let missing =
+                    super::missing_existing_patch_files(pristine_src, &record.files).await;
+                if let Some(first) = missing.first() {
+                    return VendorOutcome::Done {
+                        result: super::failed_apply_result(
+                            purl,
+                            format!("Cannot apply patch: {first} - File not found"),
+                        ),
+                        entry: None,
+                        warnings,
+                    };
+                }
+            }
+            // The engine does the heavy lifting: fresh copy → hardened apply
+            // pipeline → `replace` upsert (refuses a user-authored same-version
+            // pin).
+            let result = apply_go_redirect(
+                purl,
+                module,
+                version,
+                pristine_src,
+                project_root,
+                &base_rel,
+                &record.files,
+                sources,
+                Some(&record.uuid),
+                dry_run,
+                crate::patch::apply::MismatchPolicy::Force,
+            )
+            .await;
+            if result.success {
+                warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));
+            }
+            result
+        }
+    };
 
     if dry_run {
         return VendorOutcome::Done {
@@ -338,6 +413,123 @@ pub async fn vendor_go_module(
         result,
         entry: Some(entry),
         warnings,
+    }
+}
+
+/// Outcome of attempting to materialise the go copy from the patch service.
+enum GoServiceRedirect {
+    /// The prebuilt module zip was extracted and the `replace` wired.
+    Used,
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to copying + patching the pristine module source.
+    FallBack,
+}
+
+/// Download the prebuilt module zip, verify it (sha512 + the `h1:` dirhash,
+/// done by `fetch_verified_archive`), extract it into `copy_dir` (stripping its
+/// `{module}@{version}/` prefix), ensure a `go.mod`, and wire the `replace`
+/// directive — the same end state `apply_go_redirect` produces, minus the copy
+/// + local apply. Maps each service outcome onto the `auto` / `service` policy.
+#[allow(clippy::too_many_arguments)]
+async fn go_service_redirect(
+    service: Option<&VendorServiceConfig>,
+    record: &PatchRecord,
+    module: &str,
+    version: &str,
+    base_rel: &str,
+    copy_dir: &Path,
+    project_root: &Path,
+    warnings: &mut Vec<VendorWarning>,
+) -> GoServiceRedirect {
+    let Some(cfg) = service else {
+        return GoServiceRedirect::FallBack;
+    };
+    // An empty-files patch is a degenerate no-op; let the engine's empty
+    // handling deal with it rather than downloading anything.
+    if !cfg.service_enabled() || record.files.is_empty() {
+        return GoServiceRedirect::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> GoServiceRedirect {
+        GoServiceRedirect::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            GoServiceRedirect::FallBack
+        }
+    };
+    match fetch_verified_archive(cfg, &record.uuid, module).await {
+        ServiceArtifact::Ready(archive) => {
+            // Clean copy dir; extract the module zip (strip its literal
+            // `{module}@{version}/` prefix) into it.
+            let _ = remove_tree(copy_dir).await;
+            if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot create {}: {e}", copy_dir.display()),
+                );
+            }
+            let prefix = format!("{module}@{version}/");
+            if let Err(e) = extract_zip_with_prefix(&archive.bytes, copy_dir, &prefix) {
+                let _ = remove_tree(&project_root.join(base_rel)).await;
+                return hard(
+                    "vendor_prebuilt_extract_failed",
+                    format!("cannot extract the prebuilt module zip: {e}"),
+                );
+            }
+            // A `replace` target needs a go.mod declaring the module path;
+            // pre-modules zips may lack one — synthesize the minimal form.
+            if let Err(e) = ensure_module_go_mod(copy_dir, module).await {
+                let _ = remove_tree(&project_root.join(base_rel)).await;
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot synthesize go.mod for the copy: {e}"),
+                );
+            }
+            if let Err(e) =
+                go_mod_edit::ensure_replace_entry(project_root, module, version, base_rel, false)
+                    .await
+            {
+                let _ = remove_tree(&project_root.join(base_rel)).await;
+                return hard(
+                    "vendor_prebuilt_wire_failed",
+                    format!("failed to update go.mod: {e}"),
+                );
+            }
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!("vendored {module} from the patch service ({})", archive.source_url),
+            ));
+            GoServiceRedirect::Used
+        }
+        ServiceArtifact::IntegrityMismatch(reason) => miss(
+            warnings,
+            "vendor_prebuilt_integrity_mismatch",
+            format!("prebuilt module zip failed integrity ({reason})"),
+        ),
+        ServiceArtifact::Pending => miss(
+            warnings,
+            "vendor_prebuilt_pending",
+            "prebuilt module zip is still building".to_string(),
+        ),
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt module zip unavailable: {reason}"),
+                )
+            } else {
+                GoServiceRedirect::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => miss(
+            warnings,
+            "vendor_prebuilt_unavailable",
+            format!("patch service request failed ({reason})"),
+        ),
     }
 }
 
@@ -510,6 +702,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             dry_run,
             false,
+            None,
         )
         .await
     }
@@ -983,5 +1176,224 @@ mod tests {
             "no replace written"
         );
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+    }
+
+    // ─────────────── service-download path (Tier B: golang) ───────────────
+    //
+    // golang vendors a patched module DIRECTORY behind a go.mod `replace`, so
+    // the service path downloads the prebuilt module zip, verifies it (sha512 +
+    // the `h1:` dirhash), extracts it into the copy dir, and wires the replace.
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha512};
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    }
+
+    fn go_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline,
+        }
+    }
+
+    /// Build a Go module zip (entries prefixed `{MODULE}@{VERSION}/`).
+    fn make_module_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (rel, content) in files {
+                zw.start_file(format!("{MODULE}@{VERSION}/{rel}"), opts).unwrap();
+                zw.write_all(content).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    async fn mount_go_granted(
+        server: &wiremock::MockServer,
+        sha512: &str,
+        dirhash_h1: Option<&str>,
+        zip_bytes: &[u8],
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let serve_path = format!("/patch/golang/{MODULE}/{VERSION}/tok/{UUID}/bar-{VERSION}.zip");
+        let serve_url = format!("{}{serve_path}", server.uri());
+        let mut integrity = serde_json::json!({ "sha512": sha512 });
+        if let Some(h1) = dirhash_h1 {
+            integrity["dirhashH1"] = serde_json::Value::from(h1);
+        }
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "purl": PURL,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url, "integrity": integrity }]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_go_status(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Service success: the prebuilt module zip is extracted into the copy dir
+    /// (patched bytes), the go.mod `replace` is wired, and a
+    /// `vendor_prebuilt_downloaded` advisory is emitted — WITHOUT touching the
+    /// pristine source (a deliberately-missing path).
+    #[tokio::test]
+    async fn service_success_extracts_module_and_wires_replace() {
+        let (dir, blobs, _pristine, record) = fixture().await;
+        let root = dir.path();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("bar.go", PATCHED),
+        ]);
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, None, &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let bogus_pristine = root.join("no-such-cache");
+        let outcome = vendor_go_module(
+            PURL,
+            &bogus_pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let copy = root.join(copy_rel());
+        assert_eq!(tokio::fs::read(copy.join("bar.go")).await.unwrap(), PATCHED);
+        let entries = read_replace_entries(root).await;
+        let e = entries.iter().find(|e| e.module == MODULE).expect("replace wired");
+        assert_eq!(e.owner, Some(ReplaceOwner::Vendor));
+        assert_eq!(e.path.as_deref(), Some(format!("./{}", copy_rel()).as_str()));
+        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// `service` mode + a wrong `h1:` dirhash hard-fails (verifies the
+    /// golang-specific dirhash check), nothing wired.
+    #[tokio::test]
+    async fn service_wrong_dirhash_h1_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("bar.go", PATCHED),
+        ]);
+        let sri = sri_sha512(&zip); // correct sha512
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &sri, Some("h1:bogusdirhashvaluethatwontmatch="), &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+    }
+
+    /// `auto` + a not-built service status falls back to the local build.
+    #[tokio::test]
+    async fn service_unavailable_auto_falls_back_to_build() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_go_status(&server, "not_found").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("bar.go")).await.unwrap(),
+            PATCHED
+        );
+    }
+
+    /// `--offline` + `--vendor-source=service` refuses without any network.
+    #[tokio::test]
+    async fn offline_service_mode_refuses() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg("http://127.0.0.1:1", VendorSource::Service, true)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_service_offline_conflict");
     }
 }
