@@ -115,7 +115,7 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | `--proxy-url <url>` | `SOCKET_PROXY_URL` | Public proxy URL used when no API token is set. |
 | `-e, --ecosystems <list>` | `SOCKET_ECOSYSTEMS` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`). |
 | `--download-mode <mode>` | `SOCKET_DOWNLOAD_MODE` | Artifact to fetch when local files are missing: `diff` (default, smallest delta), `package` (full per-package tarball), or `file` (legacy per-file blobs). |
-| `--vendor-source <mode>` | `SOCKET_VENDOR_SOURCE` | How `vendor` acquires the installable artifact: `auto` (default — download the prebuilt package from patch.socket.dev, fall back to a local build on any miss), `service` (require the service, fail-closed), or `build` (always build locally). Covers npm, pypi, cargo, golang, and composer today; gem builds locally. |
+| `--vendor-source <mode>` | `SOCKET_VENDOR_SOURCE` | How `vendor` acquires the installable artifact: `auto` (default — download the prebuilt package from patch.socket.dev, fall back to a local build on any miss), `service` (require the service, fail-closed), or `build` (always build locally). Covers npm, pypi, cargo, golang, composer, and gem. |
 | `--vendor-url <url>` | `SOCKET_VENDOR_URL` | Base host for the vendoring service's package-reference request (default: the active `--api-url`/`--proxy-url` base). Point at staging / local dev for testing. |
 | `--patch-server-url <url>` | `SOCKET_PATCH_SERVER_URL` | Override the host of the prebuilt-archive download URL the service returns (default: as returned). Mainly for local-dev / testing. |
 | `--offline` | `SOCKET_OFFLINE` | Strict airgap: never contact the network. Operations that need remote data fail loudly. |

@@ -709,6 +709,36 @@ impl ApiClient {
             None => download_url.to_string(),
         };
 
+        // Surface the OTHER served artifacts (e.g. the gem path-source stub
+        // gemspec) — their host-rewritten URL + normalized sha512 — so a
+        // backend that needs one can download + verify it lazily. Each is
+        // skipped unless it carries both a url and a sha512.
+        let mut secondary_artifacts: Vec<SecondaryArtifact> = Vec::new();
+        if let Some(arts) = result.artifacts.as_ref() {
+            for a in arts {
+                if a.kind == "tarball" {
+                    continue;
+                }
+                let (Some(url), Some(sha512)) =
+                    (a.url.as_deref(), a.integrity.sha512.as_deref())
+                else {
+                    continue;
+                };
+                let url = match patch_server_url {
+                    Some(base) => match rewrite_url_host(url, base) {
+                        Ok(u) => u,
+                        Err(_) => continue,
+                    },
+                    None => url.to_string(),
+                };
+                secondary_artifacts.push(SecondaryArtifact {
+                    kind: a.kind.clone(),
+                    url,
+                    integrity_sri: normalize_sha512_sri(sha512),
+                });
+            }
+        }
+
         // ── Step 2: download the prebuilt archive ──────────────────────────
         match self.download_vendor_archive(&download_url).await {
             ServeDownload::Ok(bytes) => VendorServiceOutcome::Ready(FetchedVendorPackage {
@@ -719,6 +749,7 @@ impl ApiClient {
                 size_bytes: artifact.size_bytes,
                 content_type: artifact.content_type.clone(),
                 source_url: download_url,
+                secondary_artifacts,
             }),
             ServeDownload::NotFound => {
                 VendorServiceOutcome::Unavailable("serve returned 404/410".into())
@@ -842,6 +873,24 @@ impl ApiClient {
             Err(e) => ServeDownload::Failed(ApiError::Network(e)),
         }
     }
+
+    /// Download a secondary artifact (e.g. the gem stub gemspec) from its
+    /// grant-tokenized serve URL. Same plain-client + cap discipline as the
+    /// tarball download; the caller verifies the bytes against the artifact's
+    /// integrity. A 404/410/408 surfaces as an error (a secondary the
+    /// reference promised should be present).
+    pub async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
+        match self.download_vendor_archive(url).await {
+            ServeDownload::Ok(bytes) => Ok(bytes),
+            ServeDownload::NotFound => {
+                Err(ApiError::Other(format!("artifact not found: {url}")))
+            }
+            ServeDownload::Pending => {
+                Err(ApiError::Other(format!("artifact still building: {url}")))
+            }
+            ServeDownload::Failed(e) => Err(e),
+        }
+    }
 }
 
 // ── Free functions ────────────────────────────────────────────────────
@@ -867,6 +916,20 @@ pub struct FetchedVendorPackage {
     pub content_type: Option<String>,
     /// The (possibly host-rewritten) URL the bytes were fetched from.
     pub source_url: String,
+    /// The OTHER served artifacts (e.g. the gem path-source stub gemspec),
+    /// each with a host-rewritten URL + normalized sha512, for a backend to
+    /// download + verify lazily via [`ApiClient::download_artifact`].
+    pub secondary_artifacts: Vec<SecondaryArtifact>,
+}
+
+/// A non-tarball served artifact reference (e.g. `gem-stub-gemspec`): its kind,
+/// final download URL, and sha512 SRI. Bytes are fetched + verified on demand.
+#[derive(Debug, Clone)]
+pub struct SecondaryArtifact {
+    pub kind: String,
+    pub url: String,
+    /// Normalized `sha512-<b64>` of the artifact bytes.
+    pub integrity_sri: String,
 }
 
 /// Outcome of [`ApiClient::fetch_vendor_package`].

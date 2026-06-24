@@ -249,43 +249,10 @@ async fn fetch_gem(
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
     verify_integrity(&bytes, &entry.integrity)?;
 
-    // Locate data.tar.gz inside the (uncompressed) outer tar.
-    let mut archive = tar::Archive::new(bytes.as_slice());
-    let mut data: Option<Vec<u8>> = None;
-    for e in archive
-        .entries()
-        .map_err(|e| FetchError::Failed(format!("unreadable .gem: {e}")))?
-    {
-        use std::io::Read as _;
-        let mut e = e.map_err(|err| FetchError::Failed(format!("unreadable .gem entry: {err}")))?;
-        let is_data = e
-            .path()
-            .ok()
-            .is_some_and(|p| p.as_os_str() == "data.tar.gz");
-        if !is_data {
-            continue;
-        }
-        if e.header().size().unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
-            return Err(FetchError::Failed(
-                "data.tar.gz exceeds the size cap".into(),
-            ));
-        }
-        let mut buf = Vec::new();
-        e.read_to_end(&mut buf)
-            .map_err(|err| FetchError::Failed(format!("cannot read data.tar.gz: {err}")))?;
-        data = Some(buf);
-        break;
-    }
-    let Some(data) = data else {
-        return Err(FetchError::Failed(format!(
-            "fetched .gem for {}@{} carries no data.tar.gz",
-            entry.name, entry.version
-        )));
-    };
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("gem");
-    extract_tgz_no_strip(&data, &dir).map_err(FetchError::Failed)?;
+    extract_gem_data(&bytes, &dir).map_err(FetchError::Failed)?;
     Ok(FetchedPackage {
         dir,
         url,
@@ -869,9 +836,44 @@ pub(crate) fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
 
 /// Like [`extract_tgz`] but keeps entry paths verbatim (gem `data.tar.gz`
 /// archives carry package content at the root, no prefix dir).
-#[allow(dead_code)] // used by the gem fetcher (feature-independent helper)
 fn extract_tgz_no_strip(bytes: &[u8], dest: &Path) -> Result<(), String> {
     extract_tar_gz(bytes, dest, /*strip_first=*/ false)
+}
+
+/// Extract a `.gem`'s package content into `dest`. A `.gem` is a plain
+/// (uncompressed) outer tar holding `data.tar.gz` (the lib files, at the ROOT
+/// — no prefix dir), `metadata.gz`, and `checksums.yaml.gz`; only
+/// `data.tar.gz` carries content a path source loads, so it is the only member
+/// extracted (verbatim paths, no strip). Fails closed when the member is
+/// missing or exceeds the size cap.
+///
+/// `pub(crate)` so the gem service-download path can extract a downloaded,
+/// integrity-verified `.gem` into the vendor copy dir — the same content the
+/// local `fresh_copy(installed_dir)` produces.
+pub(crate) fn extract_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), String> {
+    use std::io::Read as _;
+    let mut archive = tar::Archive::new(gem_bytes);
+    for e in archive
+        .entries()
+        .map_err(|e| format!("unreadable .gem: {e}"))?
+    {
+        let mut e = e.map_err(|err| format!("unreadable .gem entry: {err}"))?;
+        let is_data = e
+            .path()
+            .ok()
+            .is_some_and(|p| p.as_os_str() == "data.tar.gz");
+        if !is_data {
+            continue;
+        }
+        if e.header().size().unwrap_or(u64::MAX) > MAX_DOWNLOAD_BYTES {
+            return Err("data.tar.gz exceeds the size cap".into());
+        }
+        let mut buf = Vec::new();
+        e.read_to_end(&mut buf)
+            .map_err(|err| format!("cannot read data.tar.gz: {err}"))?;
+        return extract_tgz_no_strip(&buf, dest);
+    }
+    Err("the .gem carries no data.tar.gz".to_string())
 }
 
 fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {

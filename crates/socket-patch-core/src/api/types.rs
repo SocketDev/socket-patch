@@ -131,9 +131,10 @@ pub struct PackageVendorResult {
     pub artifacts: Option<Vec<PackageVendorArtifact>>,
 }
 
-/// One served artifact: the native tarball (`kind: "tarball"`), or — npm only —
-/// a yarn-berry cache zip (`kind: "yarn-berry-zip"`). `url` is null only when
-/// the artifact isn't stored yet (e.g. an unbuilt berry zip).
+/// One served artifact: the native tarball (`kind: "tarball"`), or a
+/// second artifact — npm's yarn-berry cache zip (`kind: "yarn-berry-zip"`) or
+/// gem's path-source stub gemspec (`kind: "gem-stub-gemspec"`). `url` is null
+/// only when the artifact isn't stored yet (e.g. an unbuilt berry zip).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackageVendorArtifact {

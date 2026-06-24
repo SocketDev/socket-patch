@@ -8,7 +8,7 @@
 //! per-ecosystem backends own the placement (Tier A: write the archive; Tier B:
 //! extract it into the vendor directory) and the build-vs-service policy.
 
-use crate::api::client::VendorServiceOutcome;
+use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::patch::vendor::lock_inventory::LockIntegrity;
 use crate::patch::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::patch::vendor::VendorServiceConfig;
@@ -28,6 +28,10 @@ pub(crate) struct VerifiedArchive {
     pub integrity_sri: String,
     /// The (possibly host-rewritten) URL the bytes came from — for logging.
     pub source_url: String,
+    /// The OTHER served artifacts (e.g. gem's path-source stub gemspec), still
+    /// unverified — a backend that needs one calls [`fetch_verified_secondary`]
+    /// to download + integrity-verify it on demand.
+    pub secondary: Vec<SecondaryArtifact>,
 }
 
 /// Result of attempting a service download for one patch UUID.
@@ -102,7 +106,57 @@ pub(crate) async fn fetch_verified_archive(
         bytes: pkg.tarball,
         integrity_sri: pkg.integrity_sri,
         source_url: pkg.source_url,
+        secondary: pkg.secondary_artifacts,
     })
+}
+
+/// Outcome of fetching + verifying a named secondary artifact.
+pub(crate) enum SecondaryArtifactResult {
+    /// Bytes downloaded and sha512-verified.
+    Ready(Vec<u8>),
+    /// No artifact of this kind was served (e.g. a native-extension gem emits
+    /// no stub, or an old row predates the rebuild) — a terminal miss.
+    Absent,
+    /// Request / transport / auth failure. `String` is a log reason.
+    Failed(String),
+    /// Bytes downloaded but failed integrity verification — never fall back.
+    IntegrityMismatch(String),
+}
+
+/// Download + integrity-verify the secondary artifact of `kind` (e.g.
+/// `gem-stub-gemspec`) referenced by a [`VerifiedArchive`].
+///
+/// `verify_name` is the package's bare name (only consulted by the yarn-berry
+/// checksum kind, which never reaches here). The bytes are verified against the
+/// artifact's own sha512 SRI, fail-closed like the primary archive. Returns
+/// `Absent` when the archive referenced no artifact of this kind — the caller
+/// treats that as a miss (fall back under `auto`, refuse under `service`).
+pub(crate) async fn fetch_verified_secondary(
+    cfg: &VendorServiceConfig,
+    archive: &VerifiedArchive,
+    kind: &str,
+    verify_name: &str,
+) -> SecondaryArtifactResult {
+    let Some(client) = cfg.client.as_ref() else {
+        return SecondaryArtifactResult::Failed("vendor service not configured".to_string());
+    };
+    let Some(artifact) = archive.secondary.iter().find(|a| a.kind == kind) else {
+        return SecondaryArtifactResult::Absent;
+    };
+
+    let bytes = match client.download_artifact(&artifact.url).await {
+        Ok(bytes) => bytes,
+        Err(e) => return SecondaryArtifactResult::Failed(e.to_string()),
+    };
+
+    if let Err(e) = artifact_matches_integrity(
+        &bytes,
+        verify_name,
+        &LockIntegrity::Sri(artifact.integrity_sri.clone()),
+    ) {
+        return SecondaryArtifactResult::IntegrityMismatch(e);
+    }
+    SecondaryArtifactResult::Ready(bytes)
 }
 
 #[cfg(test)]
