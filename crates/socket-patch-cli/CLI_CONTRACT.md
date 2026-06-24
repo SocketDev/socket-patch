@@ -351,11 +351,17 @@ per service outcome:
 | 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |
 | `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
 
-Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), and
-**cargo** (download + extract the `.crate`). For ecosystems not yet covered (golang, gem, composer,
-maven, nuget) `auto`/`build` build locally as before, and `service` refuses with
-`vendor_service_unsupported_ecosystem`. A successful service vend emits `vendor_prebuilt_downloaded`.
-Unrelated to `--download-mode` (which selects the patch-CONTENT format for the local build).
+Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), **cargo**
+(download + extract the `.crate`), **golang** (download + extract the module zip, verify the `h1:`
+dirhash, wire the `replace`), and **composer** (download + extract the dist zip). The Tier-B
+ecosystems (cargo/golang/composer) download the patched archive and extract it into the vendor
+directory — the same source tree the local build commits — then run the existing path-dep wiring;
+their build-equivalence is exercised by the toolchain-backed e2e suites (which skip when the package
+manager is absent). **gem** is NOT covered (it builds locally): a path-sourced gem needs a stub
+gemspec that the `.gem` archive doesn't carry in bundler's required form. For not-covered ecosystems
+`auto`/`build` build locally as before, and `service` refuses with `vendor_service_unsupported_ecosystem`.
+A successful service vend emits `vendor_prebuilt_downloaded`. Unrelated to `--download-mode` (which
+selects the patch-CONTENT format for the local build).
 
 **Patch sources stay in memory (v3.4)**: vendoring never writes `.socket/blobs/`, `.socket/diffs/`,
 or temporary patch files. Pre-existing `.socket/` artifacts (from a prior `apply`/`get`/`repair`)

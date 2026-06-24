@@ -107,19 +107,20 @@ pub(crate) async fn dispatch_vendor_one(
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
 
-    // Prebuilt service downloads currently cover npm, pypi, and cargo; the
-    // remaining ecosystems vendor by building locally. Under fail-closed
-    // `service` mode, refuse the not-yet-covered ones with a clear message
-    // rather than silently building (which would violate the contract). Under
-    // `auto`/`build` they fall through to the local build as before.
+    // Prebuilt service downloads cover npm, pypi, cargo, golang, and composer;
+    // the rest (gem) vendor by building locally — gem needs a stub gemspec the
+    // `.gem` archive doesn't carry in the form bundler's path source wants.
+    // Under fail-closed `service` mode, refuse the not-covered ones with a clear
+    // message rather than silently building (which would violate the contract).
+    // Under `auto`/`build` they fall through to the local build as before.
     const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo", "golang", "composer"];
     if let Some(cfg) = service {
         if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
             return Some(VendorOutcome::Refused {
                 code: "vendor_service_unsupported_ecosystem",
                 detail: format!(
-                    "--vendor-source=service is not yet supported for `{eco}` \
-                     (prebuilt downloads currently cover npm, pypi, and cargo); \
+                    "--vendor-source=service is not supported for `{eco}` \
+                     (prebuilt downloads cover npm, pypi, cargo, golang, and composer); \
                      use --vendor-source=auto or --vendor-source=build"
                 ),
             });
