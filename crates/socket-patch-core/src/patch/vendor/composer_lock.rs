@@ -45,10 +45,12 @@ use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::registry_fetch::extract_zip;
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
@@ -95,6 +97,7 @@ pub async fn vendor_composer(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
@@ -272,42 +275,72 @@ pub async fn vendor_composer(
     }
 
     // ── copy + patch (wiring last) ───────────────────────────────────────
-    if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-        return VendorOutcome::Done {
-            result: synthesized_result(
-                purl,
-                &copy_dir,
-                Vec::new(),
-                false,
-                Some(format!("failed to copy installed package: {e}")),
-            ),
-            entry: None,
-            warnings: Vec::new(),
-        };
-    }
+    // Prefer the prebuilt dist zip from the patch service (download + extract,
+    // no installed package needed); else copy the installed package and patch
+    // it.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    let mut result = super::force_apply_staged(
-        purl,
-        &copy_dir,
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && cfg.offline {
+            return refused(
+                "vendor_service_offline_conflict",
+                "--vendor-source=service needs the network but --offline is set",
+            );
+        }
+    }
+    let mut result = match composer_service_copy(
+        service,
         record,
-        sources,
-        false,
-        force,
         &pkg,
-        version,
+        &copy_dir,
+        &uuid_dir,
         &mut warnings,
     )
-    .await;
-    result.package_path = copy_dir.display().to_string();
-    if !result.success {
-        // Don't leave a half-built copy; the lock was never touched.
-        let _ = remove_tree(&uuid_dir).await;
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
-    }
+    .await
+    {
+        ComposerServiceCopy::Used => {
+            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            synthesized_result(purl, &copy_dir, verified, true, None)
+        }
+        ComposerServiceCopy::HardFail(outcome) => return *outcome,
+        ComposerServiceCopy::FallBack => {
+            if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
+                return VendorOutcome::Done {
+                    result: synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy installed package: {e}")),
+                    ),
+                    entry: None,
+                    warnings,
+                };
+            }
+            let mut result = super::force_apply_staged(
+                purl,
+                &copy_dir,
+                record,
+                sources,
+                false,
+                force,
+                &pkg,
+                version,
+                &mut warnings,
+            )
+            .await;
+            result.package_path = copy_dir.display().to_string();
+            if !result.success {
+                // Don't leave a half-built copy; the lock was never touched.
+                let _ = remove_tree(&uuid_dir).await;
+                return VendorOutcome::Done {
+                    result,
+                    entry: None,
+                    warnings,
+                };
+            }
+            result
+        }
+    };
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     let original_entry = lock[section][idx].clone();
@@ -483,6 +516,96 @@ pub async fn revert_composer(
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Outcome of attempting to materialise the composer copy from the patch service.
+enum ComposerServiceCopy {
+    /// The prebuilt dist zip was extracted into `copy_dir`.
+    Used,
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to copying + patching the installed package.
+    FallBack,
+}
+
+/// Download the prebuilt dist zip, integrity-verify it, and extract it into
+/// `copy_dir` (dropping the zip's variable top-level dir). Maps each service
+/// outcome onto the `auto` / `service` fallback policy. The extracted zip IS
+/// the patched package, so it needs no installed copy.
+async fn composer_service_copy(
+    service: Option<&VendorServiceConfig>,
+    record: &PatchRecord,
+    pkg: &str,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    warnings: &mut Vec<VendorWarning>,
+) -> ComposerServiceCopy {
+    let Some(cfg) = service else {
+        return ComposerServiceCopy::FallBack;
+    };
+    if !cfg.service_enabled() || record.files.is_empty() {
+        return ComposerServiceCopy::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> ComposerServiceCopy {
+        ComposerServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            ComposerServiceCopy::FallBack
+        }
+    };
+    match fetch_verified_archive(cfg, &record.uuid, pkg).await {
+        ServiceArtifact::Ready(archive) => {
+            let _ = remove_tree(copy_dir).await;
+            if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot create {}: {e}", copy_dir.display()),
+                );
+            }
+            // composer dist zips carry a single variable top-level dir.
+            if let Err(e) = extract_zip(&archive.bytes, copy_dir, /*strip_first=*/ true) {
+                let _ = remove_tree(uuid_dir).await;
+                return hard(
+                    "vendor_prebuilt_extract_failed",
+                    format!("cannot extract the prebuilt dist zip: {e}"),
+                );
+            }
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!("vendored {pkg} from the patch service ({})", archive.source_url),
+            ));
+            ComposerServiceCopy::Used
+        }
+        ServiceArtifact::IntegrityMismatch(reason) => miss(
+            warnings,
+            "vendor_prebuilt_integrity_mismatch",
+            format!("prebuilt dist zip failed integrity ({reason})"),
+        ),
+        ServiceArtifact::Pending => miss(
+            warnings,
+            "vendor_prebuilt_pending",
+            "prebuilt dist zip is still building".to_string(),
+        ),
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt dist zip unavailable: {reason}"),
+                )
+            } else {
+                ComposerServiceCopy::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => miss(
+            warnings,
+            "vendor_prebuilt_unavailable",
+            format!("patch service request failed ({reason})"),
+        ),
+    }
+}
 
 fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
     VendorOutcome::Refused {
@@ -853,6 +976,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             dry_run,
             false,
+            None,
         )
         .await
     }
@@ -1315,5 +1439,223 @@ mod tests {
                 .exists(),
             "uuid dir still removed"
         );
+    }
+
+    // ─────────────── service-download path (Tier B: composer) ───────────────
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha512};
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    }
+
+    fn composer_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline,
+        }
+    }
+
+    /// Build a composer dist zip with a single variable top-level dir.
+    fn make_dist_zip(top: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default();
+            for (rel, content) in files {
+                zw.start_file(format!("{top}/{rel}"), opts).unwrap();
+                zw.write_all(content).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    async fn mount_composer_granted(server: &wiremock::MockServer, sha512: &str, zip_bytes: &[u8]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let serve_path = format!("/patch/composer/psr/log/3.0.2/tok/{UUID}/psr-log-3.0.2.zip");
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "purl": PURL,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sha512 } }]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_composer_status(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn vendor_with_service(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        cfg: &VendorServiceConfig,
+    ) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(blobs);
+        vendor_composer(
+            PURL,
+            installed,
+            root,
+            record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(cfg),
+        )
+        .await
+    }
+
+    /// Service success: the prebuilt dist zip is extracted into the copy dir
+    /// (patched bytes), the lock is rewired, and a `vendor_prebuilt_downloaded`
+    /// advisory is emitted — WITHOUT touching the installed package.
+    #[tokio::test]
+    async fn service_success_extracts_dist_and_rewrites_lock() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, _installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                ("src/LoggerInterface.php", PATCHED),
+                ("composer.json", b"{\"name\": \"psr/log\"}\n"),
+            ],
+        );
+        let sri = sri_sha512(&zip);
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &sri, &zip).await;
+
+        let bogus_installed = root.join("no-such-install");
+        let (result, entry, warnings) = unwrap_done(
+            vendor_with_service(
+                root,
+                &blobs,
+                &bogus_installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let copy = root.join(copy_rel());
+        assert_eq!(
+            tokio::fs::read(copy.join("src/LoggerInterface.php")).await.unwrap(),
+            PATCHED
+        );
+        let lock_text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap();
+        assert!(lock_text.contains(&copy_rel()), "lock rewired to the copy: {lock_text}");
+        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// `service` mode + integrity mismatch hard-fails, nothing extracted.
+    #[tokio::test]
+    async fn service_integrity_mismatch_service_mode_hard_fails() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip("x", &[("src/LoggerInterface.php", PATCHED)]);
+        let wrong = sri_sha512(b"different bytes");
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &wrong, &zip).await;
+
+        let (code, _) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/composer/{UUID}")).exists());
+    }
+
+    /// `auto` + a not-built service status falls back to the local build.
+    #[tokio::test]
+    async fn service_unavailable_auto_falls_back_to_build() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_composer_status(&server, "not_found").await;
+
+        let (result, entry, _) = unwrap_done(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg(&server.uri(), VendorSource::Auto, false),
+            )
+            .await,
+        );
+        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php")).await.unwrap(),
+            PATCHED
+        );
+    }
+
+    /// `--offline` + `--vendor-source=service` refuses without any network.
+    #[tokio::test]
+    async fn offline_service_mode_refuses() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let (code, _) = unwrap_refused(
+            vendor_with_service(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &composer_service_cfg("http://127.0.0.1:1", VendorSource::Service, true),
+            )
+            .await,
+        );
+        assert_eq!(code, "vendor_service_offline_conflict");
     }
 }

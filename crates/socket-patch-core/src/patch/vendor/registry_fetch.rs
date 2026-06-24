@@ -133,7 +133,10 @@ pub async fn fetch_and_stage(
 /// Traversal-guarded zip extraction. `strip_first` mirrors the tar
 /// behavior (composer dist zips carry a variable top dir; wheels carry
 /// content at the root).
-fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+///
+/// `pub(crate)` so the composer service-download path can extract a downloaded
+/// dist zip into the vendor copy dir (`strip_first` = drop the top-level dir).
+pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
