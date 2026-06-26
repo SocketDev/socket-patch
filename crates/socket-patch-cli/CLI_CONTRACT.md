@@ -35,6 +35,9 @@ In v3.0 every subcommand accepts the same set of "global" flags via a single sha
 | `--proxy-url` | — | `SOCKET_PROXY_URL` | `https://patches-api.socket.dev` | string | Public proxy when no token |
 | `--ecosystems` | `-e` | `SOCKET_ECOSYSTEMS` | (all) | CSV → `Vec<String>` | Restrict to these ecosystems |
 | `--download-mode` | — | `SOCKET_DOWNLOAD_MODE` | **`diff`** | enum: `diff` \| `package` \| `file` | Patch artifact format |
+| `--vendor-source` | — | `SOCKET_VENDOR_SOURCE` | **`auto`** | enum: `auto` \| `service` \| `build` | How `vendor` acquires the installable artifact (see "Prebuilt vendor artifacts") |
+| `--vendor-url` | — | `SOCKET_VENDOR_URL` | (active API/proxy base) | string | Base host for the vendoring-service package-reference request |
+| `--patch-server-url` | — | `SOCKET_PATCH_SERVER_URL` | (server-returned) | string | Override the host of the prebuilt-archive download URL (local-dev / testing) |
 | `--offline` | — | `SOCKET_OFFLINE` | `false` | bool | **Strict airgap on every command** — never contact the network |
 | `--global` | `-g` | `SOCKET_GLOBAL` | `false` | bool | Operate on globally-installed packages |
 | `--global-prefix` | — | `SOCKET_GLOBAL_PREFIX` | (auto) | path | Override global packages root |
@@ -326,6 +329,46 @@ machines with **no socket-patch installed and no Socket API access** (registry a
 unvendored dependencies may still be needed). Every mechanism below was validated against the real
 package managers (`spikes/PHASE0-FINDINGS.txt`).
 
+**Prebuilt vendor artifacts (`--vendor-source`)**: by default (`auto`) `vendor` first tries to
+DOWNLOAD the already-built patched artifact + integrity from the patch.socket.dev vendoring service,
+and silently falls back to building it locally on any non-fatal miss. `service` requires the service
+(fail-closed); `build` always builds locally (the pre-service behavior). The download is a two-step
+flow on the configured API/proxy host (`--vendor-url` overrides it): a package-reference POST
+(`/v0/orgs/{slug}/patches/package` authenticated, else the public proxy's `/patch/package`) yields a
+grant-tokenized serve URL + integrity, then a GET fetches the archive (`--patch-server-url` rewrites
+that URL's host for local-dev / testing). The downloaded bytes are ALWAYS integrity-verified before
+use (sha512 SRI for every ecosystem; golang additionally the `h1:` module dirhash) — a mismatch is a
+hard error, never a silent fallback. A service-vended package reports each patched file as
+`AlreadyPatched` (trust is the verified service integrity, not a local re-apply). The fallback ladder
+per service outcome:
+
+| Service outcome | `auto` | `service` |
+|---|---|---|
+| granted/reused, integrity ok | **use service** | **use service** |
+| integrity mismatch | local build + `vendor_prebuilt_integrity_mismatch` | refuse (`vendor_prebuilt_required`) |
+| still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
+| not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
+| 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |
+| `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
+
+Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), **cargo**
+(download + extract the `.crate`), **golang** (download + extract the module zip, verify the `h1:`
+dirhash, wire the `replace`), **composer** (download + extract the dist zip), and **gem** (download +
+extract the `.gem`, plus a `gem-stub-gemspec` SECOND artifact). The Tier-B ecosystems
+(cargo/golang/composer/gem) download the patched archive and extract it into the vendor directory —
+the same source tree the local build commits — then run the existing path-dep wiring; their
+build-equivalence is exercised by the toolchain-backed e2e suites (which skip when the package
+manager is absent). **gem** needs the extra `gem-stub-gemspec` artifact because a path-sourced gem
+needs an eval-able stub gemspec that the `.gem` archive doesn't carry in bundler's required form (a
+`.gem` keeps the gemspec as YAML in `metadata.gz`); the converter generates that stub and serves it
+alongside the `.gem`, and the gem backend downloads + integrity-verifies both. A served gem whose
+stub is missing (a native-extension gem, for which the converter emits no stub, or a patch built
+before the stub rollout) is treated as a service miss — `auto` falls back to the local build,
+`service` refuses (`vendor_prebuilt_required`). For any ecosystem with no service path at all
+`auto`/`build` build locally as before, and `service` refuses with
+`vendor_service_unsupported_ecosystem`. A successful service vend emits `vendor_prebuilt_downloaded`.
+Unrelated to `--download-mode` (which selects the patch-CONTENT format for the local build).
+
 **Patch sources stay in memory (v3.4)**: vendoring never writes `.socket/blobs/`, `.socket/diffs/`,
 or temporary patch files. Pre-existing `.socket/` artifacts (from a prior `apply`/`get`/`repair`)
 are read in place; already-vendored purls re-stage patch content from the committed artifact itself
@@ -523,6 +566,9 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_PROXY_URL` | `--proxy-url` | `https://patches-api.socket.dev` | **Renamed in v3.0** (was `SOCKET_PATCH_PROXY_URL`). |
 | `SOCKET_ECOSYSTEMS` | `--ecosystems` / `-e` | (all) | Comma-separated list. |
 | `SOCKET_DOWNLOAD_MODE` | `--download-mode` | `diff` | One of `diff` / `package` / `file`. |
+| `SOCKET_VENDOR_SOURCE` | `--vendor-source` | `auto` | One of `auto` / `service` / `build`. |
+| `SOCKET_VENDOR_URL` | `--vendor-url` | (active API/proxy base) | Vendoring-service package-reference host. |
+| `SOCKET_PATCH_SERVER_URL` | `--patch-server-url` | (server-returned) | Rewrites the prebuilt-archive download host. |
 | `SOCKET_OFFLINE` | `--offline` | `false` | — |
 | `SOCKET_GLOBAL` | `--global` / `-g` | `false` | — |
 | `SOCKET_GLOBAL_PREFIX` | `--global-prefix` | (auto) | — |

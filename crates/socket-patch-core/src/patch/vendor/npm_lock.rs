@@ -82,6 +82,7 @@ pub async fn vendor_npm(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -176,6 +177,7 @@ pub async fn vendor_npm(
         dry_run,
         force,
         &mut warnings,
+        service,
     )
     .await
     {
@@ -861,6 +863,7 @@ mod tests {
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
+                None,
             )
             .await
         }
@@ -1215,6 +1218,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             /*force=*/ true,
+            None,
         )
         .await;
         let (result, entry, _) = expect_done(outcome);
@@ -1831,5 +1835,308 @@ mod tests {
 
         assert_eq!(escape_json_pointer_token("@scope/name"), "@scope~1name");
         assert_eq!(escape_json_pointer_token("a~b"), "a~0b");
+    }
+
+    // ─────────────── service-download path (Tier A: npm) ───────────────
+    //
+    // Both halves of the contract are exercised: the service-backed download
+    // AND the local-build fallback, against a `wiremock` stand-in for the
+    // patch.socket.dev two-step (package-reference POST + serve GET).
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+
+    const SERVE_PATH: &str = "/patch/npm/left-pad/1.3.0/grant-tok/uuid/left-pad-1.3.0.tgz";
+
+    fn service_cfg(server_uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server_uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline,
+        }
+    }
+
+    async fn vendor_service(fx: &Fixture, cfg: &VendorServiceConfig) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        vendor_npm(
+            &fx.purl(),
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(cfg),
+        )
+        .await
+    }
+
+    /// The deterministic tgz a LOCAL build yields for the fixture's patch
+    /// (vendored in a throwaway copy), plus its sha512 SRI — the bytes the
+    /// service is made to serve so integrity matches by construction.
+    async fn locally_built_artifact() -> (Vec<u8>, String) {
+        let fx = fixture().await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let tgz = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        let sri = sri_sha512(&tgz);
+        (tgz, sri)
+    }
+
+    async fn mount_granted(server: &wiremock::MockServer, sha512: &str, tgz: &[u8]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let serve_url = format!("{}{SERVE_PATH}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "purl": "pkg:npm/left-pad@1.3.0",
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sha512 } }]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_status_only(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Mount a POST mock asserting the service is NEVER contacted.
+    async fn mount_post_never(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    fn lock_integrity(lock: &Value, key: &str) -> String {
+        lock["packages"][key]["integrity"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Service success: the prebuilt tarball is written verbatim, the lock is
+    /// rewired to the service integrity, the ledger describes the bytes, and a
+    /// `vendor_prebuilt_downloaded` advisory is emitted. Because the served
+    /// bytes ARE the local-build bytes, this also proves byte-for-byte parity
+    /// between the two paths.
+    #[tokio::test]
+    async fn service_success_writes_tgz_and_rewires_lock() {
+        let (served, sri) = locally_built_artifact().await;
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &sri, &served).await;
+
+        let fx = fixture().await;
+        let outcome = vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("service vendor must carry a ledger entry");
+
+        let on_disk = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, served, "service tgz written byte-for-byte");
+        assert_eq!(entry.artifact.sha256, hex::encode(sha2::Sha256::digest(&served)));
+        assert_eq!(entry.artifact.size, Some(served.len() as u64));
+
+        let lock = fx.read_lock().await;
+        for key in [
+            "node_modules/left-pad",
+            "node_modules/foo/node_modules/left-pad",
+        ] {
+            assert_eq!(lock_integrity(&lock, key), sri, "{key}: lock integrity = service sha512");
+            assert_eq!(
+                lock["packages"][key]["resolved"],
+                json!(format!("file:{}", fx.expected_rel_tgz())),
+                "{key}: resolved rewired to the vendored tarball"
+            );
+        }
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "expected a vendor_prebuilt_downloaded advisory, got {warnings:?}"
+        );
+    }
+
+    /// `service` mode + a downloaded artifact that fails integrity = hard fail,
+    /// project byte-untouched (no tgz, lock unchanged).
+    #[tokio::test]
+    async fn service_integrity_mismatch_service_mode_hard_fails() {
+        let (served, _) = locally_built_artifact().await;
+        let wrong = sri_sha512(b"not the real tarball");
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &wrong, &served).await;
+
+        let fx = fixture().await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+        let (result, _entry, _) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await);
+        assert!(!result.success, "integrity mismatch under `service` must fail");
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            before,
+            "lock must be byte-untouched on a hard fail"
+        );
+        assert!(
+            !fx.root().join(fx.expected_rel_tgz()).exists(),
+            "no tarball must be written on a hard fail"
+        );
+    }
+
+    /// `auto` + integrity mismatch falls back to a local build (loudly): the
+    /// lock ends up rewired to the LOCALLY-recomputed integrity, not the bad
+    /// service value.
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_falls_back_to_build() {
+        let (served, _) = locally_built_artifact().await;
+        let wrong = sri_sha512(b"not the real tarball");
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &wrong, &served).await;
+
+        let fx = fixture().await;
+        let (result, entry, warnings) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
+        assert!(result.success, "auto must fall back to a successful build: {:?}", result.error);
+        assert!(entry.is_some());
+        let on_disk = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        let local_sri = sri_sha512(&on_disk);
+        assert_eq!(
+            lock_integrity(&fx.read_lock().await, "node_modules/left-pad"),
+            local_sri,
+            "fallback build's integrity, not the bad service value"
+        );
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_prebuilt_integrity_mismatch"),
+            "expected a vendor_prebuilt_integrity_mismatch advisory, got {warnings:?}"
+        );
+    }
+
+    /// `auto` + pending_build falls back to a local build (with an advisory).
+    #[tokio::test]
+    async fn service_pending_build_auto_falls_back() {
+        let server = wiremock::MockServer::start().await;
+        mount_status_only(&server, "pending_build").await;
+
+        let fx = fixture().await;
+        let (result, entry, warnings) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(fx.root().join(fx.expected_rel_tgz()).exists());
+        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_pending"));
+    }
+
+    /// `service` mode + pending_build hard-fails (no fallback).
+    #[tokio::test]
+    async fn service_pending_build_service_mode_hard_fails() {
+        let server = wiremock::MockServer::start().await;
+        mount_status_only(&server, "pending_build").await;
+
+        let fx = fixture().await;
+        let (result, _, _) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await);
+        assert!(!result.success);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
+    /// `auto` + not_found falls back QUIETLY (the common "not built / free-only"
+    /// case must not emit a loud `vendor_prebuilt_*` advisory).
+    #[tokio::test]
+    async fn service_not_found_auto_falls_back_quietly() {
+        let server = wiremock::MockServer::start().await;
+        mount_status_only(&server, "not_found").await;
+
+        let fx = fixture().await;
+        let (result, entry, warnings) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            !warnings.iter().any(|w| w.code.starts_with("vendor_prebuilt_")),
+            "a not_found miss must be quiet, got {warnings:?}"
+        );
+    }
+
+    /// `--offline` + `auto`: the service is NEVER contacted; the local build runs.
+    #[tokio::test]
+    async fn offline_auto_does_not_call_service() {
+        let server = wiremock::MockServer::start().await;
+        mount_post_never(&server).await;
+
+        let fx = fixture().await;
+        let (result, entry, _) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, true)).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        // `mount_post_never`'s `.expect(0)` is verified on `server` drop.
+    }
+
+    /// `--vendor-source=build`: the service is NEVER contacted; the local build runs.
+    #[tokio::test]
+    async fn build_mode_does_not_call_service() {
+        let server = wiremock::MockServer::start().await;
+        mount_post_never(&server).await;
+
+        let fx = fixture().await;
+        let (result, entry, _) =
+            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Build, false)).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+    }
+
+    /// `--offline` + `--vendor-source=service` is an irreconcilable request:
+    /// refuse loudly, touch nothing, never hit the network.
+    #[tokio::test]
+    async fn offline_service_mode_refuses() {
+        let server = wiremock::MockServer::start().await;
+        mount_post_never(&server).await;
+
+        let fx = fixture().await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+        match vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, true)).await {
+            VendorOutcome::Refused { code, .. } => {
+                assert_eq!(code, "vendor_service_offline_conflict");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
     }
 }

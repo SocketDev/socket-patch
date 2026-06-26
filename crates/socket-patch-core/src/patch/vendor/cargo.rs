@@ -28,11 +28,13 @@ use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
 use super::cargo_lock::{self, LockEditError, LockEntryOriginal};
 use super::path::vendor_uuid_dir_rel;
+use super::registry_fetch::extract_tgz;
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// True if a crate is vendored under `<project_root>/vendor/` (in either the
 /// `<name>-<version>/` or bare `<name>/` layout the cargo crawler probes). A
@@ -144,6 +146,99 @@ fn done(
     }
 }
 
+/// Outcome of attempting to materialise the cargo copy from the patch service.
+enum CargoServiceCopy {
+    /// The prebuilt crate was extracted into `copy_dir`.
+    Used,
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to copying + patching the pristine source.
+    FallBack,
+}
+
+/// Download the prebuilt `.crate`, integrity-verify it, and extract it into
+/// `copy_dir` (a path-dep copy must carry no `.cargo-checksum.json`). Maps each
+/// service outcome onto the `auto` / `service` fallback policy. The extracted
+/// crate IS the patched package the converter built, so it needs no pristine
+/// source — which is the point of the service path.
+async fn cargo_service_copy(
+    service: Option<&VendorServiceConfig>,
+    record: &PatchRecord,
+    name: &str,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    warnings: &mut Vec<VendorWarning>,
+) -> CargoServiceCopy {
+    let Some(cfg) = service else {
+        return CargoServiceCopy::FallBack;
+    };
+    if !cfg.service_enabled() {
+        return CargoServiceCopy::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> CargoServiceCopy {
+        CargoServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            CargoServiceCopy::FallBack
+        }
+    };
+    match fetch_verified_archive(cfg, &record.uuid, name).await {
+        ServiceArtifact::Ready(archive) => {
+            // Clean copy dir, then extract the `.crate` (tar.gz; strip its
+            // single `{name}-{version}/` top-level dir) into it.
+            let _ = remove_tree(copy_dir).await;
+            if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+                return hard(
+                    "vendor_prebuilt_write_failed",
+                    format!("cannot create {}: {e}", copy_dir.display()),
+                );
+            }
+            if let Err(e) = extract_tgz(&archive.bytes, copy_dir) {
+                let _ = remove_tree(uuid_dir).await;
+                return hard(
+                    "vendor_prebuilt_extract_failed",
+                    format!("cannot extract the prebuilt crate: {e}"),
+                );
+            }
+            let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!("vendored {name} from the patch service ({})", archive.source_url),
+            ));
+            CargoServiceCopy::Used
+        }
+        ServiceArtifact::IntegrityMismatch(reason) => miss(
+            warnings,
+            "vendor_prebuilt_integrity_mismatch",
+            format!("prebuilt crate failed integrity ({reason})"),
+        ),
+        ServiceArtifact::Pending => miss(
+            warnings,
+            "vendor_prebuilt_pending",
+            "prebuilt crate is still building".to_string(),
+        ),
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt crate unavailable: {reason}"),
+                )
+            } else {
+                CargoServiceCopy::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => miss(
+            warnings,
+            "vendor_prebuilt_unavailable",
+            format!("patch service request failed ({reason})"),
+        ),
+    }
+}
+
 /// Vendor one cargo crate: patched copy + `[patch.crates-io]` entry +
 /// `Cargo.lock` surgery + marker, returning the ledger entry to persist.
 ///
@@ -165,6 +260,7 @@ pub async fn vendor_cargo_crate(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((name, version)) = parse_cargo_purl(purl) else {
@@ -357,60 +453,82 @@ pub async fn vendor_cargo_crate(
     }
 
     // ── materialise the patched copy ──────────────────────────────────────
-    // Skip any `.cargo-checksum.json`: cargo 1.93 registry/src dirs no longer
-    // carry one (spike surprise), but older layouts do and a path-dep copy
-    // must never include it (its presence would re-enable checksum fixups).
-    if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
-        // Clear the whole uuid dir, not just the copy: a partial copy (or an
-        // empty `<uuid>/` husk) under .socket/vendor/ would be misjudged by
-        // verify/sweep.
-        let _ = remove_tree(&uuid_dir).await;
-        return done(
-            synthesized_result(
+    // Prefer the prebuilt `.crate` from the patch service (download + extract,
+    // no pristine source needed); else copy the pristine source and patch it.
+    // Either way a path-dep copy must never carry a `.cargo-checksum.json`
+    // (cargo 1.93 src dirs no longer have one, but older layouts do and its
+    // presence would re-enable checksum fixups).
+    let mut warnings: Vec<VendorWarning> = Vec::new();
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && cfg.offline {
+            return VendorOutcome::Refused {
+                code: "vendor_service_offline_conflict",
+                detail: "--vendor-source=service needs the network but --offline is set"
+                    .to_string(),
+            };
+        }
+    }
+    let mut result = match cargo_service_copy(service, record, name, &copy_dir, &uuid_dir, &mut warnings)
+        .await
+    {
+        CargoServiceCopy::Used => {
+            // The service crate is the patched package; trust its verified
+            // integrity (every file reads as AlreadyPatched).
+            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            synthesized_result(purl, &copy_dir, verified, true, None)
+        }
+        CargoServiceCopy::HardFail(outcome) => return *outcome,
+        CargoServiceCopy::FallBack => {
+            if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
+                // Clear the whole uuid dir, not just the copy: a partial copy
+                // (or an empty `<uuid>/` husk) under .socket/vendor/ would be
+                // misjudged by verify/sweep.
+                let _ = remove_tree(&uuid_dir).await;
+                return done(
+                    synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy pristine source: {e}")),
+                    ),
+                    None,
+                    warnings,
+                );
+            }
+            // Delegate to the hardened pipeline (vendor auto-force policy —
+            // see `force_apply_staged`), pointed at the copy.
+            let mut result = super::force_apply_staged(
                 purl,
                 &copy_dir,
-                Vec::new(),
+                record,
+                sources,
                 false,
-                Some(format!("failed to copy pristine source: {e}")),
-            ),
-            None,
-            Vec::new(),
-        );
-    }
-
-    // Delegate to the hardened pipeline (vendor auto-force policy — see
-    // `force_apply_staged`), pointed at the copy.
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-    let mut result = super::force_apply_staged(
-        purl,
-        &copy_dir,
-        record,
-        sources,
-        false,
-        force,
-        name,
-        version,
-        &mut warnings,
-    )
-    .await;
-    result.package_path = copy_dir.display().to_string();
-
-    if !result.success {
-        // Don't leave a half-built copy (or an empty uuid husk) that
-        // verify/sweep would misjudge.
-        let _ = remove_tree(&uuid_dir).await;
-        return done(result, None, warnings);
-    }
-
-    // A path-dep copy must never carry a checksum sidecar. The fresh copy
-    // excluded it; enforce the invariant defensively in case the patch itself
-    // recreated the file.
-    let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
-    debug_assert!(
-        result.sidecar.is_none(),
-        "vendor copy must not produce a cargo sidecar"
-    );
-    result.sidecar = None;
+                force,
+                name,
+                version,
+                &mut warnings,
+            )
+            .await;
+            result.package_path = copy_dir.display().to_string();
+            if !result.success {
+                // Don't leave a half-built copy (or an empty uuid husk) that
+                // verify/sweep would misjudge.
+                let _ = remove_tree(&uuid_dir).await;
+                return done(result, None, warnings);
+            }
+            // A path-dep copy must never carry a checksum sidecar. The fresh
+            // copy excluded it; enforce defensively in case the patch recreated
+            // the file.
+            let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+            debug_assert!(
+                result.sidecar.is_none(),
+                "vendor copy must not produce a cargo sidecar"
+            );
+            result.sidecar = None;
+            result
+        }
+    };
 
     // ── wire the config entry ─────────────────────────────────────────────
     if let Err(e) = cargo_config::ensure_patch_entry(project_root, name, &copy_rel, false).await {
@@ -750,6 +868,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             dry_run,
             false,
+            None,
         )
         .await
     }
@@ -1359,5 +1478,229 @@ mod tests {
                 .unwrap(),
             lock_body()
         );
+    }
+
+    // ─────────────── service-download path (Tier B: cargo) ───────────────
+    //
+    // cargo vendors a patched source DIRECTORY, so the service path downloads
+    // the prebuilt `.crate`, verifies it, and extracts it into the copy dir.
+    // Both the service path AND the local-build fallback are exercised.
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::patch::vendor::{VendorServiceConfig, VendorSource};
+
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha512};
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    }
+
+    fn cargo_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline,
+        }
+    }
+
+    /// Build a `.crate` (tar.gz with a single `{prefix}/` top-level dir).
+    fn make_crate_tgz(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut builder = tar::Builder::new(Vec::new());
+        for (rel, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{prefix}/{rel}"), *content)
+                .unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut enc =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    async fn mount_cargo_granted(server: &wiremock::MockServer, sha512: &str, crate_bytes: &[u8]) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let serve_path = format!("/patch/cargo/cfg-if/1.0.4/tok/{UUID}/cfg-if-1.0.4.crate");
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "purl": PURL,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sha512 } }]
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(crate_bytes.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_cargo_status(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn copy_lib(root: &Path) -> PathBuf {
+        root.join(format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"))
+    }
+
+    /// Service success: the prebuilt crate is extracted into the copy dir (with
+    /// the patched content, no checksum sidecar), the config is wired, and a
+    /// `vendor_prebuilt_downloaded` advisory is emitted — WITHOUT touching the
+    /// pristine source (a deliberately-missing path).
+    #[tokio::test]
+    async fn service_success_extracts_crate_and_wires_config() {
+        let (dir, blobs, _pristine, record) = fixture().await;
+        let root = dir.path();
+        let crate_tgz = make_crate_tgz(
+            "cfg-if-1.0.4",
+            &[
+                ("src/lib.rs", PATCHED),
+                ("Cargo.toml", b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n"),
+                (".cargo-checksum.json", b"{\"files\":{}}"),
+            ],
+        );
+        let sri = sri_sha512(&crate_tgz);
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        // A deliberately-missing pristine source: the service path must not need it.
+        let bogus_pristine = root.join("no-such-pristine");
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &bogus_pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+        assert!(
+            !root
+                .join(format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/.cargo-checksum.json"))
+                .exists(),
+            "path-dep copy must not carry a checksum sidecar"
+        );
+        let cfg = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        assert!(cfg.contains("[patch.crates-io]") && cfg.contains("cfg-if"), "{cfg}");
+        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// `service` mode + integrity mismatch hard-fails, nothing extracted.
+    #[tokio::test]
+    async fn service_integrity_mismatch_service_mode_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let crate_tgz = make_crate_tgz("cfg-if-1.0.4", &[("src/lib.rs", PATCHED)]);
+        let wrong = sri_sha512(b"different bytes");
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &wrong, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Service, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    }
+
+    /// `auto` + a not-built service status falls back to the local build (which
+    /// copies the pristine source + patches it).
+    #[tokio::test]
+    async fn service_unavailable_auto_falls_back_to_build() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_status(&server, "not_found").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(entry.is_some());
+        // The locally-built copy has the patched content.
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
+    }
+
+    /// `--offline` + `--vendor-source=service` refuses without any network.
+    #[tokio::test]
+    async fn offline_service_mode_refuses() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, true)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_service_offline_conflict");
     }
 }

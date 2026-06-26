@@ -528,7 +528,7 @@ async fn redirect_in_sync(
 /// crash / power loss / `ENOSPC` mid-write would otherwise commit a torn or
 /// empty `go.mod`. A reader (a concurrent `go build`, or the file landing in a
 /// commit) then only ever sees the complete file, never a half-written one.
-async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::io::Result<()> {
+pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::io::Result<()> {
     let go_mod = copy_dir.join("go.mod");
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());

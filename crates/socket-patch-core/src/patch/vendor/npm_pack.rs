@@ -38,6 +38,28 @@ pub struct PackedTarball {
     pub size: u64,
 }
 
+impl PackedTarball {
+    /// Compute the tarball's identity facts (sha512 SRI / sha256 / sha1 / size)
+    /// from its bytes, writing nothing.
+    ///
+    /// Single home for the hash formulas so a locally-packed tarball
+    /// ([`pack_deterministic`]) and a service-downloaded one
+    /// ([`super::npm_common::staged_pack_from_service_bytes`]) describe
+    /// themselves identically — the lockfile `integrity` is byte-for-byte the
+    /// same whichever path produced the bytes.
+    pub fn from_bytes(bytes: &[u8]) -> PackedTarball {
+        PackedTarball {
+            integrity: format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+            ),
+            sha256_hex: hex::encode(Sha256::digest(bytes)),
+            sha1_hex: hex::encode(Sha1::digest(bytes)),
+            size: bytes.len() as u64,
+        }
+    }
+}
+
 /// Pack every regular file under `staged_dir` into an npm-conventional
 /// `package/`-prefixed tar.gz at `dest`, deterministically (see module docs).
 ///
@@ -55,16 +77,7 @@ pub async fn pack_deterministic(staged_dir: &Path, dest: &Path) -> std::io::Resu
 
     atomic_write_bytes(dest, &bytes).await?;
 
-    let integrity = format!(
-        "sha512-{}",
-        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes))
-    );
-    Ok(PackedTarball {
-        integrity,
-        sha256_hex: hex::encode(Sha256::digest(&bytes)),
-        sha1_hex: hex::encode(Sha1::digest(&bytes)),
-        size: bytes.len() as u64,
-    })
+    Ok(PackedTarball::from_bytes(&bytes))
 }
 
 /// Build the deterministic tar.gz in memory (vendored packages are small —
@@ -349,5 +362,28 @@ mod tests {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "stage litter: {name}");
         }
+    }
+
+    /// The DRY invariant the service-download path depends on: a locally-packed
+    /// tarball's returned facts are exactly `PackedTarball::from_bytes` of the
+    /// bytes that landed on disk. So a service-downloaded tarball that hashes
+    /// the same describes itself identically (same lockfile `integrity`).
+    #[tokio::test]
+    async fn pack_deterministic_result_equals_from_bytes_of_written_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        build_stage(&stage).await;
+        let dest = tmp.path().join("pkg.tgz");
+
+        let packed = pack_deterministic(&stage, &dest).await.unwrap();
+        let written = tokio::fs::read(&dest).await.unwrap();
+        let recomputed = PackedTarball::from_bytes(&written);
+
+        assert_eq!(packed.integrity, recomputed.integrity);
+        assert_eq!(packed.sha256_hex, recomputed.sha256_hex);
+        assert_eq!(packed.sha1_hex, recomputed.sha1_hex);
+        assert_eq!(packed.size, recomputed.size);
+        assert!(packed.integrity.starts_with("sha512-"));
+        assert_eq!(packed.size, written.len() as u64);
     }
 }

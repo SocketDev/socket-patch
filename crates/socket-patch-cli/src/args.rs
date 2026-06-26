@@ -22,6 +22,7 @@ use socket_patch_core::constants::{
     DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_SOCKET_API_URL,
 };
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::patch::vendor::VendorSource;
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
@@ -47,6 +48,16 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
             "unsupported ecosystem `{s}` in this build (supported: {supported})"
         ))
     }
+}
+
+/// clap value-parser for `--vendor-source` / `SOCKET_VENDOR_SOURCE`.
+///
+/// Validates the token against [`VendorSource`] (`auto` | `service` | `build`,
+/// case-insensitive) at parse time so a typo fails the command immediately
+/// rather than at vendor time, and normalizes it to the canonical lowercase
+/// tag. Mirrors [`parse_supported_ecosystem`]'s fail-loud-on-typo posture.
+fn parse_vendor_source(s: &str) -> Result<String, String> {
+    VendorSource::parse(s).map(|v| v.as_tag().to_string())
 }
 
 /// clap value-parser for boolean flags backed by an env var.
@@ -133,6 +144,35 @@ pub struct GlobalArgs {
         default_value = "diff"
     )]
     pub download_mode: String,
+
+    /// Where `vendor` acquires the installable patched artifact. `auto`
+    /// (default) downloads the prebuilt archive from the patch.socket.dev
+    /// vendoring service and silently falls back to a local build on any miss;
+    /// `service` requires the service and fails closed; `build` always builds
+    /// locally (the pre-service behavior). Only `vendor` uses this; other
+    /// subcommands accept it silently.
+    #[arg(
+        long = "vendor-source",
+        env = "SOCKET_VENDOR_SOURCE",
+        default_value = "auto",
+        value_parser = parse_vendor_source,
+    )]
+    pub vendor_source: String,
+
+    /// Base URL for the patch vendoring service's package-reference request
+    /// (the step-1 POST). Defaults to the active API base (`--api-url`) when
+    /// authenticated or the proxy base (`--proxy-url`) otherwise. Override to
+    /// point `vendor` at staging / local dev independently of `--api-url`.
+    #[arg(long = "vendor-url", env = "SOCKET_VENDOR_URL")]
+    pub vendor_url: Option<String>,
+
+    /// Override the host of the prebuilt-archive download URL the vendoring
+    /// service returns (the step-2 GET). When set, the CLI rewrites the
+    /// scheme + host (+ port) of the returned URL to this base, preserving the
+    /// path. Mainly for local-dev / testing, where the host the server bakes
+    /// into the URL is not the one to actually fetch from.
+    #[arg(long = "patch-server-url", env = "SOCKET_PATCH_SERVER_URL")]
+    pub patch_server_url: Option<String>,
 
     /// Strict airgap: never contact the network. Operations that need remote
     /// data fail loudly when this is set.
@@ -330,6 +370,9 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_PROXY_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_OFFLINE",
     "SOCKET_GLOBAL",
     "SOCKET_GLOBAL_PREFIX",
@@ -390,6 +433,9 @@ impl Default for GlobalArgs {
             proxy_url: String::new(),
             ecosystems: None,
             download_mode: "diff".to_string(),
+            vendor_source: "auto".to_string(),
+            vendor_url: None,
+            patch_server_url: None,
             offline: false,
             strict: false,
             global: false,
@@ -524,6 +570,7 @@ mod tests {
             std::env::set_var("SOCKET_GLOBAL_PREFIX", "");
             std::env::set_var("SOCKET_ECOSYSTEMS", "");
             std::env::set_var("SOCKET_DOWNLOAD_MODE", "");
+            std::env::set_var("SOCKET_VENDOR_SOURCE", "");
             std::env::set_var("SOCKET_MANIFEST_PATH", "keep.json");
             std::env::set_var("SOCKET_ORG_SLUG", " ");
 
@@ -552,8 +599,93 @@ mod tests {
             assert!(cli.common.global_prefix.is_none());
             assert!(cli.common.ecosystems.is_none());
             assert_eq!(cli.common.download_mode, "diff");
+            assert_eq!(
+                cli.common.vendor_source, "auto",
+                "empty SOCKET_VENDOR_SOURCE must fall back to the `auto` default"
+            );
             assert_eq!(cli.common.manifest_path, "keep.json");
         });
+    }
+
+    /// `--vendor-source` parses every known token, normalizes case, honors the
+    /// env var, and defaults to `auto`; an unknown token aborts the parse.
+    #[test]
+    #[serial_test::serial]
+    fn vendor_source_flag_parses_normalizes_and_defaults() {
+        with_clean_socket_env(|| {
+            // Default when unset.
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert_eq!(cli.common.vendor_source, "auto");
+
+            // CLI value, case-normalized to the canonical tag.
+            let cli =
+                TestCli::try_parse_from(["socket-patch", "--vendor-source", "SERVICE"]).unwrap();
+            assert_eq!(cli.common.vendor_source, "service");
+
+            // Env var honored.
+            std::env::set_var("SOCKET_VENDOR_SOURCE", "build");
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert_eq!(cli.common.vendor_source, "build");
+            std::env::remove_var("SOCKET_VENDOR_SOURCE");
+
+            // Garbage is rejected at parse time.
+            assert!(
+                TestCli::try_parse_from(["socket-patch", "--vendor-source", "download"]).is_err(),
+                "an unknown vendor source must fail the parse",
+            );
+        });
+    }
+
+    /// The new URL knobs flow through to the parsed args from CLI and env.
+    #[test]
+    #[serial_test::serial]
+    fn vendor_url_and_patch_server_url_flow_from_cli_and_env() {
+        with_clean_socket_env(|| {
+            let cli = TestCli::try_parse_from([
+                "socket-patch",
+                "--vendor-url",
+                "https://patch.socket-staging.dev",
+                "--patch-server-url",
+                "http://localhost:4026",
+            ])
+            .unwrap();
+            assert_eq!(
+                cli.common.vendor_url.as_deref(),
+                Some("https://patch.socket-staging.dev")
+            );
+            assert_eq!(
+                cli.common.patch_server_url.as_deref(),
+                Some("http://localhost:4026")
+            );
+
+            std::env::set_var("SOCKET_VENDOR_URL", "https://from-env.example");
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert_eq!(
+                cli.common.vendor_url.as_deref(),
+                Some("https://from-env.example")
+            );
+            std::env::remove_var("SOCKET_VENDOR_URL");
+            // Unset by default.
+            let cli = TestCli::try_parse_from(["socket-patch"]).unwrap();
+            assert!(cli.common.vendor_url.is_none());
+            assert!(cli.common.patch_server_url.is_none());
+        });
+    }
+
+    /// Single-source-of-truth guard: the new env vars must be registered in
+    /// `GLOBAL_ARG_ENV_VARS` (drives the scrub + clean-env harness).
+    #[test]
+    fn global_arg_env_vars_includes_vendor_knobs() {
+        for var in [
+            "SOCKET_VENDOR_SOURCE",
+            "SOCKET_VENDOR_URL",
+            "SOCKET_PATCH_SERVER_URL",
+        ] {
+            assert!(
+                GLOBAL_ARG_ENV_VARS.contains(&var),
+                "{var} must be in GLOBAL_ARG_ENV_VARS",
+            );
+        }
     }
 
     /// `parse_bool_flag` accepts the same vocabulary as clap's

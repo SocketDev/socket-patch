@@ -25,7 +25,7 @@ use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::patch::vendor::{
     self, ecosystem_dir_for_purl, load_state, save_state, RevertOutcome, VendorEntry,
-    VendorOutcome, VendorWarning,
+    VendorOutcome, VendorServiceConfig, VendorSource, VendorWarning,
 };
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
@@ -99,8 +99,35 @@ pub(crate) async fn dispatch_vendor_one(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    // The patch.socket.dev vendoring-service config. `None` = build-only (the
+    // pre-service behavior); used by the `vendor` command, `None` from `scan
+    // --vendor` / repair. Per-ecosystem backends consume it as they gain a
+    // service path.
+    service: Option<&VendorServiceConfig>,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
+
+    // Prebuilt service downloads now cover every vendorable ecosystem: npm,
+    // pypi, cargo, golang, composer, and gem. Gem's `.gem` archive doesn't
+    // carry the eval-able stub gemspec a bundler path source wants, so the
+    // converter generates it and serves it as a `gem-stub-gemspec` second
+    // artifact alongside the `.gem` (the gem backend downloads + verifies both).
+    // Under fail-closed `service` mode, refuse any not-covered ecosystem with a
+    // clear message rather than silently building (which would violate the
+    // contract). Under `auto`/`build` they fall through to the local build.
+    const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo", "golang", "composer", "gem"];
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
+            return Some(VendorOutcome::Refused {
+                code: "vendor_service_unsupported_ecosystem",
+                detail: format!(
+                    "--vendor-source=service is not supported for `{eco}` \
+                     (prebuilt downloads cover npm, pypi, cargo, golang, composer, and gem); \
+                     use --vendor-source=auto or --vendor-source=build"
+                ),
+            });
+        }
+    }
     Some(match eco {
         "npm" => {
             // The flavor router probes the project's lockfile (package-lock /
@@ -114,6 +141,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -127,6 +155,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -140,6 +169,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -154,6 +184,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -168,6 +199,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -182,6 +214,7 @@ pub(crate) async fn dispatch_vendor_one(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -311,10 +344,23 @@ pub(crate) fn record_warning(
 
 pub async fn run(args: VendorArgs) -> i32 {
     apply_env_toggles(&args.common);
-    let (telemetry_client, _) =
+    let (telemetry_client, use_public_proxy) =
         get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
+
+    // Vendoring-service config, built once from the run-level client + flags.
+    // `vendor_source` was validated by clap, so the parse cannot fail; fall
+    // back to the `auto` default defensively. The same client is reused for
+    // the package-reference request (no second auth round-trip).
+    let vendor_service = VendorServiceConfig {
+        source: VendorSource::parse(&args.common.vendor_source).unwrap_or_default(),
+        client: Some(telemetry_client.clone()),
+        use_public_proxy,
+        vendor_url: args.common.vendor_url.clone(),
+        patch_server_url: args.common.patch_server_url.clone(),
+        offline: args.common.offline,
+    };
 
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path
@@ -363,7 +409,7 @@ pub async fn run(args: VendorArgs) -> i32 {
     let exit = if args.revert {
         run_revert(&args, &mut env).await
     } else {
-        run_vendor(&args, &manifest_path, &mut env).await
+        run_vendor(&args, &manifest_path, &mut env, &vendor_service).await
     };
 
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
@@ -415,7 +461,12 @@ pub async fn run(args: VendorArgs) -> i32 {
     exit
 }
 
-async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope) -> i32 {
+async fn run_vendor(
+    args: &VendorArgs,
+    manifest_path: &Path,
+    env: &mut Envelope,
+    service: &VendorServiceConfig,
+) -> i32 {
     let common = &args.common;
     let manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
@@ -455,7 +506,16 @@ async fn run_vendor(args: &VendorArgs, manifest_path: &Path, env: &mut Envelope)
         };
     let sources = staged.as_patch_sources();
 
-    has_errors |= vendor_records(common, &manifest.patches, &sources, false, args.force, env).await;
+    has_errors |= vendor_records(
+        common,
+        &manifest.patches,
+        &sources,
+        false,
+        args.force,
+        env,
+        Some(service),
+    )
+    .await;
 
     if has_errors {
         env.mark_partial_failure();
@@ -615,6 +675,9 @@ pub(crate) async fn vendor_records(
     detached: bool,
     force: bool,
     env: &mut Envelope,
+    // Vendoring-service config (`None` = build-only). The `vendor` command
+    // passes `Some(_)`; `scan --vendor` passes `None` today.
+    service: Option<&VendorServiceConfig>,
 ) -> bool {
     let mut has_errors = false;
     let manifest_purls: Vec<String> = records.keys().cloned().collect();
@@ -889,6 +952,7 @@ pub(crate) async fn vendor_records(
                 &vendored_at,
                 common.dry_run,
                 force,
+                service,
             )
             .await;
 

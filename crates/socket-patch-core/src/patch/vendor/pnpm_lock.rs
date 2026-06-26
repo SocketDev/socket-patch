@@ -85,6 +85,7 @@ pub async fn vendor_pnpm(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -169,6 +170,7 @@ pub async fn vendor_pnpm(
         dry_run,
         force,
         &mut warnings,
+        service,
     )
     .await
     {
@@ -2120,6 +2122,7 @@ snapshots:
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
+                None,
             )
             .await
         }
@@ -2759,6 +2762,7 @@ snapshots:
             "2026-06-09T00:00:00Z",
             false,
             false,
+            None,
         )
         .await;
         let (r2, e2, _) = expect_done(outcome);
