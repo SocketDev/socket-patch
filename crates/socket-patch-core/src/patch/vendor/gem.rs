@@ -63,10 +63,14 @@ use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
 use super::path::vendor_uuid_dir_rel;
+use super::registry_fetch::extract_gem_data;
+use super::service_fetch::{
+    fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact,
+};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
-use super::{RevertOutcome, VendorOutcome, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
@@ -103,11 +107,18 @@ const MARKER_SCHEMA_VERSION: u32 = 1;
 ///
 /// `installed_dir` is the crawler's gem dir (`<gem_home>/gems/<name>-<version>`,
 /// the same root `apply` patches — manifest file keys resolve relative to it);
-/// the stub gemspec is derived from it
+/// the LOCAL build's stub gemspec is derived from it
 /// (`<gem_home>/specifications/<name>-<version>.gemspec` — `specifications/`
 /// is a sibling of `gems/`).
 ///
-/// Edit order: copy+patch → Gemfile → Gemfile.lock; a lock-edit failure
+/// `service` (when configured) lets the materialise step download the prebuilt
+/// patched `.gem` + the converter's `gem-stub-gemspec` second artifact from
+/// patch.socket.dev instead of copying + patching locally — no local install
+/// or stub needed (`auto` falls back to the local build on a miss, `service`
+/// fails closed). The wiring (Gemfile + Gemfile.lock pair edit) is identical
+/// either way; only how `copy_dir` + its `<name>.gemspec` are produced differs.
+///
+/// Edit order: materialise → Gemfile → Gemfile.lock; a lock-edit failure
 /// unwinds the Gemfile to its recorded original bytes, so the pair is never
 /// left half-wired.
 #[allow(clippy::too_many_arguments)]
@@ -120,6 +131,7 @@ pub async fn vendor_gem(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
     // ── coordinates ──────────────────────────────────────────────────────
     let Some((name, version)) = parse_gem_purl(purl) else {
@@ -204,38 +216,37 @@ pub async fn vendor_gem(
         }
     };
 
-    // ── stub gemspec ─────────────────────────────────────────────────────
+    // ── stub gemspec (local) ─────────────────────────────────────────────
     // `specifications/` is a sibling of `gems/`; derive it from installed_dir.
+    // The read is non-fatal: the LOCAL build needs this stub, but the service
+    // path brings its own (the converter-generated `gem-stub-gemspec`), so an
+    // auto-fetched (not-installed) gem whose only `installed_dir` is a bare
+    // `data.tar.gz` extraction can still vendor via the service. The
+    // `gem_spec_missing` refusal moves into the local-build fallback, where the
+    // stub is actually required.
     let spec_src = installed_dir
         .parent()
         .and_then(Path::parent)
         .map(|home| home.join("specifications").join(format!("{leaf}.gemspec")));
-    let spec_text = match &spec_src {
+    let spec_text: Option<String> = match &spec_src {
         Some(p) => tokio::fs::read_to_string(p).await.ok(),
         None => None,
-    };
-    let Some(spec_text) = spec_text else {
-        return refused(
-            "gem_spec_missing",
-            format!(
-                "no stub gemspec at {} (a path source cannot be wired without one)",
-                spec_src
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "<gem_home>/specifications".to_string())
-            ),
-        );
     };
     // Textual heuristic, deliberately fail-closed on a match: bundler skips
     // extension builds for path sources entirely, so a native gem would
     // install fine and then fail at `require` time with a missing `.so`.
-    if gemspec_declares_extensions(&spec_text) {
-        return refused(
-            "native_extensions_unsupported",
-            format!(
-                "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
-            ),
-        );
+    // Only the local stub is checked here (when present); the service stub is
+    // re-checked in `gem_service_copy`, and a native gem emits no service stub
+    // at all (the converter refuses it), so the service path also misses.
+    if let Some(text) = &spec_text {
+        if gemspec_declares_extensions(text) {
+            return refused(
+                "native_extensions_unsupported",
+                format!(
+                    "{leaf}.gemspec declares native extensions; bundler does not build extensions for path-sourced gems"
+                ),
+            );
+        }
     }
 
     // ── idempotent hot path ──────────────────────────────────────────────
@@ -268,54 +279,39 @@ pub async fn vendor_gem(
             // missing/stale: rebuild the ARTIFACT only — the pair edit is
             // already correct and the full path would re-record the live
             // vendored fragments as `original`, breaking a later --revert.
+            // Service-preferred like the full path (an auto-fetched gem has no
+            // local stub to rebuild from — only the service can).
             if !dry_run {
-                if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-                    return VendorOutcome::Done {
-                        result: synthesized_result(
-                            purl,
-                            &copy_dir,
-                            Vec::new(),
-                            false,
-                            Some(format!("failed to copy installed gem: {e}")),
-                        ),
-                        entry: None,
-                        warnings: Vec::new(),
-                    };
-                }
-                if let Err(e) =
-                    tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), &spec_text).await
-                {
-                    let _ = remove_tree(&uuid_dir).await;
-                    return VendorOutcome::Done {
-                        result: synthesized_result(
-                            purl,
-                            &copy_dir,
-                            Vec::new(),
-                            false,
-                            Some(format!(
-                                "failed to copy the stub gemspec into the vendored dir: {e}"
-                            )),
-                        ),
-                        entry: None,
-                        warnings: Vec::new(),
-                    };
+                if let Some(cfg) = service {
+                    if cfg.source.requires_service() && cfg.offline {
+                        return refused(
+                            "vendor_service_offline_conflict",
+                            "--vendor-source=service needs the network but --offline is set"
+                                .to_string(),
+                        );
+                    }
                 }
                 let mut warnings: Vec<VendorWarning> = Vec::new();
-                let mut result = super::force_apply_staged(
+                let result = match materialise_patched_copy(
                     purl,
+                    installed_dir,
                     &copy_dir,
-                    record,
-                    sources,
-                    false,
-                    force,
+                    &uuid_dir,
                     name,
                     version,
+                    spec_text.as_deref(),
+                    record,
+                    sources,
+                    force,
+                    service,
                     &mut warnings,
                 )
-                .await;
-                result.package_path = copy_dir.display().to_string();
+                .await
+                {
+                    Ok(result) => result,
+                    Err(outcome) => return *outcome,
+                };
                 if !result.success {
-                    let _ = remove_tree(&uuid_dir).await;
                     return VendorOutcome::Done {
                         result,
                         entry: None,
@@ -384,61 +380,48 @@ pub async fn vendor_gem(
         Err(detail) => return refused("gemfile_declaration_not_editable", detail),
     };
 
-    // ── copy + patch ─────────────────────────────────────────────────────
-    if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-        return VendorOutcome::Done {
-            result: synthesized_result(
-                purl,
-                &copy_dir,
-                Vec::new(),
-                false,
-                Some(format!("failed to copy installed gem: {e}")),
-            ),
-            entry: None,
-            warnings: Vec::new(),
-        };
-    }
-    // The vendored dir is freshly created and not yet referenced by anything,
-    // so a plain write suffices for the gemspec.
-    if let Err(e) = tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), &spec_text).await {
-        let _ = remove_tree(&uuid_dir).await;
-        return VendorOutcome::Done {
-            result: synthesized_result(
-                purl,
-                &copy_dir,
-                Vec::new(),
-                false,
-                Some(format!(
-                    "failed to copy the stub gemspec into the vendored dir: {e}"
-                )),
-            ),
-            entry: None,
-            warnings: Vec::new(),
-        };
-    }
+    // ── materialise the patched copy ──────────────────────────────────────
+    // Prefer the prebuilt `.gem` + stub gemspec from the patch service
+    // (download + extract; no local install or patch-apply needed); else copy
+    // the installed gem, drop in the local stub gemspec, and apply the patch.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    let mut result = super::force_apply_staged(
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && cfg.offline {
+            return refused(
+                "vendor_service_offline_conflict",
+                "--vendor-source=service needs the network but --offline is set".to_string(),
+            );
+        }
+    }
+    let mut result = match materialise_patched_copy(
         purl,
+        installed_dir,
         &copy_dir,
-        record,
-        sources,
-        false,
-        force,
+        &uuid_dir,
         name,
         version,
+        spec_text.as_deref(),
+        record,
+        sources,
+        force,
+        service,
         &mut warnings,
     )
-    .await;
-    result.package_path = copy_dir.display().to_string();
+    .await
+    {
+        Ok(result) => result,
+        Err(outcome) => return *outcome,
+    };
     if !result.success {
-        // Don't leave a half-built copy; neither file was touched.
-        let _ = remove_tree(&uuid_dir).await;
+        // The copy / stub / patch step left the result un-successful (and
+        // cleaned up its own partial copy); neither project file was touched.
         return VendorOutcome::Done {
             result,
             entry: None,
             warnings,
         };
     }
+    result.package_path = copy_dir.display().to_string();
 
     // ── Gemfile edit ─────────────────────────────────────────────────────
     let new_gemfile = apply_gemfile_plan(&gemfile_text, &plan);
@@ -588,6 +571,263 @@ pub async fn vendor_gem(
         result,
         entry: Some(entry),
         warnings,
+    }
+}
+
+// ── materialisation (service download / local build) ──────────────────────────
+
+/// The path-source stub gemspec served as the gem's SECOND artifact, alongside
+/// the `.gem` (mirrors npm's `yarn-berry-zip`). The converter generates it
+/// because a `.gem` only carries the gemspec as YAML in `metadata.gz`, not the
+/// eval-able Ruby form a bundler path source loads.
+const GEM_STUB_ARTIFACT_KIND: &str = "gem-stub-gemspec";
+
+/// Outcome of attempting to materialise the gem copy from the patch service.
+enum GemServiceCopy {
+    /// The prebuilt `.gem` was extracted into `copy_dir` and the verified stub
+    /// gemspec written as `<name>.gemspec`.
+    Used,
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to copying the installed gem + local stub and patching it.
+    FallBack,
+}
+
+/// Download the prebuilt `.gem` + its `gem-stub-gemspec` secondary artifact,
+/// integrity-verify both, extract the `.gem`'s `data.tar.gz` into `copy_dir`,
+/// and write the stub as `<name>.gemspec`. The extracted `.gem` IS the patched
+/// package the converter built, so it needs no local install — the point of
+/// the service path. Maps each service outcome onto the `auto` / `service`
+/// fallback policy.
+///
+/// A MISSING stub artifact is a terminal miss (fall back under `auto`, refuse
+/// under `service`): it means either a native-extension gem (the converter
+/// emits no stub — bundler can't build extensions for a path source) or a gem
+/// patch built before the stub rollout (the invalidation migration rebuilds
+/// those). The downloaded stub is re-checked for native extensions as defense
+/// in depth.
+async fn gem_service_copy(
+    service: Option<&VendorServiceConfig>,
+    record: &PatchRecord,
+    name: &str,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    warnings: &mut Vec<VendorWarning>,
+) -> GemServiceCopy {
+    let Some(cfg) = service else {
+        return GemServiceCopy::FallBack;
+    };
+    if !cfg.service_enabled() {
+        return GemServiceCopy::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> GemServiceCopy {
+        GemServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
+            GemServiceCopy::FallBack
+        }
+    };
+
+    // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
+    let archive = match fetch_verified_archive(cfg, &record.uuid, name).await {
+        ServiceArtifact::Ready(archive) => archive,
+        ServiceArtifact::IntegrityMismatch(reason) => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_integrity_mismatch",
+                format!("prebuilt .gem failed integrity ({reason})"),
+            );
+        }
+        ServiceArtifact::Pending => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_pending",
+                "prebuilt .gem is still building".to_string(),
+            );
+        }
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                return hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt .gem unavailable: {reason}"),
+                );
+            }
+            return GemServiceCopy::FallBack;
+        }
+        ServiceArtifact::Failed(reason) => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_unavailable",
+                format!("patch service request failed ({reason})"),
+            );
+        }
+    };
+
+    // Step 2: the stub gemspec the converter generated alongside the `.gem`.
+    let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND, name).await {
+        SecondaryArtifactResult::Ready(bytes) => bytes,
+        SecondaryArtifactResult::Absent => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_stub_missing",
+                "the patch service served no stub gemspec for this gem (a native-extension \
+                 gem, or a patch built before the stub rollout)"
+                    .to_string(),
+            );
+        }
+        SecondaryArtifactResult::IntegrityMismatch(reason) => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_integrity_mismatch",
+                format!("prebuilt stub gemspec failed integrity ({reason})"),
+            );
+        }
+        SecondaryArtifactResult::Failed(reason) => {
+            return miss(
+                warnings,
+                "vendor_prebuilt_unavailable",
+                format!("could not fetch the stub gemspec ({reason})"),
+            );
+        }
+    };
+
+    // Defense in depth: the converter does not emit a stub for native gems, but
+    // refuse one here too — bundler silently skips extension builds for path
+    // sources, so a native gem would install and then fail at `require` time.
+    if gemspec_declares_extensions(&String::from_utf8_lossy(&stub)) {
+        return hard(
+            "native_extensions_unsupported",
+            format!(
+                "the served stub gemspec for {name} declares native extensions; bundler does \
+                 not build extensions for path-sourced gems"
+            ),
+        );
+    }
+
+    // Extract the patched `.gem`'s data.tar.gz into a clean copy dir, then add
+    // the stub as `<name>.gemspec` (a `.gem`'s data.tar.gz never carries one —
+    // the gemspec lives in metadata.gz).
+    let _ = remove_tree(copy_dir).await;
+    if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {
+        return hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot create {}: {e}", copy_dir.display()),
+        );
+    }
+    if let Err(e) = extract_gem_data(&archive.bytes, copy_dir) {
+        let _ = remove_tree(uuid_dir).await;
+        return hard(
+            "vendor_prebuilt_extract_failed",
+            format!("cannot extract the prebuilt .gem: {e}"),
+        );
+    }
+    if let Err(e) = tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), &stub).await {
+        let _ = remove_tree(uuid_dir).await;
+        return hard(
+            "vendor_prebuilt_write_failed",
+            format!("cannot write the stub gemspec into the vendored dir: {e}"),
+        );
+    }
+    warnings.push(VendorWarning::new(
+        "vendor_prebuilt_downloaded",
+        format!(
+            "vendored {name} from the patch service ({})",
+            archive.source_url
+        ),
+    ));
+    GemServiceCopy::Used
+}
+
+/// Materialise the patched copy at `copy_dir` plus its `<name>.gemspec` stub,
+/// service-download first (see [`gem_service_copy`]) and local copy+stub+apply
+/// as the fallback. Returns the verify [`ApplyResult`] (a synthesized
+/// `AlreadyPatched` on the service path), or a terminal [`VendorOutcome`] to
+/// bubble. A non-fatal copy/stub/patch failure is surfaced as an UN-successful
+/// `ApplyResult` (the caller returns it as a `Done` with no ledger entry); this
+/// helper cleans up its own partial copy in that case.
+#[allow(clippy::too_many_arguments)]
+async fn materialise_patched_copy(
+    purl: &str,
+    installed_dir: &Path,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    name: &str,
+    version: &str,
+    spec_text: Option<&str>,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<ApplyResult, Box<VendorOutcome>> {
+    match gem_service_copy(service, record, name, copy_dir, uuid_dir, warnings).await {
+        GemServiceCopy::Used => {
+            // The service `.gem` is the patched package; trust its verified
+            // integrity (every file reads as AlreadyPatched).
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
+            Ok(synthesized_result(purl, copy_dir, verified, true, None))
+        }
+        GemServiceCopy::HardFail(outcome) => Err(outcome),
+        GemServiceCopy::FallBack => {
+            // The local build needs the stub gemspec from the installed gem's
+            // `specifications/` dir — absent for an auto-fetched (not-installed)
+            // gem, whose only route is the service path.
+            let Some(spec_text) = spec_text else {
+                return Err(Box::new(refused(
+                    "gem_spec_missing",
+                    format!(
+                        "no local stub gemspec for {name}@{version} (a path source cannot be \
+                         wired without one); install the gem or use --vendor-source=service"
+                    ),
+                )));
+            };
+            if let Err(e) = fresh_copy(installed_dir, copy_dir, None).await {
+                return Ok(synthesized_result(
+                    purl,
+                    copy_dir,
+                    Vec::new(),
+                    false,
+                    Some(format!("failed to copy installed gem: {e}")),
+                ));
+            }
+            // The vendored dir is freshly created and not yet referenced by
+            // anything, so a plain write suffices for the gemspec.
+            if let Err(e) =
+                tokio::fs::write(copy_dir.join(format!("{name}.gemspec")), spec_text).await
+            {
+                let _ = remove_tree(uuid_dir).await;
+                return Ok(synthesized_result(
+                    purl,
+                    copy_dir,
+                    Vec::new(),
+                    false,
+                    Some(format!(
+                        "failed to copy the stub gemspec into the vendored dir: {e}"
+                    )),
+                ));
+            }
+            let mut result = super::force_apply_staged(
+                purl, copy_dir, record, sources, false, force, name, version, warnings,
+            )
+            .await;
+            result.package_path = copy_dir.display().to_string();
+            if !result.success {
+                // Don't leave a half-built copy; neither project file was touched.
+                let _ = remove_tree(uuid_dir).await;
+            }
+            Ok(result)
+        }
     }
 }
 
@@ -1503,6 +1743,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             dry_run,
             false,
+            None,
         )
         .await
     }
@@ -2185,6 +2426,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             dry_run,
             false,
+            None,
         )
         .await
     }
@@ -2600,5 +2842,430 @@ mod tests {
                 .unwrap(),
             v1
         );
+    }
+
+    // ─────────────── service-download path (Tier B: gem) ──────────────────
+    //
+    // gem vendors a patched source DIRECTORY plus a stub gemspec, so the
+    // service path downloads the prebuilt `.gem` AND the `gem-stub-gemspec`
+    // second artifact, verifies both, extracts the `.gem`'s data.tar.gz into the
+    // copy dir, and writes the stub as `<name>.gemspec`. Both the service path
+    // and the local-build fallback are exercised.
+
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::patch::vendor::VendorSource;
+
+    /// A valid path-source stub (no native extensions).
+    const SERVICE_STUB: &[u8] = b"# -*- encoding: utf-8 -*-\n# stub: rack 3.2.6 ruby lib\n\nGem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n";
+    /// A stub that declares native extensions (must be refused).
+    const SERVICE_STUB_NATIVE: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"rack\".freeze\n  s.version = \"3.2.6\".freeze\n  s.extensions = [\"ext/rack/extconf.rb\"]\nend\n";
+
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha512};
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        )
+    }
+
+    fn gem_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline,
+        }
+    }
+
+    /// Build a `.gem` (uncompressed outer tar holding `data.tar.gz` +
+    /// `metadata.gz`). `data_files` are the inner data.tar.gz entries at the
+    /// root (no prefix dir), as a real `.gem` carries them.
+    fn make_gem(data_files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut data_tar = tar::Builder::new(Vec::new());
+        for (rel, content) in data_files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            data_tar.append_data(&mut h, rel, *content).unwrap();
+        }
+        let data_tar = data_tar.into_inner().unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&data_tar).unwrap();
+        let data_gz = enc.finish().unwrap();
+        // A token metadata.gz: the CLI service path never reads it (it uses the
+        // served stub), but a real `.gem` always carries one.
+        let mut menc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        menc.write_all(b"--- !ruby/object:Gem::Specification\nname: rack\n")
+            .unwrap();
+        let metadata_gz = menc.finish().unwrap();
+        let mut outer = tar::Builder::new(Vec::new());
+        for (name, bytes) in [
+            ("metadata.gz", metadata_gz.as_slice()),
+            ("data.tar.gz", data_gz.as_slice()),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            outer.append_data(&mut h, name, bytes).unwrap();
+        }
+        outer.into_inner().unwrap()
+    }
+
+    /// Mount the two-step granted flow: POST returns the `.gem` (tarball) and,
+    /// when `stub` is `Some`, the `gem-stub-gemspec` second artifact; GET serves
+    /// each artifact's bytes. `gem_sha512` / the stub's advertised sha512 are
+    /// passed explicitly so a test can advertise a WRONG hash.
+    async fn mount_gem_granted(
+        server: &wiremock::MockServer,
+        gem_bytes: &[u8],
+        gem_sha512: &str,
+        stub: Option<(&[u8], &str)>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let gem_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gem");
+        let gem_url = format!("{}{gem_path}", server.uri());
+        let mut artifacts = vec![serde_json::json!({
+            "kind": "tarball", "url": gem_url,
+            "integrity": { "sha512": gem_sha512 }
+        })];
+        let stub_path = format!("/patch/gem/rack/3.2.6/tok/{UUID}/rack-3.2.6.gemspec");
+        if let Some((stub_bytes, stub_sha512)) = stub {
+            let stub_url = format!("{}{stub_path}", server.uri());
+            artifacts.push(serde_json::json!({
+                "kind": "gem-stub-gemspec", "url": stub_url,
+                "integrity": { "sha512": stub_sha512 }
+            }));
+            Mock::given(method("GET"))
+                .and(path(stub_path.clone()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(stub_bytes.to_vec()))
+                .mount(server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "purl": PURL,
+                    "artifacts": artifacts
+                }}
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(gem_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gem_bytes.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_gem_status(server: &wiremock::MockServer, status: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: { "status": status, "url": null, "artifacts": [] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// An `installed_dir` that does NOT exist on disk but is named `<leaf>` (so
+    /// the platform-gem check passes): the service path must need no local copy.
+    fn missing_install(root: &Path) -> PathBuf {
+        root.join("no-such-install/rack-3.2.6")
+    }
+
+    fn copy_lib(root: &Path) -> PathBuf {
+        root.join(format!(".socket/vendor/gem/{UUID}/rack-3.2.6/lib/rack.rb"))
+    }
+
+    fn copy_gemspec(root: &Path) -> PathBuf {
+        root.join(format!(".socket/vendor/gem/{UUID}/rack-3.2.6/rack.gemspec"))
+    }
+
+    /// Service success: the prebuilt `.gem` is extracted into the copy dir, the
+    /// served stub is written as `rack.gemspec`, the Gemfile + lock are wired,
+    /// and a `vendor_prebuilt_downloaded` advisory is emitted — WITHOUT a local
+    /// install (a deliberately-missing `installed_dir`).
+    #[tokio::test]
+    async fn service_success_extracts_gem_and_wires_lock() {
+        let (_tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &missing_install(&root),
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (result, entry, warnings) = unwrap_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+        assert_eq!(
+            tokio::fs::read(copy_gemspec(&root)).await.unwrap(),
+            SERVICE_STUB
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            expected_lock_direct()
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.code == "vendor_prebuilt_downloaded"));
+    }
+
+    /// `service` mode + a `.gem` integrity mismatch hard-fails; nothing wired.
+    #[tokio::test]
+    async fn service_gem_integrity_mismatch_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let wrong = sri_sha512(b"different bytes");
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &wrong, Some((SERVICE_STUB, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        // The lock is untouched.
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// `service` mode + a stub integrity mismatch hard-fails.
+    #[tokio::test]
+    async fn service_stub_integrity_mismatch_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let wrong_stub = sri_sha512(b"not the stub");
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &wrong_stub))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// `service` mode + a missing stub artifact hard-fails (old un-rebuilt row /
+    /// native gem): the `.gem` is present but no `gem-stub-gemspec` is served.
+    #[tokio::test]
+    async fn service_stub_missing_service_mode_hard_fails() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, None).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+    }
+
+    /// `auto` + a missing stub artifact falls back to the LOCAL build (which
+    /// copies the installed gem + local stub and patches it).
+    #[tokio::test]
+    async fn service_stub_missing_auto_falls_back_to_build() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, None).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, _) = unwrap_done(outcome);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        // The locally-built copy carries the patched content + the LOCAL stub.
+        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+        assert_eq!(
+            tokio::fs::read_to_string(copy_gemspec(&root))
+                .await
+                .unwrap(),
+            GEMSPEC
+        );
+    }
+
+    /// `auto` + a not-built service status falls back to the local build.
+    #[tokio::test]
+    async fn service_unavailable_auto_falls_back_to_build() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let server = wiremock::MockServer::start().await;
+        mount_gem_status(&server, "not_found").await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, _) = unwrap_done(outcome);
+        assert!(result.success, "auto must fall back: {:?}", result.error);
+        assert!(entry.is_some());
+        assert_eq!(tokio::fs::read(copy_lib(&root)).await.unwrap(), PATCHED);
+    }
+
+    /// A served stub that declares native extensions is refused (defense in
+    /// depth — the converter should never emit one).
+    #[tokio::test]
+    async fn service_native_ext_stub_hard_fails() {
+        let (_tmp, root, _installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB_NATIVE);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB_NATIVE, &stub_sri))).await;
+        let sources = PatchSources::blobs_only(&blobs);
+
+        let outcome = vendor_gem(
+            PURL,
+            &missing_install(&root),
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "native_extensions_unsupported");
+    }
+
+    /// `--offline` + `--vendor-source=service` refuses without any network.
+    #[tokio::test]
+    async fn offline_service_mode_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_gem(
+            PURL,
+            &installed,
+            &root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&gem_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
+        )
+        .await;
+        let (code, _) = unwrap_refused(outcome);
+        assert_eq!(code, "vendor_service_offline_conflict");
     }
 }

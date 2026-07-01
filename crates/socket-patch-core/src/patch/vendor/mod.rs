@@ -69,6 +69,7 @@ pub mod pypi_requirements;
 pub mod pypi_uv;
 pub mod pypi_wheel;
 pub mod registry_fetch;
+pub(crate) mod service_fetch;
 mod toml_surgery;
 pub mod verify;
 pub mod yarn_berry_lock;
@@ -101,6 +102,93 @@ impl VendorWarning {
             code,
             detail: detail.into(),
         }
+    }
+}
+
+/// Where `vendor` acquires the installable patched artifact for a package.
+///
+/// * `Auto` (default) — try the patch.socket.dev vendoring service first and
+///   silently fall back to a local build on any non-fatal miss (offline,
+///   pending build, not found, network error). The downloaded bytes are always
+///   integrity-verified before use.
+/// * `Service` — require the vendoring service; fail closed on a miss. Useful
+///   for CI / exercising the service path exclusively.
+/// * `Build` — always build the artifact locally (the pre-service behavior;
+///   never contacts the vendoring service).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VendorSource {
+    #[default]
+    Auto,
+    Service,
+    Build,
+}
+
+impl VendorSource {
+    /// Short lowercase tag, suitable for JSON output and `--vendor-source`
+    /// flag values.
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            VendorSource::Auto => "auto",
+            VendorSource::Service => "service",
+            VendorSource::Build => "build",
+        }
+    }
+
+    /// Parse a `--vendor-source` / `SOCKET_VENDOR_SOURCE` token (case-insensitive,
+    /// surrounding whitespace trimmed).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(VendorSource::Auto),
+            "service" => Ok(VendorSource::Service),
+            "build" => Ok(VendorSource::Build),
+            other => Err(format!(
+                "unknown vendor source '{other}'. Expected auto, service, or build."
+            )),
+        }
+    }
+
+    /// Whether this mode may contact the vendoring service at all.
+    pub fn may_use_service(&self) -> bool {
+        matches!(self, VendorSource::Auto | VendorSource::Service)
+    }
+
+    /// Whether a service miss must fail closed (no local-build fallback).
+    pub fn requires_service(&self) -> bool {
+        matches!(self, VendorSource::Service)
+    }
+}
+
+/// Everything the vendor backends need to (optionally) download a prebuilt
+/// patched archive from the patch.socket.dev vendoring service.
+///
+/// Built once per `vendor` run in the CLI and threaded as
+/// `Option<&VendorServiceConfig>` through the dispatch chain — `None` means
+/// "build-only" (the pre-service behavior), which keeps every caller that
+/// doesn't opt in (and every existing test) unchanged.
+#[derive(Debug, Clone)]
+pub struct VendorServiceConfig {
+    /// The `auto` / `service` / `build` policy.
+    pub source: VendorSource,
+    /// The run-level API client (reused from the CLI). `None` disables the
+    /// service path even under `auto`/`service` (treated as a miss / refusal).
+    pub client: Option<crate::api::client::ApiClient>,
+    /// True when the client targets the public proxy (tokenless) — drives
+    /// `freeOnly` on the package-reference request.
+    pub use_public_proxy: bool,
+    /// Optional override for the step-1 package-reference base host.
+    pub vendor_url: Option<String>,
+    /// Optional override for the step-2 download host (rewrites the host of the
+    /// server-returned absolute URL).
+    pub patch_server_url: Option<String>,
+    /// Strict airgap — never contact the network.
+    pub offline: bool,
+}
+
+impl VendorServiceConfig {
+    /// Whether this run may actually attempt a service download right now:
+    /// the mode permits it, we're online, and a client is configured.
+    pub fn service_enabled(&self) -> bool {
+        self.source.may_use_service() && !self.offline && self.client.is_some()
     }
 }
 
@@ -525,6 +613,45 @@ mod policy_tests {
         // NotFound (force-skipped): not an overwrite.
         let r = result_with(vec![verify(VerifyStatus::NotFound, None, None)]);
         assert!(mismatch_overwrite_warnings(&r, "x", "1").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod vendor_source_tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_known_tokens_case_insensitively() {
+        assert_eq!(VendorSource::parse("auto").unwrap(), VendorSource::Auto);
+        assert_eq!(VendorSource::parse("AUTO").unwrap(), VendorSource::Auto);
+        assert_eq!(VendorSource::parse(" service ").unwrap(), VendorSource::Service);
+        assert_eq!(VendorSource::parse("Build").unwrap(), VendorSource::Build);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_tokens() {
+        let err = VendorSource::parse("download").unwrap_err();
+        assert!(err.contains("download"), "echoes the bad token: {err}");
+        assert!(err.contains("auto, service, or build"), "lists the set: {err}");
+        assert!(VendorSource::parse("").is_err());
+    }
+
+    #[test]
+    fn as_tag_round_trips_through_parse() {
+        for s in [VendorSource::Auto, VendorSource::Service, VendorSource::Build] {
+            assert_eq!(VendorSource::parse(s.as_tag()).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn default_is_auto_and_mode_predicates_hold() {
+        assert_eq!(VendorSource::default(), VendorSource::Auto);
+        assert!(VendorSource::Auto.may_use_service());
+        assert!(VendorSource::Service.may_use_service());
+        assert!(!VendorSource::Build.may_use_service());
+        assert!(VendorSource::Service.requires_service());
+        assert!(!VendorSource::Auto.requires_service());
+        assert!(!VendorSource::Build.requires_service());
     }
 }
 

@@ -602,6 +602,8 @@ pub(crate) async fn repair_vendored_artifacts(
             &vendored_at,
             false,
             false,
+            // Repair rebuilds locally from the recorded patch — no service.
+            None,
         )
         .await;
         match outcome {

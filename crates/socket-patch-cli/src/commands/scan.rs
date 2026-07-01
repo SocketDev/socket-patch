@@ -1288,8 +1288,10 @@ fn boxed_vendor_records<'a>(
     detached: bool,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
+    // `scan --vendor` builds locally (no vendoring-service config); the
+    // `vendor` command is the service-download entry point.
     Box::pin(vendor_records(
-        common, records, sources, detached, false, env,
+        common, records, sources, detached, false, env, None,
     ))
 }
 

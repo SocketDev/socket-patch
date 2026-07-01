@@ -273,6 +273,7 @@ pub async fn vendor_npm_any(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let (flavor, probe_warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
@@ -289,6 +290,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -302,6 +304,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -315,6 +318,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -328,6 +332,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -341,6 +346,7 @@ pub async fn vendor_npm_any(
                 vendored_at,
                 dry_run,
                 force,
+                service,
             )
             .await
         }
@@ -713,6 +719,7 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
+            None,
         )
         .await
     }

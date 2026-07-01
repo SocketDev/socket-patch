@@ -12,19 +12,25 @@
 //! the project byte-untouched (a dry run stops after verification and
 //! creates nothing on disk).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
+use crate::patch::apply::{
+    normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
+};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
+use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
-use super::{VendorOutcome, VendorWarning};
+use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
 /// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
@@ -131,8 +137,31 @@ pub(super) async fn stage_patch_pack(
     dry_run: bool,
     force: bool,
     warnings: &mut Vec<VendorWarning>,
+    service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
     let coords = guard_coordinates(purl, record)?;
+
+    // ── Service-download fast path (Tier A: write the prebuilt tarball) ──
+    // When the vendoring service is configured, try to download the already-
+    // built, integrity-verified tarball instead of staging+patching+packing
+    // locally. A dry run previews the local build (no network). Per the
+    // `auto`/`service` policy a non-fatal miss falls back to the local build
+    // below; under `service` it fails closed.
+    if let Some(cfg) = service {
+        if cfg.source.requires_service() && cfg.offline {
+            return Err(Box::new(refused(
+                "vendor_service_offline_conflict",
+                "--vendor-source=service needs the network but --offline is set".to_string(),
+            )));
+        }
+        if cfg.service_enabled() && !dry_run {
+            match try_service_pack(purl, project_root, &coords, record, cfg, warnings).await {
+                ServicePackDecision::Used(pair) => return Ok(*pair),
+                ServicePackDecision::HardFail(outcome) => return Err(outcome),
+                ServicePackDecision::FallBack => { /* fall through to local build */ }
+            }
+        }
+    }
 
     // ── Stage + patch a private copy ────────────────────────────────────
     // The stage lives in a tempdir OUTSIDE the project: nothing inside the
@@ -252,6 +281,224 @@ pub(super) async fn stage_patch_pack(
         }),
         result,
     ))
+}
+
+// ───────────────────────── service-download path ─────────────────────────
+
+/// Outcome of attempting the service-download fast path in [`stage_patch_pack`].
+enum ServicePackDecision {
+    /// Use the service artifact — the staged pack + a synthesized success.
+    /// Boxed: the pair is large relative to the other (small) variants.
+    Used(Box<(Option<NpmStagedPack>, ApplyResult)>),
+    /// Abort vendoring this package (a `service`-mode miss, or a downloaded
+    /// artifact we could not turn into a staged pack).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to the local stage→patch→pack build.
+    FallBack,
+}
+
+/// Download + verify the prebuilt tarball and turn it into an [`NpmStagedPack`],
+/// mapping each service outcome onto the `auto` / `service` fallback policy.
+async fn try_service_pack(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+    record: &PatchRecord,
+    cfg: &VendorServiceConfig,
+    warnings: &mut Vec<VendorWarning>,
+) -> ServicePackDecision {
+    let hard_fail =
+        |detail: String| ServicePackDecision::HardFail(Box::new(done_failure(purl, detail)));
+    match fetch_verified_archive(cfg, &record.uuid, &coords.name).await {
+        ServiceArtifact::Ready(archive) => {
+            match staged_pack_from_service_bytes(
+                purl,
+                project_root,
+                coords,
+                record,
+                &archive.bytes,
+                &archive.integrity_sri,
+            )
+            .await
+            {
+                Ok(staged) => {
+                    warnings.push(VendorWarning::new(
+                        "vendor_prebuilt_downloaded",
+                        format!(
+                            "vendored {}@{} from the patch service ({})",
+                            coords.name, coords.version, archive.source_url
+                        ),
+                    ));
+                    let result =
+                        synthesized_service_result(purl, &project_root.join(&staged.rel_tgz), record);
+                    ServicePackDecision::Used(Box::new((Some(staged), result)))
+                }
+                Err(outcome) => ServicePackDecision::HardFail(outcome),
+            }
+        }
+        // An artifact that downloaded but failed integrity is NEVER silently
+        // used; under `auto` we fall back to a fresh local build (loudly).
+        ServiceArtifact::IntegrityMismatch(reason) => {
+            if cfg.source.requires_service() {
+                hard_fail(format!(
+                    "prebuilt artifact failed integrity verification: {reason}"
+                ))
+            } else {
+                warnings.push(VendorWarning::new(
+                    "vendor_prebuilt_integrity_mismatch",
+                    format!(
+                        "prebuilt artifact failed integrity ({reason}); building locally instead"
+                    ),
+                ));
+                ServicePackDecision::FallBack
+            }
+        }
+        ServiceArtifact::Pending => {
+            if cfg.source.requires_service() {
+                hard_fail("prebuilt artifact is still building".to_string())
+            } else {
+                warnings.push(VendorWarning::new(
+                    "vendor_prebuilt_pending",
+                    "prebuilt artifact is still building; building locally instead".to_string(),
+                ));
+                ServicePackDecision::FallBack
+            }
+        }
+        // The common, quiet miss: not built / free-only / not found.
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard_fail(format!("prebuilt artifact unavailable: {reason}"))
+            } else {
+                ServicePackDecision::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => {
+            if cfg.source.requires_service() {
+                hard_fail(format!("patch service request failed: {reason}"))
+            } else {
+                warnings.push(VendorWarning::new(
+                    "vendor_prebuilt_unavailable",
+                    format!("patch service request failed ({reason}); building locally instead"),
+                ));
+                ServicePackDecision::FallBack
+            }
+        }
+    }
+}
+
+/// Build an [`NpmStagedPack`] from service-downloaded, sha512-verified tarball
+/// bytes: write the tarball to the vendor path and (when the patch rewrote
+/// `package.json`) extract it for the lockfile's dependency-mirror recompute.
+///
+/// Re-derives the [`PackedTarball`] facts from the bytes so the lockfile
+/// `integrity` is byte-identical to a local build, and asserts they match the
+/// integrity the service vouched for (the caller already verified the bytes
+/// against it — this guards the value actually written to the lock).
+async fn staged_pack_from_service_bytes(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+    record: &PatchRecord,
+    bytes: &[u8],
+    service_sri: &str,
+) -> Result<NpmStagedPack, Box<VendorOutcome>> {
+    let packed = PackedTarball::from_bytes(bytes);
+    if packed.integrity != service_sri {
+        return Err(Box::new(done_failure(
+            purl,
+            format!(
+                "recomputed integrity {} disagrees with the service integrity {service_sri}",
+                packed.integrity
+            ),
+        )));
+    }
+
+    let rel_tgz = format!(
+        "{}/{}",
+        coords.uuid_dir_rel,
+        tgz_rel_leaf(&coords.name, &coords.version)
+    );
+    let dest = project_root.join(&rel_tgz);
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(Box::new(done_failure(
+                purl,
+                format!("cannot create {}: {e}", parent.display()),
+            )));
+        }
+    }
+    if let Err(e) = atomic_write_bytes(&dest, bytes).await {
+        return Err(Box::new(done_failure(
+            purl,
+            format!("cannot write the vendored tarball: {e}"),
+        )));
+    }
+
+    let staged_pkg_json = if record
+        .files
+        .keys()
+        .any(|k| normalize_file_path(k) == "package.json")
+    {
+        match read_package_json_from_vendored_tgz(&dest).await {
+            Ok(pkg) => Some(pkg),
+            Err(e) => return Err(Box::new(done_failure(purl, e))),
+        }
+    } else {
+        None
+    };
+
+    Ok(NpmStagedPack {
+        name: coords.name.clone(),
+        version: coords.version.clone(),
+        rel_tgz,
+        packed,
+        staged_pkg_json,
+    })
+}
+
+/// Read the patched `package.json` out of a written vendored tarball (used
+/// only when the patch rewrote it — the lock's dependency mirror is then
+/// stale and recomputed from this).
+async fn read_package_json_from_vendored_tgz(dest: &Path) -> Result<Value, String> {
+    let dest = dest.to_path_buf();
+    let map = tokio::task::spawn_blocking(move || read_archive_to_map(&dest))
+        .await
+        .map_err(|e| format!("join error reading the vendored tarball: {e}"))?
+        .map_err(|e| format!("cannot read the vendored tarball: {e}"))?;
+    let bytes = map.get("package.json").ok_or_else(|| {
+        "the patch rewrites package.json but the prebuilt artifact has none".to_string()
+    })?;
+    serde_json::from_slice(bytes)
+        .map_err(|e| format!("vendored package.json is not parseable JSON: {e}"))
+}
+
+/// Synthesize a success [`ApplyResult`] for a service-downloaded package:
+/// there is no local apply to verify, so every patched file reads as
+/// `AlreadyPatched` (trust is the service-verified integrity). Mirrors the
+/// in-sync hot path's synthesized result.
+fn synthesized_service_result(purl: &str, dest: &Path, record: &PatchRecord) -> ApplyResult {
+    let files_verified = record
+        .files
+        .keys()
+        .map(|file| VerifyResult {
+            file: file.clone(),
+            status: VerifyStatus::AlreadyPatched,
+            message: None,
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        })
+        .collect();
+    ApplyResult {
+        package_key: purl.to_string(),
+        package_path: dest.display().to_string(),
+        success: true,
+        files_verified,
+        files_patched: Vec::new(),
+        applied_via: HashMap::new(),
+        error: None,
+        sidecar: None,
+    }
 }
 
 // ───────────────────────────── small helpers ─────────────────────────────

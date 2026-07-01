@@ -7,11 +7,6 @@ pub const DEFAULT_PATCH_API_PROXY_URL: &str = "https://patches-api.socket.dev";
 /// Default Socket API URL for authenticated access.
 pub const DEFAULT_SOCKET_API_URL: &str = "https://api.socket.dev";
 
-/// Default patch-server host that serves the hosted vendored patches (the
-/// registry-redirect `scan --redirect` target). Override with
-/// `--patch-server-url` / `SOCKET_PATCH_SERVER_URL` (e.g. for local dev/test).
-pub const DEFAULT_PATCH_SERVER_URL: &str = "https://patch.socket.dev";
-
 /// User-Agent header value for API requests.
 ///
 /// The version segment is derived from the crate version at compile time so it

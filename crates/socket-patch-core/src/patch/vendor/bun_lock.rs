@@ -74,6 +74,7 @@ pub async fn vendor_bun(
     vendored_at: &str,
     dry_run: bool,
     force: bool,
+    service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
@@ -137,6 +138,7 @@ pub async fn vendor_bun(
         dry_run,
         force,
         &mut warnings,
+        service,
     )
     .await
     {
@@ -853,6 +855,7 @@ mod tests {
                 "2026-06-09T00:00:00Z",
                 dry_run,
                 false,
+                None,
             )
             .await
         }

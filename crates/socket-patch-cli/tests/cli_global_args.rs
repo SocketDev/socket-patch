@@ -76,6 +76,17 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--download-mode", Some("package"), |c| {
             assert_eq!(c.download_mode, "package")
         }),
+        ("--vendor-source", Some("service"), |c| {
+            assert_eq!(c.vendor_source, "service")
+        }),
+        ("--vendor-url", Some("https://vendor.example.com"), |c| {
+            assert_eq!(c.vendor_url.as_deref(), Some("https://vendor.example.com"))
+        }),
+        (
+            "--patch-server-url",
+            Some("http://localhost:4026"),
+            |c| assert_eq!(c.patch_server_url.as_deref(), Some("http://localhost:4026")),
+        ),
         ("--offline", None, |c| assert!(c.offline)),
         ("--global", None, |c| assert!(c.global)),
         ("--global-prefix", Some("/opt/global"), |c| {
@@ -188,7 +199,6 @@ fn global_flag_cases_cover_every_global_field() {
         api_token: _,
         org: _,
         proxy_url: _,
-        patch_server_url: _,
         ecosystems: _,
         download_mode: _,
         offline: _,
@@ -204,13 +214,16 @@ fn global_flag_cases_cover_every_global_field() {
         debug: _,
         no_telemetry: _,
         strict: _,
+        vendor_source: _,
+        vendor_url: _,
+        patch_server_url: _,
     } = common;
 
-    // 20 fields ↔ 20 long-flag cases. Bump both this count and add a case when
+    // 23 fields ↔ 23 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        20,
+        23,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 
