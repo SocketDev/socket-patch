@@ -22,7 +22,7 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
-    build_document_with_vendored, detect_product, BuildOptions, Document, FailedPatch,
+    build_document_with_provenance, detect_product, BuildOptions, Document, FailedPatch,
     VendorContext, VerifyOutcome,
 };
 
@@ -218,6 +218,9 @@ pub async fn run(args: VexArgs) -> i32 {
         manifest_file.unwrap_or_else(PatchManifest::new),
     )
     .await;
+    // `scan --redirect` patches live only in the redirect ledger (no manifest
+    // record); fold them in before the emptiness check so they're attestable.
+    let (manifest, redirected) = augment_with_redirect(&args.common, manifest).await;
 
     if manifest.patches.is_empty() {
         if !had_manifest_file {
@@ -248,7 +251,7 @@ pub async fn run(args: VexArgs) -> i32 {
         compact: args.compact,
     };
 
-    match generate_vex(&args.common, &params, &manifest).await {
+    match generate_vex(&args.common, &params, &manifest, &redirected).await {
         Ok(summary) => {
             if args.common.json {
                 emit_envelope_success(&summary.doc, &summary.failed);
@@ -320,6 +323,7 @@ pub(crate) async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest: &PatchManifest,
+    redirected: &[String],
 ) -> Result<VexWriteSummary, VexGenError> {
     // Resolve product.
     let product_id = match resolve_product_id(common, params.product.as_deref()).await {
@@ -358,6 +362,12 @@ pub(crate) async fn generate_vex(
     // mechanism, so no install hook exists (or is needed) by construction.
     let vendored_set: std::collections::HashSet<String> =
         outcome.vendored.iter().cloned().collect();
+    // Redirected patches (from `scan --redirect`) bypass the property-7
+    // ecosystem filter for the same reason vendored ones do: the committed
+    // lockfile rewrite IS the persistence mechanism, so no install hook exists
+    // (or is needed) by construction.
+    let redirected_set: std::collections::HashSet<&str> =
+        redirected.iter().map(|s| s.as_str()).collect();
     let mut allowed = crate::commands::setup::configured_ecosystems(common).await;
     if let Some(s) = &manifest.setup {
         for name in &s.manual {
@@ -369,6 +379,7 @@ pub(crate) async fn generate_vex(
     let before = outcome.applied.len();
     outcome.applied.retain(|purl| {
         vendored_set.contains(purl)
+            || redirected_set.contains(purl.as_str())
             || Ecosystem::from_purl(purl)
                 .map(|e| allowed.contains(&e))
                 .unwrap_or(false)
@@ -400,24 +411,28 @@ pub(crate) async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc =
-        match build_document_with_vendored(manifest, &outcome.applied, &outcome.vendored, &opts) {
-            Some(doc) => doc,
-            None => {
-                track_vex_failed(
-                    "no_applicable_patches",
-                    common.api_token.as_deref(),
-                    common.org.as_deref(),
-                )
-                .await;
-                return Err(VexGenError {
-                    code: "no_applicable_patches",
-                    message: "No applied patches with vulnerability metadata to attest."
-                        .to_string(),
-                    failed: outcome.failed,
-                });
-            }
-        };
+    let doc = match build_document_with_provenance(
+        manifest,
+        &outcome.applied,
+        &outcome.vendored,
+        redirected,
+        &opts,
+    ) {
+        Some(doc) => doc,
+        None => {
+            track_vex_failed(
+                "no_applicable_patches",
+                common.api_token.as_deref(),
+                common.org.as_deref(),
+            )
+            .await;
+            return Err(VexGenError {
+                code: "no_applicable_patches",
+                message: "No applied patches with vulnerability metadata to attest.".to_string(),
+                failed: outcome.failed,
+            });
+        }
+    };
 
     // Serialize.
     let serialized = if params.compact {
@@ -477,10 +492,12 @@ pub(crate) async fn generate_vex_from_manifest_path(
         Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
     };
     let had_manifest_file = manifest_file.is_some();
-    // Detached vendored patches (`scan --vendor --detached`) have no
-    // manifest record; the ledger's embedded copies must still attest.
+    // Detached vendored patches (`scan --vendor --detached`) and redirected
+    // patches (`scan --redirect`) have no manifest record; the vendor and
+    // redirect ledgers' embedded copies must still attest.
     let manifest =
         augment_with_detached(common, manifest_file.unwrap_or_else(PatchManifest::new)).await;
+    let (manifest, redirected) = augment_with_redirect(common, manifest).await;
     if manifest.patches.is_empty() {
         if !had_manifest_file {
             return Err(fail(
@@ -497,7 +514,7 @@ pub(crate) async fn generate_vex_from_manifest_path(
         )
         .await);
     }
-    generate_vex(common, params, &manifest).await
+    generate_vex(common, params, &manifest, &redirected).await
 }
 
 /// Fold detached vendor entries' embedded records into a manifest view so
@@ -519,6 +536,29 @@ async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest)
         }
     }
     manifest
+}
+
+/// Fold the `scan --redirect` ledger's embedded records into a manifest view
+/// and return the set of redirected PURLs (so the builder can mark them
+/// `(redirected)`). Redirected patches have no `.socket/manifest.json` record
+/// by design — the lockfile rewrite + this ledger IS the persistence — so,
+/// like detached vendored patches, they must still be attestable. An existing
+/// manifest entry wins a collision (that PURL is manifest-owned). A missing or
+/// unreadable ledger leaves the manifest unchanged and returns no redirected
+/// PURLs.
+async fn augment_with_redirect(
+    common: &GlobalArgs,
+    mut manifest: PatchManifest,
+) -> (PatchManifest, Vec<String>) {
+    let mut redirected = Vec::new();
+    if let Some(state) = socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
+    {
+        for (purl, record) in state.records {
+            redirected.push(purl.clone());
+            manifest.patches.entry(purl).or_insert(record);
+        }
+    }
+    (manifest, redirected)
 }
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].

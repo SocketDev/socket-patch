@@ -1337,8 +1337,7 @@ fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
     let rest = stripped.strip_prefix("pkg:")?;
     let (typ, after) = rest.split_once('/')?;
     let (coord, version) = after.rsplit_once('@')?;
-    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord)
-        .into_owned();
+    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
     Some((typ.to_string(), name, version.to_string()))
 }
 
@@ -1353,7 +1352,10 @@ async fn run_redirect(
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
 ) -> i32 {
-    use socket_patch_core::patch::redirect::{rewrite_registry_redirect, DepOverride};
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::redirect::{
+        rewrite_registry_redirect, DepOverride, RedirectState,
+    };
 
     // Same discovery/selection as `--apply`/`--vendor`.
     let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
@@ -1376,6 +1378,10 @@ async fn run_redirect(
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut overrides: Vec<DepOverride> = Vec::new();
+    // PURL -> manifest patch record, persisted into the redirect ledger so a
+    // post-install `socket-patch vex` can attest the redirected patches.
+    let mut records: std::collections::BTreeMap<String, PatchRecord> =
+        std::collections::BTreeMap::new();
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|s| s.uuid.clone()).collect();
@@ -1397,11 +1403,15 @@ async fn run_redirect(
             }
             let purl = reference.purl.as_deref().unwrap_or(&sel.purl);
             let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
-                skipped.push(serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "bad_purl" }));
+                skipped.push(
+                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "bad_purl" }),
+                );
                 continue;
             };
             let Some(url) = reference.url.clone() else {
-                skipped.push(serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "no_url" }));
+                skipped.push(
+                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "no_url" }),
+                );
                 continue;
             };
             let integrity = reference
@@ -1422,12 +1432,18 @@ async fn run_redirect(
                 registry_override: reference.registry_override.clone(),
                 integrity,
             });
+            // Fetch the full patch view (file hashes + vulnerabilities) and
+            // record it for VEX. Best-effort: a fetch failure just means this
+            // patch won't be attestable, not that the redirect fails.
+            if let Ok(Some(resp)) = api_client.fetch_patch(effective_org_slug, &sel.uuid).await {
+                let (rec_purl, record) = crate::commands::get::record_from_patch_response(&resp);
+                records.insert(rec_purl, record);
+            }
         }
     }
 
     // Read the project's candidate files, run the rewriters.
-    let mut files: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
+    let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in REDIRECT_CANDIDATE_FILES {
         if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(name)) {
             files.insert((*name).to_string(), content);
@@ -1447,15 +1463,18 @@ async fn run_redirect(
                 return 1;
             }
         }
-        // Ledger for a future revert (mirrors the vendor state.json shape).
-        if !rewrite.edits.is_empty() {
+        // Ledger (mirrors the vendor state.json shape): recorded edits for a
+        // future revert + the patch records (file hashes + vulnerabilities) so
+        // a post-install `socket-patch vex` can attest the redirected patches.
+        if !rewrite.edits.is_empty() || !records.is_empty() {
             let vendor_dir = args.common.cwd.join(".socket").join("vendor");
             let _ = std::fs::create_dir_all(&vendor_dir);
-            let ledger = serde_json::json!({
-                "version": 1,
-                "mode": "redirect",
-                "edits": rewrite.edits,
-            });
+            let ledger = RedirectState {
+                version: 1,
+                mode: "redirect".to_string(),
+                edits: rewrite.edits.clone(),
+                records: records.clone(),
+            };
             let _ = std::fs::write(
                 vendor_dir.join("redirect-state.json"),
                 format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
@@ -1463,25 +1482,59 @@ async fn run_redirect(
         }
     }
 
+    // Emit an OpenVEX attestation for the redirected patches when `--vex` was
+    // requested. The redirected bytes are fetched from the hosted patch server
+    // at install time, so in-run this is a NO-VERIFY attestation (the integrity
+    // pins written into the lockfile are the evidence); a post-install
+    // `socket-patch vex` hash-verifies the same records against the installed
+    // tree (it reads them back from the redirect ledger via augment_with_redirect).
+    let mut vex_statements: Option<usize> = None;
+    let mut vex_error: Option<(&'static str, String)> = None;
+    let mut vex_code = 0;
+    if args.vex.vex.is_some() && !args.common.dry_run && !records.is_empty() {
+        let mut params = args.vex.to_build_params();
+        params.no_verify = true;
+        let manifest_path = args.common.resolved_manifest_path();
+        match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+            Ok(summary) => vex_statements = Some(summary.statements),
+            Err(e) => {
+                vex_code = 1;
+                vex_error = Some((e.code, e.message));
+            }
+        }
+    }
+
     if args.common.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "success",
-                "redirect": {
-                    "redirected": overrides.len(),
-                    "rewrittenFiles": rewritten,
-                    "skipped": skipped,
-                    "warnings": rewrite.warnings.iter().map(|w| serde_json::json!({
-                        "code": w.code, "detail": w.detail,
-                    })).collect::<Vec<_>>(),
-                    "dryRun": args.common.dry_run,
-                }
-            }))
-            .unwrap()
-        );
+        let mut result = serde_json::json!({
+            "status": "success",
+            "redirect": {
+                "redirected": overrides.len(),
+                "rewrittenFiles": rewritten,
+                "skipped": skipped,
+                "warnings": rewrite.warnings.iter().map(|w| serde_json::json!({
+                    "code": w.code, "detail": w.detail,
+                })).collect::<Vec<_>>(),
+                "dryRun": args.common.dry_run,
+            }
+        });
+        if let Some(statements) = vex_statements {
+            result["vex"] = serde_json::json!({
+                "path": args.vex.vex.as_ref().unwrap().display().to_string(),
+                "statements": statements,
+                "format": "openvex-0.2.0",
+                "verified": false,
+            });
+        } else if let Some((code, message)) = &vex_error {
+            result["status"] = serde_json::json!("error");
+            result["error"] = serde_json::json!({ "code": code, "message": message });
+        }
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else if !args.common.silent {
-        let verb = if args.common.dry_run { "would rewrite" } else { "rewrote" };
+        let verb = if args.common.dry_run {
+            "would rewrite"
+        } else {
+            "rewrote"
+        };
         println!(
             "Redirected {} package(s); {verb} {} file(s).",
             overrides.len(),
@@ -1490,8 +1543,19 @@ async fn run_redirect(
         for s in &skipped {
             eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
         }
+        if let Some(statements) = vex_statements {
+            eprintln!(
+                "Wrote OpenVEX document with {} statement(s) to {} (unverified: redirected \
+                 bytes are fetched at install time — run `socket-patch vex` after installing \
+                 to hash-verify against the installed tree).",
+                statements,
+                args.vex.vex.as_ref().unwrap().display(),
+            );
+        } else if let Some((_, message)) = &vex_error {
+            eprintln!("Error: VEX generation failed: {message}");
+        }
     }
-    0
+    vex_code
 }
 
 pub async fn run(args: ScanArgs) -> i32 {

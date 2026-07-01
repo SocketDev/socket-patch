@@ -77,7 +77,11 @@ fn redirect_golden_fixtures_match() {
     let root = fixtures_root();
     assert!(root.is_dir(), "fixtures root missing: {}", root.display());
     let cases = case_dirs(&root);
-    assert!(!cases.is_empty(), "no golden cases found under {}", root.display());
+    assert!(
+        !cases.is_empty(),
+        "no golden cases found under {}",
+        root.display()
+    );
 
     let mut asserted = 0;
     for case in &cases {
@@ -97,10 +101,9 @@ fn redirect_golden_fixtures_match() {
             files.insert(rel_key(&input_dir, f), fs::read_to_string(f).unwrap());
         }
 
-        let overrides: Vec<DepOverride> = serde_json::from_str(
-            &fs::read_to_string(case.join("overrides.json")).unwrap(),
-        )
-        .unwrap_or_else(|e| panic!("{rel}: bad overrides.json: {e}"));
+        let overrides: Vec<DepOverride> =
+            serde_json::from_str(&fs::read_to_string(case.join("overrides.json")).unwrap())
+                .unwrap_or_else(|e| panic!("{rel}: bad overrides.json: {e}"));
 
         let result = rewrite_registry_redirect(&files, &overrides);
 

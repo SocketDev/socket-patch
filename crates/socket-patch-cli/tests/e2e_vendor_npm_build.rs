@@ -113,6 +113,45 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
+/// Like [`stage_patch`] but records a vulnerability so a generated VEX
+/// document has a statement to emit.
+fn stage_patch_with_vuln(
+    proj: &Path,
+    purl: &str,
+    file_key: &str,
+    before: &[u8],
+    after: &[u8],
+    ghsa: &str,
+) {
+    let socket = proj.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let manifest = serde_json::json!({
+        "patches": { purl: {
+            "uuid": UUID,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { file_key: {
+                "beforeHash": git_sha256(before),
+                "afterHash": git_sha256(after),
+            }},
+            "vulnerabilities": { ghsa: {
+                "cves": ["CVE-2024-99999"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        }}
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
+}
+
 fn parse_envelope(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
@@ -359,5 +398,86 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
     assert!(
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
+    );
+}
+
+/// Real-toolchain VEX capstone for npm: after a REAL install + `vendor`, the
+/// vendored `.tgz` is the on-disk evidence. `socket-patch vex` must attest the
+/// patch against that vendored tarball with the `(vendored)` marker — proving
+/// the vendored-artifact verification path works for a real npm tarball (not
+/// just the synthetic cargo-dir fixtures).
+#[test]
+fn npm_vendor_vex_attests_against_vendored_tarball() {
+    if !has_command("npm") {
+        println!("SKIP e2e_vendor_npm_build (vex): `npm` not installed");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vex-vendor","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+
+    let cache = tmp.path().join("npm-cache");
+    let install = npm(
+        &proj,
+        &[
+            "install",
+            &format!("{DEP}@{DEP_VERSION}"),
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ],
+    );
+    if !install.status.success() {
+        println!("SKIP e2e_vendor_npm_build (vex): npm install failed (registry unreachable?)");
+        return;
+    }
+
+    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let orig = std::fs::read(&installed_index).expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    const GHSA: &str = "GHSA-vend-npm-real";
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, GHSA);
+
+    // Vendor (offline: blob staged locally).
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // VEX against the vendored tarball (default verify mode).
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "the vendored npm patch must be attested: {doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], GHSA);
+    assert_eq!(stmts[0]["status"], "not_affected");
+    assert_eq!(stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);
+    let impact = stmts[0]["impact_statement"].as_str().unwrap();
+    assert!(
+        impact.contains("(vendored)"),
+        "vendored attestation must carry the (vendored) marker: {impact}"
     );
 }

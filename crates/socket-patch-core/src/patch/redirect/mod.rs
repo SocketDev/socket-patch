@@ -20,6 +20,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub mod state;
+pub use state::{load_redirect_state, RedirectState, REDIRECT_STATE_REL};
+
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,8 +76,9 @@ pub struct DepOverride {
     pub integrity: Integrity,
 }
 
-/// One recorded file edit (mirrors the TS `FileEdit`).
-#[derive(Debug, Clone, Serialize)]
+/// One recorded file edit (mirrors the TS `FileEdit`). `Deserialize` so the
+/// persisted `redirect-state.json` ledger round-trips (see `redirect::state`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEdit {
     pub path: String,
     pub kind: String,
@@ -113,7 +117,10 @@ fn full_name(dep: &DepOverride) -> String {
 /// (2-space pretty via serde_json, key order preserved by `preserve_order`,
 /// `/` unescaped).
 fn serialize_json(value: &Value) -> String {
-    format!("{}\n", serde_json::to_string_pretty(value).unwrap_or_default())
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    )
 }
 
 /// Run every rewriter and merge the results (each owns distinct files).
@@ -141,8 +148,7 @@ fn rewrite_npm_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let npm: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
         return;
     }
@@ -173,8 +179,8 @@ fn rewrite_npm_lock(
         if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
             for (key, entry) in packages.iter_mut() {
                 let matches_key = key == &suffix || key.ends_with(&format!("/{suffix}"));
-                let matches_ver = entry.get("version").and_then(Value::as_str)
-                    == Some(dep.version.as_str());
+                let matches_ver =
+                    entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str());
                 if matches_key && matches_ver {
                     if let Some(edit) = rewrite_npm_entry(
                         entry,
@@ -192,8 +198,7 @@ fn rewrite_npm_lock(
         }
         // v2 legacy `dependencies` tree (keyed by name), recursive.
         if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-            changed = rewrite_npm_v2_deps(deps, &fname, dep, &sha512, lockfile, result)
-                || changed;
+            changed = rewrite_npm_v2_deps(deps, &fname, dep, &sha512, lockfile, result) || changed;
         }
     }
     if changed {
@@ -276,14 +281,15 @@ fn rewrite_pypi_requirements(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let pypi: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
+    let pypi: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
     if pypi.is_empty() || !files.contains_key("requirements.txt") {
         return;
     }
     let name_re = Regex::new(r"^([A-Za-z0-9._-]+)\s*(?:[=<>~!]=?|@|;|\s|$)").unwrap();
-    let mut lines: Vec<String> =
-        files["requirements.txt"].split('\n').map(|s| s.to_string()).collect();
+    let mut lines: Vec<String> = files["requirements.txt"]
+        .split('\n')
+        .map(|s| s.to_string())
+        .collect();
     let mut changed = false;
     for dep in &pypi {
         let Some(sha256) = dep.integrity.sha256.clone() else {
@@ -332,7 +338,9 @@ fn rewrite_pypi_requirements(
         }
     }
     if changed {
-        result.files.insert("requirements.txt".into(), lines.join("\n"));
+        result
+            .files
+            .insert("requirements.txt".into(), lines.join("\n"));
     }
 }
 
@@ -346,8 +354,10 @@ fn rewrite_cargo(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let cargo: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "cargo").collect();
+    let cargo: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "cargo")
+        .collect();
     if cargo.is_empty() {
         return;
     }
@@ -446,7 +456,9 @@ fn rewrite_cargo(
         }
     }
     if config_changed {
-        result.files.insert(".cargo/config.toml".into(), cargo_config);
+        result
+            .files
+            .insert(".cargo/config.toml".into(), cargo_config);
     }
 }
 
@@ -513,9 +525,7 @@ fn set_cargo_lock_source(
     // Rust's regex has NO lookahead, so bound the [[package]] block by string
     // search: from its header to the next `\n[[package]]` (or EOF), so the
     // trailing bytes after the block (incl. the final newline) are preserved.
-    let head = format!(
-        "[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n"
-    );
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
     let block_start = content.find(&head)?;
     let body_start = block_start + head.len();
     let mut block_end = match content[body_start..].find("\n[[package]]") {
@@ -568,8 +578,7 @@ fn rewrite_pnpm_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let npm: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("pnpm-lock.yaml") {
         return;
     }
@@ -635,8 +644,7 @@ fn rewrite_yarn_classic(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let npm: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
         return;
     }
@@ -659,10 +667,9 @@ fn rewrite_yarn_classic(
         };
         let header_re =
             Regex::new(&(String::from(r#"(?m)^ *"?"#) + &regex::escape(&fname) + "@")).unwrap();
-        let version_re = Regex::new(
-            &(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""),
-        )
-        .unwrap();
+        let version_re =
+            Regex::new(&(String::from(r#"\n {2}version ""#) + &regex::escape(&dep.version) + "\""))
+                .unwrap();
         for block in blocks.iter_mut() {
             if !header_re.is_match(block) || !version_re.is_match(block) {
                 continue;
@@ -674,7 +681,10 @@ fn rewrite_yarn_classic(
                 .map(|s| format!("#{s}"))
                 .unwrap_or_default();
             let mut rewritten = resolved_re
-                .replace(block, format!("\n  resolved \"{}{frag}\"", dep.artifact_url).as_str())
+                .replace(
+                    block,
+                    format!("\n  resolved \"{}{frag}\"", dep.artifact_url).as_str(),
+                )
                 .to_string();
             if integrity_re.is_match(&rewritten) {
                 rewritten = integrity_re
@@ -685,8 +695,11 @@ fn rewrite_yarn_classic(
                     .replace(
                         &rewritten,
                         // $0 re-inserts the matched resolved line, then add integrity.
-                        format!("\n  resolved \"{}{frag}\"\n  integrity {sha512}", dep.artifact_url)
-                            .as_str(),
+                        format!(
+                            "\n  resolved \"{}{frag}\"\n  integrity {sha512}",
+                            dep.artifact_url
+                        )
+                        .as_str(),
                     )
                     .to_string();
             }
@@ -715,14 +728,12 @@ fn rewrite_uv_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let pypi: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
+    let pypi: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "pypi").collect();
     if pypi.is_empty() || !files.contains_key("uv.lock") {
         return;
     }
     let mut content = files["uv.lock"].clone();
-    let wheel_re =
-        Regex::new(r#"\{ url = "[^"]*", hash = "sha256:[^"]*"([^}]*) \}"#).unwrap();
+    let wheel_re = Regex::new(r#"\{ url = "[^"]*", hash = "sha256:[^"]*"([^}]*) \}"#).unwrap();
     let name_re = Regex::new(r#"name = "([^"]+)""#).unwrap();
     let mut changed = false;
     for dep in &pypi {
@@ -829,8 +840,10 @@ fn rewrite_composer_lock(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let composer: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "composer").collect();
+    let composer: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "composer")
+        .collect();
     if composer.is_empty() || !files.contains_key("composer.lock") {
         return;
     }
@@ -855,7 +868,9 @@ fn rewrite_composer_lock(
             });
             continue;
         };
-        let Some(dist_start) = content[name_idx..].find("\"dist\": {").map(|r| name_idx + r)
+        let Some(dist_start) = content[name_idx..]
+            .find("\"dist\": {")
+            .map(|r| name_idx + r)
         else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_composer_no_dist".into(),
@@ -909,7 +924,11 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
     let mut out = config.to_string();
     let source_line = format!("    <add key=\"{reg}\" value=\"{index_url}\" />");
     if out.contains("<packageSources>") {
-        out = out.replacen("<packageSources>", &format!("<packageSources>\n{source_line}"), 1);
+        out = out.replacen(
+            "<packageSources>",
+            &format!("<packageSources>\n{source_line}"),
+            1,
+        );
     } else {
         out = out.replacen(
             "<configuration>",
@@ -929,7 +948,11 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
             1,
         );
     } else {
-        out = out.replacen("</configuration>", &format!("{map_block}\n</configuration>"), 1);
+        out = out.replacen(
+            "</configuration>",
+            &format!("{map_block}\n</configuration>"),
+            1,
+        );
     }
     out
 }
@@ -939,8 +962,10 @@ fn rewrite_nuget(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let nuget: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "nuget").collect();
+    let nuget: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "nuget")
+        .collect();
     if nuget.is_empty() {
         return;
     }
@@ -972,7 +997,10 @@ fn rewrite_nuget(
             });
             continue;
         };
-        let content_hash = sha512_sri.strip_prefix("sha512-").unwrap_or(&sha512_sri).to_string();
+        let content_hash = sha512_sri
+            .strip_prefix("sha512-")
+            .unwrap_or(&sha512_sri)
+            .to_string();
         let reg = format!("socket-patch-{}", dep.patch_uuid);
         let id_lower = ov
             .identifiers
@@ -994,7 +1022,10 @@ fn rewrite_nuget(
         }
 
         if let Some(lock_val) = lock.as_mut() {
-            if let Some(deps) = lock_val.get_mut("dependencies").and_then(Value::as_object_mut) {
+            if let Some(deps) = lock_val
+                .get_mut("dependencies")
+                .and_then(Value::as_object_mut)
+            {
                 for framework in deps.values_mut() {
                     if let Some(fw) = framework.as_object_mut() {
                         for (id, entry) in fw.iter_mut() {
@@ -1053,8 +1084,7 @@ fn rewrite_gem(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    let gem: Vec<&DepOverride> =
-        overrides.iter().filter(|o| o.ecosystem == "gem").collect();
+    let gem: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "gem").collect();
     if gem.is_empty() {
         return;
     }
@@ -1141,7 +1171,9 @@ fn rewrite_gem(
             .unwrap();
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
             if sum_line_re.is_match(lk) {
-                *lk = sum_line_re.replace(lk, format!("${{1}} sha256={sha256}").as_str()).to_string();
+                *lk = sum_line_re
+                    .replace(lk, format!("${{1}} sha256={sha256}").as_str())
+                    .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
                     path: "Gemfile.lock".into(),
@@ -1155,8 +1187,11 @@ fn rewrite_gem(
                 *lk = checksums_re
                     .replace(
                         lk,
-                        format!("CHECKSUMS\n  {} ({}) sha256={sha256}", dep.name, dep.version)
-                            .as_str(),
+                        format!(
+                            "CHECKSUMS\n  {} ({}) sha256={sha256}",
+                            dep.name, dep.version
+                        )
+                        .as_str(),
                     )
                     .to_string();
                 lock_changed = true;

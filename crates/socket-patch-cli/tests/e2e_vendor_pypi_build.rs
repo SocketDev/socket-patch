@@ -163,7 +163,12 @@ fn stage_patch(proj: &Path, installed_six: &Path) -> Vec<u8> {
                 "beforeHash": git_sha256(&orig),
                 "afterHash": git_sha256(&patched),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { "GHSA-vend-pypi-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -315,6 +320,36 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     assert!(
         uvlock.contains(&wheel_rel),
         "uv.lock must resolve six from the vendored wheel path:\n{uvlock}"
+    );
+
+    // Real-toolchain VEX: attest the vendored patch against the vendored WHEEL
+    // (the distinct pypi vendored-artifact verification path), `(vendored)`.
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:pypi/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    let vex_stmts = vex_doc["statements"].as_array().unwrap();
+    assert_eq!(vex_stmts.len(), 1, "vendored pypi patch must be attested: {vex_doc}");
+    assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-pypi-real");
+    assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL);
+    assert!(
+        vex_stmts[0]["impact_statement"]
+            .as_str()
+            .unwrap()
+            .contains("(vendored)"),
+        "vendored attestation must carry the (vendored) marker: {vex_doc}"
     );
 
     // `uv lock --check` accepts the wired pair, and a plain `uv sync` both

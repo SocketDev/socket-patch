@@ -65,10 +65,28 @@ pub fn build_document_with_vendored(
     vendored: &[String],
     opts: &BuildOptions,
 ) -> Option<Document> {
+    build_document_with_provenance(manifest, applied, vendored, &[], opts)
+}
+
+/// [`build_document_with_vendored`] extended with a `redirected` set (PURLs
+/// pointed at Socket's hosted vendored patches by `scan --redirect`). A
+/// redirected PURL carries the phrasing "Patched via Socket patch `<uuid>`
+/// (redirected)". `vendored` and `redirected` are disjoint in practice
+/// (`--redirect` conflicts with `--vendor`); if a PURL somehow appears in
+/// both, `vendored` wins. Status and justification are unchanged.
+pub fn build_document_with_provenance(
+    manifest: &PatchManifest,
+    applied: &[String],
+    vendored: &[String],
+    redirected: &[String],
+    opts: &BuildOptions,
+) -> Option<Document> {
     let timestamp = now_rfc3339();
     let applied_set: std::collections::HashSet<&str> = applied.iter().map(|s| s.as_str()).collect();
     let vendored_set: std::collections::HashSet<&str> =
         vendored.iter().map(|s| s.as_str()).collect();
+    let redirected_set: std::collections::HashSet<&str> =
+        redirected.iter().map(|s| s.as_str()).collect();
 
     // vuln-id -> (aliases, impact-statement parts, subcomponent PURLs)
     // BTreeMap keeps statement order deterministic by vuln id, which
@@ -91,6 +109,8 @@ pub fn build_document_with_vendored(
                 .impact_parts
                 .push(if vendored_set.contains(purl.as_str()) {
                     format!("Patched via Socket patch {} (vendored)", record.uuid)
+                } else if redirected_set.contains(purl.as_str()) {
+                    format!("Patched via Socket patch {} (redirected)", record.uuid)
                 } else {
                     format!("Patched via Socket patch {}", record.uuid)
                 });
@@ -738,6 +758,50 @@ mod tests {
         assert_eq!(
             st.justification,
             Some(Justification::InlineMitigationsAlreadyExist)
+        );
+    }
+
+    /// A redirected PURL's impact statement carries the "(redirected)"
+    /// suffix; status/justification stay identical to the plain form.
+    #[test]
+    fn redirected_purl_gets_redirected_impact_phrasing() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            record("u-rdir", vec![("GHSA-rrrr", vec!["CVE-2024-8"])]),
+        );
+        let applied = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+        let doc =
+            build_document_with_provenance(&manifest, &applied, &[], &applied, &opts()).unwrap();
+        let st = &doc.statements[0];
+        assert_eq!(
+            st.impact_statement.as_deref(),
+            Some("Patched via Socket patch u-rdir (redirected)")
+        );
+        assert_eq!(st.status, Status::NotAffected);
+        assert_eq!(
+            st.justification,
+            Some(Justification::InlineMitigationsAlreadyExist)
+        );
+    }
+
+    /// If a PURL is defensively present in BOTH the vendored and redirected
+    /// sets, the vendored phrasing wins (they are disjoint in practice —
+    /// `--redirect` conflicts with `--vendor`).
+    #[test]
+    fn vendored_takes_precedence_over_redirected() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:cargo/serde@1.0.0".to_string(),
+            record("u-both", vec![("GHSA-both", vec!["CVE-2024-9"])]),
+        );
+        let applied = vec!["pkg:cargo/serde@1.0.0".to_string()];
+        let doc =
+            build_document_with_provenance(&manifest, &applied, &applied, &applied, &opts())
+                .unwrap();
+        assert_eq!(
+            doc.statements[0].impact_statement.as_deref(),
+            Some("Patched via Socket patch u-both (vendored)")
         );
     }
 

@@ -121,7 +121,12 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
                 "beforeHash": git_sha256(before),
                 "afterHash": git_sha256(after),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { "GHSA-vend-yarn-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -267,6 +272,35 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     assert!(
         proj.join(".socket/vendor/state.json").is_file(),
         "vendor ledger missing"
+    );
+
+    // Real-toolchain VEX: attest the vendored patch (`(vendored)` marker).
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vex",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ],
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    let vex_stmts = vex_doc["statements"].as_array().unwrap();
+    assert_eq!(vex_stmts.len(), 1, "vendored patch must be attested: {vex_doc}");
+    assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-yarn-real");
+    assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);
+    assert!(
+        vex_stmts[0]["impact_statement"]
+            .as_str()
+            .unwrap()
+            .contains("(vendored)"),
+        "vendored attestation must carry the (vendored) marker: {vex_doc}"
     );
 
     // Lock rewiring: `resolved "file:./<rel-tgz>#<sha1>"` + a recomputed

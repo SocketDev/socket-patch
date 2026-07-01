@@ -164,7 +164,12 @@ fn write_patch(consumer: &Path) {
                 "beforeHash": git_sha256(PRISTINE_LIB.as_bytes()),
                 "afterHash": git_sha256(PATCHED_LIB.as_bytes()),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { "GHSA-vend-golang-real": {
+                "cves": ["CVE-2024-88888"],
+                "summary": "capstone vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -305,6 +310,39 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         "informational vendor marker missing"
     );
     assert!(consumer.join(".socket/vendor/state.json").is_file());
+
+    // Real-toolchain VEX: attest the vendored patch against the vendored Go
+    // module dir (`(vendored)` marker). golang has no product auto-detect, so
+    // the product PURL is supplied explicitly.
+    let vex_path = consumer.join("out.vex.json");
+    let (code, stdout, stderr) = run_socket(
+        &consumer,
+        &[
+            "vex",
+            "--cwd",
+            consumer.to_str().unwrap(),
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:golang/example.com/app@v0.0.1",
+        ],
+        &modcache,
+    );
+    assert_eq!(code, 0, "vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let vex_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+    let vex_stmts = vex_doc["statements"].as_array().unwrap();
+    assert_eq!(vex_stmts.len(), 1, "vendored go patch must be attested: {vex_doc}");
+    assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-golang-real");
+    assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], UPURL);
+    assert!(
+        vex_stmts[0]["impact_statement"]
+            .as_str()
+            .unwrap()
+            .contains("(vendored)"),
+        "vendored attestation must carry the (vendored) marker: {vex_doc}"
+    );
+
     assert_eq!(
         std::fs::read(modcache.join(format!("{UMOD}@{UVER}")).join("lib.go")).unwrap(),
         PRISTINE_LIB.as_bytes(),
