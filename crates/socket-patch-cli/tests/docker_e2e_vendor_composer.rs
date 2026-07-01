@@ -13,7 +13,10 @@
 //!     `state.json`, and the composer.lock entry rewired to
 //!     `dist: {type: path, url: <copy>, reference: <patch-uuid>}` +
 //!     `transport-options: {symlink: false}` + `source` removed, with
-//!     composer.json untouched.
+//!     composer.json untouched; then `socket-patch vex` attests the vendored
+//!     patch (composer has no product auto-detect, so `--product` is
+//!     explicit) — exit 0 in-container, the statement body re-asserted
+//!     host-side from the mounted out.vex.json.
 //!   stage 2 (`--network none`, empty COMPOSER_HOME): ONLY the committable
 //!     files (composer.json + composer.lock + .socket/) are copied to a
 //!     fresh dir; `composer install` must succeed cold+offline, materialize
@@ -43,8 +46,12 @@ const IMAGE: &str = "socket-patch-test-composer:latest";
 /// Canonical lowercase patch uuid — a dedicated path level under
 /// `.socket/vendor/composer/`, and the value `dist.reference` must carry.
 const UUID: &str = "21212121-2121-4121-8121-212121212121";
+/// The staged patch's vulnerability id — the stage-1 VEX leg must attest
+/// exactly this (mirrors GHSA-vend-npm-real / GHSA-vend-cargo-real in the
+/// host capstones).
+const GHSA: &str = "GHSA-vend-composer-real";
 
-/// Glue the shared bash helpers onto a stage body and pin the uuid.
+/// Glue the shared bash helpers onto a stage body and pin the uuid + ghsa.
 fn render(stage_body: &str) -> String {
     format!(
         "{}{}{}{}",
@@ -54,6 +61,7 @@ fn render(stage_body: &str) -> String {
         stage_body
     )
     .replace("__UUID__", UUID)
+    .replace("__GHSA__", GHSA)
 }
 
 /// Stage 1: real fixture install (network OK) + staged marker patch +
@@ -101,7 +109,8 @@ grep -q 'SOCKET-PATCH-VENDOR-E2E-MARKER' "$ORIG" \
 cp "$ORIG" /tmp/patched.php
 printf '\n// SOCKET-PATCH-VENDOR-E2E-MARKER patch=__UUID__\n' >> /tmp/patched.php
 PURL="pkg:composer/psr/log@$PSR_VER"
-stage_patch "$PURL" "__UUID__" "src/LoggerInterface.php" "$ORIG" /tmp/patched.php
+stage_patch "$PURL" "__UUID__" "src/LoggerInterface.php" "$ORIG" /tmp/patched.php \
+  "__GHSA__" "CVE-2024-66666"
 
 # Pre-vendor snapshots: consumed by stage 2/3 byte-identity asserts.
 mkdir -p /workspace/snap
@@ -156,7 +165,18 @@ cmp -s composer.json /workspace/snap/composer.json.prevendor \
   || fail "vendor must NOT touch composer.json (lock-only wiring)"
 echo "===LOCK WIRING VERIFIED==="
 
-# 6. Fresh-checkout staging: ONLY the committable files.
+# 6. Real-toolchain VEX: attest the vendored patch against the vendored copy
+#    (composer has no product auto-detect — the product purl is explicit).
+#    Exit 0 + a non-empty document are asserted here; the statement body is
+#    re-asserted host-side (assert_vex_attested_from_host) via serde_json.
+socket-patch vex --cwd "$PWD" --output out.vex.json \
+  --product "pkg:composer/app@1.0.0" > /tmp/vex.out 2>/tmp/vex.err
+RC=$?; cat /tmp/vex.err >&2
+[ "$RC" -eq 0 ] || { cat /tmp/vex.out >&2; fail "vex exited $RC (expected 0)"; }
+[ -s out.vex.json ] || fail "vex did not write out.vex.json"
+echo "===VEX RUN VERIFIED==="
+
+# 7. Fresh-checkout staging: ONLY the committable files.
 rm -rf /workspace/fresh && mkdir -p /workspace/fresh
 cp composer.json composer.lock /workspace/fresh/
 cp -R .socket /workspace/fresh/.socket
@@ -297,6 +317,40 @@ fn assert_lock_wired_from_host(host_dir: &std::path::Path) {
     );
 }
 
+/// Host-side oracle on the bind-mounted `out.vex.json` the stage-1 VEX leg
+/// wrote: exactly one statement attesting the vendored composer patch as
+/// `not_affected` with the `(vendored)` impact marker (mirrors
+/// `e2e_vendor_npm_build.rs::npm_vendor_vex_attests_against_vendored_tarball`).
+fn assert_vex_attested_from_host(host_dir: &std::path::Path) {
+    let psr_ver = std::fs::read_to_string(host_dir.join("snap/psr-ver"))
+        .expect("snap/psr-ver")
+        .trim()
+        .to_string();
+    let doc: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(host_dir.join("proj/out.vex.json")).expect("read mounted out.vex.json"),
+    )
+    .expect("mounted out.vex.json parses");
+    let stmts = doc["statements"].as_array().expect("statements[]");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the vendored composer patch must be attested: {doc}"
+    );
+    assert_eq!(stmts[0]["vulnerability"]["name"], GHSA);
+    assert_eq!(stmts[0]["status"], "not_affected");
+    assert_eq!(
+        stmts[0]["products"][0]["subcomponents"][0]["@id"],
+        format!("pkg:composer/psr/log@{psr_ver}")
+    );
+    let impact = stmts[0]["impact_statement"]
+        .as_str()
+        .expect("impact_statement");
+    assert!(
+        impact.contains("(vendored)"),
+        "vendored attestation must carry the (vendored) marker: {impact}"
+    );
+}
+
 #[test]
 fn composer_vendor_fresh_checkout_install_and_revert() {
     if skip_if_no_image(IMAGE) {
@@ -307,14 +361,16 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     // confuse Docker Desktop's file-sharing allowlist.
     let host_dir = tmp.path().canonicalize().expect("canonicalize tempdir");
 
-    // Stage 1 — networked fixture install + offline vendor + wiring asserts.
+    // Stage 1 — networked fixture install + offline vendor + wiring + VEX
+    // asserts.
     let out = run_in_image(IMAGE, &host_dir, &render(STAGE1));
     assert_stage_markers(
         "composer stage 1 (install+vendor)",
         &out,
-        &["VENDOR RUN", "ARTIFACT", "LOCK WIRING", "STAGE1"],
+        &["VENDOR RUN", "ARTIFACT", "LOCK WIRING", "VEX RUN", "STAGE1"],
     );
     assert_lock_wired_from_host(&host_dir);
+    assert_vex_attested_from_host(&host_dir);
 
     // Stage 2 — fresh checkout, cold caches, network cut.
     let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE2));
