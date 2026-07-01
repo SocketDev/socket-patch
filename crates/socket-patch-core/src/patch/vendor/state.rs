@@ -280,14 +280,27 @@ fn state_path(project_root: &Path) -> PathBuf {
 
 /// Load the ledger. A missing file is an empty ledger; an unreadable or
 /// unparseable file is an error (fail-closed — revert must not guess).
+///
+/// One deliberate exception to fail-closed: a parseable JSON object that is
+/// clearly a DIFFERENT Socket ledger (it carries a `mode` tag and no
+/// `entries` — e.g. an early registry-redirect ledger committed to this path
+/// by the depscan GitHub-app flow) is treated as an empty vendor ledger
+/// instead of bricking every vendor-adjacent command (`remove`, `vendor`,
+/// `repair`) with `vendor_state_unreadable`. Such a file carries no vendor
+/// data by construction, so nothing is guessed.
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-            std::io::Error::new(
+        Ok(bytes) => serde_json::from_slice(&bytes).or_else(|e| {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if value.get("mode").is_some() && value.get("entries").is_none() {
+                    return Ok(VendorState::new());
+                }
+            }
+            Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("corrupt {}: {e}", path.display()),
-            )
+            ))
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VendorState::new()),
         Err(e) => Err(e),
@@ -601,6 +614,38 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::write(root.join(VENDOR_STATE_REL), b"{not json")
+            .await
+            .unwrap();
+        let err = load_state(root).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A mode-tagged NON-vendor ledger squatting on this path (an early
+    /// registry-redirect ledger committed by the depscan GitHub-app flow)
+    /// must read as an EMPTY vendor ledger, not brick `remove`/`vendor`/
+    /// `repair` with vendor_state_unreadable. A vendor-shaped file that is
+    /// genuinely corrupt stays fail-closed.
+    #[tokio::test]
+    async fn foreign_mode_ledger_reads_as_empty_vendor_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(VENDOR_STATE_REL),
+            br#"{ "version": 1, "mode": "registry", "edits": [] }"#,
+        )
+        .await
+        .unwrap();
+        assert!(
+            load_state(root).await.unwrap().is_empty(),
+            "a foreign mode-tagged ledger is not vendor data"
+        );
+
+        // Fail-closed control: valid JSON that is neither a vendor ledger
+        // nor mode-tagged still errors.
+        tokio::fs::write(root.join(VENDOR_STATE_REL), br#"{ "version": 1 }"#)
             .await
             .unwrap();
         let err = load_state(root).await.unwrap_err();

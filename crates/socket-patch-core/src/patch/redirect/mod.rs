@@ -215,6 +215,13 @@ fn rewrite_npm_entry(
     key: &str,
 ) -> Option<FileEdit> {
     let obj = entry.as_object_mut()?;
+    // Already redirected: recording an edit whose `original` IS the hosted
+    // URL would grow the ledger on every re-run and poison a future revert.
+    if obj.get("resolved").and_then(Value::as_str) == Some(dep.artifact_url.as_str())
+        && obj.get("integrity").and_then(Value::as_str) == Some(sha512)
+    {
+        return None;
+    }
     let original = json!({
         "resolved": obj.get("resolved").cloned().unwrap_or(Value::Null),
         "integrity": obj.get("integrity").cloned().unwrap_or(Value::Null),
@@ -311,8 +318,28 @@ fn rewrite_pypi_requirements(
             if normalize_py_name(&caps[1]) != target {
                 continue;
             }
-            let marker = match line.find(';') {
-                Some(idx) => &line[idx..],
+            // pip-compile --generate-hashes emits backslash continuations
+            // (`foo==1.2 \` + indented `--hash=…` lines). Rewriting only the
+            // first physical line would orphan the old hash lines and — with
+            // an environment marker — leave a mid-line `\` that makes pip
+            // fail with InvalidMarker. Refuse rather than corrupt.
+            if line.ends_with('\\') {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_requirements_continuation".into(),
+                    detail: format!(
+                        "{}@{} uses backslash continuations; not rewritten",
+                        dep.name, dep.version
+                    ),
+                });
+                continue;
+            }
+            // Take the marker from the requirement portion only — everything
+            // BEFORE any per-requirement ` --` option. Grabbing to end-of-line
+            // would swallow a previously appended `--hash=…` and duplicate it
+            // on every re-run.
+            let req_part = line.split(" --").next().unwrap_or(line).trim_end();
+            let marker = match req_part.find(';') {
+                Some(idx) => req_part[idx..].trim_end(),
                 None => "",
             };
             let rewritten = if marker.is_empty() {
@@ -428,19 +455,22 @@ fn rewrite_cargo(
 
         // 3. Cargo.lock [[package]] → set source + checksum.
         if let Some(lock) = cargo_lock.as_mut() {
-            if let Some(edit) =
-                set_cargo_lock_source(lock, &dep.name, &dep.version, index_url, &cksum)
-            {
-                result.edits.push(edit);
-                lock_changed = true;
-            } else {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_cargo_lock_pkg_not_found".into(),
-                    detail: format!(
-                        "no [[package]] for {}@{} in Cargo.lock",
-                        dep.name, dep.version
-                    ),
-                });
+            match set_cargo_lock_source(lock, &dep.name, &dep.version, index_url, &cksum) {
+                CargoLockRewrite::Rewritten(edit) => {
+                    result.edits.push(*edit);
+                    lock_changed = true;
+                }
+                // Re-run over an already-redirected lock: nothing to record.
+                CargoLockRewrite::AlreadyRedirected => {}
+                CargoLockRewrite::NotFound => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_cargo_lock_pkg_not_found".into(),
+                        detail: format!(
+                            "no [[package]] for {}@{} in Cargo.lock",
+                            dep.name, dep.version
+                        ),
+                    });
+                }
             }
         }
     }
@@ -521,12 +551,14 @@ fn set_cargo_lock_source(
     version: &str,
     index_url: &str,
     cksum: &str,
-) -> Option<FileEdit> {
+) -> CargoLockRewrite {
     // Rust's regex has NO lookahead, so bound the [[package]] block by string
     // search: from its header to the next `\n[[package]]` (or EOF), so the
     // trailing bytes after the block (incl. the final newline) are preserved.
     let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
-    let block_start = content.find(&head)?;
+    let Some(block_start) = content.find(&head) else {
+        return CargoLockRewrite::NotFound;
+    };
     let body_start = block_start + head.len();
     let mut block_end = match content[body_start..].find("\n[[package]]") {
         Some(rel) => body_start + rel,
@@ -561,15 +593,29 @@ fn set_cargo_lock_source(
             .to_string();
     }
     let rebuilt = format!("{head}{body}");
+    // Already redirected (re-run): the block is at the target values; a
+    // recorded edit would have original == new and grow the ledger forever.
+    if rebuilt == original {
+        return CargoLockRewrite::AlreadyRedirected;
+    }
     *content = content.replacen(&original, &rebuilt, 1);
-    Some(FileEdit {
+    CargoLockRewrite::Rewritten(Box::new(FileEdit {
         path: "Cargo.lock".into(),
         kind: "redirect_cargo_lock_entry".into(),
         action: "rewritten".into(),
         key: Some(format!("{crate_name}@{version}")),
         original: Some(Value::String(original)),
         new: Some(Value::String(rebuilt)),
-    })
+    }))
+}
+
+/// Outcome of the Cargo.lock `[[package]]` rewrite — distinguishes a re-run
+/// over an already-redirected block (no edit, no warning) from a genuinely
+/// missing package (caller warns).
+enum CargoLockRewrite {
+    Rewritten(Box<FileEdit>),
+    AlreadyRedirected,
+    NotFound,
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
@@ -622,6 +668,10 @@ fn rewrite_pnpm_lock(
             }
         }
         let rebuilt = format!("{{{}}}", fields.join(", "));
+        // Already redirected (re-run): no edit, no ledger growth.
+        if rebuilt == original {
+            continue;
+        }
         content = content.replacen(&whole, &format!("{prefix}{rebuilt}"), 1);
         changed = true;
         result.edits.push(FileEdit {
@@ -1031,15 +1081,23 @@ fn rewrite_nuget(
                         for (id, entry) in fw.iter_mut() {
                             if id.to_lowercase() == id_lower {
                                 if let Some(obj) = entry.as_object_mut() {
-                                    let original = json!({
-                                        "resolved": obj.get("resolved").cloned().unwrap_or(Value::Null),
-                                        "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
-                                    });
                                     let resolved = ov
                                         .identifiers
                                         .nuget_version_norm
                                         .clone()
                                         .unwrap_or_else(|| dep.version.clone());
+                                    // Already redirected (re-run): no edit.
+                                    if obj.get("resolved").and_then(Value::as_str)
+                                        == Some(resolved.as_str())
+                                        && obj.get("contentHash").and_then(Value::as_str)
+                                            == Some(content_hash.as_str())
+                                    {
+                                        continue;
+                                    }
+                                    let original = json!({
+                                        "resolved": obj.get("resolved").cloned().unwrap_or(Value::Null),
+                                        "contentHash": obj.get("contentHash").cloned().unwrap_or(Value::Null),
+                                    });
                                     obj.insert("resolved".into(), Value::String(resolved.clone()));
                                     obj.insert(
                                         "contentHash".into(),
@@ -1170,7 +1228,11 @@ fn rewrite_gem(
             )
             .unwrap();
             let new_val = format!("{} ({}) sha256={sha256}", dep.name, dep.version);
-            if sum_line_re.is_match(lk) {
+            // Already redirected (re-run): the CHECKSUMS line is at the
+            // target value; recording an edit would grow the ledger forever.
+            if lk.contains(&format!("\n  {new_val}\n")) || lk.ends_with(&format!("\n  {new_val}")) {
+                // no-op
+            } else if sum_line_re.is_match(lk) {
                 *lk = sum_line_re
                     .replace(lk, format!("${{1}} sha256={sha256}").as_str())
                     .to_string();
@@ -1238,5 +1300,183 @@ fn rewrite_golang(overrides: &[DepOverride], result: &mut RewriteResult) {
                 dep.version
             ),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn npm_override(name: &str, version: &str, url: &str, sha512: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "npm".into(),
+            name: name.into(),
+            namespace: None,
+            version: version.into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: url.into(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity {
+                sha512: Some(sha512.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn pypi_override(name: &str, version: &str, url: &str, sha256: &str) -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: name.into(),
+            namespace: None,
+            version: version.into(),
+            token: String::new(),
+            patch_uuid: "11111111-1111-4111-8111-111111111111".into(),
+            artifact_url: url.into(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity {
+                sha256: Some(sha256.into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Re-running a rewriter over its own output must be a no-op: zero new
+    /// edits, byte-identical files. Recorded edits whose `original` is the
+    /// already-redirected value would grow the committed ledger on every
+    /// `scan --redirect` run and poison a future revert.
+    #[test]
+    fn second_pass_over_rewritten_output_is_a_noop() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "package-lock.json".to_string(),
+            r#"{
+  "name": "app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "app", "version": "0.0.0" },
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#
+            .to_string(),
+        );
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1 ; python_version >= \"3.7\"\n".to_string(),
+        );
+        let overrides = vec![
+            npm_override(
+                "left-pad",
+                "1.3.0",
+                "http://patch.test/left-pad-1.3.0.tgz",
+                "sha512-PATCHED==",
+            ),
+            pypi_override(
+                "requests",
+                "2.28.1",
+                "http://patch.test/requests-2.28.1-py3-none-any.whl",
+                &"c".repeat(64),
+            ),
+        ];
+
+        let first = rewrite_registry_redirect(&files, &overrides);
+        assert!(!first.edits.is_empty(), "first pass must record edits");
+
+        // Overlay the rewritten outputs and run again.
+        let mut second_input = files.clone();
+        for (name, content) in &first.files {
+            second_input.insert(name.clone(), content.clone());
+        }
+        let second = rewrite_registry_redirect(&second_input, &overrides);
+        assert!(
+            second.edits.is_empty(),
+            "second pass must record NO edits (ledger growth): {:?}",
+            second.edits
+        );
+        assert!(
+            second.files.is_empty(),
+            "second pass must change no files: {:?}",
+            second.files.keys()
+        );
+    }
+
+    /// The requirements marker is taken from the requirement portion only —
+    /// a previously appended `--hash=…` must never be swallowed into the
+    /// marker (that duplicated the hash on every re-run).
+    #[test]
+    fn requirements_marker_line_is_rerun_stable() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1 ; python_version >= \"3.7\"\n".to_string(),
+        );
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        let out = first.files.get("requirements.txt").expect("rewritten");
+        assert_eq!(
+            out.matches("--hash=sha256:").count(),
+            1,
+            "exactly one hash after the first pass: {out}"
+        );
+        assert!(
+            out.contains("; python_version >= \"3.7\" --hash="),
+            "marker preserved ahead of the hash: {out}"
+        );
+
+        let mut again = files.clone();
+        again.insert("requirements.txt".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "re-run over the marker line must be a no-op; got files={:?} edits={:?}",
+            second.files,
+            second.edits
+        );
+    }
+
+    /// pip-compile --generate-hashes continuation lines are refused (warning)
+    /// rather than corrupted: rewriting only the first physical line would
+    /// orphan the old `--hash` lines, and with a marker pip hard-fails on the
+    /// mid-line backslash (InvalidMarker).
+    #[test]
+    fn requirements_continuation_lines_are_refused() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "requirements.txt".to_string(),
+            "requests==2.28.1 ; python_version >= \"3.7\" \\\n    --hash=sha256:OLDOLDOLD\n"
+                .to_string(),
+        );
+        let overrides = vec![pypi_override(
+            "requests",
+            "2.28.1",
+            "http://patch.test/requests-2.28.1-py3-none-any.whl",
+            &"c".repeat(64),
+        )];
+        let result = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            result.files.is_empty() && result.edits.is_empty(),
+            "continuation input must not be rewritten: {:?}",
+            result.files
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_requirements_continuation"),
+            "must surface the continuation refusal: {:?}",
+            result.warnings
+        );
     }
 }

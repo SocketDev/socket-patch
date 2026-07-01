@@ -147,6 +147,7 @@ impl VexEmbedArgs {
             no_verify: self.vex_no_verify,
             doc_id: self.vex_doc_id.clone(),
             compact: self.vex_compact,
+            assume_applied: Vec::new(),
         }
     }
 }
@@ -161,6 +162,15 @@ pub(crate) struct VexBuildParams {
     pub no_verify: bool,
     pub doc_id: Option<String>,
     pub compact: bool,
+    /// In-run `scan --redirect --vex` only: the PURLs whose lockfile rewrite
+    /// THIS RUN confirmed (their hosted-patch URL landed in a project file).
+    /// These are exempt from on-disk verification — their bytes are remote
+    /// until the next install; the lockfile integrity pins are the evidence —
+    /// while every other manifest/vendored patch (and any stale ledger record
+    /// this run did NOT confirm) still verifies normally. The post-install
+    /// standalone `vex` passes an empty list so redirected patches are then
+    /// hash-verified against the installed tree like any applied patch.
+    pub assume_applied: Vec<String>,
 }
 
 /// Successful result of [`generate_vex`].
@@ -249,6 +259,7 @@ pub async fn run(args: VexArgs) -> i32 {
         no_verify: args.no_verify,
         doc_id: args.doc_id.clone(),
         compact: args.compact,
+        assume_applied: Vec::new(),
     };
 
     match generate_vex(&args.common, &params, &manifest, &redirected).await {
@@ -352,6 +363,24 @@ pub(crate) async fn generate_vex(
         )
         .await
     };
+
+    // In-run `scan --redirect --vex`: the bytes of deps THAT RUN confirmed
+    // redirected live on the patch server until the next install, so their
+    // verification against the local tree would spuriously fail
+    // (package_not_found / not_applied). Exempt exactly those PURLs —
+    // everything else above verified normally, including any stale ledger
+    // record the run did not re-confirm (a reverted lockfile or a withdrawn
+    // patch must not keep attesting).
+    if !params.assume_applied.is_empty() {
+        let exempt: std::collections::HashSet<&str> =
+            params.assume_applied.iter().map(|s| s.as_str()).collect();
+        outcome.failed.retain(|f| !exempt.contains(f.purl.as_str()));
+        for purl in &params.assume_applied {
+            if manifest.patches.contains_key(purl) && !outcome.applied.iter().any(|p| p == purl) {
+                outcome.applied.push(purl.clone());
+            }
+        }
+    }
 
     // Property 7: attest a patch only for an ecosystem that is actually set up —
     // or explicitly declared `manual` in the manifest. Patches for an ecosystem
