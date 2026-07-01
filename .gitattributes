@@ -1,0 +1,5 @@
+# The redirect golden fixtures are a byte-exact cross-language contract
+# (consumed by both this crate's redirect_golden.rs and the depscan backend's
+# golden.test.ts). EOL conversion on checkout (Windows CRLF) breaks the
+# byte-for-byte comparison, so they are checked out exactly as committed.
+crates/socket-patch-core/tests/fixtures/redirect/** -text
