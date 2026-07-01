@@ -727,7 +727,10 @@ impl ApiClient {
         }
 
         // ── Step 1: resolve the grant URL + integrity ──────────────────────
-        let result = match self.request_vendor_package(uuid, free_only, vendor_url).await {
+        let result = match self
+            .request_vendor_package(uuid, free_only, vendor_url)
+            .await
+        {
             Ok(r) => r,
             Err(e) => return VendorServiceOutcome::Failed(e),
         };
@@ -743,9 +746,7 @@ impl ApiClient {
                     "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
                 ))
             }
-            other => {
-                return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`"))
-            }
+            other => return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`")),
         }
 
         // Select the native tarball artifact and its sha512 (the universal
@@ -786,8 +787,7 @@ impl ApiClient {
                 if a.kind == "tarball" {
                     continue;
                 }
-                let (Some(url), Some(sha512)) =
-                    (a.url.as_deref(), a.integrity.sha512.as_deref())
+                let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref())
                 else {
                     continue;
                 };
@@ -876,9 +876,10 @@ impl ApiClient {
         let resp = resp.map_err(|e| ApiError::Network(format!("Network error: {e}")))?;
         let status = resp.status();
         if status == StatusCode::OK {
-            let parsed = resp.json::<PackageVendorResponse>().await.map_err(|e| {
-                ApiError::Parse(format!("Failed to parse package response: {e}"))
-            })?;
+            let parsed = resp
+                .json::<PackageVendorResponse>()
+                .await
+                .map_err(|e| ApiError::Parse(format!("Failed to parse package response: {e}")))?;
             return parsed.results.get(uuid).cloned().ok_or_else(|| {
                 ApiError::Other(format!("package response missing a result for {uuid}"))
             });
@@ -949,9 +950,7 @@ impl ApiClient {
     pub async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
         match self.download_vendor_archive(url).await {
             ServeDownload::Ok(bytes) => Ok(bytes),
-            ServeDownload::NotFound => {
-                Err(ApiError::Other(format!("artifact not found: {url}")))
-            }
+            ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
             ServeDownload::Pending => {
                 Err(ApiError::Other(format!("artifact still building: {url}")))
             }
@@ -2546,7 +2545,10 @@ mod vendor_package_tests {
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
             .and(body_partial_json(json!({ "uuids": [UUID] })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ABC123==")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(granted_body(&serve_url, "sha512-ABC123==")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2579,8 +2581,12 @@ mod vendor_package_tests {
         Mock::given(method("POST"))
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
-            .and(body_partial_json(json!({ "uuids": [UUID], "freeOnly": true })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")))
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "freeOnly": true }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2604,7 +2610,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "BAREB64==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "BAREB64==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2630,7 +2638,9 @@ mod vendor_package_tests {
         let baked = format!("https://patch.socket.dev{SERVE_PATH}");
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2670,7 +2680,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2721,7 +2733,8 @@ mod vendor_package_tests {
             Mock::given(method("POST"))
                 .and(path("/v0/orgs/acme/patches/package"))
                 .respond_with(
-                    ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")),
+                    ResponseTemplate::new(200)
+                        .set_body_json(granted_body(&serve_url, "sha512-AA==")),
                 )
                 .mount(&server)
                 .await;

@@ -25,7 +25,9 @@ use super::pypi_uv::{
     check_target_guards, classify_dependency, load_uv_project, revert_uv, wire_uv, UvDepClass,
     UvProject, UvTarget,
 };
-use super::pypi_wheel::{build_patched_wheel, locate_installed_dist, wheel_file_name, WheelArtifact};
+use super::pypi_wheel::{
+    build_patched_wheel, locate_installed_dist, wheel_file_name, WheelArtifact,
+};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
     write_marker, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
@@ -858,7 +860,10 @@ async fn try_pypi_service_wheel(
         if cfg.source.requires_service() {
             hard_fail("vendor_prebuilt_required", reason)
         } else {
-            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
             PypiServiceWheel::FallBack
         }
     };
@@ -1600,7 +1605,11 @@ wheels = [
         )
     }
 
-    fn pypi_service_cfg(server_uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
+    fn pypi_service_cfg(
+        server_uri: &str,
+        source: VendorSource,
+        offline: bool,
+    ) -> VendorServiceConfig {
         VendorServiceConfig {
             source,
             client: Some(ApiClient::new(ApiClientOptions {
@@ -1669,10 +1678,19 @@ wheels = [
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&pypi_service_cfg(&server.uri(), VendorSource::Service, false)),
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        let VendorOutcome::Done { result, entry, warnings } = outcome else {
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
             panic!("expected Done, got {outcome:?}");
         };
         assert!(result.success, "{:?}", result.error);
@@ -1691,10 +1709,14 @@ wheels = [
             req.contains(&format!("--hash=sha256:{expected_sha256}")),
             "requirements line wired to the recomputed sha256: {req}"
         );
-        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+        assert!(warnings
+            .iter()
+            .any(|w| w.code == "vendor_prebuilt_downloaded"));
         // site-packages untouched (the service path never needs the install).
         assert_eq!(
-            tokio::fs::read(fx.site_packages.join("six.py")).await.unwrap(),
+            tokio::fs::read(fx.site_packages.join("six.py"))
+                .await
+                .unwrap(),
             ORIG
         );
     }
@@ -1725,7 +1747,11 @@ wheels = [
         let VendorOutcome::Done { result, entry, .. } = outcome else {
             panic!("expected Done (local build), got {outcome:?}");
         };
-        assert!(result.success, "auto must fall back to the local wheel build: {:?}", result.error);
+        assert!(
+            result.success,
+            "auto must fall back to the local wheel build: {:?}",
+            result.error
+        );
         let entry = entry.expect("entry on success");
         // The locally-built wheel landed (not the sdist bytes).
         let wheel_rel = format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}");
@@ -1752,7 +1778,11 @@ wheels = [
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&pypi_service_cfg(&server.uri(), VendorSource::Service, false)),
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
         assert!(
@@ -1780,12 +1810,21 @@ wheels = [
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&pypi_service_cfg(&server.uri(), VendorSource::Service, false)),
+            Some(&pypi_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
-        assert!(matches!(outcome, VendorOutcome::Refused { .. }), "got {outcome:?}");
         assert!(
-            !fx.root.join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}")).exists(),
+            matches!(outcome, VendorOutcome::Refused { .. }),
+            "got {outcome:?}"
+        );
+        assert!(
+            !fx.root
+                .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"))
+                .exists(),
             "nothing written on a hard fail"
         );
     }
@@ -1805,7 +1844,11 @@ wheels = [
             false,
             false,
             // No server: offline must short-circuit before any request.
-            Some(&pypi_service_cfg("http://127.0.0.1:1", VendorSource::Service, true)),
+            Some(&pypi_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
         )
         .await;
         match outcome {

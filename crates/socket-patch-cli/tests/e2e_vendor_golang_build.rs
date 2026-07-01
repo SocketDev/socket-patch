@@ -332,9 +332,19 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
     let vex_doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
     let vex_stmts = vex_doc["statements"].as_array().unwrap();
-    assert_eq!(vex_stmts.len(), 1, "vendored go patch must be attested: {vex_doc}");
-    assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-golang-real");
-    assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], UPURL);
+    assert_eq!(
+        vex_stmts.len(),
+        1,
+        "vendored go patch must be attested: {vex_doc}"
+    );
+    assert_eq!(
+        vex_stmts[0]["vulnerability"]["name"],
+        "GHSA-vend-golang-real"
+    );
+    assert_eq!(
+        vex_stmts[0]["products"][0]["subcomponents"][0]["@id"],
+        UPURL
+    );
     assert!(
         vex_stmts[0]["impact_statement"]
             .as_str()

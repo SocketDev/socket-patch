@@ -341,7 +341,11 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     let vex_doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
     let vex_stmts = vex_doc["statements"].as_array().unwrap();
-    assert_eq!(vex_stmts.len(), 1, "vendored pypi patch must be attested: {vex_doc}");
+    assert_eq!(
+        vex_stmts.len(),
+        1,
+        "vendored pypi patch must be attested: {vex_doc}"
+    );
     assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-pypi-real");
     assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL);
     assert!(

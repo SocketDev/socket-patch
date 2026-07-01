@@ -624,7 +624,10 @@ mod vendor_source_tests {
     fn parse_accepts_known_tokens_case_insensitively() {
         assert_eq!(VendorSource::parse("auto").unwrap(), VendorSource::Auto);
         assert_eq!(VendorSource::parse("AUTO").unwrap(), VendorSource::Auto);
-        assert_eq!(VendorSource::parse(" service ").unwrap(), VendorSource::Service);
+        assert_eq!(
+            VendorSource::parse(" service ").unwrap(),
+            VendorSource::Service
+        );
         assert_eq!(VendorSource::parse("Build").unwrap(), VendorSource::Build);
     }
 
@@ -632,13 +635,20 @@ mod vendor_source_tests {
     fn parse_rejects_unknown_tokens() {
         let err = VendorSource::parse("download").unwrap_err();
         assert!(err.contains("download"), "echoes the bad token: {err}");
-        assert!(err.contains("auto, service, or build"), "lists the set: {err}");
+        assert!(
+            err.contains("auto, service, or build"),
+            "lists the set: {err}"
+        );
         assert!(VendorSource::parse("").is_err());
     }
 
     #[test]
     fn as_tag_round_trips_through_parse() {
-        for s in [VendorSource::Auto, VendorSource::Service, VendorSource::Build] {
+        for s in [
+            VendorSource::Auto,
+            VendorSource::Service,
+            VendorSource::Build,
+        ] {
             assert_eq!(VendorSource::parse(s.as_tag()).unwrap(), s);
         }
     }

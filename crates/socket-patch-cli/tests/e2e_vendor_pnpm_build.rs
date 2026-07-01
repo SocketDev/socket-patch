@@ -290,11 +290,18 @@ fn run_pnpm_capstone(pm: &str) {
             "pkg:npm/app@1.0.0",
         ],
     );
-    assert_eq!(code, 0, "vex failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vex failed ({pm}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
     let vex_doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
     let vex_stmts = vex_doc["statements"].as_array().unwrap();
-    assert_eq!(vex_stmts.len(), 1, "vendored patch must be attested: {vex_doc}");
+    assert_eq!(
+        vex_stmts.len(),
+        1,
+        "vendored patch must be attested: {vex_doc}"
+    );
     assert_eq!(vex_stmts[0]["vulnerability"]["name"], "GHSA-vend-pnpm-real");
     assert_eq!(vex_stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);
     assert!(

@@ -796,9 +796,8 @@ mod tests {
             record("u-both", vec![("GHSA-both", vec!["CVE-2024-9"])]),
         );
         let applied = vec!["pkg:cargo/serde@1.0.0".to_string()];
-        let doc =
-            build_document_with_provenance(&manifest, &applied, &applied, &applied, &opts())
-                .unwrap();
+        let doc = build_document_with_provenance(&manifest, &applied, &applied, &applied, &opts())
+            .unwrap();
         assert_eq!(
             doc.statements[0].impact_statement.as_deref(),
             Some("Patched via Socket patch u-both (vendored)")

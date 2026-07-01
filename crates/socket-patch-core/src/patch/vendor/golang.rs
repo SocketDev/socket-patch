@@ -24,7 +24,9 @@ use crate::patch::copy_tree::remove_tree;
 use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
 };
-use crate::patch::go_redirect::{apply_go_redirect, are_safe_redirect_coords, ensure_module_go_mod};
+use crate::patch::go_redirect::{
+    apply_go_redirect, are_safe_redirect_coords, ensure_module_go_mod,
+};
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
 use super::path::vendor_uuid_dir_rel;
@@ -202,7 +204,11 @@ pub async fn vendor_go_module(
     .await
     {
         GoServiceRedirect::Used => {
-            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
             synthesized_success(purl, &copy_dir, verified)
         }
         GoServiceRedirect::HardFail(outcome) => return *outcome,
@@ -457,7 +463,10 @@ async fn go_service_redirect(
         if cfg.source.requires_service() {
             hard("vendor_prebuilt_required", reason)
         } else {
-            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
             GoServiceRedirect::FallBack
         }
     };
@@ -501,7 +510,10 @@ async fn go_service_redirect(
             }
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
-                format!("vendored {module} from the patch service ({})", archive.source_url),
+                format!(
+                    "vendored {module} from the patch service ({})",
+                    archive.source_url
+                ),
             ));
             GoServiceRedirect::Used
         }
@@ -1220,7 +1232,8 @@ mod tests {
             let mut zw = zip::ZipWriter::new(&mut cursor);
             let opts = zip::write::SimpleFileOptions::default();
             for (rel, content) in files {
-                zw.start_file(format!("{MODULE}@{VERSION}/{rel}"), opts).unwrap();
+                zw.start_file(format!("{MODULE}@{VERSION}/{rel}"), opts)
+                    .unwrap();
                 zw.write_all(content).unwrap();
             }
             zw.finish().unwrap();
@@ -1309,10 +1322,18 @@ mod tests {
         let copy = root.join(copy_rel());
         assert_eq!(tokio::fs::read(copy.join("bar.go")).await.unwrap(), PATCHED);
         let entries = read_replace_entries(root).await;
-        let e = entries.iter().find(|e| e.module == MODULE).expect("replace wired");
+        let e = entries
+            .iter()
+            .find(|e| e.module == MODULE)
+            .expect("replace wired");
         assert_eq!(e.owner, Some(ReplaceOwner::Vendor));
-        assert_eq!(e.path.as_deref(), Some(format!("./{}", copy_rel()).as_str()));
-        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+        assert_eq!(
+            e.path.as_deref(),
+            Some(format!("./{}", copy_rel()).as_str())
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.code == "vendor_prebuilt_downloaded"));
     }
 
     /// `service` mode + a wrong `h1:` dirhash hard-fails (verifies the
@@ -1327,7 +1348,13 @@ mod tests {
         ]);
         let sri = sri_sha512(&zip); // correct sha512
         let server = wiremock::MockServer::start().await;
-        mount_go_granted(&server, &sri, Some("h1:bogusdirhashvaluethatwontmatch="), &zip).await;
+        mount_go_granted(
+            &server,
+            &sri,
+            Some("h1:bogusdirhashvaluethatwontmatch="),
+            &zip,
+        )
+        .await;
         let sources = PatchSources::blobs_only(&blobs);
 
         let outcome = vendor_go_module(
@@ -1368,10 +1395,16 @@ mod tests {
         )
         .await;
         let (result, entry, _) = expect_done(outcome);
-        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(
+            result.success,
+            "auto must fall back to the local build: {:?}",
+            result.error
+        );
         assert!(entry.is_some());
         assert_eq!(
-            tokio::fs::read(root.join(copy_rel()).join("bar.go")).await.unwrap(),
+            tokio::fs::read(root.join(copy_rel()).join("bar.go"))
+                .await
+                .unwrap(),
             PATCHED
         );
     }
@@ -1391,7 +1424,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&go_service_cfg("http://127.0.0.1:1", VendorSource::Service, true)),
+            Some(&go_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");

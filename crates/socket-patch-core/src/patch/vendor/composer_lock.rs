@@ -287,60 +287,58 @@ pub async fn vendor_composer(
             );
         }
     }
-    let mut result = match composer_service_copy(
-        service,
-        record,
-        &pkg,
-        &copy_dir,
-        &uuid_dir,
-        &mut warnings,
-    )
-    .await
-    {
-        ComposerServiceCopy::Used => {
-            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
-            synthesized_result(purl, &copy_dir, verified, true, None)
-        }
-        ComposerServiceCopy::HardFail(outcome) => return *outcome,
-        ComposerServiceCopy::FallBack => {
-            if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
-                return VendorOutcome::Done {
-                    result: synthesized_result(
-                        purl,
-                        &copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy installed package: {e}")),
-                    ),
-                    entry: None,
-                    warnings,
-                };
+    let mut result =
+        match composer_service_copy(service, record, &pkg, &copy_dir, &uuid_dir, &mut warnings)
+            .await
+        {
+            ComposerServiceCopy::Used => {
+                let verified = record
+                    .files
+                    .keys()
+                    .map(|f| already_patched_verify(f))
+                    .collect();
+                synthesized_result(purl, &copy_dir, verified, true, None)
             }
-            let mut result = super::force_apply_staged(
-                purl,
-                &copy_dir,
-                record,
-                sources,
-                false,
-                force,
-                &pkg,
-                version,
-                &mut warnings,
-            )
-            .await;
-            result.package_path = copy_dir.display().to_string();
-            if !result.success {
-                // Don't leave a half-built copy; the lock was never touched.
-                let _ = remove_tree(&uuid_dir).await;
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+            ComposerServiceCopy::HardFail(outcome) => return *outcome,
+            ComposerServiceCopy::FallBack => {
+                if let Err(e) = fresh_copy(installed_dir, &copy_dir, None).await {
+                    return VendorOutcome::Done {
+                        result: synthesized_result(
+                            purl,
+                            &copy_dir,
+                            Vec::new(),
+                            false,
+                            Some(format!("failed to copy installed package: {e}")),
+                        ),
+                        entry: None,
+                        warnings,
+                    };
+                }
+                let mut result = super::force_apply_staged(
+                    purl,
+                    &copy_dir,
+                    record,
+                    sources,
+                    false,
+                    force,
+                    &pkg,
+                    version,
+                    &mut warnings,
+                )
+                .await;
+                result.package_path = copy_dir.display().to_string();
+                if !result.success {
+                    // Don't leave a half-built copy; the lock was never touched.
+                    let _ = remove_tree(&uuid_dir).await;
+                    return VendorOutcome::Done {
+                        result,
+                        entry: None,
+                        warnings,
+                    };
+                }
+                result
             }
-            result
-        }
-    };
+        };
 
     // ── lock rewrite ─────────────────────────────────────────────────────
     let original_entry = lock[section][idx].clone();
@@ -552,7 +550,10 @@ async fn composer_service_copy(
         if cfg.source.requires_service() {
             hard("vendor_prebuilt_required", reason)
         } else {
-            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
             ComposerServiceCopy::FallBack
         }
     };
@@ -575,7 +576,10 @@ async fn composer_service_copy(
             }
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
-                format!("vendored {pkg} from the patch service ({})", archive.source_url),
+                format!(
+                    "vendored {pkg} from the patch service ({})",
+                    archive.source_url
+                ),
             ));
             ComposerServiceCopy::Used
         }
@@ -1580,12 +1584,21 @@ mod tests {
         assert!(entry.is_some());
         let copy = root.join(copy_rel());
         assert_eq!(
-            tokio::fs::read(copy.join("src/LoggerInterface.php")).await.unwrap(),
+            tokio::fs::read(copy.join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
             PATCHED
         );
-        let lock_text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK)).await.unwrap();
-        assert!(lock_text.contains(&copy_rel()), "lock rewired to the copy: {lock_text}");
-        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+        let lock_text = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert!(
+            lock_text.contains(&copy_rel()),
+            "lock rewired to the copy: {lock_text}"
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.code == "vendor_prebuilt_downloaded"));
     }
 
     /// `service` mode + integrity mismatch hard-fails, nothing extracted.
@@ -1610,7 +1623,9 @@ mod tests {
             .await,
         );
         assert_eq!(code, "vendor_prebuilt_required");
-        assert!(!root.join(format!(".socket/vendor/composer/{UUID}")).exists());
+        assert!(!root
+            .join(format!(".socket/vendor/composer/{UUID}"))
+            .exists());
     }
 
     /// `auto` + a not-built service status falls back to the local build.
@@ -1632,10 +1647,16 @@ mod tests {
             )
             .await,
         );
-        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(
+            result.success,
+            "auto must fall back to the local build: {:?}",
+            result.error
+        );
         assert!(entry.is_some());
         assert_eq!(
-            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php")).await.unwrap(),
+            tokio::fs::read(root.join(copy_rel()).join("src/LoggerInterface.php"))
+                .await
+                .unwrap(),
             PATCHED
         );
     }

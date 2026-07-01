@@ -448,9 +448,18 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     // Vendor (offline: blob staged locally).
     let (code, stdout, stderr) = run_socket(
         &proj,
-        &["vendor", "--json", "--offline", "--cwd", proj.to_str().unwrap()],
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
     );
-    assert_eq!(code, 0, "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     // VEX against the vendored tarball (default verify mode).
     let vex_path = proj.join("out.vex.json");
@@ -471,7 +480,11 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     let doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(stmts.len(), 1, "the vendored npm patch must be attested: {doc}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the vendored npm patch must be attested: {doc}"
+    );
     assert_eq!(stmts[0]["vulnerability"]["name"], GHSA);
     assert_eq!(stmts[0]["status"], "not_affected");
     assert_eq!(stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);

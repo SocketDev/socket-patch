@@ -1963,7 +1963,11 @@ mod tests {
         mount_granted(&server, &sri, &served).await;
 
         let fx = fixture().await;
-        let outcome = vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await;
+        let outcome = vendor_service(
+            &fx,
+            &service_cfg(&server.uri(), VendorSource::Service, false),
+        )
+        .await;
         let (result, entry, warnings) = expect_done(outcome);
         assert!(result.success, "{:?}", result.error);
         let entry = entry.expect("service vendor must carry a ledger entry");
@@ -1972,7 +1976,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on_disk, served, "service tgz written byte-for-byte");
-        assert_eq!(entry.artifact.sha256, hex::encode(sha2::Sha256::digest(&served)));
+        assert_eq!(
+            entry.artifact.sha256,
+            hex::encode(sha2::Sha256::digest(&served))
+        );
         assert_eq!(entry.artifact.size, Some(served.len() as u64));
 
         let lock = fx.read_lock().await;
@@ -1980,7 +1987,11 @@ mod tests {
             "node_modules/left-pad",
             "node_modules/foo/node_modules/left-pad",
         ] {
-            assert_eq!(lock_integrity(&lock, key), sri, "{key}: lock integrity = service sha512");
+            assert_eq!(
+                lock_integrity(&lock, key),
+                sri,
+                "{key}: lock integrity = service sha512"
+            );
             assert_eq!(
                 lock["packages"][key]["resolved"],
                 json!(format!("file:{}", fx.expected_rel_tgz())),
@@ -1988,7 +1999,9 @@ mod tests {
             );
         }
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "expected a vendor_prebuilt_downloaded advisory, got {warnings:?}"
         );
     }
@@ -2004,9 +2017,17 @@ mod tests {
 
         let fx = fixture().await;
         let before = tokio::fs::read(fx.lock_path()).await.unwrap();
-        let (result, _entry, _) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await);
-        assert!(!result.success, "integrity mismatch under `service` must fail");
+        let (result, _entry, _) = expect_done(
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
+        assert!(
+            !result.success,
+            "integrity mismatch under `service` must fail"
+        );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             before,
@@ -2029,9 +2050,14 @@ mod tests {
         mount_granted(&server, &wrong, &served).await;
 
         let fx = fixture().await;
-        let (result, entry, warnings) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
-        assert!(result.success, "auto must fall back to a successful build: {:?}", result.error);
+        let (result, entry, warnings) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        );
+        assert!(
+            result.success,
+            "auto must fall back to a successful build: {:?}",
+            result.error
+        );
         assert!(entry.is_some());
         let on_disk = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
             .await
@@ -2043,7 +2069,9 @@ mod tests {
             "fallback build's integrity, not the bad service value"
         );
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_integrity_mismatch"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_integrity_mismatch"),
             "expected a vendor_prebuilt_integrity_mismatch advisory, got {warnings:?}"
         );
     }
@@ -2055,8 +2083,9 @@ mod tests {
         mount_status_only(&server, "pending_build").await;
 
         let fx = fixture().await;
-        let (result, entry, warnings) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
+        let (result, entry, warnings) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        );
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(fx.root().join(fx.expected_rel_tgz()).exists());
@@ -2070,8 +2099,13 @@ mod tests {
         mount_status_only(&server, "pending_build").await;
 
         let fx = fixture().await;
-        let (result, _, _) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, false)).await);
+        let (result, _, _) = expect_done(
+            vendor_service(
+                &fx,
+                &service_cfg(&server.uri(), VendorSource::Service, false),
+            )
+            .await,
+        );
         assert!(!result.success);
         assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
     }
@@ -2084,12 +2118,15 @@ mod tests {
         mount_status_only(&server, "not_found").await;
 
         let fx = fixture().await;
-        let (result, entry, warnings) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await);
+        let (result, entry, warnings) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        );
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            !warnings.iter().any(|w| w.code.starts_with("vendor_prebuilt_")),
+            !warnings
+                .iter()
+                .any(|w| w.code.starts_with("vendor_prebuilt_")),
             "a not_found miss must be quiet, got {warnings:?}"
         );
     }
@@ -2101,8 +2138,9 @@ mod tests {
         mount_post_never(&server).await;
 
         let fx = fixture().await;
-        let (result, entry, _) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, true)).await);
+        let (result, entry, _) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, true)).await,
+        );
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         // `mount_post_never`'s `.expect(0)` is verified on `server` drop.
@@ -2115,8 +2153,9 @@ mod tests {
         mount_post_never(&server).await;
 
         let fx = fixture().await;
-        let (result, entry, _) =
-            expect_done(vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Build, false)).await);
+        let (result, entry, _) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Build, false)).await,
+        );
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
     }
@@ -2130,7 +2169,12 @@ mod tests {
 
         let fx = fixture().await;
         let before = tokio::fs::read(fx.lock_path()).await.unwrap();
-        match vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Service, true)).await {
+        match vendor_service(
+            &fx,
+            &service_cfg(&server.uri(), VendorSource::Service, true),
+        )
+        .await
+        {
             VendorOutcome::Refused { code, .. } => {
                 assert_eq!(code, "vendor_service_offline_conflict");
             }

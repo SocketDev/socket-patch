@@ -462,7 +462,11 @@ pub(crate) fn verify_go_h1(bytes: &[u8], expected_h1: &str) -> Result<(), String
 #[cfg(feature = "golang")]
 /// `pub(crate)` so the golang service-download path can extract a downloaded
 /// module zip (entries prefixed `{module}@{version}/`) into the vendor copy dir.
-pub(crate) fn extract_zip_with_prefix(bytes: &[u8], dest: &Path, prefix: &str) -> Result<(), String> {
+pub(crate) fn extract_zip_with_prefix(
+    bytes: &[u8],
+    dest: &Path,
+    prefix: &str,
+) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable module zip: {e}"))?;
     for i in 0..archive.len() {

@@ -19,8 +19,7 @@ use clap::Args;
 
 use socket_patch_core::api::client::ApiClientEnvOverrides;
 use socket_patch_core::constants::{
-    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH,
-    DEFAULT_SOCKET_API_URL,
+    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_SOCKET_API_URL,
 };
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::patch::vendor::VendorSource;

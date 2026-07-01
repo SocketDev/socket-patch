@@ -128,7 +128,11 @@ fn redirected_purl_attested_against_installed_tree() {
     let patched = b"redirected patched index\n";
     let after = compute_git_sha256_from_bytes(patched);
     let purl = scaffold_npm(cwd, "left-pad", "1.3.0", patched);
-    write_redirect_state(cwd, &purl, make_record(UUID, &after, "GHSA-rdir-1111", &["CVE-2024-1"]));
+    write_redirect_state(
+        cwd,
+        &purl,
+        make_record(UUID, &after, "GHSA-rdir-1111", &["CVE-2024-1"]),
+    );
     assert!(
         !cwd.join(".socket/manifest.json").exists(),
         "fixture sanity: a redirect project has no manifest"
@@ -146,7 +150,11 @@ fn redirected_purl_attested_against_installed_tree() {
 
     let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(stmts.len(), 1, "the redirected patch must be attested: {doc}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the redirected patch must be attested: {doc}"
+    );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-1111");
     assert_eq!(stmts[0]["status"], "not_affected");
     assert_eq!(stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);
@@ -170,7 +178,11 @@ fn redirected_purl_bypasses_property7_filter() {
     let patched = b"redirected patched index\n";
     let after = compute_git_sha256_from_bytes(patched);
     let purl = scaffold_npm(cwd, "left-pad", "1.3.0", patched);
-    write_redirect_state(cwd, &purl, make_record(UUID, &after, "GHSA-rdir-keep", &["CVE-2024-2"]));
+    write_redirect_state(
+        cwd,
+        &purl,
+        make_record(UUID, &after, "GHSA-rdir-keep", &["CVE-2024-2"]),
+    );
 
     // Control: a plain manifest npm patch that VERIFIES against node_modules
     // but is neither redirected nor set up / manual — property 7 must drop it,
@@ -243,7 +255,11 @@ fn tampered_installed_file_omits_redirected_patch() {
     // The installed file does NOT hash to the record's afterHash.
     let after = compute_git_sha256_from_bytes(b"what the patch should contain\n");
     let purl = scaffold_npm(cwd, "left-pad", "1.3.0", b"tampered installed bytes\n");
-    write_redirect_state(cwd, &purl, make_record(UUID, &after, "GHSA-rdir-bad", &["CVE-2024-4"]));
+    write_redirect_state(
+        cwd,
+        &purl,
+        make_record(UUID, &after, "GHSA-rdir-bad", &["CVE-2024-4"]),
+    );
 
     let vex_path = cwd.join("out.vex.json");
     let out = cli()
@@ -324,7 +340,11 @@ fn redirected_no_verify_attests_without_installed_tree() {
 
     let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
     let stmts = doc["statements"].as_array().unwrap();
-    assert_eq!(stmts.len(), 1, "the redirected patch must be attested: {doc}");
+    assert_eq!(
+        stmts.len(),
+        1,
+        "the redirected patch must be attested: {doc}"
+    );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-nv");
     assert_eq!(
         stmts[0]["impact_statement"].as_str().unwrap(),
@@ -362,9 +382,10 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
 
     let mut state = RedirectState::new();
     for (purl, ghsa) in cases {
-        state
-            .records
-            .insert(purl.to_string(), make_record(UUID, &"b".repeat(64), ghsa, &["CVE-2024-1"]));
+        state.records.insert(
+            purl.to_string(),
+            make_record(UUID, &"b".repeat(64), ghsa, &["CVE-2024-1"]),
+        );
     }
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).unwrap();
