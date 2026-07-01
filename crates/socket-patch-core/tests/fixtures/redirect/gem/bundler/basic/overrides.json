@@ -1,0 +1,22 @@
+[
+  {
+    "ecosystem": "gem",
+    "name": "rails",
+    "version": "7.0.0",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "77777777-7777-7777-7777-777777777777",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/gems/rails-7.0.0.gem",
+    "registryOverride": {
+      "kind": "rubygems-compact-index",
+      "indexUrl": "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/",
+      "identifiers": {
+        "name": "rails",
+        "version": "7.0.0",
+        "gemChecksumSha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+      }
+    },
+    "integrity": {
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    }
+  }
+]

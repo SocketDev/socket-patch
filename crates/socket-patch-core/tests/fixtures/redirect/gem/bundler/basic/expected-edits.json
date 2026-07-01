@@ -1,0 +1,17 @@
+[
+  {
+    "path": "Gemfile",
+    "kind": "redirect_gemfile_source_block",
+    "action": "rewritten",
+    "key": "rails",
+    "original": "\ngem \"rails\", \"7.0.0\"",
+    "new": "source \"https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+  },
+  {
+    "path": "Gemfile.lock",
+    "kind": "redirect_gemfile_lock_checksum",
+    "action": "rewritten",
+    "key": "rails",
+    "new": "rails (7.0.0) sha256=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  }
+]

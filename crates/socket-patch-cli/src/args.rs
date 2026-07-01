@@ -19,7 +19,8 @@ use clap::Args;
 
 use socket_patch_core::api::client::ApiClientEnvOverrides;
 use socket_patch_core::constants::{
-    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_SOCKET_API_URL,
+    DEFAULT_PATCH_API_PROXY_URL, DEFAULT_PATCH_MANIFEST_PATH, DEFAULT_PATCH_SERVER_URL,
+    DEFAULT_SOCKET_API_URL,
 };
 use socket_patch_core::crawlers::Ecosystem;
 
@@ -112,6 +113,16 @@ pub struct GlobalArgs {
         default_value = DEFAULT_PATCH_API_PROXY_URL,
     )]
     pub proxy_url: String,
+
+    /// Patch-server base URL that hosts the vendored patches, used by
+    /// `scan --redirect` to build the per-dependency override URLs. Defaults to
+    /// the production patch host; override for local dev / testing.
+    #[arg(
+        long = "patch-server-url",
+        env = "SOCKET_PATCH_SERVER_URL",
+        default_value = DEFAULT_PATCH_SERVER_URL,
+    )]
+    pub patch_server_url: String,
 
     /// Restrict to these ecosystems (comma-separated). Names not supported
     /// by this build (e.g. `maven`/`nuget` unless compiled in) are rejected.
@@ -328,6 +339,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_API_TOKEN",
     "SOCKET_ORG_SLUG",
     "SOCKET_PROXY_URL",
+    "SOCKET_PATCH_SERVER_URL",
     "SOCKET_ECOSYSTEMS",
     "SOCKET_DOWNLOAD_MODE",
     "SOCKET_OFFLINE",
@@ -388,6 +400,7 @@ impl Default for GlobalArgs {
             api_token: None,
             org: None,
             proxy_url: String::new(),
+            patch_server_url: String::new(),
             ecosystems: None,
             download_mode: "diff".to_string(),
             offline: false,

@@ -12,6 +12,7 @@ pub mod go_mod_edit;
 pub mod go_redirect;
 pub mod package;
 pub(crate) mod path_safety;
+pub mod redirect;
 pub mod rollback;
 pub mod sidecars;
 pub mod vendor;

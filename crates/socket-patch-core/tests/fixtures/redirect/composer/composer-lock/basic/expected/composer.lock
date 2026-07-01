@@ -1,0 +1,19 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state"
+    ],
+    "content-hash": "abc123def456abc123def456abc1",
+    "packages": [
+        {
+            "name": "monolog/monolog",
+            "version": "2.0.0",
+            "dist": {
+                "type": "zip",
+                "url": "https:\/\/patch.socket.dev\/patch\/composer\/monolog\/monolog\/2.0.0\/11111111-1111-1111-1111-111111111111\/44444444-4444-4444-4444-444444444444\/monolog-2.0.0.zip",
+                "reference": "abc123def456",
+                "shasum": "abcdef0123456789abcdef0123456789abcdef01"
+            }
+        }
+    ],
+    "packages-dev": []
+}

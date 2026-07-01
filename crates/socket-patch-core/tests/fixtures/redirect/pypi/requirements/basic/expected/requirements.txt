@@ -1,0 +1,2 @@
+flask==2.0.1
+Requests @ https://patch.socket.dev/patch/pypi/requests/2.28.1/11111111-1111-1111-1111-111111111111/33333333-3333-3333-3333-333333333333/requests-2.28.1-py3-none-any.whl ; python_version >= "3.7" --hash=sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef

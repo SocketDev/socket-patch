@@ -188,6 +188,7 @@ fn global_flag_cases_cover_every_global_field() {
         api_token: _,
         org: _,
         proxy_url: _,
+        patch_server_url: _,
         ecosystems: _,
         download_mode: _,
         offline: _,

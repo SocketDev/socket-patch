@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::types::*;
 use crate::constants::{
@@ -74,6 +74,46 @@ struct BatchSearchBody {
 #[derive(Serialize)]
 struct BatchComponent {
     purl: String,
+}
+
+/// Body for the patch-package reference POST endpoint (`scan --redirect`).
+#[derive(Serialize)]
+struct RegistryReferenceBody {
+    uuids: Vec<String>,
+}
+
+/// One downloadable artifact from the reference endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceArtifact {
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub integrity: crate::patch::redirect::Integrity,
+}
+
+/// One patch's resolved hosted-patch reference — mirrors the api-v0
+/// `POST /v0/orgs/{org}/patches/package` (and proxy `/patch/package`) result:
+/// the grant-tokenized artifact URL(s) + integrity + per-ecosystem registry
+/// override that `scan --redirect` turns into a `DepOverride`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryReference {
+    pub status: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub purl: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ReferenceArtifact>,
+    #[serde(default)]
+    pub registry_override: Option<crate::patch::redirect::RegistryOverride>,
+}
+
+#[derive(Deserialize)]
+struct RegistryReferenceResponse {
+    results: std::collections::HashMap<String, RegistryReference>,
 }
 
 impl ApiClient {
@@ -308,6 +348,33 @@ impl ApiClient {
                     .await
             }
         }
+    }
+
+    /// Resolve hosted-patch references for a set of published-patch UUIDs
+    /// (`scan --redirect`). Uses the authenticated
+    /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
+    /// public proxy `POST /patch/package` (free patches only). Returns a
+    /// UUID → reference map (missing/404 → empty).
+    pub async fn fetch_registry_references(
+        &self,
+        uuids: &[String],
+    ) -> Result<std::collections::HashMap<String, RegistryReference>, ApiError> {
+        if uuids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let path = if self.use_public_proxy {
+            "/patch/package".to_string()
+        } else {
+            let slug = self.org_slug.as_deref().unwrap_or("default");
+            format!("/v0/orgs/{}/patches/package", slug)
+        };
+        let body = RegistryReferenceBody {
+            uuids: uuids.to_vec(),
+        };
+        let resp = self
+            .post_json::<RegistryReferenceResponse, _>(&path, &body)
+            .await?;
+        Ok(resp.map(|r| r.results).unwrap_or_default())
     }
 
     /// Internal: POST the batch search to the public proxy's

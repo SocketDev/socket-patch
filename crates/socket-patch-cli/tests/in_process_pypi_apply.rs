@@ -241,6 +241,7 @@ async fn pypi_install_scan_sync_patches_real_file() {
         sync: true,
         vendor: false,
         detached: false,
+        redirect: false,
         all_releases: false,
         vex: Default::default(),
     };
@@ -314,6 +315,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         sync: true,
         vendor: false,
         detached: false,
+        redirect: false,
         all_releases: false,
         vex: Default::default(),
     };
@@ -419,6 +421,7 @@ async fn pypi_apply_dry_run_does_not_modify_file() {
         sync: false,
         vendor: false,
         detached: false,
+        redirect: false,
         all_releases: false,
         vex: Default::default(),
     };
@@ -530,6 +533,7 @@ async fn pypi_crawler_finds_real_installed_six() {
         sync: false,
         vendor: false,
         detached: false,
+        redirect: false,
         all_releases: false,
         vex: Default::default(),
     };

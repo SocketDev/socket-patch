@@ -1,0 +1,10 @@
+[
+  {
+    "path": "composer.lock",
+    "kind": "redirect_composer_dist",
+    "action": "rewritten",
+    "key": "monolog/monolog",
+    "original": "\"dist\": {\n                \"type\": \"zip\",\n                \"url\": \"https:\\/\\/api.github.com\\/repos\\/Seldaek\\/monolog\\/zipball\\/abc123\",\n                \"reference\": \"abc123def456\",\n                \"shasum\": \"\"\n            }",
+    "new": "\"dist\": {\n                \"type\": \"zip\",\n                \"url\": \"https:\\/\\/patch.socket.dev\\/patch\\/composer\\/monolog\\/monolog\\/2.0.0\\/11111111-1111-1111-1111-111111111111\\/44444444-4444-4444-4444-444444444444\\/monolog-2.0.0.zip\",\n                \"reference\": \"abc123def456\",\n                \"shasum\": \"abcdef0123456789abcdef0123456789abcdef01\"\n            }"
+  }
+]

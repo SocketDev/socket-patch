@@ -1,0 +1,10 @@
+version = 1
+requires-python = ">=3.8"
+
+[[package]]
+name = "click"
+version = "8.1.7"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/2e/click-8.1.7-py3-none-any.whl", hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]

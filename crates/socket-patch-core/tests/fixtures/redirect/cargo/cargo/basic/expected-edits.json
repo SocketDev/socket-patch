@@ -1,0 +1,25 @@
+[
+  {
+    "path": ".cargo/config.toml",
+    "kind": "redirect_cargo_registry",
+    "action": "added",
+    "key": "socket-patch-55555555-5555-5555-5555-555555555555",
+    "new": "[registries.socket-patch-55555555-5555-5555-5555-555555555555]\nindex = \"sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/\"\n"
+  },
+  {
+    "kind": "redirect_cargo_toml_dep",
+    "action": "rewritten",
+    "key": "serde",
+    "original": "serde = \"1.0.190\"",
+    "new": "serde = { version = \"1.0.190\", registry = \"socket-patch-55555555-5555-5555-5555-555555555555\" }",
+    "path": "Cargo.toml"
+  },
+  {
+    "kind": "redirect_cargo_lock_entry",
+    "action": "rewritten",
+    "key": "serde@1.0.190",
+    "original": "[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"91d3c334ca1ee894a2c6f6ad7bf058a4d9a3b30e9e0d5a9d1f3e8f0c2c9c0000\"",
+    "new": "[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/\"\nchecksum = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\"",
+    "path": "Cargo.lock"
+  }
+]

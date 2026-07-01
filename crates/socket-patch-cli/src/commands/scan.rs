@@ -557,6 +557,17 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false, requires = "vendor")]
     pub detached: bool,
 
+    /// Redirect every patched dependency to Socket's HOSTED vendored patches
+    /// by rewriting lockfiles/registry configs so ONLY the patched dependency
+    /// points at the patch-server (`--patch-server-url`), instead of applying
+    /// patches in place or ejecting local artifacts. This is the remote
+    /// counterpart of `--vendor`: no artifact bytes land in the repo — the
+    /// lockfile pins the hosted URL + integrity (npm/pypi/composer) or a
+    /// per-dependency registry override (cargo/nuget/gem/…). Conflicts with
+    /// `--apply`/`--sync`/`--vendor`.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync", "vendor"])]
+    pub redirect: bool,
+
     /// Download patches for every release/distribution variant of a
     /// matched package, not just the one(s) matching the locally-
     /// installed distribution. Affects ecosystems with per-release
@@ -1298,6 +1309,191 @@ async fn track_outcomes_for_vendor(
     }
 }
 
+/// Candidate lockfiles / registry configs the redirect rewriters may touch —
+/// read from the project when present and handed to `rewrite_registry_redirect`.
+const REDIRECT_CANDIDATE_FILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "requirements.txt",
+    "uv.lock",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "composer.lock",
+    "nuget.config",
+    "packages.lock.json",
+    "Gemfile",
+    "Gemfile.lock",
+];
+
+/// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
+/// coordinate keeps its full slash-bearing form (npm `@scope/name`, composer
+/// `vendor/pkg`, golang module path) — the rewriters treat that as the `name`
+/// (their `full_name()` is `name` when `namespace` is `None`).
+fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
+    let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
+    let rest = stripped.strip_prefix("pkg:")?;
+    let (typ, after) = rest.split_once('/')?;
+    let (coord, version) = after.rsplit_once('@')?;
+    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord)
+        .into_owned();
+    Some((typ.to_string(), name, version.to_string()))
+}
+
+/// `scan --redirect`: resolve hosted-patch references for the selected patches,
+/// then rewrite ONLY those dependencies' lockfile/registry-config entries to
+/// point at the hosted vendored patches (the byte-identical counterpart of the
+/// GitHub-app registry mode). No artifact bytes land in the repo.
+async fn run_redirect(
+    args: &ScanArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    effective_org_slug: Option<&str>,
+    all_packages_with_patches: &[BatchPackagePatches],
+    can_access_paid_patches: bool,
+) -> i32 {
+    use socket_patch_core::patch::redirect::{rewrite_registry_redirect, DepOverride};
+
+    // Same discovery/selection as `--apply`/`--vendor`.
+    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+    for pkg in all_packages_with_patches {
+        if let Ok(response) = api_client
+            .search_patches_by_package(effective_org_slug, &pkg.purl)
+            .await
+        {
+            all_search_results.extend(response.patches);
+        }
+    }
+    let selected = if all_search_results.is_empty() {
+        Vec::new()
+    } else {
+        match select_patches(&all_search_results, can_access_paid_patches, false) {
+            Ok(s) => s,
+            Err(code) => return code,
+        }
+    };
+
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut overrides: Vec<DepOverride> = Vec::new();
+
+    if !selected.is_empty() {
+        let uuids: Vec<String> = selected.iter().map(|s| s.uuid.clone()).collect();
+        let references = match api_client.fetch_registry_references(&uuids).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("failed to resolve patch references: {e}");
+                return 1;
+            }
+        };
+        for sel in &selected {
+            let Some(reference) = references.get(&sel.uuid) else {
+                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": "not_found" }));
+                continue;
+            };
+            if reference.status != "granted" && reference.status != "reused" {
+                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": reference.status }));
+                continue;
+            }
+            let purl = reference.purl.as_deref().unwrap_or(&sel.purl);
+            let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
+                skipped.push(serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "bad_purl" }));
+                continue;
+            };
+            let Some(url) = reference.url.clone() else {
+                skipped.push(serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "no_url" }));
+                continue;
+            };
+            let integrity = reference
+                .artifacts
+                .iter()
+                .find(|a| a.kind == "tarball")
+                .map(|a| a.integrity.clone())
+                .unwrap_or_default();
+            overrides.push(DepOverride {
+                ecosystem,
+                name,
+                namespace: None,
+                version,
+                token: String::new(),
+                patch_uuid: sel.uuid.clone(),
+                artifact_url: url,
+                berry_zip_url: None,
+                registry_override: reference.registry_override.clone(),
+                integrity,
+            });
+        }
+    }
+
+    // Read the project's candidate files, run the rewriters.
+    let mut files: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for name in REDIRECT_CANDIDATE_FILES {
+        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(name)) {
+            files.insert((*name).to_string(), content);
+        }
+    }
+    let rewrite = rewrite_registry_redirect(&files, &overrides);
+    let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+
+    if !args.common.dry_run {
+        for (rel, content) in &rewrite.files {
+            let path = args.common.cwd.join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, content) {
+                eprintln!("failed to write {rel}: {e}");
+                return 1;
+            }
+        }
+        // Ledger for a future revert (mirrors the vendor state.json shape).
+        if !rewrite.edits.is_empty() {
+            let vendor_dir = args.common.cwd.join(".socket").join("vendor");
+            let _ = std::fs::create_dir_all(&vendor_dir);
+            let ledger = serde_json::json!({
+                "version": 1,
+                "mode": "redirect",
+                "edits": rewrite.edits,
+            });
+            let _ = std::fs::write(
+                vendor_dir.join("redirect-state.json"),
+                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
+            );
+        }
+    }
+
+    if args.common.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "success",
+                "redirect": {
+                    "redirected": overrides.len(),
+                    "rewrittenFiles": rewritten,
+                    "skipped": skipped,
+                    "warnings": rewrite.warnings.iter().map(|w| serde_json::json!({
+                        "code": w.code, "detail": w.detail,
+                    })).collect::<Vec<_>>(),
+                    "dryRun": args.common.dry_run,
+                }
+            }))
+            .unwrap()
+        );
+    } else if !args.common.silent {
+        let verb = if args.common.dry_run { "would rewrite" } else { "rewrote" };
+        println!(
+            "Redirected {} package(s); {verb} {} file(s).",
+            overrides.len(),
+            rewritten.len()
+        );
+        for s in &skipped {
+            eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+        }
+    }
+    0
+}
+
 pub async fn run(args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1684,6 +1880,20 @@ pub async fn run(args: ScanArgs) -> i32 {
         telemetry_org.as_deref(),
     )
     .await;
+
+    // Registry-redirect mode is a distinct, self-contained flow (rewrite
+    // lockfiles → hosted vendored patches). It reuses discovery above, then
+    // returns — it must NOT fall through to the apply/vendor branches.
+    if args.redirect {
+        return run_redirect(
+            &args,
+            &api_client,
+            effective_org_slug,
+            &all_packages_with_patches,
+            can_access_paid_patches,
+        )
+        .await;
+    }
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
