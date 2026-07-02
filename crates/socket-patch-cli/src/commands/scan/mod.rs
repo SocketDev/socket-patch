@@ -1,3 +1,11 @@
+//! The `scan` command: crawl installed (and lockfile-resolved) packages,
+//! query the patch API for available patches, and optionally consume them
+//! in one of three modes — hosted (`hosted::run_redirect`), vendored
+//! (`vendor_flow`), or agent (in-place apply) — with an optional GC pass
+//! (`gc`) and discovery helpers (`discovery`). This module keeps the CLI
+//! surface (`ScanArgs`, `ScanMode`, `resolve_mode_flags`, `run`) and the
+//! small helpers shared across the submodules.
+
 use clap::Args;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
@@ -37,7 +45,6 @@ use self::vendor_flow::{
 };
 
 const DEFAULT_BATCH_SIZE: usize = 100;
-
 
 /// The three patch-application modes `scan` can drive, selectable via
 /// `--mode` (the documented spelling). Each variant is equivalent to one
