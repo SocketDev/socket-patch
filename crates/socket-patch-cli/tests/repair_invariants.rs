@@ -144,6 +144,79 @@ fn repair_with_no_manifest_emits_manifest_not_found_envelope() {
     assert_eq!(v["error"]["code"], "manifest_not_found");
 }
 
+/// A project whose ONLY trace is the hosted-mode redirect ledger
+/// (`.socket/vendor/redirect-state.json`) — no manifest, no vendor
+/// `state.json`, no `.socket/vendor/...` lockfile references — is a no-op for
+/// repair, not a `manifest_not_found` error. Hosted redirects point at
+/// patch.socket.dev URLs and leave no local artifacts to rebuild or sweep, so
+/// repair must exit success with an informational `redirect_only_project`
+/// skip and route the user to `scan --mode hosted`.
+#[test]
+fn repair_redirect_only_project_is_informational_no_op() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let redirect_dir = tmp.path().join(".socket").join("vendor");
+    std::fs::create_dir_all(&redirect_dir).unwrap();
+    // Minimal valid ledger; repair must not validate its contents.
+    std::fs::write(
+        redirect_dir.join("redirect-state.json"),
+        r#"{ "version": 1, "mode": "hosted" }"#,
+    )
+    .unwrap();
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(
+        code, 0,
+        "redirect-only repair must succeed; stdout=\n{stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("envelope JSON");
+    assert_eq!(v["command"], "repair");
+    assert_eq!(v["status"], "success");
+    // No error envelope — specifically NOT manifest_not_found.
+    assert!(
+        v.get("error").is_none() || v["error"].is_null(),
+        "redirect-only repair must not carry an error; got {v}"
+    );
+    // One informational skip event routing to hosted mode.
+    let events = v["events"].as_array().expect("events array");
+    let skip = events
+        .iter()
+        .find(|e| e["action"] == "skipped")
+        .expect("a skipped event");
+    assert_eq!(skip["errorCode"], "redirect_only_project");
+    assert!(
+        skip["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("scan --mode hosted"),
+        "skip reason must route to hosted mode; got {skip}"
+    );
+}
+
+/// The human (non-JSON) path of the redirect-only no-op: exit 0 with the
+/// informational message on stdout (not stderr, not an error).
+#[test]
+fn repair_redirect_only_project_human_mode_prints_note() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let redirect_dir = tmp.path().join(".socket").join("vendor");
+    std::fs::create_dir_all(&redirect_dir).unwrap();
+    std::fs::write(
+        redirect_dir.join("redirect-state.json"),
+        r#"{ "version": 1, "mode": "hosted" }"#,
+    )
+    .unwrap();
+
+    let out = socket_cmd(tmp.path())
+        .args(["repair", "--offline"])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hosted redirects need no local repair"),
+        "human mode must print the informational note; got stdout=\n{stdout}"
+    );
+}
+
 #[test]
 fn repair_with_invalid_manifest_emits_repair_failed_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");

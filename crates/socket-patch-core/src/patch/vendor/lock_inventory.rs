@@ -100,7 +100,17 @@ impl LockfileEntry {
 pub async fn inventory_npm_lock(
     project_root: &Path,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
-    let (flavor, _warnings) = detect_npm_lock_flavor(project_root).await.ok()?;
+    // Rush monorepos have no root package.json/lock pair; their single
+    // pnpm source-of-truth lives under common/config/rush/. The flavor
+    // probe (root-relative) can't see it, so fall back explicitly when the
+    // root lock is absent but rush.json is present.
+    let (flavor, _warnings) = match detect_npm_lock_flavor(project_root).await {
+        Ok(found) => found,
+        Err(_) => {
+            let rush = inventory_rush_pnpm_locks(project_root).await;
+            return (!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush)));
+        }
+    };
     let raw = match flavor {
         NpmLockFlavor::PackageLock => inventory_package_lock(project_root).await,
         NpmLockFlavor::Pnpm => inventory_pnpm_lock(project_root).await,
@@ -403,9 +413,13 @@ fn inline_map_value(fragment: &str, field: &str) -> Option<String> {
 }
 
 async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = tokio::fs::read_to_string(root.join("pnpm-lock.yaml"))
-        .await
-        .ok()?;
+    inventory_pnpm_lock_at(&root.join("pnpm-lock.yaml")).await
+}
+
+/// Inventory a specific `pnpm-lock.yaml` (path given explicitly so the Rush
+/// fallback can point it at `common/config/rush/…` and subspace locks).
+async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = tokio::fs::read_to_string(lock_path).await.ok()?;
     let lines = pnpm_lock::split_lines(&text);
     let (start, end) = pnpm_lock::section_bounds(&lines, "packages")?;
 
@@ -455,6 +469,53 @@ async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
         ));
     }
     Some(out)
+}
+
+// ─────────────────────────────── Rush monorepo ───────────────────────────────
+
+/// Inventory a Rush monorepo's pnpm locks. Rush keeps a single
+/// source-of-truth lock at `common/config/rush/pnpm-lock.yaml` and, when
+/// subspaces are enabled, one lock per subspace under
+/// `common/config/subspaces/<name>/pnpm-lock.yaml`. `rush install` copies
+/// the source lock into common/temp and runs pnpm there.
+///
+/// Only called (via [`inventory_npm_lock`]) when there is NO root lock but
+/// `rush.json` is present, so it never shadows a plain pnpm project. The
+/// subspace directory is read sorted for deterministic output. Missing
+/// files/dirs are skipped fail-soft; the caller drops the whole result when
+/// it comes back empty.
+async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
+    if tokio::fs::metadata(project_root.join("rush.json"))
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+
+    // The single source-of-truth lock.
+    let common_lock = project_root.join("common/config/rush/pnpm-lock.yaml");
+    if let Some(entries) = inventory_pnpm_lock_at(&common_lock).await {
+        out.extend(entries);
+    }
+
+    // Per-subspace locks, sorted for determinism.
+    let subspaces_dir = project_root.join("common/config/subspaces");
+    if let Ok(mut read_dir) = tokio::fs::read_dir(&subspaces_dir).await {
+        let mut subspace_dirs: Vec<std::path::PathBuf> = Vec::new();
+        while let Ok(Some(entry)) = read_dir.next_entry().await {
+            if entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+                subspace_dirs.push(entry.path());
+            }
+        }
+        subspace_dirs.sort();
+        for dir in subspace_dirs {
+            if let Some(entries) = inventory_pnpm_lock_at(&dir.join("pnpm-lock.yaml")).await {
+                out.extend(entries);
+            }
+        }
+    }
+    out
 }
 
 // ───────────────────────────── yarn.lock (classic) ─────────────────────────────
@@ -1585,6 +1646,81 @@ snapshots:
         for absent in ["local-thing", "vendored"] {
             assert!(!entries.iter().any(|e| e.name == absent), "{entries:?}");
         }
+    }
+
+    // ── Rush monorepo ───────────────────────────────────────────────────────
+
+    /// Write `content` to `rel` under `root`, creating parent dirs.
+    async fn write_nested(root: &Path, rel: &str, content: &str) {
+        let path = root.join(rel);
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(path, content).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rush_monorepo_inventories_common_and_subspace_locks() {
+        // No root package.json/lock — only rush.json plus the generated
+        // source-of-truth lock under common/config and one subspace lock.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+        write_nested(tmp.path(), "common/config/rush/pnpm-lock.yaml", PNPM_LOCK).await;
+        write_nested(
+            tmp.path(),
+            "common/config/subspaces/frontend/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'
+
+packages:
+
+  only-in-subspace@9.9.9:
+    resolution: {integrity: sha512-sub==}
+",
+        )
+        .await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Pnpm);
+        // Union across the common lock and the subspace lock.
+        assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
+        assert_eq!(entry(&entries, "only-in-subspace").version, "9.9.9");
+    }
+
+    #[tokio::test]
+    async fn rush_json_without_any_lock_yields_none() {
+        // rush.json but no common/subspace lock at all: nothing to inventory.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+        assert!(inventory_npm_lock(tmp.path()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn root_pnpm_lock_wins_over_rush_fallback() {
+        // A plain pnpm project that also happens to carry a stray rush.json
+        // must route through the normal root-lock path, never the fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
+        write_nested(
+            tmp.path(),
+            "common/config/rush/pnpm-lock.yaml",
+            "lockfileVersion: '9.0'
+
+packages:
+
+  only-in-common@1.0.0:
+    resolution: {integrity: sha512-common==}
+",
+        )
+        .await;
+
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Pnpm);
+        assert!(entries.iter().any(|e| e.name == "left-pad"));
+        assert!(
+            !entries.iter().any(|e| e.name == "only-in-common"),
+            "the root lock must win; the rush fallback must not run: {entries:?}"
+        );
     }
 
     // ── yarn classic ──────────────────────────────────────────────────────
