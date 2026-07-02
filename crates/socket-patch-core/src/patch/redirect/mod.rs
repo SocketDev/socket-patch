@@ -620,17 +620,31 @@ enum CargoLockRewrite {
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
+/// A `pnpm-lock.yaml` is `pnpm-lock.yaml` at the project root or at any nested
+/// path (e.g. Rush repos keep them under `common/config/rush/`). Every such
+/// files-map key is rewritten under the same grammar.
+fn is_pnpm_lock_key(key: &str) -> bool {
+    key == "pnpm-lock.yaml" || key.ends_with("/pnpm-lock.yaml")
+}
+
 fn rewrite_pnpm_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    if npm.is_empty() || !files.contains_key("pnpm-lock.yaml") {
+    // Deterministic order: BTreeMap iterates keys sorted, so goldens are
+    // stable across every pnpm lock in the set.
+    let lock_keys: Vec<&String> = files.keys().filter(|k| is_pnpm_lock_key(k)).collect();
+    if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
-    let mut content = files["pnpm-lock.yaml"].clone();
-    let mut changed = false;
+    // Work on an editable copy of each lock so a single dep can be rewritten
+    // in whichever locks contain it.
+    let mut contents: Vec<(&String, String, bool)> = lock_keys
+        .iter()
+        .map(|k| (*k, files[*k].clone(), false))
+        .collect();
     for dep in &npm {
         let fname = full_name(dep);
         let Some(sha512) = dep.integrity.sha512.clone() else {
@@ -647,45 +661,55 @@ fn rewrite_pnpm_lock(
             + &regex::escape(&dep.version)
             + r":\n(?: {4,}.*\n)*? {4,}resolution: )\{([^}\n]*)\}";
         let re = Regex::new(&pat).unwrap();
-        let Some(caps) = re.captures(&content) else {
+        let mut matched_any = false;
+        for (key, content, changed) in &mut contents {
+            let Some(caps) = re.captures(content) else {
+                continue;
+            };
+            matched_any = true;
+            let whole = caps.get(0).unwrap().as_str().to_string();
+            let prefix = caps.get(1).unwrap().as_str().to_string();
+            let inner = caps.get(2).unwrap().as_str().to_string();
+            let original = format!("{{{inner}}}");
+            let mut fields: Vec<String> = vec![
+                format!("integrity: {sha512}"),
+                format!("tarball: {}", dep.artifact_url),
+            ];
+            for f in inner.split(',') {
+                let t = f.trim();
+                if !t.is_empty() && !t.starts_with("integrity:") && !t.starts_with("tarball:") {
+                    fields.push(t.to_string());
+                }
+            }
+            let rebuilt = format!("{{{}}}", fields.join(", "));
+            // Already redirected (re-run): no edit, no ledger growth.
+            if rebuilt == original {
+                continue;
+            }
+            *content = content.replacen(&whole, &format!("{prefix}{rebuilt}"), 1);
+            *changed = true;
+            result.edits.push(FileEdit {
+                path: (*key).clone(),
+                kind: "redirect_pnpm_resolution".into(),
+                action: "rewritten".into(),
+                key: Some(format!("{fname}@{}", dep.version)),
+                original: Some(Value::String(original)),
+                new: Some(Value::String(rebuilt)),
+            });
+        }
+        // The entry-not-found warning fires only when the dep matched in NO
+        // pnpm lock across the whole set, not once per lock.
+        if !matched_any {
             result.warnings.push(RewriteWarning {
                 code: "redirect_pnpm_entry_not_found".into(),
                 detail: format!("no inline resolution for {fname}@{}", dep.version),
             });
-            continue;
-        };
-        let whole = caps.get(0).unwrap().as_str().to_string();
-        let prefix = caps.get(1).unwrap().as_str().to_string();
-        let inner = caps.get(2).unwrap().as_str().to_string();
-        let original = format!("{{{inner}}}");
-        let mut fields: Vec<String> = vec![
-            format!("integrity: {sha512}"),
-            format!("tarball: {}", dep.artifact_url),
-        ];
-        for f in inner.split(',') {
-            let t = f.trim();
-            if !t.is_empty() && !t.starts_with("integrity:") && !t.starts_with("tarball:") {
-                fields.push(t.to_string());
-            }
         }
-        let rebuilt = format!("{{{}}}", fields.join(", "));
-        // Already redirected (re-run): no edit, no ledger growth.
-        if rebuilt == original {
-            continue;
-        }
-        content = content.replacen(&whole, &format!("{prefix}{rebuilt}"), 1);
-        changed = true;
-        result.edits.push(FileEdit {
-            path: "pnpm-lock.yaml".into(),
-            kind: "redirect_pnpm_resolution".into(),
-            action: "rewritten".into(),
-            key: Some(format!("{fname}@{}", dep.version)),
-            original: Some(Value::String(original)),
-            new: Some(Value::String(rebuilt)),
-        });
     }
-    if changed {
-        result.files.insert("pnpm-lock.yaml".into(), content);
+    for (key, content, changed) in contents {
+        if changed {
+            result.files.insert(key.clone(), content);
+        }
     }
 }
 

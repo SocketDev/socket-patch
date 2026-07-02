@@ -22,13 +22,14 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::patch::bun_lock_text;
 use crate::patch::path_safety;
 use crate::utils::purl::strip_purl_qualifiers;
 
 use super::npm_common::is_safe_npm_name;
 use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
 use super::path::parse_vendor_path;
-use super::{bun_lock, pnpm_lock, yarn_berry_lock, yarn_classic_lock};
+use super::{pnpm_lock, yarn_berry_lock, yarn_classic_lock};
 
 /// The content verifier a lockfile records for an entry. The fetch layer
 /// refuses entries whose verifier is [`LockIntegrity::None`].
@@ -543,9 +544,9 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(root.join("bun.lock"))
         .await
         .ok()?;
-    bun_lock::check_lock_version(&text).ok()?;
+    bun_lock_text::check_lock_version(&text).ok()?;
     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let entries = bun_lock::parse_packages_section(&lines).ok()?;
+    let entries = bun_lock_text::parse_packages_section(&lines).ok()?;
 
     let mut out = Vec::new();
     for entry in entries {
@@ -557,20 +558,20 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
         let Some(spec) = entry
             .elems
             .first()
-            .and_then(|e| bun_lock::decode_json_string(e))
+            .and_then(|e| bun_lock_text::decode_json_string(e))
         else {
             continue;
         };
-        let Some((name, version)) = bun_lock::split_name_spec(&spec) else {
+        let Some((name, version)) = bun_lock_text::split_name_spec(&spec) else {
             continue;
         };
         if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             continue;
         }
-        let Some(registry) = bun_lock::decode_json_string(&entry.elems[1]) else {
+        let Some(registry) = bun_lock_text::decode_json_string(&entry.elems[1]) else {
             continue;
         };
-        let Some(integrity) = bun_lock::decode_json_string(&entry.elems[3]) else {
+        let Some(integrity) = bun_lock_text::decode_json_string(&entry.elems[3]) else {
             continue;
         };
         // elem[1] is `""` for the default registry; a full `.tgz` URL is

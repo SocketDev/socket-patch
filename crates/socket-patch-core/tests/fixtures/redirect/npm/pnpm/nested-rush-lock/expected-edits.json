@@ -1,0 +1,10 @@
+[
+  {
+    "path": "common/config/rush/pnpm-lock.yaml",
+    "kind": "redirect_pnpm_resolution",
+    "action": "rewritten",
+    "key": "left-pad@1.3.0",
+    "original": "{integrity: sha512-XPMACEGRYS9CxC3IUMzAQDLT5SqYFXXXupstreamUPSTREAMupstreamUPSTREAMabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345==}",
+    "new": "{integrity: sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==, tarball: https://patch.socket.dev/patch/npm/left-pad/1.3.0/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/left-pad-1.3.0.tgz}"
+  }
+]
