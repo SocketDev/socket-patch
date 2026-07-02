@@ -765,7 +765,7 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
-    use crate::patch::apply::VerifyStatus;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
