@@ -404,16 +404,32 @@ pub struct GetArgs {
     pub package: bool,
 
     /// Download patch without applying it.
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_SAVE_ONLY=1` (or an
+    /// exported-but-empty `SOCKET_SAVE_ONLY=`) aborted every `get`
+    /// invocation.
     #[arg(
         long = "save-only",
         alias = "no-apply",
         env = "SOCKET_SAVE_ONLY",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub save_only: bool,
 
     /// Apply patch immediately without saving to .socket folder.
-    #[arg(long = "one-off", env = "SOCKET_ONE_OFF", default_value_t = false)]
+    ///
+    /// `value_parser = parse_bool_flag`: same env-crash fix as `--save-only`
+    /// above — and `SOCKET_ONE_OFF` is shared with `rollback --one-off`,
+    /// which already parses boolishly; the two must not diverge.
+    #[arg(
+        long = "one-off",
+        env = "SOCKET_ONE_OFF",
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
+    )]
     pub one_off: bool,
 
     /// Download patches for every release/distribution variant of a
@@ -426,7 +442,7 @@ pub struct GetArgs {
         long = "all-releases",
         env = "SOCKET_ALL_RELEASES",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub all_releases: bool,
 }

@@ -663,7 +663,7 @@ const GLOBAL_ENV_VARS: &[&str] = &[
 /// "cannot parse integer from empty string"), and empty
 /// `SOCKET_DOWNLOAD_MODE=` / `SOCKET_MANIFEST_PATH=` leaked `""` past the
 /// documented defaults. The binary now scrubs empty `GlobalArgs` env vars
-/// before clap parses (`args::scrub_empty_global_env_vars` in `main`),
+/// before clap parses (`args::scrub_empty_env_vars` in `main`),
 /// restoring the documented CLI > env > default precedence for blank vars.
 /// This spawns the real binary because the scrub is `main` wiring.
 #[test]

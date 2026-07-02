@@ -730,7 +730,7 @@ pub struct ScanArgs {
         long = "all-releases",
         env = "SOCKET_ALL_RELEASES",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub all_releases: bool,
 

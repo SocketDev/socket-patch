@@ -154,7 +154,7 @@ pub struct ApplyArgs {
     #[arg(
         long = "check",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub check: bool,
 

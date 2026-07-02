@@ -88,10 +88,17 @@ pub struct RemoveArgs {
     pub common: GlobalArgs,
 
     /// Skip rolling back files before removing (only update manifest).
+    ///
+    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    /// clap's default bool parser accepts only the literal strings
+    /// `true`/`false` from the env binding, so `SOCKET_SKIP_ROLLBACK=1` (or
+    /// an exported-but-empty `SOCKET_SKIP_ROLLBACK=`) aborted every
+    /// `remove` invocation.
     #[arg(
         long = "skip-rollback",
         env = "SOCKET_SKIP_ROLLBACK",
-        default_value_t = false
+        default_value_t = false,
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub skip_rollback: bool,
 }

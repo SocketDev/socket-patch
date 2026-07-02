@@ -8,10 +8,11 @@ async fn main() {
     // names. A one-shot deprecation warning fires per legacy name set.
     promote_legacy_env_vars();
 
-    // Then drop exported-but-empty SOCKET_* globals (`SOCKET_CWD=` means
-    // "unset", not "crash the parse"). Must run after the promotion so a
-    // blanked legacy name is scrubbed too.
-    socket_patch_cli::args::scrub_empty_global_env_vars();
+    // Then drop exported-but-empty SOCKET_* flag vars — global and
+    // subcommand-local (`SOCKET_CWD=` means "unset", not "crash the
+    // parse"). Must run after the promotion so a blanked legacy name is
+    // scrubbed too.
+    socket_patch_cli::args::scrub_empty_env_vars();
 
     // The parser surface is `String`-typed, but argv is raw bytes on Unix —
     // `std::env::args()` would *panic* on a non-Unicode argument. Collect

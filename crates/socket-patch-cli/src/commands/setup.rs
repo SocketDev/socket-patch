@@ -72,7 +72,7 @@ pub struct SetupArgs {
         long = "check",
         conflicts_with = "remove",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub check: bool,
 
@@ -82,7 +82,7 @@ pub struct SetupArgs {
     #[arg(
         long = "remove",
         default_value_t = false,
-        value_parser = clap::builder::BoolishValueParser::new(),
+        value_parser = crate::args::parse_bool_flag,
     )]
     pub remove: bool,
 
