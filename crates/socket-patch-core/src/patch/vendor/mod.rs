@@ -56,10 +56,14 @@ pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
 pub mod lock_inventory;
+#[cfg(feature = "maven")]
+pub mod maven_repo;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
 pub mod npm_pack;
+#[cfg(feature = "nuget")]
+pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pypi;
 pub mod pypi_pdm;
@@ -347,7 +351,14 @@ pub async fn harvest_artifact_blobs(
             }
             continue;
         }
-        if lower.ends_with(".whl") || lower.ends_with(".zip") {
+        // `.nupkg` is a plain OPC zip (NuGet) and `.jar` is a plain zip (Maven)
+        // — both vendored artifacts read their entries the same way as
+        // wheels/zips to recover afterHash blobs.
+        if lower.ends_with(".whl")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".nupkg")
+            || lower.ends_with(".jar")
+        {
             let Ok(bytes) = tokio::fs::read(&artifact).await else {
                 continue;
             };

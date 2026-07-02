@@ -33,11 +33,14 @@ base64 = { workspace = true }
 libc = { workspace = true }
 
 [features]
-# `cargo` and `golang` are default features (npm + PyPI + Ruby gems are
-# unconditional). Mirror the CLI's defaults so a plain `cargo build` of the
-# workspace ships the supported ecosystems (npm, PyPI, Ruby gems, Go, Cargo);
-# the still-unsupported ecosystems (maven, nuget, composer, deno) stay opt-in.
-default = ["cargo", "golang"]
+# `cargo`, `golang`, `nuget`, and `maven` are default features (npm + PyPI +
+# Ruby gems are unconditional). Mirror the CLI's defaults so a plain `cargo
+# build` of the workspace ships the supported ecosystems (npm, PyPI, Ruby gems,
+# Go, Cargo, NuGet, Maven); the still-unsupported ecosystems (composer, deno)
+# stay opt-in. Maven `apply` stays runtime-gated behind
+# `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts sidecars);
+# committable `vendor` is safe (it never touches ~/.m2).
+default = ["cargo", "golang", "nuget", "maven"]
 cargo = []
 golang = []
 maven = []

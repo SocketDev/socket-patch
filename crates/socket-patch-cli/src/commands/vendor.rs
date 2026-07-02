@@ -115,7 +115,8 @@ pub(crate) async fn dispatch_vendor_one(
     // Under fail-closed `service` mode, refuse any not-covered ecosystem with a
     // clear message rather than silently building (which would violate the
     // contract). Under `auto`/`build` they fall through to the local build.
-    const SERVICE_ECOSYSTEMS: &[&str] = &["npm", "pypi", "cargo", "golang", "composer", "gem"];
+    const SERVICE_ECOSYSTEMS: &[&str] =
+        &["npm", "pypi", "cargo", "golang", "composer", "gem", "nuget"];
     if let Some(cfg) = service {
         if cfg.source.requires_service() && !SERVICE_ECOSYSTEMS.contains(&eco) {
             return Some(VendorOutcome::Refused {
@@ -218,6 +219,36 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
+        #[cfg(feature = "nuget")]
+        "nuget" => {
+            socket_patch_core::patch::vendor::nuget_feed::vendor_nuget(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        }
+        #[cfg(feature = "maven")]
+        "maven" => {
+            socket_patch_core::patch::vendor::maven_repo::vendor_maven(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        }
         _ => return None,
     })
 }
@@ -265,6 +296,16 @@ pub(crate) async fn dispatch_revert_one(
                 dry_run,
             )
             .await
+        }
+        #[cfg(feature = "nuget")]
+        "nuget" => {
+            socket_patch_core::patch::vendor::nuget_feed::revert_nuget(entry, project_root, dry_run)
+                .await
+        }
+        #[cfg(feature = "maven")]
+        "maven" => {
+            socket_patch_core::patch::vendor::maven_repo::revert_maven(entry, project_root, dry_run)
+                .await
         }
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
@@ -687,8 +728,8 @@ pub(crate) async fn vendor_records(
         .flat_map(|p| p.iter().cloned())
         .collect();
 
-    // Purls with no vendor backend (maven/nuget/jsr, or compiled-out
-    // ecosystems) are expected skips, not failures.
+    // Purls with no vendor backend (jsr, or ecosystems compiled out of this
+    // binary) are expected skips, not failures.
     let (vendorable, unsupported): (Vec<String>, Vec<String>) = target_manifest_purls
         .iter()
         .cloned()
@@ -931,8 +972,18 @@ pub(crate) async fn vendor_records(
             };
 
             // Variant probe: only the installed distribution's variant is
-            // vendored (mirrors apply / select_installed_variants).
-            if is_variant_eco && !force {
+            // vendored (mirrors apply / select_installed_variants). It hashes a
+            // representative patch-target file against the installed package
+            // dir, so it only works when those files are EXTRACTED on disk
+            // (pypi wheels / gem gems). Maven is a release-variant ecosystem
+            // too, but its patch targets live INSIDE the un-extracted
+            // `<a>-<v>.jar` — the version dir holds only the jar/pom, so the
+            // probe would always read NotFound and drop the package. Maven
+            // vendor takes the single main jar regardless (no on-disk variant
+            // to select), so the probe is inapplicable and is skipped for it.
+            let probe_applicable = is_variant_eco
+                && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
+            if probe_applicable && !force {
                 let first = match record.files.iter().next() {
                     Some((f, info)) => Some(verify_file_patch(pkg_path, f, info).await.status),
                     None => None,

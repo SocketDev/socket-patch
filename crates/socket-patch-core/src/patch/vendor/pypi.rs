@@ -985,7 +985,6 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
-    use sha2::Digest as _;
     use std::collections::HashMap;
     use std::path::PathBuf;
 

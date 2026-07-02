@@ -29,13 +29,15 @@ tempfile = { workspace = true }
 
 [features]
 # Shipped defaults: npm + PyPI + Ruby gems are always compiled in (no feature
-# gate); `cargo` and `golang` are on by default so released binaries and
-# `cargo install socket-patch-cli` patch Rust and Go deps (and run the
-# build-time cargo guard) out of the box. The still-unsupported ecosystems
-# (maven, nuget, composer, deno) stay opt-in. Build `--no-default-features`
-# for a minimal (npm + PyPI + Ruby gems only) binary — its `apply --check`
-# then fails closed.
-default = ["cargo", "golang"]
+# gate); `cargo`, `golang`, `nuget`, and `maven` are on by default so released
+# binaries and `cargo install socket-patch-cli` patch Rust, Go, .NET, and Java
+# deps (and run the build-time cargo guard) out of the box. Maven `apply` stays
+# runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching
+# corrupts sidecars); committable `vendor` is safe. The still-unsupported
+# ecosystems (composer, deno) stay opt-in. Build `--no-default-features` for a
+# minimal (npm + PyPI + Ruby gems only) binary — its `apply --check` then fails
+# closed.
+default = ["cargo", "golang", "nuget", "maven"]
 cargo = ["socket-patch-core/cargo"]
 golang = ["socket-patch-core/golang"]
 maven = ["socket-patch-core/maven"]
@@ -59,6 +61,8 @@ setup-e2e = []
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# docker_e2e_vendor_maven's host oracle recomputes the maven2 .jar.sha1 sidecar.
+sha1 = { workspace = true }
 # scan_vendor_e2e builds pristine registry tarballs for the auto-fetch tests.
 tar = { workspace = true }
 flate2 = { workspace = true }
