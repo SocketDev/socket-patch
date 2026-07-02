@@ -84,7 +84,14 @@ pub async fn verify_vendored_patch_record(
     let path_str = artifact.to_string_lossy().to_string();
     if path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz") {
         verify_tarball_members(&artifact, record).await
-    } else if path_str.ends_with(".whl") {
+    } else if path_str.ends_with(".whl")
+        || path_str.ends_with(".nupkg")
+        || path_str.ends_with(".jar")
+    {
+        // A `.nupkg` is a plain OPC zip (NuGet) and a `.jar` is a plain zip
+        // (Maven) — both carry member paths that are package-relative, exactly
+        // the manifest key space, so the bounded zip reader used for wheels
+        // verifies them verbatim.
         verify_wheel_members(&artifact, record).await
     } else {
         verify_dir_members(&artifact, record).await
@@ -213,8 +220,15 @@ pub async fn check_vendored_artifact(
         },
         Ok(()) => {
             let norm = entry.artifact.path.replace('\\', "/");
-            let file_shaped =
-                norm.ends_with(".tgz") || norm.ends_with(".tar.gz") || norm.ends_with(".whl");
+            // `.nupkg` (NuGet) and `.jar` (Maven) are single committed files
+            // whose recorded ledger sha256 the rewired lockfile / `.sha1`
+            // sidecar references, so they get the same whole-file drift
+            // cross-check as tarballs/wheels.
+            let file_shaped = norm.ends_with(".tgz")
+                || norm.ends_with(".tar.gz")
+                || norm.ends_with(".whl")
+                || norm.ends_with(".nupkg")
+                || norm.ends_with(".jar");
             if !file_shaped || entry.artifact.sha256.is_empty() {
                 return ArtifactHealth::Healthy;
             }
@@ -456,6 +470,68 @@ mod tests {
                 .unwrap_err(),
             "vendor_hash_mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn nupkg_and_jar_members_verified_as_zip() {
+        // `.nupkg` (NuGet) and `.jar` (Maven) are single committed zip files
+        // routed through the wheel zip reader. Exercise both suffix arms:
+        // member verify + tamper detection + the file-shaped sha256 drift
+        // cross-check in check_vendored_artifact.
+        let cases: &[(&str, &str, &str)] = &[
+            ("nuget", "newtonsoft.json.13.0.3.nupkg", "LICENSE.md"),
+            ("maven", "commons-text-1.10.0.jar", "META-INF/NOTICE.txt"),
+        ];
+        for (eco, leaf, member) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let rel = format!(".socket/vendor/{eco}/{UUID}/{leaf}");
+            tokio::fs::create_dir_all(root.join(format!(".socket/vendor/{eco}/{UUID}")))
+                .await
+                .unwrap();
+            write_whl(&root.join(&rel), member, PATCHED);
+
+            let rec = record(UUID, member);
+            let ent = entry(eco, UUID, &rel);
+            assert!(
+                verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
+                "{eco}: patched member verifies"
+            );
+
+            // A matching ledger sha256 → Healthy through the file-shaped path.
+            let bytes = tokio::fs::read(root.join(&rel)).await.unwrap();
+            let mut ent_sha = entry(eco, UUID, &rel);
+            ent_sha.artifact.sha256 = {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(&bytes))
+            };
+            assert_eq!(
+                check_vendored_artifact(root, &ent_sha, &rec).await,
+                ArtifactHealth::Healthy,
+                "{eco}: matching ledger sha256 is Healthy"
+            );
+
+            // Whole-file drift the member check can't see (members still
+            // verify, but the recorded sha differs).
+            ent_sha.artifact.sha256 = "0".repeat(64);
+            assert_eq!(
+                check_vendored_artifact(root, &ent_sha, &rec).await,
+                ArtifactHealth::Corrupt {
+                    reason: "vendor_sha256_mismatch".to_string()
+                },
+                "{eco}: file-shaped sha256 drift is Corrupt"
+            );
+
+            // Member tamper flips the per-file verdict.
+            write_whl(&root.join(&rel), member, b"tampered");
+            assert_eq!(
+                verify_vendored_patch_record(root, &ent, &rec)
+                    .await
+                    .unwrap_err(),
+                "vendor_hash_mismatch",
+                "{eco}: tampered member detected"
+            );
+        }
     }
 
     #[tokio::test]

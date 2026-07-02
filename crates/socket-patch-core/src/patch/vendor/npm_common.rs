@@ -329,8 +329,11 @@ async fn try_service_pack(
                             coords.name, coords.version, archive.source_url
                         ),
                     ));
-                    let result =
-                        synthesized_service_result(purl, &project_root.join(&staged.rel_tgz), record);
+                    let result = synthesized_service_result(
+                        purl,
+                        &project_root.join(&staged.rel_tgz),
+                        record,
+                    );
                     ServicePackDecision::Used(Box::new((Some(staged), result)))
                 }
                 Err(outcome) => ServicePackDecision::HardFail(outcome),

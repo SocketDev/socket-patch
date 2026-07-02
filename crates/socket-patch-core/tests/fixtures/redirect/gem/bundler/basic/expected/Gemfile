@@ -1,0 +1,5 @@
+source "https://rubygems.org"
+source "https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/" do
+  gem "rails", "7.0.0"
+end
+gem "puma", "6.0.0"

@@ -93,7 +93,11 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
 ///    `vendor_yarn_berry_unsupported`; `# yarn lockfile v1` → YarnClassic;
 ///    neither → Err `vendor_lockfile_version_unsupported`;
 /// 5. `npm-shrinkwrap.json` | `package-lock.json` → PackageLock;
-/// 6. nothing → Err `vendor_lockfile_missing`.
+/// 6. nothing recognized, but `rush.json` present → Err
+///    `vendor_rush_unsupported` (Rush's generated-workspace install model
+///    can't carry vendor's relative `file:` specs — hosted mode edits the
+///    lock in place instead);
+/// 7. nothing → Err `vendor_lockfile_missing`.
 ///
 /// `Ok` carries one `vendor_multiple_lockfiles` warning per OTHER known
 /// lockfile present (outside the detected flavor's family): installs driven
@@ -152,7 +156,27 @@ pub async fn detect_npm_lock_flavor(
             break 'flavor NpmLockFlavor::PackageLock;
         }
 
-        // 6. nothing recognizable.
+        // 6. nothing recognizable at the root. A Rush monorepo keeps its
+        //    single source-of-truth lock under common/config/rush/ (no root
+        //    package.json/lock pair), and its overrides live in
+        //    common/config/rush/pnpm-config.json rather than the lockfile —
+        //    so vendor's file:-relative rewiring cannot survive Rush's
+        //    generated-workspace install (installs run from common/temp).
+        //    Point the user at hosted mode, which edits the lock in place.
+        if exists("rush.json").await {
+            return Err((
+                "vendor_rush_unsupported",
+                "found rush.json: this is a Rush monorepo — its single pnpm lockfile lives at \
+                 common/config/rush/pnpm-lock.yaml, overrides are declared in \
+                 common/config/rush/pnpm-config.json (globalOverrides), and `rush install` \
+                 copies the lock into common/temp and runs pnpm there, so vendor's relative \
+                 file: specs cannot survive the copy; use `socket-patch scan --mode hosted`, \
+                 which edits common/config/rush/pnpm-lock.yaml in place"
+                    .to_string(),
+            ));
+        }
+
+        // Nothing recognizable.
         return Err((
             "vendor_lockfile_missing",
             format!(
@@ -604,6 +628,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (code, _) = detect(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_missing");
+    }
+
+    #[tokio::test]
+    async fn rush_json_without_root_lock_refuses_pointing_at_hosted_mode() {
+        // A Rush monorepo has no root package.json/lock pair — only
+        // rush.json and its generated-workspace lock under common/config.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+        let (code, detail) = detect(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_rush_unsupported");
+        // Names the install model and routes to hosted mode.
+        assert!(detail.contains("pnpm-config.json"), "{detail}");
+        assert!(detail.contains("common/temp"), "{detail}");
+        assert!(detail.contains("scan --mode hosted"), "{detail}");
+        assert!(
+            detail.contains("common/config/rush/pnpm-lock.yaml"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rush_check_fires_only_when_nothing_else_matched() {
+        // A repo with rush.json AND a recognized root lock is a normal npm
+        // project (some tools scaffold a stray rush.json); the flavor probe
+        // matches the root lock first — the rush arm only guards the
+        // otherwise-missing case.
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        let (flavor, _) = detect(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::PackageLock);
     }
 
     #[tokio::test]

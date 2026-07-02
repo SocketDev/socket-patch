@@ -15,6 +15,11 @@
 //!   4. legacy `.socket/go-patches/` redirect regression: an apply-redirected
 //!      Go patch verifies against the redirect copy dir, not the (pristine)
 //!      module cache
+//!   5. detached entries (`scan --vendor --detached`): attested from the
+//!      ledger's embedded record with no manifest at all
+//!   6. the cross-ecosystem matrix: one detached entry per vendor-backend
+//!      ecosystem (npm/cargo/golang/composer/gem/pypi/nuget/maven), each
+//!      verified against its real artifact shape and attested `(vendored)`
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -618,4 +623,324 @@ fn tampered_detached_artifact_omitted() {
         "tamper must surface as vendor_hash_mismatch: {skipped}"
     );
     assert!(!vex_path.exists(), "no document for an all-failed run");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 6. cross-ecosystem matrix — every vendor-backend ecosystem attests
+// ──────────────────────────────────────────────────────────────────────
+
+/// Plain sha256 hex of `bytes` — the ledger's whole-file hash for
+/// file-shaped artifacts (tarballs / wheels / nupkgs / jars).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Write a single-member `.tgz` (the npm artifact shape) at `dest` and
+/// return its bytes for the ledger sha256.
+fn write_member_tgz(dest: &Path, member: &str, bytes: &[u8]) -> Vec<u8> {
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let mut out = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut out, flate2::Compression::new(6));
+        let mut builder = tar::Builder::new(enc);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, member, bytes).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+    std::fs::write(dest, &out).unwrap();
+    out
+}
+
+/// Minimal STORED-entry (no compression) zip writer — local headers +
+/// central directory + EOCD — and returns the bytes for the ledger sha256.
+/// The production reader (`verify_wheel_members`' bounded `zip::ZipArchive`,
+/// which handles `.whl`/`.nupkg`/`.jar` alike) is the code under test;
+/// hand-rolling the writer keeps this test crate off a zip-writer dependency
+/// while still producing honest zip-family artifacts.
+fn write_stored_zip(dest: &Path, members: &[(&str, &[u8])]) -> Vec<u8> {
+    fn push_u16(out: &mut Vec<u8>, v: u16) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    fn push_u32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    for (name, bytes) in members {
+        let offset = out.len() as u32;
+        let crc = {
+            let mut crc = flate2::Crc::new();
+            crc.update(bytes);
+            crc.sum()
+        };
+        let len = bytes.len() as u32;
+        // Local file header (method 0 = stored, zeroed DOS timestamp).
+        push_u32(&mut out, 0x0403_4b50);
+        push_u16(&mut out, 20);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u16(&mut out, 0);
+        push_u32(&mut out, crc);
+        push_u32(&mut out, len);
+        push_u32(&mut out, len);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(bytes);
+        // Matching central-directory record.
+        push_u32(&mut central, 0x0201_4b50);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 20);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, crc);
+        push_u32(&mut central, len);
+        push_u32(&mut central, len);
+        push_u16(&mut central, name.len() as u16);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u16(&mut central, 0);
+        push_u32(&mut central, 0);
+        push_u32(&mut central, offset);
+        central.extend_from_slice(name.as_bytes());
+    }
+    let cd_offset = out.len() as u32;
+    let cd_size = central.len() as u32;
+    out.extend_from_slice(&central);
+    // End of central directory.
+    push_u32(&mut out, 0x0605_4b50);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, members.len() as u16);
+    push_u16(&mut out, members.len() as u16);
+    push_u32(&mut out, cd_size);
+    push_u32(&mut out, cd_offset);
+    push_u16(&mut out, 0);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(dest, &out).unwrap();
+    out
+}
+
+/// Write `content` at `rel/inner` under `cwd` (the dir-shaped artifact
+/// ecosystems: cargo / golang / composer / gem).
+fn write_dir_artifact(cwd: &Path, rel: &str, inner: &str, content: &[u8]) {
+    let file = cwd.join(rel).join(inner);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, content).unwrap();
+}
+
+/// A detached-style ledger entry (embedded record instead of a manifest
+/// one) for the matrix test. `sha256` is empty for dir-shaped artifacts,
+/// mirroring what each vendor backend records.
+fn detached_matrix_entry(
+    eco: &str,
+    purl: &str,
+    uuid: &str,
+    rel_path: &str,
+    sha256: String,
+    record: PatchRecord,
+) -> VendorEntry {
+    VendorEntry {
+        ecosystem: eco.to_string(),
+        base_purl: purl.to_string(),
+        uuid: uuid.to_string(),
+        artifact: VendorArtifact {
+            path: rel_path.to_string(),
+            sha256,
+            size: None,
+            platform_locked: None,
+        },
+        wiring: Vec::new(),
+        lock: None,
+        took_over_go_patches: false,
+        detached: true,
+        record: Some(record),
+        flavor: None,
+        uv: None,
+        pnpm: None,
+        poetry: None,
+        pdm: None,
+        pipenv: None,
+    }
+}
+
+/// One detached vendored patch per ecosystem with a vendor backend —
+/// including the registry-protocol newcomers nuget (flat-feed `.nupkg`) and
+/// maven (maven2-layout `.jar`) — laid down in each ecosystem's REAL
+/// artifact shape (dir / tarball / zip-family) with matching afterHashes,
+/// then ONE `vex` run must attest all of them `(vendored)` from the ledger
+/// alone: no manifest, no installed trees, no setup/manual declarations
+/// (the vendored property-7 exemption covers every row).
+#[test]
+fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // (eco, purl, uuid, ghsa, manifest file key, artifact leaf) — leaves
+    // follow the per-ecosystem conventions in `vendor::path`'s module table.
+    struct Case {
+        eco: &'static str,
+        purl: &'static str,
+        uuid: &'static str,
+        ghsa: &'static str,
+        file_key: &'static str,
+        leaf: &'static str,
+    }
+    let cases = [
+        Case {
+            eco: "npm",
+            purl: "pkg:npm/lodash@4.17.21",
+            uuid: "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a",
+            ghsa: "GHSA-mtrx-npm-0001",
+            file_key: "package/index.js",
+            leaf: "lodash-4.17.21.tgz",
+        },
+        Case {
+            eco: "cargo",
+            purl: "pkg:cargo/serde@1.0.190",
+            uuid: "1b1b1b1b-1111-4111-8111-1b1b1b1b1b1b",
+            ghsa: "GHSA-mtrx-cargo-0002",
+            file_key: "src/lib.rs",
+            leaf: "serde-1.0.190",
+        },
+        Case {
+            eco: "golang",
+            purl: "pkg:golang/github.com/foo/bar@v1.4.2",
+            uuid: "2c2c2c2c-1111-4111-8111-2c2c2c2c2c2c",
+            ghsa: "GHSA-mtrx-go-0003",
+            file_key: "bar.go",
+            leaf: "github.com/foo/bar@v1.4.2",
+        },
+        Case {
+            eco: "composer",
+            purl: "pkg:composer/monolog/monolog@2.9.1",
+            uuid: "3d3d3d3d-1111-4111-8111-3d3d3d3d3d3d",
+            ghsa: "GHSA-mtrx-php-0004",
+            file_key: "src/Logger.php",
+            leaf: "monolog/monolog@2.9.1",
+        },
+        Case {
+            eco: "gem",
+            purl: "pkg:gem/rack@3.2.6",
+            uuid: "4e4e4e4e-1111-4111-8111-4e4e4e4e4e4e",
+            ghsa: "GHSA-mtrx-gem-0005",
+            file_key: "lib/rack.rb",
+            leaf: "rack-3.2.6",
+        },
+        Case {
+            eco: "pypi",
+            purl: "pkg:pypi/six@1.16.0",
+            uuid: "5f5f5f5f-1111-4111-8111-5f5f5f5f5f5f",
+            ghsa: "GHSA-mtrx-py-0006",
+            file_key: "six.py",
+            leaf: "six-1.16.0-py2.py3-none-any.whl",
+        },
+        Case {
+            eco: "nuget",
+            purl: "pkg:nuget/newtonsoft.json@13.0.3",
+            uuid: "6a6a6a6a-1111-4111-8111-6a6a6a6a6a6a",
+            ghsa: "GHSA-mtrx-net-0007",
+            file_key: "lib/net6.0/Newtonsoft.Json.dll",
+            leaf: "newtonsoft.json.13.0.3.nupkg",
+        },
+        Case {
+            eco: "maven",
+            purl: "pkg:maven/com.example/app-lib@1.0.0",
+            uuid: "7b7b7b7b-1111-4111-8111-7b7b7b7b7b7b",
+            ghsa: "GHSA-mtrx-jvm-0008",
+            file_key: "com/example/Patched.class",
+            leaf: "com/example/app-lib/1.0.0/app-lib-1.0.0.jar",
+        },
+    ];
+
+    let mut state = VendorState::new();
+    for case in &cases {
+        // Distinct patched bytes per ecosystem so a cross-wired artifact
+        // (wrong entry pointing at another eco's file) cannot pass by hash
+        // coincidence.
+        let patched = format!("patched {} bytes\n", case.eco).into_bytes();
+        let rel = format!(".socket/vendor/{}/{}/{}", case.eco, case.uuid, case.leaf);
+        // Materialize the real artifact shape the eco's vendor backend
+        // commits: npm → .tgz, pypi/nuget/maven → zip-family single file,
+        // everything else → the copy dir.
+        let sha256 = match case.eco {
+            "npm" => sha256_hex(&write_member_tgz(&cwd.join(&rel), case.file_key, &patched)),
+            "pypi" | "nuget" | "maven" => sha256_hex(&write_stored_zip(
+                &cwd.join(&rel),
+                &[(case.file_key, &patched)],
+            )),
+            _ => {
+                write_dir_artifact(cwd, &rel, case.file_key, &patched);
+                String::new() // dir-shaped: integrity is per-file afterHashes
+            }
+        };
+        let record = make_record(
+            case.uuid,
+            case.file_key,
+            &compute_git_sha256_from_bytes(&patched),
+            case.ghsa,
+            &["CVE-2026-1000"],
+        );
+        state.entries.insert(
+            case.purl.to_string(),
+            detached_matrix_entry(case.eco, case.purl, case.uuid, &rel, sha256, record),
+        );
+    }
+    let dir = cwd.join(".socket/vendor");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "fixture sanity: the matrix is ledger-only (no manifest)"
+    );
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:github/acme/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "every vendored ecosystem must attest. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        cases.len(),
+        "one statement per vendored ecosystem: {doc}"
+    );
+    for case in &cases {
+        let stmt = stmts
+            .iter()
+            .find(|s| s["vulnerability"]["name"] == case.ghsa)
+            .unwrap_or_else(|| panic!("{} ({}) missing from the doc: {doc}", case.ghsa, case.eco));
+        assert_eq!(stmt["status"], "not_affected", "{}: {stmt}", case.eco);
+        let subs = stmt["products"][0]["subcomponents"].as_array().unwrap();
+        assert_eq!(subs[0]["@id"], case.purl, "{}: {stmt}", case.eco);
+        assert_eq!(
+            stmt["impact_statement"].as_str().unwrap(),
+            format!("Patched via Socket patch {} (vendored)", case.uuid),
+            "{}: the matrix attestation must carry the (vendored) marker",
+            case.eco
+        );
+    }
 }

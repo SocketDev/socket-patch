@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::types::*;
 use crate::constants::{
@@ -74,6 +74,46 @@ struct BatchSearchBody {
 #[derive(Serialize)]
 struct BatchComponent {
     purl: String,
+}
+
+/// Body for the patch-package reference POST endpoint (`scan --redirect`).
+#[derive(Serialize)]
+struct RegistryReferenceBody {
+    uuids: Vec<String>,
+}
+
+/// One downloadable artifact from the reference endpoint.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceArtifact {
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub integrity: crate::patch::redirect::Integrity,
+}
+
+/// One patch's resolved hosted-patch reference — mirrors the api-v0
+/// `POST /v0/orgs/{org}/patches/package` (and proxy `/patch/package`) result:
+/// the grant-tokenized artifact URL(s) + integrity + per-ecosystem registry
+/// override that `scan --redirect` turns into a `DepOverride`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryReference {
+    pub status: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub purl: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<ReferenceArtifact>,
+    #[serde(default)]
+    pub registry_override: Option<crate::patch::redirect::RegistryOverride>,
+}
+
+#[derive(Deserialize)]
+struct RegistryReferenceResponse {
+    results: std::collections::HashMap<String, RegistryReference>,
 }
 
 impl ApiClient {
@@ -308,6 +348,33 @@ impl ApiClient {
                     .await
             }
         }
+    }
+
+    /// Resolve hosted-patch references for a set of published-patch UUIDs
+    /// (`scan --redirect`). Uses the authenticated
+    /// `POST /v0/orgs/{org}/patches/package` when a token+org are set, else the
+    /// public proxy `POST /patch/package` (free patches only). Returns a
+    /// UUID → reference map (missing/404 → empty).
+    pub async fn fetch_registry_references(
+        &self,
+        uuids: &[String],
+    ) -> Result<std::collections::HashMap<String, RegistryReference>, ApiError> {
+        if uuids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let path = if self.use_public_proxy {
+            "/patch/package".to_string()
+        } else {
+            let slug = self.org_slug.as_deref().unwrap_or("default");
+            format!("/v0/orgs/{}/patches/package", slug)
+        };
+        let body = RegistryReferenceBody {
+            uuids: uuids.to_vec(),
+        };
+        let resp = self
+            .post_json::<RegistryReferenceResponse, _>(&path, &body)
+            .await?;
+        Ok(resp.map(|r| r.results).unwrap_or_default())
     }
 
     /// Internal: POST the batch search to the public proxy's
@@ -660,7 +727,10 @@ impl ApiClient {
         }
 
         // ── Step 1: resolve the grant URL + integrity ──────────────────────
-        let result = match self.request_vendor_package(uuid, free_only, vendor_url).await {
+        let result = match self
+            .request_vendor_package(uuid, free_only, vendor_url)
+            .await
+        {
             Ok(r) => r,
             Err(e) => return VendorServiceOutcome::Failed(e),
         };
@@ -676,9 +746,7 @@ impl ApiClient {
                     "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
                 ))
             }
-            other => {
-                return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`"))
-            }
+            other => return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`")),
         }
 
         // Select the native tarball artifact and its sha512 (the universal
@@ -719,8 +787,7 @@ impl ApiClient {
                 if a.kind == "tarball" {
                     continue;
                 }
-                let (Some(url), Some(sha512)) =
-                    (a.url.as_deref(), a.integrity.sha512.as_deref())
+                let (Some(url), Some(sha512)) = (a.url.as_deref(), a.integrity.sha512.as_deref())
                 else {
                     continue;
                 };
@@ -809,9 +876,10 @@ impl ApiClient {
         let resp = resp.map_err(|e| ApiError::Network(format!("Network error: {e}")))?;
         let status = resp.status();
         if status == StatusCode::OK {
-            let parsed = resp.json::<PackageVendorResponse>().await.map_err(|e| {
-                ApiError::Parse(format!("Failed to parse package response: {e}"))
-            })?;
+            let parsed = resp
+                .json::<PackageVendorResponse>()
+                .await
+                .map_err(|e| ApiError::Parse(format!("Failed to parse package response: {e}")))?;
             return parsed.results.get(uuid).cloned().ok_or_else(|| {
                 ApiError::Other(format!("package response missing a result for {uuid}"))
             });
@@ -882,9 +950,7 @@ impl ApiClient {
     pub async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
         match self.download_vendor_archive(url).await {
             ServeDownload::Ok(bytes) => Ok(bytes),
-            ServeDownload::NotFound => {
-                Err(ApiError::Other(format!("artifact not found: {url}")))
-            }
+            ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
             ServeDownload::Pending => {
                 Err(ApiError::Other(format!("artifact still building: {url}")))
             }
@@ -2479,7 +2545,10 @@ mod vendor_package_tests {
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
             .and(body_partial_json(json!({ "uuids": [UUID] })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ABC123==")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(granted_body(&serve_url, "sha512-ABC123==")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2512,8 +2581,12 @@ mod vendor_package_tests {
         Mock::given(method("POST"))
             .and(path("/patch/package"))
             .and(NoAuthorizationHeader)
-            .and(body_partial_json(json!({ "uuids": [UUID], "freeOnly": true })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")))
+            .and(body_partial_json(
+                json!({ "uuids": [UUID], "freeOnly": true }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-ZZ==")),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2537,7 +2610,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "BAREB64==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "BAREB64==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2563,7 +2638,9 @@ mod vendor_package_tests {
         let baked = format!("https://patch.socket.dev{SERVE_PATH}");
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&baked, "sha512-AA==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2603,7 +2680,9 @@ mod vendor_package_tests {
         let serve_url = format!("{}{SERVE_PATH}", server.uri());
         Mock::given(method("POST"))
             .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2654,7 +2733,8 @@ mod vendor_package_tests {
             Mock::given(method("POST"))
                 .and(path("/v0/orgs/acme/patches/package"))
                 .respond_with(
-                    ResponseTemplate::new(200).set_body_json(granted_body(&serve_url, "sha512-AA==")),
+                    ResponseTemplate::new(200)
+                        .set_body_json(granted_body(&serve_url, "sha512-AA==")),
                 )
                 .mount(&server)
                 .await;

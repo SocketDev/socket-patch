@@ -26,6 +26,8 @@
 //! | composer | `<vendor>/<name>@<version>/`           |
 //! | gem      | `<name>-<version>/`                    |
 //! | pypi     | `<dist>-<version>-<tags>.whl` (PEP 427)|
+//! | nuget    | `<idLower>.<versionNorm>.nupkg`        |
+//! | maven    | `<g-as-path>/<a>/<v>/<a>-<v>.jar`      |
 
 use std::path::{Path, PathBuf};
 
@@ -39,10 +41,12 @@ pub const VENDOR_DIR: &str = ".socket/vendor";
 /// `<eco>` capture of the recovery convention and are independent of which
 /// features this binary was compiled with (an orphan sweep must still
 /// recognise — and report, not delete — a dir for a compiled-out ecosystem).
-pub const ECOSYSTEM_DIRS: &[&str] = &["npm", "cargo", "golang", "composer", "gem", "pypi"];
+pub const ECOSYSTEM_DIRS: &[&str] = &[
+    "npm", "cargo", "golang", "composer", "gem", "pypi", "nuget", "maven",
+];
 
 /// The vendor ecosystem-dir name for a PURL, or `None` when the ecosystem has
-/// no vendor backend (maven/nuget/jsr) or is compiled out of this binary.
+/// no vendor backend (jsr) or is compiled out of this binary.
 pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
     if purl.starts_with("pkg:npm/") {
         return Some("npm");
@@ -64,6 +68,14 @@ pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
     #[cfg(feature = "composer")]
     if purl.starts_with("pkg:composer/") {
         return Some("composer");
+    }
+    #[cfg(feature = "nuget")]
+    if purl.starts_with("pkg:nuget/") {
+        return Some("nuget");
+    }
+    #[cfg(feature = "maven")]
+    if purl.starts_with("pkg:maven/") {
+        return Some("maven");
     }
     None
 }
@@ -160,6 +172,28 @@ fn split_at_version(leaf: &str) -> Option<(&str, &str)> {
     Some((head, version))
 }
 
+/// Split a NuGet `<idLower>.<version>` leaf (already `.nupkg`-stripped) at the
+/// version boundary: the version is the maximal trailing dotted run starting at
+/// the FIRST `.`-delimited segment that begins with a digit (NuGet ids never
+/// start a segment with a digit, versions always do — `Newtonsoft.Json.13.0.3`
+/// → `("Newtonsoft.Json", "13.0.3")`, prerelease tails ride along). Heuristic
+/// only; state.json is the ledger of record.
+fn split_nuget_leaf(stem: &str) -> Option<(&str, &str)> {
+    let mut split = None;
+    for (i, _) in stem.match_indices('.') {
+        if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
+            split = Some(i);
+            break;
+        }
+    }
+    let i = split?;
+    let (name, version) = (&stem[..i], &stem[i + 1..]);
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name, version))
+}
+
 /// Reconstruct the base PURL from a vendored leaf. This is the orphan-sweep
 /// FALLBACK identification (state.json is the ledger of record); `None` means
 /// "unrecognisable — report, never delete by guess".
@@ -206,6 +240,43 @@ pub fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
                 return None;
             }
             Some(format!("pkg:pypi/{dist}@{version}"))
+        }
+        "nuget" => {
+            let stem = leaf.strip_suffix(".nupkg")?;
+            let (name, version) = split_nuget_leaf(stem)?;
+            if !is_safe_single_segment(version) {
+                return None;
+            }
+            Some(format!("pkg:nuget/{name}@{version}"))
+        }
+        "maven" => {
+            // maven2 layout: `<g1>/…/<gN>/<artifactId>/<version>/<a>-<v>.jar`.
+            // The last three components are `<artifactId>/<version>/<file>`;
+            // everything before them is the dotted groupId. The filename must
+            // spell out `<artifactId>-<version>.jar` (a consistency check).
+            let stem = leaf.strip_suffix(".jar")?;
+            let parts: Vec<&str> = stem.split('/').collect();
+            // group (≥1) + artifact + version + filename-stem = ≥4 segments.
+            if parts.len() < 4 {
+                return None;
+            }
+            let file_stem = parts[parts.len() - 1];
+            let version = parts[parts.len() - 2];
+            let artifact = parts[parts.len() - 3];
+            let group = parts[..parts.len() - 3].join(".");
+            if group.is_empty() || artifact.is_empty() || version.is_empty() {
+                return None;
+            }
+            if file_stem != format!("{artifact}-{version}") {
+                return None;
+            }
+            if !is_safe_multi_segment(&group.replace('.', "/"))
+                || !is_safe_single_segment(artifact)
+                || !is_safe_single_segment(version)
+            {
+                return None;
+            }
+            Some(format!("pkg:maven/{group}/{artifact}@{version}"))
         }
         _ => None,
     }
@@ -299,7 +370,7 @@ mod tests {
         assert!(vendor_uuid_dir_rel("npm", "../../escape").is_none());
         assert!(vendor_uuid_dir_rel("npm", "9F6B2C4E-1D3A-4F6B-8C2D-7E5A9B1C3D5F").is_none());
         assert!(
-            vendor_uuid_dir_rel("maven", UUID).is_none(),
+            vendor_uuid_dir_rel("jsr", UUID).is_none(),
             "unknown eco dir"
         );
     }
@@ -329,6 +400,25 @@ mod tests {
         .unwrap();
         assert_eq!(p.leaf, "monolog/monolog@2.9.1");
 
+        // nuget flat-folder feed .nupkg
+        let p = parse_vendor_path(&format!(
+            ".socket/vendor/nuget/{UUID}/newtonsoft.json.13.0.3.nupkg"
+        ))
+        .unwrap();
+        assert_eq!(p.eco, "nuget");
+        assert_eq!(p.leaf, "newtonsoft.json.13.0.3.nupkg");
+
+        // maven2 nested repo path (group as dirs → artifact → version → jar)
+        let p = parse_vendor_path(&format!(
+            ".socket/vendor/maven/{UUID}/org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.jar"
+        ))
+        .unwrap();
+        assert_eq!(p.eco, "maven");
+        assert_eq!(
+            p.leaf,
+            "org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.jar"
+        );
+
         // cargo config path, backslashes (Windows spelling)
         let p =
             parse_vendor_path(&format!(".socket\\vendor\\cargo\\{UUID}\\serde-1.0.190")).unwrap();
@@ -345,7 +435,7 @@ mod tests {
 
         // Rejections: bad uuid, unknown eco, non-boundary anchor.
         assert!(parse_vendor_path(".socket/vendor/npm/not-a-uuid/x.tgz").is_none());
-        assert!(parse_vendor_path(&format!(".socket/vendor/maven/{UUID}/x")).is_none());
+        assert!(parse_vendor_path(&format!(".socket/vendor/jsr/{UUID}/x")).is_none());
         assert!(parse_vendor_path(&format!("x.socket/vendor/npm/{UUID}/y.tgz")).is_none());
     }
 
@@ -392,6 +482,44 @@ mod tests {
             leaf_to_purl("pypi", "six-1.16.0-py2.py3-none-any.whl").as_deref(),
             Some("pkg:pypi/six@1.16.0")
         );
+        // nuget nupkg: split at the first digit-leading dotted segment, so a
+        // dotted id (Newtonsoft.Json) keeps its dots and the version rides the
+        // trailing run.
+        assert_eq!(
+            leaf_to_purl("nuget", "newtonsoft.json.13.0.3.nupkg").as_deref(),
+            Some("pkg:nuget/newtonsoft.json@13.0.3")
+        );
+        assert_eq!(
+            leaf_to_purl("nuget", "contoso.widgets.2.0.0-rc1.nupkg").as_deref(),
+            Some("pkg:nuget/contoso.widgets@2.0.0-rc1")
+        );
+        assert!(
+            leaf_to_purl("nuget", "no-version-here.nupkg").is_none(),
+            ".nupkg with no version-leading segment is unparseable"
+        );
+        // maven2 nested jar: dotted group recovered from the path dirs, the
+        // version from the second-to-last component, cross-checked against the
+        // filename stem.
+        assert_eq!(
+            leaf_to_purl(
+                "maven",
+                "org/apache/commons/commons-text/1.10.0/commons-text-1.10.0.jar"
+            )
+            .as_deref(),
+            Some("pkg:maven/org.apache.commons/commons-text@1.10.0")
+        );
+        // A single-segment group still round-trips.
+        assert_eq!(
+            leaf_to_purl("maven", "single/app/1.0.0/app-1.0.0.jar").as_deref(),
+            Some("pkg:maven/single/app@1.0.0")
+        );
+        // A filename that does not spell <artifact>-<version>.jar is rejected.
+        assert!(
+            leaf_to_purl("maven", "org/apache/commons-text/1.10.0/wrong-1.10.0.jar").is_none(),
+            "filename stem must match <artifact>-<version>"
+        );
+        // Too few path segments (no group) is unparseable.
+        assert!(leaf_to_purl("maven", "app/1.0.0/app-1.0.0.jar").is_none());
         // Unparseable leaves are None, not garbage.
         assert!(leaf_to_purl("npm", "noversion.tgz").is_none());
         assert!(leaf_to_purl("golang", "no-version-here").is_none());

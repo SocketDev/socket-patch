@@ -82,11 +82,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--vendor-url", Some("https://vendor.example.com"), |c| {
             assert_eq!(c.vendor_url.as_deref(), Some("https://vendor.example.com"))
         }),
-        (
-            "--patch-server-url",
-            Some("http://localhost:4026"),
-            |c| assert_eq!(c.patch_server_url.as_deref(), Some("http://localhost:4026")),
-        ),
+        ("--patch-server-url", Some("http://localhost:4026"), |c| {
+            assert_eq!(c.patch_server_url.as_deref(), Some("http://localhost:4026"))
+        }),
         ("--offline", None, |c| assert!(c.offline)),
         ("--global", None, |c| assert!(c.global)),
         ("--global-prefix", Some("/opt/global"), |c| {

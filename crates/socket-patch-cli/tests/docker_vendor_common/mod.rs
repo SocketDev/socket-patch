@@ -144,17 +144,25 @@ git_blob_sha() {
 }
 
 /// Bash snippet defining `stage_patch <purl> <uuid> <file_key> <before_file>
-/// <after_file>`: writes `.socket/manifest.json` + the after-hash blob into
-/// `.socket/blobs/` (relative to the CURRENT directory — call from the
-/// project root) so `socket-patch vendor --offline` runs with zero network.
-/// Shape mirrors `e2e_vendor_npm_build.rs::stage_patch`. Requires
-/// [`bash_prelude`] (uses `git_blob_sha`).
+/// <after_file> [<ghsa> <cve>]`: writes `.socket/manifest.json` + the
+/// after-hash blob into `.socket/blobs/` (relative to the CURRENT directory —
+/// call from the project root) so `socket-patch vendor --offline` runs with
+/// zero network. The optional trailing `<ghsa> <cve>` pair records one
+/// high-severity vulnerability so a generated VEX document has a statement
+/// to emit; omitted, `vulnerabilities` stays empty. Shape mirrors
+/// `e2e_vendor_npm_build.rs::stage_patch` / `stage_patch_with_vuln`.
+/// Requires [`bash_prelude`] (uses `git_blob_sha`).
 pub fn stage_patch_fn() -> &'static str {
     r#"stage_patch() {
   local purl="$1" uuid="$2" file_key="$3" before_file="$4" after_file="$5"
-  local before_hash after_hash
+  local ghsa="${6:-}" cve="${7:-}"
+  local before_hash after_hash vulns
   before_hash=$(git_blob_sha "$before_file") || fail "hashing $before_file"
   after_hash=$(git_blob_sha "$after_file") || fail "hashing $after_file"
+  vulns="{}"
+  if [ -n "$ghsa" ]; then
+    vulns="{\"$ghsa\": {\"cves\": [\"$cve\"], \"summary\": \"capstone vex vuln\", \"severity\": \"high\", \"description\": \"d\"}}"
+  fi
   mkdir -p .socket/blobs || fail "mkdir .socket/blobs"
   cp "$after_file" ".socket/blobs/$after_hash" || fail "staging blob"
   cat > .socket/manifest.json <<MANIFEST_EOF
@@ -169,7 +177,7 @@ pub fn stage_patch_fn() -> &'static str {
           "afterHash": "$after_hash"
         }
       },
-      "vulnerabilities": {},
+      "vulnerabilities": $vulns,
       "description": "docker vendor capstone marker patch",
       "license": "MIT",
       "tier": "free"

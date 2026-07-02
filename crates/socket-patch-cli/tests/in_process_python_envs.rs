@@ -119,6 +119,8 @@ fn default_args(cwd: &Path, api_url: String) -> ScanArgs {
         sync: false,
         vendor: false,
         detached: false,
+        redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     }

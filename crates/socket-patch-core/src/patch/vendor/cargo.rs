@@ -182,7 +182,10 @@ async fn cargo_service_copy(
         if cfg.source.requires_service() {
             hard("vendor_prebuilt_required", reason)
         } else {
-            warnings.push(VendorWarning::new(code, format!("{reason}; building locally instead")));
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
             CargoServiceCopy::FallBack
         }
     };
@@ -207,7 +210,10 @@ async fn cargo_service_copy(
             let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
-                format!("vendored {name} from the patch service ({})", archive.source_url),
+                format!(
+                    "vendored {name} from the patch service ({})",
+                    archive.source_url
+                ),
             ));
             CargoServiceCopy::Used
         }
@@ -468,18 +474,30 @@ pub async fn vendor_cargo_crate(
             };
         }
     }
-    let mut result = match cargo_service_copy(service, record, name, &copy_dir, &uuid_dir, &mut warnings)
-        .await
+    let mut result = match cargo_service_copy(
+        service,
+        record,
+        name,
+        &copy_dir,
+        &uuid_dir,
+        &mut warnings,
+    )
+    .await
     {
         CargoServiceCopy::Used => {
             // The service crate is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
-            let verified = record.files.keys().map(|f| already_patched_verify(f)).collect();
+            let verified = record
+                .files
+                .keys()
+                .map(|f| already_patched_verify(f))
+                .collect();
             synthesized_result(purl, &copy_dir, verified, true, None)
         }
         CargoServiceCopy::HardFail(outcome) => return *outcome,
         CargoServiceCopy::FallBack => {
-            if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
+            if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await
+            {
                 // Clear the whole uuid dir, not just the copy: a partial copy
                 // (or an empty `<uuid>/` husk) under .socket/vendor/ would be
                 // misjudged by verify/sweep.
@@ -1528,8 +1546,7 @@ mod tests {
                 .unwrap();
         }
         let tar_bytes = builder.into_inner().unwrap();
-        let mut enc =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&tar_bytes).unwrap();
         enc.finish().unwrap()
     }
@@ -1572,7 +1589,9 @@ mod tests {
     }
 
     fn copy_lib(root: &Path) -> PathBuf {
-        root.join(format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"))
+        root.join(format!(
+            ".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"
+        ))
     }
 
     /// Service success: the prebuilt crate is extracted into the copy dir (with
@@ -1587,7 +1606,10 @@ mod tests {
             "cfg-if-1.0.4",
             &[
                 ("src/lib.rs", PATCHED),
-                ("Cargo.toml", b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n"),
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+                ),
                 (".cargo-checksum.json", b"{\"files\":{}}"),
             ],
         );
@@ -1607,7 +1629,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Service, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
         let (result, entry, warnings) = expect_done(outcome);
@@ -1616,15 +1642,22 @@ mod tests {
         assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
         assert!(
             !root
-                .join(format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/.cargo-checksum.json"))
+                .join(format!(
+                    ".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/.cargo-checksum.json"
+                ))
                 .exists(),
             "path-dep copy must not carry a checksum sidecar"
         );
         let cfg = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
             .await
             .unwrap();
-        assert!(cfg.contains("[patch.crates-io]") && cfg.contains("cfg-if"), "{cfg}");
-        assert!(warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"));
+        assert!(
+            cfg.contains("[patch.crates-io]") && cfg.contains("cfg-if"),
+            "{cfg}"
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.code == "vendor_prebuilt_downloaded"));
     }
 
     /// `service` mode + integrity mismatch hard-fails, nothing extracted.
@@ -1647,7 +1680,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg(&server.uri(), VendorSource::Service, false)),
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
         )
         .await;
         expect_refused(outcome, "vendor_prebuilt_required");
@@ -1677,7 +1714,11 @@ mod tests {
         )
         .await;
         let (result, entry, _) = expect_done(outcome);
-        assert!(result.success, "auto must fall back to the local build: {:?}", result.error);
+        assert!(
+            result.success,
+            "auto must fall back to the local build: {:?}",
+            result.error
+        );
         assert!(entry.is_some());
         // The locally-built copy has the patched content.
         assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
@@ -1698,7 +1739,11 @@ mod tests {
             "2026-06-09T00:00:00Z",
             false,
             false,
-            Some(&cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, true)),
+            Some(&cargo_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");

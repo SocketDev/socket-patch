@@ -192,6 +192,15 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
             json: true,
             silent: true,
             offline: true,
+            // flock guards are OFD-based: when a CONCURRENT test in this
+            // binary forks a subprocess, the pre-exec child briefly holds
+            // copies of every parent fd — including this test's just-dropped
+            // lock fd — so back-to-back in-process runs can see their own
+            // lock as "held" for the fork→exec window (observed as rare
+            // release-only `lock_held` CI failures in the revert tests). A
+            // short wait absorbs the window via the acquire loop's 100 ms
+            // retry; a real deadlock still fails after the budget.
+            lock_timeout: Some(5),
             ..GlobalArgs::default()
         },
         force: false,
@@ -475,18 +484,21 @@ async fn revert_works_without_manifest() {
 
 /// Contract behavior (CLI_CONTRACT.md "Vendor command contract"): a PURL of an
 /// ecosystem `vendor` cannot vendor is a benign skip — it never fails the run,
-/// and the supported npm patch still vendors. How the `pkg:nuget/...` entry
-/// surfaces depends on whether this build compiled the `nuget` ecosystem in:
+/// and the supported npm patch still vendors. The exemplar is `pkg:jsr/...`
+/// (Deno's JSR registry) — the one compiled-in ecosystem with no vendor
+/// backend now that nuget and maven vendor (`vendor/path.rs` pins jsr as
+/// having no vendor dir by design). How the entry surfaces depends on whether
+/// this build compiled the `deno` ecosystem in:
 ///   * compiled out (default features): the purl is unknown, dropped by
 ///     `partition_purls` before vendor's is_vendorable partition → no event.
 ///   * compiled in (`--all-features`, as CI runs): the purl is recognized but
 ///     not vendorable → a `skipped` event carrying `vendor_unsupported_ecosystem`.
 ///
-/// Either way the nuget purl is never `applied`, the npm patch vendors, and the
+/// Either way the jsr purl is never `applied`, the npm patch vendors, and the
 /// run exits 0.
 #[tokio::test]
 async fn unsupported_ecosystem_purl_is_a_benign_skip() {
-    let fx = npm_fixture_with_purls(&[PURL, "pkg:nuget/Foo.Bar@1.0.0"]);
+    let fx = npm_fixture_with_purls(&[PURL, "pkg:jsr/@std/path@1.0.0"]);
     let (code, env) = vendor_cli(fx.root(), &[]);
     assert_eq!(code, 0, "benign skip must not fail the run: {env:#}");
     assert_eq!(env["status"], "success");
@@ -494,29 +506,24 @@ async fn unsupported_ecosystem_purl_is_a_benign_skip() {
     assert_eq!(applied["purl"], PURL);
     assert_eq!(env["summary"]["applied"], 1);
 
-    let nuget_event = events(&env)
+    let jsr_event = events(&env)
         .iter()
-        .find(|e| e["purl"].as_str().is_some_and(|p| p.contains("nuget")))
+        .find(|e| e["purl"].as_str().is_some_and(|p| p.contains("jsr")))
         .cloned();
-    // The nuget purl is never vendored, on any feature set.
+    // The jsr purl is never vendored, on any feature set.
     assert!(
-        nuget_event
-            .as_ref()
-            .is_none_or(|e| e["action"] != "applied"),
-        "nuget purl must never be applied: {env:#}"
+        jsr_event.as_ref().is_none_or(|e| e["action"] != "applied"),
+        "jsr purl must never be applied: {env:#}"
     );
 
-    if cfg!(feature = "nuget") {
+    if cfg!(feature = "deno") {
         // Recognized but not vendorable ⇒ an explicit, informative skip.
-        let ev = nuget_event.expect("nuget compiled in ⇒ explicit skip event");
+        let ev = jsr_event.expect("deno compiled in ⇒ explicit skip event");
         assert_eq!(ev["action"], "skipped", "{env:#}");
         assert_eq!(ev["errorCode"], "vendor_unsupported_ecosystem", "{env:#}");
     } else {
         // Compiled out ⇒ the unknown purl is dropped before vendor sees it.
-        assert!(
-            nuget_event.is_none(),
-            "nuget compiled out ⇒ no event: {env:#}"
-        );
+        assert!(jsr_event.is_none(), "deno compiled out ⇒ no event: {env:#}");
     }
 
     assert!(fx.tgz_path().is_file(), "the npm patch still vendors");

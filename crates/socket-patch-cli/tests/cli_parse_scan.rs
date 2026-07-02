@@ -11,7 +11,7 @@
 //!   default and is a silent-regression risk if flipped.
 
 use clap::Parser;
-use socket_patch_cli::commands::scan::ScanArgs;
+use socket_patch_cli::commands::scan::{resolve_mode_flags, ScanArgs, ScanMode};
 use socket_patch_cli::{Cli, Commands};
 
 /// Every `ScanArgs`/`GlobalArgs`/`VexEmbedArgs` field that has an `env =
@@ -132,6 +132,7 @@ fn defaults_match_contract() {
     assert!(!args.sync, "--sync default is false");
     assert!(!args.vendor, "--vendor default is false");
     assert!(!args.detached, "--detached default is false");
+    assert_eq!(args.mode, None, "--mode default is None (no mode selector)");
     assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
         !args.all_releases,
@@ -555,4 +556,139 @@ fn scan_json_empty_cwd_emits_updates_key() {
         v.get("apply").is_none(),
         "no `apply` sub-object may appear when --apply was not passed"
     );
+}
+
+// --- `--mode` selector (documented spelling of the mode booleans) ----------
+//
+// `--mode <hosted|vendored|agent>` is the RELEASED spelling of the three
+// mode flags. The clap parser only fills `args.mode`; `resolve_mode_flags`
+// (run at the top of `scan::run`, exercised directly here) folds it into the
+// legacy `--redirect`/`--vendor`/`--apply` booleans and enforces the
+// cross-mode rules clap can't express (a value-dependent conflict). These
+// tests lock both the fold and the legacy aliases.
+
+/// Parse `extra` (must parse cleanly at the clap level), then run the mode
+/// fold — mirroring exactly what `scan::run` does before it reads any mode
+/// boolean.
+fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
+    let mut args = parse_scan(extra);
+    resolve_mode_flags(&mut args)?;
+    Ok(args)
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_hosted_folds_to_redirect() {
+    // The parser records the enum verbatim...
+    assert_eq!(
+        parse_scan(&["--mode", "hosted"]).mode,
+        Some(ScanMode::Hosted)
+    );
+    // ...and the fold turns it into the redirect boolean, exclusively.
+    let folded = parse_and_resolve(&["--mode", "hosted"]).expect("fold ok");
+    assert!(folded.redirect, "--mode hosted sets --redirect");
+    assert!(!folded.vendor);
+    assert!(!folded.apply);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_vendored_folds_to_vendor() {
+    let folded = parse_and_resolve(&["--mode", "vendored"]).expect("fold ok");
+    assert!(folded.vendor, "--mode vendored sets --vendor");
+    assert!(!folded.redirect);
+    assert!(!folded.apply);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_agent_folds_to_apply() {
+    let folded = parse_and_resolve(&["--mode", "agent"]).expect("fold ok");
+    assert!(folded.apply, "--mode agent sets --apply");
+    assert!(!folded.redirect);
+    assert!(!folded.vendor);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_rejects_unknown_value() {
+    // The value_enum restricts `--mode` to the three known names.
+    let err = match try_parse_scan(&["--mode", "bogus"]) {
+        Ok(_) => panic!("unknown --mode value should fail to parse"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation | clap::error::ErrorKind::InvalidValue
+        ),
+        "expected ValueValidation or InvalidValue, got {:?}",
+        err.kind()
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_hosted_with_vendor_boolean_errors() {
+    // Clap ACCEPTS the combination (no value-dependent conflict is
+    // expressible), so the parse succeeds; the fold is what rejects a
+    // boolean belonging to a different mode.
+    let mut args = parse_scan(&["--mode", "hosted", "--vendor"]);
+    assert!(
+        resolve_mode_flags(&mut args).is_err(),
+        "--mode hosted + --vendor is a cross-mode contradiction"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_agent_with_apply_boolean_is_allowed() {
+    // Same mode spelled both ways is redundant but legal.
+    let folded = parse_and_resolve(&["--mode", "agent", "--apply"]).expect("same-mode ok");
+    assert!(folded.apply);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_agent_with_sync_boolean_is_allowed() {
+    // --sync implies --apply, so it counts as an agent-mode spelling.
+    let folded = parse_and_resolve(&["--mode", "agent", "--sync"]).expect("same-mode ok");
+    assert!(folded.apply);
+    assert!(folded.sync);
+}
+
+#[test]
+#[serial_test::serial]
+fn mode_vendored_with_detached_ok() {
+    // --detached is legal under vendored mode selected via --mode.
+    let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
+    assert!(folded.vendor);
+    assert!(folded.detached);
+}
+
+#[test]
+#[serial_test::serial]
+fn detached_without_vendored_mode_errors() {
+    // --detached now requires vendored mode via resolve_mode_flags (the
+    // former clap `requires = "vendor"` could not see `--mode vendored`, so
+    // the requirement moved into the fold). Parsing alone succeeds.
+    let mut args = parse_scan(&["--detached"]);
+    assert!(
+        resolve_mode_flags(&mut args).is_err(),
+        "--detached without vendored mode must error"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn legacy_mode_spellings_still_parse() {
+    // The boolean aliases keep working with no `--mode` given; the fold is
+    // then a no-op and leaves the booleans exactly as parsed.
+    assert!(parse_scan(&["--redirect"]).redirect);
+    assert!(parse_scan(&["--vendor"]).vendor);
+    assert!(parse_scan(&["--apply"]).apply);
+    let folded = parse_and_resolve(&["--vendor", "--detached"]).expect("legacy fold ok");
+    assert!(folded.vendor);
+    assert!(folded.detached);
+    assert_eq!(folded.mode, None, "no --mode ⇒ selector stays None");
 }

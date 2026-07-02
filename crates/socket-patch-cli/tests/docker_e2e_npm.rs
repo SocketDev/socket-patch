@@ -37,6 +37,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
+/// The vulnerability the staged manifest carries, so the agent-mode VEX leg
+/// has something to attest. Plain agent provenance (no vendored/redirected
+/// marker) is what the host oracle asserts.
+const GHSA: &str = "GHSA-agent-npm-real";
 
 /// Marker we splice into the patched bytes so the test can assert
 /// post-apply that the file has been overwritten.
@@ -170,7 +174,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2021-44906"],
+                    "summary": "Synthetic prototype pollution (agent e2e fixture)",
+                    "severity": "high",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "E2E test fixture",
             "license": "MIT",
             "tier": "free",
@@ -212,6 +224,16 @@ COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
 mkdir -p /workspace/proj && cd /workspace/proj
 echo '{{ "name": "e2e-proj", "version": "0.0.0" }}' > package.json
 npm install --silent --no-audit --no-fund minimist@1.2.2
+
+# Pre-seed setup.manual so the agent-mode VEX leg (step 5b) keeps the npm
+# patch through property 7: this project isn't `socket-patch setup`-configured,
+# and an agent patch is applied by hand/CI — exactly what `manual` declares.
+# scan --sync merges the downloaded patch into this manifest and preserves the
+# setup block, so the manifest the VEX leg reads carries both.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+MANIFEST
 
 # 2. scan --json: must discover the patch via the real batch API. A
 #    clean exit alone proves nothing (a no-op scan also exits 0), so we
@@ -286,6 +308,29 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' node_modules/minimist/index.js; then
   exit 1
 fi
 echo "===PATCH VERIFIED===" >&2
+
+# 5b. Agent-mode VEX leg. The manifest scan --sync wrote now carries
+#     {GHSA} (served in the patch view); vex verifies the patched file
+#     still on disk (this runs BEFORE rollback) and attests it. --offline keeps
+#     vex fully local (no telemetry/API). The doc is emitted between markers so
+#     the host oracle can parse it (no bind mount in these agent suites).
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:npm/e2e-app@1.0.0' --ecosystems npm >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
 
 # 6. rollback. The fixture's manifest records a placeholder all-zero
 #    beforeHash and serves no matching before-blob, so an --offline
@@ -621,6 +666,14 @@ async fn npm_install_scan_apply_rollback_cycle() {
         "PASS marker missing from stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the installed tree.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
+
     // Keep the workspace_root reference alive — used by host mode to
     // resolve the in-tree binary. Without this clippy warns unused.
     let _ = workspace_root();
@@ -658,6 +711,50 @@ async fn npm_global_install_full_apply_chain() {
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
     assert_real_api_pipeline_ran(&server).await;
+}
+
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers. These agent suites run
+/// the workspace inside the container with no bind mount (unlike the vendor
+/// capstones), so the doc is parsed straight from captured stdout. Asserts
+/// exactly one statement attesting the agent patch: the fixture GHSA,
+/// `not_affected`, the installed-package subcomponent purl, and a PLAIN impact
+/// statement with NO `(vendored)`/`(redirected)` marker — the marker's absence
+/// is precisely what distinguishes agent provenance from the vendored/hosted
+/// modes.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
 }
 
 /// Shared check: the mock must have served BOTH the metadata discovery
@@ -705,6 +802,201 @@ async fn npm_bun_install_full_apply_chain() {
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
     assert_real_api_pipeline_ran(&server).await;
+}
+
+// ── yarn berry (4.x) docker legs ───────────────────────────────────────
+//
+// The image caches `yarn@4.12.0` in corepack WITHOUT activating it (the
+// global `yarn` stays classic 1.22.22); a project opts into berry via
+// package.json `"packageManager": "yarn@4.12.0"`, which the corepack shim
+// dispatches. Both legs use the node-modules linker so the installed tree is
+// a real hoisted `node_modules/<pkg>` (not a PnP `.yarn/cache` zip).
+
+/// Agent-mode berry leg: real yarn 4 install → `scan --sync` + forced
+/// `apply --offline` → the patched marker lands in the berry-installed tree.
+/// Container twin of the npm agent leg (`make_container_script`) with a berry
+/// install front-end. Reuses the shared `minimist@1.2.2` mock fixture.
+fn make_berry_agent_script(api_url: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
+
+# 1. Real berry install (node-modules linker). packageManager pins yarn 4 so
+#    the corepack shim dispatches it; the global yarn stays classic.
+mkdir -p /workspace/proj && cd /workspace/proj
+cat > package.json <<'PKG'
+{{ "name": "e2e-berry-proj", "version": "0.0.0", "packageManager": "yarn@4.12.0", "dependencies": {{ "minimist": "1.2.2" }} }}
+PKG
+printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml
+echo "yarn version in project: $(yarn --version)" >&2
+yarn install >/tmp/yi.out 2>/tmp/yi.err || {{ echo "FAIL: yarn berry install"; cat /tmp/yi.err >&2; exit 1; }}
+TARGET=node_modules/minimist/index.js
+[ -f "$TARGET" ] || {{ echo "FAIL: $TARGET missing after berry install (PnP layout?)" >&2; ls -la node_modules >&2; exit 1; }}
+
+# Pre-seed setup.manual so the patch survives property-7 filtering.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+MANIFEST
+
+# 2. scan --sync then forced offline apply (placeholder beforeHash fixture).
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+echo "sync exit=$?" >&2; cat /tmp/sync.err >&2 || true
+socket-patch apply --json --force --offline >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2; cat /tmp/apply.out >&2 || true; cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then echo "FAIL: berry apply exited $APPLY_RC" >&2; exit 1; fi
+if ! grep -q '"status": *"success"' /tmp/apply.out; then echo "FAIL: berry apply status not success" >&2; exit 1; fi
+
+# 3. Marker in the berry-installed file.
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
+  echo "FAIL: marker not in $TARGET after berry apply" >&2; head -3 "$TARGET" >&2; exit 1
+fi
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    )
+}
+
+/// Vendored berry leg: the container twin of `e2e_vendor_yarn_berry_build.rs`.
+/// Real yarn 4 install → stage a `.socket/` manifest + blob from the ACTUAL
+/// installed bytes (no API) → `vendor --offline` → fresh-checkout
+/// `yarn install --immutable --check-cache` (offline global cache) must
+/// install the PATCHED bytes from the vendored tarball. This proves the
+/// vendored `10c0/<hex>` checksum the CLI computes offline is exactly what a
+/// real yarn 4 accepts under `--check-cache`.
+fn make_berry_vendor_script() -> String {
+    // git-sha256 in bash: sha256("blob <len>\0" ++ bytes).
+    r#"#!/usr/bin/env bash
+set -uo pipefail
+
+git_sha256() {  # $1 = file
+  local len; len=$(wc -c < "$1")
+  { printf 'blob %d\0' "$len"; cat "$1"; } | sha256sum | cut -d' ' -f1
+}
+
+# 1. Real berry install (node-modules linker), private global cache.
+mkdir -p /workspace/proj && cd /workspace/proj
+cat > package.json <<'PKG'
+{ "name": "e2e-berry-vendor", "version": "0.0.0", "private": true, "packageManager": "yarn@4.12.0", "dependencies": { "left-pad": "1.3.0" } }
+PKG
+printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml
+export YARN_GLOBAL_FOLDER=/workspace/yarn-global
+export YARN_ENABLE_GLOBAL_CACHE=false
+echo "yarn version in project: $(yarn --version)" >&2
+yarn install >/tmp/yi.out 2>/tmp/yi.err || { echo "FAIL: yarn berry install"; cat /tmp/yi.err >&2; exit 1; }
+
+INSTALLED=node_modules/left-pad/index.js
+[ -f "$INSTALLED" ] || { echo "FAIL: $INSTALLED missing after berry install" >&2; exit 1; }
+
+# 2. Stage manifest + blob from the ACTUAL installed bytes (marker prepended).
+BEFORE_HASH=$(git_sha256 "$INSTALLED")
+cp "$INSTALLED" /tmp/orig.js
+{ printf '/* SOCKET-PATCHED */\n'; cat /tmp/orig.js; } > /tmp/patched.js
+AFTER_HASH=$(git_sha256 /tmp/patched.js)
+mkdir -p .socket/blobs
+cp /tmp/patched.js ".socket/blobs/$AFTER_HASH"
+cat > .socket/manifest.json <<MANIFEST
+{ "patches": { "pkg:npm/left-pad@1.3.0": {
+  "uuid": "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab",
+  "exportedAt": "2026-01-01T00:00:00Z",
+  "files": { "package/index.js": { "beforeHash": "$BEFORE_HASH", "afterHash": "$AFTER_HASH" } },
+  "vulnerabilities": {}, "description": "berry vendor docker fixture",
+  "license": "MIT", "tier": "free"
+} } }
+MANIFEST
+
+LOCK_BEFORE=$(sha256sum yarn.lock | cut -d' ' -f1)
+
+# 3. Vendor (offline: builds the tarball + rewrites yarn.lock + package.json).
+socket-patch vendor --json --offline --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
+VRC=$?
+echo "vendor exit=$VRC" >&2; cat /tmp/vendor.out >&2 || true; cat /tmp/vendor.err >&2 || true
+if [ "$VRC" -ne 0 ]; then echo "FAIL: berry vendor exited $VRC" >&2; exit 1; fi
+if ! grep -q '"status": *"success"' /tmp/vendor.out; then echo "FAIL: berry vendor status not success" >&2; exit 1; fi
+TGZ=.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+[ -f "$TGZ" ] || { echo "FAIL: vendored tarball missing at $TGZ" >&2; exit 1; }
+grep -q 'checksum: 10c0/' yarn.lock || { echo "FAIL: yarn.lock has no 10c0 checksum after vendor" >&2; cat yarn.lock >&2; exit 1; }
+echo "===VENDOR VERIFIED===" >&2
+
+# 4. FRESH CHECKOUT: only committable files, EMPTY global cache, strictest
+#    invocation. yarn must install the PATCHED bytes from the vendored tarball.
+mkdir -p /workspace/fresh && cd /workspace/fresh
+cp /workspace/proj/package.json .
+cp /workspace/proj/yarn.lock .
+cp /workspace/proj/.yarnrc.yml .
+cp -r /workspace/proj/.socket .
+export YARN_GLOBAL_FOLDER=/workspace/fresh-yarn-global
+yarn install --immutable --check-cache >/tmp/ci.out 2>/tmp/ci.err
+CIRC=$?
+echo "fresh install exit=$CIRC" >&2; cat /tmp/ci.out >&2 || true; cat /tmp/ci.err >&2 || true
+if [ "$CIRC" -ne 0 ]; then echo "FAIL: fresh --immutable --check-cache install exited $CIRC" >&2; exit 1; fi
+FRESH=node_modules/left-pad/index.js
+if ! head -1 "$FRESH" | grep -q 'SOCKET-PATCHED'; then
+  echo "FAIL: fresh berry install did not land the patched bytes" >&2; head -3 "$FRESH" >&2; exit 1
+fi
+echo "===FRESH INSTALL VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    .to_string()
+}
+
+/// Agent-mode berry install → apply chain in Docker.
+#[tokio::test]
+async fn npm_berry_agent_install_apply_chain() {
+    let after_hash = git_sha256(PATCHED_BYTES);
+    let server = make_mock_server(&after_hash).await;
+    if host_mode() {
+        // Host mode would need corepack yarn 4 locally; the dedicated
+        // in-process berry legs already cover the host toolchain.
+        return;
+    }
+    if skip_if_no_docker_image() {
+        return;
+    }
+    let api = api_url_for_container(&server);
+    let out = run_in_container(&make_berry_agent_script(&api));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "berry agent install/apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_real_api_pipeline_ran(&server).await;
+}
+
+/// Vendored berry offline-frozen-install chain in Docker (container twin of
+/// `e2e_vendor_yarn_berry_build.rs`). No API — the manifest is staged from the
+/// installed bytes in-container.
+#[tokio::test]
+async fn npm_berry_vendor_frozen_install_chain() {
+    if host_mode() {
+        return;
+    }
+    if skip_if_no_docker_image() {
+        return;
+    }
+    let out = run_in_container(&make_berry_vendor_script());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "berry vendor frozen-install failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===VENDOR VERIFIED==="),
+        "stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===FRESH INSTALL VERIFIED==="),
+        "stderr=\n{stderr}"
+    );
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 
 /// Smoke test: verify the test infrastructure starts up correctly. This

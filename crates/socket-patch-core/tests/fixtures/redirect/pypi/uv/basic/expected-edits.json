@@ -1,0 +1,10 @@
+[
+  {
+    "path": "uv.lock",
+    "kind": "redirect_uv_lock_wheel",
+    "action": "rewritten",
+    "key": "click@8.1.7",
+    "original": "source = { registry = \"https://pypi.org/simple\" }\nwheels = [\n    { url = \"https://files.pythonhosted.org/packages/00/2e/click-8.1.7-py3-none-any.whl\", hash = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\" },\n]\n",
+    "new": "source = { registry = \"https://pypi.org/simple\" }\nwheels = [\n    { url = \"https://patch.socket.dev/patch/pypi/click/8.1.7/11111111-1111-1111-1111-111111111111/88888888-8888-8888-8888-888888888888/click-8.1.7-py3-none-any.whl\", hash = \"sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\" },\n]\n"
+  }
+]

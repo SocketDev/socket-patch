@@ -16,6 +16,158 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **Hosted patch mode: `scan --mode hosted` (a.k.a. the hidden `--redirect`).**
+  The third patch-application mode: instead of applying in place (agent) or
+  committing artifacts (vendored), `scan` rewrites lockfiles / registry
+  configs so ONLY the patched dependencies resolve to Socket-hosted,
+  integrity-pinned packages on patch.socket.dev — no artifact bytes land in
+  the repo and no CI changes are needed. Per ecosystem: npm rewrites
+  `package-lock.json`/`npm-shrinkwrap.json` `resolved`+`integrity` (v2 legacy
+  `dependencies` mirror included), `pnpm-lock.yaml` inline resolutions, and
+  yarn classic `resolved`/`integrity` blocks; pypi rewrites `requirements.txt`
+  pins to `name @ <url> --hash=sha256:…` (pip-compile continuation lines are
+  refused rather than corrupted) and `uv.lock` wheel entries; cargo defines a
+  per-patch sparse registry in `.cargo/config.toml` plus `Cargo.toml`
+  `registry =` keys and Cargo.lock `source`/`checksum` surgery; composer
+  rewrites the lock entry's `dist` url/shasum; nuget adds a `nuget.config`
+  source + `packageSourceMapping` and repins `packages.lock.json`
+  `contentHash`; gem adds a per-dep `source` block + a `CHECKSUMS` pin
+  (bundler ≥ 2.6). A dep counts as redirected only when its hosted URL (or
+  per-dep registry index) actually landed in a project file; re-runs are
+  idempotent (zero new edits over already-rewritten output). The Rust
+  rewriters are held byte-identical to the depscan backend's TS twins (the
+  GitHub-app hosted PR flow) by shared golden fixtures under
+  `tests/fixtures/redirect/`. JSON output gains a `redirect` sub-object with
+  `mode: "hosted"`, `redirected`, `rewrittenFiles`, `skipped`, `warnings`.
+- **`scan --mode <hosted|vendored|agent>`: the documented mode selector.** One
+  value-enum flag replaces the boolean spellings (`--redirect` == hosted,
+  `--vendor` == vendored, `--apply`/`--sync` == agent), which remain supported
+  as aliases. Combining `--mode` with a boolean of a DIFFERENT mode is a
+  usage error (exit 2); the same mode spelled both ways is accepted, and
+  `--detached` now requires vendored mode in either spelling.
+- **VEX support for hosted mode: the `(redirected)` provenance marker + the
+  redirect ledger.** `scan --mode hosted` persists its recorded file edits and
+  the full patch records (file hashes + vulnerabilities) into
+  `.socket/vendor/redirect-state.json` (merge-on-rewrite, append-only edits —
+  the pre-redirect originals a future revert needs are never clobbered).
+  Redirected patches carry the impact-statement marker "Patched via Socket
+  patch `<uuid>` (redirected)", completing the provenance trio (plain =
+  agent, `(vendored)`, `(redirected)`). In-run `scan --mode hosted --vex`
+  attests confirmed redirects from the ledger WITHOUT hash verification (the
+  bytes are fetched at install time; the JSON `vex` summary carries
+  `verified: false`), while a post-install `socket-patch vex` reads the ledger
+  back and hash-verifies the redirected patches against the installed tree.
+  A confirmed redirect whose record fetch failed surfaces a
+  `record_fetch_failed` warning (the patch is missing from VEX until a
+  re-run).
+- **NuGet + Maven vendor backends (`vendor` / `scan --mode vendored`).**
+  NuGet: the uuid dir is a committed *folder feed* holding a deterministically
+  rebuilt `.nupkg` (embedded signature dropped; unsigned is accepted under
+  NuGet's default validation), wired via a `nuget.config` source +
+  `packageSourceMapping` and a `packages.lock.json` `contentHash` repin —
+  `dotnet restore --locked-mode` then fails NU1403 on tamper. Maven: the uuid
+  dir is a committed *maven2 `file://` repository* (rebuilt `.jar` + the
+  verbatim upstream pom so transitives survive + `.sha1` sidecars), wired via
+  a `pom.xml` `<repository>` with `checksumPolicy=fail`; multi-module
+  aggregator poms (`vendor_maven_multimodule_unsupported`) and gradle-only
+  projects (`vendor_gradle_unsupported`) are refused fail-closed, and the
+  always-on `vendor_maven_local_cache_shadow` advisory carries the
+  `mvn dependency:purge-local-repository` one-liner (a warm `~/.m2` copy
+  silently shadows any repository). Both are proven by docker capstones
+  against the real .NET SDK / Apache Maven (cold-cache, `--network none`,
+  RED + TAMPER probes). `nuget` and `maven` are now DEFAULT compile features;
+  in-place agent apply for both remains runtime-gated
+  (`SOCKET_EXPERIMENTAL_NUGET=1` / `SOCKET_EXPERIMENTAL_MAVEN=1` — sidecar
+  corruption risk) while the committable vendor path is safe. The vendored
+  path convention + uuid recovery rule now covers `nuget` and `maven` dirs,
+  and `--vendor-source` prebuilt downloads cover nuget.
+- **Maven hosted rewriter (pom projects) — fail-closed version suffixing +
+  Trusted Checksums.** Hosted mode's maven leg pins the patched jar the only
+  way a lockfile-less ecosystem can: the serve route exposes the patch under a
+  Socket-only `<version>-socket.<hex8>` suffix (existing ONLY on the injected
+  `socket-patch-<uuid>` repository), and the rewriter pins that version
+  explicitly — it rewrites the literal `<version>`, or (for a transitive /
+  managed dependency with no literal version) adds a `<dependencyManagement>`
+  entry — alongside the `<repository>` insert (releases enabled,
+  `checksumPolicy=fail`, snapshots disabled). An outage or tamper on the Socket
+  repo then HARD-FAILS the build: the suffixed version resolves nowhere else,
+  so there is no silent fall-through to Central (the base version 404s). A
+  `${property}` version is refused (`redirect_maven_dep_unpinned` — a literal
+  edit would break the reference and a depMgmt pin could strand sibling
+  artifacts); a literal version matching neither the base nor the suffixed
+  value is skipped (`redirect_maven_dep_version_mismatch`); a non-jar `<type>`
+  is skipped (`redirect_maven_unsupported_packaging`). When the serve route
+  supplies both the jar and pom sha256, the rewriter also emits Maven 3.9+
+  Trusted Checksums files — `.mvn/maven.config` resolver args (`originAware=false`,
+  `failIfMissing=false`) + `.mvn/checksums/checksums.sha256` entries pinning
+  both artifacts under the suffixed version's local-repo path, merging into any
+  pre-existing user config / checksum set (a conflicting value is never
+  overridden — `redirect_maven_trusted_checksums_conflict`). The `.mvn/*` files
+  are silently inert below Maven 3.9 (the version suffixing is still fail-closed
+  on its own); on 3.9.0–3.9.8 a mismatch is enforced but reported unclearly
+  (readability fixed in 3.9.9, MNG-8182). When the upstream pom is unavailable /
+  unsuffixable the rewriter falls back to the legacy same-GAV repository
+  injection with a `redirect_maven_same_gav_fallback` warning (NOT fail-closed:
+  a Socket-repo failure falls back to the unpatched artifact). Gradle build
+  scripts are never edited: a present `build.gradle*` / `settings.gradle*`
+  emits a paste-able `exclusiveContent` snippet carrying the suffixed version
+  (`redirect_gradle_manual_snippet`) plus a reminder to bump the dependency
+  declaration — fail-closed by repository exclusivity.
+- **Hosted mode now rewrites yarn-berry and bun lockfiles.** The hosted npm
+  family gains two flavors beyond package-lock / pnpm / yarn-classic. **yarn
+  berry** (`__metadata:` v2+ lock): the rewriter edits ONLY the lock entry —
+  `resolution:` gains yarn's own `::__archiveUrl=<encodeURIComponent(url)>`
+  binding and `checksum:` becomes the precomputed `yarnBerry10c0` cache-zip
+  sha512 — leaving the descriptor key and `package.json` untouched, so `yarn
+  install --immutable --check-cache` passes and tamper fails YN0018. Whole-file
+  gates refuse a `cacheKey ≠ 10c0` or a `.yarnrc.yml compressionLevel ≠ 0`
+  (`redirect_yarn_berry_cache_unsupported`) — no offline-reproducible checksum.
+  Validated e2e against real `corepack yarn@4.12.0` on the node-modules linker;
+  PnP is not exercised for hosted (the lock rewrite fires, but PnP's
+  `.yarn/cache` resolution is untested). **bun** (text `bun.lock` v1): the
+  packages-entry registry 4-tuple `["name@ver","<reg>",{deps},"sha512-…"]` is
+  rewritten to a URL 3-tuple `["name@<url>",{deps},"sha512-…"]`, fail-closed on
+  any grammar deviation; `bun install --frozen-lockfile` then installs the
+  hosted bytes and tamper fails the integrity check. A binary `bun.lockb` with
+  no text lock is auto-migrated first via the user's own `bun install
+  --save-text-lockfile --frozen-lockfile --lockfile-only` (deletes `bun.lockb`,
+  recorded as a `removed` ledger edit, offline, fails closed;
+  `redirect_bun_lockb_would_migrate` on `--dry-run`,
+  `redirect_bun_lockb_unsupported` if the migration is unavailable). The Rust
+  rewriters are byte-identical to the depscan backend's TS twins via shared
+  golden fixtures.
+- **Hosted mode supports Rush monorepos.** A Rush repo has no root
+  `package.json`/lockfile pair — its pnpm source-of-truth lock lives at
+  `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
+  `common/config/subspaces/<name>/`). `scan --mode hosted` discovers those
+  locks when `rush.json` is present and repoints them in place (the pnpm
+  rewriter is now basename-generalized, so nested locks rewrite path-generically).
+  Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
+  `common/config/rush/repo-state.json`, so a `redirect_rush_repo_state_stale`
+  warning fires when a lock was touched and that file exists — `rush install`
+  fails under `preventManualShrinkwrapChanges` until `rush update` refreshes it,
+  but the redirect survives the refresh (pnpm keeps locked resolutions for
+  unchanged specifiers). Agent mode already works through Rush's generated
+  project symlink farm; vendored mode is refused (`vendor_rush_unsupported`)
+  because `rush install` copies the lock into `common/temp`, so vendor's
+  relative `file:` specs can't survive — the refusal routes to hosted mode.
+- **pnpm hosted rewriter generalized to nested lockfiles.** The
+  `pnpm-lock.yaml` rewriter now matches any `pnpm-lock.yaml` at the project
+  root OR at any nested path (`*/pnpm-lock.yaml`), so Rush subspace locks and
+  other nested-lock layouts are rewritten in place under their repo-relative
+  keys. Write-back and confirmed-redirect gating are path-generic.
+- **Golang hosted mode is a documented NO-GO.** Hosted redirect for Go is
+  deliberately unsupported — sumdb hard-fails the patched pseudo-version on
+  every day-2 machine and the only escapes are uncommittable machine-local
+  config; Go's module-path identity would force per-grant artifacts against
+  the build-once converter; and the default `GOPROXY` chain would leak
+  licensed bytes / tokened URLs to the public mirror. The full analysis lives
+  in `docs/design/golang-hosted-no-go.md`; both the CLI rewriter and the
+  depscan backend twin emit `redirect_golang_unsupported` naming the remedy
+  (use vendored mode, which gives Go everything hosted promises elsewhere).
+  The one sanctioned exception — an ephemeral-CI GOPROXY recipe — is
+  documentation-only and never written into a repository.
+
 - **`vendor` now supports every major npm and pypi package manager.** The npm
   ecosystem gained four lockfile flavors beyond `package-lock.json` — yarn
   classic (`yarn.lock` v1), yarn berry with the node-modules linker
@@ -105,12 +257,31 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Fixed
 
+- **NuGet hosted rewriter: creating a `packageSourceMapping` from scratch now
+  emits a catch-all for pre-existing sources.** `packageSourceMapping` is
+  exclusive — once ANY mapping exists, every package must match some source's
+  pattern or restore hard-fails NU1100. A redirect into a `nuget.config` with
+  no prior mapping previously routed only the patched id, breaking every
+  OTHER package's restore; the rewriter now fans a `<package pattern="*" />`
+  mapping out to each pre-existing package source (longest-prefix match still
+  routes the patched id to the Socket source). Golden fixtures updated on
+  both the Rust and TS sides.
+
 - **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
   previously verified golang patches against the pristine module cache
   instead of the patched `.socket/go-patches/` copy, so redirect-applied
   patches were silently omitted from the document (reported `not_applied`,
   or `package_not_found` on cache-less CI). Verification now follows the
   managed `replace` directive to the committed copy.
+
+- **`repair` on a hosted-only project is an informational no-op.** Hosted
+  (`--mode hosted`) mode leaves no local artifacts to repair — the lockfiles
+  point at `patch.socket.dev` URLs, and there is no manifest or vendor ledger.
+  A project whose only `.socket/` trace is `redirect-state.json` (no manifest,
+  no vendor ledger, no vendored lockfile references) previously errored with
+  `manifest_not_found` (exit 1); it now exits 0 with a `redirect_only_project`
+  skip pointing at `scan --mode hosted`. Repair still errors on a bare
+  directory with no traces at all.
 
 ## [3.2.0] — 2026-05-29
 

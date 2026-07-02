@@ -61,10 +61,16 @@ pub async fn run(args: RepairArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
 
     if tokio::fs::metadata(&manifest_path).await.is_err() {
-        // No manifest is still repairable when the project carries vendored
-        // state: a committed ledger, or lockfiles rewired to
-        // `.socket/vendor/...` paths (the ledger itself may be the thing
-        // that needs repairing). Only a project with neither is an error.
+        // Hosted (redirect) mode leaves no local artifacts to repair: the
+        // lockfiles point at patch.socket.dev URLs, not `.socket/vendor/...`,
+        // and there is no manifest or vendor ledger. A project whose only
+        // trace is `redirect-state.json` is therefore a no-op for repair —
+        // exit success with an informational skip rather than the
+        // `manifest_not_found` error a bare directory would get.
+        let redirect_state = args
+            .common
+            .cwd
+            .join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
         let state_file = args
             .common
             .cwd
@@ -74,6 +80,22 @@ pub async fn run(args: RepairArgs) -> i32 {
                 .await
                 .is_empty();
         if !has_vendor_traces {
+            if tokio::fs::metadata(&redirect_state).await.is_ok() {
+                let msg = "hosted redirects need no local repair; re-run \
+                           `scan --mode hosted` to refresh the lockfile redirects";
+                if args.common.json {
+                    let mut env = Envelope::new(Command::Repair);
+                    env.dry_run = args.common.dry_run;
+                    env.record(
+                        PatchEvent::artifact(PatchAction::Skipped)
+                            .with_reason("redirect_only_project", msg),
+                    );
+                    println!("{}", env.to_pretty_json());
+                } else if !args.common.silent {
+                    println!("{msg}");
+                }
+                return 0;
+            }
             if args.common.json {
                 let mut env = Envelope::new(Command::Repair);
                 env.dry_run = args.common.dry_run;

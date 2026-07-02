@@ -18,6 +18,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:cargo/cfg-if@1.0.0";
 const UUID: &str = "14141414-1414-4141-8141-141414141414";
+/// The vulnerability the staged manifest carries so the agent-mode VEX leg
+/// has something to attest (plain agent provenance — no vendored/redirected
+/// marker — is what the host oracle asserts).
+const GHSA: &str = "GHSA-agent-cargo-real";
 
 const PATCHED_RS: &[u8] = b"// SOCKET-PATCH-E2E-MARKER\n\
                             // cfg-if/src/lib.rs replaced by socket-patch e2e fixture\n\
@@ -105,7 +109,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2024-30001"],
+                    "summary": "cargo agent e2e fixture vulnerability",
+                    "severity": "low",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "cargo e2e fixture",
             "license": "MIT",
             "tier": "free",
@@ -174,6 +186,15 @@ fi
 # fix-permissions code makes them writable, but we chmod up-front
 # too in case anything else stomps on it.
 chmod u+w "$LIB_RS" || true
+
+# Pre-seed setup.manual so the agent-mode VEX leg keeps the cargo patch
+# through property 7 (cargo has no auto-install setup hook; agent patches are
+# applied by hand/CI — exactly what `manual` declares). scan --sync merges the
+# downloaded patch into this manifest and preserves the setup block.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["cargo"] }} }}
+MANIFEST
 
 # scan --sync writes manifest + blob; the cargo crawler with --global
 # probes $CARGO_HOME/registry/src/. Note: in this fixture scan's own
@@ -271,11 +292,77 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$LIB_RS"; then
 fi
 
 echo "===PATCH VERIFIED===" >&2
+
+# Agent-mode VEX leg. The manifest scan --sync wrote carries {GHSA} (served in
+# the patch view); vex verifies the patched cfg-if source on disk and attests
+# it with PLAIN agent provenance. --global/--ecosystems cargo mirror the apply
+# above (the cargo crawler probes $CARGO_HOME); --offline keeps vex local. The
+# doc is emitted between markers for the host-side oracle (no bind mount here).
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:cargo/e2e-app@1.0.0' --global --ecosystems cargo >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
+
 echo "===E2E PASS==="
 exit 0
 "#,
         git_sha256_fn = GIT_SHA256_FN,
     )
+}
+
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
+/// the workspace inside the container with no bind mount, so the doc is parsed
+/// from captured stdout). Asserts exactly one statement attesting the agent
+/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
+/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
+/// marker — the marker's absence is what distinguishes agent provenance.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
 }
 
 /// Returns `true` when the test should skip (docker missing, image
@@ -334,6 +421,14 @@ async fn cargo_fetch_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the patched cargo src.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
 
     // The script gates on an exact git-blob-hash match; confirm the
     // expected hash actually appears in the log so a future edit that

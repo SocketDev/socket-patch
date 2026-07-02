@@ -56,10 +56,14 @@ pub mod gem;
 #[cfg(feature = "golang")]
 pub mod golang;
 pub mod lock_inventory;
+#[cfg(feature = "maven")]
+pub mod maven_repo;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
 pub mod npm_pack;
+#[cfg(feature = "nuget")]
+pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pypi;
 pub mod pypi_pdm;
@@ -347,7 +351,14 @@ pub async fn harvest_artifact_blobs(
             }
             continue;
         }
-        if lower.ends_with(".whl") || lower.ends_with(".zip") {
+        // `.nupkg` is a plain OPC zip (NuGet) and `.jar` is a plain zip (Maven)
+        // — both vendored artifacts read their entries the same way as
+        // wheels/zips to recover afterHash blobs.
+        if lower.ends_with(".whl")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".nupkg")
+            || lower.ends_with(".jar")
+        {
             let Ok(bytes) = tokio::fs::read(&artifact).await else {
                 continue;
             };
@@ -624,7 +635,10 @@ mod vendor_source_tests {
     fn parse_accepts_known_tokens_case_insensitively() {
         assert_eq!(VendorSource::parse("auto").unwrap(), VendorSource::Auto);
         assert_eq!(VendorSource::parse("AUTO").unwrap(), VendorSource::Auto);
-        assert_eq!(VendorSource::parse(" service ").unwrap(), VendorSource::Service);
+        assert_eq!(
+            VendorSource::parse(" service ").unwrap(),
+            VendorSource::Service
+        );
         assert_eq!(VendorSource::parse("Build").unwrap(), VendorSource::Build);
     }
 
@@ -632,13 +646,20 @@ mod vendor_source_tests {
     fn parse_rejects_unknown_tokens() {
         let err = VendorSource::parse("download").unwrap_err();
         assert!(err.contains("download"), "echoes the bad token: {err}");
-        assert!(err.contains("auto, service, or build"), "lists the set: {err}");
+        assert!(
+            err.contains("auto, service, or build"),
+            "lists the set: {err}"
+        );
         assert!(VendorSource::parse("").is_err());
     }
 
     #[test]
     fn as_tag_round_trips_through_parse() {
-        for s in [VendorSource::Auto, VendorSource::Service, VendorSource::Build] {
+        for s in [
+            VendorSource::Auto,
+            VendorSource::Service,
+            VendorSource::Build,
+        ] {
             assert_eq!(VendorSource::parse(s.as_tag()).unwrap(), s);
         }
     }

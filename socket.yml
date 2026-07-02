@@ -1,0 +1,11 @@
+# Socket (socket.dev) scanner configuration.
+#
+# The redirect golden fixtures commit manifests/lockfiles that DELIBERATELY
+# pin old, vulnerable dependency versions — they are the test inputs for a
+# security-patching tool, and the vulnerable pins are the point. Exclude them
+# from dependency scanning so their CVEs don't block PRs as if they were real
+# project dependencies.
+version: 2
+projectIgnorePaths:
+  - "crates/socket-patch-core/tests/fixtures/**"
+  - "crates/socket-patch-cli/tests/fixtures/**"

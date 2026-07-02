@@ -499,6 +499,95 @@ pub(crate) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
     cves.into_iter().chain(ghsas).collect()
 }
 
+/// The three patch-application modes `scan` can drive, selectable via
+/// `--mode` (the documented spelling). Each variant is equivalent to one
+/// legacy boolean flag, which remains supported as an alias.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Rewrite lockfiles so ONLY patched dependencies resolve to Socket's
+    /// hosted patch server (== `--redirect`): no artifact bytes land in the
+    /// repo, but installs must reach the patch server.
+    Hosted,
+    /// Commit patched artifacts to `.socket/vendor/` (== `--vendor`):
+    /// hermetic, offline-safe installs at the cost of repo size.
+    Vendored,
+    /// Record patches in `.socket/manifest.json` + blobs and re-apply them
+    /// in place, e.g. from CI (== `--apply`): smallest repo footprint, but
+    /// every install environment must run the agent.
+    Agent,
+}
+
+impl ScanMode {
+    /// The CLI spelling of the variant (`--mode <name>`), for error messages.
+    fn cli_name(self) -> &'static str {
+        match self {
+            ScanMode::Hosted => "hosted",
+            ScanMode::Vendored => "vendored",
+            ScanMode::Agent => "agent",
+        }
+    }
+}
+
+/// Fold `--mode` into the legacy boolean spellings (`--redirect` /
+/// `--vendor` / `--apply`) so everything downstream keeps a single source
+/// of truth, and enforce the cross-flag rules clap cannot express:
+///
+/// * `--mode X` combined with a boolean belonging to a DIFFERENT mode is a
+///   contradiction → `Err`. Clap's `conflicts_with` is value-independent —
+///   it could not allow `--mode vendored --vendor` while rejecting
+///   `--mode hosted --vendor` — so the check lives here.
+/// * The same mode spelled both ways (`--mode vendored --vendor`) is
+///   redundant but accepted: both spellings mean one thing.
+/// * `--sync` implies `--apply`, so it counts as an agent-mode spelling;
+///   `--prune` is an orthogonal GC knob and never conflicts.
+/// * `--detached` requires vendored mode in either spelling. The former
+///   clap-level `requires = "vendor"` couldn't see `--mode vendored`, so
+///   the requirement moved here too.
+///
+/// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
+/// fold without driving a full `run()`.
+pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
+    if let Some(mode) = args.mode {
+        // First boolean that selects a mode OTHER than the requested one.
+        let mut conflicting: Option<&'static str> = None;
+        if args.redirect && mode != ScanMode::Hosted {
+            conflicting = Some("--redirect");
+        }
+        if args.vendor && mode != ScanMode::Vendored {
+            conflicting = Some("--vendor");
+        }
+        if args.apply && mode != ScanMode::Agent {
+            conflicting = Some("--apply");
+        }
+        if args.sync && mode != ScanMode::Agent {
+            conflicting = Some("--sync");
+        }
+        if let Some(flag) = conflicting {
+            // "cannot be used with" phrasing matches clap's conflict errors —
+            // the scan_vendor_e2e contract test accepts exactly that shape.
+            return Err(format!(
+                "--mode {} cannot be used with {flag}: the flags select different \
+                 modes (hosted == --redirect, vendored == --vendor, agent == --apply/--sync)",
+                mode.cli_name(),
+            ));
+        }
+        match mode {
+            ScanMode::Hosted => args.redirect = true,
+            ScanMode::Vendored => args.vendor = true,
+            ScanMode::Agent => args.apply = true,
+        }
+    }
+    if args.detached && !args.vendor {
+        // "required" phrasing matches clap's requires errors — the
+        // scan_vendor_e2e contract test accepts exactly that shape.
+        return Err(
+            "--detached requires vendored mode: --mode vendored or --vendor is required"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 pub struct ScanArgs {
     #[command(flatten)]
@@ -514,7 +603,8 @@ pub struct ScanArgs {
     /// Designed for unattended workflows (cron jobs, bots that open PRs);
     /// pair with `--yes` for clarity though `--json` already implies non-
     /// interactive confirmation. No effect outside `--json` mode (the
-    /// non-JSON path always prompts the user).
+    /// non-JSON path always prompts the user). `--mode agent` is the
+    /// documented spelling of this mode.
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
@@ -543,19 +633,55 @@ pub struct ScanArgs {
     /// (vendoring replaces the in-place apply); combine with `--prune`
     /// to drop uninstalled entries before they fail vendoring. JSON mode
     /// is non-interactive like `--apply`; the interactive path prompts
-    /// before downloading.
+    /// before downloading. `--mode vendored` is the documented spelling
+    /// of this mode.
     #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
-    /// With `--vendor`: do not write `.socket/manifest.json` entries —
-    /// the vendor ledger (`.socket/vendor/state.json`) carries an
-    /// embedded copy of each patch record instead. Detached patches are
-    /// invisible to apply/rollback/repair (nothing is in the manifest);
-    /// they are undone per-purl via `remove <purl>` or wholesale via
+    /// With vendored mode (`--mode vendored` / `--vendor`): do not write
+    /// `.socket/manifest.json` entries — the vendor ledger
+    /// (`.socket/vendor/state.json`) carries an embedded copy of each
+    /// patch record instead. Detached patches are invisible to
+    /// apply/rollback/repair (nothing is in the manifest); they are
+    /// undone per-purl via `remove <purl>` or wholesale via
     /// `vendor --revert`, and are exempt from `vendor`'s manifest
-    /// reconcile.
-    #[arg(long, default_value_t = false, requires = "vendor")]
+    /// reconcile. The vendored-mode requirement is enforced in
+    /// `resolve_mode_flags` (not clap `requires`) so `--mode vendored`
+    /// satisfies it too.
+    #[arg(long, default_value_t = false)]
     pub detached: bool,
+
+    /// Redirect every patched dependency to Socket's HOSTED vendored patches
+    /// by rewriting lockfiles/registry configs so ONLY the patched dependency
+    /// points at the patch-server (`--patch-server-url`), instead of applying
+    /// patches in place or ejecting local artifacts. This is the remote
+    /// counterpart of `--vendor`: no artifact bytes land in the repo — the
+    /// lockfile pins the hosted URL + integrity (npm/pypi/composer) or a
+    /// per-dependency registry override (cargo/nuget/gem/…). Conflicts with
+    /// `--apply`/`--sync`/`--vendor`. Hidden from help: the flag is
+    /// unreleased and `--mode hosted` is the documented spelling.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync", "vendor"])]
+    pub redirect: bool,
+
+    /// How discovered patches are consumed — the documented selector for
+    /// the three modes (each is equivalent to one boolean flag, kept as an
+    /// alias):
+    ///
+    /// * `hosted` (== `--redirect`): rewrite lockfiles so only patched
+    ///   dependencies resolve to Socket's hosted patch server — no
+    ///   artifact bytes in the repo, but installs must reach the server.
+    /// * `vendored` (== `--vendor`): commit patched artifacts under
+    ///   `.socket/vendor/` — hermetic, offline-safe installs at the cost
+    ///   of repo size.
+    /// * `agent` (== `--apply`): record patches in `.socket/manifest.json`
+    ///   plus blobs and re-apply in place — smallest repo footprint, but
+    ///   every environment must run the agent.
+    ///
+    /// Combining `--mode` with a boolean flag from a DIFFERENT mode is
+    /// rejected (see `resolve_mode_flags`); the same mode spelled both
+    /// ways is accepted.
+    #[arg(long = "mode", value_enum)]
+    pub mode: Option<ScanMode>,
 
     /// Download patches for every release/distribution variant of a
     /// matched package, not just the one(s) matching the locally-
@@ -1300,8 +1426,526 @@ async fn track_outcomes_for_vendor(
     }
 }
 
-pub async fn run(args: ScanArgs) -> i32 {
+/// Candidate lockfiles / registry configs the redirect rewriters may touch —
+/// read from the project when present and handed to `rewrite_registry_redirect`.
+const REDIRECT_CANDIDATE_FILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    // A berry lock's cache-config gate reads `.yarnrc.yml`; bun's text lock is
+    // `bun.lock` (its binary `bun.lockb` is auto-migrated in `run_redirect`).
+    ".yarnrc.yml",
+    "bun.lock",
+    "requirements.txt",
+    "uv.lock",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo/config.toml",
+    "composer.lock",
+    "nuget.config",
+    "packages.lock.json",
+    "Gemfile",
+    "Gemfile.lock",
+    "pom.xml",
+    // Maven Trusted Checksums files the fail-closed maven rewriter merges into
+    // (read so an existing user config / checksum set is preserved, not
+    // clobbered).
+    ".mvn/maven.config",
+    ".mvn/checksums/checksums.sha256",
+    // Gradle build scripts are never edited — their presence only feeds the
+    // maven rewriter's paste-able `exclusiveContent` snippet warning.
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+/// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
+/// coordinate keeps its full slash-bearing form (npm `@scope/name`, composer
+/// `vendor/pkg`, golang module path) — the rewriters treat that as the `name`
+/// (their `full_name()` is `name` when `namespace` is `None`).
+fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
+    let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
+    let rest = stripped.strip_prefix("pkg:")?;
+    let (typ, after) = rest.split_once('/')?;
+    let (coord, version) = after.rsplit_once('@')?;
+    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
+    Some((typ.to_string(), name, version.to_string()))
+}
+
+/// `scan --redirect`: resolve hosted-patch references for the selected patches,
+/// then rewrite ONLY those dependencies' lockfile/registry-config entries to
+/// point at the hosted vendored patches (the byte-identical counterpart of the
+/// GitHub-app registry mode). No artifact bytes land in the repo.
+async fn run_redirect(
+    args: &ScanArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    effective_org_slug: Option<&str>,
+    all_packages_with_patches: &[BatchPackagePatches],
+    can_access_paid_patches: bool,
+) -> i32 {
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::redirect::{
+        rewrite_registry_redirect, DepOverride, RedirectState,
+    };
+
+    // Same discovery/selection as `--apply`/`--vendor`.
+    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+    for pkg in all_packages_with_patches {
+        if let Ok(response) = api_client
+            .search_patches_by_package(effective_org_slug, &pkg.purl)
+            .await
+        {
+            all_search_results.extend(response.patches);
+        }
+    }
+    let selected = if all_search_results.is_empty() {
+        Vec::new()
+    } else {
+        match select_patches(&all_search_results, can_access_paid_patches, false) {
+            Ok(s) => s,
+            Err(code) => return code,
+        }
+    };
+
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut overrides: Vec<DepOverride> = Vec::new();
+    // (purl, uuid, artifact_url, registry index_url, maven suffixed version)
+    // per granted reference — used AFTER the rewrite to decide which deps were
+    // actually redirected (their target URL / index / suffixed version landed
+    // in a file) before persisting records or attesting anything. The last
+    // element is Some only for fail-closed maven overrides.
+    type RedirectCandidate = (String, String, String, Option<String>, Option<String>);
+    let mut candidates: Vec<RedirectCandidate> = Vec::new();
+
+    if !selected.is_empty() {
+        let uuids: Vec<String> = selected.iter().map(|s| s.uuid.clone()).collect();
+        let references = match api_client.fetch_registry_references(&uuids).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("failed to resolve patch references: {e}");
+                return 1;
+            }
+        };
+        for sel in &selected {
+            let Some(reference) = references.get(&sel.uuid) else {
+                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": "not_found" }));
+                continue;
+            };
+            if reference.status != "granted" && reference.status != "reused" {
+                skipped.push(serde_json::json!({ "purl": sel.purl, "uuid": sel.uuid, "reason": reference.status }));
+                continue;
+            }
+            let purl = reference.purl.as_deref().unwrap_or(&sel.purl);
+            let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
+                skipped.push(
+                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "bad_purl" }),
+                );
+                continue;
+            };
+            let Some(url) = reference.url.clone() else {
+                skipped.push(
+                    serde_json::json!({ "purl": purl, "uuid": sel.uuid, "reason": "no_url" }),
+                );
+                continue;
+            };
+            let mut integrity = reference
+                .artifacts
+                .iter()
+                .find(|a| a.kind == "tarball")
+                .map(|a| a.integrity.clone())
+                .unwrap_or_default();
+            // The yarn-berry cache zip carries the `yarnBerry10c0` checksum the
+            // berry rewriter pins (berry verifies the zip, not the tarball).
+            // Merge it in and carry the zip URL (None when not stored yet).
+            let berry_zip = reference
+                .artifacts
+                .iter()
+                .find(|a| a.kind == "yarn-berry-zip");
+            if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
+                integrity.yarn_berry10c0 = Some(c);
+            }
+            candidates.push((
+                purl.to_string(),
+                sel.uuid.clone(),
+                url.clone(),
+                reference
+                    .registry_override
+                    .as_ref()
+                    .map(|o| o.index_url.clone()),
+                reference
+                    .registry_override
+                    .as_ref()
+                    .and_then(|o| o.identifiers.maven_suffixed_version.clone()),
+            ));
+            overrides.push(DepOverride {
+                ecosystem,
+                name,
+                namespace: None,
+                version,
+                token: String::new(),
+                patch_uuid: sel.uuid.clone(),
+                artifact_url: url,
+                berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
+                registry_override: reference.registry_override.clone(),
+                integrity,
+            });
+        }
+    }
+
+    // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
+    // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
+    // to `bun.lock` first. `bun install --save-text-lockfile --frozen-lockfile
+    // --lockfile-only` writes bun.lock, DELETES bun.lockb, needs no network,
+    // and fails closed on drift. Dry-run only warns; a failure degrades to the
+    // rewriter's own presence-only refusal (the .lockb stays a candidate file).
+    let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
+    let has_lockb = args.common.cwd.join("bun.lockb").exists();
+    let has_bun_lock = args.common.cwd.join("bun.lock").exists();
+    if has_lockb && !has_bun_lock {
+        if args.common.dry_run {
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_would_migrate",
+                "detail": "bun.lockb would be migrated to a text bun.lock \
+                           (`bun install --save-text-lockfile`) before redirecting; \
+                           re-run without --dry-run to apply",
+            }));
+        } else {
+            let status = std::process::Command::new("bun")
+                .args([
+                    "install",
+                    "--save-text-lockfile",
+                    "--frozen-lockfile",
+                    "--lockfile-only",
+                ])
+                .current_dir(&args.common.cwd)
+                .status();
+            let migrated =
+                matches!(status, Ok(s) if s.success()) && args.common.cwd.join("bun.lock").exists();
+            if migrated {
+                // bun deleted bun.lockb itself. Record the removal so `--revert`
+                // knows the file was replaced (binary — git history is the
+                // restore path, so no `original` bytes are captured).
+                migration_edits.push(socket_patch_core::patch::redirect::FileEdit {
+                    path: "bun.lockb".into(),
+                    kind: "redirect_bun_lockb_migrated".into(),
+                    action: "removed".into(),
+                    key: None,
+                    original: None,
+                    new: None,
+                });
+            } else {
+                migration_warnings.push(serde_json::json!({
+                    "code": "redirect_bun_lockb_unsupported",
+                    "detail": "bun.lockb could not be migrated to a text bun.lock \
+                               (`bun install --save-text-lockfile` failed or is unavailable); \
+                               the redirect cannot pin a binary lockfile",
+                }));
+            }
+        }
+    }
+
+    // Read the project's candidate files, run the rewriters.
+    let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for name in REDIRECT_CANDIDATE_FILES {
+        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(name)) {
+            files.insert((*name).to_string(), content);
+        }
+    }
+
+    // Rush monorepos have no root package.json/lock pair: the single pnpm
+    // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
+    // (when subspaces are enabled) one lock per subspace under
+    // common/config/subspaces/<name>/. Add them under their repo-relative
+    // keys — the pnpm rewriter is basename-generalized, so nested keys are
+    // rewritten in place, and the write-back below is already path-generic.
+    let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
+    if args.common.cwd.join("rush.json").is_file() {
+        let mut added_rush_lock = false;
+        let common_lock = "common/config/rush/pnpm-lock.yaml";
+        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
+            files.insert(common_lock.to_string(), content);
+            added_rush_lock = true;
+        }
+        let subspaces_dir = args.common.cwd.join("common/config/subspaces");
+        if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
+            // read_dir order is unspecified — sort for deterministic output.
+            let mut subspace_dirs: Vec<std::path::PathBuf> = read_dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect();
+            subspace_dirs.sort();
+            for dir in subspace_dirs {
+                let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
+                if let Ok(content) = std::fs::read_to_string(dir.join("pnpm-lock.yaml")) {
+                    files.insert(key, content);
+                    added_rush_lock = true;
+                }
+            }
+        }
+
+        // Editing a Rush lock outside `rush update` desyncs the
+        // pnpmShrinkwrapHash recorded in repo-state.json. When
+        // preventManualShrinkwrapChanges is enabled, `rush install` then
+        // refuses until `rush update` refreshes that hash — but the redirect
+        // survives `rush update` (pnpm preserves locked resolutions for
+        // unchanged specifiers). Warn only when we actually touched a lock and
+        // the repo-state file that carries the hash is present.
+        if added_rush_lock
+            && args
+                .common
+                .cwd
+                .join("common/config/rush/repo-state.json")
+                .is_file()
+        {
+            rush_warnings.push(serde_json::json!({
+                "code": "redirect_rush_repo_state_stale",
+                "detail":
+                    "pnpm-lock.yaml was edited outside `rush update`; if \
+                     preventManualShrinkwrapChanges is enabled, `rush install` fails until \
+                     `rush update` refreshes repo-state.json (the redirect survives `rush \
+                     update`)",
+            }));
+        }
+    }
+
+    let rewrite = rewrite_registry_redirect(&files, &overrides);
+    let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+
+    // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
+    // per-dependency registry index URL) actually landed in the project's
+    // files — either written by this run or already present from an earlier
+    // one. A granted reference whose rewriter found nothing to edit (e.g. no
+    // lockfile) must NOT be recorded or attested: nothing pins the patch.
+    let final_texts: Vec<&String> = files
+        .iter()
+        .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
+        .chain(
+            rewrite
+                .files
+                .iter()
+                .filter(|(name, _)| !files.contains_key(*name))
+                .map(|(_, content)| content),
+        )
+        .collect();
+    let confirmed: Vec<(String, String)> = candidates
+        .iter()
+        .filter(|(_, _, artifact_url, index_url, suffixed_version)| {
+            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
+            final_texts.iter().any(|text| {
+                text.contains(artifact_url.as_str())
+                    // The berry rewriter writes the URL percent-encoded into the
+                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
+                    || text.contains(encoded.as_str())
+                    || index_url.as_deref().is_some_and(|iu| text.contains(iu))
+                    // Fail-closed maven pins the globally-unique
+                    // `-socket.<hex8>` suffixed version (never the `.pom` URL),
+                    // so match on that string.
+                    || suffixed_version
+                        .as_deref()
+                        .is_some_and(|sv| text.contains(sv))
+            })
+        })
+        .map(|(purl, uuid, _, _, _)| (purl.clone(), uuid.clone()))
+        .collect();
+
+    // Fetch the full patch view (file hashes + vulnerabilities) for each
+    // CONFIRMED redirect and persist it so a post-install `socket-patch vex`
+    // can attest the patch. A fetch failure does not undo the redirect, but
+    // it leaves the patch unattestable — surface it as a warning (JSON +
+    // stderr) so CI can detect the attestation gap and re-run.
+    let mut records: std::collections::BTreeMap<String, PatchRecord> =
+        std::collections::BTreeMap::new();
+    let mut record_warnings: Vec<serde_json::Value> = Vec::new();
+    if !args.common.dry_run {
+        for (purl, uuid) in &confirmed {
+            match api_client.fetch_patch(effective_org_slug, uuid).await {
+                Ok(Some(resp)) => {
+                    let (rec_purl, record) =
+                        crate::commands::get::record_from_patch_response(&resp);
+                    records.insert(rec_purl, record);
+                }
+                Ok(None) | Err(_) => {
+                    record_warnings.push(serde_json::json!({
+                        "code": "record_fetch_failed",
+                        "detail": format!(
+                            "{purl} redirected, but its patch record could not be fetched; \
+                             it will be missing from VEX until `scan --redirect` is re-run"
+                        ),
+                    }));
+                }
+            }
+        }
+    }
+
+    if !args.common.dry_run {
+        for (rel, content) in &rewrite.files {
+            let path = args.common.cwd.join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&path, content) {
+                eprintln!("failed to write {rel}: {e}");
+                return 1;
+            }
+        }
+        // Ledger (mirrors the vendor state.json shape): recorded edits for a
+        // future revert + the patch records (file hashes + vulnerabilities) so
+        // a post-install `socket-patch vex` can attest the redirected patches.
+        // MERGE with any existing ledger rather than overwriting: an idempotent
+        // re-run produces no new edits (the lockfile already points at the
+        // hosted patch), and clobbering the file would lose the original
+        // pre-redirect values a future revert needs. New edits APPEND (revert
+        // walks them in reverse); records are keyed by PURL, newest wins.
+        if !rewrite.edits.is_empty() || !records.is_empty() || !migration_edits.is_empty() {
+            let vendor_dir = args.common.cwd.join(".socket").join("vendor");
+            let _ = std::fs::create_dir_all(&vendor_dir);
+            let mut ledger =
+                socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
+                    .await
+                    .unwrap_or_else(RedirectState::new);
+            // Ledgers written before the mode-string rename carry
+            // `"mode": "redirect"`; normalize on rewrite so the on-disk
+            // ledger converges on the documented "hosted" name (the
+            // loader accepts either — mode is an opaque string to it).
+            ledger.mode = "hosted".to_string();
+            // The bun.lockb→bun.lock migration removal precedes the rewrite
+            // edits so `--revert` unwinds it last (after restoring bun.lock).
+            ledger.edits.extend(migration_edits.iter().cloned());
+            ledger.edits.extend(rewrite.edits.iter().cloned());
+            ledger.records.extend(records.clone());
+            let _ = std::fs::write(
+                vendor_dir.join("redirect-state.json"),
+                format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
+            );
+        }
+    }
+
+    // Emit an OpenVEX attestation when `--vex` was requested. The redirected
+    // bytes are fetched from the hosted patch server at install time, so the
+    // PURLs CONFIRMED REDIRECTED BY THIS RUN are attested from the ledger
+    // records WITHOUT hash verification (`assume_applied` — the integrity
+    // pins written into the lockfile are the evidence), while any OTHER
+    // manifest patches (previously applied / vendored — and any stale ledger
+    // records this run did not confirm) still verify normally. A post-install
+    // `socket-patch vex` hash-verifies the redirected patches against the
+    // installed tree (it reads the records back from the redirect ledger via
+    // augment_with_redirect). Requested-but-failed VEX (including "nothing to
+    // attest") flips the exit code, matching `scan --vex`.
+    let mut vex_statements: Option<usize> = None;
+    let mut vex_error: Option<(&'static str, String)> = None;
+    let mut vex_code = 0;
+    if args.vex.vex.is_some() && !args.common.dry_run {
+        let mut params = args.vex.to_build_params();
+        params.assume_applied = confirmed.iter().map(|(purl, _)| purl.clone()).collect();
+        let manifest_path = args.common.resolved_manifest_path();
+        match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
+            Ok(summary) => vex_statements = Some(summary.statements),
+            Err(e) => {
+                vex_code = 1;
+                vex_error = Some((e.code, e.message));
+            }
+        }
+    }
+
+    if args.common.json {
+        let mut warnings: Vec<serde_json::Value> = rewrite
+            .warnings
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "code": w.code, "detail": w.detail,
+                })
+            })
+            .collect();
+        warnings.extend(record_warnings.iter().cloned());
+        warnings.extend(migration_warnings.iter().cloned());
+        warnings.extend(rush_warnings.iter().cloned());
+        let mut result = serde_json::json!({
+            "status": "success",
+            "redirect": {
+                // Final mode naming: `--redirect` IS hosted mode. Additive
+                // key so JSON consumers can dispatch on the mode without
+                // inferring it from which sub-object is present.
+                "mode": "hosted",
+                "redirected": confirmed.len(),
+                "rewrittenFiles": rewritten,
+                "skipped": skipped,
+                "warnings": warnings,
+                "dryRun": args.common.dry_run,
+            }
+        });
+        if let Some(statements) = vex_statements {
+            result["vex"] = serde_json::json!({
+                "path": args.vex.vex.as_ref().unwrap().display().to_string(),
+                "statements": statements,
+                "format": "openvex-0.2.0",
+                "verified": false,
+            });
+        } else if let Some((code, message)) = &vex_error {
+            result["status"] = serde_json::json!("error");
+            result["error"] = serde_json::json!({ "code": code, "message": message });
+        }
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    } else if !args.common.silent {
+        let verb = if args.common.dry_run {
+            "would rewrite"
+        } else {
+            "rewrote"
+        };
+        println!(
+            "Redirected {} package(s); {verb} {} file(s).",
+            confirmed.len(),
+            rewritten.len()
+        );
+        for s in &skipped {
+            eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
+        }
+        for w in &record_warnings {
+            eprintln!("  warning: {}", w["detail"]);
+        }
+        for w in &migration_warnings {
+            eprintln!("  warning: {}", w["detail"]);
+        }
+        for w in &rush_warnings {
+            eprintln!("  warning: {}", w["detail"]);
+        }
+        if let Some(statements) = vex_statements {
+            eprintln!(
+                "Wrote OpenVEX document with {} statement(s) to {} (redirected patches are \
+                 attested from the ledger, not hash-verified — their bytes are fetched at \
+                 install time; run `socket-patch vex` after installing to verify against \
+                 the installed tree).",
+                statements,
+                args.vex.vex.as_ref().unwrap().display(),
+            );
+        } else if let Some((_, message)) = &vex_error {
+            eprintln!("Error: VEX generation failed: {message}");
+        } else if args.vex.vex.is_some() && args.common.dry_run {
+            eprintln!("Skipping VEX generation (--dry-run).");
+        }
+    }
+    vex_code
+}
+
+pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
+
+    // Fold `--mode` into the legacy mode booleans before anything reads
+    // them, so every branch below keeps a single source of truth. Cross-
+    // mode combinations get a usage-style error (exit 2, matching clap's
+    // conflict exit code) — see `resolve_mode_flags` for why clap itself
+    // can't express them.
+    if let Err(message) = resolve_mode_flags(&mut args) {
+        eprintln!("error: {message}");
+        return 2;
+    }
 
     // `--sync` is sugar for `--apply --prune`. Derive locals once and
     // use them everywhere downstream so the flag interactions are
@@ -1686,6 +2330,20 @@ pub async fn run(args: ScanArgs) -> i32 {
         telemetry_org.as_deref(),
     )
     .await;
+
+    // Registry-redirect mode is a distinct, self-contained flow (rewrite
+    // lockfiles → hosted vendored patches). It reuses discovery above, then
+    // returns — it must NOT fall through to the apply/vendor branches.
+    if args.redirect {
+        return run_redirect(
+            &args,
+            &api_client,
+            effective_org_slug,
+            &all_packages_with_patches,
+            can_access_paid_patches,
+        )
+        .await;
+    }
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the

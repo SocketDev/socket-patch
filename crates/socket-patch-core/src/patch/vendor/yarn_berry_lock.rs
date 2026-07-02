@@ -37,6 +37,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
+use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
 use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
@@ -939,21 +940,6 @@ fn yarnrc_compression_level(rc: &str) -> Option<&str> {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))
     })
-}
-
-/// JS `encodeURIComponent` (uppercase hex, RFC 2396 unreserved set) — the
-/// encoding yarn uses for the `locator=` binding in keys/resolutions.
-fn encode_uri_component(s: &str) -> String {
-    const UNRESERVED: &[u8] = b"-_.!~*'()";
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || UNRESERVED.contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// The manifest's indent unit (mirrors `npm_lock::detect_indent`); defaults

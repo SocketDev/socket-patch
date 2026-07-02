@@ -63,8 +63,10 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 | `vendor` | `--revert` | `SOCKET_VENDOR_REVERT` | Undo vendoring: restore recorded original lockfile fragments + remove `.socket/vendor/` artifacts. Works without a manifest |
 | `apply`, `scan`, `vendor` | `--vex` | `SOCKET_VEX` | Generate an OpenVEX 0.2.0 document at this path on a successful run; see "embedded VEX" below |
 | `apply`, `scan`, `vendor` | `--vex-product`, `--vex-no-verify`, `--vex-doc-id`, `--vex-compact` | `SOCKET_VEX_PRODUCT`, `SOCKET_VEX_NO_VERIFY`, `SOCKET_VEX_DOC_ID`, `SOCKET_VEX_COMPACT` | Passthrough to the embedded VEX builder; mirror the standalone `vex` knobs. Inert unless `--vex` is set |
-| `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune) |
-| `scan` | `--vendor` / `--detached` | — | Vendor every patched dependency instead of applying in place (`--vendor`; conflicts with `--apply`/`--sync`, combines with `--prune`); `--detached` additionally skips all manifest writes — the vendor ledger embeds the patch records (requires `--vendor`) |
+| `scan` | `--mode <hosted\|vendored\|agent>` | — | The documented selector for the three patch-application modes. Each value is equivalent to one legacy boolean spelling: `hosted` == `--redirect`, `vendored` == `--vendor`, `agent` == `--apply` (`--sync` counts as an agent spelling). Combining `--mode` with a boolean of a DIFFERENT mode is a usage error (exit 2, enforced in `resolve_mode_flags` — clap's `conflicts_with` is value-independent); the same mode spelled both ways is accepted. `--prune` is an orthogonal GC knob and never conflicts |
+| `scan` | `--redirect` | — | Hosted mode's legacy boolean spelling (**hidden from `--help`**; `--mode hosted` is the documented spelling, but the flag is part of the contract): rewrite lockfiles / registry configs so ONLY the patched dependencies resolve to Socket's hosted patch server; no artifact bytes land in the repo. Conflicts with `--apply`/`--sync`/`--vendor` |
+| `scan` | `--apply` / `--prune` / `--sync` | — | Mode selectors (sync = apply + prune); `--apply` == `--mode agent` |
+| `scan` | `--vendor` / `--detached` | — | Vendor every patched dependency instead of applying in place (`--vendor` == `--mode vendored`; conflicts with `--apply`/`--sync`, combines with `--prune`); `--detached` additionally skips all manifest writes — the vendor ledger embeds the patch records (requires vendored mode in either spelling) |
 | `scan` | `--batch-size` | `SOCKET_BATCH_SIZE` | API batch chunk size (default `100`) |
 | `get` | positional `identifier`; `--id` / `--cve` / `--ghsa` / `--package` (`-p`); `--save-only` (alias `--no-apply`); `--one-off` | `SOCKET_SAVE_ONLY`, `SOCKET_ONE_OFF` | Patch lookup + save-vs-apply mode |
 | `remove` | positional `identifier`; `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Manifest entry removal |
@@ -79,7 +81,7 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 
 `scan` queries the patch API in `--batch-size` chunks. Authenticated runs POST `/v0/orgs/{slug}/patches/batch`; token-less runs POST `{proxy}/patch/batch` on the public proxy and degrade to per-package `GET /patch/by-package/:purl` requests in two cases: the deployed proxy predates the batch endpoint (legacy proxies answer the POST with their `400 "Unsupported endpoint"` catch-all), or the all-or-nothing batch validation rejects the chunk (e.g. a crawled PURL type the server doesn't recognize, such as `pkg:jsr/…` — the per-package path tolerates those individually, preserving the pre-batch scan semantics). Rate limits and over-capacity 503s surface instead of silently degrading.
 
-**Lockfile supplement (v3.4)**: `scan` discovery is no longer limited to installed trees. The project's lockfiles (`package-lock.json`/`npm-shrinkwrap.json`, `pnpm-lock.yaml` v9, `yarn.lock` classic + berry, `bun.lock`, `Cargo.lock`, `go.sum`, `composer.lock`, `Gemfile.lock`, `uv.lock`/`poetry.lock`/pinned `requirements.txt`) are inventoried and dependencies with NO installed copy join discovery — counts, the API lookup, the table (flagged ` [NOT INSTALLED]`, plus a stderr note), and the prune "scanned" set (a wiped node_modules no longer prunes lockfile-listed entries). JSON gains a top-level `lockfileOnlyPackages` count and an additive `notInstalled: true` on matching `packages[]` entries. `--apply` partitions lockfile-only patches out BEFORE download (calm `skipped`/`package_not_installed` records — never an error exit, never a manifest write); `--vendor` passes them through to the vendor engine's auto-fetch. Vendored-ledger entries likewise stay discoverable on a fresh clone (the committed artifact is the dependency). Global scans (`--global`) get no supplement.
+**Lockfile supplement (v3.4)**: `scan` discovery is no longer limited to installed trees. The project's lockfiles (`package-lock.json`/`npm-shrinkwrap.json`, `pnpm-lock.yaml` v9, `yarn.lock` classic + berry, `bun.lock`, `Cargo.lock`, `go.sum`, `composer.lock`, `Gemfile.lock`, `uv.lock`/`poetry.lock`/pinned `requirements.txt`) are inventoried and dependencies with NO installed copy join discovery — counts, the API lookup, the table (flagged ` [NOT INSTALLED]`, plus a stderr note), and the prune "scanned" set (a wiped node_modules no longer prunes lockfile-listed entries). JSON gains a top-level `lockfileOnlyPackages` count and an additive `notInstalled: true` on matching `packages[]` entries. `--apply` partitions lockfile-only patches out BEFORE download (calm `skipped`/`package_not_installed` records — never an error exit, never a manifest write); `--vendor` passes them through to the vendor engine's auto-fetch. Vendored-ledger entries likewise stay discoverable on a fresh clone (the committed artifact is the dependency). Global scans (`--global`) get no supplement. **Rush monorepos** (no root lockfile, `rush.json` present): the npm-lock inventory falls back to the Rush source-of-truth locks — `common/config/rush/pnpm-lock.yaml` plus every `common/config/subspaces/*/pnpm-lock.yaml` (`read_dir`-sorted, repo-relative paths preserved) — so a Rush repo's dependencies still join discovery.
 
 **Vendor auto-fetch (v3.4)**: `vendor`/`scan --vendor` no longer fail on lockfile-resolved packages with no installed copy. Already-vendored purls stage from their committed artifact (sha256-verified against the vendor ledger; offline-safe). Otherwise the pristine artifact is fetched per the lockfile resolution and verified against the lock's recorded integrity FAIL-CLOSED before any write: npm SRI (or yarn classic's sha1 fragment), yarn berry's cache-zip checksum (rebuilt from the fetched tarball; cacheKey 10c0 only), Cargo.lock sha256 over the .crate, go.sum `h1:` dirhash over the module zip, composer `dist.shasum` (sha1), Gemfile.lock `CHECKSUMS` sha256, uv.lock wheel sha256 (pure `py3-none-any` wheels only). Entries the lock cannot verify are NEVER fetched (`vendor_fetch_unverifiable` warning + the calm `package_not_installed` skip). Registry bases honor `SOCKET_NPM_REGISTRY`, `SOCKET_CRATES_REGISTRY`, `SOCKET_GOPROXY` (else `GOPROXY`); npm/yarn/composer/gem/uv lock-recorded URLs are used verbatim. `--offline` refuses the fetch with the calm skip (the detail names the lockfile resolution). The fetch stages into a private tempdir — the project tree is never touched.
 
@@ -88,6 +90,15 @@ Beyond the globals above, each subcommand defines a small set of local arguments
 `scan --vendor` swaps the in-place apply for the vendor pipeline: discover → download (manifest written, as `--apply`) → vendor every patched dependency via the same engine as the `vendor` command (under the same lock). The whole manifest is vendored, so a package vendored at an older patch uuid is **re-vendored automatically** (its old uuid dir is removed — `vendor_stale_artifact_removed`); same-uuid re-runs are `already_vendored` skips. With `--prune`, GC runs **before** the vendor step so stale manifest entries don't fail vendoring with `package_not_installed`. JSON output gains a `download` sub-object (the download phase; no `applied` field — nothing is applied in place) and a `vendor` sub-object (a full vendor Envelope). The download phase writes only `.socket/manifest.json`; patch blobs are held in memory (see "Patch sources stay in memory" under the vendor contract). `--dry-run` previews per-patch `would_vendor` | `would_revendor` (+`oldUuid`) | `already_vendored` without network downloads or disk writes. Interactive mode prompts "Download and vendor N patch(es)?".
 
 `scan --vendor --detached` performs the same vendoring **without ever writing `.socket/manifest.json`**: records are fetched into memory (`download.detached: true`), the artifacts are built + wired, and the ledger entry carries `detached: true` plus an embedded copy of the patch record (`record`) as the verification source. Detached patches are invisible to apply/rollback/repair (nothing is in the manifest), exempt from `vendor`'s manifest reconcile, and exit via `remove <purl>` (which reverts them) or `vendor --revert`. Idempotent re-runs reuse the embedded record and skip the patch-view fetch entirely.
+
+`scan --mode hosted` (== `--redirect`) swaps the in-place apply for the registry-redirect pipeline: discover → resolve hosted-patch references (grant token + integrity + per-dep registry override) → rewrite ONLY the patched dependencies' lockfile / registry-config entries to point at the hosted packages. A dep counts as **redirected** only when its hosted-artifact URL (or per-dep registry index URL) actually landed in a project file — a granted reference whose rewriter found nothing to edit is neither recorded nor attested. Re-runs over already-rewritten output record zero new edits. JSON output gains a `redirect` sub-object: `{ mode: "hosted", redirected, rewrittenFiles, skipped, warnings, dryRun }` (`mode` is additive so consumers can dispatch without inferring it). Rewriter warnings carry stable `redirect_*` codes (e.g. `redirect_npm_no_lockfile`, `redirect_gradle_manual_snippet`, `redirect_golang_unsupported`); new codes are additive (MINOR).
+
+The rewriter reads a fixed set of candidate files from the project root: the npm-family locks (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, plus `.yarnrc.yml` for the berry cache-config gate and `bun.lock`), `requirements.txt` / `uv.lock`, `Cargo.toml` / `Cargo.lock` / `.cargo/config.toml`, `composer.lock`, `nuget.config` / `packages.lock.json`, `Gemfile` / `Gemfile.lock`, `pom.xml` (+ `.mvn/maven.config` / `.mvn/checksums/checksums.sha256` for maven Trusted Checksums merge, and the Gradle build scripts read only to trigger the manual-snippet warning). **npm-family flavor coverage**: package-lock / npm-shrinkwrap, pnpm (root OR any nested `*/pnpm-lock.yaml`), yarn classic, **yarn berry** (`yarn.lock` entry only — `resolution: ::__archiveUrl=` + `yarnBerry10c0` checksum; cacheKey `10c0` and `.yarnrc.yml compressionLevel 0` gated by `redirect_yarn_berry_cache_unsupported`), and **bun** (text `bun.lock` v1 — a binary `bun.lockb` with no text lock is auto-migrated to text via `bun install --save-text-lockfile --frozen-lockfile --lockfile-only` before the read, recorded as a `removed` FileEdit; `redirect_bun_lockb_would_migrate` on `--dry-run`, `redirect_bun_lockb_unsupported` when the migration is unavailable). **Rush monorepos**: when `rush.json` is present the rewriter also reads `common/config/rush/pnpm-lock.yaml` and each `common/config/subspaces/<name>/pnpm-lock.yaml` (sorted for determinism) under their repo-relative keys and repoints them in place; editing them emits `redirect_rush_repo_state_stale` when `common/config/rush/repo-state.json` exists (the `pnpmShrinkwrapHash` desync is refreshed by `rush update`, which the redirect survives). **maven** is fail-closed via version suffixing: a `mavenSuffixedVersion` + `mavenPomSha256` override pins the Socket-only `<version>-socket.<hex8>` by rewriting the literal `<version>` (`redirect_maven_dep_version`) or adding a `<dependencyManagement>` entry (`redirect_maven_dep_management_added`), plus optional Trusted Checksums (`redirect_maven_trusted_checksums`, conflicts as `redirect_maven_trusted_checksums_conflict`); a `${property}` version is refused (`redirect_maven_dep_unpinned`), a non-matching literal skipped (`redirect_maven_dep_version_mismatch`), and an override without a suffixed version falls back to same-GAV repository injection (`redirect_maven_same_gav_fallback`, NOT fail-closed).
+
+**Mode ledgers (contract surfaces).** Each committable mode persists its state at a stable repo-relative path; external tools (and the depscan backend's GitHub-app PR flows) read and write these files, so path + schema are part of the contract:
+
+* `.socket/vendor/state.json` — the **vendored**-mode ledger (see "Ownership, state, and reversal" below): wiring edits with verbatim pre-vendor originals, artifact fingerprints, optional `detached` records.
+* `.socket/vendor/redirect-state.json` — the **hosted**-mode ledger (`RedirectState` in `socket-patch-core/src/patch/redirect/state.rs`): `{ version, mode: "hosted", edits[], records{} }`. `edits` are recorded `FileEdit`s (append-only across re-runs — merge, never clobber: the pre-redirect originals a future revert needs live here); `records` maps PURL → the full manifest `PatchRecord` so a post-install `vex` can attest redirected patches with no manifest entry. The `mode` string is opaque to the loader (pre-rename ledgers carrying `"redirect"` still load; a hosted re-run normalizes them to `"hosted"`). Written identically by this CLI and by the depscan backend's hosted PR flow (`github-patch-pr-hosted.ts`).
 
 `--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts.
 
@@ -104,6 +115,18 @@ Contract details:
 * **Built from the post-run manifest**, verified against on-disk state (unless `--vex-no-verify`). Generated for real applies, `--dry-run`, and read-only `scan` alike.
 * **JSON success surface**: `apply` adds a top-level `vex` object to its envelope; `scan` adds a top-level `vex` key to its result. Both carry `{ path, statements, format: "openvex-0.2.0" }`.
 * `apply`'s no-manifest early exit (the "No .socket folder found" success no-op) does **not** trigger VEX generation — there is nothing to attest.
+
+### VEX provenance markers (contract)
+
+Every VEX statement's impact string records which patch-application mode persists the patch. The three marker strings are **stable contract surfaces** — scanners and policy engines match on them, so renaming or reformatting any of them is a MAJOR change:
+
+| Impact statement | Mode | Verification evidence |
+|---|---|---|
+| `Patched via Socket patch <uuid>` | agent | installed-tree file hashes vs the manifest's `afterHash` |
+| `Patched via Socket patch <uuid> (vendored)` | vendored | the committed `.socket/vendor/` artifact (no install hook needed) |
+| `Patched via Socket patch <uuid> (redirected)` | hosted | the lockfile's hosted integrity pin; in-run `scan --mode hosted --vex` attests from the redirect ledger WITHOUT hash verification (the JSON `vex` summary carries `verified: false`), while a post-install `socket-patch vex` re-reads the ledger and hash-verifies against the installed tree |
+
+`vendored` and `redirected` are disjoint in practice (the modes conflict); if a PURL somehow appears in both sets, `vendored` wins.
 
 `repair` keeps its `gc` visible alias.
 
@@ -353,8 +376,11 @@ per service outcome:
 
 Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), **cargo**
 (download + extract the `.crate`), **golang** (download + extract the module zip, verify the `h1:`
-dirhash, wire the `replace`), **composer** (download + extract the dist zip), and **gem** (download +
-extract the `.gem`, plus a `gem-stub-gemspec` SECOND artifact). The Tier-B ecosystems
+dirhash, wire the `replace`), **composer** (download + extract the dist zip), **gem** (download +
+extract the `.gem`, plus a `gem-stub-gemspec` SECOND artifact), and **nuget** (download the prebuilt
+`.nupkg`). **maven** attempts the prebuilt `.jar` download under `auto` but is NOT in the fail-closed
+`service` coverage list — `--vendor-source service` refuses maven purls with
+`vendor_service_unsupported_ecosystem`. The Tier-B ecosystems
 (cargo/golang/composer/gem) download the patched archive and extract it into the vendor directory —
 the same source tree the local build commits — then run the existing path-dep wiring; their
 build-equivalence is exercised by the toolchain-backed e2e suites (which skip when the package
@@ -400,7 +426,11 @@ source changes the rebuilt bytes and fails closed (`vendor_artifact_rebuild_fail
 kept). Reconstructed entries carry no pre-vendor wiring originals, so a later `--revert` degrades
 to the documented `vendor_lock_entry_drifted` guidance (re-resolve with the package manager). Because of this
 phase, `repair` no longer errors with `manifest_not_found` when the project has a vendor ledger
-or vendor-path lockfile references — it runs the vendored phase alone. Step 1's source download
+or vendor-path lockfile references — it runs the vendored phase alone. A **hosted-only** project
+(no manifest, no vendor ledger, no vendored references — only `.socket/vendor/redirect-state.json`)
+is a no-op: `repair` exits 0 with a `redirect_only_project` skip pointing at `scan --mode hosted`
+(hosted redirects have no local artifacts to repair), rather than the `manifest_not_found` error a
+bare directory still gets. Step 1's source download
 likewise skips vendored-in-sync manifest entries (their content lives in the committed artifact),
 so repairing a vendored project never re-litters `.socket/blobs`. `--dry-run` previews
 (`details.wouldRebuild`); `--offline` rebuilds only from fully local sources and fails per-entry
@@ -419,7 +449,7 @@ in every lockfile-visible path string. External tools recover "this dependency i
 by patch `<uuid>`" from the lockfile alone with this rule (no access to `.socket/` needed):
 
 ```text
-(?:file:)?(?:\./)?\.socket[/\\]vendor[/\\](npm|cargo|golang|composer|gem|pypi)[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\](.+)
+(?:file:)?(?:\./)?\.socket[/\\]vendor[/\\](npm|cargo|golang|composer|gem|pypi|nuget|maven)[/\\]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[/\\](.+)
 ```
 
 Updating a patch changes the UUID → changes the path → changes the lockfile, so staleness is
@@ -452,9 +482,11 @@ to **six flavors**.
 | pypi / pdm (pdm.lock) | (rebuilt wheel) | lock-only: the `[[package]]` gains the local-file `path` + `files[]` hash. pyproject + `content_hash` untouched. Non-fixture `[metadata] strategy` / hash-less locks refused | `pdm sync` (+ `pdm install --check`), cold cache |
 | pypi / pipenv (Pipfile.lock) | (rebuilt wheel) | lock-only: the `default`/`develop` entry → `{file, hashes:[sha256-of-our-wheel]}`. Pipfile + `_meta.hash` untouched. Emits `vendor_integrity_unverified` — pipenv does not hash-check file entries; the committed wheel bytes are the protection | `pipenv install --deploy` (+ `pipenv verify`), cold cache |
 | pypi / requirements.txt (pip / `uv pip`) | (rebuilt wheel) | pin line → `./<wheel> --hash=sha256:<hex>` (markers carried over; transitive deps appended) | `pip install -r` / `uv pip install -r` **run from the project root** (both resolve bare paths against the CWD) |
+| nuget | deterministically rebuilt `.nupkg` at `<idLower>.<versionNorm>.nupkg` (the uuid dir IS a NuGet folder feed; the stale embedded signature is dropped — unsigned is accepted under NuGet's default validation) | `nuget.config` source + `packageSourceMapping` for the id (creating the mapping from scratch ALSO fans a `<package pattern="*" />` out to every pre-existing source — mapping is exclusive, NU1100 otherwise) **+** `packages.lock.json` `contentHash` → `base64(sha512(nupkg))` when the lock exists (`vendor_nuget_no_lockfile` warning otherwise) | `dotnet restore --locked-mode`, cold cache, `--network none` (tampered nupkg fails NU1403) |
+| maven | deterministically rebuilt `.jar` + the **verbatim upstream pom** (transitives survive; refused via `vendor_maven_pom_unavailable` rather than fabricated) + `.sha1` sidecars, laid out as a maven2 repository under the uuid dir | `pom.xml` `<repository>` (`id=socket-patch-vendor-<uuid>`, `url=file://${project.basedir}/.socket/vendor/maven/<uuid>`, `checksumPolicy=fail`, snapshots disabled). Multi-module aggregator poms refused (`vendor_maven_multimodule_unsupported`); gradle-only projects refused (`vendor_gradle_unsupported`); always-on `vendor_maven_local_cache_shadow` advisory (warm `~/.m2` wins over any repository) | `mvn` build on a fresh checkout with the GAV purged from the local repo, `--network none` (docker capstone; note `mvn -o` refuses `file://` repositories outright) |
 
-Ecosystems with no vendor backend that this build still *recognizes* (maven/nuget/jsr when their
-features are compiled in) refuse per-purl with `vendor_unsupported_ecosystem`. yarn-berry **PnP**
+Ecosystems with no vendor backend that this build still *recognizes* (jsr when its feature is
+compiled in) refuse per-purl with `vendor_unsupported_ecosystem`. yarn-berry **PnP**
 (`.pnp.*`) and bun's binary `bun.lockb` are refused with stable codes pointing at the native
 alternative / a text-lockfile migration; a lock-less tool marker (a `[tool.uv]`/`[tool.poetry]`/
 `[tool.pdm]` table or a `Pipfile` without its lock) refuses `<tool>_no_lockfile` unless a
@@ -685,7 +717,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_revert_failed`    | top-level error  | remove: the vendor revert failed; the manifest was NOT modified. |
 | `vendor_state_retained`   | `skipped`        | remove `--skip-rollback`: vendor wiring + artifact deliberately left in place (the next `vendor` run reconciles the dropped entry). Also the top-level error code when `--skip-rollback` targets a detached-only patch. |
 | `vendor_stale_artifact_removed` | `removed`  | vendor / scan `--vendor`: re-vendor under a newer patch uuid removed the previous uuid's orphaned artifact dir. |
-| `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (maven/nuget/jsr, or compiled out). |
+| `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (jsr, or compiled out — maven/nuget have backends since their promotion to default features). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |
@@ -713,7 +745,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 
 | Code                  | Subcommands                      | Meaning |
 |-----------------------|----------------------------------|---------|
-| `manifest_not_found`  | list, remove, repair, rollback   | `.socket/manifest.json` doesn't exist. v3.5: `repair` proceeds anyway (vendored phase only) when a vendor ledger or vendor-path lockfile references exist. |
+| `manifest_not_found`  | list, remove, repair, rollback   | `.socket/manifest.json` doesn't exist. v3.5: `repair` proceeds anyway (vendored phase only) when a vendor ledger or vendor-path lockfile references exist, and exits 0 with a `redirect_only_project` skip (not this error) when the only `.socket/` trace is a hosted-mode `redirect-state.json`. |
 | `manifest_invalid`    | list, remove                     | Manifest exists but is unparseable. |
 | `manifest_unreadable` | list, remove                     | I/O error reading manifest. |
 | `apply_failed`        | apply                            | apply pipeline error before any patch ran. |

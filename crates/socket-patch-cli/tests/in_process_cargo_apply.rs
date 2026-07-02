@@ -242,6 +242,8 @@ async fn cargo_fetch_scan_sync_patches_real_file() {
         sync: true,
         vendor: false,
         detached: false,
+        redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     };
@@ -358,6 +360,8 @@ async fn cargo_apply_refuses_on_before_hash_mismatch() {
         sync: true,
         vendor: false,
         detached: false,
+        redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     };
@@ -453,6 +457,8 @@ async fn cargo_crawler_finds_real_fetched_crate() {
         sync: false,
         vendor: false,
         detached: false,
+        redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     };

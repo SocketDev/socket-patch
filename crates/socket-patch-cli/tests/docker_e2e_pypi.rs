@@ -27,6 +27,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:pypi/six@1.16.0";
 const UUID: &str = "12121212-1212-4121-8121-121212121212";
+/// The vulnerability the staged manifest carries so the agent-mode VEX leg
+/// has something to attest (plain agent provenance — no vendored/redirected
+/// marker — is what the host oracle asserts).
+const GHSA: &str = "GHSA-agent-pypi-real";
 
 /// The synthetic content that replaces the installed six.py file.
 /// Contains the marker we grep for to verify apply succeeded.
@@ -177,7 +181,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2024-30004"],
+                    "summary": "pypi agent e2e fixture vulnerability",
+                    "severity": "high",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "pypi e2e fixture",
             "license": "MIT",
             "tier": "free",
@@ -202,6 +214,15 @@ pip install --disable-pip-version-check --quiet --no-cache-dir six==1.16.0
 # Link the venv into the cwd so the python crawler discovers it.
 mkdir -p /workspace/proj && cd /workspace/proj
 ln -sf /workspace/venv .venv
+
+# Pre-seed setup.manual so the agent-mode VEX leg keeps the pypi patch through
+# property 7 (this venv project isn't `socket-patch setup`-configured; agent
+# patches are applied by hand/CI — exactly what `manual` declares). scan --sync
+# merges the downloaded patch into this manifest and preserves the setup block.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["pypi"] }} }}
+MANIFEST
 
 # Locate the installed six.py file.
 SIX_PY=$(ls /workspace/venv/lib/python3.*/site-packages/six.py)
@@ -279,6 +300,30 @@ if [ "$ACTUAL_SHA" != "{expected_sha}" ]; then
 fi
 
 echo "===PATCH VERIFIED===" >&2
+
+# Agent-mode VEX leg. The manifest scan --sync wrote carries {GHSA} (served in
+# the patch view); vex verifies the patched six.py in the venv site-packages
+# and attests it with PLAIN agent provenance. --ecosystems pypi (no --global,
+# matching the local apply above); --offline keeps vex local. The doc is
+# emitted between markers for the host-side oracle (no bind mount here).
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:pypi/e2e-app@1.0.0' --ecosystems pypi >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
+
 echo "===E2E PASS==="
 exit 0
 "#
@@ -701,6 +746,48 @@ fn skip_if_no_image() -> bool {
     false
 }
 
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
+/// the workspace inside the container with no bind mount, so the doc is parsed
+/// from captured stdout). Asserts exactly one statement attesting the agent
+/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
+/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
+/// marker — the marker's absence is what distinguishes agent provenance.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
+}
+
 fn run_container(_api_url: &str, script: &str) -> std::process::Output {
     let mut cmd = Command::new("docker");
     cmd.args([
@@ -735,6 +822,13 @@ async fn pypi_local_install_full_apply_chain() {
     assert!(stderr.contains("===SCAN VERIFIED==="), "stderr=\n{stderr}");
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the patched six.py.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
     assert_api_path_exercised(&server).await;
 }
 

@@ -1,0 +1,13 @@
+[
+  {
+    "ecosystem": "pypi",
+    "name": "click",
+    "version": "8.1.7",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "88888888-8888-8888-8888-888888888888",
+    "artifactUrl": "https://patch.socket.dev/patch/pypi/click/8.1.7/11111111-1111-1111-1111-111111111111/88888888-8888-8888-8888-888888888888/click-8.1.7-py3-none-any.whl",
+    "integrity": {
+      "sha256": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    }
+  }
+]

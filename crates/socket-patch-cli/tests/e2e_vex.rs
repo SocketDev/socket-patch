@@ -23,11 +23,32 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
 
-/// Every setup-supported ecosystem, declared `manual` in test fixtures so the
-/// property-7 setup-state filter (`commands/setup::configured_ecosystems`) does
-/// not drop these patches — these tests exercise VEX document GENERATION, not
-/// setup state, so they opt every patch in via the `manual` escape hatch.
+/// Always-compiled setup-supported ecosystems, declared `manual` in test
+/// fixtures so the property-7 setup-state filter
+/// (`commands/setup::configured_ecosystems`) does not drop these patches —
+/// these tests exercise VEX document GENERATION, not setup state, so they opt
+/// every patch in via the `manual` escape hatch. Feature-gated apply-only
+/// ecosystems (maven/nuget) are appended by [`all_manual`] when their cargo
+/// feature is on. (`cargo`/`golang`/`composer` are listed here unconditionally:
+/// when their feature is absent `ecosystem_from_manual_name` maps them to
+/// `None`, so the entry is a harmless no-op — the same reason maven/nuget are
+/// safe to add, just made explicit for the two that gate a matrix test.)
 const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
+
+/// [`ALL_MANUAL`] plus the feature-gated apply-only ecosystems (maven/nuget),
+/// appended only under their cargo feature — mirroring the `#[cfg]` arms in
+/// `vex::ecosystem_from_manual_name`. Declaring an ecosystem `manual` whose
+/// feature is not compiled in is a silent no-op (the name resolves to `None`),
+/// but gating the append keeps the emitted `setup.manual` honest to the build
+/// and lets the all-ecosystem agent matrix below declare every one of the 8.
+fn all_manual() -> Vec<String> {
+    let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
+    #[cfg(feature = "maven")]
+    names.push("maven".to_string());
+    #[cfg(feature = "nuget")]
+    names.push("nuget".to_string());
+    names
+}
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_socket-patch")
@@ -67,7 +88,7 @@ fn write_manifest(cwd: &Path, manifest: &PatchManifest) {
     let mut m = manifest.clone();
     m.setup = Some(SetupConfig {
         exclude: Vec::new(),
-        manual: ALL_MANUAL.iter().map(|s| s.to_string()).collect(),
+        manual: all_manual(),
     });
     std::fs::write(
         dir.join("manifest.json"),
@@ -255,6 +276,153 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
     let ids: Vec<&str> = subs.iter().map(|s| s["@id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"pkg:npm/foo@1.0.0"));
     assert!(ids.contains(&"pkg:npm/bar@2.0.0"));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Cross-ecosystem AGENT matrix — the agent-mode twin of
+// `e2e_vex_redirect::no_verify_attests_redirected_patches_across_ecosystems`.
+// One manifest patch per official ecosystem (qualified PURLs for the
+// release-variant ones: pypi `?artifact_id=`, gem `?platform=`, maven
+// `?classifier=&ext=`), `setup.manual` declaring every ecosystem (via
+// `all_manual`) so property 7 keeps them all, and `--no-verify` attests
+// straight from the manifest with no installed tree.
+//
+// Unlike the redirect matrix — whose patches bypass BOTH property 7 and
+// `Ecosystem::from_purl` via the `redirected` set — an agent patch routes
+// through `Ecosystem::from_purl` + the `manual` allowlist. That only resolves
+// for ecosystems whose cargo feature is compiled in, so getting all 8
+// statements requires every ecosystem feature present: hence the all-features
+// cfg gate (cargo/golang/nuget are default; maven/composer are the opt-ins
+// this gate additionally demands). Each statement must carry a PLAIN impact
+// statement (NO `(vendored)`/`(redirected)` marker — that is what distinguishes
+// agent provenance) and preserve the (possibly qualified) PURL verbatim as the
+// subcomponent id.
+#[cfg(all(
+    feature = "cargo",
+    feature = "golang",
+    feature = "composer",
+    feature = "maven",
+    feature = "nuget"
+))]
+#[test]
+fn no_verify_attests_agent_patches_across_ecosystems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // (manifest purl, GHSA id, patch uuid). Distinct uuids so each statement's
+    // plain impact string is uniquely pinned to its patch.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "pkg:npm/left-pad@1.3.0",
+            "GHSA-eco-npm",
+            "11111111-1111-4111-8111-111111111111",
+        ),
+        (
+            "pkg:pypi/six@1.16.0?artifact_id=sdist",
+            "GHSA-eco-pypi",
+            "22222222-2222-4222-8222-222222222222",
+        ),
+        (
+            "pkg:cargo/serde@1.0.0",
+            "GHSA-eco-cargo",
+            "33333333-3333-4333-8333-333333333333",
+        ),
+        (
+            "pkg:gem/rack@2.2.3?platform=ruby",
+            "GHSA-eco-gem",
+            "44444444-4444-4444-8444-444444444444",
+        ),
+        (
+            "pkg:golang/github.com/foo/bar@v1.4.2",
+            "GHSA-eco-golang",
+            "55555555-5555-4555-8555-555555555555",
+        ),
+        (
+            "pkg:maven/org.example/lib@1.0.0?classifier=native&ext=jar",
+            "GHSA-eco-maven",
+            "66666666-6666-4666-8666-666666666666",
+        ),
+        (
+            "pkg:nuget/Newtonsoft.Json@13.0.1",
+            "GHSA-eco-nuget",
+            "77777777-7777-4777-8777-777777777777",
+        ),
+        (
+            "pkg:composer/monolog/monolog@2.0.0",
+            "GHSA-eco-composer",
+            "88888888-8888-4888-8888-888888888888",
+        ),
+    ];
+
+    let mut manifest = PatchManifest::new();
+    for (purl, ghsa, uuid) in cases {
+        manifest.patches.insert(
+            purl.to_string(),
+            make_record(
+                uuid,
+                "package/index.js",
+                "a".repeat(64).as_str(),
+                "b".repeat(64).as_str(),
+                ghsa,
+                &["CVE-2024-1"],
+            ),
+        );
+    }
+    // write_manifest stamps setup.manual = all_manual(), which under this
+    // all-features cfg declares every one of the 8 ecosystems.
+    write_manifest(cwd, &manifest);
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "every ecosystem's agent patch must attest. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(
+        stmts.len(),
+        cases.len(),
+        "every ecosystem's agent patch must be attested (one statement each): {doc}"
+    );
+    for (purl, ghsa, uuid) in cases {
+        let st = stmts
+            .iter()
+            .find(|s| s["vulnerability"]["name"] == *ghsa)
+            .unwrap_or_else(|| panic!("missing statement for {ghsa}: {doc}"));
+        assert_eq!(st["status"], "not_affected");
+        let impact = st["impact_statement"]
+            .as_str()
+            .unwrap_or_else(|| panic!("impact_statement missing for {ghsa}: {doc}"));
+        // Plain agent phrasing — the exact-equality check simultaneously proves
+        // there is NO `(vendored)`/`(redirected)` provenance marker appended.
+        assert_eq!(
+            impact,
+            format!("Patched via Socket patch {uuid}"),
+            "{ghsa} must carry the PLAIN agent impact statement (no provenance marker)"
+        );
+        assert!(
+            !impact.contains("(vendored)") && !impact.contains("(redirected)"),
+            "{ghsa} agent attestation must have no provenance marker: {impact}"
+        );
+        assert_eq!(
+            st["products"][0]["subcomponents"][0]["@id"], *purl,
+            "the (possibly qualified) PURL must survive verbatim as the subcomponent id"
+        );
+    }
+
+    maybe_validate_with_vexctl(&String::from_utf8_lossy(&out.stdout));
 }
 
 #[test]

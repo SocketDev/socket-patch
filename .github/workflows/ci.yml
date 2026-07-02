@@ -337,6 +337,8 @@ jobs:
           case "${{ matrix.ecosystem }}" in
             composer) EXTRA="--test docker_e2e_vendor_composer" ;;
             gem)      EXTRA="--test docker_e2e_vendor_gem" ;;
+            maven)    EXTRA="--test docker_e2e_vendor_maven" ;;
+            nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
           esac
           cargo llvm-cov \
             --features docker-e2e,cargo,golang,maven,composer,nuget,deno \
@@ -454,6 +456,16 @@ jobs:
             suite: e2e_composer
           - os: ubuntu-latest
             suite: e2e_nuget
+          # Host vendor build-proof capstones: fresh-checkout install +
+          # revert against the REAL composer/bundler toolchains. `#[ignore]`-
+          # gated (the unpinned `test` job skips them); this job pins the
+          # toolchain (composer 2, bundler 2.5) below and runs them via
+          # `--ignored`. ubuntu-latest only — they need the pinned toolchain,
+          # not per-OS coverage.
+          - os: ubuntu-latest
+            suite: e2e_vendor_composer_build
+          - os: ubuntu-latest
+            suite: e2e_vendor_gem_build
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -539,7 +551,7 @@ jobs:
           python-version: '3.12.x'
 
       - name: Setup Ruby
-        if: matrix.suite == 'e2e_gem'
+        if: matrix.suite == 'e2e_gem' || matrix.suite == 'e2e_vendor_gem_build'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           # setup-ruby does NOT support `3.2.x` wildcard pinning the
@@ -549,7 +561,21 @@ jobs:
           # patch in the future, bump to whatever's available — see
           # https://github.com/ruby/setup-ruby for the supported list.
           ruby-version: '3.2.10'
+          # e2e_vendor_gem_build asserts the pair-edit lock grammar against
+          # the spike-verified bundler 2.5 floor; pin it so the host capstone
+          # does not ride whatever bundler the runner's Ruby happens to ship.
+          bundler: '2.5'
           bundler-cache: false
+
+      - name: Setup PHP
+        if: matrix.suite == 'e2e_vendor_composer_build'
+        # e2e_vendor_composer_build shells out to a real composer; pin the
+        # composer 2 major so the composer.lock grammar the pair edit asserts
+        # stays stable across runners.
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: '8.2'
+          tools: composer:2
 
       - name: Run e2e tests
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- --ignored
