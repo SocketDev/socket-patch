@@ -81,16 +81,81 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   corruption risk) while the committable vendor path is safe. The vendored
   path convention + uuid recovery rule now covers `nuget` and `maven` dirs,
   and `--vendor-source` prebuilt downloads cover nuget.
-- **Maven hosted rewriter (pom projects).** Hosted mode's maven leg: a
-  surgical `<repository id="socket-patch-<uuid>">` insert (releases enabled,
-  `checksumPolicy=fail`, snapshots disabled) pointing the patched GAV at a
-  single-artifact Socket maven2 repository. Same-GAV handling is VERIFY-ONLY
-  — the rewriter never edits a `<version>`; it warns when the redirect can't
-  take effect (`redirect_maven_dep_unpinned` for property/managed versions,
-  `redirect_maven_dep_not_found`, `redirect_maven_unsupported_packaging` for
-  non-jar `<type>`s). Gradle build scripts are never edited: a present
-  `build.gradle*`/`settings.gradle*` emits the paste-able `exclusiveContent`
-  snippet as a `redirect_gradle_manual_snippet` warning instead.
+- **Maven hosted rewriter (pom projects) — fail-closed version suffixing +
+  Trusted Checksums.** Hosted mode's maven leg pins the patched jar the only
+  way a lockfile-less ecosystem can: the serve route exposes the patch under a
+  Socket-only `<version>-socket.<hex8>` suffix (existing ONLY on the injected
+  `socket-patch-<uuid>` repository), and the rewriter pins that version
+  explicitly — it rewrites the literal `<version>`, or (for a transitive /
+  managed dependency with no literal version) adds a `<dependencyManagement>`
+  entry — alongside the `<repository>` insert (releases enabled,
+  `checksumPolicy=fail`, snapshots disabled). An outage or tamper on the Socket
+  repo then HARD-FAILS the build: the suffixed version resolves nowhere else,
+  so there is no silent fall-through to Central (the base version 404s). A
+  `${property}` version is refused (`redirect_maven_dep_unpinned` — a literal
+  edit would break the reference and a depMgmt pin could strand sibling
+  artifacts); a literal version matching neither the base nor the suffixed
+  value is skipped (`redirect_maven_dep_version_mismatch`); a non-jar `<type>`
+  is skipped (`redirect_maven_unsupported_packaging`). When the serve route
+  supplies both the jar and pom sha256, the rewriter also emits Maven 3.9+
+  Trusted Checksums files — `.mvn/maven.config` resolver args (`originAware=false`,
+  `failIfMissing=false`) + `.mvn/checksums/checksums.sha256` entries pinning
+  both artifacts under the suffixed version's local-repo path, merging into any
+  pre-existing user config / checksum set (a conflicting value is never
+  overridden — `redirect_maven_trusted_checksums_conflict`). The `.mvn/*` files
+  are silently inert below Maven 3.9 (the version suffixing is still fail-closed
+  on its own); on 3.9.0–3.9.8 a mismatch is enforced but reported unclearly
+  (readability fixed in 3.9.9, MNG-8182). When the upstream pom is unavailable /
+  unsuffixable the rewriter falls back to the legacy same-GAV repository
+  injection with a `redirect_maven_same_gav_fallback` warning (NOT fail-closed:
+  a Socket-repo failure falls back to the unpatched artifact). Gradle build
+  scripts are never edited: a present `build.gradle*` / `settings.gradle*`
+  emits a paste-able `exclusiveContent` snippet carrying the suffixed version
+  (`redirect_gradle_manual_snippet`) plus a reminder to bump the dependency
+  declaration — fail-closed by repository exclusivity.
+- **Hosted mode now rewrites yarn-berry and bun lockfiles.** The hosted npm
+  family gains two flavors beyond package-lock / pnpm / yarn-classic. **yarn
+  berry** (`__metadata:` v2+ lock): the rewriter edits ONLY the lock entry —
+  `resolution:` gains yarn's own `::__archiveUrl=<encodeURIComponent(url)>`
+  binding and `checksum:` becomes the precomputed `yarnBerry10c0` cache-zip
+  sha512 — leaving the descriptor key and `package.json` untouched, so `yarn
+  install --immutable --check-cache` passes and tamper fails YN0018. Whole-file
+  gates refuse a `cacheKey ≠ 10c0` or a `.yarnrc.yml compressionLevel ≠ 0`
+  (`redirect_yarn_berry_cache_unsupported`) — no offline-reproducible checksum.
+  Validated e2e against real `corepack yarn@4.12.0` on the node-modules linker;
+  PnP is not exercised for hosted (the lock rewrite fires, but PnP's
+  `.yarn/cache` resolution is untested). **bun** (text `bun.lock` v1): the
+  packages-entry registry 4-tuple `["name@ver","<reg>",{deps},"sha512-…"]` is
+  rewritten to a URL 3-tuple `["name@<url>",{deps},"sha512-…"]`, fail-closed on
+  any grammar deviation; `bun install --frozen-lockfile` then installs the
+  hosted bytes and tamper fails the integrity check. A binary `bun.lockb` with
+  no text lock is auto-migrated first via the user's own `bun install
+  --save-text-lockfile --frozen-lockfile --lockfile-only` (deletes `bun.lockb`,
+  recorded as a `removed` ledger edit, offline, fails closed;
+  `redirect_bun_lockb_would_migrate` on `--dry-run`,
+  `redirect_bun_lockb_unsupported` if the migration is unavailable). The Rust
+  rewriters are byte-identical to the depscan backend's TS twins via shared
+  golden fixtures.
+- **Hosted mode supports Rush monorepos.** A Rush repo has no root
+  `package.json`/lockfile pair — its pnpm source-of-truth lock lives at
+  `common/config/rush/pnpm-lock.yaml` (plus one per subspace under
+  `common/config/subspaces/<name>/`). `scan --mode hosted` discovers those
+  locks when `rush.json` is present and repoints them in place (the pnpm
+  rewriter is now basename-generalized, so nested locks rewrite path-generically).
+  Editing a Rush lock outside `rush update` desyncs the `pnpmShrinkwrapHash` in
+  `common/config/rush/repo-state.json`, so a `redirect_rush_repo_state_stale`
+  warning fires when a lock was touched and that file exists — `rush install`
+  fails under `preventManualShrinkwrapChanges` until `rush update` refreshes it,
+  but the redirect survives the refresh (pnpm keeps locked resolutions for
+  unchanged specifiers). Agent mode already works through Rush's generated
+  project symlink farm; vendored mode is refused (`vendor_rush_unsupported`)
+  because `rush install` copies the lock into `common/temp`, so vendor's
+  relative `file:` specs can't survive — the refusal routes to hosted mode.
+- **pnpm hosted rewriter generalized to nested lockfiles.** The
+  `pnpm-lock.yaml` rewriter now matches any `pnpm-lock.yaml` at the project
+  root OR at any nested path (`*/pnpm-lock.yaml`), so Rush subspace locks and
+  other nested-lock layouts are rewritten in place under their repo-relative
+  keys. Write-back and confirmed-redirect gating are path-generic.
 - **Golang hosted mode is a documented NO-GO.** Hosted redirect for Go is
   deliberately unsupported — sumdb hard-fails the patched pseudo-version on
   every day-2 machine and the only escapes are uncommittable machine-local
@@ -208,6 +273,15 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   patches were silently omitted from the document (reported `not_applied`,
   or `package_not_found` on cache-less CI). Verification now follows the
   managed `replace` directive to the committed copy.
+
+- **`repair` on a hosted-only project is an informational no-op.** Hosted
+  (`--mode hosted`) mode leaves no local artifacts to repair — the lockfiles
+  point at `patch.socket.dev` URLs, and there is no manifest or vendor ledger.
+  A project whose only `.socket/` trace is `redirect-state.json` (no manifest,
+  no vendor ledger, no vendored lockfile references) previously errored with
+  `manifest_not_found` (exit 1); it now exits 0 with a `redirect_only_project`
+  skip pointing at `scan --mode hosted`. Repair still errors on a bare
+  directory with no traces at all.
 
 ## [3.2.0] — 2026-05-29
 
