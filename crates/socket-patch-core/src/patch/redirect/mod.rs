@@ -3137,7 +3137,7 @@ mod tests {
                 .to_string(),
         );
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(
             r.files.is_empty() && r.warnings.is_empty(),
             "classic declined"
@@ -3147,7 +3147,7 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("yarn.lock".to_string(), berry_lock("8c0"));
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
 
@@ -3159,7 +3159,7 @@ mod tests {
             "compressionLevel: 9\n".to_string(),
         );
         let mut r = RewriteResult::default();
-        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
 
@@ -3225,7 +3225,7 @@ mod tests {
         let mut files = BTreeMap::new();
         files.insert("bun.lockb".to_string(), "BINARY-NEVER-PARSED".to_string());
         let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lockb_unsupported");
 
@@ -3240,7 +3240,7 @@ mod tests {
         );
         files.insert("bun.lockb".to_string(), "BINARY".to_string());
         let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.contains_key("bun.lock"));
         assert!(!r
             .warnings
@@ -3257,7 +3257,7 @@ mod tests {
             ),
         );
         let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
 
@@ -3270,7 +3270,7 @@ mod tests {
                 .to_string(),
         );
         let mut r = RewriteResult::default();
-        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
 
