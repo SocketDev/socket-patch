@@ -631,7 +631,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
 | `SOCKET_UNLOCK_RELEASE` | `unlock --release` | `false` | Local to `unlock`. Delete the lock file when free; refused when held. |
 | `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
-| `SOCKET_VEX` | `apply --vex` / `scan --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on `apply`/`scan` they bind to `--vex-product` etc. |
+| `SOCKET_VEX` | `apply --vex` / `scan --vex` / `vendor --vex` | (none) | Embedded OpenVEX output path. The `SOCKET_VEX_*` knobs (`_PRODUCT`, `_NO_VERIFY`, `_DOC_ID`, `_COMPACT`) are shared with the standalone `vex` command; on the host commands they bind to `--vex-product` etc. |
 | `SOCKET_VEX_OUTPUT` | `vex --output` / `-O` | (none) | Local to the standalone `vex`: document output path (required with `--json`). |
 
 ### Registry override env vars

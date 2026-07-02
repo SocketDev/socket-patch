@@ -150,7 +150,7 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--cwd <dir>` | `SOCKET_CWD` | Working directory (default: `.`). The manifest path is resolved relative to this. |
-| `-m, --manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
+| `--manifest-path <path>` | `SOCKET_MANIFEST_PATH` | Path to the patch manifest, resolved relative to `--cwd` (default: `.socket/manifest.json`). |
 | `--api-url <url>` | `SOCKET_API_URL` | Socket API URL for the authenticated endpoint (default: `https://api.socket.dev`). |
 | `--api-token <token>` | `SOCKET_API_TOKEN` | Socket API token. When omitted, the public patch proxy is used. |
 | `-o, --org <slug>` | `SOCKET_ORG_SLUG` | Organization slug. Auto-resolved when omitted and a token is set. |
@@ -161,15 +161,16 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | `--vendor-url <url>` | `SOCKET_VENDOR_URL` | Base host for the vendoring service's package-reference request (default: the active `--api-url`/`--proxy-url` base). Point at staging / local dev for testing. |
 | `--patch-server-url <url>` | `SOCKET_PATCH_SERVER_URL` | Override the host of the prebuilt-archive download URL the service returns (default: as returned). Mainly for local-dev / testing. |
 | `--offline` | `SOCKET_OFFLINE` | Strict airgap: never contact the network. Operations that need remote data fail loudly. |
+| `--strict` | `SOCKET_STRICT` | Fail-closed on before-hash mismatches instead of the default warn-and-overwrite: a file whose current content matches neither `beforeHash` nor `afterHash` aborts that package's apply. Overridden by `--force`. |
 | `-g, --global` | `SOCKET_GLOBAL` | Operate on globally-installed packages. |
 | `--global-prefix <path>` | `SOCKET_GLOBAL_PREFIX` | Override the path used to discover globally-installed packages. |
-| `-j, --json` | `SOCKET_JSON` | Emit machine-readable JSON output. Every JSON response includes a `"status"` field (`"success"`, `"error"`, `"no_manifest"`, etc.) for reliable programmatic consumption. |
+| `-j, --json` | `SOCKET_JSON` | Emit machine-readable JSON output. Every JSON response includes a `"status"` field — camelCase on the envelope commands (`"success"`, `"error"`, `"noManifest"`, `"partialFailure"`; apply/list/repair/remove/vendor), snake_case on the legacy shapes (`"partial_failure"`, `"not_found"`; get/scan/rollback/setup). See [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md) for the exact shapes. |
 | `-v, --verbose` | `SOCKET_VERBOSE` | Show extra detail in human-readable output. |
 | `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
 | `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
 | `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
-| `--break-lock` | `SOCKET_BREAK_LOCK` | Force-remove a stale `.socket/apply.lock` before acquiring it. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
+| `--break-lock` | `SOCKET_BREAK_LOCK` | Reclaim a stale `.socket/apply.lock` (one left by a crashed run) before acquiring it — the file itself is never deleted, and a lock with a live holder is refused. Use only when no other socket-patch process is running; emits an auditable `lock_broken` event in the JSON envelope. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 
@@ -762,7 +763,7 @@ socket-patch scan --json --mode agent --prune --yes | jq '{
 
 # Apply patches and check result
 socket-patch apply --json | jq '.status'
-# "success", "partial_failure", "no_manifest", or "error"
+# "success", "partialFailure", "noManifest", or "error"
 ```
 
 When stdin is not a TTY (e.g., in CI pipelines), interactive prompts auto-proceed instead of blocking. Progress indicators and ANSI colors are automatically suppressed when output is piped.
