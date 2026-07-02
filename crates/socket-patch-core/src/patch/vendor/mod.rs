@@ -53,6 +53,7 @@ pub mod cargo;
 pub mod cargo_config;
 #[cfg(feature = "cargo")]
 pub mod cargo_lock;
+pub(crate) mod common;
 #[cfg(feature = "composer")]
 pub mod composer_lock;
 pub mod gem;

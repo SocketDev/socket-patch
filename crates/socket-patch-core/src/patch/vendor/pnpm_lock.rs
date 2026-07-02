@@ -33,16 +33,16 @@
 //! unwinds package.json to its original bytes so the P3 desync pair is
 //! never left behind.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::{already_patched_verify, synthesized_result};
 use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
@@ -1830,41 +1830,13 @@ fn serialize_json(doc: &Value, indent: &str) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn synthesized_result(
-    package_key: &str,
-    path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use std::collections::HashMap;
     use base64::Engine as _;
     use sha2::{Digest, Sha512};
     use std::path::PathBuf;

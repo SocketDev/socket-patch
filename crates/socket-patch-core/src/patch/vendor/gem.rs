@@ -46,22 +46,20 @@
 //! sources and the missing `.so` only fails at `require` time with a
 //! confusing error — refusing up front is the honest failure.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
-};
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
+use super::common::{
+    already_patched_verify, copy_matches_after_hashes, refused, synthesized_result,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_gem_data;
 use super::service_fetch::{
@@ -1565,73 +1563,14 @@ fn gemspec_declares_extensions(spec_text: &str) -> bool {
     false
 }
 
-/// True when the copy exists and every patched file in it already hashes to
-/// its `afterHash` (the vendor twin of `go_redirect::redirect_in_sync`).
-async fn copy_matches_after_hashes(
-    copy_dir: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never hash through a manifest key that escapes the copy
-        // dir — fail the sync check instead (the full pipeline would refuse
-        // the key anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        match compute_file_git_sha256(&copy_dir.join(normalized)).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
-fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
-    VendorOutcome::Refused {
-        code,
-        detail: detail.into(),
-    }
-}
-
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::VerifyStatus;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";

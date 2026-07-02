@@ -21,16 +21,16 @@
 //! blocks (comments, blank lines, other blocks, CRLF line endings) is
 //! preserved verbatim, so yarn's re-serialization produces no churn.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::{already_patched_verify, synthesized_result};
 use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
@@ -773,45 +773,13 @@ pub(super) fn json_to_lines(value: &Value) -> Option<Vec<String>> {
         .collect()
 }
 
-// ─────────────── shared synthesized-result helpers ───────────────
-// (mirrors npm_lock's private helpers; pub(super) so the berry backend can
-// synthesize the same in-sync AlreadyPatched shape)
-
-pub(super) fn synthesized_result(
-    package_key: &str,
-    path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-pub(super) fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use std::collections::HashMap;
     use base64::Engine as _;
     use serde_json::json;
     use sha1::Digest as _;

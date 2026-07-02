@@ -27,13 +27,12 @@
 //! grammar that fails CLOSED on anything unexpected; the file is never fed
 //! to a JSON parser.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::PatchSources;
 use crate::patch::bun_lock_text::{
     check_lock_version, decode_json_string, packages_bounds, parse_entry_line,
     parse_packages_section, split_name_spec, BunEntry,
@@ -41,6 +40,7 @@ use crate::patch::bun_lock_text::{
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::{already_patched_verify, synthesized_result};
 use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
@@ -467,45 +467,13 @@ fn json_str(s: &str) -> String {
     format!("\"{s}\"")
 }
 
-// ───────────────────────── small shared helpers ───────────────────────────
-// (same shapes as npm_lock's; duplicated because that module's helpers are
-// private and this file is the only allowed edit surface)
-
-fn synthesized_result(
-    package_key: &str,
-    path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
+    use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use std::collections::HashMap;
     use base64::Engine as _;
     use sha2::{Digest, Sha512};
     use std::path::PathBuf;

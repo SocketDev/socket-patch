@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult, VerifyStatus};
+use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
@@ -29,6 +29,7 @@ use crate::patch::go_redirect::{
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
+use super::common::{already_patched_verify, copy_matches_after_hashes, synthesized_result};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip_with_prefix;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -36,17 +37,6 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
-}
 
 /// A synthesized success [`ApplyResult`] for a service-downloaded module: there
 /// is no local apply to verify (the downloaded zip IS the patched module), so
@@ -57,34 +47,7 @@ fn synthesized_success(
     copy_dir: &Path,
     files_verified: Vec<VerifyResult>,
 ) -> ApplyResult {
-    ApplyResult {
-        package_key: purl.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success: true,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: std::collections::HashMap::new(),
-        error: None,
-        sidecar: None,
-    }
-}
-
-/// The committed copy exists and every patched file matches its afterHash.
-async fn copy_hashes_ok(
-    copy_dir: &Path,
-    files: &std::collections::HashMap<String, crate::manifest::schema::PatchFileInfo>,
-) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let path = copy_dir.join(crate::patch::apply::normalize_file_path(file_name));
-        match crate::patch::file_hash::compute_file_git_sha256(&path).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
+    synthesized_result(purl, copy_dir, files_verified, true, None)
 }
 
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
@@ -166,7 +129,7 @@ pub async fn vendor_go_module(
     let copy_dir = project_root
         .join(&base_rel)
         .join(format!("{module}@{version}"));
-    let copy_was_ok = wired && copy_hashes_ok(&copy_dir, &record.files).await;
+    let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
     // Vendor auto-force policy (the engine's copy is staged from the
     // pristine source, never the user's tree — see `force_apply_staged`):

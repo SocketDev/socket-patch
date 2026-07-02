@@ -52,14 +52,14 @@ use sha2::{Digest as _, Sha512};
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources, VerifyResult,
-    VerifyStatus,
+    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
 };
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
+use super::common::{already_patched_verify, refused, synthesized_result};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -1480,45 +1480,8 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
     let _ = remove_tree(uuid_dir).await;
 }
 
-fn refused(code: &'static str, detail: impl Into<String>) -> VendorOutcome {
-    VendorOutcome::Refused {
-        code,
-        detail: detail.into(),
-    }
-}
-
-fn synthesized_result(
-    package_key: &str,
-    nupkg_path: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: nupkg_path.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
 fn failed_result(purl: &str, nupkg_path: &Path, error: String) -> ApplyResult {
     synthesized_result(purl, nupkg_path, Vec::new(), false, Some(error))
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
 }
 
 #[cfg(test)]

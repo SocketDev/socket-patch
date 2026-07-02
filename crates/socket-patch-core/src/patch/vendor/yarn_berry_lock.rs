@@ -40,14 +40,15 @@ use crate::utils::fs::atomic_write_bytes;
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
+use super::common::{already_patched_verify, synthesized_result};
 use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    already_patched_verify, body_field_line, detect_eol, json_to_lines, lines_to_json,
-    replace_block, scan_blocks, split_key_patterns, split_pattern, synthesized_result, LockBlock,
+    body_field_line, detect_eol, json_to_lines, lines_to_json, replace_block, scan_blocks,
+    split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 

@@ -13,20 +13,17 @@
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, so all the
 //! verify → package/diff/blob → atomic-write machinery is reused unchanged.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    normalize_file_path, ApplyResult, PatchSources, VerifyResult, VerifyStatus,
-};
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 
 use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
 use super::cargo_lock::{self, LockEditError, LockEntryOriginal};
+use super::common::{already_patched_verify, copy_matches_after_hashes, synthesized_result};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_tgz;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -75,25 +72,6 @@ async fn lock_entry_detached(project_root: &Path, name: &str, version: &str) -> 
     )
 }
 
-/// True if the copy exists, every patched file in it already hashes to its
-/// `afterHash`, the config entry points at this copy, and the lock entry is
-/// already detached — i.e. a re-run has nothing to do. Touch nothing then, so
-/// cargo's source fingerprint and the committed bytes stay stable.
-/// The committed copy exists and every patched file matches its afterHash.
-async fn copy_hashes_ok(copy_dir: &Path, files: &HashMap<String, PatchFileInfo>) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
-        return false;
-    }
-    for (file_name, info) in files {
-        let path = copy_dir.join(normalize_file_path(file_name));
-        match compute_file_git_sha256(&path).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
 /// The config `[patch]` entry points at THIS copy and the lock entry is
 /// already detached — the wiring half of the in-sync test.
 async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel: &str) -> bool {
@@ -102,36 +80,6 @@ async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel
         return false;
     }
     lock_entry_detached(project_root, name, version).await
-}
-
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
 }
 
 fn done(
@@ -397,7 +345,7 @@ pub async fn vendor_cargo_crate(
     // Hot path: already in sync → touch nothing (entry stays with the caller's
     // existing ledger record, which holds the unrecoverable lock originals).
     if wiring_in_sync(project_root, name, version, &copy_rel).await {
-        if copy_hashes_ok(&copy_dir, &record.files).await {
+        if copy_matches_after_hashes(&copy_dir, &record.files).await {
             let verified = record
                 .files
                 .keys()
@@ -756,8 +704,9 @@ pub async fn revert_cargo_vendor(
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    use crate::manifest::schema::VulnerabilityInfo;
+    use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
+    use std::collections::HashMap;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const PURL: &str = "pkg:cargo/cfg-if@1.0.4";

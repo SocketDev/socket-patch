@@ -28,9 +28,11 @@ use std::path::{Path, PathBuf};
 use crate::manifest::schema::{PatchFileInfo, PatchManifest};
 use crate::patch::apply::{
     apply_package_patch, normalize_file_path, ApplyResult, MismatchPolicy, PatchSources,
-    VerifyResult, VerifyStatus,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
+use crate::patch::vendor::common::{
+    already_patched_verify, copy_matches_after_hashes, synthesized_result,
+};
 use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
 use super::copy_tree::{fresh_copy, remove_tree};
@@ -504,15 +506,8 @@ async fn redirect_in_sync(
     version: &str,
     base_rel: &str,
 ) -> bool {
-    if tokio::fs::metadata(copy_dir).await.is_err() {
+    if !copy_matches_after_hashes(copy_dir, files).await {
         return false;
-    }
-    for (file_name, info) in files {
-        let path = copy_dir.join(normalize_file_path(file_name));
-        match compute_file_git_sha256(&path).await {
-            Ok(h) if h == info.after_hash => {}
-            _ => return false,
-        }
     }
     let expected = replace_target_path(base_rel, module, version);
     read_replace_entries(project_root).await.iter().any(|e| {
@@ -546,36 +541,6 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
 /// hardened writer.
 async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     crate::utils::fs::atomic_write_bytes(path, content).await
-}
-
-fn synthesized_result(
-    package_key: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-    success: bool,
-    error: Option<String>,
-) -> ApplyResult {
-    ApplyResult {
-        package_key: package_key.to_string(),
-        package_path: copy_dir.display().to_string(),
-        success,
-        files_verified,
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error,
-        sidecar: None,
-    }
-}
-
-fn already_patched_verify(file: &str) -> VerifyResult {
-    VerifyResult {
-        file: file.to_string(),
-        status: VerifyStatus::AlreadyPatched,
-        message: None,
-        current_hash: None,
-        expected_hash: None,
-        target_hash: None,
-    }
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,

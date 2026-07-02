@@ -32,6 +32,10 @@ use super::path::vendor_uuid_dir_rel;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
 
+/// Re-export of the shared refusal helper so the npm-flavor backends keep
+/// importing it from here.
+pub(super) use super::common::refused;
+
 /// Validated npm vendoring coordinates (the output of
 /// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
 /// components (the API serves scoped purls as `%40scope/name`; the
@@ -574,10 +578,6 @@ async fn read_staged_package_json(stage: &Path) -> Result<Value, String> {
         .map_err(|e| format!("patched package.json unreadable in the stage: {e}"))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| format!("patched package.json is not parseable JSON: {e}"))
-}
-
-pub(super) fn refused(code: &'static str, detail: String) -> VendorOutcome {
-    VendorOutcome::Refused { code, detail }
 }
 
 /// A backend failure after the refusal phase: `Done` with a failed
