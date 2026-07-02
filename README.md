@@ -536,6 +536,34 @@ socket-patch repair --download-only
 socket-patch repair --json
 ```
 
+### `unlock`
+
+Inspect — and optionally release — the `.socket/apply.lock` advisory lock that the mutating commands (`apply`, `rollback`, `repair`, `remove`, `vendor`) take. Exits `0` when the lock is free and `1` when another socket-patch process holds it, so CI gates and monitoring can pattern-match the exit code without parsing JSON.
+
+Reach for it when recovering from a crashed run that left a stale `apply.lock` behind: `unlock` tells you whether anything still holds the lock, and `unlock --release` deletes the file once it's confirmed free. A held lock is never released — for that scenario re-run the failing mutating command with [`--break-lock`](#global-options) (or wait for the holder with `--lock-timeout`).
+
+**Usage:**
+```bash
+socket-patch unlock [options]
+```
+
+**Command-specific options** (plus all [Global Options](#global-options)):
+| Flag | Description |
+|------|-------------|
+| `--release` | When the lock is free, also delete the lock file (it is normally retained across runs). Refused when the lock is held. (env: `SOCKET_UNLOCK_RELEASE`) |
+
+**Examples:**
+```bash
+# Is anything holding the lock?
+socket-patch unlock
+
+# Free a stale lock left by a crashed run
+socket-patch unlock --release
+
+# JSON output for scripting
+socket-patch unlock --json
+```
+
 ### `setup`
 
 Configure your project so patches are **re-applied automatically after install** — no manual `socket-patch apply` step in CI. `setup` is a one-time operation: run it, commit the change together with your `.socket/` patches, and every later install handles the rest. It is strictly **opt-in** — nothing is hooked unless you run `setup` and commit the result.
@@ -627,6 +655,19 @@ socket-patch vex --json --output socket.vex.json
 # Generate on a build box without verifying on-disk files
 socket-patch vex --no-verify --output socket.vex.json
 ```
+
+### Undoing things
+
+Six commands undo different layers of socket-patch state — pick by what you want back:
+
+| Command | What it undoes |
+|---------|----------------|
+| [`rollback`](#rollback) | Restores the original file bytes but **keeps the manifest entry** — the next `apply` re-applies the patch |
+| [`remove`](#remove) | Rollback **plus** deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
+| [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
+| [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages no longer installed and garbage-collects orphan blob/diff/archive files — installed patches stay |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
+| [`unlock --release`](#unlock) | **Frees a stale lock** left by a crashed run — never touches patches or the manifest, and refuses while the lock is held |
 
 ## OpenVEX attestations
 

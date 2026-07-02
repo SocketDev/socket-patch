@@ -106,13 +106,13 @@ fn apply_dry_run_empty_manifest_emits_dry_run_envelope() {
         .unwrap_or_else(|e| panic!("invalid JSON: {e}\n{stdout}"));
     assert_eq!(v["command"], "apply");
     assert_eq!(v["dryRun"], true);
-    // INTENDED CONTRACT (see this test's doc-comment: "reports dryRun:true
-    // and success"). These two asserts are currently RED and intentionally
-    // left so: `apply` against an empty/non-matching manifest exits 1 with
-    // status="partialFailure" instead of a clean no-op success. That is a
-    // known, separately-tracked production bug (it breaks the npm
-    // postinstall hook, which runs `apply` on every install) — NOT a test
-    // defect. Do not relax these to match the buggy output; fix the bug.
+    // Pinned contract: `apply` against an empty manifest is a clean no-op
+    // success — exit 0, status "success" — never a partialFailure/exit-1.
+    // This is load-bearing for the install hooks (npm postinstall, the
+    // Python .pth hook, the Bundler plugin), which run `apply` on every
+    // install; a non-zero exit there would break user installs. The
+    // non-dry-run flavor is pinned by
+    // `in_process_edge_cases::apply_empty_manifest_is_noop`.
     assert_eq!(
         out.status.code(),
         Some(0),
