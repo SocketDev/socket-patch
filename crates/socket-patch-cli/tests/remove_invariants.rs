@@ -432,3 +432,92 @@ fn remove_honors_manifest_path_override() {
         "remove must not create a default .socket manifest when --manifest-path is given"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --dry-run (global contract row: "Preview, no mutations")
+// ---------------------------------------------------------------------------
+
+/// `remove --dry-run` must mutate NOTHING — the manifest keeps every entry —
+/// while the envelope reports the preview: `dryRun: true`, per-purl
+/// `Verified` events (the apply/vendor/repair dry-run convention), and
+/// `summary.removed` stays 0 because no entry was actually deleted.
+#[test]
+fn remove_dry_run_keeps_manifest_and_emits_verified_previews() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = make_socket_dir(tmp.path());
+
+    let (code, stdout) = run_remove(
+        tmp.path(),
+        "pkg:npm/__remove_test_a__@1.0.0",
+        &["--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["command"], "remove");
+    assert_eq!(v["dryRun"], true);
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "a preview must not count as a removal"
+    );
+
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["action"] == "verified"
+            && e["purl"] == "pkg:npm/__remove_test_a__@1.0.0"),
+        "expected a Verified preview event for the matched purl: {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e["action"] != "removed"),
+        "dry-run must not emit Removed events: {events:?}"
+    );
+
+    // The on-disk manifest is untouched: both entries survive.
+    let manifest = read_manifest(&socket);
+    let patches = manifest["patches"].as_object().unwrap();
+    assert_eq!(patches.len(), 2, "dry-run must not delete manifest entries");
+    assert!(patches.contains_key("pkg:npm/__remove_test_a__@1.0.0"));
+    assert!(patches.contains_key("pkg:npm/__remove_test_b__@2.0.0"));
+}
+
+/// The blob sweep runs in preview mode on `--dry-run`: the artifact-level
+/// carrier event reports how many blobs WOULD be swept (as `Verified`,
+/// with `details.blobsRemoved`), but the blob files stay on disk.
+#[test]
+fn remove_dry_run_previews_blob_sweep_without_deleting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = make_socket_dir(tmp.path());
+
+    // A's afterHash blob: referenced only by entry A, so removing A
+    // makes it sweepable.
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob_a =
+        blobs.join("1111111111111111111111111111111111111111111111111111111111111111");
+    std::fs::write(&blob_a, b"patched contents").unwrap();
+
+    let (code, stdout) = run_remove(
+        tmp.path(),
+        "pkg:npm/__remove_test_a__@1.0.0",
+        &["--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["dryRun"], true);
+
+    let events = v["events"].as_array().expect("events array");
+    let carrier = events
+        .iter()
+        .find(|e| e["action"] == "verified" && e["details"]["blobsRemoved"].is_number())
+        .unwrap_or_else(|| panic!("expected a Verified blob-sweep carrier event: {events:?}"));
+    assert_eq!(
+        carrier["details"]["blobsRemoved"], 1,
+        "the preview must count A's now-unreferenced blob"
+    );
+
+    assert!(
+        blob_a.exists(),
+        "dry-run must not delete blobs from disk"
+    );
+    let manifest = read_manifest(&socket);
+    assert_eq!(manifest["patches"].as_object().unwrap().len(), 2);
+}

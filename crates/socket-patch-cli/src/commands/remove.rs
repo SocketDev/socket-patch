@@ -132,7 +132,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Command::Remove,
         args.common.json,
         args.common.silent,
-        false, // remove has no --dry-run
+        args.common.dry_run,
         Duration::from_secs(args.common.lock_timeout.unwrap_or(0)),
         args.common.break_lock,
     ) {
@@ -228,8 +228,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
         eprintln!();
     }
 
+    // `--dry-run` previews without mutating, so there is nothing to
+    // confirm — skip the prompt (matching the global contract row:
+    // "Preview, no mutations").
     let prompt = format!("Remove {} patch(es) and rollback files?", matching.len());
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json && !args.common.silent {
             println!("Removal cancelled.");
         }
@@ -246,7 +249,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             &args.common.cwd,
             &manifest_path,
             Some(&args.identifier),
-            false,
+            args.common.dry_run,
             args.common.json || args.common.silent,
             args.common.offline,
             args.common.global,
@@ -360,7 +363,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
         } else {
             for (key, entry) in &vendored_matches {
-                let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+                let outcome =
+                    dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
                 for w in &outcome.warnings {
                     if !args.common.json {
                         eprintln!("Warning ({}): {}", w.code, w.detail);
@@ -388,6 +392,20 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     );
                     return 1;
                 }
+                if args.common.dry_run {
+                    if !args.common.json {
+                        println!("Would revert vendoring for {key}");
+                    }
+                    // Dry-run flips the would-be Removed to a Verified
+                    // preview, same convention as apply/vendor/repair.
+                    vendor_reverted_events.push(
+                        PatchEvent::new(PatchAction::Verified, key.clone()).with_reason(
+                            "vendor_would_revert",
+                            "vendoring would be reverted on remove",
+                        ),
+                    );
+                    continue;
+                }
                 vendor_state.entries.remove(key);
                 if let Err(e) = save_state(&args.common.cwd, &vendor_state).await {
                     emit_error_envelope(
@@ -408,8 +426,18 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
-    // Now remove from manifest
-    match remove_patch_from_manifest(&args.identifier, &manifest_path).await {
+    // Now remove from manifest. On --dry-run the removal is simulated in
+    // memory (manifest untouched) so the blob sweep below can still
+    // preview against the post-removal reference set.
+    let removal = if args.common.dry_run {
+        let removed: Vec<String> = matching.iter().map(|(purl, _)| (*purl).clone()).collect();
+        let mut simulated = manifest.clone();
+        simulated.patches.retain(|purl, _| !removed.contains(purl));
+        Ok((removed, simulated))
+    } else {
+        remove_patch_from_manifest(&args.identifier, &manifest_path).await
+    };
+    match removal {
         Ok((removed, manifest)) => {
             if removed.is_empty() {
                 emit_not_found(
@@ -423,25 +451,48 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
 
             if !args.common.json && !args.common.silent {
-                println!("Removed {} patch(es) from manifest:", removed.len());
+                if args.common.dry_run {
+                    println!("Would remove {} patch(es) from manifest:", removed.len());
+                } else {
+                    println!("Removed {} patch(es) from manifest:", removed.len());
+                }
                 for purl in &removed {
                     println!("  - {purl}");
                 }
-                println!("\nManifest updated at {}", manifest_path.display());
+                if args.common.dry_run {
+                    println!("\nDry run — nothing was changed.");
+                } else {
+                    println!("\nManifest updated at {}", manifest_path.display());
+                }
             }
 
-            // Clean up unused blobs
+            // Clean up unused blobs (previewed, not deleted, on --dry-run).
             let blobs_path = socket_dir.join("blobs");
             let mut blobs_removed = 0;
-            if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
+            if let Ok(cleanup_result) =
+                cleanup_unused_blobs(&manifest, &blobs_path, args.common.dry_run).await
+            {
                 blobs_removed = cleanup_result.blobs_removed;
                 if !args.common.json && !args.common.silent && cleanup_result.blobs_removed > 0 {
-                    println!("\n{}", format_cleanup_result(&cleanup_result, false));
+                    println!(
+                        "\n{}",
+                        format_cleanup_result(&cleanup_result, args.common.dry_run)
+                    );
                 }
             }
 
             if args.common.json {
                 let mut env = Envelope::new(Command::Remove);
+                env.dry_run = args.common.dry_run;
+                // Dry-run flips would-be Removed events to Verified
+                // previews (the apply/vendor/repair convention), so
+                // `summary.removed` stays "manifest entries actually
+                // deleted" — zero on a preview.
+                let removal_action = if args.common.dry_run {
+                    PatchAction::Verified
+                } else {
+                    PatchAction::Removed
+                };
                 if lock_was_broken {
                     env.record(lock_broken_event(socket_dir));
                 }
@@ -457,9 +508,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 for ev in vendor_skipped_events {
                     env.record(ev);
                 }
-                // One Removed event per purl whose manifest entry was deleted.
+                // One Removed event per purl whose manifest entry was
+                // deleted (Verified on --dry-run).
                 for purl in &removed {
-                    env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                    env.record(PatchEvent::new(removal_action, purl.clone()));
                 }
                 // One artifact-level Removed event carrying the
                 // blob-sweep and rollback counts. Emitted whenever either
@@ -478,7 +530,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 // totals from `details`, never from `summary.removed`.
                 if blobs_removed > 0 || rollback_count > 0 {
                     env.events
-                        .push(PatchEvent::artifact(PatchAction::Removed).with_details(
+                        .push(PatchEvent::artifact(removal_action).with_details(
                             serde_json::json!({
                                 "blobsRemoved": blobs_removed,
                                 "rolledBack": rollback_count,
@@ -488,7 +540,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 println!("{}", env.to_pretty_json());
             }
 
-            track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
+            if !args.common.dry_run {
+                track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref())
+                    .await;
+            }
             0
         }
         Err(e) => {
@@ -535,11 +590,12 @@ async fn remove_detached_only(
         }
         eprintln!();
     }
+    // `--dry-run` previews without mutating — nothing to confirm.
     let prompt = format!(
         "Remove {} vendored patch(es) and revert their vendoring?",
         detached.len()
     );
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.json {
             println!("Removal cancelled.");
         }
@@ -547,11 +603,12 @@ async fn remove_detached_only(
     }
 
     let mut env = Envelope::new(Command::Remove);
+    env.dry_run = args.common.dry_run;
     if lock_was_broken {
         env.record(lock_broken_event(socket_dir));
     }
     for (key, entry) in &detached {
-        let outcome = dispatch_revert_one(entry, &args.common.cwd, false).await;
+        let outcome = dispatch_revert_one(entry, &args.common.cwd, args.common.dry_run).await;
         for w in &outcome.warnings {
             if !args.common.json {
                 eprintln!("Warning ({}): {}", w.code, w.detail);
@@ -578,6 +635,20 @@ async fn remove_detached_only(
             );
             return 1;
         }
+        if args.common.dry_run {
+            if !args.common.json {
+                println!("Would revert vendoring for {key}");
+            }
+            // Verified preview (the dry-run convention); still recorded
+            // so `summary.verified` counts the would-be removals.
+            env.record(
+                PatchEvent::new(PatchAction::Verified, key.clone()).with_reason(
+                    "vendor_would_revert",
+                    "vendoring would be reverted on remove",
+                ),
+            );
+            continue;
+        }
         state.entries.remove(key);
         if let Err(e) = save_state(&args.common.cwd, &state).await {
             emit_error_envelope(args.common.json, "vendor_state_write_failed", e.to_string());
@@ -594,7 +665,9 @@ async fn remove_detached_only(
     if args.common.json {
         println!("{}", env.to_pretty_json());
     }
-    track_patch_removed(detached.len(), api_token, org_slug).await;
+    if !args.common.dry_run {
+        track_patch_removed(detached.len(), api_token, org_slug).await;
+    }
     0
 }
 
