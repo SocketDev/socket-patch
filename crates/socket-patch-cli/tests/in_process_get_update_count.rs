@@ -60,7 +60,6 @@ fn params(root: &Path, server: &MockServer) -> DownloadParams {
         org: Some(ORG.to_string()),
         // save_only isolates download bookkeeping from the apply step.
         save_only: true,
-        one_off: false,
         global: false,
         global_prefix: None,
         json: true,

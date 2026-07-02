@@ -14,8 +14,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
-use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
+use crate::commands::lock_cli::{acquire_or_emit, error_envelope, lock_broken_event};
+use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
 pub struct RepairArgs {
@@ -46,11 +46,9 @@ pub async fn run(args: RepairArgs) -> i32 {
     // --offline implies strict airgap: no network calls. `--download-only`
     // is the inverse (network-only). The two are now mutually exclusive.
     if args.common.offline && args.download_only {
-        let msg = "--offline and --download-only are mutually exclusive".to_string();
+        let msg = "--offline and --download-only are mutually exclusive";
         if args.common.json {
-            let mut env = Envelope::new(Command::Repair);
-            env.dry_run = args.common.dry_run;
-            env.mark_error(EnvelopeError::new("invalid_args", msg));
+            let env = error_envelope(Command::Repair, args.common.dry_run, "invalid_args", msg);
             println!("{}", env.to_pretty_json());
         } else {
             eprintln!("Error: {msg}");
@@ -96,16 +94,17 @@ pub async fn run(args: RepairArgs) -> i32 {
                 }
                 return 0;
             }
+            let msg = format!("Manifest not found at {}", manifest_path.display());
             if args.common.json {
-                let mut env = Envelope::new(Command::Repair);
-                env.dry_run = args.common.dry_run;
-                env.mark_error(EnvelopeError::new(
+                let env = error_envelope(
+                    Command::Repair,
+                    args.common.dry_run,
                     "manifest_not_found",
-                    format!("Manifest not found at {}", manifest_path.display()),
-                ));
+                    &msg,
+                );
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("Manifest not found at {}", manifest_path.display());
+                eprintln!("{msg}");
             }
             return 1;
         }
@@ -183,9 +182,7 @@ pub async fn run(args: RepairArgs) -> i32 {
             )
             .await;
             if args.common.json {
-                let mut env = Envelope::new(Command::Repair);
-                env.dry_run = args.common.dry_run;
-                env.mark_error(EnvelopeError::new("repair_failed", e));
+                let env = error_envelope(Command::Repair, args.common.dry_run, "repair_failed", &e);
                 println!("{}", env.to_pretty_json());
             } else {
                 eprintln!("Error: {e}");
@@ -196,13 +193,13 @@ pub async fn run(args: RepairArgs) -> i32 {
 }
 
 /// Aggregate counts surfaced by `repair_inner` for telemetry use.
-pub(crate) struct RepairCounts {
+struct RepairCounts {
     downloaded: usize,
     cleaned: usize,
     bytes_freed: u64,
 }
 
-pub(crate) async fn repair_inner(
+async fn repair_inner(
     args: &RepairArgs,
     manifest_path: &Path,
 ) -> Result<(Envelope, RepairCounts), String> {
@@ -303,58 +300,14 @@ pub(crate) async fn repair_inner(
     };
     let missing_count = missing_artifacts.len();
 
-    if !args.common.offline {
-        if !missing_artifacts.is_empty() {
-            if !quiet {
-                println!(
-                    "Found {} missing {} artifact(s)",
-                    missing_artifacts.len(),
-                    download_mode.as_tag()
-                );
-            }
-
-            if args.common.dry_run {
-                if !quiet {
-                    println!("\nDry run - would download:");
-                    for id in missing_artifacts.iter().take(10) {
-                        println!("  - {}...", &id[..12.min(id.len())]);
-                    }
-                    if missing_artifacts.len() > 10 {
-                        println!("  ... and {} more", missing_artifacts.len() - 10);
-                    }
-                }
-            } else {
-                if !quiet {
-                    println!("\nDownloading missing {}s...", download_mode.as_tag());
-                }
-                let (client, _) =
-                    get_api_client_with_overrides(args.common.api_client_overrides()).await;
-                let sources = PatchSources {
-                    blobs_path: &blobs_path,
-                    packages_path: Some(&packages_path),
-                    diffs_path: Some(&diffs_path),
-                    mem_blobs: None,
-                };
-                // Step 1 only runs with a manifest (missing_artifacts is
-                // empty otherwise), so the expect is unreachable.
-                let m = scoped_manifest
-                    .as_ref()
-                    .expect("step 1 requires a manifest");
-                let fetch_result =
-                    fetch_missing_sources(m, &sources, download_mode, &client, None).await;
-                downloaded_count = fetch_result.downloaded;
-                download_failed_count = fetch_result.failed;
-                if !quiet {
-                    println!("{}", format_fetch_result(&fetch_result));
-                }
-            }
-        } else if !quiet {
+    if missing_artifacts.is_empty() {
+        if !quiet {
             println!(
                 "All {} artifacts are present locally.",
                 download_mode.as_tag()
             );
         }
-    } else if !missing_artifacts.is_empty() {
+    } else if args.common.offline {
         if !quiet {
             println!(
                 "Warning: {} {} artifact(s) are missing (offline mode - not downloading)",
@@ -368,35 +321,73 @@ pub(crate) async fn repair_inner(
                 println!("  ... and {} more", missing_artifacts.len() - 5);
             }
         }
-    } else if !quiet {
-        println!(
-            "All {} artifacts are present locally.",
-            download_mode.as_tag()
-        );
+    } else {
+        if !quiet {
+            println!(
+                "Found {} missing {} artifact(s)",
+                missing_artifacts.len(),
+                download_mode.as_tag()
+            );
+        }
+
+        if args.common.dry_run {
+            if !quiet {
+                println!("\nDry run - would download:");
+                for id in missing_artifacts.iter().take(10) {
+                    println!("  - {}...", &id[..12.min(id.len())]);
+                }
+                if missing_artifacts.len() > 10 {
+                    println!("  ... and {} more", missing_artifacts.len() - 10);
+                }
+            }
+        } else {
+            if !quiet {
+                println!("\nDownloading missing {}s...", download_mode.as_tag());
+            }
+            let (client, _) =
+                get_api_client_with_overrides(args.common.api_client_overrides()).await;
+            let sources = PatchSources {
+                blobs_path: &blobs_path,
+                packages_path: Some(&packages_path),
+                diffs_path: Some(&diffs_path),
+                mem_blobs: None,
+            };
+            // Step 1 only runs with a manifest (missing_artifacts is
+            // empty otherwise), so the expect is unreachable.
+            let m = scoped_manifest
+                .as_ref()
+                .expect("step 1 requires a manifest");
+            let fetch_result =
+                fetch_missing_sources(m, &sources, download_mode, &client, None).await;
+            downloaded_count = fetch_result.downloaded;
+            download_failed_count = fetch_result.failed;
+            if !quiet {
+                println!("{}", format_fetch_result(&fetch_result));
+            }
+        }
     }
 
     // Step 1.5: vendored artifacts — health-check the ledger (and any
     // lockfile vendor references with no ledger coverage) and rebuild
     // missing/corrupt artifacts. Runs under `--download-only` too:
     // restoring artifacts IS repair's download half.
-    let vendor_counts = crate::commands::repair_vendor::repair_vendored_artifacts(
+    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts(
         &args.common,
         manifest.as_ref(),
         socket_dir,
         &mut env,
     )
     .await;
-    if !quiet && vendor_counts.rebuilt > 0 {
-        println!("Rebuilt {} vendored artifact(s).", vendor_counts.rebuilt);
+    if !quiet && vendor_rebuilt > 0 {
+        println!("Rebuilt {} vendored artifact(s).", vendor_rebuilt);
     }
 
     // Step 2: Clean up unused artifacts across all three directories.
     if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
-        let manifest = manifest.clone();
         if !quiet {
             println!();
         }
-        match cleanup_unused_blobs(&manifest, &blobs_path, args.common.dry_run).await {
+        match cleanup_unused_blobs(manifest, &blobs_path, args.common.dry_run).await {
             Ok(cleanup_result) => {
                 blobs_checked += cleanup_result.blobs_checked;
                 blobs_cleaned += cleanup_result.blobs_removed;
@@ -424,44 +415,25 @@ pub(crate) async fn repair_inner(
             }
         }
 
-        // Diff archives.
-        match cleanup_unused_archives(&manifest, &diffs_path, args.common.dry_run).await {
-            Ok(cleanup_result) => {
-                blobs_checked += cleanup_result.blobs_checked;
-                blobs_cleaned += cleanup_result.blobs_removed;
-                bytes_freed += cleanup_result.bytes_freed;
-                if !quiet && cleanup_result.blobs_removed > 0 {
-                    println!(
-                        "{}",
-                        format_cleanup_result(&cleanup_result, args.common.dry_run)
-                            .replace("blob(s)", "diff archive(s)")
-                    );
+        // Diff and package archives.
+        for (path, label) in [(&diffs_path, "diff"), (&packages_path, "package")] {
+            match cleanup_unused_archives(manifest, path, args.common.dry_run).await {
+                Ok(cleanup_result) => {
+                    blobs_checked += cleanup_result.blobs_checked;
+                    blobs_cleaned += cleanup_result.blobs_removed;
+                    bytes_freed += cleanup_result.bytes_freed;
+                    if !quiet && cleanup_result.blobs_removed > 0 {
+                        println!(
+                            "{}",
+                            format_cleanup_result(&cleanup_result, args.common.dry_run)
+                                .replace("blob(s)", &format!("{label} archive(s)"))
+                        );
+                    }
                 }
-            }
-            Err(e) => {
-                if !quiet {
-                    eprintln!("Warning: diff cleanup failed: {e}");
-                }
-            }
-        }
-
-        // Package archives.
-        match cleanup_unused_archives(&manifest, &packages_path, args.common.dry_run).await {
-            Ok(cleanup_result) => {
-                blobs_checked += cleanup_result.blobs_checked;
-                blobs_cleaned += cleanup_result.blobs_removed;
-                bytes_freed += cleanup_result.bytes_freed;
-                if !quiet && cleanup_result.blobs_removed > 0 {
-                    println!(
-                        "{}",
-                        format_cleanup_result(&cleanup_result, args.common.dry_run)
-                            .replace("blob(s)", "package archive(s)")
-                    );
-                }
-            }
-            Err(e) => {
-                if !quiet {
-                    eprintln!("Warning: package cleanup failed: {e}");
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("Warning: {label} cleanup failed: {e}");
+                    }
                 }
             }
         }
@@ -474,23 +446,19 @@ pub(crate) async fn repair_inner(
     // Translate the aggregate counts into envelope events. `repair`
     // operates on artifacts (not specific patches), so events use the
     // `PatchEvent::artifact` form (no PURL/UUID).
-    let action_for_repair = if args.common.dry_run {
-        PatchAction::Verified
-    } else {
-        PatchAction::Downloaded
-    };
+    //
     // Only the online path downloads (or, in dry-run, *would* download).
     // In offline mode nothing is fetched even when artifacts are missing,
     // so don't record a download/would-download event there — that would
     // contradict the human-readable path, which only prints a warning.
     if downloaded_count > 0 || (!args.common.offline && args.common.dry_run && missing_count > 0) {
-        let count = if args.common.dry_run {
-            missing_count
+        let (action, count) = if args.common.dry_run {
+            (PatchAction::Verified, missing_count)
         } else {
-            downloaded_count
+            (PatchAction::Downloaded, downloaded_count)
         };
         env.record(
-            PatchEvent::artifact(action_for_repair).with_details(serde_json::json!({
+            PatchEvent::artifact(action).with_details(serde_json::json!({
                 "count": count,
                 "mode": download_mode.as_tag(),
             })),

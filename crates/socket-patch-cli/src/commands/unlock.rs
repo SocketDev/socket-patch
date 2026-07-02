@@ -24,7 +24,8 @@ use socket_patch_core::patch::apply_lock::{acquire, LockError};
 use socket_patch_core::utils::telemetry::{track_patch_unlock_failed, track_patch_unlocked};
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::json_envelope::{Command, Envelope, EnvelopeError};
+use crate::commands::lock_cli::error_envelope;
+use crate::json_envelope::Command;
 
 #[derive(Args)]
 pub struct UnlockArgs {
@@ -62,8 +63,8 @@ pub async fn run(args: UnlockArgs) -> i32 {
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let lock_file = socket_dir.join("apply.lock");
-    let api_token = args.common.api_token.clone();
-    let org_slug = args.common.org.clone();
+    let api_token = args.common.api_token.as_deref();
+    let org_slug = args.common.org.as_deref();
 
     // No `.socket/` at all → treat as "free" (no one could be
     // holding a lock that doesn't exist). Useful for fresh repos
@@ -73,7 +74,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
         // remove, so `released` is false regardless of whether the
         // user passed --release. Telemetry and the emitted envelope
         // must agree on this.
-        track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
+        track_patch_unlocked(false, false, api_token, org_slug).await;
         return emit_free(
             args.common.json,
             args.common.silent,
@@ -98,7 +99,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
             // delete races nothing.
             drop(guard);
 
-            if args.release {
+            let removed = if args.release {
                 match std::fs::remove_file(&lock_file) {
                     // `remove_file` here almost always returns `Ok`
                     // (the probe's `acquire` ensured the file exists),
@@ -108,80 +109,46 @@ pub async fn run(args: UnlockArgs) -> i32 {
                     // operator asked for a clean slate), but only claim
                     // we "released" something when a lock file was there
                     // before we probed.
-                    Ok(()) => {
-                        track_patch_unlocked(
-                            false,
-                            lock_existed,
-                            api_token.as_deref(),
-                            org_slug.as_deref(),
-                        )
-                        .await;
-                        emit_free(
-                            args.common.json,
-                            args.common.silent,
-                            &lock_file,
-                            lock_existed,
-                            true,
-                        )
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // The file was never created (e.g. socket
-                        // dir existed but no run has acquired the
-                        // lock yet). Treat as success.
-                        track_patch_unlocked(
-                            false,
-                            false,
-                            api_token.as_deref(),
-                            org_slug.as_deref(),
-                        )
-                        .await;
-                        emit_free(
-                            args.common.json,
-                            args.common.silent,
-                            &lock_file,
-                            false,
-                            true,
-                        )
-                    }
+                    Ok(()) => lock_existed,
+                    // NotFound: the file was never created (e.g. socket
+                    // dir existed but no run has acquired the lock yet).
+                    // Treat as success.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                     Err(e) => {
                         let msg = format!(
                             "failed to remove lock file at {}: {}",
                             lock_file.display(),
                             e
                         );
-                        track_patch_unlock_failed(&msg, api_token.as_deref(), org_slug.as_deref())
-                            .await;
+                        track_patch_unlock_failed(&msg, api_token, org_slug).await;
                         emit_error(args.common.json, args.common.silent, "lock_io", &msg);
-                        1
+                        return 1;
                     }
                 }
             } else {
-                track_patch_unlocked(false, false, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_free(
-                    args.common.json,
-                    args.common.silent,
-                    &lock_file,
-                    false,
-                    false,
-                )
-            }
+                false
+            };
+            track_patch_unlocked(false, removed, api_token, org_slug).await;
+            emit_free(
+                args.common.json,
+                args.common.silent,
+                &lock_file,
+                removed,
+                args.release,
+            )
         }
         Err(LockError::Held) => {
-            track_patch_unlock_failed(
-                "lock held by another process",
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
+            track_patch_unlock_failed("lock held by another process", api_token, org_slug).await;
             if args.common.json {
-                let mut env = Envelope::new(Command::Unlock);
-                env.mark_error(EnvelopeError::new(
+                let env = error_envelope(
+                    Command::Unlock,
+                    false,
                     "lock_held",
-                    format!(
+                    &format!(
                         "another socket-patch process is operating in {}",
                         socket_dir.display()
                     ),
-                ));
+                );
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent {
                 eprintln!(
@@ -202,7 +169,7 @@ pub async fn run(args: UnlockArgs) -> i32 {
         }
         Err(LockError::Io { path, source }) => {
             let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            track_patch_unlock_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
+            track_patch_unlock_failed(&msg, api_token, org_slug).await;
             emit_error(args.common.json, args.common.silent, "lock_io", &msg);
             1
         }
@@ -244,8 +211,7 @@ fn emit_free(json: bool, silent: bool, lock_file: &Path, removed: bool, release:
 
 fn emit_error(json: bool, silent: bool, code: &str, message: &str) {
     if json {
-        let mut env = Envelope::new(Command::Unlock);
-        env.mark_error(EnvelopeError::new(code, message));
+        let env = error_envelope(Command::Unlock, false, code, message);
         println!("{}", env.to_pretty_json());
     } else if !silent {
         eprintln!("Error: {message}.");

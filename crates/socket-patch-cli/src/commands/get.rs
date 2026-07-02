@@ -58,7 +58,7 @@ pub(crate) enum PatchAction {
 /// historical bug was a `status` of `success` (keyed only on download
 /// failures) sitting next to an exit code of `1` produced by a failed
 /// *apply* step.
-pub(crate) fn run_outcome(patches_failed: bool, apply_failed: bool) -> (&'static str, i32) {
+fn run_outcome(patches_failed: bool, apply_failed: bool) -> (&'static str, i32) {
     if patches_failed || apply_failed {
         ("partial_failure", 1)
     } else {
@@ -85,7 +85,7 @@ pub(crate) fn decide_patch_action(
 /// Ordinal rank for severity strings. Higher = worse. Unknown labels
 /// (including GHSA's `moderate` which maps to `medium`) get sensible
 /// defaults so the max-severity selector still works.
-pub(crate) fn severity_rank(severity: &str) -> u8 {
+fn severity_rank(severity: &str) -> u8 {
     match severity.to_ascii_lowercase().as_str() {
         "critical" => 4,
         "high" => 3,
@@ -99,7 +99,7 @@ pub(crate) fn severity_rank(severity: &str) -> u8 {
 /// Return the highest-severity label from a vulnerabilities map.
 /// Returns `None` when the map is empty or every entry's severity is
 /// unrecognized.
-pub(crate) fn max_vuln_severity(vulns: &HashMap<String, VulnerabilityResponse>) -> Option<String> {
+fn max_vuln_severity(vulns: &HashMap<String, VulnerabilityResponse>) -> Option<String> {
     vulns
         .values()
         .max_by_key(|v| severity_rank(&v.severity))
@@ -123,7 +123,7 @@ pub(crate) fn max_vuln_severity(vulns: &HashMap<String, VulnerabilityResponse>) 
 ///
 /// Output keys are JSON-camelCase to match the rest of the envelope.
 /// The vulnerability list is sorted by ID for stable test snapshots.
-pub(crate) fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
+fn patch_event_metadata(patch: &PatchResponse) -> serde_json::Value {
     let mut vulns: Vec<serde_json::Value> = patch
         .vulnerabilities
         .iter()
@@ -199,12 +199,12 @@ pub(crate) fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
     }
 }
 
-/// Short, display-only prefix of a UUID for `[update]` log lines. Returns
+/// Short, display-only prefix of a UUID for log lines. Returns
 /// the first 8 bytes when they fall on a char boundary, otherwise the
 /// whole string. A naive `&uuid[..8]` panics on a malformed/short UUID in
 /// the manifest (out-of-bounds or mid-codepoint); this never does. Pure
 /// so the no-panic guarantee is unit-testable.
-fn short_uuid(uuid: &str) -> &str {
+pub(crate) fn short_uuid(uuid: &str) -> &str {
     uuid.get(..8).unwrap_or(uuid)
 }
 
@@ -254,7 +254,7 @@ fn report_error(json: bool, message: impl std::fmt::Display) {
 /// hash comes from an untrusted API response and is used as a filesystem
 /// path component: anything else (`../../x`, an absolute path) would
 /// escape the blobs directory via `Path::join`.
-fn is_valid_blob_hash(hash: &str) -> bool {
+pub(crate) fn is_valid_blob_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -288,21 +288,21 @@ async fn write_all_patch_blobs(
     quiet: bool,
 ) -> Result<(), ()> {
     for (file_path, file_info) in &patch.files {
-        if let (Some(blob), Some(hash)) = (&file_info.blob_content, &file_info.after_hash) {
-            if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, "blob").await {
-                if !quiet {
-                    eprintln!("  [error] {e}");
+        for (blob, hash, label) in [
+            (&file_info.blob_content, &file_info.after_hash, "blob"),
+            (
+                &file_info.before_blob_content,
+                &file_info.before_hash,
+                "before-blob",
+            ),
+        ] {
+            if let (Some(blob), Some(hash)) = (blob, hash) {
+                if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, label).await {
+                    if !quiet {
+                        eprintln!("  [error] {e}");
+                    }
+                    return Err(());
                 }
-                return Err(());
-            }
-        }
-        if let (Some(blob), Some(hash)) = (&file_info.before_blob_content, &file_info.before_hash) {
-            if let Err(e) = write_blob_entry(blobs_dir, blob, hash, file_path, "before-blob").await
-            {
-                if !quiet {
-                    eprintln!("  [error] {e}");
-                }
-                return Err(());
             }
         }
     }
@@ -346,10 +346,14 @@ fn build_patch_record(patch: &PatchResponse, files: HashMap<String, PatchFileInf
     }
 }
 
-/// `(purl, manifest record)` from a fetched patch view — the both-hashes
-/// file rule shared with the download flows (new files with no beforeHash
-/// are not part of the record).
-pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
+/// Build the manifest-shaped `files` map from a fetched patch view,
+/// keeping only files that carry BOTH hashes — the download-flow rule
+/// shared by the record builders and installed-distribution matching
+/// (new files with no `beforeHash` are excluded; `save_and_apply_patch`
+/// has the new-file-tolerant variant). A file with an empty-string
+/// `beforeHash` is still kept so first-file verification can treat it
+/// as Ready.
+fn files_with_both_hashes(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
     let mut files = HashMap::new();
     for (file_path, file_info) in &patch.files {
         if let (Some(before), Some(after)) = (&file_info.before_hash, &file_info.after_hash) {
@@ -362,7 +366,17 @@ pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, Patc
             );
         }
     }
-    (patch.purl.clone(), build_patch_record(patch, files))
+    files
+}
+
+/// `(purl, manifest record)` from a fetched patch view — the both-hashes
+/// file rule shared with the download flows (new files with no beforeHash
+/// are not part of the record).
+pub(crate) fn record_from_patch_response(patch: &PatchResponse) -> (String, PatchRecord) {
+    (
+        patch.purl.clone(),
+        build_patch_record(patch, files_with_both_hashes(patch)),
+    )
 }
 
 #[derive(Args)]
@@ -465,7 +479,7 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
 /// - JSON mode with multiple free patches: returns an error with options list.
 ///
 /// Returns `Ok(selected_patches)` or `Err(exit_code)` if selection fails.
-pub fn select_patches(
+pub(crate) fn select_patches(
     patches: &[PatchSearchResult],
     can_access_paid: bool,
     is_json: bool,
@@ -581,7 +595,6 @@ pub struct DownloadParams {
     pub cwd: PathBuf,
     pub org: Option<String>,
     pub save_only: bool,
-    pub one_off: bool,
     pub global: bool,
     pub global_prefix: Option<PathBuf>,
     pub json: bool,
@@ -630,13 +643,18 @@ pub struct DownloadParams {
 ///
 /// Both fallbacks push a human-readable warning.
 ///
-/// Returns the kept patches plus any warnings to surface to the caller.
+/// Returns the kept patches plus any warnings to surface to the caller
+/// (also printed to stderr here, in human mode). With `--all-releases`
+/// set this is a verbatim pass-through.
 async fn filter_to_installed_releases(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
     api_client: &socket_patch_core::api::client::ApiClient,
-    org: Option<&str>,
 ) -> (Vec<PatchSearchResult>, Vec<String>) {
+    if params.all_releases {
+        return (selected.to_vec(), Vec::new());
+    }
+
     // Group release-variant ecosystem selections (PyPI / RubyGems / Maven)
     // by their base PURL (qualifiers stripped). Anything that can't have
     // release variants, or whose base has a single variant, is kept
@@ -709,9 +727,10 @@ async fn filter_to_installed_releases(
         // can hash-match against the installed distribution.
         let mut candidates: Vec<(String, HashMap<String, PatchFileInfo>)> = Vec::new();
         for s in &variants {
-            match api_client.fetch_patch(org, &s.uuid).await {
+            // org slug is already stored in the client.
+            match api_client.fetch_patch(None, &s.uuid).await {
                 Ok(Some(patch)) => {
-                    candidates.push((s.purl.clone(), files_for_selection(&patch)));
+                    candidates.push((s.purl.clone(), files_with_both_hashes(&patch)));
                 }
                 // On a fetch error/miss, keep the variant so the main
                 // download loop can record the failure as it would today.
@@ -744,27 +763,22 @@ async fn filter_to_installed_releases(
         }
     }
 
+    if !params.json && !params.silent {
+        for w in &warnings {
+            eprintln!("  [note] {w}");
+        }
+    }
     (kept, warnings)
 }
 
-/// Build the before/after-hash map used for installed-distribution
-/// matching. Mirrors the download flow's requirement that a patchable
-/// file carry both hashes (new files, with an empty `beforeHash`, are
-/// still kept so first-file verification can treat them as Ready).
-fn files_for_selection(patch: &PatchResponse) -> HashMap<String, PatchFileInfo> {
-    let mut files = HashMap::new();
-    for (file_path, file_info) in &patch.files {
-        if let (Some(before), Some(after)) = (&file_info.before_hash, &file_info.after_hash) {
-            files.insert(
-                file_path.clone(),
-                PatchFileInfo {
-                    before_hash: before.clone(),
-                    after_hash: after.clone(),
-                },
-            );
-        }
+/// Build the API client for a download run, defaulting the override org
+/// slug to the caller's `--org` when no explicit override was given.
+async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+    let mut overrides = params.api_overrides.clone();
+    if overrides.org_slug.is_none() {
+        overrides.org_slug = params.org.clone();
     }
-    files
+    get_api_client_with_overrides(overrides).await.0
 }
 
 /// Download and apply a set of selected patches.
@@ -782,13 +796,7 @@ pub(crate) async fn download_patch_records(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
-    let mut overrides = params.api_overrides.clone();
-    if overrides.org_slug.is_none() {
-        overrides.org_slug = params.org.clone();
-    }
-    let (api_client, _) =
-        socket_patch_core::api::client::get_api_client_with_overrides(overrides).await;
-    let effective_org: Option<&str> = None;
+    let api_client = api_client_for(params).await;
 
     let socket_dir = params.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
@@ -804,22 +812,8 @@ pub(crate) async fn download_patch_records(
         }
     }
 
-    let mut narrow_warnings: Vec<String> = Vec::new();
-    let selected_owned: Vec<PatchSearchResult>;
-    let selected: &[PatchSearchResult] = if params.all_releases {
-        selected
-    } else {
-        let (kept, warns) =
-            filter_to_installed_releases(selected, params, &api_client, effective_org).await;
-        if !params.json && !params.silent {
-            for w in &warns {
-                eprintln!("  [note] {w}");
-            }
-        }
-        narrow_warnings = warns;
-        selected_owned = kept;
-        &selected_owned
-    };
+    let (selected, narrow_warnings) =
+        filter_to_installed_releases(selected, params, &api_client).await;
 
     let vendor_state = socket_patch_core::patch::vendor::load_state(&params.cwd)
         .await
@@ -831,7 +825,7 @@ pub(crate) async fn download_patch_records(
     let mut failed = 0usize;
     let mut patch_records_json: Vec<serde_json::Value> = Vec::new();
 
-    for search_result in selected {
+    for search_result in &selected {
         // Idempotency: a detached entry already at this uuid carries its
         // own record — no view fetch needed.
         let existing = vendor_state
@@ -858,27 +852,12 @@ pub(crate) async fn download_patch_records(
             continue;
         }
 
-        match api_client
-            .fetch_patch(effective_org, &search_result.uuid)
-            .await
-        {
+        // org slug is already stored in the client.
+        match api_client.fetch_patch(None, &search_result.uuid).await {
             Ok(Some(patch)) => {
                 // Same both-hashes rule as the download flow: new files
                 // (no beforeHash) are skipped from the record.
-                let mut files = HashMap::new();
-                for (file_path, file_info) in &patch.files {
-                    if let (Some(before), Some(after)) =
-                        (&file_info.before_hash, &file_info.after_hash)
-                    {
-                        files.insert(
-                            file_path.clone(),
-                            PatchFileInfo {
-                                before_hash: before.clone(),
-                                after_hash: after.clone(),
-                            },
-                        );
-                    }
-                }
+                let files = files_with_both_hashes(&patch);
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
                 // step re-fetches what it needs); persisting blobs here
@@ -954,11 +933,12 @@ pub(crate) async fn download_patch_records(
 /// function sits on the in-process scan→download→apply chain, whose summed
 /// poll frames must fit Windows' 1 MiB main-thread stack in debug builds.
 async fn warn_on_vendored_uuid_drift(
-    params: &DownloadParams,
+    cwd: &Path,
+    quiet: bool,
     downloaded_patches: &[serde_json::Value],
     warnings: &mut Vec<String>,
 ) {
-    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(&params.cwd).await else {
+    let Ok(vendor_state) = socket_patch_core::patch::vendor::load_state(cwd).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -981,7 +961,7 @@ async fn warn_on_vendored_uuid_drift(
                  run `socket-patch vendor` to refresh the committed artifact",
                 entry.uuid
             );
-            if !params.json && !params.silent {
+            if !quiet {
                 eprintln!("  [note] {w}");
             }
             warnings.push(w);
@@ -989,17 +969,51 @@ async fn warn_on_vendored_uuid_drift(
     }
 }
 
+/// Run the nested `apply` step over the manifest under `cwd`. Returns
+/// whether apply exited 0. Callers print their own "Applying patches..."
+/// line (they differ on stdout vs stderr). `get` drives apply internally:
+/// the read-only cargo-redirect verifier stays off and embedded VEX is
+/// opt-in on the top-level command only, never on this internal
+/// invocation.
+async fn run_nested_apply(
+    cwd: &Path,
+    global: bool,
+    global_prefix: Option<PathBuf>,
+    quiet: bool,
+    download_mode: String,
+    strict: bool,
+) -> bool {
+    let apply_args = super::apply::ApplyArgs {
+        common: crate::args::GlobalArgs {
+            manifest_path: cwd
+                .join(".socket")
+                .join("manifest.json")
+                .display()
+                .to_string(),
+            cwd: cwd.to_path_buf(),
+            global,
+            global_prefix,
+            silent: quiet,
+            download_mode,
+            strict,
+            ..crate::args::GlobalArgs::default()
+        },
+        force: false,
+        check: false,
+        vex: Default::default(),
+    };
+    let code = super::apply::run(apply_args).await;
+    if code != 0 && !quiet {
+        eprintln!("\nSome patches could not be applied.");
+    }
+    code == 0
+}
+
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value) {
-    let mut overrides = params.api_overrides.clone();
-    if overrides.org_slug.is_none() {
-        overrides.org_slug = params.org.clone();
-    }
-    let (api_client, _) =
-        socket_patch_core::api::client::get_api_client_with_overrides(overrides).await;
-    let effective_org: Option<&str> = None;
+    let api_client = api_client_for(params).await;
 
     let socket_dir = params.cwd.join(".socket");
     let blobs_dir = socket_dir.join("blobs");
@@ -1023,25 +1037,11 @@ pub async fn download_and_apply_patches(
         _ => PatchManifest::new(),
     };
 
-    // Narrow PyPI multi-release selections to the installed distribution
+    // Narrow multi-release selections to the installed distribution
     // unless --all-releases was passed. `filter_to_installed_releases`
-    // is a no-op for non-PyPI ecosystems and single-variant packages.
-    let mut narrow_warnings: Vec<String> = Vec::new();
-    let selected_owned: Vec<PatchSearchResult>;
-    let selected: &[PatchSearchResult] = if params.all_releases {
-        selected
-    } else {
-        let (kept, warns) =
-            filter_to_installed_releases(selected, params, &api_client, effective_org).await;
-        if !params.json && !params.silent {
-            for w in &warns {
-                eprintln!("  [note] {w}");
-            }
-        }
-        narrow_warnings = warns;
-        selected_owned = kept;
-        &selected_owned
-    };
+    // is a no-op for non-variant ecosystems and single-variant packages.
+    let (selected, mut narrow_warnings) =
+        filter_to_installed_releases(selected, params, &api_client).await;
 
     if !params.json && !params.silent {
         eprintln!("\nDownloading {} patch(es)...", selected.len());
@@ -1053,11 +1053,9 @@ pub async fn download_and_apply_patches(
     let mut patches_updated = 0;
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
-    for search_result in selected {
-        match api_client
-            .fetch_patch(effective_org, &search_result.uuid)
-            .await
-        {
+    for search_result in &selected {
+        // org slug is already stored in the client.
+        match api_client.fetch_patch(None, &search_result.uuid).await {
             Ok(Some(patch)) => {
                 // Classify against the manifest state BEFORE we touch it.
                 // `Skipped` early-returns; `Updated` is preserved so the
@@ -1082,20 +1080,7 @@ pub async fn download_and_apply_patches(
                 // Build the manifest `files` map. Download flow requires
                 // BOTH before+after hash (skips new files); see
                 // `save_and_apply_patch` for the new-file-tolerant variant.
-                let mut files = HashMap::new();
-                for (file_path, file_info) in &patch.files {
-                    if let (Some(before), Some(after)) =
-                        (&file_info.before_hash, &file_info.after_hash)
-                    {
-                        files.insert(
-                            file_path.clone(),
-                            PatchFileInfo {
-                                before_hash: before.clone(),
-                                after_hash: after.clone(),
-                            },
-                        );
-                    }
-                }
+                let files = files_with_both_hashes(&patch);
 
                 let quiet = params.json || params.silent;
                 // Vendor flows keep blob content in memory (the vendor
@@ -1205,7 +1190,13 @@ pub async fn download_and_apply_patches(
     // uuid — tell the operator now instead of letting VEX surprise them
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
-    warn_on_vendored_uuid_drift(params, &downloaded_patches, &mut narrow_warnings).await;
+    warn_on_vendored_uuid_drift(
+        &params.cwd,
+        params.json || params.silent,
+        &downloaded_patches,
+        &mut narrow_warnings,
+    )
+    .await;
 
     if !params.json && !params.silent {
         eprintln!("\nPatches saved to {}", manifest_path.display());
@@ -1227,29 +1218,15 @@ pub async fn download_and_apply_patches(
         if !params.json && !params.silent {
             eprintln!("\nApplying patches...");
         }
-        let apply_args = super::apply::ApplyArgs {
-            common: crate::args::GlobalArgs {
-                cwd: params.cwd.clone(),
-                manifest_path: manifest_path.display().to_string(),
-                global: params.global,
-                global_prefix: params.global_prefix.clone(),
-                silent: params.json || params.silent,
-                download_mode: params.download_mode.clone(),
-                strict: params.strict,
-                ..crate::args::GlobalArgs::default()
-            },
-            force: false,
-            // get never runs the read-only cargo-redirect verifier.
-            check: false,
-            // get drives apply internally; embedded VEX is opt-in on the
-            // top-level command, never on this internal invocation.
-            vex: Default::default(),
-        };
-        let code = super::apply::run(apply_args).await;
-        apply_succeeded = code == 0;
-        if code != 0 && !params.json && !params.silent {
-            eprintln!("\nSome patches could not be applied.");
-        }
+        apply_succeeded = run_nested_apply(
+            &params.cwd,
+            params.global,
+            params.global_prefix.clone(),
+            params.json || params.silent,
+            params.download_mode.clone(),
+            params.strict,
+        )
+        .await;
     }
 
     // An apply step that ran (patches were added, not --save-only) but
@@ -1294,14 +1271,10 @@ pub async fn run(args: GetArgs) -> i32 {
         return 1;
     }
     if args.one_off && args.save_only {
-        if args.common.json {
-            print_json(&serde_json::json!({
-                "status": "error",
-                "error": "--one-off and --save-only cannot be used together",
-            }));
-        } else {
-            eprintln!("Error: --one-off and --save-only cannot be used together");
-        }
+        report_error(
+            args.common.json,
+            "--one-off and --save-only cannot be used together",
+        );
         return 1;
     }
 
@@ -1656,7 +1629,6 @@ pub async fn run(args: GetArgs) -> i32 {
         cwd: args.common.cwd.clone(),
         org: args.common.org.clone(),
         save_only: args.save_only,
-        one_off: args.one_off,
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
         json: args.common.json,
@@ -1810,27 +1782,17 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     // until a `vendor` run refreshes the committed artifact.
     let mut warnings: Vec<String> = Vec::new();
     if added {
-        if let Ok(vendor_state) =
-            socket_patch_core::patch::vendor::load_state(&args.common.cwd).await
-        {
-            let entry = vendor_state.entries.get(&patch.purl).or_else(|| {
-                vendor_state
-                    .entries
-                    .values()
-                    .find(|e| e.base_purl == patch.purl)
-            });
-            if let Some(entry) = entry.filter(|e| e.uuid != patch.uuid) {
-                let w = format!(
-                    "{} is vendored at patch {} but the manifest now records {}; run \
-                     `socket-patch vendor` to refresh the committed artifact",
-                    patch.purl, entry.uuid, patch.uuid
-                );
-                if !quiet {
-                    eprintln!("  [note] {w}");
-                }
-                warnings.push(w);
-            }
-        }
+        warn_on_vendored_uuid_drift(
+            &args.common.cwd,
+            quiet,
+            &[serde_json::json!({
+                "purl": patch.purl,
+                "uuid": patch.uuid,
+                "action": "added",
+            })],
+            &mut warnings,
+        )
+        .await;
     }
 
     if !quiet {
@@ -1847,29 +1809,15 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         if !quiet {
             println!("\nApplying patches...");
         }
-        let apply_args = super::apply::ApplyArgs {
-            common: crate::args::GlobalArgs {
-                cwd: args.common.cwd.clone(),
-                manifest_path: manifest_path.display().to_string(),
-                global: args.common.global,
-                global_prefix: args.common.global_prefix.clone(),
-                silent: quiet,
-                download_mode: args.common.download_mode.clone(),
-                strict: args.common.strict,
-                ..crate::args::GlobalArgs::default()
-            },
-            force: false,
-            // get never runs the read-only cargo-redirect verifier.
-            check: false,
-            // get drives apply internally; embedded VEX is opt-in on the
-            // top-level command, never on this internal invocation.
-            vex: Default::default(),
-        };
-        let code = super::apply::run(apply_args).await;
-        apply_succeeded = code == 0;
-        if code != 0 && !quiet {
-            eprintln!("\nSome patches could not be applied.");
-        }
+        apply_succeeded = run_nested_apply(
+            &args.common.cwd,
+            args.common.global,
+            args.common.global_prefix.clone(),
+            quiet,
+            args.common.download_mode.clone(),
+            args.common.strict,
+        )
+        .await;
     }
 
     // The apply step ran (patch added, not --save-only) but failed →

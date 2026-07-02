@@ -26,11 +26,12 @@ use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
+use socket_patch_core::patch::vendor::state::VendorArtifact;
 use socket_patch_core::patch::vendor::{
     self, check_vendored_artifact, file_sha256_hex, load_state, lock_inventory, parse_vendor_path,
-    registry_fetch, ArtifactHealth, VendorEntry,
+    registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
 };
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vex::time::now_rfc3339;
 
 use crate::args::GlobalArgs;
@@ -41,14 +42,6 @@ use crate::commands::vendor::{
 };
 use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
-
-/// Counts surfaced to `repair_inner` for telemetry/human output.
-#[derive(Default)]
-pub(crate) struct RepairVendorCounts {
-    pub rebuilt: usize,
-    pub failed: usize,
-    pub healthy: usize,
-}
 
 /// One broken vendored unit queued for rebuild.
 struct Candidate {
@@ -131,7 +124,7 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
         ecosystem: eco.to_string(),
         base_purl: base_purl.to_string(),
         uuid: uuid.to_string(),
-        artifact: socket_patch_core::patch::vendor::state::VendorArtifact {
+        artifact: VendorArtifact {
             path: artifact_path.to_string(),
             sha256: String::new(),
             size: None,
@@ -151,37 +144,40 @@ fn synth_entry(eco: &str, uuid: &str, artifact_path: &str, base_purl: &str) -> V
     }
 }
 
-fn fail(
-    env: &mut Envelope,
-    counts: &mut RepairVendorCounts,
-    quiet: bool,
-    purl: &str,
-    code: &str,
-    detail: String,
-) {
+fn fail(env: &mut Envelope, quiet: bool, purl: &str, code: &str, detail: String) {
     if !quiet {
         eprintln!(
             "Cannot repair vendored artifact for {}: {detail}",
-            socket_patch_core::utils::purl::normalize_purl(purl)
+            normalize_purl(purl)
         );
     }
     env.record(PatchEvent::new(PatchAction::Failed, purl.to_string()).with_error(code, detail));
     env.mark_partial_failure();
-    counts.failed += 1;
+}
+
+/// Best-effort removal of a vendored uuid dir — ahead of a rebuild (corrupt
+/// bytes must never blend into one) or after a failed post-verify (never
+/// leave unverifiable bytes behind).
+async fn remove_vendor_dir(cwd: &Path, eco: &str, uuid: &str) {
+    if let Some(rel) = vendor::path::vendor_uuid_dir_rel(eco, uuid) {
+        let _ = remove_tree(&cwd.join(rel)).await;
+    }
 }
 
 /// The vendored-artifact phase of `repair`. Runs between the download and
 /// cleanup phases (and under `--download-only` — restoring artifacts IS
 /// repair's job). `manifest` is `None` when the project has no
 /// `.socket/manifest.json` (detached/reconstruction-only repairs).
+/// Returns the number of artifacts rebuilt (for the human summary line);
+/// failures are carried by `env` (`Failed` events + partial-failure status).
 pub(crate) async fn repair_vendored_artifacts(
     common: &GlobalArgs,
     manifest: Option<&PatchManifest>,
     socket_dir: &Path,
     env: &mut Envelope,
-) -> RepairVendorCounts {
+) -> usize {
     let quiet = common.json || common.silent;
-    let mut counts = RepairVendorCounts::default();
+    let mut rebuilt = 0usize;
 
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
@@ -191,8 +187,7 @@ pub(crate) async fn repair_vendored_artifacts(
                     .with_error("vendor_state_unreadable", e.to_string()),
             );
             env.mark_partial_failure();
-            counts.failed += 1;
-            return counts;
+            return rebuilt;
         }
     };
 
@@ -227,7 +222,6 @@ pub(crate) async fn repair_vendored_artifacts(
                 None => {
                     fail(
                         env,
-                        &mut counts,
                         quiet,
                         purl,
                         "vendor_artifact_unrepairable",
@@ -252,7 +246,7 @@ pub(crate) async fn repair_vendored_artifacts(
             continue;
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
-            ArtifactHealth::Healthy => counts.healthy += 1,
+            ArtifactHealth::Healthy => {}
             ArtifactHealth::StaleUuid => {
                 env.record(
                     PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
@@ -264,14 +258,18 @@ pub(crate) async fn repair_vendored_artifacts(
             ArtifactHealth::Unverifiable { reason } => {
                 fail(
                     env,
-                    &mut counts,
                     quiet,
                     purl,
                     "vendor_artifact_unrepairable",
                     format!("the ledger entry cannot be verified ({reason}); fix state.json"),
                 );
             }
-            ArtifactHealth::Missing => {
+            health @ (ArtifactHealth::Missing | ArtifactHealth::Corrupt { .. }) => {
+                let reason = if matches!(health, ArtifactHealth::Missing) {
+                    "vendor_artifact_missing"
+                } else {
+                    "vendor_artifact_corrupt"
+                };
                 let detached = entry.detached;
                 candidates.push(Candidate {
                     purl: purl.clone(),
@@ -279,18 +277,7 @@ pub(crate) async fn repair_vendored_artifacts(
                     record,
                     detached,
                     reconstructed: false,
-                    reason: "vendor_artifact_missing",
-                });
-            }
-            ArtifactHealth::Corrupt { .. } => {
-                let detached = entry.detached;
-                candidates.push(Candidate {
-                    purl: purl.clone(),
-                    entry,
-                    record,
-                    detached,
-                    reconstructed: false,
-                    reason: "vendor_artifact_corrupt",
+                    reason,
                 });
             }
         }
@@ -316,7 +303,6 @@ pub(crate) async fn repair_vendored_artifacts(
                     None => {
                         fail(
                             env,
-                            &mut counts,
                             quiet,
                             &format!("pkg:{eco}/unknown@{uuid}"),
                             "vendor_artifact_missing",
@@ -359,7 +345,6 @@ pub(crate) async fn repair_vendored_artifacts(
                     persist_vendor_entry(common, env, &mut state, &purl, entry, detached, &record)
                         .await;
                 if save_failed {
-                    counts.failed += 1;
                     continue;
                 }
                 env.record(
@@ -371,7 +356,7 @@ pub(crate) async fn repair_vendored_artifacts(
                         }),
                     ),
                 );
-                counts.rebuilt += 1;
+                rebuilt += 1;
             }
             _ => {
                 candidates.push(Candidate {
@@ -387,7 +372,7 @@ pub(crate) async fn repair_vendored_artifacts(
     }
 
     if candidates.is_empty() {
-        return counts;
+        return rebuilt;
     }
 
     // ── Dry run: preview only ────────────────────────────────────────────
@@ -404,7 +389,7 @@ pub(crate) async fn repair_vendored_artifacts(
                 ),
             );
         }
-        return counts;
+        return rebuilt;
     }
 
     if !quiet {
@@ -420,10 +405,7 @@ pub(crate) async fn repair_vendored_artifacts(
     // never leaves tampered bytes to be blended into a rebuild).
     for c in &candidates {
         if c.reason == "vendor_artifact_corrupt" {
-            if let Some(rel) = vendor::path::vendor_uuid_dir_rel(&c.entry.ecosystem, &c.entry.uuid)
-            {
-                let _ = remove_tree(&common.cwd.join(rel)).await;
-            }
+            remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
         }
     }
 
@@ -443,7 +425,6 @@ pub(crate) async fn repair_vendored_artifacts(
             for c in &candidates {
                 fail(
                     env,
-                    &mut counts,
                     quiet,
                     &c.purl,
                     c.reason,
@@ -459,13 +440,12 @@ pub(crate) async fn repair_vendored_artifacts(
                     ),
                 );
             }
-            return counts;
+            return rebuilt;
         }
         Err(e) => {
             env.record(PatchEvent::artifact(PatchAction::Failed).with_error("stage_failed", e));
             env.mark_partial_failure();
-            counts.failed += candidates.len();
-            return counts;
+            return rebuilt;
         }
     };
     let sources = staged.as_patch_sources();
@@ -495,7 +475,6 @@ pub(crate) async fn repair_vendored_artifacts(
         if common.offline {
             fail(
                 env,
-                &mut counts,
                 quiet,
                 &c.purl,
                 c.reason,
@@ -539,14 +518,7 @@ pub(crate) async fn repair_vendored_artifacts(
                                 }
                                 Err(registry_fetch::FetchError::Failed(d))
                                 | Err(registry_fetch::FetchError::Unverifiable(d)) => {
-                                    fail(
-                                        env,
-                                        &mut counts,
-                                        quiet,
-                                        &c.purl,
-                                        "vendor_fetch_failed",
-                                        d,
-                                    );
+                                    fail(env, quiet, &c.purl, "vendor_fetch_failed", d);
                                     unrebuildable.insert(c.purl.clone());
                                     continue;
                                 }
@@ -554,31 +526,22 @@ pub(crate) async fn repair_vendored_artifacts(
                         }
                     }
                 }
-                let detail = fetch_pristine_unrepairable_detail(c).unwrap_or_else(|| {
+                let detail = if c.entry.artifact.platform_locked == Some(true) {
+                    "the vendored wheel is platform-locked (compiled); reinstall the \
+                     package on this platform and re-run repair, or run `socket-patch \
+                     vendor` to rebuild it"
+                        .to_string()
+                } else {
                     "no verifiable pristine source: the package is not installed, the \
                      lockfile is rewired to the (broken) vendored artifact, and the \
                      ledger records no recoverable registry fragment"
                         .to_string()
-                });
-                fail(
-                    env,
-                    &mut counts,
-                    quiet,
-                    &c.purl,
-                    "vendor_artifact_unrepairable",
-                    detail,
-                );
+                };
+                fail(env, quiet, &c.purl, "vendor_artifact_unrepairable", detail);
                 unrebuildable.insert(c.purl.clone());
             }
             PristineFetch::Failed(detail) => {
-                fail(
-                    env,
-                    &mut counts,
-                    quiet,
-                    &c.purl,
-                    "vendor_fetch_failed",
-                    detail,
-                );
+                fail(env, quiet, &c.purl, "vendor_fetch_failed", detail);
                 unrebuildable.insert(c.purl.clone());
             }
         }
@@ -610,17 +573,16 @@ pub(crate) async fn repair_vendored_artifacts(
             None => {
                 fail(
                     env,
-                    &mut counts,
                     quiet,
                     &c.purl,
                     "vendor_artifact_unrepairable",
                     "no vendor backend for this ecosystem in this build".to_string(),
                 );
             }
-            Some(socket_patch_core::patch::vendor::VendorOutcome::Refused { code, detail }) => {
-                fail(env, &mut counts, quiet, &c.purl, code, detail);
+            Some(VendorOutcome::Refused { code, detail }) => {
+                fail(env, quiet, &c.purl, code, detail);
             }
-            Some(socket_patch_core::patch::vendor::VendorOutcome::Done {
+            Some(VendorOutcome::Done {
                 result,
                 entry,
                 warnings,
@@ -628,7 +590,6 @@ pub(crate) async fn repair_vendored_artifacts(
                 if !result.success {
                     fail(
                         env,
-                        &mut counts,
                         quiet,
                         &c.purl,
                         "vendor_artifact_rebuild_failed",
@@ -656,14 +617,9 @@ pub(crate) async fn repair_vendored_artifacts(
                         Err(e) => Err(format!("cannot read the rebuilt artifact: {e}")),
                     };
                     if let Err(detail) = verdict {
-                        if let Some(rel) =
-                            vendor::path::vendor_uuid_dir_rel(&c.entry.ecosystem, &c.entry.uuid)
-                        {
-                            let _ = remove_tree(&common.cwd.join(rel)).await;
-                        }
+                        remove_vendor_dir(&common.cwd, &c.entry.ecosystem, &c.entry.uuid).await;
                         fail(
                             env,
-                            &mut counts,
                             quiet,
                             &c.purl,
                             "vendor_artifact_rebuild_failed",
@@ -680,20 +636,13 @@ pub(crate) async fn repair_vendored_artifacts(
                 // match: a backend-returned entry (drift healed / wiring
                 // re-recorded) wins; a reconstructed entry gets its
                 // fingerprint computed from the rebuilt bytes.
-                let mut check_entry = c.entry.clone();
-                if let Some(e) = entry {
-                    check_entry = e.clone();
-                    if persist_vendor_entry(
-                        common, env, &mut state, &c.purl, e, c.detached, &c.record,
-                    )
-                    .await
-                    {
-                        counts.failed += 1;
-                        continue;
-                    }
-                } else if c.reconstructed {
+                let from_backend = entry.is_some();
+                let mut check_entry = entry.unwrap_or_else(|| c.entry.clone());
+                if !from_backend && c.reconstructed {
                     fill_artifact_fingerprint(&common.cwd, &mut check_entry).await;
-                    if persist_vendor_entry(
+                }
+                if (from_backend || c.reconstructed)
+                    && persist_vendor_entry(
                         common,
                         env,
                         &mut state,
@@ -703,10 +652,8 @@ pub(crate) async fn repair_vendored_artifacts(
                         &c.record,
                     )
                     .await
-                    {
-                        counts.failed += 1;
-                        continue;
-                    }
+                {
+                    continue;
                 }
                 // ── Fail-closed post-verify ──────────────────────────────
                 match check_vendored_artifact(&common.cwd, &check_entry, &c.record).await {
@@ -714,7 +661,7 @@ pub(crate) async fn repair_vendored_artifacts(
                         if !quiet {
                             println!(
                                 "Rebuilt {} ({})",
-                                socket_patch_core::utils::purl::normalize_purl(&c.purl),
+                                normalize_purl(&c.purl),
                                 check_entry.artifact.path
                             );
                         }
@@ -726,21 +673,16 @@ pub(crate) async fn repair_vendored_artifacts(
                                 }),
                             ),
                         );
-                        counts.rebuilt += 1;
+                        rebuilt += 1;
                     }
                     other => {
                         // The deterministic rebuild did not reproduce the
                         // recorded artifact (e.g. a tampered ledger sha):
                         // remove it rather than leave unverifiable bytes.
-                        if let Some(rel) = vendor::path::vendor_uuid_dir_rel(
-                            &check_entry.ecosystem,
-                            &check_entry.uuid,
-                        ) {
-                            let _ = remove_tree(&common.cwd.join(rel)).await;
-                        }
+                        remove_vendor_dir(&common.cwd, &check_entry.ecosystem, &check_entry.uuid)
+                            .await;
                         fail(
                             env,
-                            &mut counts,
                             quiet,
                             &c.purl,
                             "vendor_artifact_rebuild_failed",
@@ -756,7 +698,7 @@ pub(crate) async fn repair_vendored_artifacts(
         }
     }
     drop(holders);
-    counts
+    rebuilt
 }
 
 /// Compute and record the artifact fingerprint (sha256 + size for
@@ -797,19 +739,6 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name.to_string(), version.to_string()))
-}
-
-/// A more specific unrepairable detail when one is knowable from the entry.
-fn fetch_pristine_unrepairable_detail(c: &Candidate) -> Option<String> {
-    if c.entry.artifact.platform_locked == Some(true) {
-        Some(
-            "the vendored wheel is platform-locked (compiled); reinstall the package on \
-             this platform and re-run repair, or run `socket-patch vendor` to rebuild it"
-                .to_string(),
-        )
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

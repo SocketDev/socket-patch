@@ -141,7 +141,11 @@ fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str
 /// separators (`github.com/foo/bar`), so it is validated **per segment**
 /// (see [`path_safety::is_safe_multi_segment`]); a version is a single
 /// segment. Reject fail-closed before any disk access.
-pub(crate) fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
+///
+/// `pub` (not `pub(crate)`): the CLI's VEX go-patches synthesis keys the
+/// same copy-dir path from the same untrusted `go.mod` coordinates and must
+/// apply this exact guard rather than a drift-prone mirror.
+pub fn are_safe_redirect_coords(module: &str, version: &str) -> bool {
     path_safety::is_safe_multi_segment(module) && path_safety::is_safe_single_segment(version)
 }
 

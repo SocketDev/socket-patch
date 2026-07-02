@@ -19,13 +19,14 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::patch::vendor::{
-    self, ecosystem_dir_for_purl, load_state, save_state, RevertOutcome, VendorEntry,
-    VendorOutcome, VendorServiceConfig, VendorSource, VendorWarning,
+    self, ecosystem_dir_for_purl, load_state, lock_inventory, registry_fetch, save_state,
+    RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource, VendorState,
+    VendorWarning,
 };
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
@@ -82,7 +83,7 @@ pub struct VendorArgs {
 
 /// Refusal codes that are expected skips, not command failures: the user's
 /// request is still fully satisfied when these are the only non-successes.
-pub(crate) fn refusal_is_benign(code: &str) -> bool {
+fn refusal_is_benign(code: &str) -> bool {
     matches!(code, "vendor_unsupported_ecosystem" | "already_vendored")
 }
 
@@ -133,7 +134,7 @@ pub(crate) async fn dispatch_vendor_one(
         "npm" => {
             // The flavor router probes the project's lockfile (package-lock /
             // yarn / pnpm / bun) and dispatches or refuses per flavor.
-            socket_patch_core::patch::vendor::npm_flavor::vendor_npm_any(
+            vendor::npm_flavor::vendor_npm_any(
                 purl,
                 pkg_path,
                 project_root,
@@ -147,7 +148,7 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         }
         "pypi" => {
-            socket_patch_core::patch::vendor::pypi::vendor_pypi(
+            vendor::pypi::vendor_pypi(
                 purl,
                 pkg_path,
                 project_root,
@@ -161,7 +162,7 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         }
         "gem" => {
-            socket_patch_core::patch::vendor::gem::vendor_gem(
+            vendor::gem::vendor_gem(
                 purl,
                 pkg_path,
                 project_root,
@@ -176,7 +177,7 @@ pub(crate) async fn dispatch_vendor_one(
         }
         #[cfg(feature = "cargo")]
         "cargo" => {
-            socket_patch_core::patch::vendor::cargo::vendor_cargo_crate(
+            vendor::cargo::vendor_cargo_crate(
                 purl,
                 pkg_path,
                 project_root,
@@ -191,7 +192,7 @@ pub(crate) async fn dispatch_vendor_one(
         }
         #[cfg(feature = "golang")]
         "golang" => {
-            socket_patch_core::patch::vendor::golang::vendor_go_module(
+            vendor::golang::vendor_go_module(
                 purl,
                 pkg_path,
                 project_root,
@@ -206,7 +207,7 @@ pub(crate) async fn dispatch_vendor_one(
         }
         #[cfg(feature = "composer")]
         "composer" => {
-            socket_patch_core::patch::vendor::composer_lock::vendor_composer(
+            vendor::composer_lock::vendor_composer(
                 purl,
                 pkg_path,
                 project_root,
@@ -221,7 +222,7 @@ pub(crate) async fn dispatch_vendor_one(
         }
         #[cfg(feature = "nuget")]
         "nuget" => {
-            socket_patch_core::patch::vendor::nuget_feed::vendor_nuget(
+            vendor::nuget_feed::vendor_nuget(
                 purl,
                 pkg_path,
                 project_root,
@@ -236,7 +237,7 @@ pub(crate) async fn dispatch_vendor_one(
         }
         #[cfg(feature = "maven")]
         "maven" => {
-            socket_patch_core::patch::vendor::maven_repo::vendor_maven(
+            vendor::maven_repo::vendor_maven(
                 purl,
                 pkg_path,
                 project_root,
@@ -260,53 +261,19 @@ pub(crate) async fn dispatch_revert_one(
     dry_run: bool,
 ) -> RevertOutcome {
     match entry.ecosystem.as_str() {
-        "npm" => {
-            socket_patch_core::patch::vendor::npm_flavor::revert_npm_any(
-                entry,
-                project_root,
-                dry_run,
-            )
-            .await
-        }
-        "pypi" => {
-            socket_patch_core::patch::vendor::pypi::revert_pypi(entry, project_root, dry_run).await
-        }
-        "gem" => {
-            socket_patch_core::patch::vendor::gem::revert_gem(entry, project_root, dry_run).await
-        }
+        "npm" => vendor::npm_flavor::revert_npm_any(entry, project_root, dry_run).await,
+        "pypi" => vendor::pypi::revert_pypi(entry, project_root, dry_run).await,
+        "gem" => vendor::gem::revert_gem(entry, project_root, dry_run).await,
         #[cfg(feature = "cargo")]
-        "cargo" => {
-            socket_patch_core::patch::vendor::cargo::revert_cargo_vendor(
-                entry,
-                project_root,
-                dry_run,
-            )
-            .await
-        }
+        "cargo" => vendor::cargo::revert_cargo_vendor(entry, project_root, dry_run).await,
         #[cfg(feature = "golang")]
-        "golang" => {
-            socket_patch_core::patch::vendor::golang::revert_go_vendor(entry, project_root, dry_run)
-                .await
-        }
+        "golang" => vendor::golang::revert_go_vendor(entry, project_root, dry_run).await,
         #[cfg(feature = "composer")]
-        "composer" => {
-            socket_patch_core::patch::vendor::composer_lock::revert_composer(
-                entry,
-                project_root,
-                dry_run,
-            )
-            .await
-        }
+        "composer" => vendor::composer_lock::revert_composer(entry, project_root, dry_run).await,
         #[cfg(feature = "nuget")]
-        "nuget" => {
-            socket_patch_core::patch::vendor::nuget_feed::revert_nuget(entry, project_root, dry_run)
-                .await
-        }
+        "nuget" => vendor::nuget_feed::revert_nuget(entry, project_root, dry_run).await,
         #[cfg(feature = "maven")]
-        "maven" => {
-            socket_patch_core::patch::vendor::maven_repo::revert_maven(entry, project_root, dry_run)
-                .await
-        }
+        "maven" => vendor::maven_repo::revert_maven(entry, project_root, dry_run).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
         )),
@@ -317,12 +284,9 @@ pub(crate) async fn dispatch_revert_one(
 /// dependency graph? `None` = cannot determine — callers must keep the
 /// entry (fail-safe): non-npm ecosystems have no in-use probe yet, and a
 /// missing/unreadable lockfile proves nothing.
-pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
+async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.ecosystem.as_str() {
-        "npm" => {
-            socket_patch_core::patch::vendor::npm_flavor::vendored_entry_in_use(entry, project_root)
-                .await
-        }
+        "npm" => vendor::npm_flavor::vendored_entry_in_use(entry, project_root).await,
         _ => None,
     }
 }
@@ -333,11 +297,11 @@ pub(crate) async fn dispatch_in_use_one(entry: &VendorEntry, project_root: &Path
 /// owned by a recorded entry, so removal is safe; removed unless
 /// `dry_run`. Unparseable dirs are never returned (and never deleted).
 /// Returns the orphans so callers can emit events / counts.
-pub(crate) async fn sweep_orphan_vendor_dirs(
+async fn sweep_orphan_vendor_dirs(
     cwd: &Path,
-    state: &socket_patch_core::patch::vendor::VendorState,
+    state: &VendorState,
     dry_run: bool,
-) -> Vec<socket_patch_core::patch::vendor::path::SweptVendorDir> {
+) -> Vec<vendor::path::SweptVendorDir> {
     let recorded_units: HashSet<(&str, &str)> = state
         .entries
         .values()
@@ -447,7 +411,7 @@ pub async fn run(args: VendorArgs) -> i32 {
         env.record(lock_broken_event(&socket_dir));
     }
 
-    let exit = if args.revert {
+    let mut exit = if args.revert {
         run_revert(&args, &mut env).await
     } else {
         run_vendor(&args, &manifest_path, &mut env, &vendor_service).await
@@ -455,7 +419,6 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
     // requested-but-failed VEX flips the exit code.
-    let mut exit = exit;
     if exit == 0 && !args.revert {
         if let Some(vex_path) = args.vex.vex.as_ref() {
             let params = args.vex.to_build_params();
@@ -566,15 +529,6 @@ async fn run_vendor(
     }
 }
 
-/// The vendoring engine, decoupled from the manifest file. `records` is the
-/// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
-/// manifest-driven `vendor` command (and `scan --vendor`), or the
-/// freshly-fetched record map for `scan --vendor --detached`. Entries written
-/// in `detached` mode carry [`VendorEntry::detached`] plus an embedded copy
-/// of their record, so revert/verify/VEX work without a manifest entry.
-///
-/// Does NOT lock, read the manifest, or print the envelope — callers own all
-/// three. Returns whether any non-benign failure occurred.
 /// Persist one backend-returned ledger entry: detached flagging, wiring
 /// `original` carry-forward from the entry being replaced, per-package save
 /// (crash-consistent with what is already wired), and the stale-uuid-dir
@@ -583,9 +537,9 @@ async fn run_vendor(
 pub(crate) async fn persist_vendor_entry(
     common: &GlobalArgs,
     env: &mut Envelope,
-    state: &mut socket_patch_core::patch::vendor::VendorState,
+    state: &mut VendorState,
     candidate: &str,
-    mut entry: socket_patch_core::patch::vendor::VendorEntry,
+    mut entry: VendorEntry,
     detached: bool,
     record: &PatchRecord,
 ) -> bool {
@@ -611,9 +565,7 @@ pub(crate) async fn persist_vendor_entry(
         // (`vendor_lock_entry_drifted`) instead of
         // restoring the registry fragment.
         for rec in &mut entry.wiring {
-            if rec.action == socket_patch_core::patch::vendor::state::WiringAction::Rewritten
-                && rec.original.is_none()
-            {
+            if rec.action == vendor::state::WiringAction::Rewritten && rec.original.is_none() {
                 if let Some(prev_rec) = prev
                     .wiring
                     .iter()
@@ -668,7 +620,7 @@ pub(crate) async fn persist_vendor_entry(
 /// for vendored packages, so only `--revert`'s restore data still knows the
 /// registry resolution). Always integrity-verified fail-closed.
 pub(crate) enum PristineFetch {
-    Fetched(socket_patch_core::patch::vendor::registry_fetch::FetchedPackage),
+    Fetched(registry_fetch::FetchedPackage),
     /// Neither the lockfile nor the ledger can name a verifiable source.
     NoSource,
     Unverifiable(String),
@@ -677,13 +629,11 @@ pub(crate) enum PristineFetch {
 
 pub(crate) async fn fetch_pristine_package(
     project_root: &Path,
-    inventory: &[socket_patch_core::patch::vendor::lock_inventory::LockfileEntry],
-    client: &socket_patch_core::patch::vendor::registry_fetch::RegistryClient,
+    inventory: &[lock_inventory::LockfileEntry],
+    client: &registry_fetch::RegistryClient,
     purl: &str,
-    ledger_entry: Option<&socket_patch_core::patch::vendor::VendorEntry>,
+    ledger_entry: Option<&VendorEntry>,
 ) -> PristineFetch {
-    use socket_patch_core::patch::vendor::{lock_inventory, registry_fetch};
-
     let entry = match lock_inventory::lookup(inventory, purl) {
         Some(e) => e.clone(),
         None => {
@@ -709,6 +659,15 @@ pub(crate) async fn fetch_pristine_package(
     }
 }
 
+/// The vendoring engine, decoupled from the manifest file. `records` is the
+/// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
+/// manifest-driven `vendor` command (and `scan --vendor`), or the
+/// freshly-fetched record map for `scan --vendor --detached`. Entries written
+/// in `detached` mode carry [`VendorEntry::detached`] plus an embedded copy
+/// of their record, so revert/verify/VEX work without a manifest entry.
+///
+/// Does NOT lock, read the manifest, or print the envelope — callers own all
+/// three. Returns whether any non-benign failure occurred.
 pub(crate) async fn vendor_records(
     common: &GlobalArgs,
     records: &HashMap<String, PatchRecord>,
@@ -784,13 +743,11 @@ pub(crate) async fn vendor_records(
     // project tree is never touched, and the lock wiring works without an
     // installed copy (it keys off lock entries). The holders keep the
     // tempdirs alive until the dispatch loop below has staged from them.
-    let mut fetched_holders: Vec<socket_patch_core::patch::vendor::registry_fetch::FetchedPackage> =
-        Vec::new();
+    let mut fetched_holders: Vec<registry_fetch::FetchedPackage> = Vec::new();
     // Fetch failures must keep their distinct Failed event; this set
     // suppresses the later duplicate `package_not_installed` skip.
     let mut fetch_failed: HashSet<String> = HashSet::new();
     {
-        use socket_patch_core::patch::vendor::{lock_inventory, registry_fetch};
         let missing: Vec<String> = vendorable
             .iter()
             .filter(|p| !all_packages.contains_key(*p))
@@ -1118,14 +1075,10 @@ pub(crate) async fn vendor_records(
         // Offline runs name the packages the lockfile COULD have fetched —
         // the inventory is a local file read, allowed offline.
         let lock_resolvable: HashSet<String> = if common.offline {
-            let entries =
-                socket_patch_core::patch::vendor::lock_inventory::inventory_project(&common.cwd)
-                    .await;
+            let entries = lock_inventory::inventory_project(&common.cwd).await;
             unmatched
                 .iter()
-                .filter(|p| {
-                    socket_patch_core::patch::vendor::lock_inventory::lookup(&entries, p).is_some()
-                })
+                .filter(|p| lock_inventory::lookup(&entries, p).is_some())
                 .cloned()
                 .collect()
         } else {
@@ -1168,6 +1121,32 @@ pub(crate) async fn vendor_records(
     has_errors
 }
 
+/// Ledger entries whose patch is gone from the manifest — the stale test
+/// shared by [`reconcile_dropped`] and [`run_vendor_gc`]. Respects this
+/// run's --ecosystems scope: a `vendor --ecosystems npm` invocation must
+/// not silently revert a cargo/go entry (restoring its lockfile and
+/// deleting its artifact) as a cross-ecosystem side effect. Detached
+/// entries (`scan --vendor --detached`) are never manifest-tracked, so
+/// "absent from the manifest" is their normal state, not a drop — only
+/// `vendor --revert` or `remove` may undo them.
+fn manifest_dropped_purls(
+    state: &VendorState,
+    manifest: &PatchManifest,
+    common: &GlobalArgs,
+) -> Vec<String> {
+    state
+        .entries
+        .iter()
+        .filter(|(purl, entry)| {
+            !entry.detached
+                && ecosystem_in_scope(common, &entry.ecosystem)
+                && !manifest.patches.contains_key(*purl)
+                && !manifest.patches.contains_key(&entry.base_purl)
+        })
+        .map(|(purl, _)| purl.clone())
+        .collect()
+}
+
 /// Revert vendored entries whose patches were dropped from the manifest.
 /// Shared with `scan --vendor` (which runs the same engine in-process).
 pub(crate) async fn reconcile_dropped(
@@ -1179,24 +1158,7 @@ pub(crate) async fn reconcile_dropped(
         Ok(s) => s,
         Err(_) => return false, // unreadable state is reported by the main path
     };
-    // Respect this run's --ecosystems scope: a `vendor --ecosystems npm`
-    // invocation must not silently revert a cargo/go entry (restoring its
-    // lockfile and deleting its artifact) as a cross-ecosystem side effect.
-    let stale: Vec<String> = state
-        .entries
-        .iter()
-        .filter(|(purl, entry)| {
-            // Detached entries (`scan --vendor --detached`) are never
-            // manifest-tracked, so "absent from the manifest" is their
-            // normal state, not a drop — only `vendor --revert` or
-            // `remove` may undo them.
-            !entry.detached
-                && ecosystem_in_scope(common, &entry.ecosystem)
-                && !manifest.patches.contains_key(*purl)
-                && !manifest.patches.contains_key(&entry.base_purl)
-        })
-        .map(|(purl, _)| purl.clone())
-        .collect();
+    let stale = manifest_dropped_purls(&state, manifest, common);
     let mut had_error = false;
     for purl in stale {
         let entry = state.entries.get(&purl).cloned().expect("listed above");
@@ -1242,11 +1204,8 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     };
 
     let mut has_errors = false;
-    let recorded: Vec<String> = {
-        let mut keys: Vec<String> = state.entries.keys().cloned().collect();
-        keys.sort();
-        keys
-    };
+    let mut recorded: Vec<String> = state.entries.keys().cloned().collect();
+    recorded.sort();
 
     for purl in &recorded {
         let entry = state.entries.get(purl).cloned().expect("key listed above");
@@ -1392,23 +1351,9 @@ pub(crate) async fn run_vendor_gc(
     };
 
     // (a) manifest-dropped entries.
-    let mut manifest = socket_patch_core::manifest::operations::read_manifest(manifest_path)
-        .await
-        .ok()
-        .flatten();
+    let mut manifest = read_manifest(manifest_path).await.ok().flatten();
     if let Some(m) = &manifest {
-        let stale: Vec<String> = state
-            .entries
-            .iter()
-            .filter(|(purl, entry)| {
-                !entry.detached
-                    && ecosystem_in_scope(common, &entry.ecosystem)
-                    && !m.patches.contains_key(*purl)
-                    && !m.patches.contains_key(&entry.base_purl)
-            })
-            .map(|(purl, _)| purl.clone())
-            .collect();
-        for purl in stale {
+        for purl in manifest_dropped_purls(&state, m, common) {
             if dry_run {
                 out.dropped_reverted.push(purl);
                 continue;
@@ -1471,8 +1416,7 @@ pub(crate) async fn run_vendor_gc(
         let _ = save_state(&common.cwd, &state).await;
         if manifest_dirty {
             if let Some(m) = &manifest {
-                let _ =
-                    socket_patch_core::manifest::operations::write_manifest(manifest_path, m).await;
+                let _ = write_manifest(manifest_path, m).await;
             }
         }
     }
@@ -1487,9 +1431,7 @@ pub(crate) async fn run_vendor_gc(
 #[cfg(test)]
 mod gc_tests {
     use super::*;
-    use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
     use socket_patch_core::patch::vendor::state::VendorArtifact;
-    use socket_patch_core::patch::vendor::VendorState;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
