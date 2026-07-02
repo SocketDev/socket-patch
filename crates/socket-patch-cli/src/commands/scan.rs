@@ -563,8 +563,10 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
             conflicting = Some("--sync");
         }
         if let Some(flag) = conflicting {
+            // "cannot be used with" phrasing matches clap's conflict errors —
+            // the scan_vendor_e2e contract test accepts exactly that shape.
             return Err(format!(
-                "--mode {} cannot be combined with {flag}: the flags select different \
+                "--mode {} cannot be used with {flag}: the flags select different \
                  modes (hosted == --redirect, vendored == --vendor, agent == --apply/--sync)",
                 mode.cli_name(),
             ));
@@ -576,7 +578,12 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         }
     }
     if args.detached && !args.vendor {
-        return Err("--detached requires vendored mode (--mode vendored or --vendor)".to_string());
+        // "required" phrasing matches clap's requires errors — the
+        // scan_vendor_e2e contract test accepts exactly that shape.
+        return Err(
+            "--detached requires vendored mode: --mode vendored or --vendor is required"
+                .to_string(),
+        );
     }
     Ok(())
 }
