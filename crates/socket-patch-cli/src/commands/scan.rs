@@ -1643,6 +1643,67 @@ async fn run_redirect(
             files.insert((*name).to_string(), content);
         }
     }
+
+    // Rush monorepos have no root package.json/lock pair: the single pnpm
+    // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
+    // (when subspaces are enabled) one lock per subspace under
+    // common/config/subspaces/<name>/. Add them under their repo-relative
+    // keys — the pnpm rewriter is basename-generalized, so nested keys are
+    // rewritten in place, and the write-back below is already path-generic.
+    let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
+    if args.common.cwd.join("rush.json").is_file() {
+        let mut added_rush_lock = false;
+        let common_lock = "common/config/rush/pnpm-lock.yaml";
+        if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
+            files.insert(common_lock.to_string(), content);
+            added_rush_lock = true;
+        }
+        let subspaces_dir = args.common.cwd.join("common/config/subspaces");
+        if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
+            // read_dir order is unspecified — sort for deterministic output.
+            let mut subspace_dirs: Vec<std::path::PathBuf> = read_dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect();
+            subspace_dirs.sort();
+            for dir in subspace_dirs {
+                let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
+                if let Ok(content) = std::fs::read_to_string(dir.join("pnpm-lock.yaml")) {
+                    files.insert(key, content);
+                    added_rush_lock = true;
+                }
+            }
+        }
+
+        // Editing a Rush lock outside `rush update` desyncs the
+        // pnpmShrinkwrapHash recorded in repo-state.json. When
+        // preventManualShrinkwrapChanges is enabled, `rush install` then
+        // refuses until `rush update` refreshes that hash — but the redirect
+        // survives `rush update` (pnpm preserves locked resolutions for
+        // unchanged specifiers). Warn only when we actually touched a lock and
+        // the repo-state file that carries the hash is present.
+        if added_rush_lock
+            && args
+                .common
+                .cwd
+                .join("common/config/rush/repo-state.json")
+                .is_file()
+        {
+            rush_warnings.push(serde_json::json!({
+                "code": "redirect_rush_repo_state_stale",
+                "detail":
+                    "pnpm-lock.yaml was edited outside `rush update`; if \
+                     preventManualShrinkwrapChanges is enabled, `rush install` fails until \
+                     `rush update` refreshes repo-state.json (the redirect survives `rush \
+                     update`)",
+            }));
+        }
+    }
+
     let rewrite = rewrite_registry_redirect(&files, &overrides);
     let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
 
@@ -1788,6 +1849,7 @@ async fn run_redirect(
             .collect();
         warnings.extend(record_warnings.iter().cloned());
         warnings.extend(migration_warnings.iter().cloned());
+        warnings.extend(rush_warnings.iter().cloned());
         let mut result = serde_json::json!({
             "status": "success",
             "redirect": {
@@ -1832,6 +1894,9 @@ async fn run_redirect(
             eprintln!("  warning: {}", w["detail"]);
         }
         for w in &migration_warnings {
+            eprintln!("  warning: {}", w["detail"]);
+        }
+        for w in &rush_warnings {
             eprintln!("  warning: {}", w["detail"]);
         }
         if let Some(statements) = vex_statements {

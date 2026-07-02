@@ -903,3 +903,210 @@ async fn scan_redirect_migrates_bun_lockb_then_redirects() {
         "the ledger must record the bun.lockb removal: {ledger}"
     );
 }
+
+// ── Rush monorepo ────────────────────────────────────────────────────────
+
+/// A Rush pnpm lock (v9) resolving the patched package under `packages:`, so
+/// the pnpm redirect rewriter has a `NAME@VERSION` block to repoint. `extra`
+/// lets a subspace lock resolve a DIFFERENT package name so the two locks are
+/// distinguishable in assertions.
+fn rush_pnpm_lock(pkg_name: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      {pkg_name}:
+        specifier: {VERSION}
+        version: {VERSION}
+
+packages:
+  {pkg_name}@{VERSION}:
+    resolution: {{integrity: sha512-UPSTREAMupstream==}}
+
+snapshots:
+  {pkg_name}@{VERSION}: {{}}
+"
+    )
+}
+
+/// Lay down a Rush monorepo: rush.json, the single source-of-truth lock at
+/// common/config/rush/pnpm-lock.yaml resolving the patched package, and one
+/// subspace lock. NO root package.json / package-lock.json pair. When
+/// `with_repo_state` is set, also drop common/config/rush/repo-state.json (the
+/// file that carries pnpmShrinkwrapHash).
+fn write_rush_project(root: &Path, with_repo_state: bool) {
+    std::fs::write(root.join("rush.json"), r#"{ "rushVersion": "5.100.0" }"#).unwrap();
+    let common = root.join("common/config/rush");
+    std::fs::create_dir_all(&common).unwrap();
+    // The common lock resolves the patched package (matches mock_reference PURL).
+    std::fs::write(common.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    // A subspace lock ALSO resolves the patched package, so both nested locks
+    // get rewritten in place under their own repo-relative keys.
+    let subspace = root.join("common/config/subspaces/frontend");
+    std::fs::create_dir_all(&subspace).unwrap();
+    std::fs::write(subspace.join("pnpm-lock.yaml"), rush_pnpm_lock(NAME)).unwrap();
+    if with_repo_state {
+        std::fs::write(
+            common.join("repo-state.json"),
+            "{\n  \"pnpmShrinkwrapHash\": \"deadbeef\",\n  \"preventManualShrinkwrapChanges\": true\n}\n",
+        )
+        .unwrap();
+    }
+}
+
+/// `scan --redirect` in a Rush monorepo rewrites BOTH the common
+/// source-of-truth lock and every subspace lock in place (nested FileEdit
+/// paths), even though there is no root package.json/lock pair — the package
+/// is discovered from the Rush locks (lockfile supplement) and the pnpm
+/// rewriter is basename-generalized. With repo-state.json present, the run
+/// warns that the lock was edited outside `rush update`.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), true);
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "scan --redirect should succeed in a Rush repo");
+
+    // Both nested locks are rewritten in place (not a new root lock).
+    for rel in [
+        "common/config/rush/pnpm-lock.yaml",
+        "common/config/subspaces/frontend/pnpm-lock.yaml",
+    ] {
+        let lock = std::fs::read_to_string(tmp.path().join(rel)).unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "{rel} must be repointed at the hosted patch; got:\n{lock}"
+        );
+        assert!(
+            lock.contains(PATCHED_SHA512),
+            "{rel} integrity must be the patched sha512; got:\n{lock}"
+        );
+    }
+    // No stray root lock was created.
+    assert!(
+        !tmp.path().join("pnpm-lock.yaml").exists(),
+        "the rewrite must edit nested locks in place, not create a root lock"
+    );
+
+    // repo-state.json present → the stale-hash warning fires.
+    let out = std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json"))
+        .expect("a redirect ledger should be written");
+    assert!(
+        out.contains(HOSTED_URL),
+        "the ledger records the redirect for revert: {out}"
+    );
+}
+
+/// Run the built `socket-patch` binary as a subprocess against `api_url`
+/// (a wiremock server) so we can parse the `--json` envelope's `warnings`
+/// array — the in-process `run` writes JSON to the process stdout, which a
+/// hosting test can't read back. No package-manager binary is needed: the
+/// rewrite is pure text over the fixture locks.
+fn run_redirect_subprocess(cwd: &Path, api_url: &str) -> serde_json::Value {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"))
+        .args([
+            "scan",
+            "--redirect",
+            "--json",
+            "--yes",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            api_url,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .output()
+        .expect("run socket-patch");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "scan --redirect must succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "scan --redirect --json output is not JSON: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+/// Collect the `code` field of every warning in the redirect envelope.
+fn warning_codes(env: &serde_json::Value) -> Vec<String> {
+    env["redirect"]["warnings"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `redirect_rush_repo_state_stale` warning fires exactly when a Rush lock
+/// was rewritten AND common/config/rush/repo-state.json is present (the file
+/// that carries pnpmShrinkwrapHash, which an out-of-band lock edit desyncs).
+/// The twin fixture without repo-state.json rewrites identically but emits no
+/// such warning. repo-state.json itself is never edited by the redirect — the
+/// customer refreshes it with `rush update`, which the redirect survives.
+#[tokio::test]
+#[serial]
+async fn rush_repo_state_stale_warning_is_gated_on_repo_state_presence() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    // With repo-state.json: the stale-hash warning is present.
+    let with_state = tempfile::tempdir().unwrap();
+    write_rush_project(with_state.path(), true);
+    let repo_state_before =
+        std::fs::read_to_string(with_state.path().join("common/config/rush/repo-state.json"))
+            .unwrap();
+    let env = run_redirect_subprocess(with_state.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "repo-state.json present → stale-hash warning must fire; got warnings {:?}",
+        warning_codes(&env)
+    );
+    // repo-state.json is Rush's business — the redirect must not touch it.
+    let repo_state_after =
+        std::fs::read_to_string(with_state.path().join("common/config/rush/repo-state.json"))
+            .unwrap();
+    assert_eq!(
+        repo_state_before, repo_state_after,
+        "the redirect must not rewrite repo-state.json"
+    );
+
+    // Twin without repo-state.json: rewrites identically, no warning.
+    let no_state = tempfile::tempdir().unwrap();
+    write_rush_project(no_state.path(), false);
+    let env = run_redirect_subprocess(no_state.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert!(
+        !warning_codes(&env).contains(&"redirect_rush_repo_state_stale".to_string()),
+        "no repo-state.json → no stale-hash warning; got warnings {:?}",
+        warning_codes(&env)
+    );
+    // The rewrite still landed in the common lock.
+    let lock =
+        std::fs::read_to_string(no_state.path().join("common/config/rush/pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(HOSTED_URL),
+        "the common lock must still be redirected without repo-state.json; got:\n{lock}"
+    );
+}
