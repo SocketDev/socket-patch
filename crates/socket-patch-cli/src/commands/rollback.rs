@@ -246,11 +246,10 @@ fn result_to_json(result: &RollbackResult) -> serde_json::Value {
 pub async fn run(args: RollbackArgs) -> i32 {
     apply_env_toggles(&args.common);
 
-    let (telemetry_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
-
+    // Bail on the unimplemented flag BEFORE constructing the API client:
+    // client construction can auto-resolve the org slug over the network,
+    // and the contract promises the one-off stub fails before any network
+    // or disk activity.
     if args.one_off {
         let msg = if args.identifier.is_none() {
             "--one-off requires an identifier (UUID or PURL)"
@@ -271,6 +270,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
         return 1;
     }
+
+    let (telemetry_client, _) =
+        get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    let api_token = telemetry_client.api_token().cloned();
+    let org_slug = telemetry_client.org_slug().cloned();
 
     let manifest_path = args.common.resolved_manifest_path();
 
@@ -499,10 +503,14 @@ async fn rollback_patches_inner(
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
     let socket_dir = manifest_path.parent().unwrap();
-    let blobs_path = socket_dir.join("blobs");
-    tokio::fs::create_dir_all(&blobs_path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut blobs_path = socket_dir.join("blobs");
+    // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
+    // don't create the blobs dir; a throwaway stage replaces it below.
+    if !args.common.dry_run {
+        tokio::fs::create_dir_all(&blobs_path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     let patches_to_rollback = find_patches_to_rollback(&manifest, args.identifier.as_deref());
 
@@ -573,6 +581,42 @@ async fn rollback_patches_inner(
     // and reads no blobs, so a missing before-blob must not block an offline
     // redirect rollback.
     let gate_manifest = exclude_local_redirects(&scoped_manifest, &args.common);
+
+    // `--dry-run`: verification needs real blob content for an accurate
+    // preview, but the preview must not leave new files in the committable
+    // `.socket/blobs` (a wet run's sweep would have removed them) — so stage
+    // blob reads in a throwaway sibling dir: hardlink (or copy) the
+    // already-cached before-blobs in, and let any download below land there
+    // too. `tempdir_in(socket_dir)` keeps it on the same filesystem for
+    // hardlinks and is auto-removed on drop, like the `.socket-stage-*`
+    // atomic-write siblings.
+    let _dry_run_blob_stage: Option<tempfile::TempDir> = if args.common.dry_run {
+        let stage = tempfile::Builder::new()
+            .prefix(".socket-stage-dryrun-blobs-")
+            .tempdir_in(socket_dir)
+            .map_err(|e| e.to_string())?;
+        let staged_path = stage.path().to_path_buf();
+        for patch in gate_manifest.patches.values() {
+            for info in patch.files.values() {
+                if info.before_hash.is_empty() {
+                    continue; // created-by-patch marker: no blob to read
+                }
+                let src = blobs_path.join(&info.before_hash);
+                let dst = staged_path.join(&info.before_hash);
+                if tokio::fs::metadata(&src).await.is_ok()
+                    && !dst.exists()
+                    && tokio::fs::hard_link(&src, &dst).await.is_err()
+                {
+                    let _ = tokio::fs::copy(&src, &dst).await;
+                }
+            }
+        }
+        blobs_path = staged_path;
+        Some(stage)
+    } else {
+        None
+    };
+
     let missing_blobs = get_missing_before_blobs(&gate_manifest, &blobs_path).await;
     if !missing_blobs.is_empty() {
         if args.common.offline {

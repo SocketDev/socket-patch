@@ -870,7 +870,10 @@ mod tests {
             "v2.0.0-20210101000000-abcdef123456"
         ));
         assert!(!are_safe_redirect_coords("../../../etc", "v1.0.0"));
-        assert!(!are_safe_redirect_coords("github.com/../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords(
+            "github.com/../../../etc",
+            "v1.0.0"
+        ));
         assert!(!are_safe_redirect_coords("/abs/path", "v1.0.0"));
         assert!(!are_safe_redirect_coords("github.com//bar", "v1.0.0"));
         assert!(!are_safe_redirect_coords("foo/./bar", "v1.0.0"));

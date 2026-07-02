@@ -462,8 +462,9 @@ fn remove_dry_run_keeps_manifest_and_emits_verified_previews() {
 
     let events = v["events"].as_array().expect("events array");
     assert!(
-        events.iter().any(|e| e["action"] == "verified"
-            && e["purl"] == "pkg:npm/__remove_test_a__@1.0.0"),
+        events
+            .iter()
+            .any(|e| e["action"] == "verified" && e["purl"] == "pkg:npm/__remove_test_a__@1.0.0"),
         "expected a Verified preview event for the matched purl: {events:?}"
     );
     assert!(
@@ -491,8 +492,7 @@ fn remove_dry_run_previews_blob_sweep_without_deleting() {
     // makes it sweepable.
     let blobs = socket.join("blobs");
     std::fs::create_dir_all(&blobs).unwrap();
-    let blob_a =
-        blobs.join("1111111111111111111111111111111111111111111111111111111111111111");
+    let blob_a = blobs.join("1111111111111111111111111111111111111111111111111111111111111111");
     std::fs::write(&blob_a, b"patched contents").unwrap();
 
     let (code, stdout) = run_remove(
@@ -514,10 +514,57 @@ fn remove_dry_run_previews_blob_sweep_without_deleting() {
         "the preview must count A's now-unreferenced blob"
     );
 
-    assert!(
-        blob_a.exists(),
-        "dry-run must not delete blobs from disk"
-    );
+    assert!(blob_a.exists(), "dry-run must not delete blobs from disk");
     let manifest = read_manifest(&socket);
     assert_eq!(manifest["patches"].as_object().unwrap().len(), 2);
+}
+
+/// The full-path preview (no --skip-rollback) must not create `.socket/blobs`
+/// either: rollback's preview previously `create_dir_all`'d it (and, online,
+/// downloaded before-blobs into it) — leaving new files a wet remove's sweep
+/// would have deleted. Offline keeps this hermetic: the preview reports the
+/// missing-blob failure (accurate — a wet offline run fails the same way)
+/// without inventing directories.
+#[test]
+fn remove_dry_run_with_rollback_does_not_create_blobs_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = make_socket_dir(tmp.path());
+    assert!(!socket.join("blobs").exists(), "precondition: no blobs dir");
+
+    let out = Command::new(binary())
+        .args([
+            "remove",
+            "pkg:npm/__remove_test_a__@1.0.0",
+            "--json",
+            "--yes",
+            "--dry-run",
+            "--offline",
+        ])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // Offline + missing before-blobs: the preview accurately reports the
+    // rollback failure a wet run would hit (exit 1, rollback_failed)...
+    assert_eq!(out.status.code(), Some(1), "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "rollback_failed");
+    assert_eq!(
+        v["dryRun"], true,
+        "preview failures must still report dryRun:true"
+    );
+    // ...but mutates nothing: no blobs dir, manifest intact, no stage litter.
+    assert!(
+        !socket.join("blobs").exists(),
+        "dry-run must not create .socket/blobs"
+    );
+    assert_eq!(read_manifest(&socket)["patches"].as_object().unwrap().len(), 2);
+    let litter: Vec<_> = std::fs::read_dir(&socket)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".socket-stage-"))
+        .collect();
+    assert!(litter.is_empty(), "no stage litter: {litter:?}");
 }

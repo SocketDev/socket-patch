@@ -129,7 +129,8 @@ pub(super) async fn run_apply_gc(
     // entries — so the manifest prune + blob sweep below reclaims their
     // blobs in this same pass (and the stale `vendored` exemption set is
     // harmless: the entries it would exempt are already gone).
-    let vendor_gc = crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
+    let vendor_gc =
+        crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
 
     // Re-read the just-written manifest (the apply step may have added
     // or updated entries we now want to consider for pruning).
@@ -166,7 +167,8 @@ async fn preview_apply_gc(
     vendored: &HashSet<String>,
 ) -> GcSummary {
     // Read-only preview of the vendored-state GC (lists, never reverts).
-    let vendor_gc = crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
+    let vendor_gc =
+        crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
 
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,

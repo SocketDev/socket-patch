@@ -586,7 +586,11 @@ fn mode_hosted_is_the_source_of_truth() {
     assert_eq!(folded.mode, Some(ScanMode::Hosted));
     // ...and the legacy boolean spelling folds INTO the enum.
     let folded = parse_and_resolve(&["--redirect"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Hosted), "--redirect == --mode hosted");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Hosted),
+        "--redirect == --mode hosted"
+    );
 }
 
 #[test]
@@ -595,7 +599,11 @@ fn mode_vendored_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "vendored"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Vendored));
     let folded = parse_and_resolve(&["--vendor"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Vendored), "--vendor == --mode vendored");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Vendored),
+        "--vendor == --mode vendored"
+    );
 }
 
 #[test]
@@ -604,10 +612,18 @@ fn mode_agent_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "agent"]).expect("fold ok");
     assert_eq!(folded.mode, Some(ScanMode::Agent));
     let folded = parse_and_resolve(&["--apply"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Agent), "--apply == --mode agent");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Agent),
+        "--apply == --mode agent"
+    );
     // --sync counts as an agent-mode spelling (its prune half is orthogonal).
     let folded = parse_and_resolve(&["--sync"]).expect("fold ok");
-    assert_eq!(folded.mode, Some(ScanMode::Agent), "--sync == --mode agent --prune");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Agent),
+        "--sync == --mode agent --prune"
+    );
     assert!(folded.sync, "the prune half of --sync stays readable");
     // No mode selected at all: scan stays read-only.
     let folded = parse_and_resolve(&[]).expect("fold ok");

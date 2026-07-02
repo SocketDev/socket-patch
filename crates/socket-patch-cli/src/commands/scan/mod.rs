@@ -267,7 +267,7 @@ pub struct ScanArgs {
 /// on failure (per the fail-the-command contract). Returns the final exit
 /// code: `base_code` when not requested / skipped / on VEX success, `1`
 /// when VEX generation failed. Caller prints `result` after this returns.
-pub(super) async fn embed_vex_into_json(
+async fn embed_vex_into_json(
     common: &GlobalArgs,
     vex_args: &VexEmbedArgs,
     manifest_path: &Path,
@@ -339,7 +339,7 @@ async fn embed_vex_human(
 /// workflows have no "specify --id" option, so non-TTY runs auto-select
 /// the newest patch rather than erroring with `selection_required`. `Err`
 /// carries `select_patches`' exit code.
-pub(super) async fn discover_selected(
+async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     org_slug: Option<&str>,
     packages: &[BatchPackagePatches],
@@ -363,7 +363,12 @@ pub(super) async fn discover_selected(
 /// The `DownloadParams` every scan-driven download shares. Only the output
 /// shape (`json`/`silent`) and `save_only` differ per flow; vendor mode
 /// never persists blobs (the vendor step consumes the staged sources).
-pub(super) fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
+fn download_params(
+    args: &ScanArgs,
+    save_only: bool,
+    json: bool,
+    silent: bool,
+) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
         org: args.common.org.clone(),

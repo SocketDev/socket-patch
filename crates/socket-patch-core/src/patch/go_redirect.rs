@@ -437,7 +437,23 @@ pub async fn verify_go_redirect_state(
             drifts.push(Drift::MissingCopy { purl: purl.clone() });
         } else {
             for (file_name, info) in &record.files {
-                let path = copy_dir.join(normalize_file_path(file_name));
+                let normalized = normalize_file_path(file_name);
+                // SECURITY: never hash through a manifest key that escapes
+                // the copy dir — a poisoned manifest (`../../../home/...`)
+                // would otherwise leak the existence + content hash of an
+                // arbitrary user-readable file into the audit output.
+                // Fail closed as drift, same as the guarded
+                // `copy_matches_after_hashes` this audit mirrors.
+                if !crate::patch::apply::is_safe_relative_subpath(normalized) {
+                    drifts.push(Drift::StaleCopy {
+                        purl: purl.clone(),
+                        file: file_name.clone(),
+                        expected: info.after_hash.clone(),
+                        found: None,
+                    });
+                    continue;
+                }
+                let path = copy_dir.join(normalized);
                 match compute_file_git_sha256(&path).await {
                     Ok(h) if h == info.after_hash => {}
                     Ok(h) => drifts.push(Drift::StaleCopy {
@@ -1274,6 +1290,64 @@ mod tests {
         assert!(drifts
             .iter()
             .any(|d| matches!(d, Drift::OrphanReplace { .. })));
+    }
+
+    /// SECURITY: the audit must not hash through a manifest file key that
+    /// escapes the copy dir — a poisoned committed manifest would otherwise
+    /// leak the existence + content hash of an arbitrary user-readable file
+    /// into the drift report. The unsafe key fails closed as
+    /// `StaleCopy { found: None }` with no out-of-tree read.
+    #[tokio::test]
+    async fn test_verify_rejects_escaping_manifest_key_without_reading() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        // The out-of-tree file a poisoned key points at (5 `..`s climb from
+        // `.socket/go-patches/github.com/foo/bar@v1.4.2/` back to root).
+        tokio::fs::write(root.join("secret.txt"), b"out-of-tree")
+            .await
+            .unwrap();
+        let mut manifest = manifest_with(&files);
+        manifest.patches.get_mut(PURL).unwrap().files.insert(
+            "../../../../../secret.txt".to_string(),
+            PatchFileInfo {
+                before_hash: "0".repeat(64),
+                after_hash: "1".repeat(64),
+            },
+        );
+
+        let desired: HashSet<String> = [PURL.to_string()].into_iter().collect();
+        let drifts = verify_go_redirect_state(root, &manifest, &desired)
+            .await
+            .unwrap_err();
+        let found = drifts
+            .iter()
+            .find_map(|d| match d {
+                Drift::StaleCopy { file, found, .. } if file.contains("secret") => {
+                    Some(found.clone())
+                }
+                _ => None,
+            })
+            .expect("unsafe key must surface as drift");
+        assert_eq!(
+            found, None,
+            "must fail closed WITHOUT hashing the out-of-tree file"
+        );
     }
 
     #[tokio::test]

@@ -48,9 +48,12 @@ fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String
 
 /// Emit the `not_found` envelope (or stderr line) for an identifier that
 /// matched nothing, tracking the failure. Both the pre-flight match and
-/// the post-rollback manifest mutation share this exit path.
+/// the post-rollback manifest mutation share this exit path. `dry_run`
+/// rides the envelope so a preview's failures still report `dryRun: true`
+/// (matching apply's error envelopes and remove's own success envelope).
 async fn emit_not_found(
     json: bool,
+    dry_run: bool,
     identifier: &str,
     api_token: Option<&str>,
     org_slug: Option<&str>,
@@ -59,6 +62,7 @@ async fn emit_not_found(
     track_patch_remove_failed(&msg, api_token, org_slug).await;
     if json {
         let mut env = Envelope::new(Command::Remove);
+        env.dry_run = dry_run;
         env.status = Status::NotFound;
         env.error = Some(EnvelopeError::new("not_found", msg));
         println!("{}", env.to_pretty_json());
@@ -68,10 +72,12 @@ async fn emit_not_found(
 }
 
 /// Emit a `remove` error envelope and return. Used by the many error
-/// paths in `run` so they all share the same JSON shape.
-fn emit_error_envelope(json: bool, code: &str, message: String) {
+/// paths in `run` so they all share the same JSON shape. `dry_run` rides
+/// the envelope so preview failures report `dryRun: true`.
+fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
     if json {
         let mut env = Envelope::new(Command::Remove);
+        env.dry_run = dry_run;
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
     } else {
@@ -115,6 +121,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         emit_error_envelope(
             args.common.json,
+            args.common.dry_run,
             "manifest_not_found",
             format!("Manifest not found at {}", manifest_path.display()),
         );
@@ -148,13 +155,19 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Ok(None) => {
             emit_error_envelope(
                 args.common.json,
+                args.common.dry_run,
                 "manifest_invalid",
                 "Invalid manifest".to_string(),
             );
             return 1;
         }
         Err(e) => {
-            emit_error_envelope(args.common.json, "manifest_unreadable", e.to_string());
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "manifest_unreadable",
+                e.to_string(),
+            );
             return 1;
         }
     };
@@ -192,6 +205,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
         emit_not_found(
             args.common.json,
+            args.common.dry_run,
             &args.identifier,
             api_token.as_deref(),
             org_slug.as_deref(),
@@ -267,7 +281,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     )
                     .await;
                     emit_error_envelope(
-                        args.common.json,
+        args.common.json,
+        args.common.dry_run,
                         "rollback_failed",
                         "Rollback failed during patch removal. Use --skip-rollback to remove from manifest without restoring files.".to_string(),
                     );
@@ -305,7 +320,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
                 emit_error_envelope(
-                    args.common.json,
+        args.common.json,
+        args.common.dry_run,
                     "rollback_failed",
                     format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
                 );
@@ -332,6 +348,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Err(e) => {
             emit_error_envelope(
                 args.common.json,
+                args.common.dry_run,
                 "vendor_state_unreadable",
                 format!("cannot read .socket/vendor/state.json: {e}"),
             );
@@ -383,6 +400,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     .await;
                     emit_error_envelope(
                         args.common.json,
+                        args.common.dry_run,
                         "vendor_revert_failed",
                         format!(
                             "could not revert vendoring for {key}: {}. The manifest was not \
@@ -410,6 +428,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 if let Err(e) = save_state(&args.common.cwd, &vendor_state).await {
                     emit_error_envelope(
                         args.common.json,
+                        args.common.dry_run,
                         "vendor_state_write_failed",
                         e.to_string(),
                     );
@@ -442,6 +461,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
             if removed.is_empty() {
                 emit_not_found(
                     args.common.json,
+                    args.common.dry_run,
                     &args.identifier,
                     api_token.as_deref(),
                     org_slug.as_deref(),
@@ -541,14 +561,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
 
             if !args.common.dry_run {
-                track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref())
-                    .await;
+                track_patch_removed(removed.len(), api_token.as_deref(), org_slug.as_deref()).await;
             }
             0
         }
         Err(e) => {
             track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-            emit_error_envelope(args.common.json, "remove_failed", e);
+            emit_error_envelope(args.common.json, args.common.dry_run, "remove_failed", e);
             1
         }
     }
@@ -573,6 +592,7 @@ async fn remove_detached_only(
     if args.skip_rollback {
         emit_error_envelope(
             args.common.json,
+            args.common.dry_run,
             "vendor_state_retained",
             format!(
                 "{} matches only detached vendored patch(es); removing one means reverting \
@@ -627,6 +647,7 @@ async fn remove_detached_only(
             .await;
             emit_error_envelope(
                 args.common.json,
+                args.common.dry_run,
                 "vendor_revert_failed",
                 format!(
                     "could not revert vendoring for {key}: {}",
@@ -651,7 +672,12 @@ async fn remove_detached_only(
         }
         state.entries.remove(key);
         if let Err(e) = save_state(&args.common.cwd, &state).await {
-            emit_error_envelope(args.common.json, "vendor_state_write_failed", e.to_string());
+            emit_error_envelope(
+                args.common.json,
+                args.common.dry_run,
+                "vendor_state_write_failed",
+                e.to_string(),
+            );
             return 1;
         }
         if !args.common.json {
