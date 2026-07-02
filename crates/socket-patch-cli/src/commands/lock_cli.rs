@@ -1,11 +1,11 @@
 //! Envelope-aware wrapper around the
 //! `socket_patch_core::patch::apply_lock` advisory lock.
 //!
-//! Mutating subcommands (`apply`, `rollback`, `repair`, `remove`) all
-//! need the same shape: acquire the lock at the top of `run`, on
-//! contention emit a JSON envelope with `errorCode: "lock_held"` (or
-//! stderr in human mode) and exit 1. This module centralises that
-//! emission so the four call sites stay one line each.
+//! Mutating subcommands (`apply`, `rollback`, `repair`, `remove`,
+//! `vendor`) all need the same shape: acquire the lock at the top of
+//! `run`, on contention emit a JSON envelope with `errorCode:
+//! "lock_held"` (or stderr in human mode) and exit 1. This module
+//! centralises that emission so the call sites stay one line each.
 //!
 //! The lock itself is in `socket-patch-core` (cross-crate, also used
 //! by tests). This module is the CLI-side glue that knows how to
@@ -20,9 +20,9 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchE
 
 /// Stable `errorCode` tag emitted as a `Skipped` warning event when
 /// `--break-lock` actually reclaims a stale pre-existing lock file.
-/// Exposed for downstream consumers and integration tests that
-/// pattern-match on it.
-pub const LOCK_BROKEN_CODE: &str = "lock_broken";
+/// Integration tests and downstream consumers pattern-match on the
+/// literal string.
+pub(crate) const LOCK_BROKEN_CODE: &str = "lock_broken";
 
 /// Outcome of a successful lock acquisition. Callers attach a
 /// `lock_broken` event to their own envelope when [`broke_lock`] is
@@ -31,13 +31,13 @@ pub const LOCK_BROKEN_CODE: &str = "lock_broken";
 ///
 /// [`broke_lock`]: LockAcquired::broke_lock
 #[derive(Debug)]
-pub struct LockAcquired {
-    pub guard: LockGuard,
+pub(crate) struct LockAcquired {
+    pub(crate) guard: LockGuard,
     /// True iff `--break-lock` was set AND a pre-existing
     /// `apply.lock` file (with no live holder) was reclaimed.
     /// False when the file didn't exist (nothing to break) — the
     /// flag was a no-op in that case so no warning is warranted.
-    pub broke_lock: bool,
+    pub(crate) broke_lock: bool,
 }
 
 /// Try to acquire `<socket_dir>/apply.lock` and return the guard, or
@@ -66,7 +66,7 @@ pub struct LockAcquired {
 /// pre-existing file is reclaimed with no live holder the return
 /// value's `broke_lock` is true and the caller should attach a
 /// `lock_broken` warning event to their envelope.
-pub fn acquire_or_emit(
+pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
     json: bool,
@@ -75,104 +75,47 @@ pub fn acquire_or_emit(
     timeout: Duration,
     break_lock: bool,
 ) -> Result<LockAcquired, i32> {
-    if break_lock {
-        let path = socket_dir.join("apply.lock");
+    // `--break-lock` is a *non-blocking* try-once probe (the caller's
+    // `timeout` never applies to it) that never unlinks the lock file —
+    // see the doc comment for why removal would defeat mutual
+    // exclusion. Snapshot whether a lock file existed *before* the
+    // acquire: it opens with `create(true)`, so afterwards the file
+    // always exists, and only a *pre-existing* leftover counts as
+    // "broke a lock" (mirroring `unlock`'s `lock_existed`
+    // source-of-truth pattern).
+    let lock_existed = break_lock && socket_dir.join("apply.lock").exists();
+    let acquire_timeout = if break_lock { Duration::ZERO } else { timeout };
 
-        // Snapshot whether a lock file existed *before* we touch
-        // anything. The probe `acquire` below opens with `create(true)`,
-        // so afterwards the file always exists — even on a clean tree.
-        // We only want to report `broke_lock` (and emit the warning
-        // event) when a *pre-existing* leftover was actually reclaimed,
-        // mirroring `unlock`'s `lock_existed` source-of-truth pattern.
-        let lock_existed = path.exists();
-
-        // CRITICAL: never steal a lock from a *live* holder, and never
-        // unlink the lock file at all. Removal defeats mutual exclusion
-        // in two ways:
-        //   * unlinking a *held* file leaves the holder flocking the
-        //     old (unlinked) inode while we lock a fresh one — both
-        //     processes then believe they hold the lock and race on
-        //     every file write, which is exactly what the lock exists
-        //     to prevent;
-        //   * even when a probe proves no holder at unlink time, a
-        //     competitor mid-`acquire` that opened the file *before*
-        //     the unlink can flock the orphaned inode *after* it, with
-        //     the same double-hold result.
-        // A leftover file from a crashed run needs no removal anyway:
-        // the kernel released the dead process's advisory lock along
-        // with its file handle, so a non-blocking acquire simply
-        // reclaims the file in place.
-        //   * Ok  => no live holder — the probe guard IS the lock.
-        //            Return it; `broke_lock` reports whether a
-        //            pre-existing leftover was reclaimed so callers
-        //            attach the warning event.
-        //   * Held => a live holder exists. Refuse rather than steal —
-        //            this is the case `--break-lock` was *wrongly*
-        //            relied on for, and the only one where it mattered.
-        //   * Io   => surface the real fault.
-        match acquire(socket_dir, Duration::ZERO) {
-            Ok(guard) => {
-                // Only a *pre-existing* leftover counts as "broke a
-                // lock". If the probe itself just created the file on a
-                // clean tree, the flag was a no-op for the warning
-                // surface — `broke_lock` stays false so callers don't
-                // emit a spurious event.
-                let broke_lock = lock_existed;
-                if broke_lock && !silent && !json {
-                    eprintln!(
-                        "Warning: --break-lock reclaimed stale {} (no live holder).",
-                        path.display()
-                    );
-                }
-                return Ok(LockAcquired { guard, broke_lock });
-            }
-            Err(LockError::Held) => {
-                // The probe above is a *non-blocking* try-once
-                // (`Duration::ZERO`), so report a zero wait. Threading
-                // the caller's `timeout` here would claim a "(waited …)"
-                // that never happened — the probe refuses a live holder
-                // immediately, it does not wait out the budget first.
-                // `break_probe_held_message` takes no timeout precisely so
-                // the wrong value can't be passed back in.
-                let msg = break_probe_held_message();
-                // The user already passed --break-lock and it was refused:
-                // advising it again would be self-defeating. Only the
-                // inspect path remains actionable.
-                emit(
-                    command,
-                    json,
-                    silent,
-                    dry_run,
-                    "lock_held",
-                    &msg,
-                    Hint::UnlockOnly,
+    match acquire(socket_dir, acquire_timeout) {
+        Ok(guard) => {
+            // No live holder — the acquire's guard IS the lock; a
+            // crashed run's leftover needs no removal (the kernel
+            // already released the dead holder's advisory lock).
+            if lock_existed && !silent && !json {
+                eprintln!(
+                    "Warning: --break-lock reclaimed stale {} (no live holder).",
+                    socket_dir.join("apply.lock").display()
                 );
-                return Err(1);
             }
-            Err(LockError::Io { path, source }) => {
-                let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-                emit(command, json, silent, dry_run, "lock_io", &msg, Hint::None);
-                return Err(1);
-            }
+            Ok(LockAcquired {
+                guard,
+                broke_lock: lock_existed,
+            })
         }
-    }
-
-    match acquire(socket_dir, timeout) {
-        Ok(guard) => Ok(LockAcquired {
-            guard,
-            broke_lock: false,
-        }),
         Err(LockError::Held) => {
-            let msg = held_message(timeout);
-            emit(
-                command,
-                json,
-                silent,
-                dry_run,
-                "lock_held",
-                &msg,
-                Hint::UnlockOrBreakLock,
-            );
+            // A live holder exists. For `--break-lock` that means
+            // refuse rather than steal, with two consequences for the
+            // message: the probe never waited, so it must not claim a
+            // "(waited …)" (`break_probe_held_message` takes no timeout
+            // precisely so the wrong value can't be passed back in);
+            // and re-advising --break-lock — which was just refused —
+            // would be self-defeating, so only the inspect hint remains.
+            let (msg, hint) = if break_lock {
+                (break_probe_held_message(), Hint::UnlockOnly)
+            } else {
+                (held_message(timeout), Hint::UnlockOrBreakLock)
+            };
+            emit(command, json, silent, dry_run, "lock_held", &msg, hint);
             Err(1)
         }
         Err(LockError::Io { path, source }) => {
@@ -187,7 +130,7 @@ pub fn acquire_or_emit(
 /// when [`LockAcquired::broke_lock`] is true. Artifact-level (no
 /// PURL) since the action targets the `.socket/` directory itself,
 /// not a specific package.
-pub fn lock_broken_event(socket_dir: &Path) -> PatchEvent {
+pub(crate) fn lock_broken_event(socket_dir: &Path) -> PatchEvent {
     PatchEvent::artifact(PatchAction::Skipped).with_reason(
         LOCK_BROKEN_CODE,
         format!(
@@ -195,13 +138,6 @@ pub fn lock_broken_event(socket_dir: &Path) -> PatchEvent {
             socket_dir.display()
         ),
     )
-}
-
-/// Convenience: record the `lock_broken` warning event on an
-/// envelope. Mirrors the inline pattern at each call site so we
-/// don't drift on the action / errorCode pair.
-pub fn record_lock_broken(env: &mut Envelope, socket_dir: &Path) {
-    env.record(lock_broken_event(socket_dir));
 }
 
 /// Contention message for the `--break-lock` pre-acquire probe. That
@@ -240,11 +176,17 @@ fn fmt_duration(d: Duration) -> String {
     }
 }
 
-/// Build the top-level error envelope emitted in `--json` mode when
-/// lock acquisition fails. Split out from [`emit`] so the serialized
-/// shape (status / error.code / command / dryRun) is unit-testable
-/// without capturing stdout.
-fn error_envelope(command: Command, dry_run: bool, code: &str, message: &str) -> Envelope {
+/// Build the top-level error envelope emitted in `--json` mode when a
+/// command fails before doing real work (lock acquisition here; `repair`
+/// reuses it for its early error exits). Split out from [`emit`] so the
+/// serialized shape (status / error.code / command / dryRun) is
+/// unit-testable without capturing stdout.
+pub(crate) fn error_envelope(
+    command: Command,
+    dry_run: bool,
+    code: &str,
+    message: &str,
+) -> Envelope {
     let mut env = Envelope::new(command);
     env.dry_run = dry_run;
     env.mark_error(EnvelopeError::new(code, message));

@@ -177,7 +177,6 @@ pub(crate) struct VexBuildParams {
 pub(crate) struct VexWriteSummary {
     pub statements: usize,
     pub failed: Vec<FailedPatch>,
-    pub wrote_to_file: bool,
     /// The built document — returned so the standalone `vex` command can
     /// emit its per-subcomponent envelope without rebuilding.
     pub doc: Document,
@@ -210,49 +209,6 @@ pub async fn run(args: VexArgs) -> i32 {
         return 2;
     }
 
-    let manifest_path = args.common.resolved_manifest_path();
-
-    // `None` ⇒ no manifest file. That is no longer terminal by itself:
-    // a `scan --vendor --detached` project carries its patch records in
-    // the vendor ledger instead, and those must still be attestable.
-    let manifest_file = match read_manifest(&manifest_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            emit_envelope_error_and_track(&args, "manifest_unreadable", &e.to_string()).await;
-            return 2;
-        }
-    };
-    let had_manifest_file = manifest_file.is_some();
-    let manifest = augment_with_detached(
-        &args.common,
-        manifest_file.unwrap_or_else(PatchManifest::new),
-    )
-    .await;
-    // `scan --redirect` patches live only in the redirect ledger (no manifest
-    // record); fold them in before the emptiness check so they're attestable.
-    let (manifest, redirected) = augment_with_redirect(&args.common, manifest).await;
-
-    if manifest.patches.is_empty() {
-        if !had_manifest_file {
-            // No manifest AND nothing detached — the original contract.
-            emit_envelope_error_and_track(
-                &args,
-                "manifest_not_found",
-                &format!("Manifest not found at {}", manifest_path.display()),
-            )
-            .await;
-            return 2;
-        }
-        emit_envelope_error_and_track(
-            &args,
-            "no_patches",
-            "Manifest is empty — nothing to attest. Run `socket-patch get` \
-             or `socket-patch scan --sync` first.",
-        )
-        .await;
-        return 1;
-    }
-
     let params = VexBuildParams {
         output: args.output.clone(),
         product: args.product.clone(),
@@ -262,16 +218,17 @@ pub async fn run(args: VexArgs) -> i32 {
         assume_applied: Vec::new(),
     };
 
-    match generate_vex(&args.common, &params, &manifest, &redirected).await {
+    let manifest_path = args.common.resolved_manifest_path();
+    match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
         Ok(summary) => {
             if args.common.json {
                 emit_envelope_success(&summary.doc, &summary.failed);
-            } else if summary.wrote_to_file {
+            } else if let Some(path) = &args.output {
                 if !args.common.silent {
-                    let path = args.output.as_ref().unwrap().display();
                     println!(
-                        "Wrote OpenVEX document with {} statement(s) to {path}",
-                        summary.statements
+                        "Wrote OpenVEX document with {} statement(s) to {}",
+                        summary.statements,
+                        path.display()
                     );
                 }
             } else if !args.common.silent {
@@ -279,12 +236,24 @@ pub async fn run(args: VexArgs) -> i32 {
             }
             0
         }
-        // `no_applicable_patches` is a soft "nothing to attest" (exit 1)
-        // and lists the omitted patches; every other error is a hard
-        // failure (exit 2). `generate_vex` already fired telemetry, so
-        // these emit-only sinks must not re-track.
+        // `no_applicable_patches` and `no_patches` are soft "nothing to
+        // attest" cases (exit 1); every other error is a hard failure
+        // (exit 2). `generate_vex_from_manifest_path` already fired
+        // telemetry, so these emit-only sinks must not re-track.
         Err(e) if e.code == "no_applicable_patches" => {
             emit_envelope_error_with_failures(&args, e.code, &e.message, &e.failed);
+            1
+        }
+        // Standalone-only remediation hint: after an embedded `apply --vex`
+        // / `scan --vex` run the advice would be circular, so the shared
+        // path keeps the bare message and it is appended here.
+        Err(e) if e.code == "no_patches" => {
+            emit_envelope_error(
+                &args,
+                e.code,
+                "Manifest is empty — nothing to attest. Run `socket-patch get` \
+                 or `socket-patch scan --sync` first.",
+            );
             1
         }
         Err(e) => {
@@ -464,16 +433,13 @@ pub(crate) async fn generate_vex(
     };
 
     // Serialize.
-    let serialized = if params.compact {
-        match serde_json::to_string(&doc) {
-            Ok(s) => s,
-            Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
-        }
+    let serialized = match if params.compact {
+        serde_json::to_string(&doc)
     } else {
-        match serde_json::to_string_pretty(&doc) {
-            Ok(s) => s,
-            Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
-        }
+        serde_json::to_string_pretty(&doc)
+    } {
+        Ok(s) => s,
+        Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
     };
 
     // Write.
@@ -502,7 +468,6 @@ pub(crate) async fn generate_vex(
     Ok(VexWriteSummary {
         statements: doc.statements.len(),
         failed: outcome.failed,
-        wrote_to_file,
         doc,
     })
 }
@@ -690,6 +655,7 @@ async fn synthesize_go_patches(
     use socket_patch_core::patch::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
+    use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;
     use socket_patch_core::utils::purl::build_golang_purl;
 
     let mut go_patches = HashMap::new();
@@ -710,11 +676,10 @@ async fn synthesize_go_patches(
             continue;
         }
         // SECURITY: module/version come from a committed (tamper-able)
-        // go.mod and are about to key a path we hash. Validate with the
-        // same per-segment rules `go_redirect::are_safe_redirect_coords`
-        // applies (it is crate-private to core) before building the
-        // copy-dir path.
-        if !are_safe_go_redirect_coords(&entry.module, version) {
+        // go.mod and are about to key a path we hash. Apply the same
+        // fail-closed coordinate guard `go_redirect` itself uses before
+        // building the copy-dir path.
+        if !are_safe_redirect_coords(&entry.module, version) {
             continue;
         }
         go_patches.insert(
@@ -726,27 +691,6 @@ async fn synthesize_go_patches(
         );
     }
     go_patches
-}
-
-/// Local mirror of core's `go_redirect::are_safe_redirect_coords` (which is
-/// `pub(crate)` there): a module path is `/`-separated segments, each
-/// non-empty and not `.`/`..`, no leading `/`, no backslash/NUL; a version
-/// is a single such segment. Fail-closed before any disk access.
-#[cfg(feature = "golang")]
-fn are_safe_go_redirect_coords(module: &str, version: &str) -> bool {
-    fn safe_segment(seg: &str) -> bool {
-        !seg.is_empty() && seg != "." && seg != ".."
-    }
-    let module_ok = !module.is_empty()
-        && !module.starts_with('/')
-        && !module.contains('\\')
-        && !module.contains('\0')
-        && module.split('/').all(safe_segment);
-    let version_ok = safe_segment(version)
-        && !version.contains('/')
-        && !version.contains('\\')
-        && !version.contains('\0');
-    module_ok && version_ok
 }
 
 /// Walk the ecosystem dispatch to build the PURL -> on-disk-path map
@@ -910,36 +854,35 @@ mod tests {
         }
     }
 
-    /// The local mirror of core's `are_safe_redirect_coords` must enforce
-    /// the same accept/reject set (cases lifted from core's pinned tests) —
-    /// a divergence would let a tampered go.mod `replace` key an
-    /// out-of-tree path into the go-patches verification map.
+    /// The go-patches synthesis guards its copy-dir keys with core's
+    /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI
+    /// side — a regression here would let a tampered go.mod `replace` key
+    /// an out-of-tree path into the go-patches verification map.
     #[cfg(feature = "golang")]
     #[test]
     fn go_redirect_coord_guard_matches_core_rules() {
-        assert!(are_safe_go_redirect_coords("github.com/foo/bar", "v1.4.2"));
-        assert!(are_safe_go_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));
-        assert!(are_safe_go_redirect_coords(
+        use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;
+
+        assert!(are_safe_redirect_coords("github.com/foo/bar", "v1.4.2"));
+        assert!(are_safe_redirect_coords("gopkg.in/inf.v0", "v0.9.1"));
+        assert!(are_safe_redirect_coords(
             "github.com/foo/bar/v2",
             "v2.0.0-20210101000000-abcdef123456"
         ));
-        assert!(!are_safe_go_redirect_coords("../../../etc", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords(
-            "github.com/../../../etc",
-            "v1.0.0"
-        ));
-        assert!(!are_safe_go_redirect_coords("/abs/path", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("github.com//bar", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("foo/./bar", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("foo\\bar", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords("", "v1.0.0"));
-        assert!(!are_safe_go_redirect_coords(
+        assert!(!are_safe_redirect_coords("../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("github.com/../../../etc", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("/abs/path", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("github.com//bar", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("foo/./bar", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("foo\\bar", "v1.0.0"));
+        assert!(!are_safe_redirect_coords("", "v1.0.0"));
+        assert!(!are_safe_redirect_coords(
             "github.com/foo/bar",
             "../../../evil"
         ));
-        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", "v1/0/0"));
-        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ".."));
-        assert!(!are_safe_go_redirect_coords("github.com/foo/bar", ""));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", "v1/0/0"));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", ".."));
+        assert!(!are_safe_redirect_coords("github.com/foo/bar", ""));
     }
 
     #[derive(Parser)]

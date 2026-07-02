@@ -2,20 +2,23 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::crawlers::CrawlerOptions;
-use socket_patch_core::manifest::operations::read_manifest;
+use socket_patch_core::manifest::operations::{get_before_hash_blobs, read_manifest};
 use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::select_installed_variants;
 use socket_patch_core::patch::rollback::{
     rollback_package_patch, RollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
+#[cfg(feature = "golang")]
+use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::{acquire_or_emit, LOCK_BROKEN_CODE};
+use crate::commands::remove::patch_matches;
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 
@@ -54,15 +57,7 @@ struct PatchToRollback {
 // directive) + the patched copy — no in-place restore, no before-blob. Cargo
 // patches in place (vendored or registry cache), so it rolls back in place from
 // before-blobs like npm/pypi. The helper is an inert stub without `golang`.
-
-/// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
-#[cfg(feature = "golang")]
-fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
-    use socket_patch_core::crawlers::Ecosystem;
-    !common.global
-        && common.global_prefix.is_none()
-        && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
-}
+// `is_local_go` is shared with `apply`, which creates the same redirects.
 
 /// True when `purl` rolls back by dropping a project-local redirect (local-mode
 /// go) rather than restoring bytes from a before-blob. The before-blob gate uses
@@ -158,56 +153,15 @@ fn find_patches_to_rollback(
     manifest: &PatchManifest,
     identifier: Option<&str>,
 ) -> Vec<PatchToRollback> {
-    match identifier {
-        None => manifest
-            .patches
-            .iter()
-            .map(|(purl, patch)| PatchToRollback {
-                purl: purl.clone(),
-                patch: patch.clone(),
-            })
-            .collect(),
-        Some(id) => {
-            let mut patches = Vec::new();
-            if id.starts_with("pkg:") {
-                // A base PURL (no `?`) matches every release variant of
-                // that package@version; a qualified PURL targets one.
-                for (purl, patch) in &manifest.patches {
-                    if purl_matches_identifier(purl, id) {
-                        patches.push(PatchToRollback {
-                            purl: purl.clone(),
-                            patch: patch.clone(),
-                        });
-                    }
-                }
-            } else {
-                for (purl, patch) in &manifest.patches {
-                    if patch.uuid == id {
-                        patches.push(PatchToRollback {
-                            purl: purl.clone(),
-                            patch: patch.clone(),
-                        });
-                    }
-                }
-            }
-            patches
-        }
-    }
-}
-
-fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
-    let mut blobs = HashSet::new();
-    for patch in manifest.patches.values() {
-        for file_info in patch.files.values() {
-            // An empty beforeHash is the "file created by the patch" sentinel,
-            // not a blob: rollback deletes the file instead of restoring
-            // content, so there is nothing to download or gate on.
-            if !file_info.before_hash.is_empty() {
-                blobs.insert(file_info.before_hash.clone());
-            }
-        }
-    }
-    blobs
+    manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| identifier.is_none_or(|id| patch_matches(purl, &patch.uuid, id)))
+        .map(|(purl, patch)| PatchToRollback {
+            purl: purl.clone(),
+            patch: patch.clone(),
+        })
+        .collect()
 }
 
 async fn get_missing_before_blobs(manifest: &PatchManifest, blobs_path: &Path) -> HashSet<String> {
@@ -297,36 +251,23 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let api_token = telemetry_client.api_token().cloned();
     let org_slug = telemetry_client.org_slug().cloned();
 
-    // Validate one-off requires identifier
-    if args.one_off && args.identifier.is_none() {
-        if args.common.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "error",
-                    "error": "--one-off requires an identifier (UUID or PURL)",
-                }))
-                .unwrap()
-            );
-        } else {
-            eprintln!("Error: --one-off requires an identifier (UUID or PURL)");
-        }
-        return 1;
-    }
-
-    // Handle one-off mode
     if args.one_off {
+        let msg = if args.identifier.is_none() {
+            "--one-off requires an identifier (UUID or PURL)"
+        } else {
+            "One-off rollback mode is not yet implemented"
+        };
         if args.common.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "error",
-                    "error": "One-off rollback mode is not yet implemented",
+                    "error": msg,
                 }))
                 .unwrap()
             );
         } else {
-            eprintln!("Error: One-off rollback mode is not yet implemented");
+            eprintln!("Error: {msg}");
         }
         return 1;
     }
@@ -467,13 +408,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     for result in &results {
                         println!("  {}:", result.package_key);
                         for f in &result.files_verified {
-                            let status_str = match f.status {
-                                VerifyRollbackStatus::Ready => "ready",
-                                VerifyRollbackStatus::AlreadyOriginal => "already original",
-                                VerifyRollbackStatus::HashMismatch => "hash mismatch",
-                                VerifyRollbackStatus::NotFound => "not found",
-                                VerifyRollbackStatus::MissingBlob => "missing blob",
-                            };
+                            // Same labels as the JSON status strings, with the
+                            // underscores humanized (`already_original` →
+                            // `already original`).
+                            let status_str =
+                                verify_rollback_status_str(&f.status).replace('_', " ");
                             println!("    {} [{}]", f.file, status_str);
                             if let Some(ref msg) = f.message {
                                 println!("      message: {msg}");
@@ -795,7 +734,7 @@ async fn rollback_patches_inner(
 // Export for use by remove command. The third tuple element lists
 // vendor-owned purls that were excluded from in-place rollback (benign).
 #[allow(clippy::too_many_arguments)]
-pub async fn rollback_patches(
+pub(crate) async fn rollback_patches(
     cwd: &Path,
     manifest_path: &Path,
     identifier: Option<&str>,

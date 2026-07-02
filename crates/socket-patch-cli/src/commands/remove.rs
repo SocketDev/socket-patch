@@ -9,6 +9,7 @@ use socket_patch_core::utils::telemetry::{track_patch_remove_failed, track_patch
 use std::path::Path;
 use std::time::Duration;
 
+use super::get::short_uuid;
 use super::rollback::{all_files_already_original, rollback_patches};
 use super::vendor::dispatch_revert_one;
 use crate::args::{apply_env_toggles, GlobalArgs};
@@ -16,26 +17,54 @@ use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
 
+/// A remove/rollback identifier matches a patch by PURL for `pkg:`
+/// identifiers (a base PURL matches every release variant of that
+/// package@version; a qualified PURL targets a single patch), or by patch
+/// uuid otherwise.
+pub(crate) fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
+    if identifier.starts_with("pkg:") {
+        purl_matches_identifier(purl, identifier)
+    } else {
+        uuid == identifier
+    }
+}
+
 /// Vendor-ledger entries matching a remove identifier: by ledger key or
-/// base purl for `pkg:` identifiers (a base PURL matches every release
-/// variant, mirroring the manifest matching), or by patch uuid otherwise.
-/// Sorted by key for deterministic event order.
+/// base purl (mirroring the manifest matching). Sorted by key for
+/// deterministic event order.
 fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
     let mut matches: Vec<(String, VendorEntry)> = state
         .entries
         .iter()
         .filter(|(key, entry)| {
-            if identifier.starts_with("pkg:") {
-                purl_matches_identifier(key, identifier)
-                    || purl_matches_identifier(&entry.base_purl, identifier)
-            } else {
-                entry.uuid == identifier
-            }
+            patch_matches(key, &entry.uuid, identifier)
+                || patch_matches(&entry.base_purl, &entry.uuid, identifier)
         })
         .map(|(k, e)| (k.clone(), e.clone()))
         .collect();
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     matches
+}
+
+/// Emit the `not_found` envelope (or stderr line) for an identifier that
+/// matched nothing, tracking the failure. Both the pre-flight match and
+/// the post-rollback manifest mutation share this exit path.
+async fn emit_not_found(
+    json: bool,
+    identifier: &str,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    let msg = format!("No patch found matching identifier: {identifier}");
+    track_patch_remove_failed(&msg, api_token, org_slug).await;
+    if json {
+        let mut env = Envelope::new(Command::Remove);
+        env.status = Status::NotFound;
+        env.error = Some(EnvelopeError::new("not_found", msg));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("{msg}");
+    }
 }
 
 /// Emit a `remove` error envelope and return. Used by the many error
@@ -123,23 +152,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
 
-    // Find matching patches to show what will be removed. A base PURL
-    // (no `?`) matches every release variant of that package@version; a
-    // qualified PURL or a UUID targets a single patch.
-    let matching: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
-        if args.identifier.starts_with("pkg:") {
-            manifest
-                .patches
-                .iter()
-                .filter(|(purl, _)| purl_matches_identifier(purl, &args.identifier))
-                .collect()
-        } else {
-            manifest
-                .patches
-                .iter()
-                .filter(|(_, patch)| patch.uuid == args.identifier)
-                .collect()
-        };
+    // Find matching patches to show what will be removed.
+    let matching: Vec<_> = manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, &args.identifier))
+        .collect();
 
     if matching.is_empty() {
         // Detached vendored patches (`scan --vendor --detached`) have no
@@ -165,16 +183,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
             .await;
         }
 
-        let msg = format!("No patch found matching identifier: {}", args.identifier);
-        track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-        if args.common.json {
-            let mut env = Envelope::new(Command::Remove);
-            env.status = Status::NotFound;
-            env.error = Some(EnvelopeError::new("not_found", msg));
-            println!("{}", env.to_pretty_json());
-        } else {
-            eprintln!("No patch found matching identifier: {}", args.identifier);
-        }
+        emit_not_found(
+            args.common.json,
+            &args.identifier,
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
         return 1;
     }
 
@@ -196,14 +211,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
             eprintln!("The following patch(es) will be removed:");
         }
         for (purl, patch) in &matching {
-            let file_count = patch.files.len();
-            // Short-UUID for display only. Slice on a char boundary and
-            // tolerate UUIDs shorter than 8 chars — a malformed manifest
-            // must not panic the whole command in the display path.
-            let short_uuid = patch.uuid.get(..8).unwrap_or(patch.uuid.as_str());
             eprintln!(
                 "  - {} (UUID: {}, {} file(s))",
-                purl, short_uuid, file_count
+                purl,
+                short_uuid(&patch.uuid),
+                patch.files.len()
             );
         }
         eprintln!();
@@ -393,16 +405,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
     match remove_patch_from_manifest(&args.identifier, &manifest_path).await {
         Ok((removed, manifest)) => {
             if removed.is_empty() {
-                let msg = format!("No patch found matching identifier: {}", args.identifier);
-                track_patch_remove_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
-                if args.common.json {
-                    let mut env = Envelope::new(Command::Remove);
-                    env.status = Status::NotFound;
-                    env.error = Some(EnvelopeError::new("not_found", msg));
-                    println!("{}", env.to_pretty_json());
-                } else {
-                    eprintln!("No patch found matching identifier: {}", args.identifier);
-                }
+                emit_not_found(
+                    args.common.json,
+                    &args.identifier,
+                    api_token.as_deref(),
+                    org_slug.as_deref(),
+                )
+                .await;
                 return 1;
             }
 
@@ -415,7 +424,6 @@ pub async fn run(args: RemoveArgs) -> i32 {
             }
 
             // Clean up unused blobs
-            let socket_dir = manifest_path.parent().unwrap();
             let blobs_path = socket_dir.join("blobs");
             let mut blobs_removed = 0;
             if let Ok(cleanup_result) = cleanup_unused_blobs(&manifest, &blobs_path, false).await {
@@ -516,8 +524,7 @@ async fn remove_detached_only(
     if !args.common.json {
         eprintln!("The following detached vendored patch(es) will be reverted and removed:");
         for (key, entry) in &detached {
-            let short_uuid = entry.uuid.get(..8).unwrap_or(entry.uuid.as_str());
-            eprintln!("  - {key} (UUID: {short_uuid})");
+            eprintln!("  - {key} (UUID: {})", short_uuid(&entry.uuid));
         }
         eprintln!();
     }
@@ -593,28 +600,15 @@ async fn remove_patch_from_manifest(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Invalid manifest".to_string())?;
 
-    let mut removed = Vec::new();
+    let removed: Vec<String> = manifest
+        .patches
+        .iter()
+        .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, identifier))
+        .map(|(purl, _)| purl.clone())
+        .collect();
 
-    let purls_to_remove: Vec<String> = if identifier.starts_with("pkg:") {
-        // Base PURL removes every release variant; qualified PURL removes one.
-        manifest
-            .patches
-            .keys()
-            .filter(|purl| purl_matches_identifier(purl, identifier))
-            .cloned()
-            .collect()
-    } else {
-        manifest
-            .patches
-            .iter()
-            .filter(|(_, patch)| patch.uuid == identifier)
-            .map(|(purl, _)| purl.clone())
-            .collect()
-    };
-
-    for purl in purls_to_remove {
-        manifest.patches.remove(&purl);
-        removed.push(purl);
+    for purl in &removed {
+        manifest.patches.remove(purl);
     }
 
     if !removed.is_empty() {

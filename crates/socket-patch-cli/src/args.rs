@@ -307,7 +307,7 @@ pub struct GlobalArgs {
 impl GlobalArgs {
     /// Resolve `manifest_path` against `cwd`. See
     /// `socket_patch_core::manifest::operations::resolve_manifest_path`.
-    pub fn resolved_manifest_path(&self) -> PathBuf {
+    pub(crate) fn resolved_manifest_path(&self) -> PathBuf {
         socket_patch_core::manifest::operations::resolve_manifest_path(
             &self.cwd,
             &self.manifest_path,
@@ -346,7 +346,7 @@ impl GlobalArgs {
 /// without this mirror a bare `--offline` flag (or a truthy spelling like
 /// `SOCKET_OFFLINE=yes` that core's `"1" | "true"` match doesn't recognize)
 /// still let telemetry fire a network request.
-pub fn apply_env_toggles(common: &GlobalArgs) {
+pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
     }
@@ -466,19 +466,12 @@ mod tests {
         common: GlobalArgs,
     }
 
-    /// Full list of env vars `GlobalArgs` reads, so each clap-parse test starts
-    /// from a known-clean environment (no ambient `SOCKET_*` bleed-through).
-    /// Aliases the production list so the scrub and the harness can't drift.
-    const SOCKET_ENV_VARS: &[&str] = GLOBAL_ARG_ENV_VARS;
-
-    /// Snapshot/clear every `SOCKET_*` var, run `f`, then restore. Keeps the
+    /// Snapshot/clear each var in `vars`, run `f`, then restore. Keeps the
     /// env-mutating clap tests hermetic and reversible.
-    fn with_clean_socket_env(f: impl FnOnce()) {
-        let saved: Vec<(&str, Option<String>)> = SOCKET_ENV_VARS
-            .iter()
-            .map(|&k| (k, std::env::var(k).ok()))
-            .collect();
-        for &k in SOCKET_ENV_VARS {
+    fn with_env_cleared(vars: &[&str], f: impl FnOnce()) {
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for &k in vars {
             std::env::remove_var(k);
         }
         f();
@@ -490,24 +483,19 @@ mod tests {
         }
     }
 
+    /// Clear every env var `GlobalArgs` reads (the production list, so the
+    /// scrub and the harness can't drift), giving each clap-parse test a
+    /// known-clean environment with no ambient `SOCKET_*` bleed-through.
+    fn with_clean_socket_env(f: impl FnOnce()) {
+        with_env_cleared(GLOBAL_ARG_ENV_VARS, f);
+    }
+
     /// Clear the extra env the core telemetry gate reads beyond the
     /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` and the
     /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests
     /// below can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        const EXTRA: &[&str] = &["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"];
-        let saved: Vec<(&str, Option<String>)> =
-            EXTRA.iter().map(|&k| (k, std::env::var(k).ok())).collect();
-        for &k in EXTRA {
-            std::env::remove_var(k);
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
+        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -977,36 +965,24 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn apply_env_toggles_mirrors_flags_into_env() {
-        let saved_debug = std::env::var("SOCKET_DEBUG").ok();
-        let saved_telemetry = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
-        std::env::remove_var("SOCKET_DEBUG");
-        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+        with_env_cleared(&["SOCKET_DEBUG", "SOCKET_TELEMETRY_DISABLED"], || {
+            // Flags off: no-op, env stays unset.
+            apply_env_toggles(&GlobalArgs::default());
+            assert!(std::env::var("SOCKET_DEBUG").is_err());
+            assert!(std::env::var("SOCKET_TELEMETRY_DISABLED").is_err());
 
-        // Flags off: no-op, env stays unset.
-        apply_env_toggles(&GlobalArgs::default());
-        assert!(std::env::var("SOCKET_DEBUG").is_err());
-        assert!(std::env::var("SOCKET_TELEMETRY_DISABLED").is_err());
-
-        // Flags on: mirrored into the env.
-        let args = GlobalArgs {
-            debug: true,
-            no_telemetry: true,
-            ..GlobalArgs::default()
-        };
-        apply_env_toggles(&args);
-        assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
-        assert_eq!(
-            std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(),
-            Ok("1")
-        );
-
-        match saved_debug {
-            Some(v) => std::env::set_var("SOCKET_DEBUG", v),
-            None => std::env::remove_var("SOCKET_DEBUG"),
-        }
-        match saved_telemetry {
-            Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
-            None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
-        }
+            // Flags on: mirrored into the env.
+            let args = GlobalArgs {
+                debug: true,
+                no_telemetry: true,
+                ..GlobalArgs::default()
+            };
+            apply_env_toggles(&args);
+            assert_eq!(std::env::var("SOCKET_DEBUG").as_deref(), Ok("1"));
+            assert_eq!(
+                std::env::var("SOCKET_TELEMETRY_DISABLED").as_deref(),
+                Ok("1")
+            );
+        });
     }
 }

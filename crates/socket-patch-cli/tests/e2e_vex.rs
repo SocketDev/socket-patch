@@ -42,6 +42,8 @@ const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer
 /// but gating the append keeps the emitted `setup.manual` honest to the build
 /// and lets the all-ecosystem agent matrix below declare every one of the 8.
 fn all_manual() -> Vec<String> {
+    // `mut` is only exercised by the feature-gated pushes below.
+    #[cfg_attr(not(any(feature = "maven", feature = "nuget")), allow(unused_mut))]
     let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
     #[cfg(feature = "maven")]
     names.push("maven".to_string());

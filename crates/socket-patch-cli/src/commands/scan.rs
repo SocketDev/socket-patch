@@ -37,32 +37,32 @@ const DEFAULT_BATCH_SIZE: usize = 100;
 /// would replace an existing manifest entry with a newer UUID. Stable schema —
 /// see CLI_CONTRACT.md (`scan` JSON output / `updates` field).
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct UpdateInfo {
-    pub purl: String,
-    pub old_uuid: String,
-    pub new_uuid: String,
+struct UpdateInfo {
+    purl: String,
+    old_uuid: String,
+    new_uuid: String,
 }
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
 /// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
 /// stable schema.
 #[derive(Debug, Default)]
-pub(crate) struct GcSummary {
+struct GcSummary {
     /// PURLs removed from the manifest (apply mode) or eligible to be
     /// removed (preview mode).
-    pub pruned: Vec<String>,
-    pub blobs: CleanupResult,
-    pub diffs: CleanupResult,
-    pub packages: CleanupResult,
+    pruned: Vec<String>,
+    blobs: CleanupResult,
+    diffs: CleanupResult,
+    packages: CleanupResult,
     /// Vendored entries reverted (or revertable, preview mode) because
     /// their patch is gone from the manifest or their dependency left the
     /// lockfile graph — see `vendor::run_vendor_gc`. Sorted.
-    pub vendored_reverted: Vec<String>,
+    vendored_reverted: Vec<String>,
     /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
-    pub vendor_orphan_dirs: usize,
+    vendor_orphan_dirs: usize,
     /// `true` when `--no-prune` was set; the sub-object only carries the
     /// `skipped: true` field in that case.
-    pub skipped: bool,
+    skipped: bool,
 }
 
 impl GcSummary {
@@ -138,7 +138,6 @@ async fn run_gc(
         blobs,
         diffs,
         packages,
-        skipped: false,
         ..Default::default()
     }
 }
@@ -233,6 +232,47 @@ async fn preview_apply_gc(
     gc
 }
 
+/// The `gc` sub-object for the JSON paths: a read-only preview under
+/// `--dry-run`, the mutating pass otherwise, serialized with the matching
+/// (`prunable*`/`orphan*` vs `pruned*`/`removed*`) field names.
+async fn gc_json(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+    vendored: &HashSet<String>,
+    dry_run: bool,
+) -> serde_json::Value {
+    if dry_run {
+        preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
+            .await
+            .to_preview_json()
+    } else {
+        run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored)
+            .await
+            .to_apply_json()
+    }
+}
+
+/// Human-readable one-liner for the vendored-state half of a GC pass;
+/// prints nothing when that half did nothing.
+fn print_gc_vendored_line(gc: &GcSummary) {
+    if gc.vendored_reverted.is_empty() && gc.vendor_orphan_dirs == 0 {
+        return;
+    }
+    println!(
+        "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
+        gc.vendored_reverted.len(),
+        if gc.vendored_reverted.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        gc.vendor_orphan_dirs,
+        if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
+    );
+}
+
 /// PURL strings present in the manifest but absent from `scanned_purls`.
 /// These are candidates for pruning during `scan`'s GC pass — they
 /// correspond to packages that were once patched but are no longer
@@ -259,7 +299,7 @@ async fn preview_apply_gc(
 /// crawler purls carry the literal `@scope` — comparing the raw strings
 /// would make every encoded scoped entry look prunable and `--prune`/
 /// `--sync` would GC the very patch it just downloaded.
-pub(crate) fn detect_prunable(
+fn detect_prunable(
     manifest: &PatchManifest,
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
@@ -288,8 +328,6 @@ struct LockfileSupplement {
     packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
     /// Literal crawler-form purls, for fast membership tests.
     purls: HashSet<String>,
-    /// The lockfile the entries came from, for messages.
-    source: &'static str,
 }
 
 /// Inventory the project's lockfile(s) and fabricate crawl entries for
@@ -304,10 +342,7 @@ async fn lockfile_supplement(
 ) -> LockfileSupplement {
     use socket_patch_core::patch::vendor::lock_inventory;
 
-    let mut out = LockfileSupplement {
-        source: "project lockfiles",
-        ..Default::default()
-    };
+    let mut out = LockfileSupplement::default();
     if common.global || common.global_prefix.is_some() {
         return out;
     }
@@ -447,7 +482,7 @@ async fn preverify_vendor_baselines(
 /// PURLs whose newest available patch UUID differs from the locally-recorded
 /// one. Used by both the discovery JSON path and the table-print path.
 /// Pure / no I/O so it's unit-testable.
-pub(crate) fn detect_updates(
+fn detect_updates(
     existing_manifest: Option<&PatchManifest>,
     packages: &[BatchPackagePatches],
 ) -> Vec<UpdateInfo> {
@@ -481,7 +516,7 @@ pub(crate) fn detect_updates(
 /// before GHSAs and each group is sorted, so the rendered output is stable —
 /// the per-patch ID lists and set-based dedup are otherwise nondeterministic
 /// in order. Pure / no I/O so it's unit-testable.
-pub(crate) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
+fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
     let mut cves: HashSet<String> = HashSet::new();
     let mut ghsas: HashSet<String> = HashSet::new();
     for patch in &pkg.patches {
@@ -815,6 +850,54 @@ async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serd
     serde_json::json!({ "dryRun": true, "patches": patches })
 }
 
+/// The per-package discovery + selection step shared by the apply, vendor,
+/// and redirect flows: search each patched package's full patch list, then
+/// resolve the newest accessible patch per PURL. Per-package search errors
+/// are skipped. Passes `is_json = false` to `select_patches`: scan-driven
+/// workflows have no "specify --id" option, so non-TTY runs auto-select
+/// the newest patch rather than erroring with `selection_required`. `Err`
+/// carries `select_patches`' exit code.
+async fn discover_selected(
+    api_client: &socket_patch_core::api::client::ApiClient,
+    org_slug: Option<&str>,
+    packages: &[BatchPackagePatches],
+    can_access_paid_patches: bool,
+) -> Result<Vec<PatchSearchResult>, i32> {
+    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+    for pkg in packages {
+        if let Ok(response) = api_client
+            .search_patches_by_package(org_slug, &pkg.purl)
+            .await
+        {
+            all_search_results.extend(response.patches);
+        }
+    }
+    if all_search_results.is_empty() {
+        return Ok(Vec::new());
+    }
+    select_patches(&all_search_results, can_access_paid_patches, false)
+}
+
+/// The `DownloadParams` every scan-driven download shares. Only the output
+/// shape (`json`/`silent`) and `save_only` differ per flow; vendor mode
+/// never persists blobs (the vendor step consumes the staged sources).
+fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
+    DownloadParams {
+        cwd: args.common.cwd.clone(),
+        org: args.common.org.clone(),
+        save_only,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json,
+        silent,
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
+        all_releases: args.all_releases,
+        strict: args.common.strict,
+        persist_blobs: !args.vendor,
+    }
+}
+
 /// The vendor step shared by `scan --vendor`'s JSON and interactive
 /// paths: acquire the apply lock, stage patch sources, and drive
 /// [`vendor_records`] — manifest mode (`detached_records: None`, records
@@ -851,7 +934,7 @@ async fn run_scan_vendor_step(
 
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
-    let has_errors = match detached_records {
+    let (manifest, detached, mut has_errors) = match detached_records {
         Some(records) => {
             // Staging probes blobs by the records' hashes; a synthetic
             // manifest view is all it needs.
@@ -859,20 +942,7 @@ async fn run_scan_vendor_step(
                 patches: records.clone(),
                 setup: None,
             };
-            let staged =
-                match stage_vendor_sources_in_memory(common, &synth, socket_dir, &common.cwd).await
-                {
-                    Ok(MemStageOutcome::Ready(s)) => s,
-                    Ok(MemStageOutcome::Unavailable) => {
-                        return Err((
-                            "no_local_source",
-                            "patch artifacts unavailable (offline or download failure)".to_string(),
-                        ))
-                    }
-                    Err(e) => return Err(("stage_failed", e)),
-                };
-            let sources = staged.as_patch_sources();
-            boxed_vendor_records(common, records, &sources, true, &mut env).await
+            (synth, true, false)
         }
         None => {
             let manifest = match read_manifest(manifest_path).await {
@@ -887,26 +957,24 @@ async fn run_scan_vendor_step(
             };
             // Same placement as the `vendor` command: dropped entries
             // are reverted even when zero in-scope patches remain.
-            let mut has_errors = reconcile_dropped(&manifest, common, &mut env).await;
-            let staged =
-                match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd)
-                    .await
-                {
-                    Ok(MemStageOutcome::Ready(s)) => s,
-                    Ok(MemStageOutcome::Unavailable) => {
-                        return Err((
-                            "no_local_source",
-                            "patch artifacts unavailable (offline or download failure)".to_string(),
-                        ))
-                    }
-                    Err(e) => return Err(("stage_failed", e)),
-                };
-            let sources = staged.as_patch_sources();
-            has_errors |=
-                boxed_vendor_records(common, &manifest.patches, &sources, false, &mut env).await;
-            has_errors
+            let has_errors = reconcile_dropped(&manifest, common, &mut env).await;
+            (manifest, false, has_errors)
         }
     };
+    let staged =
+        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
+            Ok(MemStageOutcome::Ready(s)) => s,
+            Ok(MemStageOutcome::Unavailable) => {
+                return Err((
+                    "no_local_source",
+                    "patch artifacts unavailable (offline or download failure)".to_string(),
+                ))
+            }
+            Err(e) => return Err(("stage_failed", e)),
+        };
+    let sources = staged.as_patch_sources();
+    has_errors |=
+        boxed_vendor_records(common, &manifest.patches, &sources, detached, &mut env).await;
     drop(guard);
     if has_errors {
         env.mark_partial_failure();
@@ -938,28 +1006,19 @@ async fn run_vendor_json_path(
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
 ) -> i32 {
-    // Same discovery as `--apply`: per-package search, then the
-    // selection logic that resolves the newest accessible patch.
-    // Vendored purls are NOT filtered here — re-vendoring a stale
-    // uuid is the point of the flag (same-uuid re-runs land on the
-    // backend's `already_vendored` skip).
-    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
-    for pkg in all_packages_with_patches {
-        match api_client
-            .search_patches_by_package(effective_org_slug, &pkg.purl)
-            .await
-        {
-            Ok(response) => all_search_results.extend(response.patches),
-            Err(_) => continue,
-        }
-    }
-    let selected = if all_search_results.is_empty() {
-        Vec::new()
-    } else {
-        match select_patches(&all_search_results, can_access_paid_patches, false) {
-            Ok(s) => s,
-            Err(code) => return code,
-        }
+    // Same discovery as `--apply`. Vendored purls are NOT filtered here —
+    // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
+    // land on the backend's `already_vendored` skip).
+    let selected = match discover_selected(
+        api_client,
+        effective_org_slug,
+        all_packages_with_patches,
+        can_access_paid_patches,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
     if args.common.dry_run {
@@ -967,15 +1026,15 @@ async fn run_vendor_json_path(
         // and preview the GC, exactly like `--apply`'s dry run.
         result["vendor"] = preview_vendor_json(&args.common.cwd, &selected).await;
         if prune {
-            let gc = preview_apply_gc(
+            result["gc"] = gc_json(
                 &args.common,
                 manifest_path,
                 socket_dir,
                 scanned_purls,
                 vendored_purls,
+                true,
             )
             .await;
-            result["gc"] = gc.to_preview_json();
         }
         let final_code =
             embed_vex_into_json(&args.common, &args.vex, manifest_path, 0, result).await;
@@ -988,21 +1047,9 @@ async fn run_vendor_json_path(
     //    fires); detached mode fetches records without touching
     //    the manifest. Either way the vendor step still runs when
     //    zero patches were downloaded (re-vendor after a wipe).
-    let params = DownloadParams {
-        cwd: args.common.cwd.clone(),
-        org: args.common.org.clone(),
-        save_only: true,
-        one_off: false,
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-        json: true,
-        silent: true,
-        download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
-        all_releases: args.all_releases,
-        strict: args.common.strict,
-        persist_blobs: !args.vendor,
-    };
+    let params = download_params(
+        args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
+    );
     let mut has_errors = false;
     let detached_records: Option<HashMap<String, PatchRecord>> = if args.detached {
         let (code, mut dl_json, records) = boxed_download_patch_records(&selected, &params).await;
@@ -1037,15 +1084,15 @@ async fn run_vendor_json_path(
     //    package_not_installed; vendored entries are exempt from
     //    the prune itself.
     if prune {
-        let gc = run_apply_gc(
+        result["gc"] = gc_json(
             &args.common,
             manifest_path,
             socket_dir,
             scanned_purls,
             vendored_purls,
+            false,
         )
         .await;
-        result["gc"] = gc.to_apply_json();
     }
 
     // 3) The vendor engine, under the same lock as apply/vendor.
@@ -1147,19 +1194,7 @@ async fn run_vendor_interactive_path(
                 }
             });
         }
-        if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
-            println!(
-                "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
-                gc.vendored_reverted.len(),
-                if gc.vendored_reverted.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                gc.vendor_orphan_dirs,
-                if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
-            );
-        }
+        print_gc_vendored_line(&gc);
     }
     match boxed_scan_vendor_step(
         &args.common,
@@ -1195,56 +1230,35 @@ async fn run_vendor_interactive_path(
     }
 }
 
-/// Partition vendor-owned purls out of the selected set and pre-render
-/// their `skipped`/`vendored` JSON records (sorted by purl). A plain fn
-/// (not inlined into `run`) so the json! temporaries don't ride `run`'s
-/// async poll frame — see [`run_vendor_json_path`]'s Windows-stack note.
-fn partition_vendored_selected(
+/// Partition purls matching `skip` out of the selected set and pre-render
+/// their skip records (sorted by purl) with the contract `error_code`.
+/// Two skip classes ride this, both removed BEFORE download:
+///
+/// * `"vendored"` — the patch is consumed from the committed artifact, and
+///   moving the manifest past the vendored uuid would break VEX
+///   verification (`vendor_uuid_mismatch`) until a vendor run.
+/// * `"package_not_installed"` — the package is not on disk to patch in
+///   place, and downloading its patch into the manifest would create a
+///   not-yet-appliable entry (and flip the apply path's exit code).
+///   `scan --vendor` is the route that handles these (the vendor engine
+///   auto-fetches lockfile-resolved packages); matching bridges API purl
+///   encoding via `normalize_purl`.
+///
+/// A plain fn (not inlined into `run`) so the json! temporaries don't ride
+/// `run`'s async poll frame — see [`run_vendor_json_path`]'s Windows-stack
+/// note.
+fn partition_skipped_selected(
     selected: Vec<PatchSearchResult>,
-    vendored_purls: &HashSet<String>,
+    skip: impl Fn(&str) -> bool,
+    error_code: &str,
 ) -> (Vec<PatchSearchResult>, Vec<serde_json::Value>) {
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-    let (vendored_selected, kept): (Vec<_>, Vec<_>) =
-        selected.into_iter().partition(|p| is_vendored(&p.purl));
-    let mut vendored_records: Vec<serde_json::Value> = vendored_selected
+    let (skipped, kept): (Vec<_>, Vec<_>) = selected.into_iter().partition(|p| skip(&p.purl));
+    let mut records: Vec<serde_json::Value> = skipped
         .iter()
         .map(|p| {
             serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid,
-                "action": "skipped", "errorCode": "vendored",
-            })
-        })
-        .collect();
-    vendored_records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
-    (kept, vendored_records)
-}
-
-/// Lockfile-only patches are skipped BEFORE download in apply mode: the
-/// package is not on disk to patch in place, and downloading its patch
-/// into the manifest would create a not-yet-appliable entry (and flip the
-/// apply path's exit code). `scan --vendor` is the route that handles them
-/// (the vendor engine auto-fetches lockfile-resolved packages). Matching
-/// bridges API purl encoding via `normalize_purl`. Same shape/mechanics as
-/// [`partition_vendored_selected`].
-fn partition_not_installed_selected(
-    selected: Vec<PatchSearchResult>,
-    lockfile_only: &HashSet<String>,
-) -> (Vec<PatchSearchResult>, Vec<serde_json::Value>) {
-    if lockfile_only.is_empty() {
-        return (selected, Vec::new());
-    }
-    let is_lockfile_only =
-        |p: &str| lockfile_only.contains(normalize_purl(strip_purl_qualifiers(p)).as_ref());
-    let (not_installed, kept): (Vec<_>, Vec<_>) = selected
-        .into_iter()
-        .partition(|p| is_lockfile_only(&p.purl));
-    let mut records: Vec<serde_json::Value> = not_installed
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid,
-                "action": "skipped", "errorCode": "package_not_installed",
+                "action": "skipped", "errorCode": error_code,
             })
         })
         .collect();
@@ -1491,22 +1505,16 @@ async fn run_redirect(
     };
 
     // Same discovery/selection as `--apply`/`--vendor`.
-    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
-    for pkg in all_packages_with_patches {
-        if let Ok(response) = api_client
-            .search_patches_by_package(effective_org_slug, &pkg.purl)
-            .await
-        {
-            all_search_results.extend(response.patches);
-        }
-    }
-    let selected = if all_search_results.is_empty() {
-        Vec::new()
-    } else {
-        match select_patches(&all_search_results, can_access_paid_patches, false) {
-            Ok(s) => s,
-            Err(code) => return code,
-        }
+    let selected = match discover_selected(
+        api_client,
+        effective_org_slug,
+        all_packages_with_patches,
+        can_access_paid_patches,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(code) => return code,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -2029,8 +2037,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     all_crawled.extend(ledger_supplement);
 
     // Every PURL the crawl found, captured BEFORE the `--ecosystems`
-    // display/query filter is applied. Prune (below) must reference the
-    // full installed set: `--ecosystems npm` narrows what we *query and
+    // display/query filter is applied. Prunable detection (manifest
+    // entries whose PURL is not installed) must reference the full
+    // installed set: `--ecosystems npm` narrows what we *query and
     // show*, but packages of other ecosystems are still installed. If
     // prune used the filtered set instead, `scan --ecosystems npm --prune`
     // would treat every cargo/go/pypi/gem manifest entry as "uninstalled"
@@ -2038,7 +2047,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Lockfile-only purls are deliberately included: a dependency the
     // lockfile still resolves must not be pruned just because node_modules
     // is wiped or partially installed.
-    let installed_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
+    let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Vendor-ledger purl keys, loaded once and shared by the prune
     // exemption (a vendored package is consumed from the committed
@@ -2158,9 +2167,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
         if !lockfile_only.purls.is_empty() {
             eprintln!(
-                "Note: {} package(s) from {} are not yet installed (lockfile-only).",
+                "Note: {} package(s) from project lockfiles are not yet installed (lockfile-only).",
                 lockfile_only.purls.len(),
-                lockfile_only.source,
             );
         }
     }
@@ -2352,12 +2360,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
     let updates = detect_updates(existing_manifest.as_ref(), &all_packages_with_patches);
 
-    // Crawl PURLs as a set for prunable detection (manifest entries whose
-    // PURL is not installed). Uses `installed_purls` — the UNFILTERED crawl
-    // — not the `--ecosystems`-narrowed `all_purls`, so a display/query
-    // filter never makes an installed package look prunable.
-    let scanned_purls: HashSet<String> = installed_purls;
-
     if args.common.json {
         let mut result = serde_json::json!({
             "status": "success",
@@ -2394,55 +2396,49 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // here: a bot can `--apply` without `--prune`, or `--prune`
         // without `--apply` (just GC-sweep), or both (full sync).
         let dry = args.common.dry_run;
+        let mut apply_code = 0i32;
 
         // --- Apply path (if requested) -----------------------------------
         if apply {
-            let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
-            for pkg in &all_packages_with_patches {
-                match api_client
-                    .search_patches_by_package(effective_org_slug, &pkg.purl)
-                    .await
-                {
-                    Ok(response) => all_search_results.extend(response.patches),
-                    Err(_) => continue,
-                }
-            }
-
-            // For scan-driven bot workflows there's no "specify --id"
-            // option — we're scanning the whole project. Pass
-            // `is_json = false` so `select_one` auto-selects the newest
-            // patch in non-TTY mode rather than erroring with
-            // `selection_required`.
-            let selected = if all_search_results.is_empty() {
-                Vec::new()
-            } else {
-                match select_patches(&all_search_results, can_access_paid_patches, false) {
-                    Ok(s) => s,
-                    Err(code) => return code,
-                }
+            let selected = match discover_selected(
+                &api_client,
+                effective_org_slug,
+                &all_packages_with_patches,
+                can_access_paid_patches,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(code) => return code,
             };
 
-            // Vendor-owned purls are skipped BEFORE download (any uuid):
-            // the patch is consumed from the committed artifact, and
-            // moving the manifest past the vendored uuid would break VEX
-            // verification (`vendor_uuid_mismatch`) until a vendor run.
-            // A newer patch still surfaces in `updates[]` — the
+            // Vendor-owned purls are skipped BEFORE download (any uuid);
+            // a newer patch still surfaces in `updates[]` — the
             // operator's signal to run `scan --vendor` (or `vendor`).
-            let (selected, vendored_records) =
-                partition_vendored_selected(selected, &vendored_purls);
+            let (selected, vendored_records) = partition_skipped_selected(
+                selected,
+                |p| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p)),
+                "vendored",
+            );
             // Lockfile-only purls leave the apply selection here (calm
             // skip records, never an error); the union rides the same
             // bookkeeping as the vendored skips.
             let (selected, vendored_records) = {
-                let (kept, not_installed) =
-                    partition_not_installed_selected(selected, &lockfile_only.purls);
+                let (kept, not_installed) = partition_skipped_selected(
+                    selected,
+                    |p| {
+                        lockfile_only
+                            .purls
+                            .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
+                    },
+                    "package_not_installed",
+                );
                 let mut all = vendored_records;
                 all.extend(not_installed);
                 all.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
                 (kept, all)
             };
 
-            let mut apply_code = 0i32;
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
                 // `decide_patch_action` consults the existing manifest,
@@ -2498,21 +2494,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     "patches": vendored_records,
                 });
             } else {
-                let params = DownloadParams {
-                    cwd: args.common.cwd.clone(),
-                    org: args.common.org.clone(),
-                    save_only: false,
-                    one_off: false,
-                    global: args.common.global,
-                    global_prefix: args.common.global_prefix.clone(),
-                    json: true,
-                    silent: true,
-                    download_mode: args.common.download_mode.clone(),
-                    api_overrides: args.common.api_client_overrides(),
-                    all_releases: args.all_releases,
-                    strict: args.common.strict,
-                    persist_blobs: !args.vendor,
-                };
+                let params = download_params(
+                    &args, /*save_only=*/ false, /*json=*/ true, /*silent=*/ true,
+                );
                 let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
                 apply_code = code;
                 let mut apply_obj = apply_json;
@@ -2522,49 +2506,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     result["status"] = serde_json::json!("partial_failure");
                 }
             }
-
-            // --- GC (if requested) --------------------------------------
-            if prune {
-                let gc = if dry {
-                    preview_apply_gc(
-                        &args.common,
-                        &manifest_path,
-                        &socket_dir,
-                        &scanned_purls,
-                        &vendored_purls,
-                    )
-                    .await
-                } else {
-                    run_apply_gc(
-                        &args.common,
-                        &manifest_path,
-                        &socket_dir,
-                        &scanned_purls,
-                        &vendored_purls,
-                    )
-                    .await
-                };
-                result["gc"] = if dry {
-                    gc.to_preview_json()
-                } else {
-                    gc.to_apply_json()
-                };
-            }
-
-            let final_code = embed_vex_into_json(
-                &args.common,
-                &args.vex,
-                &manifest_path,
-                apply_code,
-                &mut result,
-            )
-            .await;
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            return final_code;
-        }
-
-        // --- Vendor path (if requested) ----------------------------------
-        if args.vendor {
+        // --- Vendor path (if requested; conflicts with --apply/--sync) ---
+        } else if args.vendor {
             // Extracted into its own boxed fn — and it must STAY extracted:
             // this branch's temporaries (json! trees, DownloadParams, the
             // engine dispatch) live in the enclosing poll frame in debug
@@ -2589,36 +2532,27 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             .await;
         }
 
-        // --- GC-only path (no --apply, just --prune) --------------------
+        // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
-            let gc = if dry {
-                preview_apply_gc(
-                    &args.common,
-                    &manifest_path,
-                    &socket_dir,
-                    &scanned_purls,
-                    &vendored_purls,
-                )
-                .await
-            } else {
-                run_apply_gc(
-                    &args.common,
-                    &manifest_path,
-                    &socket_dir,
-                    &scanned_purls,
-                    &vendored_purls,
-                )
-                .await
-            };
-            result["gc"] = if dry {
-                gc.to_preview_json()
-            } else {
-                gc.to_apply_json()
-            };
+            result["gc"] = gc_json(
+                &args.common,
+                &manifest_path,
+                &socket_dir,
+                &scanned_purls,
+                &vendored_purls,
+                dry,
+            )
+            .await;
         }
 
-        let final_code =
-            embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
+        let final_code = embed_vex_into_json(
+            &args.common,
+            &args.vex,
+            &manifest_path,
+            apply_code,
+            &mut result,
+        )
+        .await;
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         return final_code;
     }
@@ -2865,7 +2799,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let (selected, not_installed_selected): (Vec<_>, Vec<String>) = if args.vendor {
         (selected, Vec::new())
     } else {
-        let (kept, skipped) = partition_not_installed_selected(selected, &lockfile_only.purls);
+        let (kept, skipped) = partition_skipped_selected(
+            selected,
+            |p| {
+                lockfile_only
+                    .purls
+                    .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
+            },
+            "package_not_installed",
+        );
         let printed: Vec<String> = skipped
             .iter()
             .filter_map(|r| r["purl"].as_str().map(str::to_string))
@@ -3008,23 +2950,14 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // Download, then apply in place — or vendor (`--vendor`).
-    let params = DownloadParams {
-        cwd: args.common.cwd.clone(),
-        org: args.common.org.clone(),
-        // Vendor mode downloads only; the vendor step below does the rest.
-        save_only: args.vendor,
-        one_off: false,
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-        json: false,
-        silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
-        all_releases: args.all_releases,
-        strict: args.common.strict,
-        persist_blobs: !args.vendor,
-    };
+    // Download, then apply in place — or vendor (`--vendor`, where the
+    // download only saves and the vendor step below does the rest).
+    let params = download_params(
+        &args,
+        /*save_only=*/ args.vendor,
+        /*json=*/ false,
+        args.common.silent,
+    );
 
     let code = if args.vendor {
         // Extracted + boxed for the same Windows-1-MiB-frame reason as the
@@ -3072,25 +3005,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 socket_patch_core::utils::cleanup_blobs::format_bytes(gc.total_bytes()),
             );
         }
-        if !args.common.silent && (!gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0) {
-            println!(
-                "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
-                gc.vendored_reverted.len(),
-                if gc.vendored_reverted.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                gc.vendor_orphan_dirs,
-                if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
-            );
+        if !args.common.silent {
+            print_gc_vendored_line(&gc);
         }
     }
 
     embed_vex_human(&args.common, &args.vex, &manifest_path, code).await
 }
 
-pub(crate) fn severity_order(s: &str) -> u8 {
+fn severity_order(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
         "critical" => 0,
         "high" => 1,

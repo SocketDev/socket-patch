@@ -4,15 +4,37 @@ use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
 };
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::manifest::schema::PatchRecord;
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
+#[cfg(feature = "golang")]
+use socket_patch_core::patch::go_redirect::{
+    apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
+};
+#[cfg(feature = "golang")]
+use socket_patch_core::utils::purl::parse_golang_purl;
+use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
+use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
+use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
+use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::json_envelope::{
+    AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
+    VexSummary,
+};
+
 /// Files whose pre-apply content matched NEITHER hash and were (or would
 /// be) overwritten with the verified patched content — the promoted
 /// verify signature `apply_package_patch` leaves behind under the default
 /// mismatch policy.
-pub(crate) fn mismatch_overwritten_files(result: &ApplyResult) -> Vec<String> {
+fn mismatch_overwritten_files(result: &ApplyResult) -> Vec<String> {
     result
         .files_verified
         .iter()
@@ -35,7 +57,7 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
             "Warning (content_mismatch_overwritten): {} {file} did not match the patch's \
              expected original content; applied the full verified patched content instead \
              (pass --strict to fail on mismatches)",
-            socket_patch_core::utils::purl::normalize_purl(&result.package_key)
+            normalize_purl(&result.package_key)
         );
     }
 }
@@ -47,14 +69,14 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
 /// by hash (online only) so the apply below can fall through diff → blob.
 async fn ensure_blobs_for_mismatches(
     args: &ApplyArgs,
-    manifest: &socket_patch_core::manifest::schema::PatchManifest,
-    all_packages: &HashMap<String, std::path::PathBuf>,
+    manifest: &PatchManifest,
+    all_packages: &HashMap<String, PathBuf>,
     blobs_path: &Path,
 ) {
     if args.common.strict && !args.force {
         return; // strict fails on mismatch — nothing to fetch
     }
-    let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut needed: HashSet<String> = HashSet::new();
     for (purl, pkg_path) in all_packages {
         let Some(record) = manifest.patches.get(purl) else {
             continue;
@@ -64,7 +86,7 @@ async fn ensure_blobs_for_mismatches(
                 continue;
             }
             let verify = verify_file_patch(pkg_path, file_name, info).await;
-            if verify.status == socket_patch_core::patch::apply::VerifyStatus::HashMismatch
+            if verify.status == VerifyStatus::HashMismatch
                 && tokio::fs::metadata(blobs_path.join(&info.after_hash))
                     .await
                     .is_err()
@@ -101,7 +123,7 @@ async fn ensure_blobs_for_mismatches(
 
 /// The mismatch policy this run applies with: `--force` ⊃ default
 /// (adds the missing-file skip), `--strict` restores fail-closed.
-pub(crate) fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
+fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
     if force {
         MismatchPolicy::Force
     } else if strict {
@@ -110,29 +132,6 @@ pub(crate) fn mismatch_policy(force: bool, strict: bool) -> MismatchPolicy {
         MismatchPolicy::Warn
     }
 }
-
-#[cfg(feature = "golang")]
-use socket_patch_core::patch::go_redirect::{
-    apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
-};
-#[cfg(feature = "golang")]
-use socket_patch_core::utils::purl::parse_golang_purl;
-
-use crate::commands::lock_cli::{acquire_or_emit, lock_broken_event};
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::Duration;
-
-use crate::args::{apply_env_toggles, GlobalArgs};
-use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::json_envelope::{
-    AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, Status,
-    VexSummary,
-};
-
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
 
 #[derive(Args)]
 pub struct ApplyArgs {
@@ -173,8 +172,9 @@ pub struct ApplyArgs {
 // a `go.mod` `replace` directive. Inert stubs without the `golang` feature.
 
 /// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
+/// Shared with `rollback`, which drops the same redirects this creates.
 #[cfg(feature = "golang")]
-fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
+pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
     !common.global
         && common.global_prefix.is_none()
         && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
@@ -393,7 +393,7 @@ async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
 /// Sentinel `package_path` for a result synthesized because the purl is
 /// owned by `socket-patch vendor` (recorded in `.socket/vendor/state.json`).
 /// `result_to_event` routes it to `Skipped`/`vendored` by exact equality.
-pub(crate) const VENDOR_OWNED_MARKER: &str = "managed by socket-patch vendor";
+const VENDOR_OWNED_MARKER: &str = "managed by socket-patch vendor";
 
 /// Single source of truth for the `already_patched` classification, shared
 /// by [`result_to_event`] (which feeds the JSON envelope) and the
@@ -569,8 +569,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // different operation entirely. Refuse with a clear pointer to
     // `yarn patch`. pnpm gets an informational event; the CoW guard
     // in `apply_file_patch` does the substantive safety work.
-    let pkg_manager = detect_npm_pkg_manager(&args.common.cwd);
-    match pkg_manager {
+    match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
@@ -727,15 +726,11 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             } else {
                                 format!(" (via {})", tags.join("+"))
                             };
-                            println!(
-                                "  {}{}",
-                                socket_patch_core::utils::purl::normalize_purl(&result.package_key),
-                                suffix
-                            );
+                            println!("  {}{}", normalize_purl(&result.package_key), suffix);
                         } else if all_files_already_patched(result) {
                             println!(
                                 "  {} (already patched)",
-                                socket_patch_core::utils::purl::normalize_purl(&result.package_key)
+                                normalize_purl(&result.package_key)
                             );
                         }
                     }
@@ -756,16 +751,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
                             if let Some(ref msg) = f.message {
                                 println!("      message: {msg}");
                             }
-                            if args.common.verbose {
-                                if let Some(ref h) = f.current_hash {
-                                    println!("      current:  {h}");
-                                }
-                                if let Some(ref h) = f.expected_hash {
-                                    println!("      expected: {h}");
-                                }
-                                if let Some(ref h) = f.target_hash {
-                                    println!("      target:   {h}");
-                                }
+                            if let Some(ref h) = f.current_hash {
+                                println!("      current:  {h}");
+                            }
+                            if let Some(ref h) = f.expected_hash {
+                                println!("      expected: {h}");
+                            }
+                            if let Some(ref h) = f.target_hash {
+                                println!("      target:   {h}");
                             }
                         }
                     }
@@ -885,6 +878,21 @@ fn synthesize_vendor_owned_results(
     (results, matched, vendored_bases)
 }
 
+/// Targeted manifest purls that matched nothing: not attempted (or
+/// vendor-synthesized) and not a qualified sibling of a vendored variant —
+/// those are accounted for by the vendored base, not "not installed".
+fn unmatched_purls(
+    targets: &HashSet<String>,
+    matched: &HashSet<String>,
+    vendored_bases: &HashSet<String>,
+) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|p| !matched.contains(*p) && !vendored_bases.contains(strip_purl_qualifiers(p)))
+        .cloned()
+        .collect()
+}
+
 async fn apply_patches_inner(
     args: &ApplyArgs,
     manifest_path: &Path,
@@ -919,21 +927,10 @@ async fn apply_patches_inner(
         .patches
         .retain(|purl, _| target_manifest_purls.contains(purl));
 
-    let staged = match crate::commands::fetch_stage::stage_patch_sources(
-        &args.common,
-        &scoped_manifest,
-        socket_dir,
-    )
-    .await?
-    {
-        crate::commands::fetch_stage::StageOutcome::Ready(s) => s,
-        crate::commands::fetch_stage::StageOutcome::Unavailable => {
-            return Ok((false, Vec::new(), Vec::new()))
-        }
+    let staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
+        StageOutcome::Ready(s) => s,
+        StageOutcome::Unavailable => return Ok((false, Vec::new(), Vec::new())),
     };
-    let blobs_path = staged.blobs.clone();
-    let diffs_path = staged.diffs.clone();
-    let packages_path = staged.packages.clone();
 
     // Vendor ownership wins for EVERY ecosystem: a purl recorded in
     // `.socket/vendor/state.json` is managed by the explicit `vendor`
@@ -946,9 +943,8 @@ async fn apply_patches_inner(
         socket_patch_core::patch::vendor::vendored_purl_keys(&args.common.cwd).await;
     let is_vendored =
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-    let (mut results, matched_manifest_purls, vendored_bases) =
+    let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
-    let mut matched_manifest_purls = matched_manifest_purls;
 
     // Local go: prune `replace`-redirects whose patches were dropped from the
     // manifest (orphans). Done here — before the crawl + the "no packages
@@ -971,9 +967,7 @@ async fn apply_patches_inner(
     )
     .await;
 
-    let has_any_purls = !partitioned.is_empty();
-
-    if all_packages.is_empty() && !has_any_purls {
+    if all_packages.is_empty() && partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
         // filtered out by `--ecosystems`). There is genuinely no work to do,
         // so this is a clean no-op SUCCESS — not a failure. Returning `false`
@@ -991,14 +985,11 @@ async fn apply_patches_inner(
         // vendored results above); only the remainder is genuinely
         // unmatched. An all-vendored manifest with an absent installed
         // tree is a SUCCESS — the committed artifacts are the patch.
-        let unmatched: Vec<String> = target_manifest_purls
-            .iter()
-            .filter(|p| {
-                !matched_manifest_purls.contains(*p)
-                    && !vendored_bases.contains(strip_purl_qualifiers(p))
-            })
-            .cloned()
-            .collect();
+        let unmatched = unmatched_purls(
+            &target_manifest_purls,
+            &matched_manifest_purls,
+            &vendored_bases,
+        );
         if !unmatched.is_empty() && !args.common.silent && !args.common.json {
             eprintln!("Warning: No packages found that match available patches");
             eprintln!(
@@ -1013,7 +1004,9 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &blobs_path).await;
+    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &staged.blobs).await;
+    let sources = staged.as_patch_sources();
+    let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;
 
     // Group release-variant PURLs by base. PyPI (`?artifact_id=`),
@@ -1091,12 +1084,6 @@ async fn apply_patches_inner(
                 }
 
                 attempted = true;
-                let sources = PatchSources {
-                    blobs_path: &blobs_path,
-                    packages_path: Some(&packages_path),
-                    diffs_path: Some(&diffs_path),
-                    mem_blobs: None,
-                };
                 let result = apply_package_patch(
                     variant_purl,
                     pkg_path,
@@ -1104,7 +1091,7 @@ async fn apply_patches_inner(
                     &sources,
                     Some(&patch.uuid),
                     args.common.dry_run,
-                    mismatch_policy(args.force, args.common.strict),
+                    policy,
                 )
                 .await;
 
@@ -1176,42 +1163,30 @@ async fn apply_patches_inner(
                 None => continue,
             };
 
-            let sources = PatchSources {
-                blobs_path: &blobs_path,
-                packages_path: Some(&packages_path),
-                diffs_path: Some(&diffs_path),
-                mem_blobs: None,
-            };
             // Local go redirects to a project-local patched copy under
             // `.socket/go-patches/` wired via a `go.mod` `replace` (the module
             // cache is `go.sum`-verified, so in-place patching can't build).
             // Everything else — npm/pypi/gem and cargo (vendored or registry
             // cache) — patches in place via `apply_package_patch`. Without the
             // `golang` feature `try_local_go_apply` is an inert `None`.
-            let result = match try_local_go_apply(
-                purl,
-                pkg_path,
-                patch,
-                &sources,
-                &args.common,
-                mismatch_policy(args.force, args.common.strict),
-            )
-            .await
-            {
-                Some(r) => r,
-                None => {
-                    apply_package_patch(
-                        purl,
-                        pkg_path,
-                        &patch.files,
-                        &sources,
-                        Some(&patch.uuid),
-                        args.common.dry_run,
-                        mismatch_policy(args.force, args.common.strict),
-                    )
+            let result =
+                match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                     .await
-                }
-            };
+                {
+                    Some(r) => r,
+                    None => {
+                        apply_package_patch(
+                            purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            Some(&patch.uuid),
+                            args.common.dry_run,
+                            policy,
+                        )
+                        .await
+                    }
+                };
 
             warn_mismatch_overwrites(&result, &args.common);
             if !result.success {
@@ -1229,17 +1204,12 @@ async fn apply_patches_inner(
         }
     }
 
-    // Check if targeted manifest entries had no matches. Qualified siblings
-    // of a vendored variant are accounted for by the vendored base, not
-    // "not installed".
-    let unmatched: Vec<String> = target_manifest_purls
-        .iter()
-        .filter(|p| {
-            !matched_manifest_purls.contains(*p)
-                && !vendored_bases.contains(strip_purl_qualifiers(p))
-        })
-        .cloned()
-        .collect();
+    // Check if targeted manifest entries had no matches.
+    let unmatched = unmatched_purls(
+        &target_manifest_purls,
+        &matched_manifest_purls,
+        &vendored_bases,
+    );
 
     if !unmatched.is_empty() && !args.common.silent && !args.common.json {
         eprintln!(
@@ -1247,10 +1217,7 @@ async fn apply_patches_inner(
             unmatched.len()
         );
         for purl in &unmatched {
-            eprintln!(
-                "  - {}",
-                socket_patch_core::utils::purl::normalize_purl(purl)
-            );
+            eprintln!("  - {}", normalize_purl(purl));
         }
     }
 
