@@ -7,11 +7,11 @@
 //! customer gets the same lockfile whether Socket opens the PR (backend) or
 //! they run `socket-patch scan --redirect` locally (this CLI).
 //!
-//! `RUST_IMPLEMENTED` lists the ecosystems this CLI rewrites today (npm
-//! package-lock, pip requirements, cargo — covering JSON round-trip, text-line,
-//! and the multi-file per-dependency registry override). The remaining shared
-//! fixtures are implemented on the TS side and follow the identical pattern;
-//! they are skipped here (logged) rather than silently ignored.
+//! `RUST_IMPLEMENTED` lists the eco/flavor pairs this CLI rewrites today —
+//! covering JSON round-trip (npm, nuget), text-line (requirements, yarn), the
+//! multi-file per-dependency registry override (cargo, gem), and surgical XML
+//! (nuget.config, maven pom). Any shared fixture not yet ported is skipped
+//! here (logged) rather than silently ignored.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -29,6 +29,7 @@ const RUST_IMPLEMENTED: &[&str] = &[
     "composer/composer-lock",
     "nuget/packages-lock",
     "gem/bundler",
+    "maven/pom",
 ];
 
 fn fixtures_root() -> PathBuf {
@@ -107,10 +108,14 @@ fn redirect_golden_fixtures_match() {
 
         let result = rewrite_registry_redirect(&files, &overrides);
 
-        // Every expected file is produced byte-for-byte.
+        // Every expected file is produced byte-for-byte. A no-op case (e.g.
+        // an idempotent re-run) changes no files and so has no `expected/`
+        // dir — treat that as "zero expected files" rather than erroring.
         let expected_dir = case.join("expected");
         let mut expected_files = vec![];
-        walk(&expected_dir, &mut expected_files);
+        if expected_dir.is_dir() {
+            walk(&expected_dir, &mut expected_files);
+        }
         let mut expected_keys: Vec<String> = vec![];
         for f in &expected_files {
             let key = rel_key(&expected_dir, f);

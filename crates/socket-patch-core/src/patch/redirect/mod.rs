@@ -138,6 +138,7 @@ pub fn rewrite_registry_redirect(
     rewrite_composer_lock(files, overrides, &mut result);
     rewrite_nuget(files, overrides, &mut result);
     rewrite_gem(files, overrides, &mut result);
+    rewrite_maven_pom(files, overrides, &mut result);
     rewrite_golang(overrides, &mut result);
     result
 }
@@ -970,34 +971,69 @@ fn default_nuget_config() -> String {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n</configuration>\n".to_string()
 }
 
+/// The default public NuGet source key/URL, seeded as the catch-all target when
+/// a from-scratch `<packageSourceMapping>` would otherwise have NO pre-existing
+/// source to fan `*` out to (a socket-only mapping NU1100s every other package).
+const NUGET_ORG_KEY: &str = "nuget.org";
+const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
+
 fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> String {
+    // Capture the pre-existing packageSource keys BEFORE the Socket source is
+    // added — the fallback below fans a `*` mapping out to them.
+    let mut pre_existing_keys = nuget_package_source_keys(config);
     let mut out = config.to_string();
-    let source_line = format!("    <add key=\"{reg}\" value=\"{index_url}\" />");
-    if out.contains("<packageSources>") {
-        out = out.replacen(
-            "<packageSources>",
-            &format!("<packageSources>\n{source_line}"),
-            1,
-        );
-    } else {
-        out = out.replacen(
-            "<configuration>",
-            &format!("<configuration>\n  <packageSources>\n{source_line}\n  </packageSources>"),
-            1,
-        );
+
+    // A from-scratch <packageSourceMapping> is EXCLUSIVE: once it exists, every
+    // package must match some source's `*`/pattern or restore fails NU1100. If
+    // there are NO pre-existing sources to fan `*` out to, the mapping would be
+    // socket-only and every other package would fail. Seed the implicit default
+    // nuget.org source so the catch-all has a real target (unless the config
+    // already has one). Only relevant when we are about to CREATE the mapping.
+    let creating_mapping = !out.contains("<packageSourceMapping>");
+    let seed_nuget_org =
+        creating_mapping && pre_existing_keys.is_empty() && !config.contains(NUGET_ORG_KEY);
+    if seed_nuget_org {
+        out = insert_nuget_source(&out, NUGET_ORG_KEY, NUGET_ORG_URL);
+        pre_existing_keys.push(NUGET_ORG_KEY.to_string());
     }
-    let map_block = format!(
-        "  <packageSourceMapping>\n    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>\n  </packageSourceMapping>"
+
+    out = insert_nuget_source(&out, reg, index_url);
+
+    let socket_mapping = format!(
+        "    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
     );
-    if out.contains("<packageSourceMapping>") {
+    if !creating_mapping {
+        // A mapping already exists (e.g. a prior patched dep, or the project's
+        // own): append ONLY this source's mapping — every other source is
+        // already covered.
         out = out.replacen(
             "<packageSourceMapping>",
-            &format!(
-                "<packageSourceMapping>\n    <packageSource key=\"{reg}\">\n      <package pattern=\"{pkg_id}\" />\n    </packageSource>"
-            ),
+            &format!("<packageSourceMapping>\n{socket_mapping}"),
             1,
         );
     } else {
+        // Creating the mapping from scratch. Once ANY <packageSourceMapping>
+        // exists, NuGet requires EVERY package to match some source's pattern,
+        // so a mapping that routed only the patched id to the Socket source
+        // would make every OTHER package fail restore with NU1100. Fan a
+        // `<package pattern="*" />` out to each pre-existing source (which now
+        // includes the seeded nuget.org when the config had none) so the rest
+        // of the restore keeps resolving exactly where it did before.
+        let fallback_mappings = pre_existing_keys
+            .iter()
+            .map(|key| {
+                format!(
+                    "    <packageSource key=\"{key}\">\n      <package pattern=\"*\" />\n    </packageSource>"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let inner = if fallback_mappings.is_empty() {
+            socket_mapping
+        } else {
+            format!("{socket_mapping}\n{fallback_mappings}")
+        };
+        let map_block = format!("  <packageSourceMapping>\n{inner}\n  </packageSourceMapping>");
         out = out.replacen(
             "</configuration>",
             &format!("{map_block}\n</configuration>"),
@@ -1005,6 +1041,57 @@ fn add_nuget_source(config: &str, reg: &str, index_url: &str, pkg_id: &str) -> S
         );
     }
     out
+}
+
+/// Insert an `<add key="…" value="…" />` source under `<packageSources>`,
+/// creating the element (right after `<configuration>`) when absent. A
+/// self-closing `<packageSources />` (any whitespace before `/>`) is expanded
+/// in place into an open/close pair rather than left dangling beside a
+/// duplicate element.
+fn insert_nuget_source(config: &str, key: &str, url: &str) -> String {
+    let source_line = format!("    <add key=\"{key}\" value=\"{url}\" />");
+    // A self-closing element carries no children, so expand it to an open/close
+    // pair holding the new source. Matched before the open-tag check because a
+    // `<packageSources/>` literal does not contain the `<packageSources>` open
+    // tag.
+    let self_closing = Regex::new(r"<packageSources\s*/>").unwrap();
+    if let Some(m) = self_closing.find(config) {
+        let mut out = String::with_capacity(config.len() + source_line.len() + 40);
+        out.push_str(&config[..m.start()]);
+        out.push_str(&format!(
+            "<packageSources>\n{source_line}\n  </packageSources>"
+        ));
+        out.push_str(&config[m.end()..]);
+        out
+    } else if config.contains("<packageSources>") {
+        config.replacen(
+            "<packageSources>",
+            &format!("<packageSources>\n{source_line}"),
+            1,
+        )
+    } else {
+        config.replacen(
+            "<configuration>",
+            &format!("<configuration>\n  <packageSources>\n{source_line}\n  </packageSources>"),
+            1,
+        )
+    }
+}
+
+/// The `key` of every `<add … />` under `<packageSources>` (empty when there
+/// is no such element). Used to preserve resolution for non-patched packages
+/// when a `<packageSourceMapping>` is introduced.
+fn nuget_package_source_keys(config: &str) -> Vec<String> {
+    let region_re = Regex::new(r"(?s)<packageSources>(.*?)</packageSources>").unwrap();
+    let scope = region_re
+        .captures(config)
+        .map(|c| c.get(1).unwrap().as_str())
+        .unwrap_or("");
+    Regex::new(r#"<add\s+key="([^"]+)""#)
+        .unwrap()
+        .captures_iter(scope)
+        .map(|c| c[1].to_string())
+        .collect()
 }
 
 fn rewrite_nuget(
@@ -1289,13 +1376,240 @@ fn rewrite_gem(
     }
 }
 
+// ── maven (pom.xml repository + gradle manual snippet) ──────────────────────
+//
+// Minimal per-dependency override: ONLY the patched artifact is pointed at a
+// single-artifact Socket maven2 repository. Maven has no lockfile, so the
+// strongest client-side verification a stock `mvn` offers is
+// `<checksumPolicy>fail</checksumPolicy>` against the `.jar.sha1` sidecar the
+// SAME repository serves — the injected `<repository>` turns that on.
+// Same-GAV handling is VERIFY-ONLY: the rewriter never edits a dependency's
+// `<version>` (maven resolves the pinned version straight from the socket
+// repo, checked first; everything else falls through to the project's other
+// repositories) — it only warns when the redirect can't take effect. Gradle
+// has no equivalent surgical single-line edit, so a present build script gets
+// a paste-able `exclusiveContent { … }` snippet warning instead of any edit.
+
+/// Gradle build scripts (Groovy + Kotlin DSL) that trigger the manual snippet.
+const GRADLE_FILES: &[&str] = &[
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+/// Unique-per-patch maven repository id (valid chars: alnum, `-`, `_`, `.`).
+fn maven_repository_id(patch_uuid: &str) -> String {
+    format!("socket-patch-{patch_uuid}")
+}
+
+fn rewrite_maven_pom(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    let maven: Vec<&DepOverride> = overrides
+        .iter()
+        .filter(|o| o.ecosystem == "maven")
+        .collect();
+    if maven.is_empty() {
+        return;
+    }
+    let mut pom = files.get("pom.xml").cloned();
+    let mut pom_changed = false;
+    let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
+
+    for dep in &maven {
+        let ov = dep
+            .registry_override
+            .as_ref()
+            .filter(|ov| ov.kind == "maven2");
+        let Some(ov) = ov else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_missing_override".into(),
+                detail: format!("{} has no maven2 registry override", full_name(dep)),
+            });
+            continue;
+        };
+        let group_id = ov
+            .identifiers
+            .maven_group_id
+            .clone()
+            .or_else(|| dep.namespace.clone())
+            .unwrap_or_default();
+        let artifact_id = ov
+            .identifiers
+            .maven_artifact_id
+            .clone()
+            .unwrap_or_else(|| dep.name.clone());
+
+        // Gradle: emit a paste-able exclusiveContent snippet (never edit a
+        // build script). Independent of the pom edit — a project may ship both.
+        if gradle_build_present {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gradle_manual_snippet".into(),
+                detail: gradle_snippet(&ov.index_url, &group_id, &artifact_id, &dep.version),
+            });
+        }
+
+        let Some(pom_text) = pom.as_ref() else {
+            continue;
+        };
+
+        // VERIFY-ONLY same-GAV inspection: never edit the version; only warn
+        // when the redirect can't take effect for this dependency.
+        match find_maven_dependency_inner(pom_text, &group_id, &artifact_id) {
+            None => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_dep_not_found".into(),
+                    detail: format!(
+                        "no <dependency> for {group_id}:{artifact_id} in pom.xml (adding repository anyway)"
+                    ),
+                });
+            }
+            Some(dep_inner) => {
+                if let Some(typ) = extract_maven_tag_text(&dep_inner, "type") {
+                    if typ.trim() != "jar" {
+                        // The single-jar socket repository can only serve a
+                        // `.jar`; a war/pom/aar/etc. dependency can't be
+                        // redirected — skip without adding a repo.
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_maven_unsupported_packaging".into(),
+                            detail: format!(
+                                "{group_id}:{artifact_id} has <type>{}</type> (only jar can be redirected); skipping",
+                                typ.trim()
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                match extract_maven_tag_text(&dep_inner, "version") {
+                    None => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_maven_dep_unpinned".into(),
+                            detail: format!(
+                                "{group_id}:{artifact_id} has no literal <version> (inherited/managed); the socket repository only serves {}",
+                                dep.version
+                            ),
+                        });
+                    }
+                    Some(version) if version.contains("${") => {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_maven_dep_unpinned".into(),
+                            detail: format!(
+                                "{group_id}:{artifact_id} <version> is a property placeholder ({}); the socket repository only serves {}",
+                                version.trim(),
+                                dep.version
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // Idempotency: the repository id already present ⇒ no-op (no edit). A
+        // re-run over already-rewritten output records zero edits.
+        let repo_id = maven_repository_id(&dep.patch_uuid);
+        if pom_text.contains(&format!("<id>{repo_id}</id>")) {
+            continue;
+        }
+        let rebuilt = insert_maven_repository(pom_text, &repo_id, &ov.index_url);
+        pom = Some(rebuilt);
+        pom_changed = true;
+        result.edits.push(FileEdit {
+            path: "pom.xml".into(),
+            kind: "redirect_maven_repository".into(),
+            action: "added".into(),
+            key: Some(repo_id.clone()),
+            original: None,
+            new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+        });
+    }
+
+    if pom_changed {
+        if let Some(p) = pom {
+            result.files.insert("pom.xml".into(), p);
+        }
+    }
+}
+
+/// The `<repository>` block for the socket-patch source: releases enabled with
+/// `<checksumPolicy>fail</checksumPolicy>` (the only client-side verification
+/// a stock mvn offers against the served `.jar.sha1`); snapshots disabled
+/// (patched artifacts are always released versions). Indented for insertion
+/// under a `<repositories>` element (2-space step).
+fn maven_repository_block(id: &str, url: &str) -> String {
+    format!(
+        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
+    )
+}
+
+/// Insert the socket-patch repository block. Prefer an existing
+/// `<repositories>` element (single replace, inserted first so it's consulted
+/// before the project's other repositories); otherwise author a full
+/// `<repositories>` section immediately before the closing `</project>`.
+/// `<repositories>` is matched exactly so it never collides with
+/// `<pluginRepositories>`.
+fn insert_maven_repository(pom: &str, id: &str, url: &str) -> String {
+    let block = maven_repository_block(id, url);
+    if pom.contains("<repositories>") {
+        return pom.replacen("<repositories>", &format!("<repositories>\n{block}"), 1);
+    }
+    let section = format!("  <repositories>\n{block}\n  </repositories>");
+    pom.replacen("</project>", &format!("{section}\n</project>"), 1)
+}
+
+/// Return the inner XML of the first `<dependency>` whose `<groupId>` +
+/// `<artifactId>` match, or None when none matches. Scans every `<dependency>`
+/// block (including any under `<dependencyManagement>`), which is enough for
+/// the verify-only version/type inspection.
+fn find_maven_dependency_inner(pom: &str, group_id: &str, artifact_id: &str) -> Option<String> {
+    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>(.*?)</dependency>").unwrap();
+    for caps in dep_re.captures_iter(pom) {
+        let inner = caps.get(1).unwrap().as_str();
+        let g = extract_maven_tag_text(inner, "groupId");
+        let a = extract_maven_tag_text(inner, "artifactId");
+        if let (Some(g), Some(a)) = (g, a) {
+            if g.trim() == group_id && a.trim() == artifact_id {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Text content of the first `<tag>…</tag>` in `xml` (untrimmed — callers
+/// trim), or None.
+fn extract_maven_tag_text(xml: &str, tag: &str) -> Option<String> {
+    Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>"))
+        .unwrap()
+        .captures(xml)
+        .map(|c| c.get(1).unwrap().as_str().to_string())
+}
+
+/// A paste-able Gradle `exclusiveContent` block that pins ONLY the patched
+/// artifact to the socket maven2 repository (Groovy DSL — the common case; the
+/// Kotlin DSL differs only in quoting). Emitted as a warning detail; the
+/// rewriter never edits a build script.
+fn gradle_snippet(index_url: &str, group_id: &str, artifact_id: &str, version: &str) -> String {
+    format!(
+        "Gradle build detected — add this per-dependency repository manually (no automatic edit):\nrepositories {{\n    exclusiveContent {{\n        forRepository {{\n            maven {{ url \"{index_url}\" }}\n        }}\n        filter {{\n            includeVersion(\"{group_id}\", \"{artifact_id}\", \"{version}\")\n        }}\n    }}\n}}"
+    )
+}
+
 // ── golang (documented limitation) ──────────────────────────────────────────
+// Hosted redirect for Go is a deliberate no-go: every workable shape needs
+// machine-local GOPROXY/GOPRIVATE configuration that can't be committed to the
+// repo as a per-dependency edit. The full analysis (sumdb hard-fail, module-
+// path identity vs the build-once converter, GOPROXY leaking licensed bytes to
+// the public mirror) lives in `docs/design/golang-hosted-no-go.md`.
 fn rewrite_golang(overrides: &[DepOverride], result: &mut RewriteResult) {
     for dep in overrides.iter().filter(|o| o.ecosystem == "golang") {
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_unsupported".into(),
             detail: format!(
-                "{}@{}: remote per-dependency redirect is not expressible in go.mod without a fall-through GOPROXY; use local vendor mode for golang",
+                "{}@{}: hosted redirect for Go is not possible without machine-local GOPROXY/GOPRIVATE configuration; run `socket-patch vendor` (committable, offline-verified) instead",
                 full_name(dep),
                 dep.version
             ),
@@ -1443,6 +1757,323 @@ mod tests {
             "re-run over the marker line must be a no-op; got files={:?} edits={:?}",
             second.files,
             second.edits
+        );
+    }
+
+    fn maven_override() -> DepOverride {
+        DepOverride {
+            ecosystem: "maven".into(),
+            name: "slf4j-api".into(),
+            namespace: Some("org.slf4j".into()),
+            version: "1.7.36".into(),
+            token: "tok".into(),
+            patch_uuid: "uuid".into(),
+            artifact_url:
+                "https://patch.socket.dev/patch/maven/org.slf4j/slf4j-api/1.7.36/tok/uuid/slf4j-api-1.7.36.jar"
+                    .into(),
+            berry_zip_url: None,
+            registry_override: Some(RegistryOverride {
+                kind: "maven2".into(),
+                index_url: "https://patch.socket.dev/patch-registry/maven/tok/uuid/maven2".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "org.slf4j/slf4j-api".into(),
+                    version: "1.7.36".into(),
+                    maven_group_id: Some("org.slf4j".into()),
+                    maven_artifact_id: Some("slf4j-api".into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                sha1: Some("a".repeat(40)),
+                md5: Some("b".repeat(32)),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn pom_with_dep(version_xml: &str, type_xml: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>dev.socket.test</groupId>\n  <artifactId>consumer</artifactId>\n  <version>1.0.0</version>\n  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>{version_xml}{type_xml}\n    </dependency>\n  </dependencies>\n</project>\n"
+        )
+    }
+
+    /// A literal-pinned dep gets one `added` edit, and re-running over the
+    /// rewritten pom is a no-op (the `<id>` idempotency guard) — an edit whose
+    /// `original` is the already-redirected value would grow the committed
+    /// ledger on every `scan --redirect` run.
+    #[test]
+    fn maven_pom_rewrite_and_rerun_noop() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        let overrides = vec![maven_override()];
+        let first = rewrite_registry_redirect(&files, &overrides);
+        let out = first.files.get("pom.xml").expect("pom rewritten");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert!(
+            out.contains("<checksumPolicy>fail</checksumPolicy>"),
+            "{out}"
+        );
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        assert_eq!(first.edits.len(), 1);
+        assert_eq!(first.edits[0].kind, "redirect_maven_repository");
+        assert_eq!(first.edits[0].action, "added");
+
+        let mut again = files.clone();
+        again.insert("pom.xml".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &overrides);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty(),
+            "second pass must be a no-op: files={:?} edits={:?}",
+            second.files.keys(),
+            second.edits
+        );
+    }
+
+    /// Verify-only warnings: a `${property}` version still adds the repo but
+    /// warns unpinned; a missing dependency warns not-found; a non-jar
+    /// `<type>` skips the repo entirely (the single-jar repo can't serve it);
+    /// a present Gradle build script yields the manual snippet, no edits.
+    #[test]
+    fn maven_pom_warning_branches() {
+        let overrides = vec![maven_override()];
+
+        // Property placeholder → repo added + unpinned warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>${slf4j.version}</version>", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.contains_key("pom.xml"), "repo still added");
+        assert_eq!(r.warnings.len(), 1);
+        assert_eq!(r.warnings[0].code, "redirect_maven_dep_unpinned");
+
+        // No matching dependency → repo added anyway + not-found warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            "<project>\n  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>other</artifactId>\n      <version>1.0.0</version>\n    </dependency>\n  </dependencies>\n</project>\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.contains_key("pom.xml"));
+        assert_eq!(r.warnings[0].code, "redirect_maven_dep_not_found");
+
+        // Non-jar <type> → NO repo, unsupported-packaging warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep(
+                "\n      <version>1.7.36</version>",
+                "\n      <type>pom</type>",
+            ),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings.len(), 1);
+        assert_eq!(r.warnings[0].code, "redirect_maven_unsupported_packaging");
+
+        // Gradle build script present → paste-able snippet, no file edits.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "build.gradle".to_string(),
+            "plugins { id 'java' }\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(r.warnings.len(), 1);
+        assert_eq!(r.warnings[0].code, "redirect_gradle_manual_snippet");
+        assert!(
+            r.warnings[0]
+                .detail
+                .contains("includeVersion(\"org.slf4j\", \"slf4j-api\", \"1.7.36\")"),
+            "snippet pins the exact GAV: {}",
+            r.warnings[0].detail
+        );
+    }
+
+    fn nuget_override() -> DepOverride {
+        DepOverride {
+            ecosystem: "nuget".into(),
+            name: "Newtonsoft.Json".into(),
+            namespace: None,
+            version: "13.0.3".into(),
+            token: "tok".into(),
+            patch_uuid: "uuid".into(),
+            artifact_url: "https://patch.test/newtonsoft.json.13.0.3.nupkg".into(),
+            berry_zip_url: None,
+            registry_override: Some(RegistryOverride {
+                kind: "nuget-v3".into(),
+                index_url: "https://patch.test/nuget/index.json".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: "Newtonsoft.Json".into(),
+                    version: "13.0.3".into(),
+                    nuget_id_lower: Some("newtonsoft.json".into()),
+                    nuget_version_norm: Some("13.0.3".into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                sha512: Some("sha512-PATCHED==".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Creating a `<packageSourceMapping>` from scratch: once ANY mapping
+    /// exists NuGet requires EVERY package to match some source's pattern, so
+    /// the rewriter must fan a `pattern="*"` mapping out to every pre-existing
+    /// source or all other packages fail restore with NU1100.
+    #[test]
+    fn nuget_no_preexisting_mapping_gets_catch_all() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n    <add key=\"corp-feed\" value=\"https://nuget.corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "nuget.org catch-all present: {out}"
+        );
+        assert!(
+            out.contains(
+                "    <packageSource key=\"corp-feed\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "corp-feed catch-all present: {out}"
+        );
+        // The Socket mapping stays first (most specific pattern wins in NuGet,
+        // but ordering mirrors the TS rewriter for byte-consistency).
+        let socket_idx = out.find("key=\"socket-patch-uuid\">").unwrap();
+        let star_idx = out.find("pattern=\"*\"").unwrap();
+        assert!(socket_idx < star_idx, "socket mapping precedes catch-alls");
+    }
+
+    /// A config with NO pre-existing `<packageSources>` entries: a from-scratch
+    /// mapping would be socket-only, so every non-patched package would fail
+    /// restore with NU1100. The rewriter must seed the implicit default
+    /// nuget.org source and fan `*` out to it alongside the socket mapping.
+    #[test]
+    fn nuget_empty_sources_seeds_org_catch_all() {
+        let mut files = BTreeMap::new();
+        // An empty <packageSources> and no mapping (a realistic minimal config).
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        // nuget.org seeded as a source...
+        assert!(
+            out.contains("<add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />"),
+            "nuget.org source seeded: {out}"
+        );
+        // ...and mapped `*` so non-patched packages keep resolving.
+        assert!(
+            out.contains(
+                "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+            ),
+            "nuget.org catch-all present: {out}"
+        );
+        // The socket mapping still routes the patched id.
+        assert!(
+            out.contains(
+                "key=\"socket-patch-uuid\">\n      <package pattern=\"Newtonsoft.Json\" />"
+            ),
+            "socket mapping present: {out}"
+        );
+        // Exactly one catch-all (we didn't fan out to a phantom source).
+        assert_eq!(
+            out.matches("<package pattern=\"*\" />").count(),
+            1,
+            "single seeded catch-all: {out}"
+        );
+    }
+
+    /// A SELF-CLOSING `<packageSources />` must be expanded in place (not left
+    /// dangling beside a freshly-created duplicate element). The output is
+    /// byte-identical to the open-but-empty `<packageSources></packageSources>`
+    /// case — the tag form is cosmetic once expanded.
+    #[test]
+    fn nuget_self_closing_sources_expanded_in_place() {
+        let mk = |sources_xml: &str| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "nuget.config".to_string(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  {sources_xml}\n</configuration>\n"
+                ),
+            );
+            let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+            r.files
+                .get("nuget.config")
+                .expect("config rewritten")
+                .clone()
+        };
+        // Whitespace variants of the self-closing tag both expand.
+        let out_sc = mk("<packageSources />");
+        let out_sc_tight = mk("<packageSources/>");
+        let out_open = mk("<packageSources>\n  </packageSources>");
+
+        assert_eq!(
+            out_sc, out_open,
+            "self-closing (with space) expands to the same bytes as the open-empty form"
+        );
+        assert_eq!(
+            out_sc_tight, out_open,
+            "self-closing (no space) expands to the same bytes as the open-empty form"
+        );
+        // Exactly ONE opening <packageSources> element — no dangling duplicate.
+        assert_eq!(
+            out_sc.matches("<packageSources>").count(),
+            1,
+            "single packageSources element (no duplicate): {out_sc}"
+        );
+        // The self-closing tag is gone.
+        assert!(!out_sc.contains("<packageSources />"));
+        assert!(!out_sc.contains("<packageSources/>"));
+        // nuget.org still seeded + mapped.
+        assert!(out_sc.contains("<add key=\"nuget.org\""));
+        assert!(out_sc.contains(
+            "    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>"
+        ));
+    }
+
+    /// A pre-existing `<packageSourceMapping>` already covers the other
+    /// sources — the rewriter must append ONLY the Socket mapping and add NO
+    /// catch-all (injecting `*` entries would loosen the project's own
+    /// deliberate routing).
+    #[test]
+    fn nuget_preexisting_mapping_gets_no_catch_all() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "nuget.config".to_string(),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"Contoso.*\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        let out = r.files.get("nuget.config").expect("config rewritten");
+        assert!(
+            out.contains(
+                "key=\"socket-patch-uuid\">\n      <package pattern=\"Newtonsoft.Json\" />"
+            ),
+            "socket mapping appended: {out}"
+        );
+        assert!(
+            !out.contains("pattern=\"*\""),
+            "no catch-all injected when a mapping pre-exists: {out}"
+        );
+        assert_eq!(
+            out.matches("<packageSourceMapping>").count(),
+            1,
+            "existing mapping element reused: {out}"
         );
     }
 

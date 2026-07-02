@@ -1,0 +1,23 @@
+[
+  {
+    "ecosystem": "nuget",
+    "name": "Newtonsoft.Json",
+    "version": "13.0.3",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "66666666-6666-6666-6666-666666666666",
+    "artifactUrl": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+    "registryOverride": {
+      "kind": "nuget-v3",
+      "indexUrl": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+      "identifiers": {
+        "name": "Newtonsoft.Json",
+        "version": "13.0.3",
+        "nugetIdLower": "newtonsoft.json",
+        "nugetVersionNorm": "13.0.3"
+      }
+    },
+    "integrity": {
+      "sha512": "sha512-PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA=="
+    }
+  }
+]

@@ -499,6 +499,88 @@ pub(crate) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
     cves.into_iter().chain(ghsas).collect()
 }
 
+/// The three patch-application modes `scan` can drive, selectable via
+/// `--mode` (the documented spelling). Each variant is equivalent to one
+/// legacy boolean flag, which remains supported as an alias.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanMode {
+    /// Rewrite lockfiles so ONLY patched dependencies resolve to Socket's
+    /// hosted patch server (== `--redirect`): no artifact bytes land in the
+    /// repo, but installs must reach the patch server.
+    Hosted,
+    /// Commit patched artifacts to `.socket/vendor/` (== `--vendor`):
+    /// hermetic, offline-safe installs at the cost of repo size.
+    Vendored,
+    /// Record patches in `.socket/manifest.json` + blobs and re-apply them
+    /// in place, e.g. from CI (== `--apply`): smallest repo footprint, but
+    /// every install environment must run the agent.
+    Agent,
+}
+
+impl ScanMode {
+    /// The CLI spelling of the variant (`--mode <name>`), for error messages.
+    fn cli_name(self) -> &'static str {
+        match self {
+            ScanMode::Hosted => "hosted",
+            ScanMode::Vendored => "vendored",
+            ScanMode::Agent => "agent",
+        }
+    }
+}
+
+/// Fold `--mode` into the legacy boolean spellings (`--redirect` /
+/// `--vendor` / `--apply`) so everything downstream keeps a single source
+/// of truth, and enforce the cross-flag rules clap cannot express:
+///
+/// * `--mode X` combined with a boolean belonging to a DIFFERENT mode is a
+///   contradiction → `Err`. Clap's `conflicts_with` is value-independent —
+///   it could not allow `--mode vendored --vendor` while rejecting
+///   `--mode hosted --vendor` — so the check lives here.
+/// * The same mode spelled both ways (`--mode vendored --vendor`) is
+///   redundant but accepted: both spellings mean one thing.
+/// * `--sync` implies `--apply`, so it counts as an agent-mode spelling;
+///   `--prune` is an orthogonal GC knob and never conflicts.
+/// * `--detached` requires vendored mode in either spelling. The former
+///   clap-level `requires = "vendor"` couldn't see `--mode vendored`, so
+///   the requirement moved here too.
+///
+/// Public (not `pub(crate)`) so the CLI-contract tests can exercise the
+/// fold without driving a full `run()`.
+pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
+    if let Some(mode) = args.mode {
+        // First boolean that selects a mode OTHER than the requested one.
+        let mut conflicting: Option<&'static str> = None;
+        if args.redirect && mode != ScanMode::Hosted {
+            conflicting = Some("--redirect");
+        }
+        if args.vendor && mode != ScanMode::Vendored {
+            conflicting = Some("--vendor");
+        }
+        if args.apply && mode != ScanMode::Agent {
+            conflicting = Some("--apply");
+        }
+        if args.sync && mode != ScanMode::Agent {
+            conflicting = Some("--sync");
+        }
+        if let Some(flag) = conflicting {
+            return Err(format!(
+                "--mode {} cannot be combined with {flag}: the flags select different \
+                 modes (hosted == --redirect, vendored == --vendor, agent == --apply/--sync)",
+                mode.cli_name(),
+            ));
+        }
+        match mode {
+            ScanMode::Hosted => args.redirect = true,
+            ScanMode::Vendored => args.vendor = true,
+            ScanMode::Agent => args.apply = true,
+        }
+    }
+    if args.detached && !args.vendor {
+        return Err("--detached requires vendored mode (--mode vendored or --vendor)".to_string());
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 pub struct ScanArgs {
     #[command(flatten)]
@@ -514,7 +596,8 @@ pub struct ScanArgs {
     /// Designed for unattended workflows (cron jobs, bots that open PRs);
     /// pair with `--yes` for clarity though `--json` already implies non-
     /// interactive confirmation. No effect outside `--json` mode (the
-    /// non-JSON path always prompts the user).
+    /// non-JSON path always prompts the user). `--mode agent` is the
+    /// documented spelling of this mode.
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
@@ -543,18 +626,22 @@ pub struct ScanArgs {
     /// (vendoring replaces the in-place apply); combine with `--prune`
     /// to drop uninstalled entries before they fail vendoring. JSON mode
     /// is non-interactive like `--apply`; the interactive path prompts
-    /// before downloading.
+    /// before downloading. `--mode vendored` is the documented spelling
+    /// of this mode.
     #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
-    /// With `--vendor`: do not write `.socket/manifest.json` entries —
-    /// the vendor ledger (`.socket/vendor/state.json`) carries an
-    /// embedded copy of each patch record instead. Detached patches are
-    /// invisible to apply/rollback/repair (nothing is in the manifest);
-    /// they are undone per-purl via `remove <purl>` or wholesale via
+    /// With vendored mode (`--mode vendored` / `--vendor`): do not write
+    /// `.socket/manifest.json` entries — the vendor ledger
+    /// (`.socket/vendor/state.json`) carries an embedded copy of each
+    /// patch record instead. Detached patches are invisible to
+    /// apply/rollback/repair (nothing is in the manifest); they are
+    /// undone per-purl via `remove <purl>` or wholesale via
     /// `vendor --revert`, and are exempt from `vendor`'s manifest
-    /// reconcile.
-    #[arg(long, default_value_t = false, requires = "vendor")]
+    /// reconcile. The vendored-mode requirement is enforced in
+    /// `resolve_mode_flags` (not clap `requires`) so `--mode vendored`
+    /// satisfies it too.
+    #[arg(long, default_value_t = false)]
     pub detached: bool,
 
     /// Redirect every patched dependency to Socket's HOSTED vendored patches
@@ -564,9 +651,30 @@ pub struct ScanArgs {
     /// counterpart of `--vendor`: no artifact bytes land in the repo — the
     /// lockfile pins the hosted URL + integrity (npm/pypi/composer) or a
     /// per-dependency registry override (cargo/nuget/gem/…). Conflicts with
-    /// `--apply`/`--sync`/`--vendor`.
-    #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync", "vendor"])]
+    /// `--apply`/`--sync`/`--vendor`. Hidden from help: the flag is
+    /// unreleased and `--mode hosted` is the documented spelling.
+    #[arg(long, default_value_t = false, hide = true, conflicts_with_all = ["apply", "sync", "vendor"])]
     pub redirect: bool,
+
+    /// How discovered patches are consumed — the documented selector for
+    /// the three modes (each is equivalent to one boolean flag, kept as an
+    /// alias):
+    ///
+    /// * `hosted` (== `--redirect`): rewrite lockfiles so only patched
+    ///   dependencies resolve to Socket's hosted patch server — no
+    ///   artifact bytes in the repo, but installs must reach the server.
+    /// * `vendored` (== `--vendor`): commit patched artifacts under
+    ///   `.socket/vendor/` — hermetic, offline-safe installs at the cost
+    ///   of repo size.
+    /// * `agent` (== `--apply`): record patches in `.socket/manifest.json`
+    ///   plus blobs and re-apply in place — smallest repo footprint, but
+    ///   every environment must run the agent.
+    ///
+    /// Combining `--mode` with a boolean flag from a DIFFERENT mode is
+    /// rejected (see `resolve_mode_flags`); the same mode spelled both
+    /// ways is accepted.
+    #[arg(long = "mode", value_enum)]
+    pub mode: Option<ScanMode>,
 
     /// Download patches for every release/distribution variant of a
     /// matched package, not just the one(s) matching the locally-
@@ -1328,6 +1436,13 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "packages.lock.json",
     "Gemfile",
     "Gemfile.lock",
+    "pom.xml",
+    // Gradle build scripts are never edited — their presence only feeds the
+    // maven rewriter's paste-able `exclusiveContent` snippet warning.
+    "settings.gradle",
+    "settings.gradle.kts",
+    "build.gradle",
+    "build.gradle.kts",
 ];
 
 /// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
@@ -1539,6 +1654,11 @@ async fn run_redirect(
                 socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd)
                     .await
                     .unwrap_or_else(RedirectState::new);
+            // Ledgers written before the mode-string rename carry
+            // `"mode": "redirect"`; normalize on rewrite so the on-disk
+            // ledger converges on the documented "hosted" name (the
+            // loader accepts either — mode is an opaque string to it).
+            ledger.mode = "hosted".to_string();
             ledger.edits.extend(rewrite.edits.iter().cloned());
             ledger.records.extend(records.clone());
             let _ = std::fs::write(
@@ -1589,6 +1709,10 @@ async fn run_redirect(
         let mut result = serde_json::json!({
             "status": "success",
             "redirect": {
+                // Final mode naming: `--redirect` IS hosted mode. Additive
+                // key so JSON consumers can dispatch on the mode without
+                // inferring it from which sub-object is present.
+                "mode": "hosted",
                 "redirected": confirmed.len(),
                 "rewrittenFiles": rewritten,
                 "skipped": skipped,
@@ -1643,8 +1767,18 @@ async fn run_redirect(
     vex_code
 }
 
-pub async fn run(args: ScanArgs) -> i32 {
+pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
+
+    // Fold `--mode` into the legacy mode booleans before anything reads
+    // them, so every branch below keeps a single source of truth. Cross-
+    // mode combinations get a usage-style error (exit 2, matching clap's
+    // conflict exit code) — see `resolve_mode_flags` for why clap itself
+    // can't express them.
+    if let Err(message) = resolve_mode_flags(&mut args) {
+        eprintln!("error: {message}");
+        return 2;
+    }
 
     // `--sync` is sugar for `--apply --prune`. Derive locals once and
     // use them everywhere downstream so the flag interactions are

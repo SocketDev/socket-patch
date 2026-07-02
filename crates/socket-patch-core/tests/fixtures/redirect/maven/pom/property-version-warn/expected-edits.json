@@ -1,0 +1,12 @@
+[
+  {
+    "path": "pom.xml",
+    "kind": "redirect_maven_repository",
+    "action": "added",
+    "key": "socket-patch-77777777-7777-7777-7777-777777777777",
+    "new": {
+      "id": "socket-patch-77777777-7777-7777-7777-777777777777",
+      "url": "https://patch.socket.dev/patch-registry/maven/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/maven2"
+    }
+  }
+]

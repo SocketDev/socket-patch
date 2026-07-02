@@ -1,4 +1,5 @@
-//! The `scan --redirect` ledger (`.socket/vendor/redirect-state.json`).
+//! The hosted-mode ledger (`.socket/vendor/redirect-state.json`), written by
+//! `scan --mode hosted` (a.k.a. `scan --redirect`).
 //!
 //! Mirrors the vendor `state.json` shape but records a REMOTE per-dependency
 //! redirect (no local artifact bytes). It carries the recorded [`FileEdit`]s
@@ -24,6 +25,9 @@ pub const REDIRECT_STATE_REL: &str = ".socket/vendor/redirect-state.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedirectState {
     pub version: u32,
+    /// The mode that produced this ledger. Current writers emit `"hosted"`
+    /// (the final mode name); the loader is tolerant of any string, so
+    /// ledgers written before the rename (`"redirect"`) still load.
     pub mode: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<FileEdit>,
@@ -38,7 +42,7 @@ impl RedirectState {
     pub fn new() -> Self {
         Self {
             version: 1,
-            mode: "redirect".to_string(),
+            mode: "hosted".to_string(),
             edits: Vec::new(),
             records: BTreeMap::new(),
         }
@@ -109,7 +113,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&state).unwrap();
         let back: RedirectState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.version, 1);
-        assert_eq!(back.mode, "redirect");
+        assert_eq!(back.mode, "hosted");
         let rec = back.records.get("pkg:npm/left-pad@1.3.0").unwrap();
         assert_eq!(rec.files["package/index.js"].after_hash, "b".repeat(64));
         assert!(rec.vulnerabilities.contains_key("GHSA-xxxx-yyyy-zzzz"));
@@ -139,6 +143,25 @@ mod tests {
 
         let loaded = load_redirect_state(tmp.path()).await.unwrap();
         assert!(loaded.records.contains_key("pkg:npm/left-pad@1.3.0"));
+    }
+
+    #[tokio::test]
+    async fn load_legacy_redirect_mode_string_still_loads() {
+        // Ledgers written before the mode-string rename carry
+        // `"mode": "redirect"`. `mode` is an opaque string to the loader, so
+        // these must still deserialize (a hosted re-run normalizes them to
+        // "hosted"). Regression guard against tightening `mode` into an enum.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("redirect-state.json"),
+            br#"{ "version": 1, "mode": "redirect" }"#,
+        )
+        .await
+        .unwrap();
+        let loaded = load_redirect_state(tmp.path()).await.unwrap();
+        assert_eq!(loaded.mode, "redirect");
     }
 
     #[tokio::test]
