@@ -14,15 +14,12 @@
         "name": "org.slf4j/slf4j-api",
         "version": "1.7.36",
         "mavenGroupId": "org.slf4j",
-        "mavenArtifactId": "slf4j-api",
-        "mavenSuffixedVersion": "1.7.36-socket.77777777",
-        "mavenPomSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        "mavenArtifactId": "slf4j-api"
       }
     },
     "integrity": {
       "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "md5": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      "md5": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
   }
 ]

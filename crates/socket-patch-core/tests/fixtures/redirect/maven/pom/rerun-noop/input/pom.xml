@@ -11,7 +11,7 @@
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-      <version>1.7.36</version>
+      <version>1.7.36-socket.77777777</version>
     </dependency>
   </dependencies>
   <repositories>

@@ -46,6 +46,18 @@ pub struct RegistryOverrideIdentifiers {
     pub nuget_version_norm: Option<String>,
     pub maven_group_id: Option<String>,
     pub maven_artifact_id: Option<String>,
+    /// Maven hosted-mode Socket-suffixed version
+    /// (`<base>-socket.<first-8-hex-of-patch-uuid>`). Present ONLY when the
+    /// upstream pom was captured AND could be safely rewritten to advertise it;
+    /// when present the rewriter pins THIS version (never the bare upstream
+    /// `version`) so the patched jar resolves solely off the Socket repo —
+    /// fail-closed. Omitted ⇒ legacy same-GAV serving. Set together with
+    /// `maven_pom_sha256`.
+    pub maven_suffixed_version: Option<String>,
+    /// sha256 hex of the exact `.pom` bytes the serve route returns under
+    /// `maven_suffixed_version`, pinned as a Maven trusted checksum. Only
+    /// meaningful alongside `maven_suffixed_version`.
+    pub maven_pom_sha256: Option<String>,
     pub gem_checksum_sha256: Option<String>,
 }
 
@@ -1748,19 +1760,32 @@ fn rewrite_gem(
     }
 }
 
-// ── maven (pom.xml repository + gradle manual snippet) ──────────────────────
+// ── maven (pom.xml version pin + repository + trusted checksums) ────────────
 //
-// Minimal per-dependency override: ONLY the patched artifact is pointed at a
-// single-artifact Socket maven2 repository. Maven has no lockfile, so the
-// strongest client-side verification a stock `mvn` offers is
-// `<checksumPolicy>fail</checksumPolicy>` against the `.jar.sha1` sidecar the
-// SAME repository serves — the injected `<repository>` turns that on.
-// Same-GAV handling is VERIFY-ONLY: the rewriter never edits a dependency's
-// `<version>` (maven resolves the pinned version straight from the socket
-// repo, checked first; everything else falls through to the project's other
-// repositories) — it only warns when the redirect can't take effect. Gradle
-// has no equivalent surgical single-line edit, so a present build script gets
-// a paste-able `exclusiveContent { … }` snippet warning instead of any edit.
+// Maven has no lockfile, so the patched jar is pinned two ways depending on
+// whether the reference API captured a rewritable upstream pom (see the TS twin
+// `registry-rewrite/maven-pom.ts` for the full rationale):
+//
+//   FAIL-CLOSED — the override carries `identifiers.mavenSuffixedVersion`
+//   (`<base>-socket.<hex8>`) + the `mavenPomSha256` of the served pom. That
+//   version exists ONLY on the Socket repo, so the rewriter pins it EXPLICITLY
+//   (rewrite the literal `<version>`, or add a `<dependencyManagement>` entry
+//   for a transitive) — a resolver that can't reach the Socket repo or is
+//   handed different bytes can't fall through to Central, so the build
+//   hard-fails instead of silently going unpatched. When a pin lands we also
+//   inject the single-artifact `<repository>` (releases + `checksumPolicy=fail`)
+//   and, when the jar + pom sha256 are both known, Maven Trusted Checksums
+//   files (`.mvn/maven.config` + `.mvn/checksums/checksums.sha256`).
+//
+//   LEGACY same-GAV — no `mavenSuffixedVersion`. The patched jar is served
+//   under its original GAV, so the rewriter only injects the `<repository>` and
+//   warns `redirect_maven_same_gav_fallback` (a Socket-repo outage/tamper falls
+//   back to the UNPATCHED artifact — NOT fail-closed).
+//
+// Gradle has no equivalent surgical single-line edit, so a present build script
+// gets a paste-able `exclusiveContent { … }` snippet warning instead of an
+// edit. pom.xml + `.mvn/*` are authored surgically (mirrors the cargo/nuget
+// rewriters): every byte not touched by an edit is preserved.
 
 /// Gradle build scripts (Groovy + Kotlin DSL) that trigger the manual snippet.
 const GRADLE_FILES: &[&str] = &[
@@ -1770,9 +1795,96 @@ const GRADLE_FILES: &[&str] = &[
     "build.gradle.kts",
 ];
 
+/// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
+/// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
+/// line. `failIfMissing=false` so a dependency without a committed checksum
+/// still resolves (only a MISMATCH fails); origin-unaware so one checksum
+/// matches the artifact from any repository.
+const MVN_CONFIG_ARGS: &[&str] = &[
+    "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+    "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+    "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
+    "-Daether.trustedChecksumsSource.summaryFile=true",
+    "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
+    "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
+];
+
+const MVN_CONFIG: &str = ".mvn/maven.config";
+const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
+
 /// Unique-per-patch maven repository id (valid chars: alnum, `-`, `_`, `.`).
 fn maven_repository_id(patch_uuid: &str) -> String {
     format!("socket-patch-{patch_uuid}")
+}
+
+/// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
+/// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
+/// the TS `bareSha256Hex`).
+fn bare_sha256_hex(hash: &str) -> String {
+    let lower = hash.trim().to_lowercase();
+    if let Some(rest) = lower.strip_prefix("sha256-") {
+        return rest.to_string();
+    }
+    if let Some(rest) = lower.strip_prefix("sha256:") {
+        return rest.to_string();
+    }
+    lower
+}
+
+/// A `<dependency>` block matched by groupId:artifactId, with the byte offsets
+/// of its literal `<version>` inner text (None when the dep carries no literal
+/// version — inherited/managed) and its trimmed version/type text. Mirrors the
+/// TS `MavenDependencyMatch`.
+struct MavenDependencyMatch {
+    version_inner: Option<(usize, usize)>,
+    version_text: Option<String>,
+    type_text: Option<String>,
+}
+
+/// Inner-text byte range of the first `<tag>…</tag>` inside `pom[from, to)`, or
+/// None. Offsets are into the FULL `pom`.
+fn maven_tag_inner_range(pom: &str, tag: &str, from: usize, to: usize) -> Option<(usize, usize)> {
+    let re = Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>")).unwrap();
+    let caps = re.captures(&pom[from..to])?;
+    let inner = caps.get(1).unwrap();
+    Some((from + inner.start(), from + inner.end()))
+}
+
+/// Trimmed text of the first `<tag>…</tag>` inside `pom[from, to)`, or None.
+fn maven_tag_text_in(pom: &str, tag: &str, from: usize, to: usize) -> Option<String> {
+    maven_tag_inner_range(pom, tag, from, to).map(|(s, e)| pom[s..e].trim().to_string())
+}
+
+/// Every `<dependency>` block whose `<groupId>` + `<artifactId>` match, with
+/// its literal `<version>` range/text and `<type>` text (twin of the TS
+/// `findDependencyMatches`). A `<dependency>` inside `<dependencyManagement>`
+/// is matched the same way as a direct one — the suffixing path tells "managed
+/// in an unseen parent" (no literal version → depMgmt pin) from "pinned here"
+/// (rewrite the literal) purely by whether ANY match carries a literal
+/// `<version>`. Returns ALL matches so a managed base-version entry gets
+/// rewritten even when a direct dependency declares no version.
+fn find_maven_dependency_matches(
+    pom: &str,
+    group_id: &str,
+    artifact_id: &str,
+) -> Vec<MavenDependencyMatch> {
+    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>.*?</dependency>").unwrap();
+    let mut matches = vec![];
+    for m in dep_re.find_iter(pom) {
+        let (dep_open, dep_close) = (m.start(), m.end());
+        let g = maven_tag_text_in(pom, "groupId", dep_open, dep_close);
+        let a = maven_tag_text_in(pom, "artifactId", dep_open, dep_close);
+        if g.as_deref() != Some(group_id) || a.as_deref() != Some(artifact_id) {
+            continue;
+        }
+        let version_inner = maven_tag_inner_range(pom, "version", dep_open, dep_close);
+        matches.push(MavenDependencyMatch {
+            version_text: version_inner.map(|(s, e)| pom[s..e].trim().to_string()),
+            version_inner,
+            type_text: maven_tag_text_in(pom, "type", dep_open, dep_close),
+        });
+    }
+    matches
 }
 
 fn rewrite_maven_pom(
@@ -1789,6 +1901,10 @@ fn rewrite_maven_pom(
     }
     let mut pom = files.get("pom.xml").cloned();
     let mut pom_changed = false;
+    let mut mvn_config = files.get(MVN_CONFIG).cloned().unwrap_or_default();
+    let mut mvn_config_changed = false;
+    // (local-repo-relative path, bare sha256 hex) entries to merge in.
+    let mut checksum_entries: Vec<(String, String)> = vec![];
     let gradle_build_present = GRADLE_FILES.iter().any(|f| files.contains_key(*f));
 
     for dep in &maven {
@@ -1814,89 +1930,292 @@ fn rewrite_maven_pom(
             .maven_artifact_id
             .clone()
             .unwrap_or_else(|| dep.name.clone());
+        let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
+        let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
+        let jar_sha256 = dep.integrity.sha256.clone();
 
         // Gradle: emit a paste-able exclusiveContent snippet (never edit a
         // build script). Independent of the pom edit — a project may ship both.
+        // Pin the suffixed version when fail-closed; the legacy base otherwise.
         if gradle_build_present {
+            let gradle_version = suffixed_version.as_deref().unwrap_or(&dep.version);
             result.warnings.push(RewriteWarning {
                 code: "redirect_gradle_manual_snippet".into(),
-                detail: gradle_snippet(&ov.index_url, &group_id, &artifact_id, &dep.version),
+                detail: gradle_snippet(
+                    &ov.index_url,
+                    &group_id,
+                    &artifact_id,
+                    gradle_version,
+                    suffixed_version.is_some(),
+                ),
             });
         }
 
-        let Some(pom_text) = pom.as_ref() else {
+        if pom.is_none() {
+            continue;
+        }
+        let repo_id = maven_repository_id(&dep.patch_uuid);
+
+        // LEGACY same-GAV fallback: no suffixed version means the patched jar is
+        // served under its original GAV. Add the repository (transport checksum
+        // policy `fail`) exactly as before and warn that this is NOT
+        // fail-closed.
+        let Some(suffixed_version) = suffixed_version else {
+            let pom_text = pom.as_ref().unwrap();
+            // Verify-only inspection: warn when the redirect can't take effect.
+            // Only the FIRST match matters here (legacy behavior).
+            let matches = find_maven_dependency_matches(pom_text, &group_id, &artifact_id);
+            match matches.first() {
+                None => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_maven_dep_not_found".into(),
+                        detail: format!(
+                            "no <dependency> for {group_id}:{artifact_id} in pom.xml (adding repository anyway)"
+                        ),
+                    });
+                }
+                Some(first) => {
+                    if let Some(typ) = &first.type_text {
+                        if typ != "jar" {
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_maven_unsupported_packaging".into(),
+                                detail: format!(
+                                    "{group_id}:{artifact_id} has <type>{typ}</type> (only jar can be redirected); skipping"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                    match &first.version_text {
+                        None => {
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_maven_dep_unpinned".into(),
+                                detail: format!(
+                                    "{group_id}:{artifact_id} has no literal <version> (inherited/managed); the socket repository only serves {}",
+                                    dep.version
+                                ),
+                            });
+                        }
+                        Some(v) if v.contains("${") => {
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_maven_dep_unpinned".into(),
+                                detail: format!(
+                                    "{group_id}:{artifact_id} <version> is a property placeholder ({v}); the socket repository only serves {}",
+                                    dep.version
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_same_gav_fallback".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} is patched at its original GAV; a Socket-repo failure falls back to the unpatched artifact — not fail-closed. The backend will serve suffixed versions once the upstream pom is available."
+                ),
+            });
+            if pom_text.contains(&format!("<id>{repo_id}</id>")) {
+                continue;
+            }
+            pom = Some(insert_maven_repository(pom_text, &repo_id, &ov.index_url));
+            pom_changed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_repository".into(),
+                action: "added".into(),
+                key: Some(repo_id.clone()),
+                original: None,
+                new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+            });
             continue;
         };
 
-        // VERIFY-ONLY same-GAV inspection: never edit the version; only warn
-        // when the redirect can't take effect for this dependency.
-        match find_maven_dependency_inner(pom_text, &group_id, &artifact_id) {
-            None => {
+        // FAIL-CLOSED: pin the suffixed version explicitly. Scan every matching
+        // <dependency>, tracking depMgmt containment via the version presence
+        // so we can tell a literal pin here from a version managed elsewhere.
+        let matches = find_maven_dependency_matches(pom.as_ref().unwrap(), &group_id, &artifact_id);
+
+        // An unsupported <type> on any match: the single-jar repo can't serve
+        // it — skip the whole dep (no version edit, no repo, no checksum).
+        if let Some(non_jar) = matches
+            .iter()
+            .find(|m| m.type_text.as_deref().is_some_and(|t| t != "jar"))
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_unsupported_packaging".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} has <type>{}</type> (only jar can be redirected); skipping",
+                    non_jar.type_text.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
+
+        // A `${property}` version on any match: refuse this dep entirely.
+        // Editing the literal would break the property reference, and a depMgmt
+        // pin could strand sibling artifacts sharing the property.
+        if let Some(prop) = matches
+            .iter()
+            .find(|m| m.version_text.as_deref().is_some_and(|v| v.contains("${")))
+        {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_dep_unpinned".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} <version> is a property placeholder ({}); refusing to pin the suffixed version (a property edit could strand sibling artifacts)",
+                    prop.version_text.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
+
+        let mut pin_landed = false;
+        // Literal versions among the matches, with their inner ranges.
+        let versioned: Vec<(usize, usize, String)> = matches
+            .iter()
+            .filter_map(|m| {
+                m.version_inner
+                    .zip(m.version_text.clone())
+                    .map(|((s, e), v)| (s, e, v))
+            })
+            .collect();
+        // Rewrite base → suffixed. Descending offset order so earlier edits
+        // don't shift later matches' offsets.
+        let mut to_rewrite: Vec<(usize, usize)> = versioned
+            .iter()
+            .filter(|(_, _, v)| *v == dep.version)
+            .map(|(s, e, _)| (*s, *e))
+            .collect();
+        to_rewrite.sort_by(|a, b| b.0.cmp(&a.0));
+        for (start, end) in &to_rewrite {
+            let mut rebuilt = pom.as_ref().unwrap().clone();
+            rebuilt.replace_range(*start..*end, &suffixed_version);
+            pom = Some(rebuilt);
+            pom_changed = true;
+            pin_landed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_dep_version".into(),
+                action: "rewritten".into(),
+                key: Some(format!("{group_id}:{artifact_id}")),
+                original: Some(Value::String(dep.version.clone())),
+                new: Some(Value::String(suffixed_version.clone())),
+            });
+        }
+        // A literal version that is neither base nor the applied suffixed
+        // version disagrees with the row — skip it (don't guess). A dep whose
+        // only match is a mismatch adds no pin (versioned is non-empty, so the
+        // depMgmt branch below is skipped).
+        for (_, _, v) in &versioned {
+            if *v != dep.version && *v != suffixed_version {
                 result.warnings.push(RewriteWarning {
-                    code: "redirect_maven_dep_not_found".into(),
+                    code: "redirect_maven_dep_version_mismatch".into(),
                     detail: format!(
-                        "no <dependency> for {group_id}:{artifact_id} in pom.xml (adding repository anyway)"
+                        "{group_id}:{artifact_id} <version>{v}</version> matches neither the base ({}) nor the suffixed ({suffixed_version}) version; skipping",
+                        dep.version
                     ),
                 });
             }
-            Some(dep_inner) => {
-                if let Some(typ) = extract_maven_tag_text(&dep_inner, "type") {
-                    if typ.trim() != "jar" {
-                        // The single-jar socket repository can only serve a
-                        // `.jar`; a war/pom/aar/etc. dependency can't be
-                        // redirected — skip without adding a repo.
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_maven_unsupported_packaging".into(),
-                            detail: format!(
-                                "{group_id}:{artifact_id} has <type>{}</type> (only jar can be redirected); skipping",
-                                typ.trim()
-                            ),
-                        });
-                        continue;
-                    }
-                }
-                match extract_maven_tag_text(&dep_inner, "version") {
-                    None => {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_maven_dep_unpinned".into(),
-                            detail: format!(
-                                "{group_id}:{artifact_id} has no literal <version> (inherited/managed); the socket repository only serves {}",
-                                dep.version
-                            ),
-                        });
-                    }
-                    Some(version) if version.contains("${") => {
-                        result.warnings.push(RewriteWarning {
-                            code: "redirect_maven_dep_unpinned".into(),
-                            detail: format!(
-                                "{group_id}:{artifact_id} <version> is a property placeholder ({}); the socket repository only serves {}",
-                                version.trim(),
-                                dep.version
-                            ),
-                        });
-                    }
-                    Some(_) => {}
-                }
-            }
         }
 
-        // Idempotency: the repository id already present ⇒ no-op (no edit). A
-        // re-run over already-rewritten output records zero edits.
-        let repo_id = maven_repository_id(&dep.patch_uuid);
-        if pom_text.contains(&format!("<id>{repo_id}</id>")) {
+        // No literal <version> among the matches (transitive-only, or the
+        // version is managed in an unseen parent): pin via
+        // <dependencyManagement>. A re-run finds the suffixed entry we authored
+        // as a versioned match, so `versioned` is non-empty and this branch is
+        // skipped (idempotent).
+        if versioned.is_empty() {
+            pom = Some(insert_maven_dependency_management(
+                pom.as_ref().unwrap(),
+                &group_id,
+                &artifact_id,
+                &suffixed_version,
+            ));
+            pom_changed = true;
+            pin_landed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_dep_management".into(),
+                action: "added".into(),
+                key: Some(format!("{group_id}:{artifact_id}")),
+                original: None,
+                new: Some(
+                    json!({ "groupId": group_id, "artifactId": artifact_id, "version": suffixed_version }),
+                ),
+            });
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_dep_management_added".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id} has no literal <version> in pom.xml; added a <dependencyManagement> pin for the suffixed version {suffixed_version}"
+                ),
+            });
+        }
+
+        // A pin landed this run: inject the repository (idempotent via the <id>
+        // guard) and emit trusted checksums. When the pin was already present
+        // from a prior run, `pin_landed` stays false and both are skipped,
+        // keeping a re-run edit-free.
+        if !pin_landed {
             continue;
         }
-        let rebuilt = insert_maven_repository(pom_text, &repo_id, &ov.index_url);
-        pom = Some(rebuilt);
-        pom_changed = true;
-        result.edits.push(FileEdit {
-            path: "pom.xml".into(),
-            kind: "redirect_maven_repository".into(),
-            action: "added".into(),
-            key: Some(repo_id.clone()),
-            original: None,
-            new: Some(json!({ "id": repo_id, "url": ov.index_url })),
-        });
+        if !pom
+            .as_ref()
+            .unwrap()
+            .contains(&format!("<id>{repo_id}</id>"))
+        {
+            pom = Some(insert_maven_repository(
+                pom.as_ref().unwrap(),
+                &repo_id,
+                &ov.index_url,
+            ));
+            pom_changed = true;
+            result.edits.push(FileEdit {
+                path: "pom.xml".into(),
+                kind: "redirect_maven_repository".into(),
+                action: "added".into(),
+                key: Some(repo_id.clone()),
+                original: None,
+                new: Some(json!({ "id": repo_id, "url": ov.index_url })),
+            });
+        }
+
+        // Trusted Checksums: only when BOTH the jar sha256 and the served pom
+        // sha256 are known. Two entries per dep — the jar and the pom — under
+        // the SUFFIXED version's local-repo path.
+        if let (Some(jar), Some(pom_hash)) = (&jar_sha256, &pom_sha256) {
+            let (merged, conflicts) =
+                merge_mvn_config(&mvn_config, &format!("{group_id}:{artifact_id}"));
+            for conflict in conflicts {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_trusted_checksums_conflict".into(),
+                    detail: conflict,
+                });
+            }
+            if merged != mvn_config {
+                let action = if files.contains_key(MVN_CONFIG) {
+                    "rewritten"
+                } else {
+                    "added"
+                };
+                mvn_config = merged;
+                mvn_config_changed = true;
+                result.edits.push(FileEdit {
+                    path: MVN_CONFIG.into(),
+                    kind: "redirect_maven_config".into(),
+                    action: action.into(),
+                    key: Some("trustedChecksums".into()),
+                    original: None,
+                    new: None,
+                });
+            }
+            checksum_entries.push((
+                local_repo_artifact_path(&group_id, &artifact_id, &suffixed_version, "jar"),
+                bare_sha256_hex(jar),
+            ));
+            checksum_entries.push((
+                local_repo_artifact_path(&group_id, &artifact_id, &suffixed_version, "pom"),
+                bare_sha256_hex(pom_hash),
+            ));
+        }
     }
 
     if pom_changed {
@@ -1904,13 +2223,35 @@ fn rewrite_maven_pom(
             result.files.insert("pom.xml".into(), p);
         }
     }
+    if mvn_config_changed {
+        result.files.insert(MVN_CONFIG.into(), mvn_config);
+    }
+    if !checksum_entries.is_empty() {
+        let existing = files.get(MVN_CHECKSUMS).cloned().unwrap_or_default();
+        let action = if files.contains_key(MVN_CHECKSUMS) {
+            "rewritten"
+        } else {
+            "added"
+        };
+        result.files.insert(
+            MVN_CHECKSUMS.into(),
+            merge_checksums(&existing, &checksum_entries),
+        );
+        result.edits.push(FileEdit {
+            path: MVN_CHECKSUMS.into(),
+            kind: "redirect_maven_trusted_checksums".into(),
+            action: action.into(),
+            key: None,
+            original: None,
+            new: None,
+        });
+    }
 }
 
 /// The `<repository>` block for the socket-patch source: releases enabled with
-/// `<checksumPolicy>fail</checksumPolicy>` (the only client-side verification
-/// a stock mvn offers against the served `.jar.sha1`); snapshots disabled
-/// (patched artifacts are always released versions). Indented for insertion
-/// under a `<repositories>` element (2-space step).
+/// `<checksumPolicy>fail</checksumPolicy>` (the transport-level check against
+/// the served `.jar.sha1`); snapshots disabled (patched artifacts are always
+/// released versions). Indented for insertion under a `<repositories>` element.
 fn maven_repository_block(id: &str, url: &str) -> String {
     format!(
         "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
@@ -1932,41 +2273,146 @@ fn insert_maven_repository(pom: &str, id: &str, url: &str) -> String {
     pom.replacen("</project>", &format!("{section}\n</project>"), 1)
 }
 
-/// Return the inner XML of the first `<dependency>` whose `<groupId>` +
-/// `<artifactId>` match, or None when none matches. Scans every `<dependency>`
-/// block (including any under `<dependencyManagement>`), which is enough for
-/// the verify-only version/type inspection.
-fn find_maven_dependency_inner(pom: &str, group_id: &str, artifact_id: &str) -> Option<String> {
-    let dep_re = Regex::new(r"(?s)<dependency\b[^>]*>(.*?)</dependency>").unwrap();
-    for caps in dep_re.captures_iter(pom) {
-        let inner = caps.get(1).unwrap().as_str();
-        let g = extract_maven_tag_text(inner, "groupId");
-        let a = extract_maven_tag_text(inner, "artifactId");
-        if let (Some(g), Some(a)) = (g, a) {
-            if g.trim() == group_id && a.trim() == artifact_id {
-                return Some(inner.to_string());
+/// A `<dependency>` block for a `<dependencyManagement>` pin (2-space step ×4).
+fn maven_management_dependency_block(group_id: &str, artifact_id: &str, version: &str) -> String {
+    format!(
+        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
+    )
+}
+
+/// Add a `<dependencyManagement>` version pin. Prefer extending an existing
+/// `<dependencyManagement><dependencies>` element (insert right after the
+/// opening `<dependencies>` tag); otherwise author a full
+/// `<dependencyManagement>` section before `</project>`. Mirrors the TS
+/// `insertDependencyManagement`.
+fn insert_maven_dependency_management(
+    pom: &str,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> String {
+    let block = maven_management_dependency_block(group_id, artifact_id, version);
+    let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>").unwrap();
+    if let Some(m) = dm_re.find(pom) {
+        let matched = m.as_str();
+        return pom.replacen(matched, &format!("{matched}\n{block}"), 1);
+    }
+    let section = format!(
+        "  <dependencyManagement>\n    <dependencies>\n{block}\n    </dependencies>\n  </dependencyManagement>"
+    );
+    pom.replacen("</project>", &format!("{section}\n</project>"), 1)
+}
+
+/// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
+/// line). Dedupe by the `-Dkey=` prefix: an arg whose key is already present is
+/// left untouched (existing value wins). Returns the merged text + any conflict
+/// messages (a pre-existing SAME key with a DIFFERENT value). Twin of the TS
+/// `mergeMvnConfig`.
+fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = if existing.is_empty() {
+        vec![]
+    } else {
+        existing.split('\n').collect()
+    };
+    let mut conflicts = vec![];
+    let key_of =
+        |line: &str| -> Option<String> { line.find('=').map(|eq| line[..=eq].to_string()) };
+    let mut present: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in &lines {
+        if let Some(key) = key_of(line) {
+            present.insert(key, (*line).to_string());
+        }
+    }
+    let mut appended: Vec<&str> = vec![];
+    for arg in MVN_CONFIG_ARGS {
+        let key = key_of(arg).unwrap();
+        match present.get(&key) {
+            None => {
+                appended.push(arg);
+                present.insert(key, (*arg).to_string());
+            }
+            Some(existing_line) if existing_line.trim() != *arg => {
+                conflicts.push(format!(
+                    "{coordinate}: {MVN_CONFIG} already sets {key} to a different value ({}); leaving it as-is",
+                    existing_line.trim()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if appended.is_empty() {
+        return (existing.to_string(), conflicts);
+    }
+    let base = if existing.is_empty() {
+        String::new()
+    } else if existing.ends_with('\n') {
+        existing.to_string()
+    } else {
+        format!("{existing}\n")
+    };
+    (format!("{base}{}\n", appended.join("\n")), conflicts)
+}
+
+/// Merge trusted-checksum entries into `.mvn/checksums/checksums.sha256` (GNU
+/// coreutils format: `<sha256-hex><TWO spaces><local-repo-relative path>`).
+/// Parse existing entries, replace/add by path, re-sort by path, trailing
+/// newline. A malformed line (no double-space separator) is dropped. Twin of
+/// the TS `mergeChecksums`.
+fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
+    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+    if !existing.is_empty() {
+        for line in existing.split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some(sep) = line.find("  ") {
+                by_path.insert(line[sep + 2..].to_string(), line[..sep].to_string());
             }
         }
     }
-    None
+    for (path, sha256) in entries {
+        by_path.insert(path.clone(), sha256.clone());
+    }
+    // BTreeMap iterates keys in sorted (byte) order — matching JS's default
+    // sort on the ASCII paths.
+    let body: Vec<String> = by_path
+        .iter()
+        .map(|(path, sha)| format!("{sha}  {path}"))
+        .collect();
+    format!("{}\n", body.join("\n"))
 }
 
-/// Text content of the first `<tag>…</tag>` in `xml` (untrimmed — callers
-/// trim), or None.
-fn extract_maven_tag_text(xml: &str, tag: &str) -> Option<String> {
-    Regex::new(&format!("(?s)<{tag}>(.*?)</{tag}>"))
-        .unwrap()
-        .captures(xml)
-        .map(|c| c.get(1).unwrap().as_str().to_string())
+/// The local-repository-relative artifact path Maven derives for a coordinate:
+/// `<groupId-with-slashes>/<artifactId>/<version>/<artifactId>-<version>.<ext>`.
+fn local_repo_artifact_path(group_id: &str, artifact_id: &str, version: &str, ext: &str) -> String {
+    format!(
+        "{}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}",
+        group_id.replace('.', "/")
+    )
 }
 
 /// A paste-able Gradle `exclusiveContent` block that pins ONLY the patched
 /// artifact to the socket maven2 repository (Groovy DSL — the common case; the
-/// Kotlin DSL differs only in quoting). Emitted as a warning detail; the
-/// rewriter never edits a build script.
-fn gradle_snippet(index_url: &str, group_id: &str, artifact_id: &str, version: &str) -> String {
+/// Kotlin DSL differs only in quoting). Uses the SUFFIXED version when
+/// fail-closed; the message reminds the user to also bump the dependency
+/// declaration. Emitted as a warning detail; the rewriter never edits a build
+/// script.
+fn gradle_snippet(
+    index_url: &str,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+    suffixed: bool,
+) -> String {
+    let bump = if suffixed {
+        format!(
+            " Also bump the {group_id}:{artifact_id} dependency declaration to version {version} — exclusiveContent is fail-closed by repo exclusivity."
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "Gradle build detected — add this per-dependency repository manually (no automatic edit):\nrepositories {{\n    exclusiveContent {{\n        forRepository {{\n            maven {{ url \"{index_url}\" }}\n        }}\n        filter {{\n            includeVersion(\"{group_id}\", \"{artifact_id}\", \"{version}\")\n        }}\n    }}\n}}"
+        "Gradle build detected — add this per-dependency repository manually (no automatic edit):\nrepositories {{\n    exclusiveContent {{\n        forRepository {{\n            maven {{ url \"{index_url}\" }}\n        }}\n        filter {{\n            includeVersion(\"{group_id}\", \"{artifact_id}\", \"{version}\")\n        }}\n    }}\n}}{bump}"
     )
 }
 
@@ -2132,6 +2578,9 @@ mod tests {
         );
     }
 
+    const MAVEN_SUFFIXED: &str = "1.7.36-socket.aaaaaaaa";
+
+    /// A fail-closed override (suffixed version + jar/pom sha256 present).
     fn maven_override() -> DepOverride {
         DepOverride {
             ecosystem: "maven".into(),
@@ -2152,15 +2601,28 @@ mod tests {
                     version: "1.7.36".into(),
                     maven_group_id: Some("org.slf4j".into()),
                     maven_artifact_id: Some("slf4j-api".into()),
+                    maven_suffixed_version: Some(MAVEN_SUFFIXED.into()),
+                    maven_pom_sha256: Some("d".repeat(64)),
                     ..Default::default()
                 },
             }),
             integrity: Integrity {
                 sha1: Some("a".repeat(40)),
                 md5: Some("b".repeat(32)),
+                sha256: Some("c".repeat(64)),
                 ..Default::default()
             },
         }
+    }
+
+    /// A legacy override — no suffixed version, no sha256 (same-GAV serving).
+    fn legacy_maven_override() -> DepOverride {
+        let mut dep = maven_override();
+        let ids = &mut dep.registry_override.as_mut().unwrap().identifiers;
+        ids.maven_suffixed_version = None;
+        ids.maven_pom_sha256 = None;
+        dep.integrity.sha256 = None;
+        dep
     }
 
     fn pom_with_dep(version_xml: &str, type_xml: &str) -> String {
@@ -2169,12 +2631,15 @@ mod tests {
         )
     }
 
-    /// A literal-pinned dep gets one `added` edit, and re-running over the
-    /// rewritten pom is a no-op (the `<id>` idempotency guard) — an edit whose
-    /// `original` is the already-redirected value would grow the committed
-    /// ledger on every `scan --redirect` run.
+    fn warning_codes(r: &RewriteResult) -> Vec<&str> {
+        r.warnings.iter().map(|w| w.code.as_str()).collect()
+    }
+
+    /// Fail-closed literal pin: the `<version>` is rewritten to the suffixed
+    /// value, the repository + trusted-checksum files are emitted, and a re-run
+    /// over the fully-pinned output records nothing (idempotent).
     #[test]
-    fn maven_pom_rewrite_and_rerun_noop() {
+    fn maven_pom_fail_closed_literal_pin_and_rerun_noop() {
         let mut files = BTreeMap::new();
         files.insert(
             "pom.xml".to_string(),
@@ -2183,18 +2648,52 @@ mod tests {
         let overrides = vec![maven_override()];
         let first = rewrite_registry_redirect(&files, &overrides);
         let out = first.files.get("pom.xml").expect("pom rewritten");
-        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
         assert!(
-            out.contains("<checksumPolicy>fail</checksumPolicy>"),
-            "{out}"
+            out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "version suffixed: {out}"
+        );
+        assert!(!out.contains("<version>1.7.36</version>"), "base replaced");
+        assert!(out.contains("<id>socket-patch-uuid</id>"), "{out}");
+        assert!(out.contains("<checksumPolicy>fail</checksumPolicy>"));
+        let config = first.files.get(".mvn/maven.config").expect("config");
+        assert!(config.contains("trustedChecksums=true"), "{config}");
+        let checksums = first
+            .files
+            .get(".mvn/checksums/checksums.sha256")
+            .expect("checksums");
+        assert!(
+            checksums.contains(&format!(
+                "{}  org/slf4j/slf4j-api/{MAVEN_SUFFIXED}/slf4j-api-{MAVEN_SUFFIXED}.jar",
+                "c".repeat(64)
+            )),
+            "jar entry: {checksums}"
+        );
+        assert!(
+            checksums.contains(&format!(
+                "{}  org/slf4j/slf4j-api/{MAVEN_SUFFIXED}/slf4j-api-{MAVEN_SUFFIXED}.pom",
+                "d".repeat(64)
+            )),
+            "pom entry: {checksums}"
         );
         assert!(first.warnings.is_empty(), "{:?}", first.warnings);
-        assert_eq!(first.edits.len(), 1);
-        assert_eq!(first.edits[0].kind, "redirect_maven_repository");
-        assert_eq!(first.edits[0].action, "added");
+        let kinds: Vec<&str> = first.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "redirect_maven_dep_version",
+                "redirect_maven_repository",
+                "redirect_maven_config",
+                "redirect_maven_trusted_checksums",
+            ]
+        );
 
         let mut again = files.clone();
         again.insert("pom.xml".to_string(), out.clone());
+        again.insert(".mvn/maven.config".to_string(), config.clone());
+        again.insert(
+            ".mvn/checksums/checksums.sha256".to_string(),
+            checksums.clone(),
+        );
         let second = rewrite_registry_redirect(&again, &overrides);
         assert!(
             second.files.is_empty() && second.edits.is_empty(),
@@ -2204,36 +2703,67 @@ mod tests {
         );
     }
 
-    /// Verify-only warnings: a `${property}` version still adds the repo but
-    /// warns unpinned; a missing dependency warns not-found; a non-jar
-    /// `<type>` skips the repo entirely (the single-jar repo can't serve it);
-    /// a present Gradle build script yields the manual snippet, no edits.
+    /// Fail-closed transitive-only (no matching dependency): a
+    /// `<dependencyManagement>` pin for the suffixed version is authored (with
+    /// the informational note, NOT the legacy dep_not_found warning).
     #[test]
-    fn maven_pom_warning_branches() {
-        let overrides = vec![maven_override()];
+    fn maven_pom_fail_closed_transitive_dep_management() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            "<project>\n  <dependencies>\n    <dependency>\n      <groupId>ch.qos.logback</groupId>\n      <artifactId>logback-classic</artifactId>\n      <version>1.4.14</version>\n    </dependency>\n  </dependencies>\n</project>\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(
+            out.contains("<dependencyManagement>")
+                && out.contains(&format!("<version>{MAVEN_SUFFIXED}</version>")),
+            "depMgmt pin authored: {out}"
+        );
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_management_added"));
+        assert!(!warning_codes(&r).contains(&"redirect_maven_dep_not_found"));
+        let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "redirect_maven_dep_management",
+                "redirect_maven_repository",
+                "redirect_maven_config",
+                "redirect_maven_trusted_checksums",
+            ]
+        );
+    }
 
-        // Property placeholder → repo added + unpinned warning.
+    /// Fail-closed refusals: a `${property}` version refuses the whole dep (no
+    /// repo/checksums); a mismatched literal version skips it; a non-jar
+    /// `<type>` skips it.
+    #[test]
+    fn maven_pom_fail_closed_refusals() {
+        // Property placeholder → full refusal.
         let mut files = BTreeMap::new();
         files.insert(
             "pom.xml".to_string(),
             pom_with_dep("\n      <version>${slf4j.version}</version>", ""),
         );
-        let r = rewrite_registry_redirect(&files, &overrides);
-        assert!(r.files.contains_key("pom.xml"), "repo still added");
-        assert_eq!(r.warnings.len(), 1);
-        assert_eq!(r.warnings[0].code, "redirect_maven_dep_unpinned");
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert!(warning_codes(&r).contains(&"redirect_maven_dep_unpinned"));
+        assert!(!warning_codes(&r).contains(&"redirect_maven_repository"));
 
-        // No matching dependency → repo added anyway + not-found warning.
+        // Mismatched literal version → skip.
         let mut files = BTreeMap::new();
         files.insert(
             "pom.xml".to_string(),
-            "<project>\n  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>other</artifactId>\n      <version>1.0.0</version>\n    </dependency>\n  </dependencies>\n</project>\n".to_string(),
+            pom_with_dep("\n      <version>1.7.30</version>", ""),
         );
-        let r = rewrite_registry_redirect(&files, &overrides);
-        assert!(r.files.contains_key("pom.xml"));
-        assert_eq!(r.warnings[0].code, "redirect_maven_dep_not_found");
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty());
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_dep_version_mismatch"]
+        );
 
-        // Non-jar <type> → NO repo, unsupported-packaging warning.
+        // Non-jar <type> → skip.
         let mut files = BTreeMap::new();
         files.insert(
             "pom.xml".to_string(),
@@ -2242,27 +2772,118 @@ mod tests {
                 "\n      <type>pom</type>",
             ),
         );
-        let r = rewrite_registry_redirect(&files, &overrides);
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(r.warnings.len(), 1);
-        assert_eq!(r.warnings[0].code, "redirect_maven_unsupported_packaging");
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_unsupported_packaging"]
+        );
+    }
 
-        // Gradle build script present → paste-able snippet, no file edits.
+    /// Fail-closed without a jar/pom sha256: the version + repo are pinned but
+    /// NO checksum files are emitted (nothing to verify against). And a
+    /// `sha256-`-prefixed hash is stripped to bare hex before it lands.
+    #[test]
+    fn maven_pom_fail_closed_checksum_conditions() {
+        // No jar sha256 → no .mvn files.
+        let mut dep = maven_override();
+        dep.integrity.sha256 = None;
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        assert!(r.files.contains_key("pom.xml"), "version still pinned");
+        assert!(!r.files.contains_key(".mvn/maven.config"));
+        assert!(!r.files.contains_key(".mvn/checksums/checksums.sha256"));
+
+        // A `sha256-` SRI prefix is stripped to bare hex.
+        let mut dep = maven_override();
+        dep.integrity.sha256 = Some(format!("sha256-{}", "c".repeat(64)));
+        dep.registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .maven_pom_sha256 = Some(format!("sha256-{}", "d".repeat(64)));
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        let checksums = r
+            .files
+            .get(".mvn/checksums/checksums.sha256")
+            .expect("checksums");
+        assert!(
+            !checksums.contains("sha256-"),
+            "prefix stripped: {checksums}"
+        );
+        assert!(checksums.contains(&format!("{}  ", "c".repeat(64))));
+        assert!(checksums.contains(&format!("{}  ", "d".repeat(64))));
+    }
+
+    /// A user `.mvn/maven.config` key set to a different value is preserved
+    /// (never overridden) and a conflict warning is emitted.
+    #[test]
+    fn maven_pom_trusted_checksums_conflict() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        files.insert(
+            ".mvn/maven.config".to_string(),
+            "-Daether.trustedChecksumsSource.summaryFile.originAware=true\n".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        let config = r.files.get(".mvn/maven.config").expect("config");
+        assert!(
+            config.contains("originAware=true"),
+            "user value kept: {config}"
+        );
+        assert!(!config.contains("originAware=false"), "ours NOT written");
+        assert!(warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"));
+    }
+
+    /// Legacy same-GAV fallback (no suffixed version): only the repository is
+    /// added, no `.mvn` files, and the same_gav_fallback warning is emitted.
+    #[test]
+    fn maven_pom_legacy_same_gav_fallback() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "pom.xml".to_string(),
+            pom_with_dep("\n      <version>1.7.36</version>", ""),
+        );
+        let r = rewrite_registry_redirect(&files, &[legacy_maven_override()]);
+        let out = r.files.get("pom.xml").expect("repo added");
+        assert!(out.contains("<id>socket-patch-uuid</id>"));
+        assert!(out.contains("<version>1.7.36</version>"), "base GAV kept");
+        assert!(!r.files.contains_key(".mvn/maven.config"));
+        assert!(!r.files.contains_key(".mvn/checksums/checksums.sha256"));
+        assert!(warning_codes(&r).contains(&"redirect_maven_same_gav_fallback"));
+        let kinds: Vec<&str> = r.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["redirect_maven_repository"]);
+    }
+
+    /// A present Gradle build script yields a paste-able snippet pinning the
+    /// SUFFIXED version, with no file edits.
+    #[test]
+    fn maven_pom_gradle_manual_snippet() {
         let mut files = BTreeMap::new();
         files.insert(
             "build.gradle".to_string(),
             "plugins { id 'java' }\n".to_string(),
         );
-        let r = rewrite_registry_redirect(&files, &overrides);
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
         assert!(r.files.is_empty() && r.edits.is_empty());
-        assert_eq!(r.warnings.len(), 1);
-        assert_eq!(r.warnings[0].code, "redirect_gradle_manual_snippet");
+        assert_eq!(warning_codes(&r), vec!["redirect_gradle_manual_snippet"]);
+        let detail = &r.warnings[0].detail;
         assert!(
-            r.warnings[0]
-                .detail
-                .contains("includeVersion(\"org.slf4j\", \"slf4j-api\", \"1.7.36\")"),
-            "snippet pins the exact GAV: {}",
-            r.warnings[0].detail
+            detail.contains(&format!(
+                "includeVersion(\"org.slf4j\", \"slf4j-api\", \"{MAVEN_SUFFIXED}\")"
+            )),
+            "snippet pins the suffixed version: {detail}"
+        );
+        assert!(
+            detail.contains("bump the org.slf4j:slf4j-api dependency declaration"),
+            "snippet reminds to bump the declaration: {detail}"
         );
     }
 

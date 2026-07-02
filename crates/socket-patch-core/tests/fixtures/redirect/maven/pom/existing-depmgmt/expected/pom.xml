@@ -7,11 +7,19 @@
   <artifactId>consumer</artifactId>
   <version>1.0.0</version>
   <packaging>jar</packaging>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>1.7.36-socket.77777777</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
   <dependencies>
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-      <version>1.7.36-socket.77777777</version>
     </dependency>
   </dependencies>
   <repositories>
@@ -25,10 +33,6 @@
       <snapshots>
         <enabled>false</enabled>
       </snapshots>
-    </repository>
-    <repository>
-      <id>corp-mirror</id>
-      <url>https://nexus.corp.example/repository/maven-public/</url>
     </repository>
   </repositories>
 </project>

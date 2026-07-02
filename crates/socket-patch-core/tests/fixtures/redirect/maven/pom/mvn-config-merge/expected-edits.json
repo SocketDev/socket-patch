@@ -20,12 +20,12 @@
   {
     "path": ".mvn/maven.config",
     "kind": "redirect_maven_config",
-    "action": "added",
+    "action": "rewritten",
     "key": "trustedChecksums"
   },
   {
     "path": ".mvn/checksums/checksums.sha256",
     "kind": "redirect_maven_trusted_checksums",
-    "action": "added"
+    "action": "rewritten"
   }
 ]

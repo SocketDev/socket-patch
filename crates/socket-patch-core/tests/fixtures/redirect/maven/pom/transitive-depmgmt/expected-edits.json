@@ -1,11 +1,14 @@
 [
   {
     "path": "pom.xml",
-    "kind": "redirect_maven_dep_version",
-    "action": "rewritten",
+    "kind": "redirect_maven_dep_management",
+    "action": "added",
     "key": "org.slf4j:slf4j-api",
-    "original": "1.7.36",
-    "new": "1.7.36-socket.77777777"
+    "new": {
+      "groupId": "org.slf4j",
+      "artifactId": "slf4j-api",
+      "version": "1.7.36-socket.77777777"
+    }
   },
   {
     "path": "pom.xml",

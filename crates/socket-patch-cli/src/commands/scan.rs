@@ -1448,6 +1448,11 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "Gemfile",
     "Gemfile.lock",
     "pom.xml",
+    // Maven Trusted Checksums files the fail-closed maven rewriter merges into
+    // (read so an existing user config / checksum set is preserved, not
+    // clobbered).
+    ".mvn/maven.config",
+    ".mvn/checksums/checksums.sha256",
     // Gradle build scripts are never edited — their presence only feeds the
     // maven rewriter's paste-able `exclusiveContent` snippet warning.
     "settings.gradle",
@@ -1506,11 +1511,13 @@ async fn run_redirect(
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut overrides: Vec<DepOverride> = Vec::new();
-    // (purl, uuid, artifact_url, registry index_url) per granted reference —
-    // used AFTER the rewrite to decide which deps were actually redirected
-    // (their target URL landed in a lockfile) before persisting records or
-    // attesting anything.
-    let mut candidates: Vec<(String, String, String, Option<String>)> = Vec::new();
+    // (purl, uuid, artifact_url, registry index_url, maven suffixed version)
+    // per granted reference — used AFTER the rewrite to decide which deps were
+    // actually redirected (their target URL / index / suffixed version landed
+    // in a file) before persisting records or attesting anything. The last
+    // element is Some only for fail-closed maven overrides.
+    type RedirectCandidate = (String, String, String, Option<String>, Option<String>);
+    let mut candidates: Vec<RedirectCandidate> = Vec::new();
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|s| s.uuid.clone()).collect();
@@ -1567,6 +1574,10 @@ async fn run_redirect(
                     .registry_override
                     .as_ref()
                     .map(|o| o.index_url.clone()),
+                reference
+                    .registry_override
+                    .as_ref()
+                    .and_then(|o| o.identifiers.maven_suffixed_version.clone()),
             ));
             overrides.push(DepOverride {
                 ecosystem,
@@ -1725,7 +1736,7 @@ async fn run_redirect(
         .collect();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .filter(|(_, _, artifact_url, index_url)| {
+        .filter(|(_, _, artifact_url, index_url, suffixed_version)| {
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
             final_texts.iter().any(|text| {
                 text.contains(artifact_url.as_str())
@@ -1733,9 +1744,15 @@ async fn run_redirect(
                     // lock's `::__archiveUrl=` binding, so the raw form is absent.
                     || text.contains(encoded.as_str())
                     || index_url.as_deref().is_some_and(|iu| text.contains(iu))
+                    // Fail-closed maven pins the globally-unique
+                    // `-socket.<hex8>` suffixed version (never the `.pom` URL),
+                    // so match on that string.
+                    || suffixed_version
+                        .as_deref()
+                        .is_some_and(|sv| text.contains(sv))
             })
         })
-        .map(|(purl, uuid, _, _)| (purl.clone(), uuid.clone()))
+        .map(|(purl, uuid, _, _, _)| (purl.clone(), uuid.clone()))
         .collect();
 
     // Fetch the full patch view (file hashes + vulnerabilities) for each
