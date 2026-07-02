@@ -1293,6 +1293,15 @@ pub async fn run(args: GetArgs) -> i32 {
         );
         return 1;
     }
+    if args.one_off {
+        // Honest failure instead of the historical silent no-op: the flag
+        // parsed but was never implemented, so the patch was saved to the
+        // manifest anyway — lying to the user about persistence. Mirrors
+        // `rollback --one-off`'s not-yet-implemented contract; rejected
+        // before any network or disk activity.
+        report_error(args.common.json, "One-off get mode is not yet implemented");
+        return 1;
+    }
 
     apply_env_toggles(&args.common);
     // `--silent` is "errors only" (CLI_CONTRACT.md): every informational

@@ -555,13 +555,13 @@ async fn get_one_off_with_save_only_errors() {
 
 #[tokio::test]
 #[serial]
-async fn get_one_off_without_identifier_validation() {
-    // CAVEAT: `--one-off` is NOT specially handled in the UUID path — there
-    // is no "not yet implemented" stub (the original comment here was wrong).
-    // With the API unreachable, the UUID fetch fails and `report_fetch_failure`
-    // returns exit 1. So this test really exercises the network-failure path
-    // with one_off set, not a one-off stub. We pin the observable contract:
-    // exit 1 and nothing written.
+async fn get_one_off_is_an_honest_not_implemented_error() {
+    // `--one-off` was a silent no-op for three majors: the flag parsed but
+    // was never read past the `--save-only` conflict check, so the patch
+    // was saved to the manifest anyway — lying about persistence. It now
+    // fails honestly, BEFORE any network or disk activity (the unreachable
+    // API here proves no fetch is attempted: a fetch would produce the
+    // same exit code but only after a connect timeout).
     let tmp = tempfile::tempdir().unwrap();
     let mut args = default_args(UUID, tmp.path());
     args.common.api_url = "http://127.0.0.1:1".to_string();
@@ -569,7 +569,7 @@ async fn get_one_off_without_identifier_validation() {
     args.save_only = false;
 
     let code = run(args).await;
-    assert_eq!(code, 1, "unreachable API fetch must exit 1");
+    assert_eq!(code, 1, "--one-off must fail as not-yet-implemented");
     assert_no_manifest(tmp.path());
 }
 

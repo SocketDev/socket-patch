@@ -614,7 +614,7 @@ All v3.0 env vars use the `SOCKET_*` prefix. Three legacy `SOCKET_PATCH_*` names
 | `SOCKET_FORCE` | `apply --force` / `-f` | `false` | Local to `apply`. |
 | `SOCKET_BATCH_SIZE` | `scan --batch-size` | `100` | Local to `scan`. |
 | `SOCKET_SAVE_ONLY` | `get --save-only` | `false` | Local to `get`. |
-| `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. |
+| `SOCKET_ONE_OFF` | `get --one-off` / `rollback --one-off` | `false` | Local to `get`/`rollback`. Both are **not yet implemented**: the flag parses (boolishly, empty-tolerant) and the command fails up front with a "not yet implemented" error, before any network or disk activity. |
 | `SOCKET_SKIP_ROLLBACK` | `remove --skip-rollback` | `false` | Local to `remove`. |
 | `SOCKET_DOWNLOAD_ONLY` | `repair --download-only` | `false` | Local to `repair`. |
 | `SOCKET_SETUP_EXCLUDE` | `setup --exclude` | (none) | Local to `setup`; comma-separated workspace-member paths, persisted to `setup.exclude`. |
