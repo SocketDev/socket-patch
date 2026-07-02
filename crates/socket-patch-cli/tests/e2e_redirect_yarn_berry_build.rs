@@ -279,9 +279,8 @@ async fn berry_hosted_project(
     let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
     build_patched_tgz(&installed_dir, &patched, &tgz_path);
     let tgz = std::fs::read(&tgz_path).unwrap();
-    let Some(checksum) = bootstrap_berry_checksum(tmp.path(), &tgz_path) else {
-        return None;
-    };
+    // `None` (bootstrap install couldn't run) propagates as a skip.
+    let checksum = bootstrap_berry_checksum(tmp.path(), &tgz_path)?;
     let served: Vec<u8> = if tamper_served_tarball {
         // A DIFFERENT but still-valid tarball: rebuild with different patched
         // bytes so yarn's recomputed cache-zip checksum won't match the pin.

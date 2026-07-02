@@ -107,19 +107,6 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// A minimal but valid npm tarball for left-pad with `index.js` = `index`.
 fn make_tgz(index: &[u8]) -> Vec<u8> {
     let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
