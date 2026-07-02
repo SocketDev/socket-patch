@@ -804,6 +804,201 @@ async fn npm_bun_install_full_apply_chain() {
     assert_real_api_pipeline_ran(&server).await;
 }
 
+// ── yarn berry (4.x) docker legs ───────────────────────────────────────
+//
+// The image caches `yarn@4.12.0` in corepack WITHOUT activating it (the
+// global `yarn` stays classic 1.22.22); a project opts into berry via
+// package.json `"packageManager": "yarn@4.12.0"`, which the corepack shim
+// dispatches. Both legs use the node-modules linker so the installed tree is
+// a real hoisted `node_modules/<pkg>` (not a PnP `.yarn/cache` zip).
+
+/// Agent-mode berry leg: real yarn 4 install → `scan --sync` + forced
+/// `apply --offline` → the patched marker lands in the berry-installed tree.
+/// Container twin of the npm agent leg (`make_container_script`) with a berry
+/// install front-end. Reuses the shared `minimist@1.2.2` mock fixture.
+fn make_berry_agent_script(api_url: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -uo pipefail
+COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
+
+# 1. Real berry install (node-modules linker). packageManager pins yarn 4 so
+#    the corepack shim dispatches it; the global yarn stays classic.
+mkdir -p /workspace/proj && cd /workspace/proj
+cat > package.json <<'PKG'
+{{ "name": "e2e-berry-proj", "version": "0.0.0", "packageManager": "yarn@4.12.0", "dependencies": {{ "minimist": "1.2.2" }} }}
+PKG
+printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml
+echo "yarn version in project: $(yarn --version)" >&2
+yarn install >/tmp/yi.out 2>/tmp/yi.err || {{ echo "FAIL: yarn berry install"; cat /tmp/yi.err >&2; exit 1; }}
+TARGET=node_modules/minimist/index.js
+[ -f "$TARGET" ] || {{ echo "FAIL: $TARGET missing after berry install (PnP layout?)" >&2; ls -la node_modules >&2; exit 1; }}
+
+# Pre-seed setup.manual so the patch survives property-7 filtering.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+MANIFEST
+
+# 2. scan --sync then forced offline apply (placeholder beforeHash fixture).
+socket-patch scan --json --sync --yes "${{COMMON_ARGS[@]}}" >/tmp/sync.out 2>/tmp/sync.err
+echo "sync exit=$?" >&2; cat /tmp/sync.err >&2 || true
+socket-patch apply --json --force --offline >/tmp/apply.out 2>/tmp/apply.err
+APPLY_RC=$?
+echo "apply exit=$APPLY_RC" >&2; cat /tmp/apply.out >&2 || true; cat /tmp/apply.err >&2 || true
+if [ "$APPLY_RC" -ne 0 ]; then echo "FAIL: berry apply exited $APPLY_RC" >&2; exit 1; fi
+if ! grep -q '"status": *"success"' /tmp/apply.out; then echo "FAIL: berry apply status not success" >&2; exit 1; fi
+
+# 3. Marker in the berry-installed file.
+if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$TARGET"; then
+  echo "FAIL: marker not in $TARGET after berry apply" >&2; head -3 "$TARGET" >&2; exit 1
+fi
+echo "===PATCH VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    )
+}
+
+/// Vendored berry leg: the container twin of `e2e_vendor_yarn_berry_build.rs`.
+/// Real yarn 4 install → stage a `.socket/` manifest + blob from the ACTUAL
+/// installed bytes (no API) → `vendor --offline` → fresh-checkout
+/// `yarn install --immutable --check-cache` (offline global cache) must
+/// install the PATCHED bytes from the vendored tarball. This proves the
+/// vendored `10c0/<hex>` checksum the CLI computes offline is exactly what a
+/// real yarn 4 accepts under `--check-cache`.
+fn make_berry_vendor_script() -> String {
+    // git-sha256 in bash: sha256("blob <len>\0" ++ bytes).
+    r#"#!/usr/bin/env bash
+set -uo pipefail
+
+git_sha256() {  # $1 = file
+  local len; len=$(wc -c < "$1")
+  { printf 'blob %d\0' "$len"; cat "$1"; } | sha256sum | cut -d' ' -f1
+}
+
+# 1. Real berry install (node-modules linker), private global cache.
+mkdir -p /workspace/proj && cd /workspace/proj
+cat > package.json <<'PKG'
+{ "name": "e2e-berry-vendor", "version": "0.0.0", "private": true, "packageManager": "yarn@4.12.0", "dependencies": { "left-pad": "1.3.0" } }
+PKG
+printf 'nodeLinker: node-modules\nenableGlobalCache: false\n' > .yarnrc.yml
+export YARN_GLOBAL_FOLDER=/workspace/yarn-global
+export YARN_ENABLE_GLOBAL_CACHE=false
+echo "yarn version in project: $(yarn --version)" >&2
+yarn install >/tmp/yi.out 2>/tmp/yi.err || { echo "FAIL: yarn berry install"; cat /tmp/yi.err >&2; exit 1; }
+
+INSTALLED=node_modules/left-pad/index.js
+[ -f "$INSTALLED" ] || { echo "FAIL: $INSTALLED missing after berry install" >&2; exit 1; }
+
+# 2. Stage manifest + blob from the ACTUAL installed bytes (marker prepended).
+BEFORE_HASH=$(git_sha256 "$INSTALLED")
+cp "$INSTALLED" /tmp/orig.js
+{ printf '/* SOCKET-PATCHED */\n'; cat /tmp/orig.js; } > /tmp/patched.js
+AFTER_HASH=$(git_sha256 /tmp/patched.js)
+mkdir -p .socket/blobs
+cp /tmp/patched.js ".socket/blobs/$AFTER_HASH"
+cat > .socket/manifest.json <<MANIFEST
+{ "patches": { "pkg:npm/left-pad@1.3.0": {
+  "uuid": "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab",
+  "exportedAt": "2026-01-01T00:00:00Z",
+  "files": { "package/index.js": { "beforeHash": "$BEFORE_HASH", "afterHash": "$AFTER_HASH" } },
+  "vulnerabilities": {}, "description": "berry vendor docker fixture",
+  "license": "MIT", "tier": "free"
+} } }
+MANIFEST
+
+LOCK_BEFORE=$(sha256sum yarn.lock | cut -d' ' -f1)
+
+# 3. Vendor (offline: builds the tarball + rewrites yarn.lock + package.json).
+socket-patch vendor --json --offline --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
+VRC=$?
+echo "vendor exit=$VRC" >&2; cat /tmp/vendor.out >&2 || true; cat /tmp/vendor.err >&2 || true
+if [ "$VRC" -ne 0 ]; then echo "FAIL: berry vendor exited $VRC" >&2; exit 1; fi
+if ! grep -q '"status": *"success"' /tmp/vendor.out; then echo "FAIL: berry vendor status not success" >&2; exit 1; fi
+TGZ=.socket/vendor/npm/1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab/left-pad-1.3.0.tgz
+[ -f "$TGZ" ] || { echo "FAIL: vendored tarball missing at $TGZ" >&2; exit 1; }
+grep -q 'checksum: 10c0/' yarn.lock || { echo "FAIL: yarn.lock has no 10c0 checksum after vendor" >&2; cat yarn.lock >&2; exit 1; }
+echo "===VENDOR VERIFIED===" >&2
+
+# 4. FRESH CHECKOUT: only committable files, EMPTY global cache, strictest
+#    invocation. yarn must install the PATCHED bytes from the vendored tarball.
+mkdir -p /workspace/fresh && cd /workspace/fresh
+cp /workspace/proj/package.json .
+cp /workspace/proj/yarn.lock .
+cp /workspace/proj/.yarnrc.yml .
+cp -r /workspace/proj/.socket .
+export YARN_GLOBAL_FOLDER=/workspace/fresh-yarn-global
+yarn install --immutable --check-cache >/tmp/ci.out 2>/tmp/ci.err
+CIRC=$?
+echo "fresh install exit=$CIRC" >&2; cat /tmp/ci.out >&2 || true; cat /tmp/ci.err >&2 || true
+if [ "$CIRC" -ne 0 ]; then echo "FAIL: fresh --immutable --check-cache install exited $CIRC" >&2; exit 1; fi
+FRESH=node_modules/left-pad/index.js
+if ! head -1 "$FRESH" | grep -q 'SOCKET-PATCHED'; then
+  echo "FAIL: fresh berry install did not land the patched bytes" >&2; head -3 "$FRESH" >&2; exit 1
+fi
+echo "===FRESH INSTALL VERIFIED===" >&2
+echo "===E2E PASS==="
+exit 0
+"#
+    .to_string()
+}
+
+/// Agent-mode berry install → apply chain in Docker.
+#[tokio::test]
+async fn npm_berry_agent_install_apply_chain() {
+    let after_hash = git_sha256(PATCHED_BYTES);
+    let server = make_mock_server(&after_hash).await;
+    if host_mode() {
+        // Host mode would need corepack yarn 4 locally; the dedicated
+        // in-process berry legs already cover the host toolchain.
+        return;
+    }
+    if skip_if_no_docker_image() {
+        return;
+    }
+    let api = api_url_for_container(&server);
+    let out = run_in_container(&make_berry_agent_script(&api));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "berry agent install/apply failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    assert_real_api_pipeline_ran(&server).await;
+}
+
+/// Vendored berry offline-frozen-install chain in Docker (container twin of
+/// `e2e_vendor_yarn_berry_build.rs`). No API — the manifest is staged from the
+/// installed bytes in-container.
+#[tokio::test]
+async fn npm_berry_vendor_frozen_install_chain() {
+    if host_mode() {
+        return;
+    }
+    if skip_if_no_docker_image() {
+        return;
+    }
+    let out = run_in_container(&make_berry_vendor_script());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "berry vendor frozen-install failed:\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===VENDOR VERIFIED==="),
+        "stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===FRESH INSTALL VERIFIED==="),
+        "stderr=\n{stderr}"
+    );
+    assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+}
+
 /// Smoke test: verify the test infrastructure starts up correctly. This
 /// runs even without Docker so the test binary itself compiles + the
 /// wiremock listener path works.

@@ -32,7 +32,20 @@ RUN corepack enable \
  && corepack prepare pnpm@9.15.0 --activate \
  && corepack prepare yarn@1.22.22 --activate
 
+# Cache yarn berry 4.x in corepack WITHOUT activating it: the global `yarn`
+# stays 1.22.22 (classic), and berry fixtures opt in per-project via
+# package.json `"packageManager": "yarn@4.12.0"`, which the corepack shim
+# dispatches. Preparing it at image-build time means the redirect/vendor
+# berry docker legs resolve yarn 4 with no network round-trip at test time.
+RUN corepack prepare yarn@4.12.0
+
 # Verify versions are sane at image-build time so a broken NodeSource setup
-# fails the image build rather than every downstream test.
+# fails the image build rather than every downstream test. The berry check
+# runs in a throwaway dir with a packageManager pin so the corepack shim
+# dispatches yarn 4 there while the global yarn stays classic.
 RUN node --version && npm --version && bun --version \
- && pnpm --version && yarn --version && socket-patch --version
+ && pnpm --version && yarn --version && socket-patch --version \
+ && ( cd /tmp && mkdir berrycheck && cd berrycheck \
+      && echo '{"packageManager":"yarn@4.12.0"}' > package.json \
+      && test "$(yarn --version)" = "4.12.0" \
+      && cd / && rm -rf /tmp/berrycheck )
