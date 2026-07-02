@@ -192,6 +192,15 @@ fn vendor_args(cwd: &Path) -> VendorArgs {
             json: true,
             silent: true,
             offline: true,
+            // flock guards are OFD-based: when a CONCURRENT test in this
+            // binary forks a subprocess, the pre-exec child briefly holds
+            // copies of every parent fd — including this test's just-dropped
+            // lock fd — so back-to-back in-process runs can see their own
+            // lock as "held" for the fork→exec window (observed as rare
+            // release-only `lock_held` CI failures in the revert tests). A
+            // short wait absorbs the window via the acquire loop's 100 ms
+            // retry; a real deadlock still fails after the budget.
+            lock_timeout: Some(5),
             ..GlobalArgs::default()
         },
         force: false,

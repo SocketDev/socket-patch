@@ -823,6 +823,12 @@ async fn scan_redirect_rewrites_bun_lock() {
 /// a canned text bun.lock and deletes bun.lockb, exercising the migration
 /// branch of `run_redirect` without a real bun. The migration removal is
 /// recorded in the ledger, and the freshly-written bun.lock is then redirected.
+///
+/// unix-only: the shim is a `#!/bin/sh` script (Windows would need a .cmd
+/// twin and `;` PATH joining). The migration path itself is OS-agnostic
+/// (`Command::new("bun")` resolves bun.exe on Windows) and gets real-bun
+/// coverage in the toolchain-gated e2e_redirect_bun_build capstone.
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
 async fn scan_redirect_migrates_bun_lockb_then_redirects() {
