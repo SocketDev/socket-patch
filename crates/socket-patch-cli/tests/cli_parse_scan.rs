@@ -561,15 +561,16 @@ fn scan_json_empty_cwd_emits_updates_key() {
 // --- `--mode` selector (documented spelling of the mode booleans) ----------
 //
 // `--mode <hosted|vendored|agent>` is the RELEASED spelling of the three
-// mode flags. The clap parser only fills `args.mode`; `resolve_mode_flags`
-// (run at the top of `scan::run`, exercised directly here) folds it into the
-// legacy `--redirect`/`--vendor`/`--apply` booleans and enforces the
-// cross-mode rules clap can't express (a value-dependent conflict). These
-// tests lock both the fold and the legacy aliases.
+// mode flags. `resolve_mode_flags` (run at the top of `scan::run`,
+// exercised directly here) makes `args.mode` the single source of truth:
+// the legacy `--redirect`/`--vendor`/`--apply`/`--sync` booleans fold INTO
+// the enum (they are input spellings, never read downstream), and the
+// cross-mode rules clap can't express (a value-dependent conflict) are
+// enforced. These tests lock both the fold and the legacy aliases.
 
 /// Parse `extra` (must parse cleanly at the clap level), then run the mode
-/// fold — mirroring exactly what `scan::run` does before it reads any mode
-/// boolean.
+/// fold — mirroring exactly what `scan::run` does before it reads the
+/// resolved mode.
 fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
     let mut args = parse_scan(extra);
     resolve_mode_flags(&mut args)?;
@@ -578,35 +579,39 @@ fn parse_and_resolve(extra: &[&str]) -> Result<ScanArgs, String> {
 
 #[test]
 #[serial_test::serial]
-fn mode_hosted_folds_to_redirect() {
-    // The parser records the enum verbatim...
-    assert_eq!(
-        parse_scan(&["--mode", "hosted"]).mode,
-        Some(ScanMode::Hosted)
-    );
-    // ...and the fold turns it into the redirect boolean, exclusively.
+fn mode_hosted_is_the_source_of_truth() {
+    // The parser records the enum verbatim and the fold leaves it as the
+    // single source of truth (the booleans are inputs, not outputs).
     let folded = parse_and_resolve(&["--mode", "hosted"]).expect("fold ok");
-    assert!(folded.redirect, "--mode hosted sets --redirect");
-    assert!(!folded.vendor);
-    assert!(!folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Hosted));
+    // ...and the legacy boolean spelling folds INTO the enum.
+    let folded = parse_and_resolve(&["--redirect"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Hosted), "--redirect == --mode hosted");
 }
 
 #[test]
 #[serial_test::serial]
-fn mode_vendored_folds_to_vendor() {
+fn mode_vendored_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "vendored"]).expect("fold ok");
-    assert!(folded.vendor, "--mode vendored sets --vendor");
-    assert!(!folded.redirect);
-    assert!(!folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Vendored));
+    let folded = parse_and_resolve(&["--vendor"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Vendored), "--vendor == --mode vendored");
 }
 
 #[test]
 #[serial_test::serial]
-fn mode_agent_folds_to_apply() {
+fn mode_agent_is_the_source_of_truth() {
     let folded = parse_and_resolve(&["--mode", "agent"]).expect("fold ok");
-    assert!(folded.apply, "--mode agent sets --apply");
-    assert!(!folded.redirect);
-    assert!(!folded.vendor);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
+    let folded = parse_and_resolve(&["--apply"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Agent), "--apply == --mode agent");
+    // --sync counts as an agent-mode spelling (its prune half is orthogonal).
+    let folded = parse_and_resolve(&["--sync"]).expect("fold ok");
+    assert_eq!(folded.mode, Some(ScanMode::Agent), "--sync == --mode agent --prune");
+    assert!(folded.sync, "the prune half of --sync stays readable");
+    // No mode selected at all: scan stays read-only.
+    let folded = parse_and_resolve(&[]).expect("fold ok");
+    assert_eq!(folded.mode, None, "modeless scan is read-only");
 }
 
 #[test]
@@ -645,15 +650,15 @@ fn mode_hosted_with_vendor_boolean_errors() {
 fn mode_agent_with_apply_boolean_is_allowed() {
     // Same mode spelled both ways is redundant but legal.
     let folded = parse_and_resolve(&["--mode", "agent", "--apply"]).expect("same-mode ok");
-    assert!(folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
 }
 
 #[test]
 #[serial_test::serial]
 fn mode_agent_with_sync_boolean_is_allowed() {
-    // --sync implies --apply, so it counts as an agent-mode spelling.
+    // --sync implies agent mode, so it counts as an agent-mode spelling.
     let folded = parse_and_resolve(&["--mode", "agent", "--sync"]).expect("same-mode ok");
-    assert!(folded.apply);
+    assert_eq!(folded.mode, Some(ScanMode::Agent));
     assert!(folded.sync);
 }
 
@@ -662,7 +667,7 @@ fn mode_agent_with_sync_boolean_is_allowed() {
 fn mode_vendored_with_detached_ok() {
     // --detached is legal under vendored mode selected via --mode.
     let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
-    assert!(folded.vendor);
+    assert_eq!(folded.mode, Some(ScanMode::Vendored));
     assert!(folded.detached);
 }
 
@@ -682,13 +687,17 @@ fn detached_without_vendored_mode_errors() {
 #[test]
 #[serial_test::serial]
 fn legacy_mode_spellings_still_parse() {
-    // The boolean aliases keep working with no `--mode` given; the fold is
-    // then a no-op and leaves the booleans exactly as parsed.
+    // The boolean aliases keep working with no `--mode` given; the fold
+    // derives the mode enum from them (the inverse of the historical
+    // direction — `args.mode` is now the single source of truth).
     assert!(parse_scan(&["--redirect"]).redirect);
     assert!(parse_scan(&["--vendor"]).vendor);
     assert!(parse_scan(&["--apply"]).apply);
     let folded = parse_and_resolve(&["--vendor", "--detached"]).expect("legacy fold ok");
-    assert!(folded.vendor);
     assert!(folded.detached);
-    assert_eq!(folded.mode, None, "no --mode ⇒ selector stays None");
+    assert_eq!(
+        folded.mode,
+        Some(ScanMode::Vendored),
+        "legacy --vendor folds into the mode selector"
+    );
 }

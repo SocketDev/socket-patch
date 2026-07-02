@@ -563,9 +563,11 @@ impl ScanMode {
     }
 }
 
-/// Fold `--mode` into the legacy boolean spellings (`--redirect` /
-/// `--vendor` / `--apply`) so everything downstream keeps a single source
-/// of truth, and enforce the cross-flag rules clap cannot express:
+/// Fold the legacy boolean spellings (`--redirect` / `--vendor` /
+/// `--apply` / `--sync`) into `args.mode`, so `ScanMode` is the single
+/// source of truth everything downstream reads (the booleans are input
+/// spellings only, never consulted after this returns), and enforce the
+/// cross-flag rules clap cannot express:
 ///
 /// * `--mode X` combined with a boolean belonging to a DIFFERENT mode is a
 ///   contradiction → `Err`. Clap's `conflicts_with` is value-independent —
@@ -574,7 +576,8 @@ impl ScanMode {
 /// * The same mode spelled both ways (`--mode vendored --vendor`) is
 ///   redundant but accepted: both spellings mean one thing.
 /// * `--sync` implies `--apply`, so it counts as an agent-mode spelling;
-///   `--prune` is an orthogonal GC knob and never conflicts.
+///   `--prune` is an orthogonal GC knob and never conflicts. (`--sync`'s
+///   prune half is orthogonal too, and stays a separate read in `run`.)
 /// * `--detached` requires vendored mode in either spelling. The former
 ///   clap-level `requires = "vendor"` couldn't see `--mode vendored`, so
 ///   the requirement moved here too.
@@ -606,13 +609,14 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
                 mode.cli_name(),
             ));
         }
-        match mode {
-            ScanMode::Hosted => args.redirect = true,
-            ScanMode::Vendored => args.vendor = true,
-            ScanMode::Agent => args.apply = true,
-        }
+    } else if args.redirect {
+        args.mode = Some(ScanMode::Hosted);
+    } else if args.vendor {
+        args.mode = Some(ScanMode::Vendored);
+    } else if args.apply || args.sync {
+        args.mode = Some(ScanMode::Agent);
     }
-    if args.detached && !args.vendor {
+    if args.detached && args.mode != Some(ScanMode::Vendored) {
         // "required" phrasing matches clap's requires errors — the
         // scan_vendor_e2e contract test accepts exactly that shape.
         return Err(
@@ -632,14 +636,14 @@ pub struct ScanArgs {
     #[arg(long = "batch-size", env = "SOCKET_BATCH_SIZE", default_value_t = DEFAULT_BATCH_SIZE)]
     pub batch_size: usize,
 
-    /// Download and apply selected patches in JSON mode (non-interactive).
-    /// Without this flag, `scan --json` is read-only — it lists available
-    /// patches plus an `updates` array but does not mutate the manifest.
-    /// Designed for unattended workflows (cron jobs, bots that open PRs);
-    /// pair with `--yes` for clarity though `--json` already implies non-
-    /// interactive confirmation. No effect outside `--json` mode (the
-    /// non-JSON path always prompts the user). `--mode agent` is the
-    /// documented spelling of this mode.
+    /// Deprecated spelling of `--mode agent` (kept for compatibility;
+    /// prefer `--mode`). Download and apply selected patches in JSON mode
+    /// (non-interactive). Without a mode, `scan --json` is read-only — it
+    /// lists available patches plus an `updates` array but does not mutate
+    /// the manifest. Designed for unattended workflows (cron jobs, bots
+    /// that open PRs); pair with `--yes` for clarity though `--json`
+    /// already implies non-interactive confirmation. No effect outside
+    /// `--json` mode (the non-JSON path always prompts the user).
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
@@ -659,17 +663,17 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = false)]
     pub sync: bool,
 
-    /// Vendor every patched dependency into the committable
-    /// `.socket/vendor/` tree instead of applying patches in place:
-    /// download the selected patches, record them in the manifest, then
-    /// build + wire the vendored artifacts (the whole manifest is
+    /// Deprecated spelling of `--mode vendored` (kept for compatibility;
+    /// prefer `--mode`). Vendor every patched dependency into the
+    /// committable `.socket/vendor/` tree instead of applying patches in
+    /// place: download the selected patches, record them in the manifest,
+    /// then build + wire the vendored artifacts (the whole manifest is
     /// vendored, so a package vendored at an older patch uuid is
     /// re-vendored automatically). Conflicts with `--apply`/`--sync`
     /// (vendoring replaces the in-place apply); combine with `--prune`
     /// to drop uninstalled entries before they fail vendoring. JSON mode
     /// is non-interactive like `--apply`; the interactive path prompts
-    /// before downloading. `--mode vendored` is the documented spelling
-    /// of this mode.
+    /// before downloading.
     #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
@@ -894,7 +898,7 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
         api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
-        persist_blobs: !args.vendor,
+        persist_blobs: args.mode != Some(ScanMode::Vendored),
     }
 }
 
@@ -1945,9 +1949,10 @@ async fn run_redirect(
 pub async fn run(mut args: ScanArgs) -> i32 {
     apply_env_toggles(&args.common);
 
-    // Fold `--mode` into the legacy mode booleans before anything reads
-    // them, so every branch below keeps a single source of truth. Cross-
-    // mode combinations get a usage-style error (exit 2, matching clap's
+    // Fold the legacy mode booleans into `args.mode` before anything reads
+    // it, so every branch below keeps a single source of truth (the enum;
+    // the booleans are never consulted past this point). Cross-mode
+    // combinations get a usage-style error (exit 2, matching clap's
     // conflict exit code) — see `resolve_mode_flags` for why clap itself
     // can't express them.
     if let Err(message) = resolve_mode_flags(&mut args) {
@@ -1955,11 +1960,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return 2;
     }
 
-    // `--sync` is sugar for `--apply --prune`. Derive locals once and
+    // `--sync` is sugar for `--mode agent --prune`. Derive locals once and
     // use them everywhere downstream so the flag interactions are
     // expressed in one place. `--apply --prune --sync` is redundant
-    // but legal (all three end up true).
-    let apply = args.apply || args.sync;
+    // but legal.
+    let apply = args.mode == Some(ScanMode::Agent);
+    let vendor = args.mode == Some(ScanMode::Vendored);
+    let hosted = args.mode == Some(ScanMode::Hosted);
     let prune = args.prune || args.sync;
 
     // A zero batch size would panic the API-query loop below: both
@@ -2342,7 +2349,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Registry-redirect mode is a distinct, self-contained flow (rewrite
     // lockfiles → hosted vendored patches). It reuses discovery above, then
     // returns — it must NOT fall through to the apply/vendor branches.
-    if args.redirect {
+    if hosted {
         return run_redirect(
             &args,
             &api_client,
@@ -2507,7 +2514,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 }
             }
         // --- Vendor path (if requested; conflicts with --apply/--sync) ---
-        } else if args.vendor {
+        } else if vendor {
             // Extracted into its own boxed fn — and it must STAY extracted:
             // this branch's temporaries (json! trees, DownloadParams, the
             // engine dispatch) live in the enclosing poll frame in debug
@@ -2779,7 +2786,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // no-op — re-vendoring a stale uuid is exactly what the flag is for.
     let is_vendored =
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-    let (vendored_selected, selected): (Vec<_>, Vec<_>) = if args.vendor {
+    let (vendored_selected, selected): (Vec<_>, Vec<_>) = if vendor {
         (Vec::new(), selected)
     } else {
         selected.into_iter().partition(|p| is_vendored(&p.purl))
@@ -2796,7 +2803,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Lockfile-only purls leave the in-place apply selection (calm skip,
     // mirrors the JSON path). In `--vendor` mode they stay: the vendor
     // engine fetches lockfile-resolved packages pristine.
-    let (selected, not_installed_selected): (Vec<_>, Vec<String>) = if args.vendor {
+    let (selected, not_installed_selected): (Vec<_>, Vec<String>) = if vendor {
         (selected, Vec::new())
     } else {
         let (kept, skipped) = partition_skipped_selected(
@@ -2824,7 +2831,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
     }
 
-    if selected.is_empty() && !args.vendor {
+    if selected.is_empty() && !vendor {
         if !args.common.silent {
             println!("No patches selected.");
         }
@@ -2834,7 +2841,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Vendor mode: pre-verify baselines so a content mismatch surfaces
     // BEFORE the confirm prompt (vendoring still proceeds for these —
     // the stage force-applies the verified patched content).
-    let mismatched_baselines: HashSet<String> = if args.vendor && !args.common.silent {
+    let mismatched_baselines: HashSet<String> = if vendor && !args.common.silent {
         preverify_vendor_baselines(
             &api_client,
             effective_org_slug,
@@ -2850,7 +2857,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Display detailed summary of selected patches before confirming
     // (presentational only — skipped wholesale under --silent).
     if !args.common.silent {
-        if args.vendor {
+        if vendor {
             println!("\nPatches to vendor:\n");
         } else {
             println!("\nPatches to apply:\n");
@@ -2925,7 +2932,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // of which mutate the manifest and `.socket/` on disk.
     if args.common.dry_run {
         if !args.common.silent {
-            let action = if args.vendor {
+            let action = if vendor {
                 "download and vendor"
             } else {
                 "download and apply"
@@ -2939,7 +2946,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     }
 
     // Prompt to download
-    let verb = if args.vendor { "vendor" } else { "apply" };
+    let verb = if vendor { "vendor" } else { "apply" };
     let prompt = format!("Download and {verb} {} patch(es)?", selected.len());
     if !confirm(&prompt, true, args.common.yes, args.common.json) {
         if !args.common.silent {
@@ -2954,12 +2961,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // download only saves and the vendor step below does the rest).
     let params = download_params(
         &args,
-        /*save_only=*/ args.vendor,
+        /*save_only=*/ vendor,
         /*json=*/ false,
         args.common.silent,
     );
 
-    let code = if args.vendor {
+    let code = if vendor {
         // Extracted + boxed for the same Windows-1-MiB-frame reason as the
         // JSON path (see `run_vendor_json_path`).
         boxed_vendor_interactive_path(
@@ -2985,7 +2992,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // beyond what `--apply` added — users wanting to clean up should
     // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode
     // already ran its GC before the vendor step.)
-    if prune && !args.vendor {
+    if prune && !vendor {
         let gc = run_apply_gc(
             &args.common,
             &manifest_path,
