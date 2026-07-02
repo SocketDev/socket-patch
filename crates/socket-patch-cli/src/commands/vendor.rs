@@ -130,126 +130,40 @@ pub(crate) async fn dispatch_vendor_one(
             });
         }
     }
+    // Every backend takes the identical 9-argument tuple; the macro keeps
+    // the per-arm #[cfg] while collapsing the eight-way repetition.
+    macro_rules! vend {
+        ($backend:path) => {
+            $backend(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        };
+    }
     Some(match eco {
-        "npm" => {
-            // The flavor router probes the project's lockfile (package-lock /
-            // yarn / pnpm / bun) and dispatches or refuses per flavor.
-            vendor::npm_flavor::vendor_npm_any(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        "pypi" => {
-            vendor::pypi::vendor_pypi(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
-        "gem" => {
-            vendor::gem::vendor_gem(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        // The flavor router probes the project's lockfile (package-lock /
+        // yarn / pnpm / bun) and dispatches or refuses per flavor.
+        "npm" => vend!(vendor::npm_flavor::vendor_npm_any),
+        "pypi" => vend!(vendor::pypi::vendor_pypi),
+        "gem" => vend!(vendor::gem::vendor_gem),
         #[cfg(feature = "cargo")]
-        "cargo" => {
-            vendor::cargo::vendor_cargo_crate(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
         #[cfg(feature = "golang")]
-        "golang" => {
-            vendor::golang::vendor_go_module(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        "golang" => vend!(vendor::golang::vendor_go_module),
         #[cfg(feature = "composer")]
-        "composer" => {
-            vendor::composer_lock::vendor_composer(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        "composer" => vend!(vendor::composer_lock::vendor_composer),
         #[cfg(feature = "nuget")]
-        "nuget" => {
-            vendor::nuget_feed::vendor_nuget(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        "nuget" => vend!(vendor::nuget_feed::vendor_nuget),
         #[cfg(feature = "maven")]
-        "maven" => {
-            vendor::maven_repo::vendor_maven(
-                purl,
-                pkg_path,
-                project_root,
-                record,
-                sources,
-                vendored_at,
-                dry_run,
-                force,
-                service,
-            )
-            .await
-        }
+        "maven" => vend!(vendor::maven_repo::vendor_maven),
         _ => return None,
     })
 }
