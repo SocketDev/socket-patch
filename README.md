@@ -2,6 +2,44 @@
 
 Apply security patches to your dependencies — npm, PyPI, Cargo, Go, Ruby gems, and more — without waiting for upstream fixes.
 
+## Choosing a patch mode
+
+socket-patch delivers the same patched bytes three different ways. The modes differ in *where the patch lives* and *what must happen at install time*; pick one per project (`scan --mode <name>` drives exactly one mode per run).
+
+| Mode | Mechanism | User-code changes | CI changes | Offline / airgap | Integrity story | Future GitHub-app default |
+|------|-----------|-------------------|------------|------------------|-----------------|---------------------------|
+| **hosted** — `scan --mode hosted` | Lockfiles / registry configs are rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev` | Minimal: lockfile (+ small registry-config) edits; no artifact bytes land in the repo | **None** — your existing install commands pick up the patched packages | ❌ installs must be able to reach `patch.socket.dev` | The package manager's own lockfile verification (sha512 / sha256 / contentHash / CHECKSUMS) pins the hosted bytes. Maven is the exception — transport-level sha1 only (see [Maven & NuGet caveats](#maven--nuget-caveats)) | ✅ planned default for GitHub-app patch PRs — keeps the PR diff small |
+| **vendored** — `scan --mode vendored` (or the standalone [`vendor`](#vendor)) | Patched artifacts are committed under `.socket/vendor/` and the lockfile is rewired to consume them | Committed artifacts (the repo grows by the patched package sizes) | **None** | ✅ fully airgapped; no dependency on Socket infrastructure uptime | Committed bytes + recomputed lockfile hashes, verified by the package manager at install time | — |
+| **agent** — `scan --mode agent` (or [`apply`](#apply)) | `.socket/manifest.json` + patch blobs are committed; the socket-patch CLI re-applies the patches in CI / postinstall | `.socket/` manifest + blobs committed | **Required** — wire install hooks with [`setup`](#setup) or run `socket-patch apply` in CI | ✅ once blobs are committed (`apply --offline`) | The CLI verifies per-file before/after git-sha256 hashes on every apply | Today's default (the original method) |
+
+**agent** is the original method and remains fully supported, but it is the only mode that requires CI / install-hook modification — **new projects should prefer hosted or vendored**.
+
+### Mode × ecosystem support
+
+| Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
+|-----------|------------------------|------------------------------|--------------------------|
+| npm (pnpm / yarn / berry / bun) | ✅ any install layout; `setup` postinstall hook | ✅ five lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml, yarn classic. **yarn berry & bun lockfiles are not rewritten** — use vendored |
+| pypi (uv / poetry / pdm / pipenv / pip) | ✅ `.pth` startup hook via `setup` | ✅ six flavors: uv, poetry, pdm, pipenv, requirements.txt (pip / `uv pip`) | ✅ requirements.txt + uv.lock. **poetry / pdm / pipenv locks are not rewritten** — use vendored |
+| cargo | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [`setup`](#setup)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
+| gem | ✅ Bundler plugin via `setup` | ✅ Gemfile + Gemfile.lock path pair | ✅ per-dep `source` block; the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning) |
+| golang | ✅ `go.mod` `replace` → `.socket/go-patches/` | ✅ `replace` → the committed vendor tree | ❌ **not possible** — sumdb, module-path identity, and default-GOPROXY leakage each rule it out; see [docs/design/golang-hosted-no-go.md](docs/design/golang-hosted-no-go.md). **Use vendored** (`redirect_golang_unsupported` names the remedy) |
+| maven | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts the `~/.m2` checksum sidecars); prefer vendored / hosted | ✅ **new** — committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only** — a surgical `<repository>` insert with `checksumPolicy=fail`. Gradle builds get a paste-able `exclusiveContent` snippet emitted as a warning (`redirect_gradle_manual_snippet`); no build script is ever edited. See [Maven & NuGet caveats](#maven--nuget-caveats) |
+| nuget | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_NUGET=1` (in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar); prefer vendored / hosted | ✅ **new** — committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
+| composer | ✅ post-install script events (opt-in `composer` compile feature) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
+
+> **Maven / NuGet discovery gate**: discovering *installed* Maven and NuGet packages (the crawl behind `scan` / `apply` / `vendor`) currently requires the same `SOCKET_EXPERIMENTAL_MAVEN=1` / `SOCKET_EXPERIMENTAL_NUGET=1` opt-in in every mode. The vendored/hosted wiring itself is safe — the gate guards the agent-mode sidecar risk.
+
+### Maven & NuGet caveats
+
+Honest limits of the maven and nuget flows — documented behavior, not bugs:
+
+* **Warm `~/.m2` shadowing (hosted + vendored).** Maven consults the *local repository* before any configured `<repository>`, so a warm `~/.m2` copy of the same GAV silently wins over the Socket repository (hosted) or the committed `file://` repository (vendored) — the build succeeds with **unpatched** bytes. Purge it with:
+  `mvn dependency:purge-local-repository -DmanualInclude=<groupId>:<artifactId>`
+  (the always-on `vendor_maven_local_cache_shadow` warning carries the same one-liner).
+* **`mirrorOf` mirrors (hosted).** A `settings.xml` `<mirror>` with `<mirrorOf>*</mirrorOf>` (common in corporate environments) reroutes *all* repositories — including the injected `socket-patch-<uuid>` repository — through the mirror, silently defeating the redirect. Scope the mirror (e.g. `<mirrorOf>*,!socket-patch-*</mirrorOf>`) or use vendored mode.
+* **Transport-level checksums only (maven).** Maven has no lockfile. `checksumPolicy=fail` verifies the `.jar.sha1` sidecar served by the *same* repository — transport integrity, not an independent client-side pin. For strong install-time integrity use Gradle's dependency verification (`gradle --write-verification-metadata sha256`) or vendored mode (the committed bytes are the pin).
+* **NuGet locked mode (hosted + vendored).** With a `packages.lock.json` and `dotnet restore --locked-mode`, the rewritten `contentHash` pins the patched `.nupkg` — a tampered or wrong package fails restore with `NU1403`. Without a lockfile there is no client-side content pin (vendored surfaces this as a `vendor_nuget_no_lockfile` warning; the feed + source mapping still force the patched copy).
+
 ## Installation
 
 ### One-line install (recommended)
@@ -115,7 +153,7 @@ Each flag has a matching `SOCKET_*` environment variable. **Precedence is CLI ar
 | `--proxy-url <url>` | `SOCKET_PROXY_URL` | Public proxy URL used when no API token is set. |
 | `-e, --ecosystems <list>` | `SOCKET_ECOSYSTEMS` | Restrict to specific ecosystems (comma-separated, e.g. `npm,pypi`). |
 | `--download-mode <mode>` | `SOCKET_DOWNLOAD_MODE` | Artifact to fetch when local files are missing: `diff` (default, smallest delta), `package` (full per-package tarball), or `file` (legacy per-file blobs). |
-| `--vendor-source <mode>` | `SOCKET_VENDOR_SOURCE` | How `vendor` acquires the installable artifact: `auto` (default — download the prebuilt package from patch.socket.dev, fall back to a local build on any miss), `service` (require the service, fail-closed), or `build` (always build locally). Covers npm, pypi, cargo, golang, composer, and gem. |
+| `--vendor-source <mode>` | `SOCKET_VENDOR_SOURCE` | How `vendor` acquires the installable artifact: `auto` (default — download the prebuilt package from patch.socket.dev, fall back to a local build on any miss), `service` (require the service, fail-closed), or `build` (always build locally). Covers npm, pypi, cargo, golang, composer, gem, and nuget (maven attempts the prebuilt download under `auto` but is not covered by fail-closed `service`). |
 | `--vendor-url <url>` | `SOCKET_VENDOR_URL` | Base host for the vendoring service's package-reference request (default: the active `--api-url`/`--proxy-url` base). Point at staging / local dev for testing. |
 | `--patch-server-url <url>` | `SOCKET_PATCH_SERVER_URL` | Override the host of the prebuilt-archive download URL the service returns (default: as returned). Mainly for local-dev / testing. |
 | `--offline` | `SOCKET_OFFLINE` | Strict airgap: never contact the network. Operations that need remote data fail loudly. |
@@ -187,6 +225,8 @@ socket-patch get CVE-2024-12345 --json -y
 
 Scan installed packages for available security patches. Since v3.0 `scan --sync` is the single command bots need for full auto-update: it discovers patches, applies them, and garbage-collects orphan blob files plus manifest entries for uninstalled packages — all in one invocation.
 
+`scan` is also the entry point for all three [patch modes](#choosing-a-patch-mode): `--mode agent` applies in place, `--mode vendored` commits artifacts, `--mode hosted` rewrites lockfiles to Socket-hosted packages.
+
 **Usage:**
 ```bash
 socket-patch scan [options]
@@ -195,10 +235,11 @@ socket-patch scan [options]
 **Command-specific options** (plus all [Global Options](#global-options)):
 | Flag | Description |
 |------|-------------|
-| `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. |
+| `--mode <hosted\|vendored\|agent>` | The documented selector for the three [patch modes](#choosing-a-patch-mode). `agent` == `--apply`, `vendored` == `--vendor`, `hosted` rewrites lockfiles / registry configs so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages (no artifact bytes land in the repo; the recorded edits + patch records go to the `.socket/vendor/redirect-state.json` ledger so a post-install [`vex`](#vex) can attest them). Combining `--mode` with a boolean flag of a *different* mode is an error (exit 2); the same mode spelled both ways is accepted. |
+| `--apply` | Download and apply selected patches in JSON mode (non-interactive). Without it, `scan --json` is read-only. Legacy boolean spelling of `--mode agent`. |
 | `--prune` | Garbage-collect after the scan: remove manifest entries for uninstalled packages and orphan blob/diff/package-archive files. Off by default. [Vendored](#vendor) packages are never pruned. |
 | `--sync` | Sugar for `--apply --prune`. The canonical bot-mode flag. |
-| `--vendor` | [Vendor](#vendor) every patched dependency instead of applying in place: discover, download, and build + wire the committable `.socket/vendor/` artifacts in one pass. Re-vendors automatically when a newer patch is selected. Conflicts with `--apply`/`--sync`; combine with `--prune`. |
+| `--vendor` | [Vendor](#vendor) every patched dependency instead of applying in place: discover, download, and build + wire the committable `.socket/vendor/` artifacts in one pass. Re-vendors automatically when a newer patch is selected. Conflicts with `--apply`/`--sync`; combine with `--prune`. Legacy boolean spelling of `--mode vendored`. |
 | `--detached` | With `--vendor`: skip all `.socket/manifest.json` writes — the vendor ledger embeds the patch records instead. For projects that want the vendored patches *only* in the lockfile + `.socket/vendor/`. |
 | `--batch-size <n>` | Packages per API request (default: `100`) |
 | `--all-releases` | Store patches for every release/distribution variant, not just the installed one — makes the manifest portable across environments (e.g. cross-platform CI caches) |
@@ -247,6 +288,14 @@ socket-patch scan --json --vendor --detached --yes
 
 # Preview what --vendor would do (would_vendor / would_revendor / already_vendored)
 socket-patch scan --json --vendor --yes --dry-run
+
+# Hosted mode: rewrite lockfiles so patched deps resolve to Socket-hosted
+# integrity-pinned packages — no artifact bytes in the repo, no CI changes.
+socket-patch scan --json --mode hosted --yes
+
+# The --mode selector is equivalent to the legacy boolean flags:
+socket-patch scan --json --mode vendored --yes   # == --vendor
+socket-patch scan --json --mode agent --yes      # == --apply
 ```
 
 > Already-vendored packages are **skipped by plain `--apply`/`--sync`** (the committed artifact
@@ -296,16 +345,20 @@ socket-patch apply --vex socket.vex.json
 
 ### `vendor`
 
-`apply`'s **committable** sibling. Instead of patching installed packages in place
+`apply`'s **committable** sibling — the standalone command behind
+[vendored mode](#choosing-a-patch-mode) (`scan --mode vendored` runs discovery + this engine in
+one pass). Instead of patching installed packages in place
 (machine-local state), `vendor` ejects each patched package into
 `.socket/vendor/<ecosystem>/<patch-uuid>/…` and rewires your lockfile so the project consumes
 the vendored copy. Commit `.socket/vendor/` plus the lockfile edits and **every fresh checkout
 builds with the patched dependency** — no `socket-patch` binary, no Socket API access, no
 install hook required on the consuming machine.
 
-Supported ecosystems: **npm** (package-lock / yarn classic / pnpm / bun), **PyPI**
-(uv / poetry / pdm / pipenv / requirements.txt), **RubyGems**, **Cargo**, **Go**, and
-**Composer**. Vendoring is per-patch: only dependencies with a Socket patch are vendored.
+Supported ecosystems: **npm** (package-lock / yarn classic / yarn berry / pnpm / bun), **PyPI**
+(uv / poetry / pdm / pipenv / requirements.txt), **RubyGems**, **Cargo**, **Go**,
+**Composer**, **Maven** (single-module pom projects — multi-module aggregators and gradle-only
+projects are refused), and **NuGet**. Vendoring is per-patch: only dependencies with a Socket
+patch are vendored.
 
 **Usage:**
 ```bash
@@ -587,13 +640,25 @@ socket-patch vex --no-verify --output socket.vex.json
 
 **How it works**
 
-1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each patched file's hash on disk so the attestation only covers patches that are actually applied. [Vendored](#vendor) patches are verified against the **committed artifact** instead of the installed tree (their impact statement carries a `(vendored)` marker), and need no `setup` install hook to be attested — the lockfile wiring is the persistence mechanism. Detached-vendored patches (`scan --vendor --detached`) attest from the vendor ledger's embedded records, so `vex` works even with no manifest file at all.
+1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each patched file's hash on disk so the attestation only covers patches that are actually applied. [Vendored](#vendor) patches are verified against the **committed artifact** instead of the installed tree (their impact statement carries a `(vendored)` marker), and need no `setup` install hook to be attested — the lockfile wiring is the persistence mechanism. Detached-vendored patches (`scan --vendor --detached`) attest from the vendor ledger's embedded records, and [hosted-mode](#choosing-a-patch-mode) patches attest from the redirect ledger (`.socket/vendor/redirect-state.json`, marker `(redirected)` — hash-verified against the installed tree post-install), so `vex` works even with no manifest file at all.
 2. Auto-detects the top-level **product** identifier (override with `--product`), probing in order:
    - `.git/config` `[remote "origin"]` → `pkg:github/<owner>/<repo>` (similar for GitLab/Bitbucket; raw URL otherwise)
    - `package.json` → `pkg:npm/<name>@<version>`
    - `pyproject.toml` → `pkg:pypi/<name>@<version>`
    - `Cargo.toml` → `pkg:cargo/<name>@<version>`
 3. Emits an OpenVEX 0.2.0 document whose statements mark each mitigated vulnerability as `not_affected` (justification: the patch is present), suitable for piping into `vexctl`, Grype, Trivy, and similar tools.
+
+**Provenance markers**
+
+Each statement's impact string records *how* the patch is persisted — one marker per [patch mode](#choosing-a-patch-mode):
+
+| Impact statement | Mode | What the evidence is | What a consumer should do |
+|---|---|---|---|
+| `Patched via Socket patch <uuid>` | agent | The installed tree: every patched file's hash was verified against the manifest's `afterHash` | Trust the statement as long as the agent install hook (or a CI `apply`) keeps re-applying; ecosystems without a hook must be declared in `setup.manual` |
+| `Patched via Socket patch <uuid> (vendored)` | vendored | The **committed** `.socket/vendor/` artifact was hash-verified — no install hook needed; the lockfile wiring is the persistence mechanism | Trust it on any checkout; the committed bytes are the patch |
+| `Patched via Socket patch <uuid> (redirected)` | hosted | The lockfile's integrity pin points at the Socket-hosted patched package. When emitted in-run by `scan --mode hosted --vex`, the statement is attested **from the redirect ledger without hash verification** (the bytes are fetched at install time — the JSON `vex` summary carries `verified: false`) | Ensure installs still resolve from `patch.socket.dev` (the lockfile edit is intact), and run `socket-patch vex` **after installing** — it re-reads the ledger and hash-verifies the redirected patches against the installed tree |
+
+The markers are stable strings (see `CLI_CONTRACT.md`); scanners and policy engines may match on them.
 
 **Output channels**
 

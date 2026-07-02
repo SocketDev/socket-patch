@@ -16,6 +16,93 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Added
 
+- **Hosted patch mode: `scan --mode hosted` (a.k.a. the hidden `--redirect`).**
+  The third patch-application mode: instead of applying in place (agent) or
+  committing artifacts (vendored), `scan` rewrites lockfiles / registry
+  configs so ONLY the patched dependencies resolve to Socket-hosted,
+  integrity-pinned packages on patch.socket.dev — no artifact bytes land in
+  the repo and no CI changes are needed. Per ecosystem: npm rewrites
+  `package-lock.json`/`npm-shrinkwrap.json` `resolved`+`integrity` (v2 legacy
+  `dependencies` mirror included), `pnpm-lock.yaml` inline resolutions, and
+  yarn classic `resolved`/`integrity` blocks; pypi rewrites `requirements.txt`
+  pins to `name @ <url> --hash=sha256:…` (pip-compile continuation lines are
+  refused rather than corrupted) and `uv.lock` wheel entries; cargo defines a
+  per-patch sparse registry in `.cargo/config.toml` plus `Cargo.toml`
+  `registry =` keys and Cargo.lock `source`/`checksum` surgery; composer
+  rewrites the lock entry's `dist` url/shasum; nuget adds a `nuget.config`
+  source + `packageSourceMapping` and repins `packages.lock.json`
+  `contentHash`; gem adds a per-dep `source` block + a `CHECKSUMS` pin
+  (bundler ≥ 2.6). A dep counts as redirected only when its hosted URL (or
+  per-dep registry index) actually landed in a project file; re-runs are
+  idempotent (zero new edits over already-rewritten output). The Rust
+  rewriters are held byte-identical to the depscan backend's TS twins (the
+  GitHub-app hosted PR flow) by shared golden fixtures under
+  `tests/fixtures/redirect/`. JSON output gains a `redirect` sub-object with
+  `mode: "hosted"`, `redirected`, `rewrittenFiles`, `skipped`, `warnings`.
+- **`scan --mode <hosted|vendored|agent>`: the documented mode selector.** One
+  value-enum flag replaces the boolean spellings (`--redirect` == hosted,
+  `--vendor` == vendored, `--apply`/`--sync` == agent), which remain supported
+  as aliases. Combining `--mode` with a boolean of a DIFFERENT mode is a
+  usage error (exit 2); the same mode spelled both ways is accepted, and
+  `--detached` now requires vendored mode in either spelling.
+- **VEX support for hosted mode: the `(redirected)` provenance marker + the
+  redirect ledger.** `scan --mode hosted` persists its recorded file edits and
+  the full patch records (file hashes + vulnerabilities) into
+  `.socket/vendor/redirect-state.json` (merge-on-rewrite, append-only edits —
+  the pre-redirect originals a future revert needs are never clobbered).
+  Redirected patches carry the impact-statement marker "Patched via Socket
+  patch `<uuid>` (redirected)", completing the provenance trio (plain =
+  agent, `(vendored)`, `(redirected)`). In-run `scan --mode hosted --vex`
+  attests confirmed redirects from the ledger WITHOUT hash verification (the
+  bytes are fetched at install time; the JSON `vex` summary carries
+  `verified: false`), while a post-install `socket-patch vex` reads the ledger
+  back and hash-verifies the redirected patches against the installed tree.
+  A confirmed redirect whose record fetch failed surfaces a
+  `record_fetch_failed` warning (the patch is missing from VEX until a
+  re-run).
+- **NuGet + Maven vendor backends (`vendor` / `scan --mode vendored`).**
+  NuGet: the uuid dir is a committed *folder feed* holding a deterministically
+  rebuilt `.nupkg` (embedded signature dropped; unsigned is accepted under
+  NuGet's default validation), wired via a `nuget.config` source +
+  `packageSourceMapping` and a `packages.lock.json` `contentHash` repin —
+  `dotnet restore --locked-mode` then fails NU1403 on tamper. Maven: the uuid
+  dir is a committed *maven2 `file://` repository* (rebuilt `.jar` + the
+  verbatim upstream pom so transitives survive + `.sha1` sidecars), wired via
+  a `pom.xml` `<repository>` with `checksumPolicy=fail`; multi-module
+  aggregator poms (`vendor_maven_multimodule_unsupported`) and gradle-only
+  projects (`vendor_gradle_unsupported`) are refused fail-closed, and the
+  always-on `vendor_maven_local_cache_shadow` advisory carries the
+  `mvn dependency:purge-local-repository` one-liner (a warm `~/.m2` copy
+  silently shadows any repository). Both are proven by docker capstones
+  against the real .NET SDK / Apache Maven (cold-cache, `--network none`,
+  RED + TAMPER probes). `nuget` and `maven` are now DEFAULT compile features;
+  in-place agent apply for both remains runtime-gated
+  (`SOCKET_EXPERIMENTAL_NUGET=1` / `SOCKET_EXPERIMENTAL_MAVEN=1` — sidecar
+  corruption risk) while the committable vendor path is safe. The vendored
+  path convention + uuid recovery rule now covers `nuget` and `maven` dirs,
+  and `--vendor-source` prebuilt downloads cover nuget.
+- **Maven hosted rewriter (pom projects).** Hosted mode's maven leg: a
+  surgical `<repository id="socket-patch-<uuid>">` insert (releases enabled,
+  `checksumPolicy=fail`, snapshots disabled) pointing the patched GAV at a
+  single-artifact Socket maven2 repository. Same-GAV handling is VERIFY-ONLY
+  — the rewriter never edits a `<version>`; it warns when the redirect can't
+  take effect (`redirect_maven_dep_unpinned` for property/managed versions,
+  `redirect_maven_dep_not_found`, `redirect_maven_unsupported_packaging` for
+  non-jar `<type>`s). Gradle build scripts are never edited: a present
+  `build.gradle*`/`settings.gradle*` emits the paste-able `exclusiveContent`
+  snippet as a `redirect_gradle_manual_snippet` warning instead.
+- **Golang hosted mode is a documented NO-GO.** Hosted redirect for Go is
+  deliberately unsupported — sumdb hard-fails the patched pseudo-version on
+  every day-2 machine and the only escapes are uncommittable machine-local
+  config; Go's module-path identity would force per-grant artifacts against
+  the build-once converter; and the default `GOPROXY` chain would leak
+  licensed bytes / tokened URLs to the public mirror. The full analysis lives
+  in `docs/design/golang-hosted-no-go.md`; both the CLI rewriter and the
+  depscan backend twin emit `redirect_golang_unsupported` naming the remedy
+  (use vendored mode, which gives Go everything hosted promises elsewhere).
+  The one sanctioned exception — an ephemeral-CI GOPROXY recipe — is
+  documentation-only and never written into a repository.
+
 - **`vendor` now supports every major npm and pypi package manager.** The npm
   ecosystem gained four lockfile flavors beyond `package-lock.json` — yarn
   classic (`yarn.lock` v1), yarn berry with the node-modules linker
@@ -104,6 +191,16 @@ in this file — see `.github/workflows/release.yml` (`version` job).
   and over-capacity 503s still surface instead of silently degrading. (MINOR)
 
 ### Fixed
+
+- **NuGet hosted rewriter: creating a `packageSourceMapping` from scratch now
+  emits a catch-all for pre-existing sources.** `packageSourceMapping` is
+  exclusive — once ANY mapping exists, every package must match some source's
+  pattern or restore hard-fails NU1100. A redirect into a `nuget.config` with
+  no prior mapping previously routed only the patched id, breaking every
+  OTHER package's restore; the rewriter now fans a `<package pattern="*" />`
+  mapping out to each pre-existing package source (longest-prefix match still
+  routes the patched id to the Socket source). Golden fixtures updated on
+  both the Rust and TS sides.
 
 - **VEX now attests Go `replace`-redirect patches.** `socket-patch vex`
   previously verified golang patches against the pristine module cache
