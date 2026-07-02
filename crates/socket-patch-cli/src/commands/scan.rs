@@ -1433,6 +1433,10 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
     "yarn.lock",
+    // A berry lock's cache-config gate reads `.yarnrc.yml`; bun's text lock is
+    // `bun.lock` (its binary `bun.lockb` is auto-migrated in `run_redirect`).
+    ".yarnrc.yml",
+    "bun.lock",
     "requirements.txt",
     "uv.lock",
     "Cargo.toml",
@@ -1539,12 +1543,22 @@ async fn run_redirect(
                 );
                 continue;
             };
-            let integrity = reference
+            let mut integrity = reference
                 .artifacts
                 .iter()
                 .find(|a| a.kind == "tarball")
                 .map(|a| a.integrity.clone())
                 .unwrap_or_default();
+            // The yarn-berry cache zip carries the `yarnBerry10c0` checksum the
+            // berry rewriter pins (berry verifies the zip, not the tarball).
+            // Merge it in and carry the zip URL (None when not stored yet).
+            let berry_zip = reference
+                .artifacts
+                .iter()
+                .find(|a| a.kind == "yarn-berry-zip");
+            if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
+                integrity.yarn_berry10c0 = Some(c);
+            }
             candidates.push((
                 purl.to_string(),
                 sel.uuid.clone(),
@@ -1562,10 +1576,63 @@ async fn run_redirect(
                 token: String::new(),
                 patch_uuid: sel.uuid.clone(),
                 artifact_url: url,
-                berry_zip_url: None,
+                berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
                 registry_override: reference.registry_override.clone(),
                 integrity,
             });
+        }
+    }
+
+    // bun.lockb auto-migration: the redirect rewriter only edits the TEXT
+    // lockfile, so a project locked to a binary `bun.lockb` must be re-locked
+    // to `bun.lock` first. `bun install --save-text-lockfile --frozen-lockfile
+    // --lockfile-only` writes bun.lock, DELETES bun.lockb, needs no network,
+    // and fails closed on drift. Dry-run only warns; a failure degrades to the
+    // rewriter's own presence-only refusal (the .lockb stays a candidate file).
+    let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
+    let has_lockb = args.common.cwd.join("bun.lockb").exists();
+    let has_bun_lock = args.common.cwd.join("bun.lock").exists();
+    if has_lockb && !has_bun_lock {
+        if args.common.dry_run {
+            migration_warnings.push(serde_json::json!({
+                "code": "redirect_bun_lockb_would_migrate",
+                "detail": "bun.lockb would be migrated to a text bun.lock \
+                           (`bun install --save-text-lockfile`) before redirecting; \
+                           re-run without --dry-run to apply",
+            }));
+        } else {
+            let status = std::process::Command::new("bun")
+                .args([
+                    "install",
+                    "--save-text-lockfile",
+                    "--frozen-lockfile",
+                    "--lockfile-only",
+                ])
+                .current_dir(&args.common.cwd)
+                .status();
+            let migrated =
+                matches!(status, Ok(s) if s.success()) && args.common.cwd.join("bun.lock").exists();
+            if migrated {
+                // bun deleted bun.lockb itself. Record the removal so `--revert`
+                // knows the file was replaced (binary — git history is the
+                // restore path, so no `original` bytes are captured).
+                migration_edits.push(socket_patch_core::patch::redirect::FileEdit {
+                    path: "bun.lockb".into(),
+                    kind: "redirect_bun_lockb_migrated".into(),
+                    action: "removed".into(),
+                    key: None,
+                    original: None,
+                    new: None,
+                });
+            } else {
+                migration_warnings.push(serde_json::json!({
+                    "code": "redirect_bun_lockb_unsupported",
+                    "detail": "bun.lockb could not be migrated to a text bun.lock \
+                               (`bun install --save-text-lockfile` failed or is unavailable); \
+                               the redirect cannot pin a binary lockfile",
+                }));
+            }
         }
     }
 
@@ -1598,8 +1665,12 @@ async fn run_redirect(
     let confirmed: Vec<(String, String)> = candidates
         .iter()
         .filter(|(_, _, artifact_url, index_url)| {
+            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
             final_texts.iter().any(|text| {
                 text.contains(artifact_url.as_str())
+                    // The berry rewriter writes the URL percent-encoded into the
+                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
+                    || text.contains(encoded.as_str())
                     || index_url.as_deref().is_some_and(|iu| text.contains(iu))
             })
         })
@@ -1654,7 +1725,7 @@ async fn run_redirect(
         // hosted patch), and clobbering the file would lose the original
         // pre-redirect values a future revert needs. New edits APPEND (revert
         // walks them in reverse); records are keyed by PURL, newest wins.
-        if !rewrite.edits.is_empty() || !records.is_empty() {
+        if !rewrite.edits.is_empty() || !records.is_empty() || !migration_edits.is_empty() {
             let vendor_dir = args.common.cwd.join(".socket").join("vendor");
             let _ = std::fs::create_dir_all(&vendor_dir);
             let mut ledger =
@@ -1666,6 +1737,9 @@ async fn run_redirect(
             // ledger converges on the documented "hosted" name (the
             // loader accepts either — mode is an opaque string to it).
             ledger.mode = "hosted".to_string();
+            // The bun.lockb→bun.lock migration removal precedes the rewrite
+            // edits so `--revert` unwinds it last (after restoring bun.lock).
+            ledger.edits.extend(migration_edits.iter().cloned());
             ledger.edits.extend(rewrite.edits.iter().cloned());
             ledger.records.extend(records.clone());
             let _ = std::fs::write(
@@ -1713,6 +1787,7 @@ async fn run_redirect(
             })
             .collect();
         warnings.extend(record_warnings.iter().cloned());
+        warnings.extend(migration_warnings.iter().cloned());
         let mut result = serde_json::json!({
             "status": "success",
             "redirect": {
@@ -1754,6 +1829,9 @@ async fn run_redirect(
             eprintln!("  skipped {} ({})", s["purl"], s["reason"]);
         }
         for w in &record_warnings {
+            eprintln!("  warning: {}", w["detail"]);
+        }
+        for w in &migration_warnings {
             eprintln!("  warning: {}", w["detail"]);
         }
         if let Some(statements) = vex_statements {
