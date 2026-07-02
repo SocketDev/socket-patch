@@ -381,7 +381,12 @@ fn go_escape(s: &str) -> String {
 /// `"{sha256hex(content)}  {entry name}\n"` lines, base64-encoded
 /// (golang.org/x/mod/sumdb/dirhash Hash1/HashZip). Computed in memory
 /// BEFORE extraction.
-#[cfg(feature = "golang")]
+///
+/// Deliberately NOT gated on the `golang` feature: [`verify_go_h1`] runs in
+/// the ecosystem-agnostic service-download path whenever the service reports
+/// a `dirhashH1`, and gating it would either break minimal builds (it did)
+/// or silently skip content verification there — fail-open. All deps
+/// (zip/sha2/base64) are unconditional.
 fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
