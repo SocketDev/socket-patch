@@ -4,5 +4,6 @@ pub mod fs;
 pub mod fuzzy_match;
 pub mod process;
 pub mod purl;
+pub mod serde;
 pub mod telemetry;
 pub mod uri;

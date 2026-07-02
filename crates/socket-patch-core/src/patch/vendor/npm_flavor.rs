@@ -8,12 +8,14 @@
 //! `__metadata:` — checksums installs against its cache zips even under the
 //! node-modules linker, so vendoring is structurally impossible there).
 //!
-//! The router fans `vendor`/`revert` out per detected flavor. Today only the
-//! package-lock backend ([`super::npm_lock`]) exists; the yarn-classic /
-//! pnpm / bun arms refuse with the same stable code the CLI's old layout
-//! gate used (`vendor_pkg_manager_unsupported`) and will be replaced by real
-//! backends. Reverts fail CLOSED on a flavor this build has no backend for —
-//! never guess at another flavor's wiring records.
+//! The router fans `vendor`/`revert` out per detected flavor. All five
+//! flavors have real backends: package-lock ([`super::npm_lock`]),
+//! yarn classic ([`super::yarn_classic_lock`]), yarn berry
+//! ([`super::yarn_berry_lock`]), pnpm ([`super::pnpm_lock`]), and bun
+//! ([`super::bun_lock`]); a lockfile the probe can't classify refuses with
+//! the stable `vendor_pkg_manager_unsupported` code. Reverts fail CLOSED on
+//! a flavor this build has no backend for — never guess at another flavor's
+//! wiring records.
 
 use std::path::Path;
 

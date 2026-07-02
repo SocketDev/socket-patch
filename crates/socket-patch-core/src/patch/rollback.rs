@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchFileInfo;
+use crate::patch::apply::normalize_file_path;
 use crate::patch::file_hash::compute_file_git_sha256;
 
 /// Status of a file rollback verification.
@@ -47,16 +48,6 @@ pub struct RollbackResult {
     /// are still rolled back). `None` when no sidecar applied or no
     /// files were rolled back (dry run, already original).
     pub sidecar: Option<crate::patch::sidecars::SidecarRecord>,
-}
-
-/// Normalize file path by removing the "package/" prefix if present.
-fn normalize_file_path(file_name: &str) -> &str {
-    const PACKAGE_PREFIX: &str = "package/";
-    if let Some(stripped) = file_name.strip_prefix(PACKAGE_PREFIX) {
-        stripped
-    } else {
-        file_name
-    }
 }
 
 /// Verify a single file can be rolled back.

@@ -23,12 +23,13 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 use crate::utils::fs::atomic_write_bytes;
+use crate::utils::serde::serialize_sorted;
 
 use super::path::VENDOR_DIR;
 
@@ -37,14 +38,6 @@ pub const VENDOR_STATE_REL: &str = ".socket/vendor/state.json";
 
 /// Current schema version.
 pub const VENDOR_STATE_VERSION: u32 = 1;
-
-fn serialize_sorted<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-    V: Serialize,
-{
-    map.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
-}
 
 /// The vendored artifact (a tarball/wheel file, or the copy directory for the
 /// dir-shaped ecosystems).

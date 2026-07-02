@@ -13,17 +13,20 @@
 //!
 //! | eco      | artifact            | wiring                                         |
 //! |----------|---------------------|------------------------------------------------|
-//! | npm      | deterministic tgz   | package-lock.json `resolved`+`integrity` only  |
+//! | npm      | deterministic tgz   | per lockfile flavor: package-lock `resolved`+`integrity`, yarn classic, yarn berry, pnpm, bun ([`npm_flavor`] routes) |
 //! | cargo    | crate dir           | `.cargo/config.toml` `[patch.crates-io]` + Cargo.lock surgery |
 //! | golang   | module dir          | `go.mod` `replace` ([`ReplaceOwner::Vendor`])  |
 //! | composer | package dir         | composer.lock `dist` → `{type: path}`          |
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
-//! | pypi     | rebuilt wheel       | uv: pyproject+uv.lock pair; pip: requirements  |
+//! | pypi     | rebuilt wheel       | per manifest flavor: uv, poetry, pdm, pipenv, requirements ([`pypi`] routes) |
+//! | maven    | rebuilt jar         | committed `file://` maven2 repo + pom `<repository>` ([`maven_repo`]) |
+//! | nuget    | rebuilt nupkg       | folder feed + `nuget.config` + `packages.lock.json` pin ([`nuget_feed`]) |
 //!
 //! npm requests route through [`npm_flavor`], which content-sniffs the
-//! project's lockfile (package-lock / yarn / pnpm / bun) and dispatches to
-//! the matching backend — today only the package-lock backend exists and
-//! the other flavors refuse with stable reason codes.
+//! project's lockfile (not just file presence) and dispatches to the
+//! matching backend — all five flavors have real backends; a lockfile the
+//! probe can't classify (or a berry PnP layout) refuses with a stable
+//! reason code.
 //!
 //! ## Ownership & reversal
 //!
