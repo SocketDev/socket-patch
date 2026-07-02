@@ -101,6 +101,7 @@ fn default_scan_args(cwd: &Path, eco: &str, api_url: String) -> ScanArgs {
         vendor: false,
         detached: false,
         redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     }
@@ -169,6 +170,32 @@ async fn setup_apply_mock(
         })))
         .mount(server)
         .await;
+}
+
+/// Read `<cwd>/.socket/manifest.json`, parse it, and assert the agent-mode
+/// scan recorded `purl` with `uuid` and at least one patched-file entry.
+/// This is the signature the AGENT-mode `--apply`/`--sync` paths must leave
+/// behind (manifest + blobs, applied by CI) — a test that only checks the
+/// on-disk bytes would miss a regression that patches the file but forgets to
+/// persist the manifest the CI re-apply depends on.
+fn assert_manifest_records(cwd: &Path, purl: &str, uuid: &str) {
+    let manifest_path = cwd.join(".socket/manifest.json");
+    let raw = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("scan --apply must write {}: {e}", manifest_path.display()));
+    let manifest: socket_patch_core::manifest::schema::PatchManifest =
+        serde_json::from_str(&raw).expect("manifest.json parses");
+    let record = manifest
+        .patches
+        .get(purl)
+        .unwrap_or_else(|| panic!("manifest missing patch record for {purl}: {raw}"));
+    assert_eq!(
+        record.uuid, uuid,
+        "manifest record uuid mismatch for {purl}"
+    );
+    assert!(
+        !record.files.is_empty(),
+        "manifest record for {purl} recorded no patched-file hashes"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +677,260 @@ async fn nuget_handcrafted_discovery() {
     // Prove the nuget packages layout (gated on a .nuspec) was crawled and
     // its PURL queried — exit 0 alone would also pass an empty crawl.
     assert_discovered_purl(&server, "pkg:nuget/foo@1.0.0").await;
+    std::env::remove_var("NUGET_PACKAGES");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
+}
+
+// ---------------------------------------------------------------------------
+// AGENT-mode `scan --apply` (+ manifest-written) coverage
+//
+// The tests above exercise `scan --sync` (== `--apply --prune`) and assert
+// only the on-disk bytes. These add the missing agent-mode signature checks
+// for npm/composer/maven/nuget: the pure `--apply` spelling (no prune) AND an
+// explicit assertion that `.socket/manifest.json` was written with the patch
+// record — the artifact a CI re-apply consumes. Each mock advertises a
+// `beforeHash` that MATCHES the handcrafted on-disk bytes, so the default
+// (non-`--force`, non-`--strict`) apply verifies and writes cleanly.
+// ---------------------------------------------------------------------------
+
+/// npm has no host-toolchain in_process apply test otherwise (the docker suite
+/// is its only real-install coverage), so this is its dedicated agent-apply
+/// gate. node_modules lives in cwd, so `global` is off and the cwd
+/// package.json is the project marker the npm crawler requires.
+#[tokio::test]
+#[serial]
+async fn npm_handcrafted_scan_apply_writes_manifest_and_patches() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "app", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    let pkg_dir = tmp.path().join("node_modules/left-pad");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "left-pad", "version": "1.3.0" }"#,
+    )
+    .unwrap();
+    let index = pkg_dir.join("index.js");
+    let original = b"module.exports = function leftPad() {};\n";
+    std::fs::write(&index, original).unwrap();
+    let before_hash = git_sha256(original);
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-E2E-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let uuid = "abababab-abab-4bab-8bab-abababababab";
+    let server = MockServer::start().await;
+    setup_apply_mock(
+        &server,
+        purl,
+        uuid,
+        "package/index.js",
+        &before_hash,
+        &after_hash,
+        &patched,
+    )
+    .await;
+
+    // `--apply` (NOT `--sync`): the pure agent-mode apply spelling.
+    let mut args = default_scan_args(tmp.path(), "npm", server.uri());
+    args.common.global = false; // scan cwd-relative node_modules, not $(npm root -g)
+    args.sync = false;
+    args.apply = true;
+    let code = scan_run(args).await;
+    assert_eq!(
+        code, 0,
+        "scan --apply should fully apply the npm patch (exit 0)"
+    );
+
+    let after = std::fs::read(&index).expect("read after");
+    assert_eq!(
+        after, patched,
+        "patched index.js bytes do not match the served blob exactly"
+    );
+    assert_manifest_records(tmp.path(), purl, uuid);
+}
+
+#[cfg(feature = "composer")]
+#[tokio::test]
+#[serial]
+async fn composer_handcrafted_scan_apply_writes_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let vendor = tmp.path().join("vendor");
+    let pkg_dir = vendor.join("monolog/monolog");
+    std::fs::create_dir_all(pkg_dir.join("src/Monolog")).unwrap();
+    let payload = pkg_dir.join("src/Monolog/Logger.php");
+    let original = b"<?php\nnamespace Monolog;\nclass Logger {}\n";
+    std::fs::write(&payload, original).unwrap();
+    let before_hash = git_sha256(original);
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"\n// SOCKET-PATCH-E2E-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    let installed_dir = vendor.join("composer");
+    std::fs::create_dir_all(&installed_dir).unwrap();
+    std::fs::write(
+        installed_dir.join("installed.json"),
+        r#"{ "packages": [
+            { "name": "monolog/monolog", "version": "3.5.0", "version_normalized": "3.5.0.0" }
+        ] }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("composer.json"),
+        r#"{ "name": "test/proj", "require": {} }"#,
+    )
+    .unwrap();
+
+    let purl = "pkg:composer/monolog/monolog@3.5.0";
+    let uuid = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    let server = MockServer::start().await;
+    setup_apply_mock(
+        &server,
+        purl,
+        uuid,
+        "package/src/Monolog/Logger.php",
+        &before_hash,
+        &after_hash,
+        &patched,
+    )
+    .await;
+
+    let mut args = default_scan_args(tmp.path(), "composer", server.uri());
+    args.common.global = false;
+    args.sync = false;
+    args.apply = true;
+    let code = scan_run(args).await;
+    assert_eq!(
+        code, 0,
+        "scan --apply should fully apply the composer patch (exit 0)"
+    );
+
+    let after = std::fs::read(&payload).expect("read after");
+    assert_eq!(
+        after, patched,
+        "composer patched bytes do not match the served blob exactly"
+    );
+    assert_manifest_records(tmp.path(), purl, uuid);
+}
+
+#[cfg(feature = "maven")]
+#[tokio::test]
+#[serial]
+async fn maven_handcrafted_scan_apply_writes_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("m2-repo");
+    let version_dir = repo.join("org/apache/commons/commons-lang3/3.12.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::write(
+        version_dir.join("commons-lang3-3.12.0.pom"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId><version>3.12.0</version></project>",
+    )
+    .unwrap();
+    let payload_file = version_dir.join("LICENSE.txt");
+    let original = b"Apache License 2.0\nThis is the LICENSE.\n";
+    std::fs::write(&payload_file, original).unwrap();
+    let before_hash = git_sha256(original);
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"\n# SOCKET-PATCH-E2E-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    std::env::set_var("MAVEN_REPO_LOCAL", &repo);
+    std::env::set_var("SOCKET_EXPERIMENTAL_MAVEN", "1");
+
+    let purl = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
+    let uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    let server = MockServer::start().await;
+    setup_apply_mock(
+        &server,
+        purl,
+        uuid,
+        "package/LICENSE.txt",
+        &before_hash,
+        &after_hash,
+        &patched,
+    )
+    .await;
+
+    // Maven probes MAVEN_REPO_LOCAL under the default `global` bypass.
+    let mut args = default_scan_args(tmp.path(), "maven", server.uri());
+    args.sync = false;
+    args.apply = true;
+    let code = scan_run(args).await;
+    assert_eq!(
+        code, 0,
+        "scan --apply should fully apply the maven patch (exit 0)"
+    );
+
+    let after = std::fs::read(&payload_file).expect("read after");
+    assert_eq!(
+        after, patched,
+        "maven patched bytes do not match the served blob exactly"
+    );
+    assert_manifest_records(tmp.path(), purl, uuid);
+
+    std::env::remove_var("MAVEN_REPO_LOCAL");
+    std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
+}
+
+#[cfg(feature = "nuget")]
+#[tokio::test]
+#[serial]
+async fn nuget_handcrafted_scan_apply_writes_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let packages = tmp.path().join("nuget-packages");
+    let pkg_dir = packages.join("newtonsoft.json").join("13.0.3");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("newtonsoft.json.nuspec"),
+        r#"<?xml version="1.0"?><package><metadata>
+            <id>Newtonsoft.Json</id><version>13.0.3</version></metadata></package>"#,
+    )
+    .unwrap();
+    let payload = pkg_dir.join("LICENSE.md");
+    let original = b"MIT License\nCopyright (c) 2007 James Newton-King\n";
+    std::fs::write(&payload, original).unwrap();
+    let before_hash = git_sha256(original);
+    let mut patched = original.to_vec();
+    patched.extend_from_slice(b"\n# SOCKET-PATCH-E2E-MARKER\n");
+    let after_hash = git_sha256(&patched);
+
+    std::env::set_var("NUGET_PACKAGES", &packages);
+    std::env::set_var("SOCKET_EXPERIMENTAL_NUGET", "1");
+
+    let purl = "pkg:nuget/Newtonsoft.Json@13.0.3";
+    let uuid = "dfdfdfdf-dfdf-4fdf-8fdf-dfdfdfdfdfdf";
+    let server = MockServer::start().await;
+    setup_apply_mock(
+        &server,
+        purl,
+        uuid,
+        "package/LICENSE.md",
+        &before_hash,
+        &after_hash,
+        &patched,
+    )
+    .await;
+
+    let mut args = default_scan_args(tmp.path(), "nuget", server.uri());
+    args.sync = false;
+    args.apply = true;
+    let code = scan_run(args).await;
+    assert_eq!(
+        code, 0,
+        "scan --apply should fully apply the nuget patch (exit 0)"
+    );
+
+    let after = std::fs::read(&payload).expect("read after");
+    assert_eq!(
+        after, patched,
+        "nuget patched bytes do not match the served blob exactly"
+    );
+    assert_manifest_records(tmp.path(), purl, uuid);
+
     std::env::remove_var("NUGET_PACKAGES");
     std::env::remove_var("SOCKET_EXPERIMENTAL_NUGET");
 }

@@ -37,6 +37,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
+/// The vulnerability the staged manifest carries, so the agent-mode VEX leg
+/// has something to attest. Plain agent provenance (no vendored/redirected
+/// marker) is what the host oracle asserts.
+const GHSA: &str = "GHSA-agent-npm-real";
 
 /// Marker we splice into the patched bytes so the test can assert
 /// post-apply that the file has been overwritten.
@@ -170,7 +174,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2021-44906"],
+                    "summary": "Synthetic prototype pollution (agent e2e fixture)",
+                    "severity": "high",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "E2E test fixture",
             "license": "MIT",
             "tier": "free",
@@ -212,6 +224,16 @@ COMMON_ARGS=(--api-url '{api_url}' --api-token fake --org {ORG})
 mkdir -p /workspace/proj && cd /workspace/proj
 echo '{{ "name": "e2e-proj", "version": "0.0.0" }}' > package.json
 npm install --silent --no-audit --no-fund minimist@1.2.2
+
+# Pre-seed setup.manual so the agent-mode VEX leg (step 5b) keeps the npm
+# patch through property 7: this project isn't `socket-patch setup`-configured,
+# and an agent patch is applied by hand/CI — exactly what `manual` declares.
+# scan --sync merges the downloaded patch into this manifest and preserves the
+# setup block, so the manifest the VEX leg reads carries both.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["npm"] }} }}
+MANIFEST
 
 # 2. scan --json: must discover the patch via the real batch API. A
 #    clean exit alone proves nothing (a no-op scan also exits 0), so we
@@ -286,6 +308,29 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' node_modules/minimist/index.js; then
   exit 1
 fi
 echo "===PATCH VERIFIED===" >&2
+
+# 5b. Agent-mode VEX leg. The manifest scan --sync wrote now carries
+#     {GHSA} (served in the patch view); vex verifies the patched file
+#     still on disk (this runs BEFORE rollback) and attests it. --offline keeps
+#     vex fully local (no telemetry/API). The doc is emitted between markers so
+#     the host oracle can parse it (no bind mount in these agent suites).
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:npm/e2e-app@1.0.0' --ecosystems npm >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
 
 # 6. rollback. The fixture's manifest records a placeholder all-zero
 #    beforeHash and serves no matching before-blob, so an --offline
@@ -621,6 +666,14 @@ async fn npm_install_scan_apply_rollback_cycle() {
         "PASS marker missing from stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the installed tree.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
+
     // Keep the workspace_root reference alive — used by host mode to
     // resolve the in-tree binary. Without this clippy warns unused.
     let _ = workspace_root();
@@ -658,6 +711,50 @@ async fn npm_global_install_full_apply_chain() {
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
     assert_real_api_pipeline_ran(&server).await;
+}
+
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers. These agent suites run
+/// the workspace inside the container with no bind mount (unlike the vendor
+/// capstones), so the doc is parsed straight from captured stdout. Asserts
+/// exactly one statement attesting the agent patch: the fixture GHSA,
+/// `not_affected`, the installed-package subcomponent purl, and a PLAIN impact
+/// statement with NO `(vendored)`/`(redirected)` marker — the marker's absence
+/// is precisely what distinguishes agent provenance from the vendored/hosted
+/// modes.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
 }
 
 /// Shared check: the mock must have served BOTH the metadata discovery

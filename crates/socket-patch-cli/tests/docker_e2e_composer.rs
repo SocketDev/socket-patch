@@ -21,6 +21,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:composer/monolog/monolog@3.5.0";
 const UUID: &str = "17171717-1717-4171-8171-171717171717";
+/// The vulnerability the staged manifest carries so the agent-mode VEX leg
+/// has something to attest (plain agent provenance — no vendored/redirected
+/// marker — is what the host oracle asserts).
+const GHSA: &str = "GHSA-agent-composer-real";
 
 const PATCHED_PHP: &[u8] = b"<?php\n\
                              // SOCKET-PATCH-E2E-MARKER\n\
@@ -187,7 +191,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2024-30007"],
+                    "summary": "composer agent e2e fixture vulnerability",
+                    "severity": "low",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "composer e2e fixture",
             "license": "MIT",
             "tier": "free",
@@ -217,6 +229,15 @@ PHP_FILE="vendor/monolog/monolog/src/Monolog/Logger.php"
 [ -f "$PHP_FILE" ] || {{ echo "FAIL: $PHP_FILE missing" >&2; ls vendor/monolog/monolog/src/Monolog/ >&2 || true; exit 1; }}
 echo "Installed to: $PHP_FILE" >&2
 
+# Pre-seed setup.manual so the agent-mode VEX leg keeps the composer patch
+# through property 7 (this project isn't `socket-patch setup`-configured; agent
+# patches are applied by hand/CI — exactly what `manual` declares). scan --sync
+# merges the downloaded patch into this manifest and preserves the setup block.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["composer"] }} }}
+MANIFEST
+
 # pristine pre-check: the freshly-installed upstream file must NOT already
 # carry our marker, else a no-op apply would satisfy the post-checks vacuously.
 if grep -q 'SOCKET-PATCH-E2E-MARKER' "$PHP_FILE"; then
@@ -233,6 +254,30 @@ cat /tmp/sync.err >&2
 socket-patch apply --json --force --offline --ecosystems composer > /tmp/apply.json 2>/tmp/apply.err
 APPLY_EXIT=$?
 cat /tmp/apply.err >&2
+
+# Agent-mode VEX leg (runs after the apply stage above; the file is patched by
+# now). The manifest scan --sync wrote carries {GHSA}; vex verifies the patched
+# Logger.php in vendor/ and attests it with PLAIN agent provenance. --ecosystems
+# composer (no --global, matching the local apply); --offline keeps vex local.
+# The doc is emitted between markers for the host-side oracle (no bind mount
+# here). The interpolated verify_snippet then runs its own file assertions.
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:composer/e2e-app@1.0.0' --ecosystems composer >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
 {verify}"#
     )
 }
@@ -310,6 +355,48 @@ fn run_container(script: &str) -> std::process::Output {
     cmd.output().expect("docker run")
 }
 
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
+/// the workspace inside the container with no bind mount, so the doc is parsed
+/// from captured stdout). Asserts exactly one statement attesting the agent
+/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
+/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
+/// marker — the marker's absence is what distinguishes agent provenance.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
+}
+
 /// Independent (Rust-side) proof that the container exercised the real
 /// scan→sync network path against our mock — not a pre-baked/cached patch
 /// store. `scan --sync` must POST batch discovery and GET the full patch
@@ -351,6 +438,13 @@ async fn composer_local_install_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the patched Logger.php.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
     assert_real_pipeline_hit_the_api(&server).await;
 }
 

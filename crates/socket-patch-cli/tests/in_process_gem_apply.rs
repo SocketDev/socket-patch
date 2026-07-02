@@ -212,6 +212,7 @@ async fn gem_install_scan_sync_patches_real_file() {
         vendor: false,
         detached: false,
         redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     };
@@ -322,6 +323,7 @@ async fn gem_crawler_finds_real_installed_gem() {
         vendor: false,
         detached: false,
         redirect: false,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     };

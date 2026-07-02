@@ -45,6 +45,7 @@ fn redirect_args(cwd: &Path, api_url: String) -> ScanArgs {
         vendor: false,
         detached: false,
         redirect: true,
+        mode: None,
         all_releases: false,
         vex: Default::default(),
     }

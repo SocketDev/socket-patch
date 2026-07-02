@@ -17,6 +17,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:golang/github.com/gin-gonic/gin@v1.9.1";
 const UUID: &str = "15151515-1515-4151-8151-151515151515";
+/// The vulnerability the staged manifest carries so the agent-mode VEX leg
+/// has something to attest (plain agent provenance — no vendored/redirected
+/// marker — is what the host oracle asserts).
+const GHSA: &str = "GHSA-agent-golang-real";
 
 const PATCHED_GO: &[u8] = b"// SOCKET-PATCH-E2E-MARKER\n\
                             // gin.go replaced by socket-patch e2e fixture\n\
@@ -101,7 +105,15 @@ async fn make_mock_server(after_hash: &str) -> MockServer {
                     "blobContent": blob_b64,
                 }
             },
-            "vulnerabilities": {},
+            // Recorded into the manifest so the agent-mode VEX leg attests it.
+            "vulnerabilities": {
+                (GHSA): {
+                    "cves": ["CVE-2024-30002"],
+                    "summary": "golang agent e2e fixture vulnerability",
+                    "severity": "high",
+                    "description": "Agent-mode VEX leg fixture vulnerability"
+                }
+            },
             "description": "golang e2e fixture",
             "license": "MIT",
             "tier": "free",
@@ -159,6 +171,15 @@ fi
 # Module cache files are read-only by default; apply's chmod logic
 # handles it but we pre-chmod for robustness.
 chmod u+w "$GIN_GO" || true
+
+# Pre-seed setup.manual so the agent-mode VEX leg keeps the golang patch
+# through property 7 (golang has no auto-install setup hook; agent patches are
+# applied by hand/CI — exactly what `manual` declares). scan --sync merges the
+# downloaded patch into this manifest and preserves the setup block.
+mkdir -p .socket
+cat > .socket/manifest.json <<'MANIFEST'
+{{ "patches": {{}}, "setup": {{ "manual": ["golang"] }} }}
+MANIFEST
 
 # scan --sync writes manifest + blob; the go crawler with --global probes
 # $GOMODCACHE. Note: in this fixture scan's own apply pass matches 0 files
@@ -252,11 +273,77 @@ if ! grep -q 'SOCKET-PATCH-E2E-MARKER' "$GIN_GO"; then
 fi
 
 echo "===PATCH VERIFIED===" >&2
+
+# Agent-mode VEX leg. The manifest scan --sync wrote carries {GHSA} (served in
+# the patch view); vex verifies the patched gin.go on disk and attests it with
+# PLAIN agent provenance. --global/--ecosystems golang mirror the apply (the go
+# crawler probes $GOMODCACHE); --offline keeps vex local. The doc is emitted
+# between markers for the host-side oracle (no bind mount here).
+echo "===VEX OUTPUT===" >&2
+socket-patch vex --offline --cwd "$PWD" --output /tmp/out.vex.json \
+  --product 'pkg:golang/e2e-app@1.0.0' --global --ecosystems golang >/tmp/vex.out 2>/tmp/vex.err
+VEX_RC=$?
+echo "vex exit=$VEX_RC" >&2
+cat /tmp/vex.err >&2 || true
+if [ "$VEX_RC" -ne 0 ]; then
+  echo "FAIL: vex exited $VEX_RC (expected 0)" >&2
+  cat /tmp/vex.out >&2
+  exit 1
+fi
+[ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
+echo "===VEX VERIFIED===" >&2
+echo "===VEX DOC BEGIN==="
+cat /tmp/out.vex.json
+echo ""
+echo "===VEX DOC END==="
+
 echo "===E2E PASS==="
 exit 0
 "#,
         git_sha256_fn = GIT_SHA256_FN,
     )
+}
+
+/// Host-side oracle over the VEX document the container emitted between the
+/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
+/// the workspace inside the container with no bind mount, so the doc is parsed
+/// from captured stdout). Asserts exactly one statement attesting the agent
+/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
+/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
+/// marker — the marker's absence is what distinguishes agent provenance.
+fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
+    const BEGIN: &str = "===VEX DOC BEGIN===";
+    const END: &str = "===VEX DOC END===";
+    let start = stdout
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
+        + BEGIN.len();
+    let stop = stdout[start..]
+        .find(END)
+        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
+        + start;
+    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
+        .expect("emitted VEX document must be valid JSON");
+    let stmts = doc["statements"]
+        .as_array()
+        .expect("VEX document must have a statements array");
+    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
+    let st = &stmts[0];
+    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
+    assert_eq!(st["status"], "not_affected");
+    assert_eq!(
+        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
+        "subcomponent must be the patched package purl"
+    );
+    let impact = st["impact_statement"]
+        .as_str()
+        .expect("statement must carry an impact_statement");
+    assert!(
+        impact.contains("Patched via Socket patch")
+            && !impact.contains("(vendored)")
+            && !impact.contains("(redirected)"),
+        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
+    );
 }
 
 /// Returns `true` when the test should skip (docker missing, image
@@ -311,6 +398,14 @@ async fn golang_download_full_apply_chain() {
     );
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
+
+    // Agent-mode VEX leg: the manifest patch was attested with plain
+    // (non-vendored, non-redirected) provenance against the patched gin.go.
+    assert!(
+        stderr.contains("===VEX VERIFIED==="),
+        "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
+    );
+    assert_vex_agent_attested(&stdout, PURL);
 
     // The script gates on an exact git-blob-hash match; confirm the
     // expected hash actually appears in the log so a future edit that
