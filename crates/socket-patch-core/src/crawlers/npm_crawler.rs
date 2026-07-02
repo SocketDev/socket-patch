@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 /// Default batch size for crawling.
@@ -739,30 +741,20 @@ impl Default for NpmCrawler {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Check whether a path is a directory (follows symlinks).
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-}
-
 /// Whether a PURL-derived path component is safe to join onto the
 /// `node_modules` root. An npm package's scope (`@types`) and bare name
 /// (`node`) are each a single path segment, so a real one never contains a
-/// separator, a `.`/`..` segment, a backslash, or a NUL. `find_by_purls`
-/// joins these straight from the (untrusted) manifest PURL onto the
-/// `node_modules` root and then patches the resolved package in place, so a
-/// tampered PURL like `pkg:npm/../../evil@1.0.0` would otherwise read (and
-/// later write) out of tree. Reject those fail-closed. Twin of the deno
-/// (`is_safe_jsr_component`), go, and maven coordinate gates.
+/// separator, a `.`/`..` segment, a backslash, a colon, or a NUL.
+/// `find_by_purls` joins these straight from the (untrusted) manifest PURL
+/// onto the `node_modules` root and then patches the resolved package in
+/// place, so a tampered PURL like `pkg:npm/../../evil@1.0.0` would otherwise
+/// read (and later write) out of tree. Delegates to
+/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
+/// Windows drive-relative component (`C:evil`) joins as an absolute path.
+/// Fails closed. Twin of the deno (`is_safe_jsr_component`), go, and maven
+/// coordinate gates.
 fn is_safe_npm_component(component: &str) -> bool {
-    !component.is_empty()
-        && component != "."
-        && component != ".."
-        && !component.contains('/')
-        && !component.contains('\\')
-        && !component.contains('\0')
+    path_safety::is_safe_single_segment(component)
 }
 
 #[cfg(test)]
@@ -1300,6 +1292,10 @@ mod tests {
         assert!(!is_safe_npm_component("a/b"));
         assert!(!is_safe_npm_component("a\\b"));
         assert!(!is_safe_npm_component("a\0b"));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_npm_component("C:evil"));
+        assert!(!is_safe_npm_component("c:"));
     }
 
     /// A PURL whose version is not the one on disk must be skipped, while a

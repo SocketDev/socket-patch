@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
@@ -283,29 +285,22 @@ fn parse_path_coordinates(
 /// for a `.pom` file, so it is no defense — this gate is. Fails closed.
 ///
 /// - `artifact_id` and `version` are each a single path segment, so a real one
-///   never contains a separator, a `.`/`..` segment, a backslash, or a NUL.
+///   never contains a separator, a `.`/`..` segment, a backslash, a colon, or
+///   a NUL — [`path_safety::is_safe_single_segment`].
 /// - `group_id` is dot-separated and run through [`group_id_to_path`] (each
-///   `.` becomes `/`). Requiring every dot-split segment to be non-empty
-///   rejects the forms that would convert to an absolute or `..`-bearing path
-///   (`.` -> `/`, `.a` -> `/a`, `a..b` -> `a//b`).
+///   `.` becomes `/`), so every dot-split segment must independently satisfy
+///   [`path_safety::is_safe_single_segment`]. That rejects the forms that
+///   would convert to an absolute or `..`-bearing path (`.` -> `/`, `.a` ->
+///   `/a`, `a..b` -> `a//b`) and — unlike the previous local check — a `/`
+///   smuggled inside a dot-split segment (`/etc`, `com/evil`).
 ///
-/// Mirrors the `go_crawler` / `deno_crawler` coordinate guards.
+/// The delegation also rejects `:` everywhere — a Windows drive-relative
+/// coordinate (`C:evil`) joins as an absolute path. Mirrors the `go_crawler`
+/// / `deno_crawler` coordinate guards.
 fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
-    let safe_segment = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    let group_ok = !group_id.is_empty()
-        && !group_id.contains('\\')
-        && !group_id.contains('\0')
-        && group_id
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    group_ok && safe_segment(artifact_id) && safe_segment(version)
+    group_id.split('.').all(path_safety::is_safe_single_segment)
+        && path_safety::is_safe_single_segment(artifact_id)
+        && path_safety::is_safe_single_segment(version)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,14 +543,6 @@ impl Default for MavenCrawler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1188,6 +1175,17 @@ mod tests {
         assert!(!is_safe_maven_coordinate("", "a", "1.0.0"));
         assert!(!is_safe_maven_coordinate("g", "", "1.0.0"));
         assert!(!is_safe_maven_coordinate("g", "a", ""));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`; rejected in every
+        // coordinate, including inside a dot-split groupId segment.
+        assert!(!is_safe_maven_coordinate("C:evil.org", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "C:evil", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("g", "a", "C:1.0.0"));
+        // A `/` smuggled inside a dot-split groupId segment never hits the
+        // per-dot-segment checks (`/etc` has no dots at all) but converts to
+        // an absolute or deeper path via `group_id_to_path`.
+        assert!(!is_safe_maven_coordinate("/etc", "a", "1.0.0"));
+        assert!(!is_safe_maven_coordinate("com/evil", "a", "1.0.0"));
     }
 
     // ---- crawl_all tests ----

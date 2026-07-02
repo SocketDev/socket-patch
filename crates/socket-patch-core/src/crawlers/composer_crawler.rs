@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::fs::is_dir;
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
@@ -337,14 +338,6 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
             })
         })
         .collect()
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
 }
 
 /// Check whether a path is a file.

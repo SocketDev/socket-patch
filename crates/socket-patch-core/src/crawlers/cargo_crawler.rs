@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
 // Cargo.toml minimal parser
@@ -427,14 +428,6 @@ impl Default for CargoCrawler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

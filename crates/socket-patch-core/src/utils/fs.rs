@@ -2,13 +2,15 @@
 //! crate-wide atomic file writer ([`atomic_write_bytes`]).
 //!
 //! Each crawler walks one or more package directories and decides
-//! whether each entry is a candidate package. The two operations that
+//! whether each entry is a candidate package. The operations that
 //! all eight crawlers repeat are:
 //!
 //! - listing entries in a directory while tolerating permission /
 //!   I/O errors (we treat an unreadable directory as "no entries");
 //! - asking whether an entry is a directory while tolerating
-//!   `file_type()` failures (we treat a stat error as "not a dir").
+//!   `file_type()` failures (we treat a stat error as "not a dir");
+//! - asking whether an arbitrary path is a directory while tolerating
+//!   stat errors ([`is_dir`], same "not a dir" fallback).
 //!
 //! Centralizing both keeps each crawler free of the
 //! `match read_dir { Ok(rd) => rd, Err(_) => return … }` boilerplate
@@ -65,6 +67,20 @@ pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 /// `entry.path()` via `tokio::fs::metadata`, which does follow links.
 pub async fn entry_is_dir(entry: &DirEntry) -> bool {
     tokio::fs::metadata(entry.path())
+        .await
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
+/// Check whether `path` is a directory, following symlinks.
+///
+/// Returns `false` if the stat fails (missing path, broken symlink,
+/// permission error, etc.) — the crawlers probe candidate package
+/// roots and treat "can't stat" the same as "not there". The
+/// `Path`-taking counterpart of [`entry_is_dir`]; previously
+/// copy-pasted into every crawler.
+pub async fn is_dir(path: &Path) -> bool {
+    tokio::fs::metadata(path)
         .await
         .map(|m| m.is_dir())
         .unwrap_or(false)
@@ -241,6 +257,22 @@ mod tests {
                 other => panic!("unexpected entry: {other}"),
             }
         }
+    }
+
+    /// `is_dir` reports directories, and falls back to `false` for
+    /// files, missing paths, and (via `metadata`'s symlink-following)
+    /// resolves links to their target kind.
+    #[tokio::test]
+    async fn is_dir_dir_file_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let file = tmp.path().join("f");
+        tokio::fs::write(&file, b"x").await.unwrap();
+
+        assert!(is_dir(&dir).await);
+        assert!(!is_dir(&file).await);
+        assert!(!is_dir(&tmp.path().join("missing")).await);
     }
 
     /// Regression: `list_dir_entries` must hit the `read_dir` Err arm

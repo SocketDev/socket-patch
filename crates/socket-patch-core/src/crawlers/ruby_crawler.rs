@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
 /// directories or global gem installation paths.
@@ -407,29 +409,16 @@ fn gem_homes_to_gems_dirs(gempath: &str) -> Vec<PathBuf> {
 /// Whether a PURL-derived gem coordinate is safe to join onto the gem root.
 /// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
 /// directory name joined onto `gem_path`, and a real gem name/version is
-/// dash/dot/word characters only — never a separator, NUL, or bare dot
-/// segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and gems
-/// are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
+/// dash/dot/word characters only — never a separator, colon, NUL, or bare
+/// dot segment. `verify_gem_at_path` only checks for `lib/`/`.gemspec` and
+/// gems are patched in place, so a tampered manifest PURL (`pkg:gem/../x@1.0`,
 /// an absolute name, a `/`-bearing version) must be rejected here, fail
-/// closed. Mirrors the deno/go/maven/npm/nuget crawler coordinate guards.
+/// closed. Delegates to [`path_safety::is_safe_single_segment`], which also
+/// rejects `:` — a Windows drive-relative coordinate (`C:evil`) joins as an
+/// absolute path. Mirrors the deno/go/maven/npm/nuget crawler coordinate
+/// guards.
 fn is_safe_gem_coordinate(name: &str, version: &str) -> bool {
-    let safe = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    safe(name) && safe(version)
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 #[cfg(test)]
@@ -979,6 +968,10 @@ mod tests {
         assert!(!is_safe_gem_coordinate("a\\b", "1.0.0"));
         assert!(!is_safe_gem_coordinate("a\0b", "1.0.0"));
         assert!(!is_safe_gem_coordinate("/abs/evil", "1.0.0"));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_gem_coordinate("C:evil", "1.0.0"));
+        assert!(!is_safe_gem_coordinate("rails", "C:1.0.0"));
     }
 
     /// Gem names with embedded underscores/digits and multi-dash names

@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 /// NuGet/.NET ecosystem crawler for discovering packages in global cache,
 /// legacy `packages/` folders, and `obj/` restore layouts.
@@ -356,18 +358,12 @@ impl Default for NuGetCrawler {
 /// which the resolved directory is patched IN PLACE (NuGet has no redirect
 /// backend) — so a tampered PURL must not be able to traverse out of the
 /// root. A real NuGet id/version never contains a separator, a `.`/`..`
-/// segment, a backslash, or a NUL. Fails closed. Mirrors the
-/// maven/go/deno/npm crawler coordinate guards.
+/// segment, a backslash, a colon, or a NUL. Delegates to
+/// [`path_safety::is_safe_single_segment`], which also rejects `:` — a
+/// Windows drive-relative coordinate (`C:evil`) joins as an absolute path.
+/// Fails closed. Mirrors the maven/go/deno/npm crawler coordinate guards.
 fn is_safe_nuget_coordinate(name: &str, version: &str) -> bool {
-    let safe_segment = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && !s.contains('/')
-            && !s.contains('\\')
-            && !s.contains('\0')
-    };
-    safe_segment(name) && safe_segment(version)
+    path_safety::is_safe_single_segment(name) && path_safety::is_safe_single_segment(version)
 }
 
 /// Get the NuGet global packages folder.
@@ -497,14 +493,6 @@ async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf
     } else {
         Some(result)
     }
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -999,6 +987,10 @@ mod tests {
         assert!(!is_safe_nuget_coordinate("a", "."));
         assert!(!is_safe_nuget_coordinate("", "1.0.0"));
         assert!(!is_safe_nuget_coordinate("a", ""));
+        // Windows drive-relative escape: a `:` (e.g. `C:evil`) makes the
+        // joined path absolute under `Path::join`.
+        assert!(!is_safe_nuget_coordinate("C:evil", "1.0.0"));
+        assert!(!is_safe_nuget_coordinate("a", "C:1.0.0"));
     }
 
     /// SECURITY regression: a tampered manifest PURL whose name or version

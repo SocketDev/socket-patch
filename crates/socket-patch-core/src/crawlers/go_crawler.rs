@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::patch::path_safety;
+use crate::utils::fs::is_dir;
 
 // ---------------------------------------------------------------------------
 // Case-encoding helpers
@@ -385,35 +387,17 @@ fn split_module_path(module_path: &str) -> (&str, &str) {
 /// safe to join onto the module-cache root in [`GoCrawler::find_by_purls`].
 ///
 /// A Go module path legitimately contains `/` separators
-/// (`github.com/foo/bar`), so the path is validated **per segment** rather
-/// than rejecting all separators — but a real path never has an empty, `.`,
-/// or `..` segment (a leading `/` yields an empty first segment, so absolute
-/// paths are rejected here too). A version is a single segment with no
-/// separator. Backslashes and NULs are rejected outright. This mirrors the
+/// (`github.com/foo/bar`), so it is validated per segment via
+/// [`path_safety::is_safe_multi_segment`] — a real path never has an empty,
+/// `.`, or `..` segment, and absolute paths are rejected too. A version is a
+/// single segment ([`path_safety::is_safe_single_segment`]). Both helpers
+/// reject backslashes, NULs, and `:` — a Windows drive-relative coordinate
+/// (`C:evil`, `C:/evil`) joins as an absolute path. This mirrors the
 /// `go_redirect` coordinate guard and fails closed so a tampered manifest PURL
 /// cannot traverse out of the cache.
 fn is_safe_module_coordinate(module_path: &str, version: &str) -> bool {
-    let module_ok = !module_path.is_empty()
-        && !module_path.contains('\\')
-        && !module_path.contains('\0')
-        && module_path
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    let version_ok = !version.is_empty()
-        && version != "."
-        && version != ".."
-        && !version.contains('/')
-        && !version.contains('\\')
-        && !version.contains('\0');
-    module_ok && version_ok
-}
-
-/// Check whether a path is a directory.
-async fn is_dir(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+    path_safety::is_safe_multi_segment(module_path)
+        && path_safety::is_safe_single_segment(version)
 }
 
 #[cfg(test)]
@@ -989,6 +973,17 @@ mod tests {
             "a `..` segment in the module path must be rejected, not resolved \
              to a directory outside the cache root"
         );
+    }
+
+    /// Unit contract for the coordinate gate: real module paths/versions
+    /// pass; a `:` is rejected because a Windows drive-relative coordinate
+    /// (`C:evil`, `C:/evil`) joins as an absolute path under `Path::join`.
+    #[test]
+    fn test_is_safe_module_coordinate_rejects_colon() {
+        assert!(is_safe_module_coordinate("github.com/foo/bar", "v1.2.3"));
+        assert!(!is_safe_module_coordinate("C:/evil", "v1.0.0"));
+        assert!(!is_safe_module_coordinate("github.com/C:evil/bar", "v1.0.0"));
+        assert!(!is_safe_module_coordinate("github.com/foo/bar", "C:v1.0.0"));
     }
 
     #[tokio::test]
