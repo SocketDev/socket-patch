@@ -132,6 +132,8 @@ pub fn rewrite_registry_redirect(
     rewrite_npm_lock(files, overrides, &mut result);
     rewrite_pnpm_lock(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);
+    rewrite_yarn_berry(files, overrides, &mut result);
+    rewrite_bun_lock(files, overrides, &mut result);
     rewrite_pypi_requirements(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, &mut result);
     rewrite_cargo(files, overrides, &mut result);
@@ -794,6 +796,352 @@ fn rewrite_yarn_classic(
     }
     if changed {
         result.files.insert("yarn.lock".into(), blocks.join("\n\n"));
+    }
+}
+
+// ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
+// Berry derives its fetch URL from the descriptor's `npm:` resolution and
+// verifies the CONVERTED CACHE ZIP against the lock's `checksum:` (a
+// `10c0/<sha512-hex>` over the zip, not the tarball). To redirect ONE dep we
+// rewrite only the lock entry: `resolution:` gains yarn's own
+// `::__archiveUrl=<encodeURIComponent(url)>` binding, and `checksum:` becomes
+// our precomputed `integrity.yarnBerry10c0`. The descriptor KEY + package.json
+// are untouched (the `name@npm:^range` descriptor still satisfies, so
+// `--immutable` passes). Byte-for-byte twin of the TS `rewriteYarnBerry`.
+
+/// Only cacheKey `10c0` (yarn 4, compressionLevel 0 default) has a checksum we
+/// can reproduce offline; matches the vendored backend's `SUPPORTED_CACHE_KEY`.
+const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
+
+/// The `cacheKey:` value from the `__metadata` block (berry writes it unquoted:
+/// `  cacheKey: 10c0`), mirroring the vendored backend's `berry_field`.
+fn berry_cache_key(content: &str) -> Option<String> {
+    let meta = content.split("\n\n").find(|b| {
+        b.lines()
+            .next()
+            .is_some_and(|l| l.trim_end() == "__metadata:")
+    })?;
+    for line in meta.lines().skip(1) {
+        if let Some(rest) = line.strip_prefix("  cacheKey:") {
+            return Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// `.yarnrc.yml` `compressionLevel:` scalar, when set (flat top-level line
+/// scan — yarn writes it as a top-level scalar, spike B4).
+fn yarnrc_compression_level(rc: &str) -> Option<String> {
+    rc.lines().find_map(|line| {
+        let rest = line.strip_prefix("compressionLevel:")?;
+        Some(rest.trim().trim_matches(['\'', '"']).to_string())
+    })
+}
+
+/// Split `name@npm:...` at the `@` past a leading `@scope/` marker.
+fn split_berry_descriptor(pattern: &str) -> Option<(&str, &str)> {
+    let from = usize::from(pattern.starts_with('@'));
+    let at = pattern[from..].find('@')? + from;
+    let (name, range) = (&pattern[..at], &pattern[at + 1..]);
+    if name.is_empty() || range.is_empty() {
+        return None;
+    }
+    Some((name, range))
+}
+
+/// Split a berry lock key into its comma-joined descriptor patterns. yarn
+/// wraps a multi-descriptor key in ONE outer quote pair (`"a@npm:^1,
+/// a@npm:^2"`), so strip a single wrapping pair first, THEN split on `, ` —
+/// that surfaces every descriptor (letting a genuinely mixed-name key be
+/// detected as ambiguous) while a single quoted descriptor stays intact.
+/// Twin of the TS `splitKeyPatterns`.
+fn split_berry_key_patterns(key: &str) -> Vec<String> {
+    let trimmed = key.trim();
+    let inner = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    inner
+        .split(", ")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn rewrite_yarn_berry(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    if npm.is_empty() || !files.contains_key("yarn.lock") {
+        return;
+    }
+    let content = &files["yarn.lock"];
+    // The classic rewriter handles a v1 lock; berry stays out of its way.
+    if !Regex::new(r"(?m)^__metadata:").unwrap().is_match(content) {
+        return;
+    }
+
+    // Whole-file gates: refuse any lock whose cache checksum we can't reproduce
+    // offline. A guessed `checksum:` bricks installs (YN0018).
+    let key = berry_cache_key(content);
+    if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_yarn_berry_cache_unsupported".into(),
+            detail: format!(
+                "yarn.lock cacheKey is `{}`; only `{YARN_BERRY_SUPPORTED_CACHE_KEY}` \
+                 (yarn 4, compressionLevel 0 default) has an offline-reproducible cache checksum",
+                key.as_deref().unwrap_or("(missing)")
+            ),
+        });
+        return;
+    }
+    if let Some(rc) = files.get(".yarnrc.yml") {
+        if let Some(level) = yarnrc_compression_level(rc) {
+            if level != "0" {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_berry_cache_unsupported".into(),
+                    detail: format!(
+                        ".yarnrc.yml sets `compressionLevel: {level}`, which changes berry's \
+                         cache checksums; only compressionLevel 0 (the yarn 4 default) is supported"
+                    ),
+                });
+                return;
+            }
+        }
+    }
+
+    let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
+    let resolution_re = Regex::new(r#"\n {2}resolution: "[^"]*""#).unwrap();
+    let checksum_re = Regex::new(r"\n {2}checksum: [^\n]*").unwrap();
+    let mut changed = false;
+    for dep in &npm {
+        let fname = full_name(dep);
+        let Some(checksum) = dep.integrity.yarn_berry10c0.clone() else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_missing_checksum".into(),
+                detail: format!(
+                    "{fname}@{} has no yarnBerry10c0 cache checksum",
+                    dep.version
+                ),
+            });
+            continue;
+        };
+        // Berry versions are UNQUOTED (`  version: 1.3.0`, spike B3 ground truth).
+        let version_re =
+            Regex::new(&(String::from(r"\n {2}version: ") + &regex::escape(&dep.version) + "\n"))
+                .unwrap();
+        let mut matched_any = false;
+        for block in blocks.iter_mut() {
+            // A block's key is its first line up to a trailing colon; skip
+            // header comment blocks and the leading `__metadata` block.
+            let Some(first_line) = block.lines().next() else {
+                continue;
+            };
+            if first_line.starts_with([' ', '\t', '#']) || !first_line.ends_with(':') {
+                continue;
+            }
+            let raw_key = &first_line[..first_line.len() - 1];
+            if raw_key == "__metadata" {
+                continue;
+            }
+            let patterns = split_berry_key_patterns(raw_key);
+            let parsed: Vec<Option<(&str, &str)>> =
+                patterns.iter().map(|p| split_berry_descriptor(p)).collect();
+            // Every comma-joined pattern must parse as a descriptor.
+            if parsed.iter().any(Option::is_none) {
+                continue;
+            }
+            let names: std::collections::BTreeSet<&str> =
+                parsed.iter().map(|p| p.unwrap().0).collect();
+            if !names.contains(fname.as_str()) {
+                continue;
+            }
+            if names.len() > 1 {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_yarn_berry_ambiguous_entry".into(),
+                    detail: format!(
+                        "lock entry `{raw_key}` mixes {fname} with other descriptors; skipping"
+                    ),
+                });
+                continue;
+            }
+            if !version_re.is_match(block) {
+                continue;
+            }
+            // Rewrite the resolution wholesale from name+version — handles a
+            // pre-existing `::__archiveUrl=` (custom-registry lock) for free.
+            let resolution = format!(
+                "{fname}@npm:{}::__archiveUrl={}",
+                dep.version,
+                crate::utils::uri::encode_uri_component(&dep.artifact_url)
+            );
+            let mut rewritten = resolution_re
+                .replace(block, format!("\n  resolution: \"{resolution}\"").as_str())
+                .to_string();
+            if checksum_re.is_match(&rewritten) {
+                rewritten = checksum_re
+                    .replace(&rewritten, format!("\n  checksum: {checksum}").as_str())
+                    .to_string();
+            } else {
+                rewritten = resolution_re
+                    .replace(
+                        &rewritten,
+                        format!("\n  resolution: \"{resolution}\"\n  checksum: {checksum}")
+                            .as_str(),
+                    )
+                    .to_string();
+            }
+            matched_any = true;
+            if rewritten != *block {
+                result.edits.push(FileEdit {
+                    path: "yarn.lock".into(),
+                    kind: "redirect_yarn_berry_entry".into(),
+                    action: "rewritten".into(),
+                    key: Some(format!("{fname}@{}", dep.version)),
+                    original: Some(Value::String(block.clone())),
+                    new: Some(Value::String(rewritten.clone())),
+                });
+                *block = rewritten;
+                changed = true;
+            }
+        }
+        if !matched_any {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_yarn_berry_entry_not_found".into(),
+                detail: format!("no npm: lock entry resolving {fname}@{}", dep.version),
+            });
+        }
+    }
+    if changed {
+        result.files.insert("yarn.lock".into(), blocks.join("\n\n"));
+    }
+}
+
+// ── bun.lock (text lockfile) ─────────────────────────────────────────────────
+// A registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]` is
+// rewritten to a URL 3-tuple `["name@<artifactUrl>", {deps verbatim},
+// "<sha512>"]`: bun then fetches `<artifactUrl>` directly and verifies the SRI.
+// Binary `bun.lockb` is NEVER parsed — its presence (without a text `bun.lock`)
+// is a documented refusal. Uses the shared `bun_lock_text` grammar (fail-CLOSED
+// on any deviation). Byte-for-byte twin of the TS `rewriteBun`.
+fn rewrite_bun_lock(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    use crate::patch::bun_lock_text::{
+        check_lock_version, decode_json_string, parse_packages_section, split_name_spec,
+    };
+
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    if npm.is_empty() {
+        return;
+    }
+    // Binary lockfile without a text one: presence-only refusal. NEVER parse
+    // `.lockb` content. The CLI auto-migrates it to text before rewriting.
+    if files.contains_key("bun.lockb") && !files.contains_key("bun.lock") {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_bun_lockb_unsupported".into(),
+            detail: "bun.lockb is a binary lockfile; re-lock with a text lockfile \
+                     (`bun install --save-text-lockfile`) so the redirect can pin the hosted patch"
+                .into(),
+        });
+        return;
+    }
+    let Some(content) = files.get("bun.lock") else {
+        return;
+    };
+    if check_lock_version(content).is_err() {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_bun_lock_unsupported".into(),
+            detail: "bun.lock lockfileVersion is not 1; re-lock with bun >= 1.3".into(),
+        });
+        return;
+    }
+    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+    let entries = match parse_packages_section(&lines) {
+        Ok(entries) => entries,
+        Err(_) => {
+            // Fail-closed: never line-splice a lock whose packages section
+            // deviates from bun's emitted single-line grammar.
+            result.warnings.push(RewriteWarning {
+                code: "redirect_bun_lock_unsupported".into(),
+                detail: "bun.lock packages section is not in bun's emitted single-line shape"
+                    .into(),
+            });
+            return;
+        }
+    };
+
+    let mut changed = false;
+    for dep in &npm {
+        let fname = full_name(dep);
+        let Some(sha512) = dep.integrity.sha512.clone() else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_bun_missing_sha512".into(),
+                detail: format!("{fname}@{} has no sha512 integrity", dep.version),
+            });
+            continue;
+        };
+        let target_spec = format!("{fname}@{}", dep.version);
+        let url_spec = format!("{fname}@{}", dep.artifact_url);
+        for entry in &entries {
+            let Some(spec) = entry.elems.first().and_then(|e| decode_json_string(e)) else {
+                continue;
+            };
+            let deps_verbatim: String;
+            if entry.elems.len() == 4
+                && spec == target_spec
+                && decode_json_string(&entry.elems[1]).is_some()
+                && entry.elems[2].starts_with('{')
+                && decode_json_string(&entry.elems[3]).is_some()
+            {
+                // Registry 4-tuple → URL 3-tuple. Deps object preserved verbatim.
+                deps_verbatim = entry.elems[2].clone();
+            } else if entry.elems.len() == 3 && spec == url_spec {
+                // Already one of our URL 3-tuples for this exact URL. Idempotent
+                // if the integrity already matches; otherwise refresh it.
+                if entry.elems[2] == format!("\"{sha512}\"") {
+                    continue;
+                }
+                deps_verbatim = entry.elems[1].clone();
+            } else {
+                // `split_name_spec` guards a same-name-but-unowned entry (user
+                // file:/URL dep, other version) — never touched.
+                let _ = split_name_spec(&spec);
+                continue;
+            }
+            let original = lines[entry.line_idx].clone();
+            let rebuilt = format!(
+                "{indent}{key}: [{url}, {deps}, {integrity}]{comma}",
+                indent = entry.indent,
+                key = entry.key_raw,
+                url = serde_json::to_string(&url_spec).unwrap(),
+                deps = deps_verbatim,
+                integrity = serde_json::to_string(&sha512).unwrap(),
+                comma = if entry.trailing_comma { "," } else { "" },
+            );
+            if rebuilt == original {
+                continue;
+            }
+            lines[entry.line_idx] = rebuilt.clone();
+            result.edits.push(FileEdit {
+                path: "bun.lock".into(),
+                kind: "redirect_bun_lock_package".into(),
+                action: "rewritten".into(),
+                key: Some(entry.key.clone()),
+                original: Some(Value::String(original)),
+                new: Some(Value::String(rebuilt)),
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        result.files.insert("bun.lock".into(), lines.join("\n"));
     }
 }
 
@@ -2133,5 +2481,194 @@ mod tests {
             "must surface the continuation refusal: {:?}",
             result.warnings
         );
+    }
+
+    fn berry_override(name: &str, version: &str, url: &str, checksum: &str) -> DepOverride {
+        DepOverride {
+            integrity: Integrity {
+                yarn_berry10c0: Some(checksum.into()),
+                ..Default::default()
+            },
+            ..npm_override(name, version, url, "sha512-x==")
+        }
+    }
+
+    fn berry_lock(cache_key: &str) -> String {
+        format!(
+            "# header\n\n__metadata:\n  version: 8\n  cacheKey: {cache_key}\n\n\
+             \"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  resolution: \"left-pad@npm:1.3.0\"\n  \
+             checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
+            "3".repeat(128)
+        )
+    }
+
+    #[test]
+    fn yarn_berry_warning_branches() {
+        let checksum = format!("10c0/{}", "7".repeat(128));
+        let ovr = berry_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &checksum);
+
+        // A classic (v1) lock is declined silently — the classic rewriter owns it.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            "left-pad@^1.3.0:\n  version \"1.3.0\"\n  resolved \"https://x/lp.tgz\"\n  \
+             integrity sha512-y==\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        assert!(
+            r.files.is_empty() && r.warnings.is_empty(),
+            "classic declined"
+        );
+
+        // Unsupported cacheKey → refusal.
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("8c0"));
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
+
+        // .yarnrc.yml compressionLevel != 0 → refusal.
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        files.insert(
+            ".yarnrc.yml".to_string(),
+            "compressionLevel: 9\n".to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_cache_unsupported");
+
+        // Missing yarnBerry10c0 checksum → per-dep warning.
+        let mut files = BTreeMap::new();
+        files.insert("yarn.lock".to_string(), berry_lock("10c0"));
+        let no_checksum = DepOverride {
+            integrity: Integrity::default(),
+            ..ovr.clone()
+        };
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[no_checksum], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_missing_checksum");
+
+        // No npm: entry for the dep → not-found warning.
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(
+            &files,
+            &[berry_override(
+                "right-pad",
+                "9.9.9",
+                "http://p.test/rp.tgz",
+                &checksum,
+            )],
+            &mut r,
+        );
+        assert_eq!(r.warnings[0].code, "redirect_yarn_berry_entry_not_found");
+
+        // A genuinely mixed-name multi-descriptor key → ambiguous, skip block.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "yarn.lock".to_string(),
+            format!(
+                "# header\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n\
+                 \"left-pad@npm:^1.3.0, right-pad@npm:^1.0.0\":\n  version: 1.3.0\n  \
+                 resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/{}\n  languageName: node\n  \
+                 linkType: hard\n",
+                "3".repeat(128)
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_yarn_berry(&files, &[ovr], &mut r);
+        assert!(r.files.is_empty());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_yarn_berry_ambiguous_entry"));
+    }
+
+    fn bun_lock_file(entry: &str, version: u64) -> String {
+        format!(
+            "{{\n  \"lockfileVersion\": {version},\n  \"packages\": {{\n    {entry}\n  }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn bun_lock_warning_branches() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+
+        // bun.lockb without a bun.lock → presence-only refusal (never parsed).
+        let mut files = BTreeMap::new();
+        files.insert("bun.lockb".to_string(), "BINARY-NEVER-PARSED".to_string());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_lockb_unsupported");
+
+        // Both present → text lock wins, no lockb warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                1,
+            ),
+        );
+        files.insert("bun.lockb".to_string(), "BINARY".to_string());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.contains_key("bun.lock"));
+        assert!(!r
+            .warnings
+            .iter()
+            .any(|w| w.code == "redirect_bun_lockb_unsupported"));
+
+        // Unsupported lockfileVersion → refusal.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                2,
+            ),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
+
+        // Non-single-line packages section → fail-closed refusal.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            "{\n  \"lockfileVersion\": 1,\n  \"packages\": {\n    \"left-pad\": [\n      \
+             \"left-pad@1.3.0\"\n    ],\n  }\n}\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[ovr.clone()], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
+
+        // Missing sha512 → per-dep warning.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(
+                "\"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                1,
+            ),
+        );
+        let no_sha = DepOverride {
+            integrity: Integrity::default(),
+            ..ovr
+        };
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, &[no_sha], &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_missing_sha512");
     }
 }

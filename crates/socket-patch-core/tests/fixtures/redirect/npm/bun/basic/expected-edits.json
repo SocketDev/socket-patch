@@ -1,0 +1,10 @@
+[
+  {
+    "path": "bun.lock",
+    "kind": "redirect_bun_lock_package",
+    "action": "rewritten",
+    "key": "left-pad",
+    "original": "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLD==\"],",
+    "new": "    \"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz\", {}, \"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"],"
+  }
+]

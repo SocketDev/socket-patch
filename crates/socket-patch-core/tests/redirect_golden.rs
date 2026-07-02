@@ -23,6 +23,8 @@ const RUST_IMPLEMENTED: &[&str] = &[
     "npm/package-lock-v3",
     "npm/pnpm",
     "npm/yarn-classic",
+    "npm/yarn-berry",
+    "npm/bun",
     "pypi/requirements",
     "pypi/uv",
     "cargo/cargo",

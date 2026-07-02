@@ -1,0 +1,14 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "consumer",
+      "dependencies": {
+        "left-pad": "^1.3.0"
+      }
+    }
+  },
+  "packages": {
+    "haspad/left-pad": ["left-pad@1.3.0", "", {}, "sha512-OLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLD=="],
+  }
+}
