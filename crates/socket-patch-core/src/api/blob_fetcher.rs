@@ -447,6 +447,12 @@ pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
 /// makes the final path always either the complete bytes or absent, never a
 /// torn intermediate, matching the stage+rename discipline used by the
 /// patch-apply and copy-on-write write paths.
+///
+/// Deliberately LIGHTER than [`crate::utils::fs::atomic_write_bytes`] (no
+/// file fsync, no dir fsync, `.socket-dl-` prefix): these are re-downloadable
+/// content-addressed cache entries, not user-owned files — post-crash loss
+/// of a cache entry is harmless, so the extra durability isn't worth the
+/// I/O. Do not "consolidate" this into the hardened writer.
 async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = dest.parent().ok_or_else(|| {
         std::io::Error::new(

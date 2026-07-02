@@ -8,53 +8,11 @@ use super::detect::{
 
 /// Atomically write `content` to `path`.
 ///
-/// A bare `fs::write` truncates the target before writing, so a crash, power
-/// loss, or interrupted process mid-write would leave the user's
-/// `package.json` truncated or empty — destroying the file we only meant to
-/// append two scripts to. Instead we write to a sibling stage file, fsync it,
-/// then rename over the target (rename is atomic on the same filesystem) so the
-/// reader ever sees either the old bytes or the complete new bytes. Mirrors the
-/// hardened writer in `manifest/operations.rs`.
+/// The user's `package.json` must never be left torn by a crash mid-write
+/// when we only meant to append two scripts. Delegates to the crate-wide
+/// hardened writer.
 async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "package.json".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory
-    // so the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
 }
 
 /// Result of updating a single package.json.

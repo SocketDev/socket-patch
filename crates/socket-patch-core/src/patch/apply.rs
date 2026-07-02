@@ -553,61 +553,12 @@ async fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     None
 }
 
-/// Write `content` to `target` atomically via stage + rename.
-///
-/// Two-phase commit:
-///   1. Create `<parent>/.socket-stage-<filename>-<uuid>` (leading dot
-///      so editor globs ignore it; uuid suffix so concurrent callers
-///      never collide — defense in depth on top of the apply lock).
-///   2. `write_all` the content, then `sync_all()` so the bytes are
-///      durably on disk before the rename.
-///   3. `rename(stage, target)` — atomic on POSIX, best-effort on
-///      Windows. On failure unlink the stage so we don't leave a
-///      dotfile behind in the package directory.
+/// Write `content` to `target` atomically via stage + rename, so a patched
+/// package file is only ever seen as the complete old or complete new
+/// bytes. Delegates to the crate-wide hardened writer (permissions/chown
+/// are restored separately by [`restore_file_permissions`]).
 async fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let stem = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "anon".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, target).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // Durability: `sync_all` above flushed the file's *data*, but the
-    // rename only updated the parent directory entry. fsync the
-    // directory so the rename itself survives a crash — otherwise a
-    // post-crash filesystem could surface the old name (or neither).
-    // Unix only; best-effort, since a directory we can't open for fsync
-    // must not fail an otherwise-successful write.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(target, content).await
 }
 
 /// Restore the post-write permission state on `filepath`.

@@ -104,48 +104,7 @@ pub async fn write_manifest(
     let path = path.as_ref();
     let content = serde_json::to_string_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "manifest.json".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // Durability: `sync_all` flushed the file's data, but the rename only
-    // updated the parent directory entry. fsync the directory so the rename
-    // itself survives a crash. Unix only; best-effort, since a directory we
-    // can't open for fsync must not fail an otherwise-successful write.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
 }
 
 #[cfg(test)]

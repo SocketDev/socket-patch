@@ -540,50 +540,12 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
     atomic_write(&go_mod, format!("module {module}\n").as_bytes()).await
 }
 
-/// Atomically commit `content` to `path` via stage + fsync + rename. Mirrors the
-/// hardened writer in [`crate::patch::go_mod_edit`]: a reader/recovering process
-/// only ever sees the complete old or complete new bytes, never a truncated
-/// intermediate.
+/// Atomically commit `content` to `path` via stage + fsync + rename, so a
+/// reader/recovering process only ever sees the complete old or complete
+/// new bytes of a synthesized `go.mod`. Delegates to the crate-wide
+/// hardened writer.
 async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "go.mod".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-
-    // The rename only updated the parent directory entry; fsync the directory so
-    // the rename itself survives a crash. Best-effort, Unix only.
-    #[cfg(unix)]
-    {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    Ok(())
+    crate::utils::fs::atomic_write_bytes(path, content).await
 }
 
 fn synthesized_result(
