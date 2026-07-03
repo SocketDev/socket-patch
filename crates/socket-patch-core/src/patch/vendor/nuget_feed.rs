@@ -41,28 +41,26 @@
 //! the artifact removes the uuid dir; a lock-write failure additionally unwinds
 //! the config to its recorded pre-vendor bytes, so the pair is never half-wired.
 
-use std::collections::HashMap;
-use std::io::Read as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest as _, Sha512};
 
-use crate::manifest::schema::{PatchFileInfo, PatchRecord};
-use crate::patch::apply::{
-    is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
-};
+use crate::manifest::schema::PatchRecord;
+use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
-use super::common::{already_patched_verify, refused, synthesized_result};
+use super::common::{
+    already_patched_result, done, failed_result, insert_before, rebuild_zip, refused,
+    synthesized_result, zip_matches_after_hashes,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
-use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -81,9 +79,6 @@ const PACKAGES_LOCK: &str = "packages.lock.json";
 const CONFIG_SOURCE_WIRING_KIND: &str = "nuget_config_source";
 const CONFIG_MAPPING_WIRING_KIND: &str = "nuget_config_mapping";
 const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
-
-/// Marker schema version written into `socket-patch.vendor.json`.
-const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// The embedded package signature part; dropped from the rebuilt nupkg so the
 /// patched (content-changed) package reads as unsigned rather than
@@ -206,11 +201,11 @@ pub async fn vendor_nuget(
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &nupkg_path, Vec::new(), true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        return done(
+            synthesized_result(purl, &nupkg_path, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        );
     }
 
     let config_path = existing_config_path(project_root).await;
@@ -248,7 +243,7 @@ pub async fn vendor_nuget(
         .as_deref()
         .is_some_and(|t| t.contains(&source_key));
     if config_wired {
-        let nupkg_ok = nupkg_matches_after_hashes(&nupkg_path, &record.files).await;
+        let nupkg_ok = zip_matches_after_hashes(&nupkg_path, &record.files).await;
         let lock_ok = match &lock_text {
             None => true,
             Some(text) => match tokio::fs::read(&nupkg_path).await {
@@ -257,23 +252,17 @@ pub async fn vendor_nuget(
             },
         };
         if nupkg_ok && lock_ok {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            return VendorOutcome::Done {
-                result: synthesized_result(purl, &nupkg_path, verified, true, None),
-                entry: None,
-                warnings: Vec::new(),
-            };
+            return done(
+                already_patched_result(purl, &nupkg_path, &record.files),
+                None,
+                Vec::new(),
+            );
         }
         // Wired but the committed nupkg is missing/stale: rebuild the ARTIFACT
         // only (and re-pin the lock at the rebuilt bytes). The config is
         // already correct and the full path would re-record the live vendored
         // fragments as `original`, breaking a later `--revert`.
         if !dry_run {
-            check_service_offline_conflict(service);
             let mut warnings: Vec<VendorWarning> = Vec::new();
             let (bytes, mut result) = match materialise_patched_nupkg(
                 purl,
@@ -294,11 +283,7 @@ pub async fn vendor_nuget(
                 Err(outcome) => return *outcome,
             };
             if !result.success {
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
             // Re-pin the lock at the rebuilt bytes (the config is untouched).
             if let Some(text) = &lock_text {
@@ -308,11 +293,7 @@ pub async fn vendor_nuget(
                         let _ = remove_tree(&uuid_dir).await;
                         result.success = false;
                         result.error = Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
-                        return VendorOutcome::Done {
-                            result,
-                            entry: None,
-                            warnings,
-                        };
+                        return done(result, None, warnings);
                     }
                 }
             }
@@ -323,11 +304,7 @@ pub async fn vendor_nuget(
                      rebuilt at {copy_rel} (nuget.config untouched)"
                 ),
             ));
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
         // Dry runs fall through to the verify-only preview below.
     }
@@ -348,15 +325,10 @@ pub async fn vendor_nuget(
         )
         .await;
         result.package_path = nupkg_path.display().to_string();
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings: dry_warnings,
-        };
+        return done(result, None, dry_warnings);
     }
 
     // ── materialise the patched nupkg (service download / local rebuild) ──
-    check_service_offline_conflict(service);
     let mut warnings: Vec<VendorWarning> = Vec::new();
     let (nupkg_bytes, mut result) = match materialise_patched_nupkg(
         purl,
@@ -379,11 +351,7 @@ pub async fn vendor_nuget(
     if !result.success {
         // The rebuild left the result un-successful (and cleaned up its own
         // partial artifact); no project file was touched.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     result.package_path = nupkg_path.display().to_string();
     let new_hash = content_hash(&nupkg_bytes);
@@ -396,11 +364,7 @@ pub async fn vendor_nuget(
                 let _ = remove_tree(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(detail);
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
         };
     let config_target = config_path
@@ -410,11 +374,7 @@ pub async fn vendor_nuget(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", config_target.display()));
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     // ── packages.lock.json pinning (a failure here unwinds the config) ────
@@ -426,11 +386,7 @@ pub async fn vendor_nuget(
                     unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
                     result.success = false;
                     result.error = Some(format!("failed to write {PACKAGES_LOCK}: {e}"));
-                    return VendorOutcome::Done {
-                        result,
-                        entry: None,
-                        warnings,
-                    };
+                    return done(result, None, warnings);
                 }
                 lock_record = Some(WiringRecord {
                     file: PACKAGES_LOCK.to_string(),
@@ -457,11 +413,7 @@ pub async fn vendor_nuget(
                 unwind_config(&config_target, config_text.as_deref(), &uuid_dir).await;
                 result.success = false;
                 result.error = Some(detail);
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
         }
     } else {
@@ -476,16 +428,7 @@ pub async fn vendor_nuget(
 
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_nuget_purl(name, version);
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "nuget".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("nuget", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // Informational only (state.json is the ledger of record) — a marker
         // failure must not fail an otherwise-wired vendor.
@@ -500,8 +443,14 @@ pub async fn vendor_nuget(
     // `Rewritten` (revert restores `original`); when we created it, an `Added`
     // (revert deletes the file). The mapping record is audit-only.
     let created_config = config_text.is_none();
+    // Both records name the config by its basename (nuget.config always sits
+    // at the project root).
+    let config_rel = config_target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "nuget.config".to_string());
     let source_record = WiringRecord {
-        file: config_file_rel(&config_target, project_root),
+        file: config_rel.clone(),
         kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
         action: if created_config {
             WiringAction::Added
@@ -513,7 +462,7 @@ pub async fn vendor_nuget(
         new: Some(Value::String(config_edit.new_text.clone())),
     };
     let mapping_record = WiringRecord {
-        file: config_file_rel(&config_target, project_root),
+        file: config_rel,
         kind: CONFIG_MAPPING_WIRING_KIND.to_string(),
         action: WiringAction::Added,
         key: Some(name.to_string()),
@@ -553,11 +502,7 @@ pub async fn vendor_nuget(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Revert a NuGet vendor entry: undo the lock pin, restore/delete the
@@ -662,24 +607,19 @@ async fn materialise_patched_nupkg(
     service: Option<&VendorServiceConfig>,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    match nuget_service_copy(service, record, name, warnings).await {
-        NugetServiceCopy::Used(bytes) => {
+    match service_archive_copy(service, &record.uuid, name, ".nupkg", warnings).await {
+        ServiceCopy::Used(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 let _ = remove_tree(uuid_dir).await;
                 return Err(Box::new(refused("vendor_prebuilt_write_failed", e)));
             }
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
             Ok((
                 bytes,
-                synthesized_result(purl, nupkg_path, verified, true, None),
+                already_patched_result(purl, nupkg_path, &record.files),
             ))
         }
-        NugetServiceCopy::HardFail(outcome) => Err(outcome),
-        NugetServiceCopy::FallBack => {
+        ServiceCopy::HardFail(outcome) => Err(outcome),
+        ServiceCopy::FallBack => {
             local_rebuild(
                 purl,
                 installed_dir,
@@ -780,7 +720,8 @@ async fn local_rebuild(
     // plain OPC zip; NuGet reads the central directory, so entry order is free
     // to be lexicographic for stable bytes across re-runs).
     let stage_path = stage.path().to_path_buf();
-    let rezip = tokio::task::spawn_blocking(move || rebuild_nupkg(&stage_path)).await;
+    let rezip =
+        tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART))).await;
     let nupkg_bytes = match rezip {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
@@ -802,84 +743,6 @@ async fn local_rebuild(
         return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
     }
     Ok((nupkg_bytes, result))
-}
-
-/// Outcome of attempting to materialise the nupkg from the patch service.
-enum NugetServiceCopy {
-    /// The prebuilt patched `.nupkg` bytes (write them verbatim).
-    Used(Vec<u8>),
-    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
-    HardFail(Box<VendorOutcome>),
-    /// Fall back to the local rebuild.
-    FallBack,
-}
-
-/// Download + integrity-verify the prebuilt patched `.nupkg` (Tier A: the
-/// verified archive bytes ARE the vendored nupkg). Maps each service outcome
-/// onto the `auto` / `service` fallback policy.
-async fn nuget_service_copy(
-    service: Option<&VendorServiceConfig>,
-    record: &PatchRecord,
-    name: &str,
-    warnings: &mut Vec<VendorWarning>,
-) -> NugetServiceCopy {
-    let Some(cfg) = service else {
-        return NugetServiceCopy::FallBack;
-    };
-    if !cfg.service_enabled() {
-        return NugetServiceCopy::FallBack;
-    }
-    fn hard(code: &'static str, detail: String) -> NugetServiceCopy {
-        NugetServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
-    }
-    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
-        if cfg.source.requires_service() {
-            hard("vendor_prebuilt_required", reason)
-        } else {
-            warnings.push(VendorWarning::new(
-                code,
-                format!("{reason}; building locally instead"),
-            ));
-            NugetServiceCopy::FallBack
-        }
-    };
-    match fetch_verified_archive(cfg, &record.uuid, name).await {
-        ServiceArtifact::Ready(archive) => {
-            warnings.push(VendorWarning::new(
-                "vendor_prebuilt_downloaded",
-                format!(
-                    "vendored {name} from the patch service ({})",
-                    archive.source_url
-                ),
-            ));
-            NugetServiceCopy::Used(archive.bytes)
-        }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
-            "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt .nupkg failed integrity ({reason})"),
-        ),
-        ServiceArtifact::Pending => miss(
-            warnings,
-            "vendor_prebuilt_pending",
-            "prebuilt .nupkg is still building".to_string(),
-        ),
-        ServiceArtifact::Unavailable(reason) => {
-            if cfg.source.requires_service() {
-                hard(
-                    "vendor_prebuilt_required",
-                    format!("prebuilt .nupkg unavailable: {reason}"),
-                )
-            } else {
-                NugetServiceCopy::FallBack
-            }
-        }
-        ServiceArtifact::Failed(reason) => miss(
-            warnings,
-            "vendor_prebuilt_unavailable",
-            format!("patch service request failed ({reason})"),
-        ),
-    }
 }
 
 /// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
@@ -912,85 +775,6 @@ async fn locate_cached_nupkg(installed_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Re-zip the patched stage into a deterministic `.nupkg`: entries sorted
-/// lexicographically, a fixed timestamp, and a fixed deflate level so
-/// rebuilding the same patched tree always yields identical bytes (and thus a
-/// stable `contentHash`, churn-free commits). The embedded `.signature.p7s`
-/// part is dropped — the content changed, so the package is no longer the
-/// signed original and must read as unsigned.
-fn rebuild_nupkg(stage: &Path) -> Result<Vec<u8>, String> {
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    for entry in walkdir::WalkDir::new(stage).follow_links(false) {
-        let entry = entry.map_err(|e| format!("walk {}: {e}", stage.display()))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(stage)
-            .map_err(|e| format!("strip prefix: {e}"))?;
-        let name = rel.to_string_lossy().replace('\\', "/");
-        if name == SIGNATURE_PART {
-            continue;
-        }
-        let bytes = std::fs::read(entry.path()).map_err(|e| format!("read {name}: {e}"))?;
-        entries.push((name, bytes));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    for (name, bytes) in &entries {
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(zip::DateTime::default())
-            .unix_permissions(0o644);
-        writer
-            .start_file(name, options)
-            .map_err(|e| format!("zip start {name}: {e}"))?;
-        writer
-            .write_all(bytes)
-            .map_err(|e| format!("zip write {name}: {e}"))?;
-    }
-    let cursor = writer.finish().map_err(|e| format!("zip finish: {e}"))?;
-    Ok(cursor.into_inner())
-}
-
-/// True when the committed nupkg exists and every patched file in it already
-/// hashes to its `afterHash` (the vendor twin of composer's
-/// `copy_matches_after_hashes`, reading the nupkg's zip entries).
-async fn nupkg_matches_after_hashes(
-    nupkg_path: &Path,
-    files: &HashMap<String, PatchFileInfo>,
-) -> bool {
-    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    let Ok(bytes) = tokio::fs::read(nupkg_path).await else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-        return false;
-    };
-    for (file_name, info) in files {
-        let normalized = normalize_file_path(file_name);
-        // SECURITY: never look up a key that escapes the package dir — treat
-        // it as out-of-sync (the full pipeline would refuse it anyway).
-        if !is_safe_relative_subpath(normalized) {
-            return false;
-        }
-        let Ok(mut entry) = archive.by_name(normalized) else {
-            return false;
-        };
-        let mut content = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut content).is_err() {
-            return false;
-        }
-        if compute_git_sha256_from_bytes(&content) != info.after_hash {
-            return false;
-        }
-    }
-    true
-}
-
 // ── nuget.config editing ───────────────────────────────────────────────────────
 
 /// The planned config edit: the whole new file text plus the mapping fragment
@@ -1010,15 +794,6 @@ async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// The project-relative, forward-slashed name of the config file (its basename;
-/// nuget.config always sits at the project root).
-fn config_file_rel(config_path: &Path, _project_root: &Path) -> String {
-    config_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "nuget.config".to_string())
 }
 
 /// Build the wired `nuget.config` text. Creating from scratch seeds the default
@@ -1139,21 +914,6 @@ fn build_config_edit(
             })
         }
     }
-}
-
-/// Insert `insertion` (already newline-terminated) immediately before the line
-/// containing the first occurrence of `needle`. Returns `None` if `needle` is
-/// absent.
-fn insert_before(haystack: &str, needle: &str, insertion: &str) -> Option<String> {
-    let idx = haystack.find(needle)?;
-    // Back up to the start of the needle's line so the insertion lands on its
-    // own line(s) directly above.
-    let line_start = haystack[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
-    let mut out = String::with_capacity(haystack.len() + insertion.len());
-    out.push_str(&haystack[..line_start]);
-    out.push_str(insertion);
-    out.push_str(&haystack[line_start..]);
-    Some(out)
 }
 
 /// Extract the `key` attribute of every `<add ... />` element inside
@@ -1456,16 +1216,6 @@ async fn revert_lock_record(
     Ok(true)
 }
 
-// ── shared helpers ──────────────────────────────────────────────────────────────
-
-/// If a service run needs the network but `--offline` is set, that conflict is
-/// surfaced by the CLI layer's `--offline` gate; the backend only needs the
-/// service enabled/disabled decision (`service_enabled()` already returns false
-/// when offline), so this is a no-op guard kept for parity with the other
-/// backends' explicit conflict refusal. Left as a thin marker so the offline
-/// contract is visible at each entry point.
-fn check_service_offline_conflict(_service: Option<&VendorServiceConfig>) {}
-
 /// Restore the config to its pre-vendor state (or delete a created file) after
 /// a later wiring step failed, then remove the partial uuid dir.
 async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &Path) {
@@ -1480,14 +1230,14 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
     let _ = remove_tree(uuid_dir).await;
 }
 
-fn failed_result(purl: &str, nupkg_path: &Path, error: String) -> ApplyResult {
-    synthesized_result(purl, nupkg_path, Vec::new(), false, Some(error))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::io::{Read as _, Write as _};
+
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::manifest::schema::PatchFileInfo;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use serde_json::json;
 

@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::is_executable;
+
 /// npm's fixed tar entry mtime: `1985-10-26T08:15:00Z`. Every `npm pack`
 /// tarball carries this timestamp (npm pins it for reproducible packs);
 /// reusing it keeps our artifacts byte-deterministic AND familiar to any
@@ -169,19 +171,6 @@ fn collect_regular_files(staged_dir: &Path) -> std::io::Result<Vec<(String, Path
         ));
     }
     Ok(files)
-}
-
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
 }
 
 #[cfg(test)]

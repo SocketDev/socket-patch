@@ -24,7 +24,8 @@ use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
 use super::cargo_lock::{self, LockEditError};
 use super::common::{
-    already_patched_verify, copy_matches_after_hashes, refused, synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
+    synthesized_result,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_tgz;
@@ -77,18 +78,6 @@ async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel
         cargo_lock::detach_lock_entry(project_root, name, version, true).await,
         Err(LockEditError::NotRegistry) | Err(LockEditError::NoLockfile)
     )
-}
-
-fn done(
-    result: ApplyResult,
-    entry: Option<VendorEntry>,
-    warnings: Vec<VendorWarning>,
-) -> VendorOutcome {
-    VendorOutcome::Done {
-        result,
-        entry,
-        warnings,
-    }
 }
 
 /// Outcome of attempting to materialise the cargo copy from the patch service.
@@ -388,13 +377,8 @@ pub async fn vendor_cargo_crate(
     // existing ledger record, which holds the unrecoverable lock originals).
     if wiring_in_sync(project_root, name, version, &copy_rel).await {
         if copy_matches_after_hashes(&copy_dir, &record.files).await {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
             return done(
-                synthesized_result(purl, &copy_dir, verified, true, None),
+                already_patched_result(purl, &copy_dir, &record.files),
                 None,
                 Vec::new(),
             );
@@ -438,13 +422,8 @@ pub async fn vendor_cargo_crate(
     // `.cargo-checksum.json` (cargo 1.93 src dirs no longer have one, but
     // older layouts do and its presence would re-enable checksum fixups).
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return refused(
-                "vendor_service_offline_conflict",
-                "--vendor-source=service needs the network but --offline is set",
-            );
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
     let mut result = match cargo_service_copy(
         service,
@@ -459,12 +438,7 @@ pub async fn vendor_cargo_crate(
         CargoServiceCopy::Used => {
             // The service crate is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            synthesized_result(purl, &copy_dir, verified, true, None)
+            already_patched_result(purl, &copy_dir, &record.files)
         }
         CargoServiceCopy::HardFail(outcome) => return *outcome,
         CargoServiceCopy::FallBack => {
@@ -536,16 +510,7 @@ pub async fn vendor_cargo_crate(
 
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "cargo".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("cargo", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // The marker is belt-and-braces metadata (never a trust input); a
         // failed write must not undo a fully-wired vendor — surface it.

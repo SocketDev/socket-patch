@@ -30,8 +30,8 @@ use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
-use super::common::{already_patched_verify, synthesized_result};
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
+use super::common::{already_patched_result, detect_eol, refused};
+use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -224,13 +224,8 @@ pub async fn vendor_yarn_classic(
         // Every block already points at this uuid with the packed hashes:
         // in sync. Touch nothing (the tarball re-pack above was
         // byte-identical by determinism) and synthesize AlreadyPatched.
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
         return VendorOutcome::Done {
-            result: synthesized_result(purl, &dest, verified, true, None),
+            result: already_patched_result(purl, &dest, &record.files),
             entry: None,
             warnings,
         };
@@ -241,16 +236,7 @@ pub async fn vendor_yarn_classic(
     }
 
     // ── 9. Marker + ledger entry ──────────────────────────────────────────
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "npm".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
         warnings.push(VendorWarning::new(
             "vendor_marker_write_failed",
@@ -635,16 +621,6 @@ fn is_key_line(s: &str) -> bool {
 
 fn is_body_line(s: &str) -> bool {
     s.starts_with(' ') || s.starts_with('\t')
-}
-
-/// The file's dominant line terminator (new lines we write use it; bytes
-/// outside edited blocks keep whatever they had).
-pub(super) fn detect_eol(text: &str) -> &'static str {
-    if text.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
 }
 
 /// Splice `new_lines` over `block`'s byte range, preserving every byte

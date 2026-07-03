@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
-use crate::patch::apply::{ApplyResult, PatchSources, VerifyResult};
+use crate::patch::apply::{MismatchPolicy, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
@@ -29,7 +29,10 @@ use crate::patch::go_redirect::{
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
-use super::common::{already_patched_verify, copy_matches_after_hashes, synthesized_result};
+use super::common::{
+    already_patched_result, copy_matches_after_hashes, done, failed_result, refused,
+    service_offline_conflict,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip_with_prefix;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -37,18 +40,6 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
-
-/// A synthesized success [`ApplyResult`] for a service-downloaded module: there
-/// is no local apply to verify (the downloaded zip IS the patched module), so
-/// every patched file reads as `AlreadyPatched` — trust is the verified service
-/// integrity (sha512 + the `h1:` module dirhash).
-fn synthesized_success(
-    purl: &str,
-    copy_dir: &Path,
-    files_verified: Vec<VerifyResult>,
-) -> ApplyResult {
-    synthesized_result(purl, copy_dir, files_verified, true, None)
-}
 
 /// Vendor one Go module: patched copy in the uuid dir + a vendor-owned
 /// `replace` directive + marker, returning the ledger entry to persist.
@@ -75,10 +66,7 @@ pub async fn vendor_go_module(
 ) -> VendorOutcome {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!("not a golang purl: {purl}"),
-        };
+        return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
     };
     // SECURITY: `module`+`version` key the on-disk copy dir
     // (`.socket/vendor/golang/<uuid>/<module>@<version>/`) and the `replace`
@@ -86,25 +74,25 @@ pub async fn vendor_go_module(
     // manifest PURL would let the copy escape `.socket/vendor/` — refuse
     // before any disk access (same guard the redirect engine applies).
     if !are_safe_redirect_coords(module, version) {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor unsafe golang coordinates `{module}`/`{version}` \
                  (a `..` segment, absolute path, or separator would escape \
                  .socket/vendor/golang/)"
             ),
-        };
+        );
     }
     // SECURITY: the uuid is a dedicated path level created here and deleted by
     // `--revert`; anything but the canonical UUID grammar is rejected.
     let Some(base_rel) = vendor_uuid_dir_rel("golang", &record.uuid) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor {purl}: patch uuid `{}` is not a canonical uuid",
                 record.uuid
             ),
-        };
+        );
     };
 
     // Detect an existing socket-owned directive BEFORE the engine rewrites it:
@@ -129,23 +117,9 @@ pub async fn vendor_go_module(
     let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
     let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
-    // Vendor auto-force policy (the engine's copy is staged from the
-    // pristine source, never the user's tree — see `force_apply_staged`):
-    // missing patch targets still fail closed unless the caller's own
-    // `--force` asked for the skip tolerance, then the engine apply runs
-    // forced so a beforeHash mismatch (already-applied module, or a patch
-    // built against different bytes) overwrites with the verified patched
-    // content. The engine is shared with the in-place `apply` redirect
-    // path, whose strict semantics stay unchanged.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return VendorOutcome::Refused {
-                code: "vendor_service_offline_conflict",
-                detail: "--vendor-source=service needs the network but --offline is set"
-                    .to_string(),
-            };
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
 
     // Acquire the patched module: prefer the prebuilt module zip from the patch
@@ -165,31 +139,34 @@ pub async fn vendor_go_module(
     .await
     {
         GoServiceRedirect::Used => {
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            synthesized_success(purl, &copy_dir, verified)
+            // No local apply to verify (the downloaded zip IS the patched
+            // module), so every patched file reads as `AlreadyPatched` — trust
+            // is the verified service integrity (sha512 + the `h1:` dirhash).
+            already_patched_result(purl, &copy_dir, &record.files)
         }
         GoServiceRedirect::HardFail(outcome) => return *outcome,
         GoServiceRedirect::FallBack => {
             // Vendor auto-force policy (the engine's copy is staged from the
-            // pristine source, never the user's tree): missing patch targets
-            // still fail closed unless the caller's own `--force` asked for the
-            // skip tolerance.
+            // pristine source, never the user's tree — see `force_apply_staged`):
+            // missing patch targets still fail closed unless the caller's own
+            // `--force` asked for the skip tolerance, then the engine apply runs
+            // forced so a beforeHash mismatch (already-applied module, or a
+            // patch built against different bytes) overwrites with the verified
+            // patched content. The engine is shared with the in-place `apply`
+            // redirect path, whose strict semantics stay unchanged.
             if !force {
                 let missing =
                     super::missing_existing_patch_files(pristine_src, &record.files).await;
                 if let Some(first) = missing.first() {
-                    return VendorOutcome::Done {
-                        result: super::failed_apply_result(
+                    return done(
+                        failed_result(
                             purl,
+                            Path::new(""),
                             format!("Cannot apply patch: {first} - File not found"),
                         ),
-                        entry: None,
+                        None,
                         warnings,
-                    };
+                    );
                 }
             }
             // The engine does the heavy lifting: fresh copy → hardened apply
@@ -206,7 +183,7 @@ pub async fn vendor_go_module(
                 sources,
                 Some(&record.uuid),
                 dry_run,
-                crate::patch::apply::MismatchPolicy::Force,
+                MismatchPolicy::Force,
             )
             .await;
             if result.success {
@@ -217,11 +194,7 @@ pub async fn vendor_go_module(
     };
 
     if dry_run {
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     if !result.success {
         // The engine already rolled back a half-built copy, but its rollback
@@ -229,20 +202,12 @@ pub async fn vendor_go_module(
         // path husks (or a copy left by a failed `replace` upsert) linger
         // under `.socket/vendor/golang/`.
         let _ = remove_tree(&project_root.join(&base_rel)).await;
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     // A patch with no files is a no-op success: the engine wrote no copy and
     // no `replace`, so there is nothing to record or mark.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     if wired {
@@ -253,16 +218,8 @@ pub async fn vendor_go_module(
             // A wholesale-deleted uuid dir lost the informational marker;
             // restore it alongside the rebuilt copy (never a trust input —
             // a failed write only warns).
-            let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-            vulnerabilities.sort();
-            let marker = VendorMarker {
-                schema_version: 1,
-                purl: strip_purl_qualifiers(purl).to_string(),
-                patch_uuid: record.uuid.clone(),
-                ecosystem: "golang".to_string(),
-                vulnerabilities,
-                vendored_at: vendored_at.to_string(),
-            };
+            let marker =
+                VendorMarker::new("golang", strip_purl_qualifiers(purl), record, vendored_at);
             if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
                 warnings.push(VendorWarning::new(
                     "marker_write_failed",
@@ -277,11 +234,7 @@ pub async fn vendor_go_module(
                 ),
             ));
         }
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     if takeover {
@@ -317,16 +270,7 @@ pub async fn vendor_go_module(
 
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "golang".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("golang", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
         // The marker is belt-and-braces metadata (never a trust input); a
         // failed write must not undo a fully-wired vendor — surface it.
@@ -374,11 +318,7 @@ pub async fn vendor_go_module(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 /// Outcome of attempting to materialise the go copy from the patch service.
@@ -416,7 +356,7 @@ async fn go_service_redirect(
         return GoServiceRedirect::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> GoServiceRedirect {
-        GoServiceRedirect::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        GoServiceRedirect::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -570,7 +510,6 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
-    use crate::patch::apply::MismatchPolicy;
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -842,9 +781,7 @@ mod tests {
         let copy1 = tokio::fs::read(&copy).await.unwrap();
         let mod1 = tokio::fs::read(&gomod).await.unwrap();
 
-        crate::patch::copy_tree::remove_tree(&root.join(copy_rel()))
-            .await
-            .unwrap();
+        remove_tree(&root.join(copy_rel())).await.unwrap();
 
         let (result, entry, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);

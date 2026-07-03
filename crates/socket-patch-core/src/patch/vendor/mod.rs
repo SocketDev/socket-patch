@@ -65,7 +65,7 @@ pub mod maven_repo;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
-pub mod npm_pack;
+mod npm_pack;
 #[cfg(feature = "nuget")]
 pub mod nuget_feed;
 pub mod pnpm_lock;
@@ -73,9 +73,9 @@ pub mod pypi;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;
 pub mod pypi_poetry;
-pub mod pypi_requirements;
-pub mod pypi_uv;
-pub mod pypi_wheel;
+mod pypi_requirements;
+mod pypi_uv;
+mod pypi_wheel;
 pub mod registry_fetch;
 pub(crate) mod service_fetch;
 mod toml_surgery;
@@ -83,11 +83,11 @@ pub mod verify;
 pub mod yarn_berry_lock;
 pub mod yarn_classic_lock;
 
-pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
+pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub use state::{load_state, lookup_entry, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
 pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
@@ -95,6 +95,7 @@ use crate::patch::apply::{
     apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
     VerifyStatus,
 };
+use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
 /// reason tag from the CLI contract; `detail` is human text).
@@ -270,21 +271,6 @@ pub(crate) async fn missing_existing_patch_files(
     missing
 }
 
-/// A failed synthesized [`ApplyResult`] in the shape the strict apply
-/// pipeline would have produced (success=false, `error` set, no files).
-pub(crate) fn failed_apply_result(purl: &str, error: String) -> ApplyResult {
-    ApplyResult {
-        package_key: purl.to_string(),
-        package_path: String::new(),
-        success: false,
-        files_verified: Vec::new(),
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error: Some(error),
-        sidecar: None,
-    }
-}
-
 /// Patched-content blobs harvested from the committed vendor artifacts:
 /// for every manifest record whose patch uuid matches its ledger entry,
 /// hash the artifact's files (git-sha256, the manifest hash) and keep the
@@ -298,7 +284,7 @@ pub(crate) fn failed_apply_result(purl: &str, error: String) -> ApplyResult {
 /// pipeline's afterHash gate decides correctness either way).
 pub async fn harvest_artifact_blobs(
     project_root: &Path,
-    manifest_patches: &HashMap<String, crate::manifest::schema::PatchRecord>,
+    manifest_patches: &HashMap<String, PatchRecord>,
 ) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
@@ -314,7 +300,7 @@ pub async fn harvest_artifact_blobs(
     }
 
     for (purl, record) in manifest_patches {
-        let needed: std::collections::HashSet<&str> = record
+        let needed: HashSet<&str> = record
             .files
             .values()
             .map(|f| f.after_hash.as_str())
@@ -327,7 +313,7 @@ pub async fn harvest_artifact_blobs(
             state
                 .entries
                 .values()
-                .find(|e| e.base_purl == crate::utils::purl::strip_purl_qualifiers(purl))
+                .find(|e| e.base_purl == strip_purl_qualifiers(purl))
         }) else {
             continue;
         };
@@ -337,7 +323,7 @@ pub async fn harvest_artifact_blobs(
         // SECURITY: the artifact path comes from the committed, tamperable
         // ledger and is joined onto the project root for READING only —
         // still, never follow an escaping path.
-        if !crate::patch::apply::is_safe_relative_subpath(&entry.artifact.path) {
+        if !is_safe_relative_subpath(&entry.artifact.path) {
             continue;
         }
         let artifact = project_root.join(&entry.artifact.path);
@@ -402,8 +388,8 @@ pub async fn harvest_artifact_blobs(
                 if !needed.contains(info.after_hash.as_str()) {
                     continue;
                 }
-                let rel = crate::patch::apply::normalize_file_path(file_name);
-                if !crate::patch::apply::is_safe_relative_subpath(rel) {
+                let rel = normalize_file_path(file_name);
+                if !is_safe_relative_subpath(rel) {
                     continue;
                 }
                 if let Ok(content) = tokio::fs::read(artifact.join(rel)).await {
@@ -452,8 +438,9 @@ pub(crate) async fn force_apply_staged(
     if !force {
         let missing = missing_existing_patch_files(staged_dir, &record.files).await;
         if let Some(first) = missing.first() {
-            return failed_apply_result(
+            return common::failed_result(
                 purl,
+                Path::new(""),
                 format!("Cannot apply patch: {first} - File not found"),
             );
         }
@@ -533,26 +520,14 @@ pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
 }
 
-/// Cheap probe used by `apply` to respect vendor ownership: is `purl`
-/// recorded as vendored in the committed ledger?
-pub async fn is_purl_vendored(project_root: &std::path::Path, purl: &str) -> bool {
-    match load_state(project_root).await {
-        Ok(state) => lookup_entry(&state.entries, purl).is_some(),
-        Err(_) => false,
-    }
-}
-
 /// Every purl spelling under which the ledger's entries are addressable:
 /// each entry's map key (the manifest purl, possibly qualified), its
-/// resolved base purl, and the qualifier-stripped key. The one-load,
-/// many-lookups companion to [`is_purl_vendored`] for callers that match
-/// whole purl sets against vendor ownership (apply / rollback / scan
-/// prune). An unreadable ledger degrades to the empty set — the same
-/// fail-open contract as `is_purl_vendored`; mutating callers that need
-/// fail-closed semantics use [`load_state`] directly.
-pub async fn vendored_purl_keys(
-    project_root: &std::path::Path,
-) -> std::collections::HashSet<String> {
+/// resolved base purl, and the qualifier-stripped key. Loaded once for
+/// callers that match whole purl sets against vendor ownership (apply /
+/// rollback / scan prune). An unreadable ledger degrades to the empty set
+/// (fail-open); mutating callers that need fail-closed semantics use
+/// [`load_state`] directly.
+pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
     match load_state(project_root).await {
         Ok(state) => state
             .entries
@@ -561,11 +536,11 @@ pub async fn vendored_purl_keys(
                 [
                     key.clone(),
                     entry.base_purl.clone(),
-                    crate::utils::purl::strip_purl_qualifiers(key).to_string(),
+                    strip_purl_qualifiers(key).to_string(),
                 ]
             })
             .collect(),
-        Err(_) => std::collections::HashSet::new(),
+        Err(_) => HashSet::new(),
     }
 }
 

@@ -11,7 +11,6 @@
 //! is stable across re-runs and never churns committed files.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
@@ -24,15 +23,7 @@ use crate::patch::apply::{
 };
 use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
 
-/// One parsed `RECORD` row (`path,hash,size`). `hash` keeps the raw field
-/// (`sha256=<base64url-nopad>`); empty fields become `None` (the RECORD/
-/// signature rows legitimately carry no hash or size).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordEntry {
-    pub path: String,
-    pub hash: Option<String>,
-    pub size: Option<u64>,
-}
+use super::common::{failed_result, is_executable, write_zip_entries};
 
 /// The located installed distribution for one `name@version`.
 #[derive(Debug, Clone)]
@@ -44,8 +35,8 @@ pub struct InstalledDist {
     /// the wheel-filename escaping, NOT a canonical PEP 503 name.
     pub dist_name: String,
     pub version: String,
-    /// Parsed `RECORD` rows.
-    pub record: Vec<RecordEntry>,
+    /// Member paths parsed from `RECORD` (the path field of each row).
+    pub record: Vec<String>,
     /// Raw `Tag:` header values from the `WHEEL` file, in file order.
     pub wheel_tags: Vec<String>,
 }
@@ -103,7 +94,7 @@ pub async fn locate_installed_dist(
                     ),
                 )
             })?;
-        let record = parse_record_text(&record_text);
+        let record = parse_record_paths(&record_text);
         if record.is_empty() {
             return Err((
                 "pypi_missing_record",
@@ -285,8 +276,8 @@ pub async fn build_patched_wheel(
     // Select the wheel members from the installed RECORD.
     let mut members: Vec<String> = Vec::new();
     let mut out_of_tree: Vec<String> = Vec::new();
-    for row in &dist.record {
-        let path = row.path.as_str();
+    for path in &dist.record {
+        let path = path.as_str();
         if path.is_empty()
             || is_installer_bookkeeping(path, &dist_info_name)
             || path.ends_with(".pyc")
@@ -353,7 +344,11 @@ pub async fn build_patched_wheel(
                 ))
             }
         };
-        exec_bits.insert(member.clone(), file_is_executable(&src).await);
+        let exec = tokio::fs::metadata(&src)
+            .await
+            .map(|m| is_executable(&m))
+            .unwrap_or(false);
+        exec_bits.insert(member.clone(), exec);
         let dst = stage.path().join(member);
         if let Some(parent) = dst.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -404,9 +399,10 @@ pub async fn build_patched_wheel(
     members.sort();
 
     // Regenerate RECORD from the staged (patched) bytes and assemble the
-    // deterministic zip entry list: lexicographic order, RECORD forced last
+    // deterministic zip entry list (`(name, bytes, unix mode)` with the exec
+    // bit preserved as 0o755): lexicographic order, RECORD forced last
     // (installers stream-read it; last is also what bdist_wheel emits).
-    let mut entries: Vec<ZipEntry> = Vec::with_capacity(members.len() + 1);
+    let mut entries: Vec<(String, Vec<u8>, u32)> = Vec::with_capacity(members.len() + 1);
     let mut record_lines = String::new();
     for member in &members {
         let bytes = match tokio::fs::read(stage.path().join(member)).await {
@@ -425,21 +421,22 @@ pub async fn build_patched_wheel(
             b64,
             bytes.len()
         ));
-        entries.push(ZipEntry {
-            name: member.clone(),
-            bytes,
-            executable: exec_bits.get(member).copied().unwrap_or(false),
-        });
+        let mode = if exec_bits.get(member).copied().unwrap_or(false) {
+            0o755
+        } else {
+            0o644
+        };
+        entries.push((member.clone(), bytes, mode));
     }
     record_lines.push_str(&format!("{}/RECORD,,\n", csv_quote(&dist_info_name)));
-    entries.push(ZipEntry {
-        name: format!("{dist_info_name}/RECORD"),
-        bytes: record_lines.into_bytes(),
-        executable: false,
-    });
+    entries.push((
+        format!("{dist_info_name}/RECORD"),
+        record_lines.into_bytes(),
+        0o644,
+    ));
 
     let zip_bytes =
-        match tokio::task::spawn_blocking(move || build_deterministic_zip(&entries)).await {
+        match tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 result.success = false;
@@ -551,27 +548,18 @@ fn is_console_script_artifact(final_component: &str, script_names: &HashSet<Stri
     false
 }
 
-/// Parse `RECORD` rows (CSV; quoted fields possible; empty hash/size kept as
-/// `None`). Unparseable/blank lines are skipped rather than failing the whole
+/// Parse the member paths out of `RECORD` rows (`path,hash,size` CSV; quoted
+/// fields possible). Only the path field is consumed — the RECORD is
+/// regenerated from the patched bytes, so the recorded hash/size are never
+/// read. Unparseable/blank lines are skipped rather than failing the whole
 /// file — fail-open here is safe because the member list only ever loses a
 /// row it could not have staged anyway.
-fn parse_record_text(text: &str) -> Vec<RecordEntry> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = parse_csv_record(line);
-        let Some(path) = fields.first().filter(|p| !p.is_empty()) else {
-            continue;
-        };
-        out.push(RecordEntry {
-            path: path.clone(),
-            hash: fields.get(1).filter(|h| !h.is_empty()).cloned(),
-            size: fields.get(2).and_then(|s| s.parse().ok()),
-        });
-    }
-    out
+fn parse_record_paths(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| parse_csv_record(line).into_iter().next())
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 /// Minimal CSV record parser (RFC 4180 quoting: `"a,b"`, doubled `""`).
@@ -610,63 +598,6 @@ fn csv_quote(field: &str) -> String {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
-    }
-}
-
-#[cfg(unix)]
-async fn file_is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-async fn file_is_executable(_path: &Path) -> bool {
-    false
-}
-
-struct ZipEntry {
-    name: String,
-    bytes: Vec<u8>,
-    executable: bool,
-}
-
-/// Serialize `entries` (already ordered, RECORD last) into a deterministic
-/// zip: fixed DOS timestamp (1980-01-01 00:00:00), fixed deflate level, unix
-/// mode 0o644 / 0o755 (preserved exec bit) — so rebuilding from the same
-/// patched tree always yields identical bytes and a stable hash pin.
-fn build_deterministic_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
-    use std::io::Cursor;
-    use zip::write::SimpleFileOptions;
-
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    for entry in entries {
-        let options = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(zip::DateTime::default())
-            .unix_permissions(if entry.executable { 0o755 } else { 0o644 });
-        writer
-            .start_file(&entry.name, options)
-            .map_err(|e| e.to_string())?;
-        writer.write_all(&entry.bytes).map_err(|e| e.to_string())?;
-    }
-    let cursor = writer.finish().map_err(|e| e.to_string())?;
-    Ok(cursor.into_inner())
-}
-
-fn failed_result(purl: &str, site_packages: &Path, error: String) -> ApplyResult {
-    ApplyResult {
-        package_key: purl.to_string(),
-        package_path: site_packages.display().to_string(),
-        success: false,
-        files_verified: Vec::new(),
-        files_patched: Vec::new(),
-        applied_via: HashMap::new(),
-        error: Some(error),
-        sidecar: None,
     }
 }
 
@@ -785,16 +716,13 @@ mod tests {
                     \"weird,name.py\",sha256=zz,9\n\
                     six-1.16.0.dist-info/RECORD,,\n\
                     \n";
-        let rows = parse_record_text(text);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].path, "six.py");
-        assert_eq!(rows[0].hash.as_deref(), Some("sha256=abc_DEF"));
-        assert_eq!(rows[0].size, Some(123));
-        // Quoted CSV path with an embedded comma.
-        assert_eq!(rows[1].path, "weird,name.py");
-        // Empty hash + size stay None.
-        assert_eq!(rows[2].hash, None);
-        assert_eq!(rows[2].size, None);
+        let rows = parse_record_paths(text);
+        // Quoted CSV path with an embedded comma survives; the empty-field
+        // RECORD row and the blank line don't derail the parse.
+        assert_eq!(
+            rows,
+            ["six.py", "weird,name.py", "six-1.16.0.dist-info/RECORD"]
+        );
         // Emit side: a path needing quoting survives a parse round-trip.
         let quoted = csv_quote("weird,\"name\".py");
         assert_eq!(parse_csv_record(&quoted)[0], "weird,\"name\".py");
@@ -850,7 +778,7 @@ mod tests {
         assert_eq!(dist.dist_name, "six");
         assert_eq!(dist.version, "1.16.0");
         assert_eq!(dist.wheel_tags, vec!["py2-none-any", "py3-none-any"]);
-        assert!(dist.record.iter().any(|r| r.path == "six.py"));
+        assert!(dist.record.iter().any(|r| r == "six.py"));
 
         let err = locate_installed_dist(&fx.site_packages, "six", "1.17.0")
             .await

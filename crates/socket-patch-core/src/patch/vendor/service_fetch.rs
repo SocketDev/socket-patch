@@ -12,6 +12,8 @@ use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
 use crate::patch::vendor::lock_inventory::LockIntegrity;
 use crate::patch::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::patch::vendor::VendorServiceConfig;
+#[cfg(any(feature = "maven", feature = "nuget"))]
+use crate::patch::vendor::{common::refused, VendorOutcome, VendorWarning};
 
 /// A service archive whose bytes have passed integrity verification.
 ///
@@ -108,6 +110,89 @@ pub(crate) async fn fetch_verified_archive(
         source_url: pkg.source_url,
         secondary: pkg.secondary_artifacts,
     })
+}
+
+/// Outcome of attempting to materialise a single-file artifact from the patch
+/// service (the Tier-A backends — maven `.jar`, nuget `.nupkg` — where the
+/// verified archive bytes ARE the vendored artifact, written verbatim).
+#[cfg(any(feature = "maven", feature = "nuget"))]
+pub(crate) enum ServiceCopy {
+    /// The prebuilt patched bytes (write them verbatim).
+    Used(Vec<u8>),
+    /// Bubble this terminal outcome (boxed — `VendorOutcome` is large).
+    HardFail(Box<VendorOutcome>),
+    /// Fall back to the local rebuild.
+    FallBack,
+}
+
+/// Download + integrity-verify the prebuilt patched archive for the Tier-A
+/// backends, mapping each service outcome onto the `auto` / `service` fallback
+/// policy. `noun` is the artifact kind used in messages (".jar" / ".nupkg").
+#[cfg(any(feature = "maven", feature = "nuget"))]
+pub(crate) async fn service_archive_copy(
+    service: Option<&VendorServiceConfig>,
+    uuid: &str,
+    name: &str,
+    noun: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> ServiceCopy {
+    let Some(cfg) = service else {
+        return ServiceCopy::FallBack;
+    };
+    if !cfg.service_enabled() {
+        return ServiceCopy::FallBack;
+    }
+    fn hard(code: &'static str, detail: String) -> ServiceCopy {
+        ServiceCopy::HardFail(Box::new(refused(code, detail)))
+    }
+    let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
+        if cfg.source.requires_service() {
+            hard("vendor_prebuilt_required", reason)
+        } else {
+            warnings.push(VendorWarning::new(
+                code,
+                format!("{reason}; building locally instead"),
+            ));
+            ServiceCopy::FallBack
+        }
+    };
+    match fetch_verified_archive(cfg, uuid, name).await {
+        ServiceArtifact::Ready(archive) => {
+            warnings.push(VendorWarning::new(
+                "vendor_prebuilt_downloaded",
+                format!(
+                    "vendored {name} from the patch service ({})",
+                    archive.source_url
+                ),
+            ));
+            ServiceCopy::Used(archive.bytes)
+        }
+        ServiceArtifact::IntegrityMismatch(reason) => miss(
+            warnings,
+            "vendor_prebuilt_integrity_mismatch",
+            format!("prebuilt {noun} failed integrity ({reason})"),
+        ),
+        ServiceArtifact::Pending => miss(
+            warnings,
+            "vendor_prebuilt_pending",
+            format!("prebuilt {noun} is still building"),
+        ),
+        ServiceArtifact::Unavailable(reason) => {
+            if cfg.source.requires_service() {
+                hard(
+                    "vendor_prebuilt_required",
+                    format!("prebuilt {noun} unavailable: {reason}"),
+                )
+            } else {
+                ServiceCopy::FallBack
+            }
+        }
+        ServiceArtifact::Failed(reason) => miss(
+            warnings,
+            "vendor_prebuilt_unavailable",
+            format!("patch service request failed ({reason})"),
+        ),
+    }
 }
 
 /// Outcome of fetching + verifying a named secondary artifact.

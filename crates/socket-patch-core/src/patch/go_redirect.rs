@@ -32,7 +32,7 @@ use crate::patch::apply::{
 };
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::vendor::common::{
-    already_patched_verify, copy_matches_after_hashes, synthesized_result,
+    already_patched_result, copy_matches_after_hashes, synthesized_result,
 };
 use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
 
@@ -217,8 +217,7 @@ pub async fn apply_go_redirect(
     // fingerprint stays stable across repeated applies (the guard re-runs apply
     // on most "deps changed" builds).
     if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
-        let verified = files.keys().map(|f| already_patched_verify(f)).collect();
-        return synthesized_result(purl, &copy_dir, verified, true, None);
+        return already_patched_result(purl, &copy_dir, files);
     }
 
     // Fresh copy pristine → copy_dir.

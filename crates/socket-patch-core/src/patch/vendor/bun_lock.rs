@@ -40,8 +40,8 @@ use crate::patch::bun_lock_text::{
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
-use super::common::{already_patched_verify, synthesized_result};
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
+use super::common::{already_patched_result, refused};
+use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -212,13 +212,8 @@ pub(crate) async fn vendor_bun(
         // Every instance already points at this uuid with the packed
         // integrity: in sync. The tarball re-pack above was byte-identical
         // by determinism; synthesize AlreadyPatched and record nothing.
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
         return VendorOutcome::Done {
-            result: synthesized_result(purl, &project_root.join(&rel_tgz), verified, true, None),
+            result: already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
             entry: None,
             warnings,
         };
@@ -231,16 +226,7 @@ pub(crate) async fn vendor_bun(
     }
 
     // ── 6. Marker + ledger entry ──────────────────────────────────────────
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: coords.base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "npm".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&coords.uuid_dir_rel), &marker).await {
         warnings.push(VendorWarning::new(
             "vendor_marker_write_failed",

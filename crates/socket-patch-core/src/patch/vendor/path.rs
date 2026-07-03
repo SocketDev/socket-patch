@@ -33,16 +33,16 @@ use std::path::{Path, PathBuf};
 
 use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::list_dir_entries;
+use crate::utils::fs::{entry_is_dir, list_dir_entries};
 
 /// Project-relative root of all vendored artifacts.
-pub const VENDOR_DIR: &str = ".socket/vendor";
+pub(crate) const VENDOR_DIR: &str = ".socket/vendor";
 
 /// The ecosystem directory names under [`VENDOR_DIR`]. These double as the
 /// `<eco>` capture of the recovery convention and are independent of which
 /// features this binary was compiled with (an orphan sweep must still
 /// recognise — and report, not delete — a dir for a compiled-out ecosystem).
-pub const ECOSYSTEM_DIRS: &[&str] = &[
+pub(crate) const ECOSYSTEM_DIRS: &[&str] = &[
     "npm", "cargo", "golang", "composer", "gem", "pypi", "nuget", "maven",
 ];
 
@@ -74,7 +74,7 @@ pub fn vendor_uuid_dir_rel(eco: &str, uuid: &str) -> Option<String> {
 }
 
 /// One parsed vendored path (the output of [`parse_vendor_path`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct VendorPathParts {
     /// Ecosystem dir name (`npm`, `cargo`, …).
     pub eco: String,
@@ -177,7 +177,7 @@ fn split_nuget_leaf(stem: &str) -> Option<(&str, &str)> {
 /// Reconstruct the base PURL from a vendored leaf. This is the orphan-sweep
 /// FALLBACK identification (state.json is the ledger of record); `None` means
 /// "unrecognisable — report, never delete by guess".
-pub fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
+fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
     match eco {
         "npm" => {
             let stem = leaf.strip_suffix(".tgz")?;
@@ -263,7 +263,7 @@ pub fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
 }
 
 /// One swept vendored unit: the uuid dir and what could be learned about it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SweptVendorDir {
     pub eco: String,
     pub uuid: String,
@@ -289,7 +289,7 @@ pub async fn sweep_vendor_dirs(project_root: &Path) -> Vec<SweptVendorDir> {
                 continue;
             }
             let dir = entry.path();
-            if !crate::utils::fs::entry_is_dir(&entry).await {
+            if !entry_is_dir(&entry).await {
                 continue;
             }
             let purls = collect_leaf_purls(eco, &dir).await;
@@ -325,7 +325,7 @@ async fn collect_leaf_purls(eco: &str, uuid_dir: &Path) -> Vec<String> {
             // Keep descending through structural levels (go module path
             // segments, composer vendor dirs, npm @scope dirs) up to a sane
             // depth bound.
-            if crate::utils::fs::entry_is_dir(&entry).await && leaf.matches('/').count() < 8 {
+            if entry_is_dir(&entry).await && leaf.matches('/').count() < 8 {
                 stack.push((entry.path(), leaf));
             }
         }

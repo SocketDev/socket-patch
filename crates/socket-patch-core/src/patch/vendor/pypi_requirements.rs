@@ -11,7 +11,7 @@
 //!
 //! Logical-line model: physical lines join on a trailing `\`; comments start
 //! at a `#` preceded by whitespace (or column 0) outside that. The dominant
-//! newline style is preserved (mirroring `pth_hook/edit.rs`).
+//! newline style is preserved.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,21 +19,18 @@ use std::path::{Path, PathBuf};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::detect_eol;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
 /// Classification of the target package within the requirements tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PinSearch {
+#[derive(Debug, PartialEq, Eq)]
+enum PinSearch {
     /// A clean `name==version` pin (no extras). `line_start` / `line_count`
     /// span the PHYSICAL lines (0-based) of the first matching logical line.
     Exact {
         line_start: usize,
         line_count: usize,
-        /// Always `None` today — pins WITH extras classify as [`PinSearch::Extras`];
-        /// the field is kept so the span type can carry them if extras
-        /// rewriting is ever supported.
-        extras: Option<String>,
         /// The environment marker verbatim (text after `;`), to carry over.
         marker: Option<String>,
         /// The pin carries `--hash` options (informational; the rewrite
@@ -50,13 +47,18 @@ pub enum PinSearch {
     Absent,
 }
 
-/// Find the target pin in one file's content. Precedence is fail-closed:
-/// any extras occurrence wins over any non-pin occurrence wins over a clean
-/// exact pin — a file that names the package ambiguously is never rewritten.
-pub fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
+/// One clean exact pin occurrence: `(line_start, line_count, marker, hashed)`
+/// — the PHYSICAL-line span (0-based) of the logical line, the environment
+/// marker to carry over, and whether the pin carried `--hash` options.
+type PinSpan = (usize, usize, Option<String>, bool);
+
+/// Scan one file for the target package: every clean exact
+/// `canon_name==version` pin, plus whether any occurrence carries extras or
+/// a non-exact specifier.
+fn scan_pins(content: &str, canon_name: &str, version: &str) -> (Vec<PinSpan>, bool, bool) {
+    let mut exact = Vec::new();
     let mut found_extras = false;
     let mut found_range = false;
-    let mut exact: Option<PinSearch> = None;
     for ll in logical_lines(content) {
         let Some(req) = parse_requirement_line(&ll.text) else {
             continue;
@@ -74,26 +76,34 @@ pub fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
             .filter(|c| !c.is_whitespace())
             .collect();
         if spec_no_ws == format!("=={version}") {
-            if exact.is_none() {
-                exact = Some(PinSearch::Exact {
-                    line_start: ll.start,
-                    line_count: ll.physical.len(),
-                    extras: None,
-                    marker: req.marker,
-                    hashed: req.hashed,
-                });
-            }
+            exact.push((ll.start, ll.physical.len(), req.marker, req.hashed));
         } else {
             found_range = true;
         }
     }
+    (exact, found_extras, found_range)
+}
+
+/// Find the target pin in one file's content. Precedence is fail-closed:
+/// any extras occurrence wins over any non-pin occurrence wins over a clean
+/// exact pin — a file that names the package ambiguously is never rewritten.
+fn find_pin(content: &str, canon_name: &str, version: &str) -> PinSearch {
+    let (exact, found_extras, found_range) = scan_pins(content, canon_name, version);
     if found_extras {
         return PinSearch::Extras;
     }
     if found_range {
         return PinSearch::Range;
     }
-    exact.unwrap_or(PinSearch::Absent)
+    match exact.into_iter().next() {
+        Some((line_start, line_count, marker, hashed)) => PinSearch::Exact {
+            line_start,
+            line_count,
+            marker,
+            hashed,
+        },
+        None => PinSearch::Absent,
+    }
 }
 
 /// Pre-flight the wiring without writing — the orchestrator runs this before
@@ -111,7 +121,7 @@ pub(super) async fn preflight_requirements(
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
 /// includes (or append a managed transitive line at the root EOF when the
 /// package is absent). Returns the wiring records in application order.
-pub async fn wire_requirements(
+pub(super) async fn wire_requirements(
     root: &Path,
     canon_name: &str,
     version: &str,
@@ -139,7 +149,11 @@ pub async fn wire_requirements(
 /// what vendor wrote are left alone with `vendor_revert_line_drifted`; any
 /// surviving reference to the vendored uuid dir afterwards raises
 /// `vendor_revert_residual_reference`.
-pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
+pub(super) async fn revert_requirements(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // Group records per file, preserving application order within each.
@@ -185,7 +199,7 @@ pub async fn revert_requirements(entry: &VendorEntry, root: &Path, dry_run: bool
                 return RevertOutcome::failed(format!("cannot read {file}: {e}"));
             }
         };
-        let nl = newline_of(&content);
+        let nl = detect_eol(&content);
         let had_trailing_newline = content.ends_with('\n');
         let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
 
@@ -342,31 +356,15 @@ async fn plan_requirements(
 
         // Rewrite EVERY exact-pin occurrence in this file, bottom-up so the
         // recorded spans (against the original content) stay valid.
-        let mut spans: Vec<(usize, usize, Option<String>)> = Vec::new();
-        for ll in logical_lines(&file.content) {
-            let Some(req) = parse_requirement_line(&ll.text) else {
-                continue;
-            };
-            if canonicalize_pypi_name(&req.name) != canon_name || req.extras.is_some() {
-                continue;
-            }
-            let spec: String = req
-                .specifier
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect();
-            if spec == format!("=={version}") {
-                spans.push((ll.start, ll.physical.len(), req.marker));
-            }
-        }
+        let (spans, _, _) = scan_pins(&file.content, canon_name, version);
         if spans.is_empty() {
             continue;
         }
-        let nl = newline_of(&file.content);
+        let nl = detect_eol(&file.content);
         let original_lines: Vec<String> = file.content.lines().map(str::to_string).collect();
         let mut lines = original_lines.clone();
         let mut records = Vec::new();
-        for (start, count, marker) in spans.iter().rev() {
+        for (start, count, marker, _) in spans.iter().rev() {
             let line = vendor_line(
                 rel_wheel,
                 wheel_sha256_hex,
@@ -419,7 +417,7 @@ async fn plan_requirements(
             &None,
             true,
         );
-        let nl = newline_of(&root_file.content);
+        let nl = detect_eol(&root_file.content);
         let mut new_content = root_file.content.clone();
         if !new_content.is_empty() && !new_content.ends_with('\n') {
             new_content.push_str(nl);
@@ -666,15 +664,6 @@ fn parse_requirement_line(text: &str) -> Option<ParsedRequirement> {
     })
 }
 
-/// The file's dominant newline style (mirrors `pth_hook/edit.rs`).
-fn newline_of(content: &str) -> &'static str {
-    if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,13 +750,11 @@ mod tests {
             PinSearch::Exact {
                 line_start,
                 line_count,
-                extras,
                 marker,
                 hashed,
             } => {
                 assert_eq!(line_start, 1);
                 assert_eq!(line_count, 1);
-                assert_eq!(extras, None);
                 assert_eq!(marker.as_deref(), Some("python_version >= \"3.8\""));
                 assert!(hashed);
             }

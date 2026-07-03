@@ -58,7 +58,8 @@ use crate::utils::fs::atomic_write_bytes;
 use crate::utils::purl::{build_gem_purl, parse_gem_purl};
 
 use super::common::{
-    already_patched_verify, copy_matches_after_hashes, refused, synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
+    synthesized_result,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_gem_data;
@@ -95,9 +96,6 @@ const LOCK_CHECKSUM_WIRING_KIND: &str = "gemfile_lock_checksum";
 /// Managed-block fence for transitive (not-Gemfile-declared) gems.
 const MANAGED_OPEN: &str = "# >>> socket-patch vendor (managed) >>>";
 const MANAGED_CLOSE: &str = "# <<< socket-patch vendor (managed) <<<";
-
-/// Marker schema version written into `socket-patch.vendor.json`.
-const MARKER_SCHEMA_VERSION: u32 = 1;
 
 /// Vendor a gem: materialize a patched copy (plus its stub gemspec) under
 /// `.socket/vendor/gem/<uuid>/<name>-<version>` and pair-edit Gemfile +
@@ -166,11 +164,11 @@ pub async fn vendor_gem(
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
-        return VendorOutcome::Done {
-            result: synthesized_result(purl, &copy_dir, Vec::new(), true, None),
-            entry: None,
-            warnings: Vec::new(),
-        };
+        return done(
+            synthesized_result(purl, &copy_dir, Vec::new(), true, None),
+            None,
+            Vec::new(),
+        );
     }
 
     // Platform-suffixed installs (`<name>-<version>-x86_64-linux`) ship
@@ -262,16 +260,11 @@ pub async fn vendor_gem(
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
             if copy_ok {
-                let verified = record
-                    .files
-                    .keys()
-                    .map(|f| already_patched_verify(f))
-                    .collect();
-                return VendorOutcome::Done {
-                    result: synthesized_result(purl, &copy_dir, verified, true, None),
-                    entry: None,
-                    warnings: Vec::new(),
-                };
+                return done(
+                    already_patched_result(purl, &copy_dir, &record.files),
+                    None,
+                    Vec::new(),
+                );
             }
             // Wired (Gemfile + lock + CHECKSUMS) but the committed copy is
             // missing/stale: rebuild the ARTIFACT only — the pair edit is
@@ -280,14 +273,8 @@ pub async fn vendor_gem(
             // Service-preferred like the full path (an auto-fetched gem has no
             // local stub to rebuild from — only the service can).
             if !dry_run {
-                if let Some(cfg) = service {
-                    if cfg.source.requires_service() && cfg.offline {
-                        return refused(
-                            "vendor_service_offline_conflict",
-                            "--vendor-source=service needs the network but --offline is set"
-                                .to_string(),
-                        );
-                    }
+                if let Some(refusal) = service_offline_conflict(service) {
+                    return refusal;
                 }
                 let mut warnings: Vec<VendorWarning> = Vec::new();
                 let result = match materialise_patched_copy(
@@ -309,25 +296,16 @@ pub async fn vendor_gem(
                     Ok(result) => result,
                     Err(outcome) => return *outcome,
                 };
-                if !result.success {
-                    return VendorOutcome::Done {
-                        result,
-                        entry: None,
-                        warnings,
-                    };
+                if result.success {
+                    warnings.push(VendorWarning::new(
+                        "vendor_artifact_rebuilt",
+                        format!(
+                            "the committed vendored copy for {name}@{version} was missing or \
+                             stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                        ),
+                    ));
                 }
-                warnings.push(VendorWarning::new(
-                    "vendor_artifact_rebuilt",
-                    format!(
-                        "the committed vendored copy for {name}@{version} was missing or \
-                         stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
-                    ),
-                ));
-                return VendorOutcome::Done {
-                    result,
-                    entry: None,
-                    warnings,
-                };
+                return done(result, None, warnings);
             }
             // Dry runs fall through to the verify-only preview below.
         } else {
@@ -365,11 +343,7 @@ pub async fn vendor_gem(
         )
         .await;
         result.package_path = copy_dir.display().to_string();
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings: dry_warnings,
-        };
+        return done(result, None, dry_warnings);
     }
 
     // ── Gemfile edit plan (refusals before any write) ────────────────────
@@ -383,13 +357,8 @@ pub async fn vendor_gem(
     // (download + extract; no local install or patch-apply needed); else copy
     // the installed gem, drop in the local stub gemspec, and apply the patch.
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(cfg) = service {
-        if cfg.source.requires_service() && cfg.offline {
-            return refused(
-                "vendor_service_offline_conflict",
-                "--vendor-source=service needs the network but --offline is set".to_string(),
-            );
-        }
+    if let Some(refusal) = service_offline_conflict(service) {
+        return refusal;
     }
     let mut result = match materialise_patched_copy(
         purl,
@@ -413,11 +382,7 @@ pub async fn vendor_gem(
     if !result.success {
         // The copy / stub / patch step left the result un-successful (and
         // cleaned up its own partial copy); neither project file was touched.
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
     result.package_path = copy_dir.display().to_string();
 
@@ -427,11 +392,7 @@ pub async fn vendor_gem(
         let _ = remove_tree(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
-        return VendorOutcome::Done {
-            result,
-            entry: None,
-            warnings,
-        };
+        return done(result, None, warnings);
     }
 
     // ── Gemfile.lock edit (a failure here unwinds the Gemfile) ───────────
@@ -454,26 +415,13 @@ pub async fn vendor_gem(
             let _ = remove_tree(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
-            return VendorOutcome::Done {
-                result,
-                entry: None,
-                warnings,
-            };
+            return done(result, None, warnings);
         }
     };
 
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_gem_purl(name, version);
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "gem".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("gem", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&uuid_dir, &marker).await {
         // Informational only (state.json is the ledger of record) — a marker
         // failure must not fail an otherwise-wired vendor.
@@ -565,11 +513,7 @@ pub async fn vendor_gem(
         pipenv: None,
     };
 
-    VendorOutcome::Done {
-        result,
-        entry: Some(entry),
-        warnings,
-    }
+    done(result, Some(entry), warnings)
 }
 
 // ── materialisation (service download / local build) ──────────────────────────
@@ -619,7 +563,7 @@ async fn gem_service_copy(
         return GemServiceCopy::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> GemServiceCopy {
-        GemServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        GemServiceCopy::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -769,12 +713,7 @@ async fn materialise_patched_copy(
         GemServiceCopy::Used => {
             // The service `.gem` is the patched package; trust its verified
             // integrity (every file reads as AlreadyPatched).
-            let verified = record
-                .files
-                .keys()
-                .map(|f| already_patched_verify(f))
-                .collect();
-            Ok(synthesized_result(purl, copy_dir, verified, true, None))
+            Ok(already_patched_result(purl, copy_dir, &record.files))
         }
         GemServiceCopy::HardFail(outcome) => Err(outcome),
         GemServiceCopy::FallBack => {

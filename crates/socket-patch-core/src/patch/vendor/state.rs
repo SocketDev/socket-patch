@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::atomic_write_bytes;
 use crate::utils::serde::serialize_sorted;
 
@@ -358,6 +359,28 @@ pub struct VendorMarker {
     /// RFC3339 timestamp supplied by the caller (the CLI formats it).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vendored_at: String,
+}
+
+impl VendorMarker {
+    /// The schema-v1 marker every backend writes: `record`'s uuid plus its
+    /// vulnerability ids, sorted.
+    pub(crate) fn new(
+        ecosystem: &str,
+        purl: &str,
+        record: &PatchRecord,
+        vendored_at: &str,
+    ) -> Self {
+        let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
+        vulnerabilities.sort();
+        VendorMarker {
+            schema_version: 1,
+            purl: purl.to_string(),
+            patch_uuid: record.uuid.clone(),
+            ecosystem: ecosystem.to_string(),
+            vulnerabilities,
+            vendored_at: vendored_at.to_string(),
+        }
+    }
 }
 
 /// File name of the marker inside the uuid dir.

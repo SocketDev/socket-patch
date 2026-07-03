@@ -28,9 +28,13 @@ use toml_edit::{DocumentMut, Item, Value};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes;
 
+use super::common::{
+    item_get, lock_units_named, pep508_name, pep621_declared_names, record,
+    revert_lock_fragment_splice, unit_has_canon_name,
+};
 use super::path::parse_vendor_path;
 use super::state::{PdmMeta, VendorEntry, WiringAction, WiringRecord};
-use super::toml_surgery::find_unit_span;
+use super::toml_surgery::{find_unit_span, package_unit_lines, replace_files_array};
 use super::{RevertOutcome, VendorWarning};
 
 /// The only file this backend ever writes (and the revert allowlist).
@@ -172,7 +176,7 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
 /// else `"transitive"`. Diagnostics ONLY ([`PdmMeta::dep_class`]): the splice
 /// is identical either way, so a missing/unparseable pyproject degrades to
 /// `"transitive"` instead of refusing.
-pub fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
+fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
     let Some(text) = p.pyproject_text.as_deref() else {
         return "transitive";
     };
@@ -180,28 +184,7 @@ pub fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
         return "transitive";
     };
     let mut declared: Vec<String> = Vec::new();
-    if let Some(project) = doc.get("project") {
-        if let Some(deps) = item_get(project, "dependencies").and_then(Item::as_array) {
-            declared.extend(
-                deps.iter()
-                    .filter_map(Value::as_str)
-                    .map(|s| pep508_name(s).to_string()),
-            );
-        }
-        if let Some(optional) =
-            item_get(project, "optional-dependencies").and_then(Item::as_table_like)
-        {
-            for (_, item) in optional.iter() {
-                if let Some(arr) = item.as_array() {
-                    declared.extend(
-                        arr.iter()
-                            .filter_map(Value::as_str)
-                            .map(|s| pep508_name(s).to_string()),
-                    );
-                }
-            }
-        }
-    }
+    pep621_declared_names(&doc, &mut declared);
     for groups in [
         doc.get("tool")
             .and_then(|t| item_get(t, "pdm"))
@@ -243,22 +226,7 @@ pub(super) fn check_target_guards(
     version: &str,
     record_uuid: &str,
 ) -> Result<PdmTarget, (&'static str, String)> {
-    let units: Vec<&toml_edit::Table> = p
-        .lock
-        .get("package")
-        .and_then(Item::as_array_of_tables)
-        .map(|pkgs| {
-            pkgs.iter()
-                .filter(|t| {
-                    t.get("name")
-                        .and_then(Item::as_str)
-                        .map(canonicalize_pypi_name)
-                        .as_deref()
-                        == Some(canon_name)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let units = lock_units_named(&p.lock, canon_name);
     if units.is_empty() {
         return Err((
             "pypi_pdm_lock_package_missing",
@@ -405,6 +373,7 @@ pub async fn wire_pdm(
         })?;
 
     let wiring = vec![record(
+        LOCK_FILE,
         KIND_LOCK_PACKAGE,
         WiringAction::Rewritten,
         canon_name,
@@ -419,80 +388,11 @@ pub async fn wire_pdm(
     Ok((wiring, meta))
 }
 
-/// Reverse the wiring: restore the verbatim original `[[package]]` unit. A
-/// fragment that no longer matches what we wrote is left alone with a
-/// `vendor_lock_entry_drifted` warning — revert never clobbers third-party
-/// edits.
+/// Reverse the wiring: restore the verbatim original `[[package]]` unit via
+/// the shared fragment-splice revert (drift-tolerant, pdm.lock-only
+/// allowlist).
 pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
-    let lock_path = root.join(LOCK_FILE);
-    let mut lock_text = match tokio::fs::read_to_string(&lock_path).await {
-        Ok(t) => t,
-        Err(e) => return RevertOutcome::failed(format!("cannot read {LOCK_FILE}: {e}")),
-    };
-    let mut warnings: Vec<VendorWarning> = Vec::new();
-
-    for rec in entry.wiring.iter().rev() {
-        // SECURITY: `rec.file` comes verbatim from the committed, tamper-able
-        // state.json. This backend only ever wrote pdm.lock (the per-flavor
-        // file allowlist); any other recorded path is skipped fail-closed with
-        // a warning and is NEVER resolved against the filesystem.
-        if rec.file != LOCK_FILE {
-            warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "ignoring wiring record for unexpected file `{}` (only {LOCK_FILE} is \
-                     pdm-owned)",
-                    rec.file
-                ),
-            ));
-            continue;
-        }
-        let drifted = || {
-            VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "{LOCK_FILE} fragment for {:?} changed since vendoring; left untouched",
-                    rec.key
-                ),
-            )
-        };
-        match rec.kind.as_str() {
-            KIND_LOCK_PACKAGE => {
-                let new_text = rec.new.as_ref().and_then(serde_json::Value::as_str);
-                let original_text = rec.original.as_ref().and_then(serde_json::Value::as_str);
-                let (Some(new), Some(orig)) = (new_text, original_text) else {
-                    warnings.push(drifted());
-                    continue;
-                };
-                if lock_text.contains(new) {
-                    lock_text = lock_text.replacen(new, orig, 1);
-                } else {
-                    warnings.push(drifted());
-                }
-            }
-            // Forward compatibility: a newer ledger's unknown kind degrades
-            // to a warning (never guess at a fragment shape).
-            other => warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!("unknown pdm wiring kind {other:?}; skipped"),
-            )),
-        }
-    }
-
-    if !dry_run {
-        if let Err(e) = atomic_write_bytes(&lock_path, lock_text.as_bytes()).await {
-            return RevertOutcome {
-                success: false,
-                warnings,
-                error: Some(format!("cannot write {LOCK_FILE}: {e}")),
-            };
-        }
-    }
-    RevertOutcome {
-        success: true,
-        warnings,
-        error: None,
-    }
+    revert_lock_fragment_splice(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "pdm").await
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -516,47 +416,6 @@ fn lock_version_series(v: &str) -> LockVersionSeries {
     }
 }
 
-fn record(
-    kind: &str,
-    action: WiringAction,
-    key: &str,
-    original: Option<String>,
-    new: String,
-) -> WiringRecord {
-    WiringRecord {
-        file: LOCK_FILE.to_string(),
-        kind: kind.to_string(),
-        action,
-        key: Some(key.to_string()),
-        original: original.map(serde_json::Value::String),
-        new: Some(serde_json::Value::String(new)),
-    }
-}
-
-fn item_get<'a>(item: &'a Item, key: &str) -> Option<&'a Item> {
-    item.as_table_like().and_then(|t| t.get(key))
-}
-
-/// Leading PEP 508 distribution name of a dependency spec.
-fn pep508_name(spec: &str) -> &str {
-    let s = spec.trim_start();
-    let end = s
-        .char_indices()
-        .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    &s[..end]
-}
-
-fn unit_has_canon_name(lines: &[&str], canon: &str) -> bool {
-    lines
-        .iter()
-        .find_map(|l| l.strip_prefix("name = "))
-        .map(|r| canonicalize_pypi_name(r.trim().trim_matches('"')))
-        .as_deref()
-        == Some(canon)
-}
-
 /// Rewrite the target `[[package]]` unit to the D1-captured local-file
 /// shape: insert `path = "./<rel_wheel>"` right after `requires_python`
 /// (falling back to `version`/`name` — pdm's own key order) and reduce
@@ -577,57 +436,16 @@ fn rewrite_target_package_unit(
                 format!("{LOCK_FILE} has no [[package]] entry for {canon}"),
             )
         })?;
-    // `find_unit_span` ends a unit at the NEXT `[[package]]` or EOF; truncate
-    // defensively at any foreign top-level header so the splice never
-    // swallows a trailing section (pdm's [metadata] leads the file today, but
-    // the truncation keeps the cut correct if a section ever trails).
-    let mut unit: Vec<&str> = lock_text[span].lines().collect();
-    if let Some(stop) = unit
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(i, l)| (l.starts_with('[') && !l.starts_with("[package.")).then_some(i))
-    {
-        unit.truncate(stop);
-        while unit.last().is_some_and(|l| l.trim().is_empty()) {
-            unit.pop();
-        }
-    }
+    let unit = package_unit_lines(&lock_text[span]);
     let old_unit = unit.join("\n");
-    let files_lines = [
-        "files = [".to_string(),
-        format!("    {{file = \"{wheel_file_name}\", hash = \"sha256:{wheel_sha256_hex}\"}},"),
-        "]".to_string(),
-    ];
-
-    let mut out: Vec<String> = Vec::new();
-    let mut files_done = false;
-    let mut i = 0;
-    while i < unit.len() {
-        let line = unit[i];
-        if line.starts_with("files = [") {
-            out.extend(files_lines.iter().cloned());
-            files_done = true;
-            if !line.trim_end().ends_with(']') {
-                // skip the original multi-line array body + closing bracket
-                while i + 1 < unit.len() && unit[i + 1].trim() != "]" {
-                    i += 1;
-                }
-                i += 1;
-            }
-        } else {
-            out.push(line.to_string());
-        }
-        i += 1;
-    }
-    if !files_done {
+    let mut out = replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
         // The hash guard already requires hashed files entries; reaching here
         // means the parsed and textual views disagree — fail closed.
-        return Err((
+        (
             "pypi_pdm_lock_parse_failed",
             format!("the {canon} [[package]] entry has no files array to rewrite"),
-        ));
-    }
+        )
+    })?;
 
     let anchor = out
         .iter()

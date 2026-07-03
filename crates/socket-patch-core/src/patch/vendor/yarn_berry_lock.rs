@@ -40,14 +40,14 @@ use crate::utils::fs::atomic_write_bytes;
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{already_patched_verify, synthesized_result};
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
+use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
+use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack, tgz_rel_leaf};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, detect_eol, json_to_lines, lines_to_json, replace_block, scan_blocks,
+    body_field_line, json_to_lines, lines_to_json, replace_block, scan_blocks,
     split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
@@ -335,13 +335,8 @@ pub async fn vendor_yarn_berry(
         .and_then(Value::as_str)
         == Some(spec.as_str());
     if pkg_in_sync && target.is_ours && target.lines == new_lines {
-        let verified = record
-            .files
-            .keys()
-            .map(|f| already_patched_verify(f))
-            .collect();
         return VendorOutcome::Done {
-            result: synthesized_result(purl, &dest, verified, true, None),
+            result: already_patched_result(purl, &dest, &record.files),
             entry: None,
             warnings,
         };
@@ -390,16 +385,7 @@ pub async fn vendor_yarn_berry(
     }
 
     // ── 12. Marker + ledger entry ─────────────────────────────────────────
-    let mut vulnerabilities: Vec<String> = record.vulnerabilities.keys().cloned().collect();
-    vulnerabilities.sort();
-    let marker = VendorMarker {
-        schema_version: 1,
-        purl: base_purl.clone(),
-        patch_uuid: record.uuid.clone(),
-        ecosystem: "npm".to_string(),
-        vulnerabilities,
-        vendored_at: vendored_at.to_string(),
-    };
+    let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
         warnings.push(VendorWarning::new(
             "vendor_marker_write_failed",
@@ -942,30 +928,6 @@ pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))
     })
-}
-
-/// The manifest's indent unit (mirrors `npm_lock::detect_indent`); defaults
-/// to npm's 2 spaces.
-fn detect_indent(text: &str) -> String {
-    for line in text.lines() {
-        let trimmed = line.trim_start_matches([' ', '\t']);
-        if !trimmed.is_empty() && trimmed.len() < line.len() {
-            return line[..line.len() - trimmed.len()].to_string();
-        }
-    }
-    "  ".to_string()
-}
-
-/// Pretty-print with the detected indent + trailing newline (mirrors
-/// `npm_lock::serialize_lock`), so untouched keys stay byte-identical.
-fn serialize_json(value: &Value, indent: &str) -> std::io::Result<Vec<u8>> {
-    use serde::Serialize;
-    let mut out = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
-    let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-    value.serialize(&mut ser).map_err(std::io::Error::other)?;
-    out.push(b'\n');
-    Ok(out)
 }
 
 #[cfg(test)]
