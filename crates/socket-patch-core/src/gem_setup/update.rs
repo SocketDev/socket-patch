@@ -11,6 +11,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::{add_plugin_files, remove_plugin_files, BundlerProject};
+use crate::utils::fs::atomic_write_bytes;
 
 /// Outcome of one setup edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +21,7 @@ pub enum GemSetupStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GemEditResult {
     /// Envelope `files[].kind` (`gemfile` | `gem_plugin`).
     pub kind: &'static str,
@@ -31,7 +32,7 @@ pub struct GemEditResult {
 
 impl GemEditResult {
     /// Build a result from an `Ok(changed)` / `Err(message)` outcome.
-    pub(crate) fn from_result(
+    pub(super) fn from_result(
         kind: &'static str,
         path: String,
         result: Result<bool, String>,
@@ -59,19 +60,10 @@ impl GemEditResult {
     }
 }
 
-/// Atomically write `content` to `path`.
-///
-/// The user's committed `Gemfile` must never be left torn by a crash
-/// mid-write when we only meant to append a three-line block. Delegates to
-/// the crate-wide hardened writer.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
-}
-
 /// Stable substring identifying our managed block — `setup --check` and the
 /// add/remove edits all key on it, so a user-authored `plugin` line is never
 /// mistaken for ours.
-pub const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
+const MANAGED_MARKER: &str = "# >>> socket-patch:managed";
 
 /// The exact block `setup` appends to the Gemfile (trailing newline included).
 /// `File.expand_path(..., __dir__)` resolves relative to the Gemfile's own dir,
@@ -137,7 +129,10 @@ async fn edit_gemfile_add(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(gemfile, &new)
+                    // Stage+fsync+rename via the crate-wide hardened writer:
+                    // the user's committed Gemfile must never be left torn by
+                    // a crash mid-write.
+                    atomic_write_bytes(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -162,7 +157,7 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(gemfile, &new)
+                    atomic_write_bytes(gemfile, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }

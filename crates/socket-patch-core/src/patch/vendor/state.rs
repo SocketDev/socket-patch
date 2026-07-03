@@ -267,6 +267,18 @@ impl Default for VendorState {
     }
 }
 
+/// The ledger entry addressable as `purl`: the exact map key first, then
+/// any entry whose resolved `base_purl` equals it (a qualified manifest
+/// key resolves to the entry recorded under the base PURL).
+pub fn lookup_entry<'a>(
+    entries: &'a HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<&'a VendorEntry> {
+    entries
+        .get(purl)
+        .or_else(|| entries.values().find(|e| e.base_purl == purl))
+}
+
 fn state_path(project_root: &Path) -> PathBuf {
     project_root.join(VENDOR_STATE_REL)
 }

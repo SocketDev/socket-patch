@@ -25,7 +25,7 @@ use tokio::fs;
 /// CLI is invoked from `PATH` (composer has no `npx`-style fetch), offline (the
 /// patches are committed under `.socket/`) and silent (so it doesn't clutter
 /// composer's own output).
-pub const APPLY_COMMAND: &str = "socket-patch apply --offline --silent --ecosystems composer";
+const APPLY_COMMAND: &str = "socket-patch apply --offline --silent --ecosystems composer";
 
 /// Composer script events `setup` wires: post-install-cmd fires after
 /// `composer install`, post-update-cmd after `composer update`. Covering both
@@ -44,7 +44,7 @@ pub enum ComposerSetupStatus {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ComposerEditResult {
     /// Envelope `files[].kind` — always `composer`.
     pub kind: &'static str,
@@ -53,50 +53,15 @@ pub struct ComposerEditResult {
     pub error: Option<String>,
 }
 
-impl ComposerEditResult {
-    fn from_result(path: String, result: Result<bool, String>) -> Self {
-        match result {
-            Ok(true) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::Updated,
-                error: None,
-            },
-            Ok(false) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::AlreadyConfigured,
-                error: None,
-            },
-            Err(e) => Self {
-                kind: "composer",
-                path,
-                status: ComposerSetupStatus::Error,
-                error: Some(e),
-            },
-        }
-    }
-}
-
-/// A discovered composer project (the dir holding `composer.json`).
-#[derive(Debug, Clone)]
-pub struct ComposerProject {
-    pub root: PathBuf,
-    pub composer_json: PathBuf,
-}
-
-/// Find the composer project rooted at `cwd` (a `composer.json` in `cwd`).
-/// cwd-only, matching the other single-project backends (gem/pypi/go).
-pub async fn discover_composer_project(cwd: &Path) -> Option<ComposerProject> {
+/// Find the composer project rooted at `cwd`: the path to a `composer.json`
+/// directly in `cwd`. cwd-only, matching the other single-project backends
+/// (gem/pypi/go).
+pub async fn discover_composer_project(cwd: &Path) -> Option<PathBuf> {
     let composer_json = cwd.join("composer.json");
-    if fs::metadata(&composer_json).await.is_ok() {
-        Some(ComposerProject {
-            root: cwd.to_path_buf(),
-            composer_json,
-        })
-    } else {
-        None
-    }
+    fs::metadata(&composer_json)
+        .await
+        .is_ok()
+        .then_some(composer_json)
 }
 
 /// Static check: does this `composer.json` already wire our re-apply hook into
@@ -130,23 +95,35 @@ fn event_contains_marker(value: Option<&Value>) -> bool {
 
 // ── pure transforms ──────────────────────────────────────────────────────────
 
-/// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
-/// `None` if already present in every event (idempotent no-op).
-fn composer_add(content: &str) -> Result<Option<String>, String> {
-    let mut doc: Value =
+/// Parse `composer.json` for editing, rejecting malformed input: the root must
+/// be a JSON object, and a present `scripts` must be an object (or `null`) —
+/// add refuses to clobber it, remove refuses to silently swallow it as a
+/// "nothing to remove" no-op.
+fn parse_checked(content: &str) -> Result<Value, String> {
+    let doc: Value =
         serde_json::from_str(content).map_err(|e| format!("Invalid composer.json: {e}"))?;
     if !doc.is_object() {
         return Err("Invalid composer.json: root is not a JSON object".to_string());
     }
-    // Refuse to clobber a present-but-non-object `scripts`.
     if let Some(scripts) = doc.get("scripts") {
         if !scripts.is_null() && !scripts.is_object() {
             return Err("Invalid composer.json: \"scripts\" is not a JSON object".to_string());
         }
     }
+    Ok(doc)
+}
 
+/// Append [`APPLY_COMMAND`] to both hook events, normalising each to an array.
+/// `None` if already present in every event (idempotent no-op).
+fn composer_add(content: &str) -> Result<Option<String>, String> {
+    let mut doc = parse_checked(content)?;
     let root = doc.as_object_mut().unwrap();
-    let scripts = ensure_scripts_object(root);
+
+    // Get-or-create the `scripts` object (replacing a `null`).
+    if !root.get("scripts").map(Value::is_object).unwrap_or(false) {
+        root.insert("scripts".to_string(), Value::Object(Map::new()));
+    }
+    let scripts = root.get_mut("scripts").unwrap().as_object_mut().unwrap();
 
     let mut changed = false;
     for event in HOOK_EVENTS {
@@ -170,18 +147,7 @@ fn composer_add(content: &str) -> Result<Option<String>, String> {
 /// Strip [`APPLY_COMMAND`] from both hook events, pruning emptied events and an
 /// emptied `scripts` object. `None` if our command is absent everywhere.
 fn composer_remove(content: &str) -> Result<Option<String>, String> {
-    let mut doc: Value =
-        serde_json::from_str(content).map_err(|e| format!("Invalid composer.json: {e}"))?;
-    if !doc.is_object() {
-        return Err("Invalid composer.json: root is not a JSON object".to_string());
-    }
-    // Mirror `composer_add`: a present-but-non-object `scripts` is malformed and
-    // must error, not be silently swallowed as a "nothing to remove" no-op.
-    if let Some(scripts) = doc.get("scripts") {
-        if !scripts.is_null() && !scripts.is_object() {
-            return Err("Invalid composer.json: \"scripts\" is not a JSON object".to_string());
-        }
-    }
+    let mut doc = parse_checked(content)?;
     let root = doc.as_object_mut().unwrap();
     // An absent (or `null`) `scripts` is a legitimate no-op: nothing of ours.
     let scripts = match root.get_mut("scripts").and_then(Value::as_object_mut) {
@@ -200,15 +166,6 @@ fn composer_remove(content: &str) -> Result<Option<String>, String> {
         root.remove("scripts");
     }
     Ok(Some(serde_json::to_string_pretty(&doc).unwrap() + "\n"))
-}
-
-/// Get-or-create the `scripts` object (replacing a `null`).
-fn ensure_scripts_object(root: &mut Map<String, Value>) -> &mut Map<String, Value> {
-    let needs_init = !root.get("scripts").map(Value::is_object).unwrap_or(false);
-    if needs_init {
-        root.insert("scripts".to_string(), Value::Object(Map::new()));
-    }
-    root.get_mut("scripts").unwrap().as_object_mut().unwrap()
 }
 
 /// Add [`APPLY_COMMAND`] to one event, normalising string → array. Returns
@@ -264,23 +221,14 @@ fn remove_command_from_event(scripts: &mut Map<String, Value>, event: &str) -> b
 
 // ── async wrappers ───────────────────────────────────────────────────────────
 
-/// Atomically write `content` to `path`.
-///
-/// The user's committed `composer.json` must never be left torn by a crash
-/// mid-write when we only meant to append two script events. Delegates to
-/// the crate-wide hardened writer.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
-}
-
 /// Wire the project: append our command to the composer script events.
-pub async fn add_hook(project: &ComposerProject, dry_run: bool) -> ComposerEditResult {
-    edit(&project.composer_json, dry_run, composer_add).await
+pub async fn add_hook(composer_json: &Path, dry_run: bool) -> ComposerEditResult {
+    edit(composer_json, dry_run, composer_add).await
 }
 
 /// Unwire the project: strip our command, pruning emptied keys.
-pub async fn remove_hook(project: &ComposerProject, dry_run: bool) -> ComposerEditResult {
-    edit(&project.composer_json, dry_run, composer_remove).await
+pub async fn remove_hook(composer_json: &Path, dry_run: bool) -> ComposerEditResult {
+    edit(composer_json, dry_run, composer_remove).await
 }
 
 async fn edit(
@@ -299,7 +247,10 @@ async fn edit(
             None => Ok(false),
             Some(new) => {
                 if !dry_run {
-                    atomic_write(composer_json, &new)
+                    // The crate-wide atomic writer (stage+fsync+rename): the
+                    // user's committed composer.json must never be left torn
+                    // by a crash mid-write.
+                    crate::utils::fs::atomic_write_bytes(composer_json, new.as_bytes())
                         .await
                         .map_err(|e| e.to_string())?;
                 }
@@ -308,7 +259,17 @@ async fn edit(
         }
     }
     .await;
-    ComposerEditResult::from_result(composer_json.display().to_string(), result)
+    let (status, error) = match result {
+        Ok(true) => (ComposerSetupStatus::Updated, None),
+        Ok(false) => (ComposerSetupStatus::AlreadyConfigured, None),
+        Err(e) => (ComposerSetupStatus::Error, Some(e)),
+    };
+    ComposerEditResult {
+        kind: "composer",
+        path: composer_json.display().to_string(),
+        status,
+        error,
+    }
 }
 
 #[cfg(test)]
@@ -445,19 +406,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
+        let found = discover_composer_project(dir.path()).await.unwrap();
 
-        let added = add_hook(&project, false).await;
+        let added = add_hook(&found, false).await;
         assert_eq!(added.status, ComposerSetupStatus::Updated);
         assert!(is_hook_present(&fs::read_to_string(&cj).await.unwrap()));
 
         // Idempotent.
         assert_eq!(
-            add_hook(&project, false).await.status,
+            add_hook(&found, false).await.status,
             ComposerSetupStatus::AlreadyConfigured
         );
 
-        let removed = remove_hook(&project, false).await;
+        let removed = remove_hook(&found, false).await;
         assert_eq!(removed.status, ComposerSetupStatus::Updated);
         assert_eq!(
             fs::read_to_string(&cj).await.unwrap(),
@@ -471,8 +432,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
-        let res = add_hook(&project, true).await;
+        let found = discover_composer_project(dir.path()).await.unwrap();
+        let res = add_hook(&found, true).await;
         assert_eq!(res.status, ComposerSetupStatus::Updated);
         assert_eq!(
             fs::read_to_string(&cj).await.unwrap(),
@@ -622,8 +583,8 @@ mod tests {
         fs::write(&cj, BASIC).await.unwrap();
         std::fs::set_permissions(&cj, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-        let project = discover_composer_project(dir.path()).await.unwrap();
-        let res = add_hook(&project, false).await;
+        let found = discover_composer_project(dir.path()).await.unwrap();
+        let res = add_hook(&found, false).await;
         assert_eq!(
             res.status,
             ComposerSetupStatus::Updated,
@@ -638,14 +599,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cj = dir.path().join("composer.json");
         fs::write(&cj, BASIC).await.unwrap();
-        let project = discover_composer_project(dir.path()).await.unwrap();
+        let found = discover_composer_project(dir.path()).await.unwrap();
 
         assert_eq!(
-            add_hook(&project, false).await.status,
+            add_hook(&found, false).await.status,
             ComposerSetupStatus::Updated
         );
         assert_eq!(
-            remove_hook(&project, false).await.status,
+            remove_hook(&found, false).await.status,
             ComposerSetupStatus::Updated
         );
         assert_eq!(fs::read_to_string(&cj).await.unwrap(), BASIC);

@@ -26,11 +26,10 @@ use socket_patch_core::crawlers::NuGetCrawler;
 use socket_patch_core::crawlers::{NpmCrawler, PythonCrawler, RubyCrawler};
 
 /// `CrawlerOptions::default()` should populate cwd from
-/// `std::env::current_dir`, default `global` to false, leave
-/// `global_prefix` unset, and set `batch_size` to the documented 100.
-/// Covers types.rs:143-150 (the `Default` impl, which the apply-CLI
-/// tests never exercise because callers always build options
-/// explicitly).
+/// `std::env::current_dir`, default `global` to false, and leave
+/// `global_prefix` unset. Covers the `Default` impl in types.rs, which
+/// the apply-CLI tests never exercise because callers always build
+/// options explicitly.
 #[test]
 fn crawler_options_default_populates_fields() {
     let opts = CrawlerOptions::default();
@@ -46,7 +45,6 @@ fn crawler_options_default_populates_fields() {
         opts.global_prefix.is_none(),
         "global_prefix must default to None"
     );
-    assert_eq!(opts.batch_size, 100, "batch_size must default to 100");
 }
 
 fn options_at(root: &std::path::Path) -> CrawlerOptions {
@@ -54,7 +52,6 @@ fn options_at(root: &std::path::Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 

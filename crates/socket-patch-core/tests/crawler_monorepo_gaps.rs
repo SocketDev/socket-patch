@@ -30,7 +30,6 @@ fn local_opts_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 

@@ -17,12 +17,13 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
-use crate::output::{color, confirm, format_severity, stderr_is_tty, stdout_is_tty};
+use crate::output::{color, confirm, format_severity};
 
 use super::get::{
     download_and_apply_patches, select_patches, truncate_with_ellipsis, DownloadParams,
@@ -363,12 +364,7 @@ async fn discover_selected(
 /// The `DownloadParams` every scan-driven download shares. Only the output
 /// shape (`json`/`silent`) and `save_only` differ per flow; vendor mode
 /// never persists blobs (the vendor step consumes the staged sources).
-fn download_params(
-    args: &ScanArgs,
-    save_only: bool,
-    json: bool,
-    silent: bool,
-) -> DownloadParams {
+fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
         org: args.common.org.clone(),
@@ -439,7 +435,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         cwd: args.common.cwd.clone(),
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
-        batch_size,
     };
 
     let scan_target = if args.common.global || args.common.global_prefix.is_some() {
@@ -452,7 +447,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // summary, the results table, and the per-patch listing are all
     // suppressed below, mirroring `list`/`get`/`repair`/`remove`. Errors
     // and the JSON envelope are unaffected.
-    let show_progress = !args.common.json && !args.common.silent && stderr_is_tty();
+    let show_progress = !args.common.json && !args.common.silent && std::io::stderr().is_terminal();
 
     if show_progress {
         eprint!("Scanning {scan_target}...");
@@ -1003,7 +998,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return final_code;
     }
 
-    let use_color = stdout_is_tty();
+    let use_color = std::io::stdout().is_terminal();
 
     if all_packages_with_patches.is_empty() {
         if !args.common.silent {

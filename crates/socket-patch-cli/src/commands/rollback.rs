@@ -662,7 +662,6 @@ async fn rollback_patches_inner(
         cwd: args.common.cwd.clone(),
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
-        batch_size: 100,
     };
 
     let all_packages = find_packages_for_rollback(

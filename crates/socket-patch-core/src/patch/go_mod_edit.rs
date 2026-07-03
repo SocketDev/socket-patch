@@ -196,24 +196,16 @@ async fn edit_go_mod(
         None => Ok(false),
         Some(new) => {
             if !dry_run {
-                atomic_write(&path, new.as_bytes())
+                // go.mod is user-owned (their own require/replace directives and
+                // comments live alongside our socket `replace`) — a torn write
+                // would corrupt a manifest that no longer builds.
+                crate::utils::fs::atomic_write_bytes(&path, new.as_bytes())
                     .await
                     .map_err(|e| format!("write {}: {e}", path.display()))?;
             }
             Ok(true)
         }
     }
-}
-
-/// Atomically commit `content` to `path` via stage + fsync + rename.
-///
-/// A `go.mod` is a *user-owned* file that **defines the module** and carries
-/// the user's own `require`/`exclude`/`retract`/`replace` directives and
-/// comments alongside our socket `replace` — a torn write would corrupt a
-/// manifest that no longer builds, when we only meant to add or refresh one
-/// line. Delegates to the crate-wide hardened writer.
-async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(path, content).await
 }
 
 // ── parsing ────────────────────────────────────────────────────────────────

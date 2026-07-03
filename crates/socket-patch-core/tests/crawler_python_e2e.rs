@@ -475,7 +475,6 @@ async fn get_site_packages_paths_falls_back_via_pyproject_marker() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let result = crawler.get_site_packages_paths(&opts).await.unwrap();
     if let Some(v) = prev_home {
@@ -551,7 +550,6 @@ async fn get_site_packages_paths_falls_back_via_uv_lock_marker() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let result = crawler.get_site_packages_paths(&opts).await.unwrap();
     if let Some(v) = prev_home {
@@ -585,7 +583,6 @@ async fn get_site_packages_paths_no_marker_no_venv_returns_empty() {
         cwd: project.path().to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     };
     let prev_virtual_env = std::env::var("VIRTUAL_ENV").ok();
     std::env::remove_var("VIRTUAL_ENV");
@@ -695,7 +692,6 @@ async fn crawl_all_handles_unreadable_site_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(site_packages.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&site_packages);
@@ -870,7 +866,6 @@ async fn crawl_all_via_site_packages_finds_dist_info_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -914,7 +909,6 @@ async fn crawl_all_with_unparseable_dist_info_skips() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(
@@ -936,7 +930,6 @@ async fn get_site_packages_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: false,
         global_prefix: Some(custom.clone()),
-        batch_size: 100,
     };
     let paths = crawler.get_site_packages_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![custom]);

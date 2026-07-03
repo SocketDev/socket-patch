@@ -281,8 +281,8 @@ fn parse_path_coordinates(
 /// The coordinates come straight from the (untrusted) manifest PURL and are
 /// joined onto the repo root, after which the resolved directory is patched IN
 /// PLACE (Maven has no `replace`-redirect backend). A tampered PURL must not be
-/// able to traverse out of the repository. `verify_maven_at_path` only checks
-/// for a `.pom` file, so it is no defense — this gate is. Fails closed.
+/// able to traverse out of the repository. `has_pom_file` only checks for a
+/// `.pom` file, so it is no defense — this gate is. Fails closed.
 ///
 /// - `artifact_id` and `version` are each a single path segment, so a real one
 ///   never contains a separator, a `.`/`..` segment, a backslash, a colon, or
@@ -418,10 +418,10 @@ impl MavenCrawler {
                     .join(artifact_id)
                     .join(version);
 
-                if self
-                    .verify_maven_at_path(&expected_path, group_id, artifact_id, version)
-                    .await
-                {
+                // The path already encodes the coordinates
+                // (groupId/artifactId/version), so verifying the package is
+                // just checking a `.pom` file exists there.
+                if self.has_pom_file(&expected_path).await {
                     result.insert(
                         purl.clone(),
                         CrawledPackage {
@@ -453,10 +453,7 @@ impl MavenCrawler {
         if let Ok(m2_home) = std::env::var("M2_HOME") {
             return PathBuf::from(m2_home).join("repository");
         }
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "~".to_string());
-        PathBuf::from(home).join(".m2").join("repository")
+        crate::utils::fs::home_dir().join(".m2").join("repository")
     }
 
     /// Scan a Maven repository directory and return all valid packages found.
@@ -505,20 +502,6 @@ impl MavenCrawler {
         }
 
         results
-    }
-
-    /// Verify that a Maven package directory contains a `.pom` file
-    /// with the expected coordinates.
-    async fn verify_maven_at_path(
-        &self,
-        path: &Path,
-        _group_id: &str,
-        _artifact_id: &str,
-        _version: &str,
-    ) -> bool {
-        // The path already encodes the coordinates (groupId/artifactId/version),
-        // so we just need to verify a .pom file exists here.
-        self.has_pom_file(path).await
     }
 
     /// Check if a directory contains at least one `.pom` file.
@@ -1113,7 +1096,7 @@ mod tests {
         // directory outside the Maven repo root. Maven patches are applied IN
         // PLACE at the directory the crawler returns (no redirect backend
         // stands between resolution and disk), so an escape means an
-        // arbitrary out-of-tree write. `verify_maven_at_path` only checks for
+        // arbitrary out-of-tree write. `has_pom_file` only checks for
         // a `.pom` file, which does nothing to stop traversal — hence the
         // fail-closed coordinate guard. Twin of the go/deno crawler guards.
         let root = tempfile::tempdir().unwrap();
@@ -1238,7 +1221,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1277,7 +1259,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1313,7 +1294,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1332,7 +1312,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
@@ -1347,7 +1326,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();

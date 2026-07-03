@@ -559,7 +559,10 @@ fn remove_dry_run_with_rollback_does_not_create_blobs_dir() {
         !socket.join("blobs").exists(),
         "dry-run must not create .socket/blobs"
     );
-    assert_eq!(read_manifest(&socket)["patches"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        read_manifest(&socket)["patches"].as_object().unwrap().len(),
+        2
+    );
     let litter: Vec<_> = std::fs::read_dir(&socket)
         .unwrap()
         .filter_map(|e| e.ok())

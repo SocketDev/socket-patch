@@ -774,10 +774,10 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
-    use std::collections::HashMap;
     use base64::Engine as _;
     use serde_json::json;
     use sha2::{Digest, Sha512};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";

@@ -31,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::crawlers::Ecosystem;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::list_dir_entries;
 
@@ -47,37 +48,16 @@ pub const ECOSYSTEM_DIRS: &[&str] = &[
 
 /// The vendor ecosystem-dir name for a PURL, or `None` when the ecosystem has
 /// no vendor backend (jsr) or is compiled out of this binary.
+///
+/// The dir name is `Ecosystem::cli_name()`: both are persisted contracts
+/// (cli_name in manifests/sidecars, the dir in committed vendor paths) and
+/// they deliberately share one spelling — see `ECOSYSTEM_DIRS` above.
 pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
-    if purl.starts_with("pkg:npm/") {
-        return Some("npm");
+    match Ecosystem::from_purl(purl)? {
+        #[cfg(feature = "deno")]
+        Ecosystem::Deno => None,
+        eco => Some(eco.cli_name()),
     }
-    if purl.starts_with("pkg:pypi/") {
-        return Some("pypi");
-    }
-    if purl.starts_with("pkg:gem/") {
-        return Some("gem");
-    }
-    #[cfg(feature = "cargo")]
-    if purl.starts_with("pkg:cargo/") {
-        return Some("cargo");
-    }
-    #[cfg(feature = "golang")]
-    if purl.starts_with("pkg:golang/") {
-        return Some("golang");
-    }
-    #[cfg(feature = "composer")]
-    if purl.starts_with("pkg:composer/") {
-        return Some("composer");
-    }
-    #[cfg(feature = "nuget")]
-    if purl.starts_with("pkg:nuget/") {
-        return Some("nuget");
-    }
-    #[cfg(feature = "maven")]
-    if purl.starts_with("pkg:maven/") {
-        return Some("maven");
-    }
-    None
 }
 
 /// The project-relative uuid dir (`.socket/vendor/<eco>/<uuid>`), validated.
@@ -373,6 +353,35 @@ mod tests {
             vendor_uuid_dir_rel("jsr", UUID).is_none(),
             "unknown eco dir"
         );
+    }
+
+    /// `ecosystem_dir_for_purl` derives the dir from `Ecosystem::cli_name()`.
+    /// The dir is an on-disk contract (committed vendor paths), so every
+    /// classification must land inside `ECOSYSTEM_DIRS` — a cli_name rename
+    /// must fail here rather than silently move the vendor layout. JSR stays
+    /// backend-less.
+    #[test]
+    fn ecosystem_dir_matches_contract_dirs() {
+        for eco in Ecosystem::all() {
+            let purl = format!("pkg:{}/example@1.0.0", eco.cli_name());
+            match ecosystem_dir_for_purl(&purl) {
+                Some(dir) => {
+                    assert_eq!(dir, eco.cli_name());
+                    assert!(
+                        ECOSYSTEM_DIRS.contains(&dir),
+                        "dir {dir:?} missing from ECOSYSTEM_DIRS"
+                    );
+                }
+                None => {
+                    #[cfg(feature = "deno")]
+                    assert_eq!(*eco, Ecosystem::Deno, "only deno lacks a vendor backend");
+                    #[cfg(not(feature = "deno"))]
+                    panic!("no vendor dir for {}", eco.cli_name());
+                }
+            }
+        }
+        assert_eq!(ecosystem_dir_for_purl("pkg:jsr/@std/path@0.220.0"), None);
+        assert_eq!(ecosystem_dir_for_purl("pkg:unknown/foo@1.0"), None);
     }
 
     #[test]

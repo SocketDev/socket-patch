@@ -18,7 +18,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -142,7 +141,6 @@ async fn get_module_cache_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_module_cache_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -218,7 +216,6 @@ async fn crawl_all_handles_unreadable_cache_path() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(cache.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&cache);
@@ -334,7 +331,6 @@ async fn crawl_all_finds_nested_versioned_module() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -368,7 +364,6 @@ async fn crawl_all_skips_cache_metadata_dir() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(

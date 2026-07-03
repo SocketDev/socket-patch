@@ -17,16 +17,7 @@ use tokio::fs;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, spec_is_hook, HOOK_DEP};
-
-/// Atomically write `content` to `path`.
-///
-/// The user's hand-authored `pyproject.toml` / `requirements.txt` (with its
-/// comments, formatting, and other dependencies) must never be left torn by
-/// a crash mid-write when we only meant to add one dependency line.
-/// Delegates to the crate-wide hardened writer.
-async fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
-}
+use crate::utils::fs::atomic_write_bytes;
 
 /// Which manifest format a path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +84,7 @@ pub async fn add_hook_dependency(path: &Path, kind: ManifestKind, dry_run: bool)
         Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
         Ok(Some(new_content)) => {
             if !dry_run {
-                if let Err(e) = atomic_write(path, &new_content).await {
+                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
                     return PthEditResult::err(path, kind, e.to_string());
                 }
             }
@@ -128,7 +119,7 @@ pub async fn remove_hook_dependency(
         Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
         Ok(Some(new_content)) => {
             if !dry_run {
-                if let Err(e) = atomic_write(path, &new_content).await {
+                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
                     return PthEditResult::err(path, kind, e.to_string());
                 }
             }

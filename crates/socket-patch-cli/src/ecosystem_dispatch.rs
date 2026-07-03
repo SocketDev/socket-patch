@@ -1,9 +1,11 @@
 use socket_patch_core::crawlers::{
-    CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler,
+    CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler, RubyCrawler,
 };
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+use crate::args::GlobalArgs;
 
 #[cfg(feature = "cargo")]
 use socket_patch_core::crawlers::CargoCrawler;
@@ -17,7 +19,6 @@ use socket_patch_core::crawlers::GoCrawler;
 use socket_patch_core::crawlers::MavenCrawler;
 #[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
-use socket_patch_core::crawlers::RubyCrawler;
 
 /// Runtime opt-in gate for experimental Maven support.
 ///
@@ -164,7 +165,7 @@ type MergeFn = fn(&mut HashMap<String, PathBuf>, &[String], HashMap<String, Craw
 fn merge_first_wins(
     out: &mut HashMap<String, PathBuf>,
     _purls: &[String],
-    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+    packages: HashMap<String, CrawledPackage>,
 ) {
     for (purl, pkg) in packages {
         out.entry(purl).or_insert(pkg.path);
@@ -180,7 +181,7 @@ fn merge_first_wins(
 fn merge_qualified(
     out: &mut HashMap<String, PathBuf>,
     purls: &[String],
-    packages: HashMap<String, socket_patch_core::crawlers::CrawledPackage>,
+    packages: HashMap<String, CrawledPackage>,
 ) {
     for (base_purl, pkg) in packages {
         for qualified in purls {
@@ -402,6 +403,32 @@ pub async fn find_packages_for_rollback(
     silent: bool,
 ) -> HashMap<String, PathBuf> {
     dispatch_find(partitioned, options, silent, merge_qualified).await
+}
+
+/// Resolve manifest PURLs to their installed on-disk paths (partition,
+/// build crawler options from the global args, dispatch). Uses the
+/// rollback (qualified-aware) resolver, NOT `find_packages_for_purls`:
+/// release-variant ecosystems (PyPI / RubyGems / Maven) key the manifest
+/// by *qualified* PURLs (`?artifact_id=`, `?platform=`,
+/// `?classifier=&ext=`), but the crawler only knows the *base* PURL.
+/// `find_packages_for_purls` would key the result map by the base PURL,
+/// so qualified manifest lookups would all miss and every PyPI/Gem/Maven
+/// patch would silently resolve as `package_not_found`. The rollback
+/// variant fans each base path back out to every qualified manifest PURL
+/// — the same mapping the manifest was written with (`get` uses the same
+/// resolver).
+pub async fn find_manifest_package_paths(
+    purls: &[String],
+    common: &GlobalArgs,
+    quiet: bool,
+) -> HashMap<String, PathBuf> {
+    let partitioned = partition_purls(purls, common.ecosystems.as_deref());
+    let crawler_options = CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
+    };
+    find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
 /// Crawl all enabled ecosystems and return all packages plus per-ecosystem counts.
@@ -909,7 +936,6 @@ mod tests {
             cwd,
             global: false,
             global_prefix: None,
-            batch_size: 100,
         }
     }
 

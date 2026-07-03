@@ -177,8 +177,6 @@ pub struct CrawlerOptions {
     pub global: bool,
     /// Custom path to global package directory (overrides auto-detection).
     pub global_prefix: Option<PathBuf>,
-    /// Batch size for yielding packages (default: 100).
-    pub batch_size: usize,
 }
 
 impl Default for CrawlerOptions {
@@ -187,7 +185,6 @@ impl Default for CrawlerOptions {
             cwd: std::env::current_dir().unwrap_or_default(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         }
     }
 }
@@ -571,13 +568,12 @@ mod tests {
         }
     }
 
-    /// The documented default batch size is 100. A regression to 0 would
-    /// reintroduce the batch-size-0 division/panic class of bug seen in
-    /// the scan path, so pin the contract here at the source of truth.
+    /// Defaults must describe a local (non-global) crawl with no prefix
+    /// override, so a caller that forgets to set the flags gets the safe
+    /// project-local behavior.
     #[test]
-    fn test_crawler_options_default_batch_size() {
+    fn test_crawler_options_defaults() {
         let opts = CrawlerOptions::default();
-        assert_eq!(opts.batch_size, 100);
         assert!(!opts.global);
         assert!(opts.global_prefix.is_none());
     }

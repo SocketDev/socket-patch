@@ -28,7 +28,7 @@ pub fn compute_git_sha256_from_bytes(data: &[u8]) -> String {
 /// To avoid draining an arbitrarily large (or slow/unbounded) stream once the
 /// hash is already known to be invalid, the loop bails out as soon as the bytes
 /// read exceed `size`; it does not keep reading just to report a larger total.
-pub async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unpin>(
     size: u64,
     mut reader: R,
 ) -> io::Result<String> {

@@ -65,6 +65,23 @@ pub fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
     }
 }
 
+/// Check if debug mode is enabled via `SOCKET_DEBUG` (with the legacy
+/// `SOCKET_PATCH_DEBUG` shim).
+pub(crate) fn is_debug_enabled() -> bool {
+    matches!(
+        read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG").as_deref(),
+        Some("1" | "true")
+    )
+}
+
+/// The public patch-API proxy base URL: `SOCKET_PROXY_URL` (with the legacy
+/// `SOCKET_PATCH_PROXY_URL` shim), defaulting to
+/// [`DEFAULT_PATCH_API_PROXY_URL`](crate::constants::DEFAULT_PATCH_API_PROXY_URL).
+pub(crate) fn proxy_url_from_env() -> String {
+    read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
+        .unwrap_or_else(|| crate::constants::DEFAULT_PATCH_API_PROXY_URL.to_string())
+}
+
 /// Renamed env vars whose legacy `SOCKET_PATCH_*` names are still honored.
 ///
 /// First entry of each tuple is the new name (what clap and current code

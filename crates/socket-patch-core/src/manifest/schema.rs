@@ -56,7 +56,7 @@ pub struct SetupConfig {
 
 impl SetupConfig {
     /// Whether this carries no setup state (so the manifest can omit the key).
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.exclude.is_empty() && self.manual.is_empty()
     }
 }
@@ -73,7 +73,7 @@ fn setup_is_absent(setup: &Option<SetupConfig>) -> bool {
 
 /// The top-level patch manifest structure.
 /// Stored as `.socket/manifest.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PatchManifest {
     /// Maps package PURL (e.g., "pkg:npm/lodash@4.17.21") -> patch record.
     #[serde(serialize_with = "serialize_sorted")]
@@ -89,16 +89,7 @@ pub struct PatchManifest {
 impl PatchManifest {
     /// Create an empty manifest.
     pub fn new() -> Self {
-        Self {
-            patches: HashMap::new(),
-            setup: None,
-        }
-    }
-}
-
-impl Default for PatchManifest {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 

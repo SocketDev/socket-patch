@@ -620,7 +620,7 @@ async fn repair_online_downloads_missing_blob() {
 fn repair_honors_manifest_path_override() {
     // Put the manifest somewhere other than `.socket/manifest.json` and
     // confirm `--manifest-path` finds it. This exercises the
-    // `resolve_manifest_path` codepath.
+    // `resolved_manifest_path` codepath.
     let tmp = tempfile::tempdir().expect("tempdir");
     let custom_dir = tmp.path().join("custom");
     std::fs::create_dir_all(&custom_dir).unwrap();

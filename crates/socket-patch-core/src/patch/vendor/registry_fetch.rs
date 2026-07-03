@@ -24,6 +24,8 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::constants::USER_AGENT;
+#[cfg(feature = "golang")]
+use crate::crawlers::go_crawler::encode_module_path;
 use crate::patch::apply::is_safe_relative_subpath;
 
 use super::lock_inventory::{LockIntegrity, LockfileEntry};
@@ -361,22 +363,6 @@ fn goproxy_base() -> String {
     DEFAULT_GOPROXY.to_string()
 }
 
-/// Go's module-path case encoding for proxy URLs: an uppercase letter `X`
-/// becomes `!x` (applies to the module path and the version).
-#[cfg(feature = "golang")]
-fn go_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii_uppercase() {
-            out.push('!');
-            out.push(c.to_ascii_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// go.sum's `h1:` dirhash over a module zip: sha256 of the sorted
 /// `"{sha256hex(content)}  {entry name}\n"` lines, base64-encoded
 /// (golang.org/x/mod/sumdb/dirhash Hash1/HashZip). Computed in memory
@@ -525,8 +511,8 @@ async fn fetch_golang(
         format!(
             "{}/{}/@v/{}.zip",
             goproxy_base(),
-            go_escape(&entry.name),
-            go_escape(&entry.version)
+            encode_module_path(&entry.name),
+            encode_module_path(&entry.version)
         )
     });
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
@@ -1365,10 +1351,10 @@ mod tests {
     #[test]
     fn go_escape_uppercase_and_zip_prefix_guards() {
         assert_eq!(
-            go_escape("github.com/Azure/azure-sdk"),
+            encode_module_path("github.com/Azure/azure-sdk"),
             "github.com/!azure/azure-sdk"
         );
-        assert_eq!(go_escape("v1.0.0-RC1"), "v1.0.0-!r!c1");
+        assert_eq!(encode_module_path("v1.0.0-RC1"), "v1.0.0-!r!c1");
 
         // An entry outside the module prefix fails the whole artifact.
         let zip_bytes = make_module_zip("github.com/x/y@v1.0.0/", &[("go.mod", b"m\n")]);

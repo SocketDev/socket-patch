@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{home_dir, is_dir};
 
 /// Deno (JSR) ecosystem crawler.
 pub struct DenoCrawler;
@@ -56,8 +56,8 @@ impl DenoCrawler {
 
     /// Get the JSR cache root paths to scan.
     ///
-    /// In global mode (or with `--global-prefix`), returns
-    /// `$DENO_DIR/npm/jsr.io/` directly.
+    /// With `--global-prefix`, returns the prefix directly; otherwise
+    /// resolves `$DENO_DIR/npm/jsr.io/`.
     ///
     /// In local mode, only returns paths when the cwd looks like a
     /// Deno project (`deno.json`, `deno.jsonc`, or `deno.lock`
@@ -66,21 +66,12 @@ impl DenoCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        if options.global || options.global_prefix.is_some() {
-            if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
-            }
-            let cache = deno_dir().join("npm").join("jsr.io");
-            if is_dir(&cache).await {
-                return Ok(vec![cache]);
-            }
+        if let Some(ref custom) = options.global_prefix {
+            return Ok(vec![custom.clone()]);
+        }
+        if !options.global && !is_deno_project(&options.cwd).await {
             return Ok(Vec::new());
         }
-
-        if !is_deno_project(&options.cwd).await {
-            return Ok(Vec::new());
-        }
-
         let cache = deno_dir().join("npm").join("jsr.io");
         if is_dir(&cache).await {
             Ok(vec![cache])
@@ -281,15 +272,6 @@ fn default_cache_root() -> PathBuf {
     home_dir().join(".cache")
 }
 
-/// Resolve the user's home directory, mirroring the `HOME` ->
-/// `USERPROFILE` -> `~` fallback chain used by the other crawlers.
-fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
-    PathBuf::from(home)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,7 +331,6 @@ mod tests {
             cwd: tmp.path().to_path_buf(),
             global: true,
             global_prefix: Some(cache),
-            batch_size: 100,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
     }
@@ -515,7 +496,6 @@ mod tests {
             cwd: project.path().to_path_buf(), // no deno.json/.jsonc/.lock
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
         assert!(crawler.crawl_all(&opts).await.is_empty());
     }

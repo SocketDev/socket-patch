@@ -32,6 +32,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
+use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
@@ -62,20 +63,6 @@ const WIRING_KIND: &str = "composer_lock_package";
 
 /// Marker schema version written into `socket-patch.vendor.json`.
 const MARKER_SCHEMA_VERSION: u32 = 1;
-
-/// Normalize a composer version for identity comparison: strip a single
-/// leading `v`/`V` when it directly precedes a digit (`v6.4.1` → `6.4.1`).
-/// Local twin of the private `crawlers::composer_crawler::normalize_version`
-/// (not visible from here); keep the two in sync.
-fn normalize_version(version: &str) -> &str {
-    let mut chars = version.chars();
-    if matches!(chars.next(), Some('v') | Some('V'))
-        && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-    {
-        return &version[1..];
-    }
-    version
-}
 
 /// Vendor a composer package: materialize a patched copy under
 /// `.socket/vendor/composer/<uuid>/<vendor>/<name>@<version>` and rewire the

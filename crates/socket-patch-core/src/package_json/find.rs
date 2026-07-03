@@ -24,9 +24,9 @@ pub enum WorkspaceType {
 
 /// Workspace configuration.
 #[derive(Debug, Clone)]
-pub struct WorkspaceConfig {
-    pub ws_type: WorkspaceType,
-    pub patterns: Vec<String>,
+struct WorkspaceConfig {
+    ws_type: WorkspaceType,
+    patterns: Vec<String>,
 }
 
 /// Location of a discovered package.json file.
@@ -35,7 +35,6 @@ pub struct PackageJsonLocation {
     pub path: PathBuf,
     pub is_root: bool,
     pub is_workspace: bool,
-    pub workspace_pattern: Option<String>,
 }
 
 /// Result of finding package.json files.
@@ -60,23 +59,37 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
         root_exists = true;
         workspace_config = detect_workspaces(&root_package_json).await;
         results.push(PackageJsonLocation {
-            path: root_package_json,
+            path: root_package_json.clone(),
             is_root: true,
             is_workspace: false,
-            workspace_pattern: None,
         });
     }
 
     match workspace_config.ws_type {
         WorkspaceType::None => {
+            // No workspace config: pick up nested manifests with a bounded
+            // walk (the root entry is already in `results`).
             if root_exists {
-                let nested = find_nested_package_json_files(start_path).await;
-                results.extend(nested);
+                let mut nested = Vec::new();
+                search_recursive(start_path, 0, 5, &mut nested).await;
+                results.extend(
+                    nested
+                        .into_iter()
+                        .filter(|p| *p != root_package_json)
+                        .map(|path| PackageJsonLocation {
+                            path,
+                            is_root: false,
+                            is_workspace: false,
+                        }),
+                );
             }
         }
         _ => {
-            let ws_packages = find_workspace_packages(start_path, &workspace_config).await;
-            results.extend(ws_packages);
+            // Members are collected into their own vec so a `!`-negation
+            // pattern can only remove members, never the root entry.
+            let mut members = Vec::new();
+            collect_workspace_members(start_path, &workspace_config, 0, &mut members).await;
+            results.extend(members);
         }
     }
 
@@ -94,7 +107,7 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
 }
 
 /// Detect workspace configuration from package.json.
-pub async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
+async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     let default = WorkspaceConfig {
         ws_type: WorkspaceType::None,
         patterns: Vec::new(),
@@ -229,23 +242,14 @@ fn parse_yaml_list_value(raw: &str) -> String {
     value.trim().to_string()
 }
 
-/// Find workspace packages based on workspace patterns, recursing into any
-/// member that is **itself** a workspace root (property 9's nested-workspace
-/// rule). A member's own `workspaces` patterns are resolved relative to that
-/// member's directory.
-async fn find_workspace_packages(
-    root_path: &Path,
-    config: &WorkspaceConfig,
-) -> Vec<PackageJsonLocation> {
-    let mut results = Vec::new();
-    collect_workspace_members(root_path, config, 0, &mut results).await;
-    results
-}
-
 /// Bounded-depth recursion limit for nested workspaces — deep enough for any
 /// real monorepo, a hard stop against a pattern that loops back on itself.
 const MAX_WORKSPACE_DEPTH: usize = 10;
 
+/// Collect workspace members matching the config's patterns, recursing into
+/// any member that is **itself** a workspace root (property 9's
+/// nested-workspace rule). A member's own `workspaces` patterns are resolved
+/// relative to that member's directory.
 async fn collect_workspace_members(
     root_path: &Path,
     config: &WorkspaceConfig,
@@ -272,7 +276,6 @@ async fn collect_workspace_members(
                 path: p,
                 is_root: false,
                 is_workspace: true,
-                workspace_pattern: Some(pattern.clone()),
             });
             // If this member declares its own workspaces, configure ITS members
             // too (one repo-root `setup` covers the whole nested tree). The
@@ -324,7 +327,7 @@ async fn find_packages_matching_pattern(root_path: &Path, pattern: &str) -> Vec<
                 if fs::metadata(&own_pkg).await.is_ok() {
                     results.push(own_pkg);
                 }
-                search_recursive(&search_path, &mut results).await;
+                search_recursive(&search_path, 0, usize::MAX, &mut results).await;
             }
         }
         _ => {
@@ -358,7 +361,7 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
         // that is itself a symlink. `entry.file_type()` reports the *link's*
         // own type — `is_dir() == false` — so it would silently drop such a
         // member; stat the path instead so the link is followed. (The
-        // recursive `**` searchers below deliberately do NOT follow symlinks,
+        // recursive searcher below deliberately does NOT follow symlinks,
         // to avoid loops/escapes — there a symlink's `is_dir() == false` is the
         // desired skip.)
         if !fs::metadata(&path)
@@ -380,55 +383,11 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
     }
 }
 
-/// Search recursively for package.json files.
-async fn search_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Skip hidden directories, node_modules, dist, build
-        if is_ignored_dir(&name_str) {
-            continue;
-        }
-
-        let full_path = entry.path();
-        let pkg_json = full_path.join("package.json");
-        if fs::metadata(&pkg_json).await.is_ok() {
-            results.push(pkg_json);
-        }
-
-        Box::pin(search_recursive(&full_path, results)).await;
-    }
-}
-
-/// Find nested package.json files without workspace configuration.
-async fn find_nested_package_json_files(start_path: &Path) -> Vec<PackageJsonLocation> {
-    let mut results = Vec::new();
-    let root_pkg = start_path.join("package.json");
-    search_nested(start_path, &root_pkg, 0, &mut results).await;
-    results
-}
-
-async fn search_nested(
-    dir: &Path,
-    root_pkg: &Path,
-    depth: usize,
-    results: &mut Vec<PackageJsonLocation>,
-) {
-    if depth > 5 {
+/// Search recursively for package.json files, descending at most `max_depth`
+/// directory levels below `dir` (pass `usize::MAX` for an unbounded walk).
+/// Symlinks are deliberately not followed — see `search_one_level`.
+async fn search_recursive(dir: &Path, depth: usize, max_depth: usize, results: &mut Vec<PathBuf>) {
+    if depth > max_depth {
         return;
     }
 
@@ -446,25 +405,18 @@ async fn search_nested(
             continue;
         }
 
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if is_ignored_dir(&name_str) {
+        // Skip hidden directories, node_modules, dist, build
+        if is_ignored_dir(&entry.file_name().to_string_lossy()) {
             continue;
         }
 
         let full_path = entry.path();
         let pkg_json = full_path.join("package.json");
-        if fs::metadata(&pkg_json).await.is_ok() && pkg_json != root_pkg {
-            results.push(PackageJsonLocation {
-                path: pkg_json,
-                is_root: false,
-                is_workspace: false,
-                workspace_pattern: None,
-            });
+        if fs::metadata(&pkg_json).await.is_ok() {
+            results.push(pkg_json);
         }
 
-        Box::pin(search_nested(&full_path, root_pkg, depth + 1, results)).await;
+        Box::pin(search_recursive(&full_path, depth + 1, max_depth, results)).await;
     }
 }
 

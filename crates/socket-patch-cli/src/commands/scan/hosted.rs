@@ -130,6 +130,7 @@ pub(super) async fn run_redirect(
             let mut integrity = reference
                 .artifacts
                 .iter()
+                .flatten()
                 .find(|a| a.kind == "tarball")
                 .map(|a| a.integrity.clone())
                 .unwrap_or_default();
@@ -139,6 +140,7 @@ pub(super) async fn run_redirect(
             let berry_zip = reference
                 .artifacts
                 .iter()
+                .flatten()
                 .find(|a| a.kind == "yarn-berry-zip");
             if let Some(c) = berry_zip.and_then(|a| a.integrity.yarn_berry10c0.clone()) {
                 integrity.yarn_berry10c0 = Some(c);

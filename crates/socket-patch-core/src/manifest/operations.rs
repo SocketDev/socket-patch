@@ -1,18 +1,7 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::manifest::schema::PatchManifest;
-
-/// Resolve a manifest path: absolute paths are returned as-is, relative paths
-/// are joined to `cwd`. Centralizes the duplicate block previously inlined in
-/// apply/rollback/list/remove/repair commands.
-pub fn resolve_manifest_path(cwd: &Path, manifest_path: &str) -> PathBuf {
-    if Path::new(manifest_path).is_absolute() {
-        PathBuf::from(manifest_path)
-    } else {
-        cwd.join(manifest_path)
-    }
-}
 
 /// Get only afterHash blobs referenced by a manifest.
 /// Used for apply operations -- we only need the patched file content, not the original.
@@ -51,7 +40,7 @@ pub fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
 
 /// Validate a parsed JSON value as a PatchManifest.
 /// Returns Ok(manifest) if valid, or Err(message) if invalid.
-pub fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String> {
+fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String> {
     serde_json::from_value::<PatchManifest>(value.clone())
         .map_err(|e| format!("Invalid manifest: {}", e))
 }
@@ -67,7 +56,7 @@ pub async fn read_manifest(
     let content = match tokio::fs::read_to_string(path).await {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e), // FIX: propagate actual I/O error
+        Err(e) => return Err(e),
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
@@ -487,31 +476,5 @@ mod tests {
                 "a failed write must not leave stage litter, found {name}"
             );
         }
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_relative_joins_cwd() {
-        let cwd = Path::new("/tmp/proj");
-        let resolved = resolve_manifest_path(cwd, ".socket/manifest.json");
-        assert_eq!(resolved, PathBuf::from("/tmp/proj/.socket/manifest.json"));
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_absolute_unchanged() {
-        let cwd = Path::new("/tmp/proj");
-        let absolute = if cfg!(windows) {
-            r"C:\custom\manifest.json"
-        } else {
-            "/etc/custom/manifest.json"
-        };
-        let resolved = resolve_manifest_path(cwd, absolute);
-        assert_eq!(resolved, PathBuf::from(absolute));
-    }
-
-    #[test]
-    fn test_resolve_manifest_path_relative_dotted() {
-        let cwd = Path::new("/tmp/proj");
-        let resolved = resolve_manifest_path(cwd, "../manifest.json");
-        assert_eq!(resolved, PathBuf::from("/tmp/proj/../manifest.json"));
     }
 }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
@@ -27,7 +27,7 @@ use socket_patch_core::vex::{
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::ecosystem_dispatch::find_manifest_package_paths;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
 
 #[derive(Args)]
@@ -199,13 +199,15 @@ pub async fn run(args: VexArgs) -> i32 {
     // on the same stdout stream. Bail out with a clear error before
     // doing any work.
     if args.common.json && args.output.is_none() {
-        emit_envelope_error_and_track(
-            &args,
+        let e = fail(
+            &args.common,
             "json_requires_output",
             "--json requires --output (the VEX document is itself JSON; \
-             route it to a file so the envelope can use stdout)",
+             route it to a file so the envelope can use stdout)"
+                .to_string(),
         )
         .await;
+        emit_envelope_error(&args, e.code, &e.message, &[]);
         return 2;
     }
 
@@ -241,7 +243,7 @@ pub async fn run(args: VexArgs) -> i32 {
         // (exit 2). `generate_vex_from_manifest_path` already fired
         // telemetry, so these emit-only sinks must not re-track.
         Err(e) if e.code == "no_applicable_patches" => {
-            emit_envelope_error_with_failures(&args, e.code, &e.message, &e.failed);
+            emit_envelope_error(&args, e.code, &e.message, &e.failed);
             1
         }
         // Standalone-only remediation hint: after an embedded `apply --vex`
@@ -253,11 +255,12 @@ pub async fn run(args: VexArgs) -> i32 {
                 e.code,
                 "Manifest is empty — nothing to attest. Run `socket-patch get` \
                  or `socket-patch scan --sync` first.",
+                &[],
             );
             1
         }
         Err(e) => {
-            emit_envelope_error(&args, e.code, &e.message);
+            emit_envelope_error(&args, e.code, &e.message, &[]);
             2
         }
     }
@@ -299,7 +302,7 @@ fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
 /// telemetry. Returns a [`VexWriteSummary`] on success or a structured
 /// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
 /// telemetry is fired here so every caller reports consistently.
-pub(crate) async fn generate_vex(
+async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest: &PatchManifest,
@@ -323,7 +326,8 @@ pub(crate) async fn generate_vex(
         // the dispatch's human chrome ("Using <X> at: ...") in both,
         // mirroring apply/rollback's `silent || json` gating.
         let quiet = common.silent || common.json || params.output.is_none();
-        let package_paths = resolve_package_paths(common, manifest, quiet).await;
+        let purls: Vec<String> = manifest.patches.keys().cloned().collect();
+        let package_paths = find_manifest_package_paths(&purls, common, quiet).await;
         let vendor = load_vendor_context(common, manifest).await;
         socket_patch_core::vex::applied_patches_with_vendor(
             manifest,
@@ -672,7 +676,7 @@ async fn synthesize_go_patches(
         }
         // Explicit vendor entries take precedence over the synthesis
         // (vendor may have taken over an apply redirect).
-        if entries.contains_key(&purl) || entries.values().any(|e| e.base_purl == purl) {
+        if socket_patch_core::patch::vendor::lookup_entry(entries, &purl).is_some() {
             continue;
         }
         // SECURITY: module/version come from a committed (tamper-able)
@@ -693,64 +697,11 @@ async fn synthesize_go_patches(
     go_patches
 }
 
-/// Walk the ecosystem dispatch to build the PURL -> on-disk-path map
-/// used by `vex::verify::applied_patches`.
-async fn resolve_package_paths(
-    common: &GlobalArgs,
-    manifest: &PatchManifest,
-    quiet: bool,
-) -> HashMap<String, PathBuf> {
-    let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-    let partitioned = partition_purls(&purls, common.ecosystems.as_deref());
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-        batch_size: 0, // unused for find_packages_for_rollback
-    };
-    // Use the rollback (qualified-aware) resolver, NOT
-    // `find_packages_for_purls`. Release-variant ecosystems
-    // (PyPI / RubyGems / Maven) key the manifest by *qualified* PURLs
-    // (`?artifact_id=`, `?platform=`, `?classifier=&ext=`), but the
-    // crawler only knows the *base* PURL. `find_packages_for_purls`
-    // would key the result map by the base PURL, so the qualified
-    // lookups in `vex::applied_patches` would all miss and every
-    // PyPI/Gem/Maven patch would be silently dropped from the VEX doc
-    // as `package_not_found`. The rollback variant fans each base path
-    // back out to every qualified manifest PURL — the same mapping the
-    // manifest was written with (`get` uses the same resolver).
-    find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
-}
-
-fn emit_envelope_error(args: &VexArgs, code: &str, message: &str) {
-    if args.common.json {
-        let mut env = Envelope::new(Command::Vex);
-        env.mark_error(EnvelopeError::new(code, message.to_string()));
-        println!("{}", env.to_pretty_json());
-    } else {
-        eprintln!("Error: {message}");
-    }
-}
-
-/// Async error sink that mirrors `emit_envelope_error` and also fires
-/// the `vex_failed` telemetry event. Centralizes both side effects so
-/// each `return` site in `run` only needs one call.
-async fn emit_envelope_error_and_track(args: &VexArgs, code: &str, message: &str) {
-    track_vex_failed(
-        code,
-        args.common.api_token.as_deref(),
-        args.common.org.as_deref(),
-    )
-    .await;
-    emit_envelope_error(args, code, message);
-}
-
-fn emit_envelope_error_with_failures(
-    args: &VexArgs,
-    code: &str,
-    message: &str,
-    failures: &[FailedPatch],
-) {
+/// Emit a `vex` error to the active output channel: an error envelope on
+/// stdout in `--json` mode, a stderr message otherwise. `failures` lists
+/// patches omitted by verification (populated for `no_applicable_patches`,
+/// empty everywhere else).
+fn emit_envelope_error(args: &VexArgs, code: &str, message: &str, failures: &[FailedPatch]) {
     if args.common.json {
         let mut env = Envelope::new(Command::Vex);
         for f in failures {

@@ -30,7 +30,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -179,7 +178,6 @@ async fn crawl_all_via_installed_json_returns_packages() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().join("vendor")),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -218,7 +216,6 @@ async fn crawl_all_with_corrupt_installed_json_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(vendor.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty(), "corrupt JSON must yield empty crawl");
@@ -250,7 +247,6 @@ async fn get_vendor_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -353,7 +349,6 @@ async fn get_vendor_paths_global_via_composer_home_env() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -395,7 +390,6 @@ async fn get_vendor_paths_global_via_home_dot_composer_fallback() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -448,7 +442,6 @@ async fn get_vendor_paths_global_via_home_xdg_config_composer_fallback() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -498,7 +491,6 @@ async fn get_vendor_paths_global_no_composer_no_home_layout_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_vendor_paths(&opts).await.unwrap();
 
@@ -604,7 +596,6 @@ async fn crawl_all_dedups_across_vendor_paths() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(custom_vendor),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(

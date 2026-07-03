@@ -20,7 +20,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -173,7 +172,6 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: false,
         global_prefix: Some(custom.clone()),
-        batch_size: 100,
     };
     let paths = crawler.get_node_modules_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![custom]);
@@ -191,7 +189,6 @@ async fn get_node_modules_paths_global_mode_no_prefix() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     // Just must not panic — the actual list depends on the host.
     let _paths = crawler.get_node_modules_paths(&opts).await.unwrap();

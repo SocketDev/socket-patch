@@ -508,9 +508,9 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
         .collect();
     // Sidecar data is NOT attached here — it's surfaced at the
     // envelope level under `Envelope.sidecars[]` by the run loop.
-    // See `Envelope::record_sidecar`. Keeping events clean of
-    // sidecar info means each event describes only the apply
-    // action; sidecar reporting is a separate, JOIN-able list.
+    // Keeping events clean of sidecar info means each event describes
+    // only the apply action; sidecar reporting is a separate,
+    // JOIN-able list.
     PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
@@ -660,7 +660,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     // `envelope.sidecars[]` and JOIN against
                     // `events[]` by `purl` for per-package context.
                     if let Some(ref sidecar) = result.sidecar {
-                        env.record_sidecar(sidecar.clone());
+                        env.sidecars.push(sidecar.clone());
                     }
                 }
                 // Manifest entries that targeted in-scope ecosystems but
@@ -957,7 +957,6 @@ async fn apply_patches_inner(
         cwd: args.common.cwd.clone(),
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
-        batch_size: 100,
     };
 
     let all_packages = find_packages_for_purls(

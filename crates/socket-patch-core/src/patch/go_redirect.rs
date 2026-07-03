@@ -548,15 +548,7 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());
     }
-    atomic_write(&go_mod, format!("module {module}\n").as_bytes()).await
-}
-
-/// Atomically commit `content` to `path` via stage + fsync + rename, so a
-/// reader/recovering process only ever sees the complete old or complete
-/// new bytes of a synthesized `go.mod`. Delegates to the crate-wide
-/// hardened writer.
-async fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(path, content).await
+    crate::utils::fs::atomic_write_bytes(&go_mod, format!("module {module}\n").as_bytes()).await
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,

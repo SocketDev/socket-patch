@@ -24,9 +24,9 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::patch::vendor::{
-    self, ecosystem_dir_for_purl, load_state, lock_inventory, registry_fetch, save_state,
-    RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource, VendorState,
-    VendorWarning,
+    self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
+    save_state, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig, VendorSource,
+    VendorState, VendorWarning,
 };
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
@@ -357,26 +357,33 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     if !args.revert {
-        if exit == 0 {
-            track_patch_vendored(
-                env.summary.applied,
-                args.common.dry_run,
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
-        } else {
-            track_patch_vendor_failed(
-                "vendor completed with failures",
-                args.common.dry_run,
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
-        }
+        track_outcomes_for_vendor(
+            exit != 0,
+            &env,
+            args.common.dry_run,
+            api_token.as_deref(),
+            org_slug.as_deref(),
+        )
+        .await;
     }
 
     exit
+}
+
+/// Telemetry for a vendor run's success/failure split, shared by
+/// [`run`] and the scan-driven vendor step (`scan --vendor`).
+pub(crate) async fn track_outcomes_for_vendor(
+    has_errors: bool,
+    env: &Envelope,
+    dry_run: bool,
+    token: Option<&str>,
+    org: Option<&str>,
+) {
+    if has_errors {
+        track_patch_vendor_failed("vendor completed with failures", dry_run, token, org).await;
+    } else {
+        track_patch_vendored(env.summary.applied, dry_run, token, org).await;
+    }
 }
 
 async fn run_vendor(
@@ -596,15 +603,12 @@ pub(crate) async fn vendor_records(
     let mut has_errors = false;
     let manifest_purls: Vec<String> = records.keys().cloned().collect();
     let partitioned = partition_purls(&manifest_purls, common.ecosystems.as_deref());
-    let target_manifest_purls: HashSet<String> = partitioned
-        .values()
-        .flat_map(|p| p.iter().cloned())
-        .collect();
 
     // Purls with no vendor backend (jsr, or ecosystems compiled out of this
     // binary) are expected skips, not failures.
-    let (vendorable, unsupported): (Vec<String>, Vec<String>) = target_manifest_purls
-        .iter()
+    let (vendorable, unsupported): (Vec<String>, Vec<String>) = partitioned
+        .values()
+        .flatten()
         .cloned()
         .partition(|p| vendor::is_vendorable(p));
     for purl in &unsupported {
@@ -640,7 +644,6 @@ pub(crate) async fn vendor_records(
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
-        batch_size: 100,
     };
     let mut all_packages = find_packages_for_purls(
         &vendorable_partition,
@@ -678,10 +681,7 @@ pub(crate) async fn vendor_records(
             // against the ledger — offline-safe, no registry traffic.
             let ledger = load_state(&common.cwd).await.unwrap_or_default();
             for purl in &missing {
-                let ledger_entry = ledger
-                    .entries
-                    .get(purl)
-                    .or_else(|| ledger.entries.values().find(|e| &e.base_purl == purl));
+                let ledger_entry = lookup_entry(&ledger.entries, purl);
                 if let Some(entry) = ledger_entry
                     .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
                 {

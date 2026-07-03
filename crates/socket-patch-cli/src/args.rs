@@ -13,7 +13,7 @@
 //! names are still read at runtime (via `socket_patch_core::env_compat`) with
 //! a one-shot deprecation warning; they will be removed in the next major.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -305,13 +305,14 @@ pub struct GlobalArgs {
 }
 
 impl GlobalArgs {
-    /// Resolve `manifest_path` against `cwd`. See
-    /// `socket_patch_core::manifest::operations::resolve_manifest_path`.
+    /// Resolve `manifest_path` against `cwd`: absolute paths are returned
+    /// as-is, relative paths are joined to `cwd`.
     pub(crate) fn resolved_manifest_path(&self) -> PathBuf {
-        socket_patch_core::manifest::operations::resolve_manifest_path(
-            &self.cwd,
-            &self.manifest_path,
-        )
+        if Path::new(&self.manifest_path).is_absolute() {
+            PathBuf::from(&self.manifest_path)
+        } else {
+            self.cwd.join(&self.manifest_path)
+        }
     }
 
     /// Build [`ApiClientEnvOverrides`] from the CLI flags.
@@ -902,14 +903,30 @@ mod tests {
     /// An absolute `manifest_path` ignores `cwd` and passes through unchanged.
     #[test]
     fn resolved_manifest_path_passes_absolute_through() {
+        let absolute = if cfg!(windows) {
+            r"C:\etc\socket\manifest.json"
+        } else {
+            "/etc/socket/manifest.json"
+        };
         let args = GlobalArgs {
             cwd: PathBuf::from("/work/project"),
-            manifest_path: "/etc/socket/manifest.json".to_string(),
+            manifest_path: absolute.to_string(),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(args.resolved_manifest_path(), PathBuf::from(absolute));
+    }
+
+    /// A dotted relative `manifest_path` is joined verbatim, not normalized.
+    #[test]
+    fn resolved_manifest_path_joins_dotted_relative_verbatim() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "../manifest.json".to_string(),
             ..GlobalArgs::default()
         };
         assert_eq!(
             args.resolved_manifest_path(),
-            PathBuf::from("/etc/socket/manifest.json"),
+            PathBuf::from("/work/project/../manifest.json"),
         );
     }
 

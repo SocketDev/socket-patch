@@ -265,15 +265,7 @@ async fn repair_inner(
             .iter()
             .filter(|(purl, rec)| {
                 !referenced_uuids.contains(&rec.uuid)
-                    && vendor_state
-                        .entries
-                        .get(*purl)
-                        .or_else(|| {
-                            vendor_state
-                                .entries
-                                .values()
-                                .find(|e| &e.base_purl == *purl)
-                        })
+                    && socket_patch_core::patch::vendor::lookup_entry(&vendor_state.entries, purl)
                         .is_none_or(|e| e.uuid != rec.uuid)
             })
             .map(|(k, v)| (k.clone(), v.clone()))

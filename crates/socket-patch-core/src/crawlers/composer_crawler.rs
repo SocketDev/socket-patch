@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir, is_file};
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
@@ -22,10 +22,6 @@ impl ComposerCrawler {
         Self
     }
 
-    // ------------------------------------------------------------------
-    // Public API
-    // ------------------------------------------------------------------
-
     /// Get vendor paths based on options.
     ///
     /// In global mode, checks `$COMPOSER_HOME/vendor/` (env var, command
@@ -42,7 +38,14 @@ impl ComposerCrawler {
             if let Some(ref custom) = options.global_prefix {
                 return Ok(vec![custom.clone()]);
             }
-            return Ok(Self::get_global_vendor_paths().await);
+            let mut paths = Vec::new();
+            if let Some(composer_home) = get_composer_home().await {
+                let vendor_dir = composer_home.join("vendor");
+                if is_dir(&vendor_dir).await {
+                    paths.push(vendor_dir);
+                }
+            }
+            return Ok(paths);
         }
 
         // Local mode
@@ -188,24 +191,6 @@ impl ComposerCrawler {
 
         Ok(result)
     }
-
-    // ------------------------------------------------------------------
-    // Private helpers
-    // ------------------------------------------------------------------
-
-    /// Get global Composer vendor paths.
-    async fn get_global_vendor_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-
-        if let Some(composer_home) = get_composer_home().await {
-            let vendor_dir = composer_home.join("vendor");
-            if is_dir(&vendor_dir).await {
-                paths.push(vendor_dir);
-            }
-        }
-
-        paths
-    }
 }
 
 impl Default for ComposerCrawler {
@@ -283,7 +268,11 @@ async fn get_composer_home() -> Option<PathBuf> {
 /// version (`6.4.1`), so strip a single leading `v`/`V` when it
 /// directly precedes a digit. Versions that don't fit that shape (e.g.
 /// `dev-main`, `1.0.x-dev`) are returned untouched.
-fn normalize_version(version: &str) -> &str {
+///
+/// Also used by the composer vendor backend
+/// (`patch::vendor::composer_lock`) to match lock versions against PURL
+/// versions through the same normalization.
+pub(crate) fn normalize_version(version: &str) -> &str {
     let mut chars = version.chars();
     if matches!(chars.next(), Some('v') | Some('V'))
         && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
@@ -340,14 +329,6 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
         .collect()
 }
 
-/// Check whether a path is a file.
-async fn is_file(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,7 +369,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -513,7 +493,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -561,7 +540,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -660,7 +638,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -703,7 +680,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -813,7 +789,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -853,7 +828,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;

@@ -457,7 +457,6 @@ pub(crate) async fn repair_vendored_artifacts(
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
-        batch_size: 100,
     };
     let mut all_packages = find_packages_for_purls(&partitioned, &crawler_options, quiet).await;
     let inventory = lock_inventory::inventory_project(&common.cwd).await;

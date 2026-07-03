@@ -15,7 +15,6 @@ fn options_at(root: &Path) -> CrawlerOptions {
         cwd: root.to_path_buf(),
         global: false,
         global_prefix: None,
-        batch_size: 100,
     }
 }
 
@@ -132,7 +131,6 @@ async fn cargo_home_fallback_to_home_dot_cargo() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: None,
-        batch_size: 100,
     };
     let paths = crawler.get_crate_source_paths(&opts).await.unwrap();
 
@@ -241,7 +239,6 @@ async fn crawl_all_via_registry_layout() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     // Exact contents, not just a `>= 2` floor: a regression that drops a
@@ -277,7 +274,6 @@ async fn crawl_all_empty_src_returns_empty() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
@@ -293,7 +289,6 @@ async fn get_crate_source_paths_with_global_prefix_passthrough() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let paths = crawler.get_crate_source_paths(&opts).await.unwrap();
     assert_eq!(paths, vec![tmp.path().to_path_buf()]);
@@ -379,7 +374,6 @@ async fn crawl_all_falls_back_to_dir_name_when_workspace_version() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -399,7 +393,6 @@ async fn crawl_all_skips_dir_without_cargo_toml() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty(), "dir without Cargo.toml must be skipped");
@@ -493,7 +486,6 @@ async fn crawl_all_skips_hidden_dirs() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
@@ -526,7 +518,6 @@ async fn crawl_all_dedups_same_purl() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -588,7 +579,6 @@ async fn crawl_all_skips_top_level_files() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(result.len(), 1);
@@ -614,7 +604,6 @@ async fn crawl_all_skips_crate_with_unparseable_toml_and_no_version_dir_name() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(tmp.path().to_path_buf()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     assert!(
@@ -649,7 +638,6 @@ async fn crawl_all_handles_unreadable_src_path() {
         cwd: tmp.path().to_path_buf(),
         global: true,
         global_prefix: Some(unreadable.clone()),
-        batch_size: 100,
     };
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&unreadable);

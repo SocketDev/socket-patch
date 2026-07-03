@@ -84,7 +84,7 @@ pub mod yarn_berry_lock;
 pub mod yarn_classic_lock;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path, VendorPathParts, VENDOR_DIR};
-pub use state::{load_state, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
+pub use state::{load_state, lookup_entry, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};
 pub use verify::{check_vendored_artifact, file_sha256_hex, ArtifactHealth};
 
 use std::collections::HashMap;
@@ -537,9 +537,7 @@ pub fn is_vendorable(purl: &str) -> bool {
 /// recorded as vendored in the committed ledger?
 pub async fn is_purl_vendored(project_root: &std::path::Path, purl: &str) -> bool {
     match load_state(project_root).await {
-        Ok(state) => {
-            state.entries.contains_key(purl) || state.entries.values().any(|e| e.base_purl == purl)
-        }
+        Ok(state) => lookup_entry(&state.entries, purl).is_some(),
         Err(_) => false,
     }
 }

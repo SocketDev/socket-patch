@@ -139,22 +139,15 @@ pub async fn run(args: UnlockArgs) -> i32 {
         }
         Err(LockError::Held) => {
             track_patch_unlock_failed("lock held by another process", api_token, org_slug).await;
+            let msg = format!(
+                "another socket-patch process is operating in {}",
+                socket_dir.display()
+            );
             if args.common.json {
-                let env = error_envelope(
-                    Command::Unlock,
-                    false,
-                    "lock_held",
-                    &format!(
-                        "another socket-patch process is operating in {}",
-                        socket_dir.display()
-                    ),
-                );
+                let env = error_envelope(Command::Unlock, false, "lock_held", &msg);
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent {
-                eprintln!(
-                    "Lock is held: another socket-patch process is operating in {}.",
-                    socket_dir.display()
-                );
+                eprintln!("Lock is held: {msg}.");
                 if args.release {
                     eprintln!(
                         "  Refusing to release a held lock. Re-run the failing mutating command with --break-lock if you're sure no holder exists."

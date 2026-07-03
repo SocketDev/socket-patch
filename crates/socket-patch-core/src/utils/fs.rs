@@ -27,7 +27,7 @@
 //! crawlers (pnpm's content-addressed store relies on resolving
 //! symlinks into `node_modules/.pnpm/*`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::fs::FileType;
 use tokio::fs::DirEntry;
@@ -86,6 +86,18 @@ pub async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether `path` is a regular file, following symlinks.
+///
+/// Returns `false` if the stat fails (missing path, broken symlink,
+/// permission error, etc.) — the file-shaped sibling of [`is_dir`],
+/// with the same "can't stat means not there" contract.
+pub async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
 ///
 /// Use this instead of `entry_is_dir` when the caller needs to
@@ -96,6 +108,20 @@ pub async fn is_dir(path: &Path) -> bool {
 /// not the resolved-target kind from `metadata()`.
 pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
     entry.file_type().await.ok()
+}
+
+/// Resolve the user's home directory: `HOME`, then `USERPROFILE`
+/// (Windows), then a literal `"~"` — a harmless non-existent path so
+/// downstream joins probe nothing rather than panic. The shared
+/// fallback chain for every crawler that scans well-known per-user
+/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …); previously
+/// copy-pasted into each. The go/composer crawlers deliberately use a
+/// stricter no-home-means-no-path chain instead.
+pub(crate) fn home_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "~".to_string());
+    PathBuf::from(home)
 }
 
 /// Atomically commit `content` to `path` via stage + fsync + rename.

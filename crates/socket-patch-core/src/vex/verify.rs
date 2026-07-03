@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchManifest;
 use crate::patch::apply::{verify_file_patch, VerifyStatus};
-use crate::patch::vendor::state::VendorEntry;
+use crate::patch::vendor::state::{lookup_entry, VendorEntry};
 use crate::patch::vendor::verify::verify_vendored_patch_record;
 
 /// One entry per manifest PURL that did NOT pass verification. The
@@ -100,11 +100,7 @@ pub async fn applied_patches_with_vendor(
 
     for (purl, record) in &manifest.patches {
         if let Some(ctx) = vendor {
-            let entry = ctx
-                .entries
-                .get(purl)
-                .or_else(|| ctx.entries.values().find(|e| e.base_purl == *purl));
-            if let Some(entry) = entry {
+            if let Some(entry) = lookup_entry(&ctx.entries, purl) {
                 match verify_vendored_patch_record(&ctx.project_root, entry, record).await {
                     Ok(()) => {
                         out.applied.push(purl.clone());

@@ -8,7 +8,8 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
-use socket_patch_core::utils::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::patch::vendor::{load_state, lookup_entry};
+use socket_patch_core::utils::telemetry::track_patch_vendor_failed;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::get::{download_and_apply_patches, download_patch_records, DownloadParams};
-use crate::commands::vendor::{reconcile_dropped, vendor_records};
+use crate::commands::vendor::{reconcile_dropped, track_outcomes_for_vendor, vendor_records};
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
@@ -28,28 +29,20 @@ use super::{discover_selected, download_params, embed_vex_into_json, ScanArgs};
 /// `would_vendor` (no ledger entry), `already_vendored` (entry at this
 /// uuid), `would_revendor` + `oldUuid` (entry at an older uuid).
 async fn preview_vendor_json(cwd: &Path, selected: &[PatchSearchResult]) -> serde_json::Value {
-    let state = socket_patch_core::patch::vendor::load_state(cwd)
-        .await
-        .unwrap_or_default();
+    let state = load_state(cwd).await.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
-        .map(|p| {
-            let entry = state
-                .entries
-                .get(&p.purl)
-                .or_else(|| state.entries.values().find(|e| e.base_purl == p.purl));
-            match entry {
-                Some(e) if e.uuid == p.uuid => serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
-                }),
-                Some(e) => serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid,
-                    "action": "would_revendor", "oldUuid": e.uuid,
-                }),
-                None => serde_json::json!({
-                    "purl": p.purl, "uuid": p.uuid, "action": "would_vendor",
-                }),
-            }
+        .map(|p| match lookup_entry(&state.entries, &p.purl) {
+            Some(e) if e.uuid == p.uuid => serde_json::json!({
+                "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
+            }),
+            Some(e) => serde_json::json!({
+                "purl": p.purl, "uuid": p.uuid,
+                "action": "would_revendor", "oldUuid": e.uuid,
+            }),
+            None => serde_json::json!({
+                "purl": p.purl, "uuid": p.uuid, "action": "would_vendor",
+            }),
         })
         .collect();
     patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
@@ -344,13 +337,11 @@ async fn run_vendor_interactive_path(
         )
         .await;
         if !gc.pruned.is_empty() {
-            println!("GC: pruned {} manifest entr{}.", gc.pruned.len(), {
-                if gc.pruned.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                }
-            });
+            println!(
+                "GC: pruned {} manifest entr{}.",
+                gc.pruned.len(),
+                if gc.pruned.len() == 1 { "y" } else { "ies" },
+            );
         }
         print_gc_vendored_line(&gc);
     }
@@ -428,7 +419,7 @@ pub(super) fn partition_skipped_selected(
 /// `download_and_apply_patches`: they were "found" by discovery and
 /// skipped here, never downloaded. Also strips the inner `status` (scan
 /// recomputes its own). Plain fn for the same poll-frame reason as
-/// [`partition_vendored_selected`].
+/// [`partition_skipped_selected`].
 pub(super) fn fold_vendored_skips_into_apply(
     apply_obj: &mut serde_json::Value,
     vendored_records: &[serde_json::Value],
@@ -580,20 +571,4 @@ fn boxed_vendor_records<'a>(
     Box::pin(vendor_records(
         common, records, sources, detached, false, env, None,
     ))
-}
-
-/// Telemetry for the scan-driven vendor step (mirrors `vendor::run`'s
-/// success/failure split).
-async fn track_outcomes_for_vendor(
-    has_errors: bool,
-    env: &Envelope,
-    dry_run: bool,
-    token: Option<&str>,
-    org: Option<&str>,
-) {
-    if has_errors {
-        track_patch_vendor_failed("vendor completed with failures", dry_run, token, org).await;
-    } else {
-        track_patch_vendored(env.summary.applied, dry_run, token, org).await;
-    }
 }

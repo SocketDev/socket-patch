@@ -164,8 +164,8 @@ impl GoCrawler {
             .unwrap_or_default();
 
         for cache_path in &cache_paths {
-            let found = self.scan_module_cache(cache_path, &mut seen).await;
-            packages.extend(found);
+            self.scan_dir_recursive(cache_path, cache_path, &mut seen, &mut packages)
+                .await;
         }
 
         packages
@@ -258,17 +258,6 @@ impl GoCrawler {
     ///
     /// We walk the tree looking for directories whose name contains `@`
     /// (the version separator), which marks a versioned module.
-    async fn scan_module_cache(
-        &self,
-        cache_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-        self.scan_dir_recursive(cache_path, cache_path, seen, &mut results)
-            .await;
-        results
-    }
-
     fn scan_dir_recursive<'a>(
         &'a self,
         base_path: &'a Path,
@@ -300,13 +289,11 @@ impl GoCrawler {
                 // Build the child path from the raw `OsStr` rather than the
                 // lossy UTF-8 rendering, so non-UTF-8 directory names still
                 // resolve to the correct on-disk path.
-                let full_path = current_path.join(entry.file_name());
+                let full_path = current_path.join(&dir_name);
 
                 // Check if this directory has `@` in its name (versioned module)
                 if dir_name_str.contains('@') {
-                    if let Some(pkg) =
-                        self.parse_versioned_dir(base_path, &full_path, &dir_name_str, seen)
-                    {
+                    if let Some(pkg) = self.parse_versioned_dir(base_path, &full_path, seen) {
                         results.push(pkg);
                     }
                 } else {
@@ -323,7 +310,6 @@ impl GoCrawler {
         &self,
         base_path: &Path,
         dir_path: &Path,
-        _dir_name: &str,
         seen: &mut HashSet<String>,
     ) -> Option<CrawledPackage> {
         // Get the relative path from the cache root.
@@ -396,8 +382,7 @@ fn split_module_path(module_path: &str) -> (&str, &str) {
 /// `go_redirect` coordinate guard and fails closed so a tampered manifest PURL
 /// cannot traverse out of the cache.
 fn is_safe_module_coordinate(module_path: &str, version: &str) -> bool {
-    path_safety::is_safe_multi_segment(module_path)
-        && path_safety::is_safe_single_segment(version)
+    path_safety::is_safe_multi_segment(module_path) && path_safety::is_safe_single_segment(version)
 }
 
 #[cfg(test)]
@@ -610,7 +595,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -638,7 +622,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -670,7 +653,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -687,7 +669,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_module_cache_paths(&options).await.unwrap();
@@ -711,7 +692,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -735,7 +715,7 @@ mod tests {
         let dir = std::path::Path::new("/cache/@v1.0.0");
         let mut seen = HashSet::new();
         let crawler = GoCrawler;
-        let result = crawler.parse_versioned_dir(base, dir, "@v1.0.0", &mut seen);
+        let result = crawler.parse_versioned_dir(base, dir, &mut seen);
         assert!(
             result.is_none(),
             "empty encoded module path must yield None"
@@ -785,7 +765,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -813,7 +792,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -870,7 +848,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -897,7 +874,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -917,7 +893,7 @@ mod tests {
         let dir = std::path::Path::new("/cache/github.com/foo/bar@");
         let mut seen = HashSet::new();
         let crawler = GoCrawler;
-        let result = crawler.parse_versioned_dir(base, dir, "bar@", &mut seen);
+        let result = crawler.parse_versioned_dir(base, dir, &mut seen);
         assert!(result.is_none(), "empty version must yield None");
     }
 
@@ -982,7 +958,10 @@ mod tests {
     fn test_is_safe_module_coordinate_rejects_colon() {
         assert!(is_safe_module_coordinate("github.com/foo/bar", "v1.2.3"));
         assert!(!is_safe_module_coordinate("C:/evil", "v1.0.0"));
-        assert!(!is_safe_module_coordinate("github.com/C:evil/bar", "v1.0.0"));
+        assert!(!is_safe_module_coordinate(
+            "github.com/C:evil/bar",
+            "v1.0.0"
+        ));
         assert!(!is_safe_module_coordinate("github.com/foo/bar", "C:v1.0.0"));
     }
 
@@ -1023,7 +1002,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;

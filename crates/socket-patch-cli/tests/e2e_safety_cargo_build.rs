@@ -876,8 +876,8 @@ fn apply_without_cargo_checksum_emits_no_sidecar_record() {
     );
 
     // No cargo sidecar record emitted — the fixup returned None, so
-    // the apply loop never calls `record_sidecar`. The envelope's
-    // `sidecars` array is either absent or empty.
+    // the apply loop pushes nothing onto `Envelope.sidecars`. The
+    // envelope's `sidecars` array is either absent or empty.
     let has_cargo_record = env
         .get("sidecars")
         .and_then(|v| v.as_array())

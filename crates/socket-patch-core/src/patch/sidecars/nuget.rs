@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use crate::patch::apply::DirWriteGuard;
+use crate::utils::fs::is_file;
 
 use super::{
     SidecarAdvisory, SidecarAdvisoryCode, SidecarError, SidecarFile, SidecarFileAction,
@@ -129,11 +130,7 @@ async fn has_signed_marker(pkg_path: &Path) -> bool {
             continue;
         }
         // Name matches — confirm it's a regular file before believing it.
-        if tokio::fs::metadata(entry.path())
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
+        if is_file(&entry.path()).await {
             return true;
         }
     }

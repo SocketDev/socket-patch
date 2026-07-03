@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::constants::{DEFAULT_PATCH_API_PROXY_URL, DEFAULT_SOCKET_API_URL, USER_AGENT};
-use crate::utils::env_compat::read_env_with_legacy;
+use crate::constants::{DEFAULT_SOCKET_API_URL, USER_AGENT};
+use crate::utils::env_compat::{is_debug_enabled, proxy_url_from_env, read_env_with_legacy};
 
 // ---------------------------------------------------------------------------
 // Session ID — generated once per process invocation
@@ -161,17 +161,6 @@ pub fn is_telemetry_disabled() -> bool {
     disabled_via_env || vitest || offline
 }
 
-/// Check if debug mode is enabled. Reads `SOCKET_DEBUG` (with legacy
-/// `SOCKET_PATCH_DEBUG` shim).
-fn is_debug_enabled() -> bool {
-    matches!(
-        read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG")
-            .unwrap_or_default()
-            .as_str(),
-        "1" | "true"
-    )
-}
-
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
     if is_debug_enabled() {
@@ -299,9 +288,7 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
             (format!("{api_url}/v0/orgs/{slug}/telemetry"), true)
         }
         _ => {
-            let proxy_url = read_env_with_legacy("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL")
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| DEFAULT_PATCH_API_PROXY_URL.to_string());
+            let proxy_url = proxy_url_from_env();
             let proxy_url = proxy_url.trim_end_matches('/');
             (format!("{proxy_url}/patch/telemetry"), false)
         }

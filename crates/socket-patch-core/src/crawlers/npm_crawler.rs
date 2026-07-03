@@ -8,10 +8,6 @@ use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
-/// Default batch size for crawling.
-#[cfg(test)]
-const DEFAULT_BATCH_SIZE: usize = 100;
-
 /// Directories to skip when searching for workspace node_modules.
 const SKIP_DIRS: &[&str] = &[
     "dist",
@@ -305,7 +301,7 @@ impl NpmCrawler {
             .unwrap_or_default();
 
         for nm_path in &nm_paths {
-            let found = self.scan_node_modules(nm_path, &mut seen).await;
+            let found = Self::scan_node_modules(nm_path, &mut seen).await;
             packages.extend(found);
         }
 
@@ -324,64 +320,48 @@ impl NpmCrawler {
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
-        // Parse each PURL to extract the directory key and expected version.
-        //
         // `purl` is the *verbatim* caller-supplied PURL, including any
         // `?qualifiers`. The result map is keyed by this exact string: the
         // dispatcher drives npm with `passthrough_purls` + `merge_first_wins`,
         // so it looks results back up under the PURL it handed in. Keying by a
         // reconstructed/stripped PURL silently loses every qualified PURL
         // (e.g. `pkg:npm/foo@1.0.0?vcs_url=...`).
-        struct Target {
-            namespace: Option<String>,
-            name: String,
-            version: String,
-            purl: String,
-            dir_key: String,
-        }
-
-        let mut targets: Vec<Target> = Vec::new();
-
         for purl in purls {
-            if let Some((ns, name, version)) = Self::parse_purl_components(purl) {
-                // SECURITY: `ns`/`name` come straight from the (untrusted)
-                // manifest PURL and are joined onto `node_modules_path` below,
-                // then patched in place. A real npm scope/name is a single
-                // path segment, so reject any that could traverse out of the
-                // tree (`pkg:npm/../../evil@1.0.0`). Fail closed — twin of the
-                // deno/go/maven coordinate gates.
-                let ns_safe = ns.as_deref().map(is_safe_npm_component).unwrap_or(true);
-                if !ns_safe || !is_safe_npm_component(&name) {
-                    continue;
-                }
-                let dir_key = match &ns {
-                    Some(ns_str) => format!("{ns_str}/{name}"),
-                    None => name.clone(),
-                };
-                targets.push(Target {
-                    namespace: ns,
-                    name,
-                    version,
-                    purl: purl.clone(),
-                    dir_key,
-                });
-            }
-        }
+            let Some((namespace, name, version)) = Self::parse_purl_components(purl) else {
+                continue;
+            };
 
-        for target in &targets {
-            let pkg_path = node_modules_path.join(&target.dir_key);
+            // SECURITY: `namespace`/`name` come straight from the (untrusted)
+            // manifest PURL and are joined onto `node_modules_path` below,
+            // then patched in place. A real npm scope/name is a single
+            // path segment, so reject any that could traverse out of the
+            // tree (`pkg:npm/../../evil@1.0.0`). Fail closed — twin of the
+            // deno/go/maven coordinate gates.
+            let ns_safe = namespace
+                .as_deref()
+                .map(is_safe_npm_component)
+                .unwrap_or(true);
+            if !ns_safe || !is_safe_npm_component(&name) {
+                continue;
+            }
+
+            let dir_key = match &namespace {
+                Some(ns) => format!("{ns}/{name}"),
+                None => name.clone(),
+            };
+            let pkg_path = node_modules_path.join(dir_key);
             let pkg_json_path = pkg_path.join("package.json");
 
-            if let Some((_, version)) = read_package_json(&pkg_json_path).await {
-                if version == target.version {
+            if let Some((_, found_version)) = read_package_json(&pkg_json_path).await {
+                if found_version == version {
                     result.insert(
-                        target.purl.clone(),
+                        purl.clone(),
                         CrawledPackage {
-                            name: target.name.clone(),
-                            version,
-                            namespace: target.namespace.clone(),
-                            purl: target.purl.clone(),
-                            path: pkg_path.clone(),
+                            name,
+                            version: found_version,
+                            namespace,
+                            purl: purl.clone(),
+                            path: pkg_path,
                         },
                     );
                 }
@@ -524,51 +504,57 @@ impl NpmCrawler {
     // ------------------------------------------------------------------
 
     /// Scan a `node_modules` directory, returning all valid packages found.
-    async fn scan_node_modules(
-        &self,
-        node_modules_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
+    /// Recurses into each package's own nested `node_modules`.
+    fn scan_node_modules<'a>(
+        node_modules_path: &'a Path,
+        seen: &'a mut HashSet<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
+        Box::pin(async move {
+            let mut results = Vec::new();
 
-        for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy().to_string();
+            for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy().to_string();
 
-            // Skip hidden files and node_modules
-            if name_str.starts_with('.') || name_str == "node_modules" {
-                continue;
-            }
-
-            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                continue;
-            };
-
-            // Allow both directories and symlinks (pnpm uses symlinks)
-            if !file_type.is_dir() && !file_type.is_symlink() {
-                continue;
-            }
-
-            let entry_path = node_modules_path.join(&name_str);
-
-            if name_str.starts_with('@') {
-                // Scoped packages
-                let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
-                results.extend(scoped);
-            } else {
-                // Regular package
-                if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                    results.push(pkg);
+                // Skip hidden files and node_modules
+                if name_str.starts_with('.') || name_str == "node_modules" {
+                    continue;
                 }
-                // Nested node_modules only for real directories (not symlinks)
-                if file_type.is_dir() {
-                    let nested = Self::scan_nested_node_modules(&entry_path, seen).await;
-                    results.extend(nested);
+
+                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                    continue;
+                };
+
+                // Allow both directories and symlinks (pnpm uses symlinks)
+                if !file_type.is_dir() && !file_type.is_symlink() {
+                    continue;
+                }
+
+                let entry_path = node_modules_path.join(&name_str);
+
+                if name_str.starts_with('@') {
+                    // Scoped packages
+                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
+                    results.extend(scoped);
+                } else {
+                    // Regular package
+                    if let Some(pkg) = Self::check_package(&entry_path, seen).await {
+                        results.push(pkg);
+                    }
+                    // Recurse into nested node_modules only for real
+                    // directories (not symlinks). Following a symlink here
+                    // would walk into pnpm's content-addressed store (or an
+                    // `npm link` target outside the project).
+                    if file_type.is_dir() {
+                        let nested =
+                            Self::scan_node_modules(&entry_path.join("node_modules"), seen).await;
+                        results.extend(nested);
+                    }
                 }
             }
-        }
 
-        results
+            results
+        })
     }
 
     /// Scan a scoped packages directory (`@scope/`).
@@ -602,58 +588,9 @@ impl NpmCrawler {
 
                 // Nested node_modules only for real directories
                 if file_type.is_dir() {
-                    let nested = Self::scan_nested_node_modules(&pkg_path, seen).await;
+                    let nested =
+                        Self::scan_node_modules(&pkg_path.join("node_modules"), seen).await;
                     results.extend(nested);
-                }
-            }
-
-            results
-        })
-    }
-
-    /// Scan nested `node_modules` inside a package (if it exists).
-    fn scan_nested_node_modules<'a>(
-        pkg_path: &'a Path,
-        seen: &'a mut HashSet<String>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
-        Box::pin(async move {
-            let nested_nm = pkg_path.join("node_modules");
-            let mut results = Vec::new();
-
-            for entry in crate::utils::fs::list_dir_entries(&nested_nm).await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
-
-                if name_str.starts_with('.') || name_str == "node_modules" {
-                    continue;
-                }
-
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-
-                if !file_type.is_dir() && !file_type.is_symlink() {
-                    continue;
-                }
-
-                let entry_path = nested_nm.join(&name_str);
-
-                if name_str.starts_with('@') {
-                    let scoped = Self::scan_scoped_packages(&entry_path, seen).await;
-                    results.extend(scoped);
-                } else {
-                    if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                        results.push(pkg);
-                    }
-                    // Recurse into deeper nested node_modules only for real
-                    // directories (not symlinks) — matching the invariant in
-                    // `scan_node_modules`/`scan_scoped_packages`. Following a
-                    // symlink here would walk into pnpm's content-addressed
-                    // store (or an `npm link` target outside the project).
-                    if file_type.is_dir() {
-                        let deeper = Self::scan_nested_node_modules(&entry_path, seen).await;
-                        results.extend(deeper);
-                    }
                 }
             }
 
@@ -885,7 +822,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: DEFAULT_BATCH_SIZE,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -914,7 +850,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: DEFAULT_BATCH_SIZE,
         };
 
         let packages = crawler.crawl_all(&options).await;

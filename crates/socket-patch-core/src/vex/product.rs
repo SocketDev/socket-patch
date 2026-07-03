@@ -19,6 +19,11 @@
 
 use std::path::Path;
 
+// npm/Node strip a BOM from package.json and cargo accepts one in Cargo.toml,
+// but serde_json and the line scanner both reject it — without this, manifests
+// the user's own toolchain accepts yield no PURL.
+use crate::package_json::detect::strip_bom;
+
 /// Outcome of [`detect_product`].
 #[derive(Debug, Clone, Default)]
 pub struct DetectResult {
@@ -98,14 +103,6 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     }
 
     result
-}
-
-/// Strip a leading UTF-8 BOM. npm/Node strip one from package.json and
-/// cargo accepts one in Cargo.toml, but serde_json and the line scanner
-/// both reject it — without this, manifests the user's own toolchain
-/// accepts yield no PURL. Mirrors `package_json/detect.rs`.
-fn strip_bom(content: &str) -> &str {
-    content.strip_prefix('\u{feff}').unwrap_or(content)
 }
 
 async fn read_package_json(path: &Path) -> Option<String> {
@@ -222,11 +219,7 @@ async fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
     };
     loop {
         let candidate = cursor.join(".git").join("config");
-        if tokio::fs::metadata(&candidate)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
+        if crate::utils::fs::is_file(&candidate).await {
             return Some(candidate);
         }
         match cursor.parent() {

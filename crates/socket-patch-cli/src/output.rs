@@ -1,17 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 
-/// Check if stdout is a terminal (for ANSI color output).
-pub fn stdout_is_tty() -> bool {
-    std::io::stdout().is_terminal()
-}
-
-/// Check if stderr is a terminal (for progress output).
-pub fn stderr_is_tty() -> bool {
-    std::io::stderr().is_terminal()
-}
-
 /// Check if stdin is a terminal (for interactive prompts).
-pub fn stdin_is_tty() -> bool {
+pub(crate) fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
@@ -53,7 +43,7 @@ pub enum SelectError {
 /// - Non-TTY stdin: return `default_yes` with a stderr warning.
 /// - Interactive: print prompt to stderr, read line; empty = `default_yes`;
 ///   unreadable input (e.g. non-UTF-8 bytes) = no.
-pub fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_json: bool) -> bool {
+pub(crate) fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_json: bool) -> bool {
     if skip_prompt || is_json {
         return default_yes;
     }
@@ -97,16 +87,13 @@ pub fn select_one(prompt: &str, options: &[String], is_json: bool) -> Result<usi
         eprintln!("Non-interactive mode: auto-selecting first option.");
         return Ok(0);
     }
-    let selection = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+    dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt(prompt)
         .items(options)
         .default(0)
         .interact_opt()
-        .map_err(|_| SelectError::Cancelled)?;
-    match selection {
-        Some(idx) => Ok(idx),
-        None => Err(SelectError::Cancelled),
-    }
+        .map_err(|_| SelectError::Cancelled)?
+        .ok_or(SelectError::Cancelled)
 }
 
 #[cfg(test)]

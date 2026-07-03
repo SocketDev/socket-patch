@@ -210,38 +210,24 @@ impl CargoCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_cargo_purl(purl) {
-                // Try registry layout: <name>-<version>/
-                let registry_dir = src_path.join(format!("{name}-{version}"));
-                if self
-                    .verify_crate_at_path(&registry_dir, name, version)
-                    .await
-                {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: registry_dir,
-                        },
-                    );
-                    continue;
-                }
-
-                // Try vendor layout: <name>/
-                let vendor_dir = src_path.join(name);
-                if self.verify_crate_at_path(&vendor_dir, name, version).await {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: vendor_dir,
-                        },
-                    );
+                // Registry layout first (<name>-<version>/), then vendor (<name>/).
+                for dir in [
+                    src_path.join(format!("{name}-{version}")),
+                    src_path.join(name),
+                ] {
+                    if self.verify_crate_at_path(&dir, name, version).await {
+                        result.insert(
+                            purl.clone(),
+                            CrawledPackage {
+                                name: name.to_string(),
+                                version: version.to_string(),
+                                namespace: None,
+                                purl: purl.clone(),
+                                path: dir,
+                            },
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -316,20 +302,14 @@ impl CargoCrawler {
         let cargo_toml_path = crate_path.join("Cargo.toml");
         let content = tokio::fs::read_to_string(&cargo_toml_path).await.ok()?;
 
-        let (name, version) = match parse_cargo_toml_name_version(&content) {
-            Some(nv) => nv,
-            None => {
-                // Fallback: parse directory name as <name>-<version>
-                Self::parse_dir_name_version(dir_name)?
-            }
-        };
+        // Fallback: parse directory name as <name>-<version>
+        let (name, version) = parse_cargo_toml_name_version(&content)
+            .or_else(|| Self::parse_dir_name_version(dir_name))?;
 
         let purl = crate::utils::purl::build_cargo_purl(&name, &version);
-
-        if seen.contains(&purl) {
+        if !seen.insert(purl.clone()) {
             return None;
         }
-        seen.insert(purl.clone());
 
         Some(CrawledPackage {
             name,
@@ -351,19 +331,11 @@ impl CargoCrawler {
 
         match parse_cargo_toml_name_version(&content) {
             Some((n, v)) => n == name && v == version,
-            None => {
-                // Fallback: check directory name
-                let dir_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if let Some((parsed_name, parsed_version)) = Self::parse_dir_name_version(&dir_name)
-                {
-                    parsed_name == name && parsed_version == version
-                } else {
-                    false
-                }
-            }
+            // Fallback: check directory name
+            None => path
+                .file_name()
+                .and_then(|n| Self::parse_dir_name_version(&n.to_string_lossy()))
+                .is_some_and(|(n, v)| n == name && v == version),
         }
     }
 
@@ -387,7 +359,7 @@ impl CargoCrawler {
     ///
     /// This is only a fallback for when `Cargo.toml` itself cannot be
     /// parsed; for registry crates the manifest is authoritative.
-    pub(crate) fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
+    fn parse_dir_name_version(dir_name: &str) -> Option<(String, String)> {
         let mut first_dotted: Option<usize> = None;
         let mut last_any: Option<usize> = None;
         for (i, _) in dir_name.match_indices('-') {
@@ -417,10 +389,7 @@ impl CargoCrawler {
         if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
             return PathBuf::from(cargo_home);
         }
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "~".to_string());
-        PathBuf::from(home).join(".cargo")
+        crate::utils::fs::home_dir().join(".cargo")
     }
 }
 
@@ -591,7 +560,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -622,7 +590,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -649,7 +616,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -687,7 +653,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
@@ -716,7 +681,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
@@ -742,7 +706,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
@@ -763,7 +726,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(), // no Cargo.toml/Cargo.lock here
             global: false,
             global_prefix: Some(prefix.clone()),
-            batch_size: 100,
         };
 
         let paths = crawler.get_crate_source_paths(&options).await.unwrap();
@@ -929,7 +891,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -1036,7 +997,6 @@ version = "fake"
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;

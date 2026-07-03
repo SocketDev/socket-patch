@@ -111,71 +111,51 @@ impl NuGetCrawler {
         let mut result: HashMap<String, CrawledPackage> = HashMap::new();
 
         for purl in purls {
-            if let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) {
-                // SECURITY: the coordinates are untrusted manifest input
-                // joined onto the package root and then patched IN PLACE
-                // (NuGet has no redirect backend). Reject anything that
-                // could traverse out of the root before touching the
-                // filesystem — `verify_nuget_package` only checks for
-                // `lib/` or a `.nuspec`, so it is no defense.
-                if !is_safe_nuget_coordinate(name, version) {
-                    continue;
-                }
+            let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) else {
+                continue;
+            };
+            // SECURITY: the coordinates are untrusted manifest input
+            // joined onto the package root and then patched IN PLACE
+            // (NuGet has no redirect backend). Reject anything that
+            // could traverse out of the root before touching the
+            // filesystem — `verify_nuget_package` only checks for
+            // `lib/` or a `.nuspec`, so it is no defense.
+            if !is_safe_nuget_coordinate(name, version) {
+                continue;
+            }
 
-                // Try global cache layout: <lowercase-name>/<lowercase-version>/.
-                // NuGet lowercases BOTH the id and the version when it lays
-                // out the global packages folder, so a prerelease tag like
-                // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
-                // the name (but not the version) would miss those packages.
-                let global_dir = pkg_path
-                    .join(name.to_lowercase())
-                    .join(version.to_lowercase());
-                if self.verify_nuget_package(&global_dir).await {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: global_dir,
-                        },
-                    );
-                    continue;
-                }
+            // Global cache layout: <lowercase-name>/<lowercase-version>/.
+            // NuGet lowercases BOTH the id and the version when it lays
+            // out the global packages folder, so a prerelease tag like
+            // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
+            // the name (but not the version) would miss those packages.
+            let global_dir = pkg_path
+                .join(name.to_lowercase())
+                .join(version.to_lowercase());
+            // Legacy layout: <Name>.<Version>/, tried exact-case first, then
+            // case-insensitively (NuGet names are case-insensitive).
+            let legacy_dir = pkg_path.join(format!("{name}.{version}"));
 
-                // Try legacy layout: <Name>.<Version>/
-                let legacy_dir = pkg_path.join(format!("{name}.{version}"));
-                if self.verify_nuget_package(&legacy_dir).await {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: legacy_dir,
-                        },
-                    );
-                    continue;
-                }
-
-                // Try case-insensitive legacy scan (NuGet names are case-insensitive)
-                if let Some(found_dir) = self
-                    .find_legacy_dir_case_insensitive(pkg_path, name, version)
+            let found = if self.verify_nuget_package(&global_dir).await {
+                Some(global_dir)
+            } else if self.verify_nuget_package(&legacy_dir).await {
+                Some(legacy_dir)
+            } else {
+                self.find_legacy_dir_case_insensitive(pkg_path, name, version)
                     .await
-                {
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: None,
-                            purl: purl.clone(),
-                            path: found_dir,
-                        },
-                    );
-                }
+            };
+
+            if let Some(path) = found {
+                result.insert(
+                    purl.clone(),
+                    CrawledPackage {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        namespace: None,
+                        purl: purl.clone(),
+                        path,
+                    },
+                );
             }
         }
 
@@ -316,7 +296,15 @@ impl NuGetCrawler {
         }
 
         // Check for any .nuspec file
-        find_nuspec_in_dir(path).await.is_some()
+        for entry in crate::utils::fs::list_dir_entries(path).await {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".nuspec") {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Find a legacy package directory with case-insensitive matching.
@@ -379,10 +367,7 @@ fn nuget_home() -> PathBuf {
         }
     }
 
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string());
-    PathBuf::from(home).join(".nuget").join("packages")
+    crate::utils::fs::home_dir().join(".nuget").join("packages")
 }
 
 /// Check if the cwd contains any .NET project indicators.
@@ -435,29 +420,17 @@ fn parse_legacy_dir_name(dir_name: &str) -> Option<(String, String)> {
     Some((name.to_string(), version.to_string()))
 }
 
-/// Find a `.nuspec` file in a directory.
-async fn find_nuspec_in_dir(dir: &Path) -> Option<PathBuf> {
-    for entry in crate::utils::fs::list_dir_entries(dir).await {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.ends_with(".nuspec") {
-                return Some(dir.join(name));
-            }
-        }
-    }
-    None
-}
-
 /// Discover additional package paths from `obj/project.assets.json` files.
 async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     // Look for obj/project.assets.json in cwd
     let assets_path = cwd.join("obj").join("project.assets.json");
-    if let Some(pkg_folder) = parse_project_assets_package_folders(&assets_path).await {
-        for folder in pkg_folder {
-            paths.push(folder);
-        }
-    }
+    paths.extend(
+        parse_project_assets_package_folders(&assets_path)
+            .await
+            .unwrap_or_default(),
+    );
 
     // Also check subdirectories one level deep for multi-project solutions
     for entry in crate::utils::fs::list_dir_entries(cwd).await {
@@ -468,11 +441,11 @@ async fn discover_paths_from_assets(cwd: &Path) -> Vec<PathBuf> {
             .join(entry.file_name())
             .join("obj")
             .join("project.assets.json");
-        if let Some(pkg_folders) = parse_project_assets_package_folders(&sub_assets).await {
-            for folder in pkg_folders {
-                paths.push(folder);
-            }
-        }
+        paths.extend(
+            parse_project_assets_package_folders(&sub_assets)
+                .await
+                .unwrap_or_default(),
+        );
     }
     paths
 }
@@ -485,14 +458,7 @@ async fn parse_project_assets_package_folders(path: &Path) -> Option<Vec<PathBuf
     let content = tokio::fs::read_to_string(path).await.ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let folders = json.get("packageFolders")?.as_object()?;
-
-    let result: Vec<PathBuf> = folders.keys().map(PathBuf::from).collect();
-
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
+    Some(folders.keys().map(PathBuf::from).collect())
 }
 
 #[cfg(test)]
@@ -590,7 +556,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -623,7 +588,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -707,7 +671,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let packages = crawler.crawl_all(&options).await;
@@ -773,7 +736,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
@@ -801,7 +763,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: None,
-            batch_size: 100,
         };
 
         let paths = crawler.get_nuget_package_paths(&options).await.unwrap();
@@ -855,7 +816,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let pkgs = crawler.crawl_all(&options).await;
@@ -884,7 +844,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let pkgs = crawler.crawl_all(&options).await;
@@ -916,7 +875,6 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             global: false,
             global_prefix: Some(dir.path().to_path_buf()),
-            batch_size: 100,
         };
 
         let mut purls: Vec<String> = crawler
