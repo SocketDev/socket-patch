@@ -114,7 +114,7 @@ export default function render(ctx: FileCtx): string {
     `3. Edit the file to close those loopholes.`,
     `4. Build and run just this file's tests to confirm they still pass against the`,
     `   current code, e.g.:`,
-    `     cargo test -p ${ctx.crate}${ctx.crate === "socket-patch-cli" ? " --features cargo" : ""} --test ${ctx.stem}`,
+    `     cargo test -p ${ctx.crate} --test ${ctx.stem}`,
     `   (for inline/unit tests run the crate's lib tests; adapt the invocation as`,
     `    needed and report exactly what you ran).`,
   ];

@@ -3,8 +3,6 @@
 //! detection, gradle marker detection, m2_repo_path env-var
 //! resolution, walkdir-based scanning.
 
-#![cfg(feature = "maven")]
-
 use std::path::Path;
 
 use serial_test::serial;

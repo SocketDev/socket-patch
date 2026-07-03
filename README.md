@@ -25,7 +25,7 @@ socket-patch delivers the same patched bytes three different ways. The modes dif
 | golang | ✅ `go.mod` `replace` → `.socket/go-patches/` | ✅ `replace` → the committed vendor tree | ❌ **not possible** — sumdb, module-path identity, and default-GOPROXY leakage each rule it out; see [docs/design/golang-hosted-no-go.md](docs/design/golang-hosted-no-go.md). **Use vendored** (`redirect_golang_unsupported` names the remedy) |
 | maven | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts the `~/.m2` checksum sidecars); prefer vendored / hosted | ✅ **new** — committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is served under a Socket-only `<version>-socket.<hex8>` suffix, so the rewriter pins that version (rewrite the literal `<version>`, or add a `<dependencyManagement>` entry for a transitive) alongside the `<repository>` insert (`checksumPolicy=fail`). An outage or tamper on the Socket repo then hard-fails the build — the suffixed version exists nowhere else, so there is no silent fall-through to Central. Optionally emits Maven 3.9+ Trusted Checksums files pinning the jar + pom sha256. `${property}` versions are refused. Gradle builds get a paste-able `exclusiveContent` snippet (`redirect_gradle_manual_snippet`); no build script is edited. See [Maven & NuGet caveats](#maven--nuget-caveats) |
 | nuget | ⚠️ experimental — gated behind `SOCKET_EXPERIMENTAL_NUGET=1` (in-place patching breaks the `.nupkg.sha512` tamper-evidence sidecar); prefer vendored / hosted | ✅ **new** — committed folder feed + `packageSourceMapping` + `packages.lock.json` contentHash pin | ✅ `nuget.config` source + source-mapping, `packages.lock.json` contentHash rewrite. See the locked-mode note in [Maven & NuGet caveats](#maven--nuget-caveats) |
-| composer | ✅ post-install script events (opt-in `composer` compile feature) | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
+| composer | ✅ post-install script events | ✅ `composer.lock` `dist: path` rewrite | ✅ `composer.lock` dist url + shasum rewrite |
 
 > **Maven / NuGet discovery gate**: discovering *installed* Maven and NuGet packages (the crawl behind `scan` / `apply` / `vendor`) currently requires the same `SOCKET_EXPERIMENTAL_MAVEN=1` / `SOCKET_EXPERIMENTAL_NUGET=1` opt-in in every mode. The vendored/hosted wiring itself is safe — the gate guards the agent-mode sidecar risk.
 
@@ -105,12 +105,8 @@ pip install socket-patch
 cargo install socket-patch-cli
 ```
 
-By default this builds with npm, PyPI, and Cargo support. For additional
-ecosystems:
-
-```bash
-cargo install socket-patch-cli --features golang,maven,composer,nuget,deno
-```
+This builds with every supported ecosystem (npm, PyPI, Ruby gems, Cargo,
+Go, Maven, Composer, NuGet, Deno) compiled in.
 
 ### RubyGems
 
@@ -543,7 +539,7 @@ Configure your project so patches are **re-applied automatically after install**
 - **npm / yarn / pnpm / bun** — writes a `postinstall` script into `package.json` so any install re-applies patches (pnpm: root package only).
 - **Python (pip / uv / poetry / pdm / hatch)** — Python has no universal post-install hook, so `setup` instead commits a **`socket-patch[hook]`** dependency (for classic Poetry, the equivalent `socket-patch = { extras = ["hook"] }`). Installing it lays down a startup `.pth` (shipped by the small `socket-patch-hook` wheel) that re-applies your committed `.socket/` patches the next time the interpreter runs. It is package-manager-agnostic (it rides the interpreter, not any one installer) and **fail-open** — a hook error can never break interpreter startup.
 - **Ruby gems (Bundler)** — adds a managed `plugin "socket-patch"` block to the `Gemfile` and commits an in-tree Bundler plugin under `.socket/bundler-plugin/`. It re-applies patches on every `bundle install` (cached *and* fresh). (Requires the `socket-patch` CLI on `PATH`.)
-- **Composer (PHP)** *(opt-in `composer` feature)* — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. Only available in a build compiled with `--features composer`. (Requires the `socket-patch` CLI on `PATH`.)
+- **Composer (PHP)** — appends `socket-patch apply` to `composer.json`'s `post-install-cmd` / `post-update-cmd` script events, so patches re-apply on every `composer install` / `composer update`. (Requires the `socket-patch` CLI on `PATH`.)
 - **Cargo & Go** — *apply-only, no `setup` hook.* A one-click auto-repatch-on-build isn't possible for these, so `setup` skips them. Patch with `socket-patch apply` directly: **cargo** patches the crate in place (in `vendor/` or the registry cache, rewriting `.cargo-checksum.json` so `cargo build` accepts it); **go** writes a project-local patched copy under `.socket/go-patches/` plus a `go.mod` `replace` directive (the module cache is `go.sum`-verified, so in-place patching can't build). Commit `go.mod` + `.socket/go-patches/` so a clone builds the patched bytes. Declare them in `setup.manual` for VEX attestation.
 - **Apply-only ecosystems** (nuget · maven · deno) — no native install hook to wire, so `setup` reports `no_files`; patch them on demand with `socket-patch apply`.
 

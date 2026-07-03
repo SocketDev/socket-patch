@@ -1,5 +1,4 @@
 pub mod api;
-#[cfg(feature = "composer")]
 pub mod composer_setup;
 pub mod constants;
 pub mod crawlers;

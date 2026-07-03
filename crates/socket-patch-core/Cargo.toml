@@ -32,26 +32,11 @@ base64 = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
-[features]
-# `cargo`, `golang`, `nuget`, and `maven` are default features (npm + PyPI +
-# Ruby gems are unconditional). Mirror the CLI's defaults so a plain `cargo
-# build` of the workspace ships the supported ecosystems (npm, PyPI, Ruby gems,
-# Go, Cargo, NuGet, Maven); the still-unsupported ecosystems (composer, deno)
-# stay opt-in. Maven `apply` stays runtime-gated behind
-# `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching corrupts sidecars);
-# committable `vendor` is safe (it never touches ~/.m2).
-default = ["cargo", "golang", "nuget", "maven"]
-cargo = []
-golang = []
-maven = []
-composer = []
-nuget = []
-# Deno covers two surfaces: (1) Deno 2.0's npm-install layouts that
-# produce a standard node_modules/ (handled by NpmCrawler today,
-# triggered here by deno.json / deno.lock project markers) and
-# (2) JSR-registry packages cached at $DENO_DIR/npm/jsr.io/* with
-# `pkg:jsr/<scope>/<name>@<version>` PURLs handled by DenoCrawler.
-deno = []
+# All ecosystems (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
+# Deno) are unconditionally compiled in — there are no ecosystem feature
+# gates. Maven `apply` stays runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1`
+# (in-place jar patching corrupts sidecars); committable `vendor` is safe (it
+# never touches ~/.m2).
 
 [dev-dependencies]
 tempfile = { workspace = true }

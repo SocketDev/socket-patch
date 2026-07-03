@@ -31,9 +31,7 @@ use std::path::Path;
 use crate::crawlers::Ecosystem;
 use crate::manifest::schema::PatchFileInfo;
 
-#[cfg(feature = "cargo")]
 pub(crate) mod cargo;
-#[cfg(feature = "nuget")]
 pub(crate) mod nuget;
 pub mod types;
 
@@ -103,7 +101,6 @@ pub(crate) fn advisory_only_payload(
 /// boundary, so their sidecar entries are still stale and the retry
 /// must resync them. `files` is reserved for future use (currently
 /// unread).
-#[allow(unused_variables)] // `pkg_path` is feature-gated below
 pub async fn dispatch_fixup(
     package_key: &str,
     pkg_path: &Path,
@@ -120,9 +117,7 @@ pub async fn dispatch_fixup(
     };
 
     let payload: Option<SidecarPayload> = match ecosystem {
-        #[cfg(feature = "cargo")]
         Ecosystem::Cargo => cargo::fixup(pkg_path, patched).await?,
-        #[cfg(feature = "nuget")]
         Ecosystem::Nuget => nuget::fixup(pkg_path).await?,
         Ecosystem::Pypi => Some(advisory_only_payload(
             SidecarAdvisoryCode::PypiRecordStale,
@@ -137,7 +132,6 @@ pub async fn dispatch_fixup(
             "Ruby gem: `bundle install --redownload` will revert these \
              patches by reinstalling from the cached .gem.",
         )),
-        #[cfg(feature = "golang")]
         Ecosystem::Golang => Some(advisory_only_payload(
             SidecarAdvisoryCode::GoModVerifyFails,
             SidecarSeverity::Warning,
@@ -170,7 +164,6 @@ pub async fn dispatch_fixup(
 /// `AlreadyOriginal` (restored by an earlier partial rollback that
 /// never reached this boundary). Same return contract as
 /// [`dispatch_fixup`].
-#[allow(unused_variables)] // `pkg_path` is feature-gated below
 pub async fn dispatch_rollback_fixup(
     package_key: &str,
     pkg_path: &Path,
@@ -186,7 +179,6 @@ pub async fn dispatch_rollback_fixup(
     };
 
     let payload: Option<SidecarPayload> = match ecosystem {
-        #[cfg(feature = "cargo")]
         Ecosystem::Cargo => cargo::resync_after_rollback(pkg_path, rolled_back).await?,
         _ => None,
     };
@@ -312,7 +304,6 @@ mod tests {
     /// Cargo PURL routes through `dispatch_fixup` to the checksum
     /// rewriter and the resulting record denormalizes purl + ecosystem
     /// and carries the rewritten-file entry.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_rewrites_checksum_and_builds_record() {
         let d = tempfile::tempdir().unwrap();
@@ -353,7 +344,6 @@ mod tests {
     /// Cargo crate with no `.cargo-checksum.json` → the sub-fixup
     /// returns `None`, so `dispatch_fixup` produces no record (not an
     /// empty-files record).
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_without_checksum_returns_none() {
         let d = tempfile::tempdir().unwrap();
@@ -372,7 +362,6 @@ mod tests {
     /// `dispatch_fixup` must propagate the `SidecarError` (the apply
     /// boundary converts it to a `sidecar_fixup_failed` advisory) and
     /// must NOT swallow it into `Ok(None)`.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_dispatch_propagates_malformed_error() {
         let d = tempfile::tempdir().unwrap();
@@ -393,7 +382,6 @@ mod tests {
     /// NuGet PURL routes through `dispatch_fixup` to the metadata
     /// neutralizer; the on-disk `.nupkg.metadata` is deleted and the
     /// record records it as `Deleted`.
-    #[cfg(feature = "nuget")]
     #[tokio::test]
     async fn nuget_dispatch_deletes_metadata_and_builds_record() {
         let d = tempfile::tempdir().unwrap();
@@ -422,7 +410,6 @@ mod tests {
     }
 
     /// NuGet package with neither metadata nor signature → no record.
-    #[cfg(feature = "nuget")]
     #[tokio::test]
     async fn nuget_dispatch_nothing_to_do_returns_none() {
         let d = tempfile::tempdir().unwrap();
@@ -439,7 +426,6 @@ mod tests {
 
     /// Go PURL routes through `dispatch_fixup` to the advisory-only
     /// path and denormalizes the ecosystem name to `golang`.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn golang_dispatch_returns_structured_advisory() {
         let d = tempfile::tempdir().unwrap();
@@ -462,7 +448,6 @@ mod tests {
     /// Rollback dispatcher: a cargo PURL routes to the checksum resync
     /// and the record carries the rewritten-file entry; a deleted
     /// (patch-added) file's entry is dropped from the map.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_rollback_dispatch_resyncs_checksum() {
         let d = tempfile::tempdir().unwrap();
@@ -532,24 +517,6 @@ mod tests {
         let out = dispatch_rollback_fixup("pkg:cargo/mycrate@1.0.0", d.path(), &[])
             .await
             .unwrap();
-        assert!(out.is_none());
-    }
-
-    /// When the `cargo` feature is disabled, a `pkg:cargo/` PURL is
-    /// unrecognized by `Ecosystem::from_purl` and `dispatch_fixup`
-    /// returns `None` rather than attempting (or panicking on) a fixup.
-    #[cfg(not(feature = "cargo"))]
-    #[tokio::test]
-    async fn cargo_purl_without_feature_returns_none() {
-        let d = tempfile::tempdir().unwrap();
-        let out = dispatch_fixup(
-            "pkg:cargo/mycrate@1.0.0",
-            d.path(),
-            &["src/lib.rs".to_string()],
-            &empty_files(),
-        )
-        .await
-        .unwrap();
         assert!(out.is_none());
     }
 }

@@ -21,9 +21,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 
-# Build all features so every ecosystem dispatch path compiles into the
-# binary. `--locked` enforces Cargo.lock is honored exactly.
-RUN cargo build --release --workspace --all-features --locked --bin socket-patch \
+# Every ecosystem is unconditionally compiled in. `--locked` enforces
+# Cargo.lock is honored exactly.
+RUN cargo build --release --workspace --locked --bin socket-patch \
  && cp target/release/socket-patch /out-socket-patch
 
 # ----------------------------------------------------------------------

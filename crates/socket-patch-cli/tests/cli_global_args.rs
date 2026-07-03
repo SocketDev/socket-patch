@@ -389,9 +389,6 @@ fn env_vars_populate_global_args() {
         ("SOCKET_API_TOKEN", "env-token"),
         ("SOCKET_ORG_SLUG", "env-org"),
         ("SOCKET_PROXY_URL", "https://env-proxy.example.com"),
-        // npm + gem are unconditional ecosystems, so this env-binding
-        // assertion holds regardless of which optional features are
-        // compiled in (maven is not in the default build).
         ("SOCKET_ECOSYSTEMS", "npm,gem"),
         ("SOCKET_DOWNLOAD_MODE", "package"),
         ("SOCKET_OFFLINE", "true"),

@@ -174,7 +174,6 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        #[cfg(feature = "cargo")]
         "cargo" => {
             socket_patch_core::patch::vendor::cargo::vendor_cargo_crate(
                 purl,
@@ -189,7 +188,6 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        #[cfg(feature = "golang")]
         "golang" => {
             socket_patch_core::patch::vendor::golang::vendor_go_module(
                 purl,
@@ -204,7 +202,6 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        #[cfg(feature = "composer")]
         "composer" => {
             socket_patch_core::patch::vendor::composer_lock::vendor_composer(
                 purl,
@@ -219,7 +216,6 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        #[cfg(feature = "nuget")]
         "nuget" => {
             socket_patch_core::patch::vendor::nuget_feed::vendor_nuget(
                 purl,
@@ -234,7 +230,6 @@ pub(crate) async fn dispatch_vendor_one(
             )
             .await
         }
-        #[cfg(feature = "maven")]
         "maven" => {
             socket_patch_core::patch::vendor::maven_repo::vendor_maven(
                 purl,
@@ -274,7 +269,6 @@ pub(crate) async fn dispatch_revert_one(
         "gem" => {
             socket_patch_core::patch::vendor::gem::revert_gem(entry, project_root, dry_run).await
         }
-        #[cfg(feature = "cargo")]
         "cargo" => {
             socket_patch_core::patch::vendor::cargo::revert_cargo_vendor(
                 entry,
@@ -283,12 +277,10 @@ pub(crate) async fn dispatch_revert_one(
             )
             .await
         }
-        #[cfg(feature = "golang")]
         "golang" => {
             socket_patch_core::patch::vendor::golang::revert_go_vendor(entry, project_root, dry_run)
                 .await
         }
-        #[cfg(feature = "composer")]
         "composer" => {
             socket_patch_core::patch::vendor::composer_lock::revert_composer(
                 entry,
@@ -297,12 +289,10 @@ pub(crate) async fn dispatch_revert_one(
             )
             .await
         }
-        #[cfg(feature = "nuget")]
         "nuget" => {
             socket_patch_core::patch::vendor::nuget_feed::revert_nuget(entry, project_root, dry_run)
                 .await
         }
-        #[cfg(feature = "maven")]
         "maven" => {
             socket_patch_core::patch::vendor::maven_repo::revert_maven(entry, project_root, dry_run)
                 .await

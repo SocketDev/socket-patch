@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "golang"))]
+#![cfg(unix)]
 //! Full go-toolchain capstone for the Go `replace`-redirect: proves the patched
 //! bytes are actually LINKED by `go build`, and that the read-only
 //! `apply --check` redirect auditor detects drift in the committed copy.

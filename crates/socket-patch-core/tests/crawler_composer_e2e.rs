@@ -3,8 +3,6 @@
 //! find_by_purls happy path, crawl_all via installed.json parsing,
 //! malformed installed.json variants.
 
-#![cfg(feature = "composer")]
-
 use std::path::Path;
 
 use socket_patch_core::crawlers::composer_crawler::parse_composer_home_output;

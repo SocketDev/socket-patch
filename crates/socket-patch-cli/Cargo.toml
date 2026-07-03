@@ -28,22 +28,12 @@ regex = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-# Shipped defaults: npm + PyPI + Ruby gems are always compiled in (no feature
-# gate); `cargo`, `golang`, `nuget`, and `maven` are on by default so released
-# binaries and `cargo install socket-patch-cli` patch Rust, Go, .NET, and Java
-# deps (and run the build-time cargo guard) out of the box. Maven `apply` stays
-# runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1` (in-place jar patching
-# corrupts sidecars); committable `vendor` is safe. The still-unsupported
-# ecosystems (composer, deno) stay opt-in. Build `--no-default-features` for a
-# minimal (npm + PyPI + Ruby gems only) binary — its `apply --check` then fails
-# closed.
-default = ["cargo", "golang", "nuget", "maven"]
-cargo = ["socket-patch-core/cargo"]
-golang = ["socket-patch-core/golang"]
-maven = ["socket-patch-core/maven"]
-composer = ["socket-patch-core/composer"]
-nuget = ["socket-patch-core/nuget"]
-deno = ["socket-patch-core/deno"]
+# Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,
+# Deno) is unconditionally compiled in — there are no ecosystem feature gates.
+# Maven `apply` stays runtime-gated behind `SOCKET_EXPERIMENTAL_MAVEN=1`
+# (in-place jar patching corrupts sidecars); committable `vendor` is safe.
+# The only features left gate opt-in test suites:
+#
 # Enables the Docker-driven real-package e2e test suite under
 # `tests/docker_e2e_*.rs`. Tests in this suite require either a running
 # Docker daemon OR `SOCKET_PATCH_TEST_HOST=1` (host-toolchain mode).

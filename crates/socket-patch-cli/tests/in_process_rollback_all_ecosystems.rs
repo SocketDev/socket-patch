@@ -296,7 +296,6 @@ async fn rollback_gem_restores_original_content() {
 // cargo
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cargo")]
 #[tokio::test]
 #[serial]
 async fn rollback_cargo_restores_original_content() {
@@ -355,7 +354,6 @@ version = "1.0.0"
 // golang
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn rollback_golang_restores_original_content() {
@@ -406,7 +404,6 @@ async fn rollback_golang_restores_original_content() {
 // maven
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn rollback_maven_restores_original_content() {
@@ -467,7 +464,6 @@ async fn rollback_maven_restores_original_content() {
 // composer
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn rollback_composer_restores_original_content() {
@@ -523,7 +519,6 @@ async fn rollback_composer_restores_original_content() {
 // nuget
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn rollback_nuget_restores_original_content() {

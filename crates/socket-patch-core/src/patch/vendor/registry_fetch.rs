@@ -116,11 +116,8 @@ pub async fn fetch_and_stage(
     }
     match entry.ecosystem {
         "npm" => fetch_npm(entry, client).await,
-        #[cfg(feature = "cargo")]
         "cargo" => fetch_cargo(entry, client).await,
-        #[cfg(feature = "golang")]
         "golang" => fetch_golang(entry, client).await,
-        #[cfg(feature = "composer")]
         "composer" => fetch_composer(entry, client).await,
         "gem" => fetch_gem(entry, client).await,
         "pypi" => fetch_pypi(entry, client).await,
@@ -200,7 +197,6 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
 
 /// Composer dist zips (packagist/GitHub zipballs): sha1-verified, variable
 /// top dir stripped. The extracted dir plays the installed package dir.
-#[cfg(feature = "composer")]
 async fn fetch_composer(
     entry: &LockfileEntry,
     client: &reqwest::Client,
@@ -288,10 +284,8 @@ async fn fetch_pypi(
 }
 
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
-#[cfg(feature = "cargo")]
 pub const DEFAULT_CRATES_REGISTRY: &str = "https://static.crates.io/crates";
 
-#[cfg(feature = "cargo")]
 fn crates_registry_base() -> String {
     std::env::var("SOCKET_CRATES_REGISTRY")
         .ok()
@@ -303,7 +297,6 @@ fn crates_registry_base() -> String {
 /// `.crate` files are tar.gz with a `{name}-{version}/` top dir — the same
 /// extraction path as npm tarballs. The Cargo.lock `checksum` is the sha256
 /// of the `.crate` bytes.
-#[cfg(feature = "cargo")]
 async fn fetch_cargo(
     entry: &LockfileEntry,
     client: &reqwest::Client,
@@ -339,10 +332,8 @@ async fn fetch_cargo(
 
 /// Default Go module proxy; `SOCKET_GOPROXY` wins, else the standard
 /// `GOPROXY` env (first element that isn't `direct`/`off`).
-#[cfg(feature = "golang")]
 pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 
-#[cfg(feature = "golang")]
 fn goproxy_base() -> String {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
@@ -363,7 +354,6 @@ fn goproxy_base() -> String {
 
 /// Go's module-path case encoding for proxy URLs: an uppercase letter `X`
 /// becomes `!x` (applies to the module path and the version).
-#[cfg(feature = "golang")]
 fn go_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -381,7 +371,6 @@ fn go_escape(s: &str) -> String {
 /// `"{sha256hex(content)}  {entry name}\n"` lines, base64-encoded
 /// (golang.org/x/mod/sumdb/dirhash Hash1/HashZip). Computed in memory
 /// BEFORE extraction.
-#[cfg(feature = "golang")]
 fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -459,7 +448,6 @@ pub(crate) fn verify_go_h1(bytes: &[u8], expected_h1: &str) -> Result<(), String
 /// (`<module>@<version>/` — go module paths contain slashes, so a
 /// first-component strip would be wrong). Same guard family as
 /// [`extract_tgz`]; an entry outside the prefix fails the whole artifact.
-#[cfg(feature = "golang")]
 /// `pub(crate)` so the golang service-download path can extract a downloaded
 /// module zip (entries prefixed `{module}@{version}/`) into the vendor copy dir.
 pub(crate) fn extract_zip_with_prefix(
@@ -506,7 +494,6 @@ pub(crate) fn extract_zip_with_prefix(
     Ok(())
 }
 
-#[cfg(feature = "golang")]
 async fn fetch_golang(
     entry: &LockfileEntry,
     client: &reqwest::Client,
@@ -1218,7 +1205,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_crate_fetch_verifies_sha256_and_extracts() {
         // .crate = tar.gz with a {name}-{version}/ top dir.
@@ -1265,7 +1251,6 @@ mod tests {
 
     /// Build a go module zip in memory (files only, `module@version/`
     /// prefix — the go zip layout).
-    #[cfg(feature = "golang")]
     fn make_module_zip(prefix: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Write as _;
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -1284,7 +1269,6 @@ mod tests {
 
     /// Independent spec-mirror of dirhash Hash1/HashZip, structured
     /// differently from the production fn to catch encoding slips.
-    #[cfg(feature = "golang")]
     fn spec_h1(files: &[(&str, &[u8])], prefix: &str) -> String {
         // dirhash.Hash1 sorts the FILE NAMES, then emits one line per file.
         let mut named: Vec<(String, &[u8])> = files
@@ -1303,7 +1287,6 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn golang_module_fetch_verifies_h1_dirhash_and_extracts() {
         // Out-of-order files prove the sort; nested module path proves the
@@ -1356,7 +1339,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn go_escape_uppercase_and_zip_prefix_guards() {
         assert_eq!(
@@ -1390,7 +1372,6 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
-    #[cfg(feature = "composer")]
     #[tokio::test]
     async fn composer_dist_fetch_verifies_sha1_and_strips_top_dir() {
         // GitHub zipballs carry an `owner-repo-sha/` top dir.

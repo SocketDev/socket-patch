@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "golang"))]
+#![cfg(unix)]
 //! End-to-end for the Go `replace`-redirect backend, driven through the CLI
 //! binary. No `go` toolchain needed: `apply`/`--check` only read a pristine
 //! extracted module-cache dir and write project-local copies + a `go.mod`

@@ -1,33 +1,21 @@
-#[cfg(feature = "cargo")]
 pub mod cargo_crawler;
-#[cfg(feature = "composer")]
 pub mod composer_crawler;
-#[cfg(feature = "deno")]
 pub mod deno_crawler;
-#[cfg(feature = "golang")]
 pub mod go_crawler;
-#[cfg(feature = "maven")]
 pub mod maven_crawler;
 pub mod npm_crawler;
-#[cfg(feature = "nuget")]
 pub mod nuget_crawler;
 pub mod pkg_managers;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod types;
 
-#[cfg(feature = "cargo")]
 pub use cargo_crawler::CargoCrawler;
-#[cfg(feature = "composer")]
 pub use composer_crawler::ComposerCrawler;
-#[cfg(feature = "deno")]
 pub use deno_crawler::DenoCrawler;
-#[cfg(feature = "golang")]
 pub use go_crawler::GoCrawler;
-#[cfg(feature = "maven")]
 pub use maven_crawler::MavenCrawler;
 pub use npm_crawler::NpmCrawler;
-#[cfg(feature = "nuget")]
 pub use nuget_crawler::NuGetCrawler;
 pub use pkg_managers::{detect_npm_pkg_manager, NpmPkgManager};
 pub use python_crawler::PythonCrawler;

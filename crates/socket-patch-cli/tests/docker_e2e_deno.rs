@@ -25,9 +25,9 @@
 //!     healthy; it does not produce the scanned layout.
 //!
 //! Run command:
-//!   `cargo test -p socket-patch-cli --features docker-e2e,deno --test docker_e2e_deno`
+//!   `cargo test -p socket-patch-cli --features docker-e2e --test docker_e2e_deno`
 
-#![cfg(all(feature = "docker-e2e", feature = "deno"))]
+#![cfg(feature = "docker-e2e")]
 
 use std::process::Command;
 

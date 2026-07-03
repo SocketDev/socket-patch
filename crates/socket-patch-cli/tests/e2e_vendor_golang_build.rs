@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "golang"))]
+#![cfg(unix)]
 //! Real-go capstone e2e for `socket-patch vendor` — the committability proof
 //! for the `go.mod` `replace`-directive vendoring, plus the apply↔vendor
 //! interplay (takeover + yield).

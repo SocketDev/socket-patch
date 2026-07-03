@@ -2578,7 +2578,6 @@ mod tests {
     /// sidecar fixup, or its checksum entry stays stale forever and
     /// `cargo build` refuses the crate even though the retry reported
     /// success.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_apply_retry_resyncs_already_patched_checksum_entries() {
         fn plain_sha256(b: &[u8]) -> String {

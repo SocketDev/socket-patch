@@ -225,7 +225,7 @@ still show up in VEX).
 | npm / yarn / pnpm / bun | `scripts.postinstall` + `scripts.dependencies` | `npm/pnpm install` (+ `install <pkg>`) | pnpm: root package only |
 | pypi | `socket-patch[hook]` dependency → `.pth` startup hook | Python interpreter startup after installed-set change | manifest = `pyproject.toml` (uv/poetry/pdm/hatch) or `requirements.txt` (pip) |
 | gem | managed `plugin "socket-patch"` block in the `Gemfile` → committed in-tree Bundler plugin under `.socket/bundler-plugin/` | every `bundle install` (cached + fresh: load-time digest gate + `after-install-all` hook) | Bundler loads only committed git plugins, so the generated dir must be committed; CLI must be on `PATH`. Phase 1 references the in-tree plugin via `git:`; Phase 2 (follow-up) switches to a published `socket-patch-bundler` gem |
-| composer *(opt-in `composer` feature)* | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH`; only compiled in with `--features composer` (apply support is likewise feature-gated). Without the feature, composer is a `no_files` no-op |
+| composer | `socket-patch apply` appended to `composer.json`'s `post-install-cmd` + `post-update-cmd` script events | every `composer install` / `composer update` | CLI must be on `PATH` |
 | cargo · golang | **none** (apply-only) | — | see "Cargo and Go: apply-only, no setup" below; candidates for the **manual** declaration |
 | nuget · maven · deno | **none** (apply-only) | — | `setup` reports `no_files`; candidates for the **manual** declaration |
 
@@ -485,8 +485,8 @@ to **six flavors**.
 | nuget | deterministically rebuilt `.nupkg` at `<idLower>.<versionNorm>.nupkg` (the uuid dir IS a NuGet folder feed; the stale embedded signature is dropped — unsigned is accepted under NuGet's default validation) | `nuget.config` source + `packageSourceMapping` for the id (creating the mapping from scratch ALSO fans a `<package pattern="*" />` out to every pre-existing source — mapping is exclusive, NU1100 otherwise) **+** `packages.lock.json` `contentHash` → `base64(sha512(nupkg))` when the lock exists (`vendor_nuget_no_lockfile` warning otherwise) | `dotnet restore --locked-mode`, cold cache, `--network none` (tampered nupkg fails NU1403) |
 | maven | deterministically rebuilt `.jar` + the **verbatim upstream pom** (transitives survive; refused via `vendor_maven_pom_unavailable` rather than fabricated) + `.sha1` sidecars, laid out as a maven2 repository under the uuid dir | `pom.xml` `<repository>` (`id=socket-patch-vendor-<uuid>`, `url=file://${project.basedir}/.socket/vendor/maven/<uuid>`, `checksumPolicy=fail`, snapshots disabled). Multi-module aggregator poms refused (`vendor_maven_multimodule_unsupported`); gradle-only projects refused (`vendor_gradle_unsupported`); always-on `vendor_maven_local_cache_shadow` advisory (warm `~/.m2` wins over any repository) | `mvn` build on a fresh checkout with the GAV purged from the local repo, `--network none` (docker capstone; note `mvn -o` refuses `file://` repositories outright) |
 
-Ecosystems with no vendor backend that this build still *recognizes* (jsr when its feature is
-compiled in) refuse per-purl with `vendor_unsupported_ecosystem`. yarn-berry **PnP**
+Ecosystems with no vendor backend (jsr) refuse per-purl with
+`vendor_unsupported_ecosystem`. yarn-berry **PnP**
 (`.pnp.*`) and bun's binary `bun.lockb` are refused with stable codes pointing at the native
 alternative / a text-lockfile migration; a lock-less tool marker (a `[tool.uv]`/`[tool.poetry]`/
 `[tool.pdm]` table or a `Pipfile` without its lock) refuses `<tool>_no_lockfile` unless a
@@ -717,7 +717,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_revert_failed`    | top-level error  | remove: the vendor revert failed; the manifest was NOT modified. |
 | `vendor_state_retained`   | `skipped`        | remove `--skip-rollback`: vendor wiring + artifact deliberately left in place (the next `vendor` run reconciles the dropped entry). Also the top-level error code when `--skip-rollback` targets a detached-only patch. |
 | `vendor_stale_artifact_removed` | `removed`  | vendor / scan `--vendor`: re-vendor under a newer patch uuid removed the previous uuid's orphaned artifact dir. |
-| `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (jsr, or compiled out — maven/nuget have backends since their promotion to default features). |
+| `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (jsr). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `unsafe_coordinates`      | `failed`         | vendor: purl/uuid would escape `.socket/vendor/` (tampered manifest/state); refused before any write. |
 | `revert_failed`           | `failed`         | vendor --revert: a recorded entry could not be reverted. |

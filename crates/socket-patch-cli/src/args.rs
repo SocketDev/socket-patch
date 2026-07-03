@@ -26,11 +26,8 @@ use socket_patch_core::patch::vendor::VendorSource;
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
-/// Rejects any name this build does not support — both typos and
-/// ecosystems whose Cargo feature is not compiled in (e.g. `maven` /
-/// `nuget` on a default build, which ships npm + PyPI + Ruby gems + Go +
-/// Cargo). `Ecosystem::all()` is itself `#[cfg]`-gated, so the accepted
-/// set tracks the compiled feature set exactly.
+/// Rejects any name that is not a supported ecosystem, so typos fail
+/// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
 /// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a

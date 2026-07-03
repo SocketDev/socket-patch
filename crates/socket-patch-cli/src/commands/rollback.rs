@@ -56,7 +56,6 @@ struct PatchToRollback {
 // before-blobs like npm/pypi. The helper is an inert stub without `golang`.
 
 /// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
-#[cfg(feature = "golang")]
 fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
     use socket_patch_core::crawlers::Ecosystem;
     !common.global
@@ -69,7 +68,6 @@ fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
 /// this to skip those PURLs — they read no blobs, so a missing before-blob must
 /// not block (or trigger a needless download for) an offline redirect rollback.
 fn is_local_redirect(purl: &str, common: &GlobalArgs) -> bool {
-    #[cfg(feature = "golang")]
     if is_local_go(purl, common) {
         return true;
     }
@@ -98,7 +96,6 @@ fn exclude_local_redirects(manifest: &PatchManifest, common: &GlobalArgs) -> Pat
 /// is left pristine by the redirect, so there is no before-blob to restore;
 /// mirrors apply's `try_local_go_apply`. Go has no `vendor/` fallthrough (apply
 /// always redirects local go), so there is no vendored discriminator here.
-#[cfg(feature = "golang")]
 async fn try_rollback_local_go(
     purl: &str,
     pkg_path: &Path,
@@ -142,16 +139,6 @@ async fn try_rollback_local_go(
         result.error = Some(e.to_string());
     }
     Some(result)
-}
-
-#[cfg(not(feature = "golang"))]
-async fn try_rollback_local_go(
-    _purl: &str,
-    _pkg_path: &Path,
-    _patch: &PatchRecord,
-    _common: &GlobalArgs,
-) -> Option<RollbackResult> {
-    None
 }
 
 fn find_patches_to_rollback(
@@ -759,8 +746,7 @@ async fn rollback_patches_inner(
 
             // Local go drops the project-local `replace`-redirect; everything
             // else — npm/pypi/gem and cargo (vendored or registry cache) —
-            // restores in place from before-blobs. Without the `golang` feature
-            // `try_rollback_local_go` is an inert `None`.
+            // restores in place from before-blobs.
             let result = match try_rollback_local_go(purl, pkg_path, patch, &args.common).await {
                 Some(r) => r,
                 None => {
@@ -1118,7 +1104,6 @@ mod tests {
     /// must NOT be excluded by the before-blob gate: a missing cargo before-blob
     /// IS a real problem the gate should surface. This guards against cargo
     /// being mistakenly reclassified as a redirect again.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn gate_manifest_keeps_cargo_before_blobs_in_missing_check() {
         let mut patches = HashMap::new();
@@ -1165,7 +1150,6 @@ mod tests {
     /// an offline local-go rollback. Before the fix only cargo was excluded, so
     /// a local-go patch with an absent before-blob aborted the whole rollback
     /// under `--offline`.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn gate_manifest_excludes_local_go_before_blobs_from_missing_check() {
         let mut patches = HashMap::new();
@@ -1233,7 +1217,6 @@ mod tests {
     /// cache, every file verified `AlreadyOriginal`, and the redirect was left
     /// active — a silent no-op that reported "already original" while the build
     /// kept using the patched copy.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn try_rollback_local_go_drops_redirect_and_copy() {
         use socket_patch_core::patch::go_mod_edit::{
@@ -1319,7 +1302,6 @@ mod tests {
     /// it unconditionally, so `rollback --dry-run --json` reported
     /// `rolledBack: 1` (with the files listed in `filesRolledBack`) for a run
     /// that mutated nothing.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn try_rollback_local_go_dry_run_reports_no_files_rolled_back() {
         use socket_patch_core::patch::go_mod_edit::{
@@ -1382,7 +1364,6 @@ mod tests {
     /// A go PURL under `--global` is an in-place module-cache rollback, NOT a
     /// redirect — `try_rollback_local_go` must decline it so the caller falls
     /// through to `rollback_package_patch`.
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn try_rollback_local_go_declines_global() {
         let patch = record_with_file("uuid-go", "errors.go", "go_before");

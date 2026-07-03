@@ -1,7 +1,5 @@
 //! Integration coverage for `crawlers::cargo_crawler`.
 
-#![cfg(feature = "cargo")]
-
 use std::path::Path;
 
 use socket_patch_core::crawlers::cargo_crawler::parse_cargo_toml_name_version;

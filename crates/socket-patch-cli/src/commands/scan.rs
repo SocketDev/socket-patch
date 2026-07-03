@@ -2115,13 +2115,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         } else {
             #[allow(unused_mut)]
             let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-            #[cfg(feature = "cargo")]
             install_cmds.push_str("/cargo");
-            #[cfg(feature = "golang")]
             install_cmds.push_str("/go");
-            #[cfg(feature = "maven")]
             install_cmds.push_str("/mvn");
-            #[cfg(feature = "composer")]
             install_cmds.push_str("/composer");
             println!("No packages found. Run {install_cmds} install first.");
         }

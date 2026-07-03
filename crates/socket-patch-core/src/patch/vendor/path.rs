@@ -38,15 +38,13 @@ use crate::utils::fs::list_dir_entries;
 pub const VENDOR_DIR: &str = ".socket/vendor";
 
 /// The ecosystem directory names under [`VENDOR_DIR`]. These double as the
-/// `<eco>` capture of the recovery convention and are independent of which
-/// features this binary was compiled with (an orphan sweep must still
-/// recognise — and report, not delete — a dir for a compiled-out ecosystem).
+/// `<eco>` capture of the recovery convention.
 pub const ECOSYSTEM_DIRS: &[&str] = &[
     "npm", "cargo", "golang", "composer", "gem", "pypi", "nuget", "maven",
 ];
 
 /// The vendor ecosystem-dir name for a PURL, or `None` when the ecosystem has
-/// no vendor backend (jsr) or is compiled out of this binary.
+/// no vendor backend (jsr).
 pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
     if purl.starts_with("pkg:npm/") {
         return Some("npm");
@@ -57,23 +55,18 @@ pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
     if purl.starts_with("pkg:gem/") {
         return Some("gem");
     }
-    #[cfg(feature = "cargo")]
     if purl.starts_with("pkg:cargo/") {
         return Some("cargo");
     }
-    #[cfg(feature = "golang")]
     if purl.starts_with("pkg:golang/") {
         return Some("golang");
     }
-    #[cfg(feature = "composer")]
     if purl.starts_with("pkg:composer/") {
         return Some("composer");
     }
-    #[cfg(feature = "nuget")]
     if purl.starts_with("pkg:nuget/") {
         return Some("nuget");
     }
-    #[cfg(feature = "maven")]
     if purl.starts_with("pkg:maven/") {
         return Some("maven");
     }
