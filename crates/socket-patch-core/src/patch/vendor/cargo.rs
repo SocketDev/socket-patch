@@ -13,7 +13,7 @@
 //! [`apply_package_patch`] pipeline** pointed at the fresh copy, so all the
 //! verify → package/diff/blob → atomic-write machinery is reused unchanged.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
@@ -22,8 +22,10 @@ use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 
 use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
-use super::cargo_lock::{self, LockEditError, LockEntryOriginal};
-use super::common::{already_patched_verify, copy_matches_after_hashes, synthesized_result};
+use super::cargo_lock::{self, LockEditError};
+use super::common::{
+    already_patched_verify, copy_matches_after_hashes, refused, synthesized_result,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_tgz;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -61,25 +63,20 @@ fn is_legacy_redirect_path(path: &str) -> bool {
     norm.starts_with(&format!("{LEGACY_CARGO_PATCHES_DIR}/"))
 }
 
-/// True when the lock entry for `name`+`version` no longer needs detaching:
-/// either there is no lockfile (nothing to edit — the first build generates a
-/// path-form lock), or the entry exists with no `source` (already detached).
-/// Probed via a dry-run detach: `NotRegistry` *is* the detached shape.
-async fn lock_entry_detached(project_root: &Path, name: &str, version: &str) -> bool {
-    matches!(
-        cargo_lock::detach_lock_entry(project_root, name, version, true).await,
-        Err(LockEditError::NotRegistry) | Err(LockEditError::NoLockfile)
-    )
-}
-
-/// The config `[patch]` entry points at THIS copy and the lock entry is
-/// already detached — the wiring half of the in-sync test.
+/// The config `[patch]` entry points at THIS copy and the lock entry no
+/// longer needs detaching: either there is no lockfile (nothing to edit — the
+/// first build generates a path-form lock), or the entry exists with no
+/// `source` (already detached). The lock half is probed via a dry-run detach:
+/// `NotRegistry` *is* the detached shape.
 async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel: &str) -> bool {
     let entries = cargo_config::read_patch_entries(project_root).await;
     if entries.get(name).and_then(|i| i.path.as_deref()) != Some(copy_rel) {
         return false;
     }
-    lock_entry_detached(project_root, name, version).await
+    matches!(
+        cargo_lock::detach_lock_entry(project_root, name, version, true).await,
+        Err(LockEditError::NotRegistry) | Err(LockEditError::NoLockfile)
+    )
 }
 
 fn done(
@@ -124,7 +121,7 @@ async fn cargo_service_copy(
         return CargoServiceCopy::FallBack;
     }
     fn hard(code: &'static str, detail: String) -> CargoServiceCopy {
-        CargoServiceCopy::HardFail(Box::new(VendorOutcome::Refused { code, detail }))
+        CargoServiceCopy::HardFail(Box::new(refused(code, detail)))
     }
     let miss = |warnings: &mut Vec<VendorWarning>, code: &'static str, reason: String| {
         if cfg.source.requires_service() {
@@ -193,6 +190,56 @@ async fn cargo_service_copy(
     }
 }
 
+/// Copy the pristine source into `copy_dir` and run the hardened apply
+/// pipeline against it (vendor auto-force policy — see
+/// [`super::force_apply_staged`]). On failure the whole uuid dir is removed —
+/// a partial copy (or an empty `<uuid>/` husk) under `.socket/vendor/` would
+/// be misjudged by verify/sweep — and the failed [`ApplyResult`] is the `Err`
+/// for the caller to bubble. On success the copy carries no
+/// `.cargo-checksum.json` (a path-dep copy must never have one; the fresh
+/// copy excludes it, and it is re-removed defensively in case the patch
+/// recreated it).
+#[allow(clippy::too_many_arguments)]
+async fn copy_and_patch(
+    purl: &str,
+    pristine_src: &Path,
+    copy_dir: &Path,
+    uuid_dir: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    force: bool,
+    name: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<ApplyResult, ApplyResult> {
+    if let Err(e) = fresh_copy(pristine_src, copy_dir, Some(".cargo-checksum.json")).await {
+        let _ = remove_tree(uuid_dir).await;
+        return Err(synthesized_result(
+            purl,
+            copy_dir,
+            Vec::new(),
+            false,
+            Some(format!("failed to copy pristine source: {e}")),
+        ));
+    }
+    let mut result = super::force_apply_staged(
+        purl, copy_dir, record, sources, false, force, name, version, warnings,
+    )
+    .await;
+    result.package_path = copy_dir.display().to_string();
+    if !result.success {
+        let _ = remove_tree(uuid_dir).await;
+        return Err(result);
+    }
+    let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
+    debug_assert!(
+        result.sidecar.is_none(),
+        "vendor copy must not produce a cargo sidecar"
+    );
+    result.sidecar = None;
+    Ok(result)
+}
+
 /// Vendor one cargo crate: patched copy + `[patch.crates-io]` entry +
 /// `Cargo.lock` surgery + marker, returning the ledger entry to persist.
 ///
@@ -218,10 +265,7 @@ pub async fn vendor_cargo_crate(
 ) -> VendorOutcome {
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((name, version)) = parse_cargo_purl(purl) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!("not a cargo purl: {purl}"),
-        };
+        return refused("unsafe_coordinates", format!("not a cargo purl: {purl}"));
     };
     // SECURITY: `name`/`version` key the on-disk copy dir
     // (`.socket/vendor/cargo/<uuid>/<name>-<version>/`) and the `[patch]`
@@ -229,36 +273,36 @@ pub async fn vendor_cargo_crate(
     // and the apply pipeline escape `.socket/vendor/` — refuse before any
     // disk access.
     if !is_safe_single_segment(name) || !is_safe_single_segment(version) {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor unsafe cargo coordinates `{name}`/`{version}` \
                  (a path separator or `..` would escape .socket/vendor/cargo/)"
             ),
-        };
+        );
     }
     // SECURITY: the uuid is a dedicated path level created here and deleted by
     // `--revert`; anything but the canonical UUID grammar is rejected.
     let Some(base_rel) = vendor_uuid_dir_rel("cargo", &record.uuid) else {
-        return VendorOutcome::Refused {
-            code: "unsafe_coordinates",
-            detail: format!(
+        return refused(
+            "unsafe_coordinates",
+            format!(
                 "refusing to vendor {purl}: patch uuid `{}` is not a canonical uuid",
                 record.uuid
             ),
-        };
+        );
     };
 
     // ── pre-flight refusals (read-only) ───────────────────────────────────
     // (a) A real `cargo vendor` tree already provides this crate.
     if is_vendored(project_root, name, version).await {
-        return VendorOutcome::Refused {
-            code: "already_vendored_in_tree",
-            detail: format!(
+        return refused(
+            "already_vendored_in_tree",
+            format!(
                 "{name}@{version} is provided by the project's `vendor/` tree \
                  (cargo vendor); patch it in place with `apply` instead"
             ),
-        };
+        );
     }
     // (b) The lock must resolve this exact version, or the `[patch]` would be
     // unused and an unlocked build would silently re-lock (spike claim 6).
@@ -268,21 +312,19 @@ pub async fn vendor_cargo_crate(
             Some(versions) => {
                 let mut sorted: Vec<&str> = versions.iter().map(String::as_str).collect();
                 sorted.sort_unstable();
-                return VendorOutcome::Refused {
-                    code: "locked_version_mismatch",
-                    detail: format!(
+                return refused(
+                    "locked_version_mismatch",
+                    format!(
                         "Cargo.lock resolves `{name}` to {} but the patch targets {version}",
                         sorted.join(", ")
                     ),
-                };
+                );
             }
             None => {
-                return VendorOutcome::Refused {
-                    code: "locked_version_mismatch",
-                    detail: format!(
-                        "`{name}` is not present in Cargo.lock (patch targets {version})"
-                    ),
-                };
+                return refused(
+                    "locked_version_mismatch",
+                    format!("`{name}` is not present in Cargo.lock (patch targets {version})"),
+                );
             }
         }
     }
@@ -294,14 +336,14 @@ pub async fn vendor_cargo_crate(
         .remove(name);
     if let Some(info) = &prior_entry {
         if !info.socket_owned {
-            return VendorOutcome::Refused {
-                code: "user_authored_patch_entry",
-                detail: format!(
+            return refused(
+                "user_authored_patch_entry",
+                format!(
                     "`patch.crates-io.{name}` in .cargo/config.toml is user-authored \
                      ({}); refusing to overwrite",
                     info.path.as_deref().unwrap_or("non-path source")
                 ),
-            };
+            );
         }
     }
 
@@ -361,41 +403,24 @@ pub async fn vendor_cargo_crate(
         // ARTIFACT only — config + lock are already correct, and the full
         // path's surgery would re-record live vendored state over the
         // first run's unrecoverable lock originals.
-        if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await {
-            let _ = remove_tree(&uuid_dir).await;
-            return done(
-                synthesized_result(
-                    purl,
-                    &copy_dir,
-                    Vec::new(),
-                    false,
-                    Some(format!("failed to copy pristine source: {e}")),
-                ),
-                None,
-                Vec::new(),
-            );
-        }
         let mut warnings: Vec<VendorWarning> = Vec::new();
-        let mut result = super::force_apply_staged(
+        let result = match copy_and_patch(
             purl,
+            pristine_src,
             &copy_dir,
+            &uuid_dir,
             record,
             sources,
-            false,
             force,
             name,
             version,
             &mut warnings,
         )
-        .await;
-        result.package_path = copy_dir.display().to_string();
-        if !result.success {
-            let _ = remove_tree(&uuid_dir).await;
-            return done(result, None, warnings);
-        }
-        // Same path-dep invariant as the full path: no checksum sidecar.
-        let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
-        result.sidecar = None;
+        .await
+        {
+            Ok(result) => result,
+            Err(result) => return done(result, None, warnings),
+        };
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
@@ -408,18 +433,17 @@ pub async fn vendor_cargo_crate(
 
     // ── materialise the patched copy ──────────────────────────────────────
     // Prefer the prebuilt `.crate` from the patch service (download + extract,
-    // no pristine source needed); else copy the pristine source and patch it.
-    // Either way a path-dep copy must never carry a `.cargo-checksum.json`
-    // (cargo 1.93 src dirs no longer have one, but older layouts do and its
-    // presence would re-enable checksum fixups).
+    // no pristine source needed); else copy the pristine source and patch it
+    // (`copy_and_patch`). Either way a path-dep copy must never carry a
+    // `.cargo-checksum.json` (cargo 1.93 src dirs no longer have one, but
+    // older layouts do and its presence would re-enable checksum fixups).
     let mut warnings: Vec<VendorWarning> = Vec::new();
     if let Some(cfg) = service {
         if cfg.source.requires_service() && cfg.offline {
-            return VendorOutcome::Refused {
-                code: "vendor_service_offline_conflict",
-                detail: "--vendor-source=service needs the network but --offline is set"
-                    .to_string(),
-            };
+            return refused(
+                "vendor_service_offline_conflict",
+                "--vendor-source=service needs the network but --offline is set",
+            );
         }
     }
     let mut result = match cargo_service_copy(
@@ -444,55 +468,23 @@ pub async fn vendor_cargo_crate(
         }
         CargoServiceCopy::HardFail(outcome) => return *outcome,
         CargoServiceCopy::FallBack => {
-            if let Err(e) = fresh_copy(pristine_src, &copy_dir, Some(".cargo-checksum.json")).await
-            {
-                // Clear the whole uuid dir, not just the copy: a partial copy
-                // (or an empty `<uuid>/` husk) under .socket/vendor/ would be
-                // misjudged by verify/sweep.
-                let _ = remove_tree(&uuid_dir).await;
-                return done(
-                    synthesized_result(
-                        purl,
-                        &copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy pristine source: {e}")),
-                    ),
-                    None,
-                    warnings,
-                );
-            }
-            // Delegate to the hardened pipeline (vendor auto-force policy —
-            // see `force_apply_staged`), pointed at the copy.
-            let mut result = super::force_apply_staged(
+            match copy_and_patch(
                 purl,
+                pristine_src,
                 &copy_dir,
+                &uuid_dir,
                 record,
                 sources,
-                false,
                 force,
                 name,
                 version,
                 &mut warnings,
             )
-            .await;
-            result.package_path = copy_dir.display().to_string();
-            if !result.success {
-                // Don't leave a half-built copy (or an empty uuid husk) that
-                // verify/sweep would misjudge.
-                let _ = remove_tree(&uuid_dir).await;
-                return done(result, None, warnings);
+            .await
+            {
+                Ok(result) => result,
+                Err(result) => return done(result, None, warnings),
             }
-            // A path-dep copy must never carry a checksum sidecar. The fresh
-            // copy excluded it; enforce defensively in case the patch recreated
-            // the file.
-            let _ = tokio::fs::remove_file(copy_dir.join(".cargo-checksum.json")).await;
-            debug_assert!(
-                result.sidecar.is_none(),
-                "vendor copy must not produce a cargo sidecar"
-            );
-            result.sidecar = None;
-            result
         }
     };
 
@@ -515,7 +507,7 @@ pub async fn vendor_cargo_crate(
     }
 
     // ── detach the lock entry ─────────────────────────────────────────────
-    let lock_original: Option<LockEntryOriginal> =
+    let lock_original: Option<CargoLockOriginal> =
         match cargo_lock::detach_lock_entry(project_root, name, version, false).await {
             Ok(orig) => Some(orig),
             Err(LockEditError::NoLockfile) => {
@@ -600,10 +592,7 @@ pub async fn vendor_cargo_crate(
             platform_locked: None,
         },
         wiring,
-        lock: lock_original.map(|o| CargoLockOriginal {
-            source: o.source,
-            checksum: o.checksum,
-        }),
+        lock: lock_original,
         took_over_go_patches: false,
         detached: false,
         record: None,
@@ -647,12 +636,7 @@ pub async fn revert_cargo_vendor(
     let mut out = RevertOutcome::ok();
 
     if let Some(lock) = &entry.lock {
-        let original = LockEntryOriginal {
-            source: lock.source.clone(),
-            checksum: lock.checksum.clone(),
-        };
-        match cargo_lock::restore_lock_entry(project_root, name, version, &original, dry_run).await
-        {
+        match cargo_lock::restore_lock_entry(project_root, name, version, lock, dry_run).await {
             Ok(true) => {}
             Ok(false) => out.warnings.push(VendorWarning::new(
                 "lock_restore_skipped",
@@ -687,7 +671,7 @@ pub async fn revert_cargo_vendor(
     }
 
     if !dry_run {
-        let uuid_dir: PathBuf = project_root.join(&base_rel);
+        let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
                                               // Best-effort: prune the now-empty `.socket/vendor/cargo/` level so a
                                               // fully-reverted project carries no vendor residue (`save_state` then
@@ -707,6 +691,7 @@ mod tests {
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     const PURL: &str = "pkg:cargo/cfg-if@1.0.4";

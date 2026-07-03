@@ -244,8 +244,9 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
 }
 
 /// Ensure `parent[key]` is a table, creating it if absent. Errors if present
-/// but a non-table.
-fn ensure_table<'a>(
+/// but a non-table. Also used by the cargo vendor backend's
+/// `[patch.crates-io]` editing (`patch::vendor::cargo_config`).
+pub(crate) fn ensure_table<'a>(
     parent: &'a mut Table,
     key: &str,
     implicit: bool,

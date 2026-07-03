@@ -41,7 +41,7 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
 use super::common::{already_patched_verify, synthesized_result};
-use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack, tgz_rel_leaf};
+use super::npm_common::{done_failure, guard_coordinates, refused, stage_patch_pack};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -54,18 +54,12 @@ const BUN_LOCK: &str = "bun.lock";
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
 
-/// SECURITY: revert writes are restricted to the one file vendor edits — a
-/// poisoned state.json must not be able to point the rewrite at an arbitrary
-/// project file. Records naming anything else are skipped with a warning
-/// (fail-closed).
-const REVERT_ALLOWLIST: [&str; 1] = [BUN_LOCK];
-
 /// Vendor one installed npm package into a bun project (see the module doc).
 /// Same contract as `npm_lock::vendor_npm`: refuse-early / wire-last,
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
 /// re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_bun(
+pub(crate) async fn vendor_bun(
     purl: &str,
     installed_dir: &Path,
     project_root: &Path,
@@ -84,8 +78,6 @@ pub async fn vendor_bun(
         Err(outcome) => return *outcome,
     };
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
-    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
-    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, tgz_rel_leaf(name, version));
 
     // ── 2. Read + strictly parse the lock (refuse before any write) ──────
     let lock_text = match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
@@ -153,7 +145,8 @@ pub async fn vendor_bun(
             warnings,
         };
     };
-    debug_assert_eq!(staged.rel_tgz, rel_tgz);
+    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
+    let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
     if staged.staged_pkg_json.is_some() {
         // The tuple's deps object mirrors the package's own manifest; the
@@ -181,7 +174,7 @@ pub async fn vendor_bun(
             TupleShape::Ours { path } => {
                 // Idempotency: an instance already carrying this exact path
                 // and integrity needs no edit and no wiring record.
-                if path == rel_tgz && entry.elems[2] == json_str(&packed.integrity) {
+                if path == rel_tgz && entry.elems[2] == format!("\"{}\"", packed.integrity) {
                     continue;
                 }
                 (entry.elems[1].clone(), true)
@@ -287,7 +280,11 @@ pub async fn vendor_bun(
 /// Undo one bun-vendored package: restore the recorded entry lines and
 /// remove the artifact dir. Reverse application order; per-record ownership
 /// is re-checked against the live line (drift ⇒ warning, left alone).
-pub async fn revert_bun(entry: &VendorEntry, project_root: &Path, dry_run: bool) -> RevertOutcome {
+pub(crate) async fn revert_bun(
+    entry: &VendorEntry,
+    project_root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     // SECURITY: `entry.uuid` comes from the committed, tamper-able
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used.
@@ -302,9 +299,13 @@ pub async fn revert_bun(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     }
     let mut outcome = RevertOutcome::ok();
 
+    // SECURITY: revert writes are restricted to the one file vendor edits — a
+    // poisoned state.json must not be able to point the rewrite at an
+    // arbitrary project file. Records naming anything else are skipped with a
+    // warning (fail-closed).
     let mut touches_lock = false;
     for rec in &entry.wiring {
-        if !REVERT_ALLOWLIST.contains(&rec.file.as_str()) {
+        if rec.file != BUN_LOCK {
             outcome.warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
@@ -460,11 +461,6 @@ fn classify(entry: &BunEntry, target_spec: &str, name: &str) -> Option<TupleShap
         }
         _ => None,
     }
-}
-
-/// Encode for verbatim comparison against a tuple element.
-fn json_str(s: &str) -> String {
-    format!("\"{s}\"")
 }
 
 #[cfg(test)]

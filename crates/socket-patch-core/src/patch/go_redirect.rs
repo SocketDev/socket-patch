@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::{PatchFileInfo, PatchManifest};
 use crate::patch::apply::{
-    apply_package_patch, normalize_file_path, ApplyResult, MismatchPolicy, PatchSources,
+    apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult,
+    MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::vendor::common::{
@@ -37,8 +38,8 @@ use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualif
 
 use super::copy_tree::{fresh_copy, remove_tree};
 use super::go_mod_edit::{
-    self, expected_replace_path, read_replace_entries, read_required_versions, replace_target_path,
-    ReplaceOwner, GO_PATCHES_DIR,
+    self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
+    GO_PATCHES_DIR,
 };
 use super::path_safety;
 
@@ -126,7 +127,11 @@ impl std::fmt::Display for Drift {
 /// [`GO_PATCHES_DIR`] for apply, `<GO_VENDOR_DIR>/<uuid>` for vendor).
 /// `module` carries the real (decoded) module path with `/`-separators, so the
 /// on-disk layout mirrors the module cache (`github.com/foo/bar@v1.4.2`).
-fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str) -> PathBuf {
+///
+/// `pub` (not `pub(crate)`): the single home of this on-disk layout — the
+/// vendor backend and the CLI's VEX go-patches synthesis key the same copy
+/// dir and must stay in lockstep rather than carry drift-prone mirrors.
+pub fn copy_dir_for(project_root: &Path, base_rel: &str, module: &str, version: &str) -> PathBuf {
     project_root
         .join(base_rel)
         .join(format!("{module}@{version}"))
@@ -442,32 +447,22 @@ pub async fn verify_go_redirect_state(
                 // the copy dir — a poisoned manifest (`../../../home/...`)
                 // would otherwise leak the existence + content hash of an
                 // arbitrary user-readable file into the audit output.
-                // Fail closed as drift, same as the guarded
-                // `copy_matches_after_hashes` this audit mirrors.
-                if !crate::patch::apply::is_safe_relative_subpath(normalized) {
+                // Fail closed as drift (`found: None`, no read), same as the
+                // guarded `copy_matches_after_hashes` this audit mirrors.
+                let found = if is_safe_relative_subpath(normalized) {
+                    compute_file_git_sha256(&copy_dir.join(normalized))
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+                if found.as_deref() != Some(info.after_hash.as_str()) {
                     drifts.push(Drift::StaleCopy {
                         purl: purl.clone(),
                         file: file_name.clone(),
                         expected: info.after_hash.clone(),
-                        found: None,
+                        found,
                     });
-                    continue;
-                }
-                let path = copy_dir.join(normalized);
-                match compute_file_git_sha256(&path).await {
-                    Ok(h) if h == info.after_hash => {}
-                    Ok(h) => drifts.push(Drift::StaleCopy {
-                        purl: purl.clone(),
-                        file: file_name.clone(),
-                        expected: info.after_hash.clone(),
-                        found: Some(h),
-                    }),
-                    Err(_) => drifts.push(Drift::StaleCopy {
-                        purl: purl.clone(),
-                        file: file_name.clone(),
-                        expected: info.after_hash.clone(),
-                        found: None,
-                    }),
                 }
             }
         }
@@ -476,7 +471,7 @@ pub async fn verify_go_redirect_state(
         // keys `replace` by module + version, so a socket directive pinned to
         // another version (an aborted/partial apply, a bad merge, a hand-edit)
         // is silently ignored while the copy-hash checks above pass.
-        let expected = expected_replace_path(module, version);
+        let expected = replace_target_path(GO_PATCHES_DIR, module, version);
         let socket = entries
             .iter()
             .find(|e| e.module == module && e.owner == Some(ReplaceOwner::GoPatches));
@@ -553,23 +548,15 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,
 /// returning `(purl, dir)`. A module dir is identified by an `@` in its final
-/// path component (`github.com/foo/bar@v1.4.2`); recursion stops there (the
+/// path component (`github.com/foo/bar@v1.4.2`); descent stops there (the
 /// module's own contents are not scanned). Returns empty if the root is absent.
 async fn collect_copy_modules(go_patches_root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
-    collect_copy_modules_inner(go_patches_root, String::new(), &mut out).await;
-    out
-}
-
-fn collect_copy_modules_inner<'a>(
-    dir: &'a Path,
-    prefix: String,
-    out: &'a mut Vec<(String, PathBuf)>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-    Box::pin(async move {
-        let mut rd = match tokio::fs::read_dir(dir).await {
+    let mut pending = vec![(go_patches_root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = pending.pop() {
+        let mut rd = match tokio::fs::read_dir(&dir).await {
             Ok(rd) => rd,
-            Err(_) => return,
+            Err(_) => continue,
         };
         while let Ok(Some(entry)) = rd.next_entry().await {
             if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
@@ -578,8 +565,7 @@ fn collect_copy_modules_inner<'a>(
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(at) = name.rfind('@') {
                 // `<name_before_@>` is the module's final path segment.
-                let leaf = &name[..at];
-                let version = &name[at + 1..];
+                let (leaf, version) = (&name[..at], &name[at + 1..]);
                 let module = if prefix.is_empty() {
                     leaf.to_string()
                 } else {
@@ -588,17 +574,18 @@ fn collect_copy_modules_inner<'a>(
                 if !module.is_empty() && !version.is_empty() {
                     out.push((build_golang_purl(&module, version), entry.path()));
                 }
-                // Do not recurse into a module dir.
+                // Do not descend into a module dir.
             } else {
                 let child_prefix = if prefix.is_empty() {
-                    name.clone()
+                    name
                 } else {
                     format!("{prefix}/{name}")
                 };
-                collect_copy_modules_inner(&entry.path(), child_prefix, out).await;
+                pending.push((entry.path(), child_prefix));
             }
         }
-    })
+    }
+    out
 }
 
 #[cfg(test)]

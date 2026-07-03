@@ -125,7 +125,7 @@ fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) 
 /// Assert no patch-time temp files leaked into `pkg_dir`.
 ///
 /// Two distinct stagers write into the package directory:
-///   * the atomic writer (`apply::write_atomic`) stages `.socket-stage-*`,
+///   * the atomic writer (`utils::fs::atomic_write_bytes`) stages `.socket-stage-*`,
 ///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
 ///     branches) stages `.socket-cow-*`.
 ///

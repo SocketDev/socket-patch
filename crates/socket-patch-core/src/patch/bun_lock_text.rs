@@ -11,7 +11,7 @@
 
 /// The only text-lockfile version the surgery has byte-exact fixtures for
 /// (bun 1.3.x; spike pinned 1.3.14).
-pub(crate) const SUPPORTED_LOCK_VERSION: u64 = 1;
+const SUPPORTED_LOCK_VERSION: u64 = 1;
 
 /// One parsed single-line packages entry.
 pub(crate) struct BunEntry {
@@ -134,7 +134,7 @@ pub(crate) fn parse_entry_line(line: &str) -> Result<BunEntry, String> {
 
 /// Byte index one past the closing quote of the JSON string at the start of
 /// `s` (escape-aware).
-pub(crate) fn scan_json_string(s: &str) -> Result<usize, String> {
+fn scan_json_string(s: &str) -> Result<usize, String> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'"') {
         return Err("expected a quoted key".to_string());
@@ -152,13 +152,13 @@ pub(crate) fn scan_json_string(s: &str) -> Result<usize, String> {
 
 /// Byte index one past the `]` matching the `[` at the start of `s`
 /// (string- and nesting-aware).
-pub(crate) fn scan_balanced_array(s: &str) -> Result<usize, String> {
+fn scan_balanced_array(s: &str) -> Result<usize, String> {
     let bytes = s.as_bytes();
     let mut depth = 0usize;
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'"' => i += scan_json_string(&s[i..]).map_err(|e| e.to_string())? - 1,
+            b'"' => i += scan_json_string(&s[i..])? - 1,
             b'[' | b'{' => depth += 1,
             b']' | b'}' => {
                 depth -= 1;
@@ -175,7 +175,7 @@ pub(crate) fn scan_balanced_array(s: &str) -> Result<usize, String> {
 
 /// Split the tuple interior at top-level commas into verbatim trimmed
 /// element substrings.
-pub(crate) fn split_top_level(interior: &str) -> Result<Vec<String>, String> {
+fn split_top_level(interior: &str) -> Result<Vec<String>, String> {
     let bytes = interior.as_bytes();
     let mut elems = Vec::new();
     let mut depth = 0usize;

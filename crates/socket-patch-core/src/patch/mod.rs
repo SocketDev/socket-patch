@@ -6,7 +6,7 @@ pub(crate) mod bun_lock_text;
 pub mod copy_tree;
 pub mod cow;
 pub mod diff;
-pub mod file_hash;
+pub(crate) mod file_hash;
 #[cfg(feature = "golang")]
 pub mod go_mod_edit;
 #[cfg(feature = "golang")]

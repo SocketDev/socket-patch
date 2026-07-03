@@ -98,6 +98,45 @@ pub async fn is_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Open `path` read-only, requiring a regular file.
+///
+/// Returns the open handle plus its `fstat` metadata. Deriving the
+/// metadata from the open descriptor — rather than `stat`-ing the path
+/// separately — means the size and any bytes subsequently read cannot
+/// come from different inodes, even if the path is renamed/replaced
+/// concurrently (the patch engine reads files an attacker may swap at
+/// any moment).
+///
+/// On Unix the open itself is non-blocking (`O_NONBLOCK`): a plain
+/// `open(2)` of a FIFO with `O_RDONLY` waits for a writer that may
+/// never come, which would hang the patch engine forever before the
+/// regular-file guard below ever runs. `O_NONBLOCK` has no effect on
+/// regular-file reads; the handle-based `is_file` check then rejects
+/// FIFOs/devices/directories with `InvalidInput` instead of reading
+/// them (on some platforms a directory reads as zero bytes, which
+/// would otherwise be silently hashed as the empty blob).
+pub(crate) async fn open_regular_file(
+    path: &Path,
+) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
+    #[cfg(unix)]
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .await?;
+    #[cfg(not(unix))]
+    let file = tokio::fs::File::open(path).await?;
+
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok((file, metadata))
+}
+
 /// Return the raw `FileType` for `entry`, swallowing stat errors.
 ///
 /// Use this instead of `entry_is_dir` when the caller needs to

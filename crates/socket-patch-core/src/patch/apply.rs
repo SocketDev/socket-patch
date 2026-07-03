@@ -45,14 +45,13 @@ pub struct VerifyResult {
 /// content or fails, never silently corrupted. What tolerance can do is
 /// discard local modifications to the dependency file, which is why
 /// `Strict` exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MismatchPolicy {
     /// DEFAULT: a beforeHash mismatch is overwritten with the verified
     /// patched content and surfaced as a warning (the promoted
     /// [`VerifyResult`] keeps `expected_hash`/`current_hash`, which is
     /// how callers detect and report it). A MISSING pre-existing file is
     /// still a hard error.
-    #[default]
     Warn,
     /// A beforeHash mismatch is a hard error (`--strict`).
     Strict,
@@ -103,9 +102,10 @@ pub struct PatchSources<'a> {
 
 impl<'a> PatchSources<'a> {
     /// Construct a `PatchSources` that only knows about the legacy
-    /// per-file blob directory. Convenient for tests and existing call
-    /// sites that have not been upgraded.
-    pub fn blobs_only(blobs_path: &'a Path) -> Self {
+    /// per-file blob directory. All remaining callers are same-crate
+    /// tests, hence the `cfg(test)` gate.
+    #[cfg(test)]
+    pub(crate) fn blobs_only(blobs_path: &'a Path) -> Self {
         Self {
             blobs_path,
             packages_path: None,
@@ -141,7 +141,7 @@ pub struct ApplyResult {
 /// Normalize file path by removing the "package/" prefix if present.
 /// Patch files come from the API with paths like "package/lib/file.js"
 /// but we need relative paths like "lib/file.js" for the actual package directory.
-pub fn normalize_file_path(file_name: &str) -> &str {
+pub(crate) fn normalize_file_path(file_name: &str) -> &str {
     const PACKAGE_PREFIX: &str = "package/";
     if let Some(stripped) = file_name.strip_prefix(PACKAGE_PREFIX) {
         stripped
@@ -160,7 +160,7 @@ pub fn normalize_file_path(file_name: &str) -> &str {
 /// execution) via `pkg_path.join(key)` — `Path::join` discards the base on an
 /// absolute key, and `..` components walk out. We reject anything that isn't a
 /// plain relative path (no absolute/root/prefix components, no `..`, no NUL).
-pub fn is_safe_relative_subpath(normalized: &str) -> bool {
+pub(crate) fn is_safe_relative_subpath(normalized: &str) -> bool {
     use std::path::Component;
     if normalized.is_empty() || normalized.contains('\0') {
         return false;
@@ -373,7 +373,7 @@ pub async fn select_installed_variants(
 /// set on new files to honor the read-only-by-default policy.
 ///
 /// Writes the patched content and verifies the resulting hash.
-pub async fn apply_file_patch(
+pub(crate) async fn apply_file_patch(
     pkg_path: &Path,
     file_name: &str,
     patched_content: &[u8],
@@ -447,9 +447,10 @@ pub async fn apply_file_patch(
     // before we mutate. No-op on regular private files (single
     // syscall). See `patch::cow`.
     //
-    // Atomic write: stage in the parent directory, fsync, rename onto
-    // the target. POSIX `rename(2)` is atomic — observers see either
-    // the old bytes or the new bytes, never a truncated half-write.
+    // Atomic write (`utils::fs::atomic_write_bytes`): stage in the
+    // parent directory, fsync, rename onto the target. POSIX
+    // `rename(2)` is atomic — observers see either the old bytes or
+    // the new bytes, never a truncated half-write.
     //
     // The stage file is created with the user's umask defaults
     // (typically 0o644) — that's how we sidestep the "existing file
@@ -462,7 +463,7 @@ pub async fn apply_file_patch(
     // restored — even if a step errors — before the failure propagates.
     let write_result = async {
         break_hardlink_if_needed(&filepath).await?;
-        write_atomic(&filepath, patched_content).await
+        crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await
     }
     .await;
     dir_guard.restore().await;
@@ -551,14 +552,6 @@ async fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
         cur = p.parent();
     }
     None
-}
-
-/// Write `content` to `target` atomically via stage + rename, so a patched
-/// package file is only ever seen as the complete old or complete new
-/// bytes. Delegates to the crate-wide hardened writer (permissions/chown
-/// are restored separately by [`restore_file_permissions`]).
-async fn write_atomic(target: &Path, content: &[u8]) -> std::io::Result<()> {
-    crate::utils::fs::atomic_write_bytes(target, content).await
 }
 
 /// Restore the post-write permission state on `filepath`.
@@ -686,7 +679,6 @@ pub async fn apply_package_patch(
         // disk write — NOT skippable by `--force`, since a path escape is never
         // a legitimate patch target.
         if !is_safe_relative_subpath(normalize_file_path(file_name)) {
-            result.success = false;
             result.error = Some(format!(
                 "Refusing patch with unsafe file path (escapes package directory): {file_name}"
             ));
@@ -879,9 +871,7 @@ pub async fn apply_package_patch(
     // consumers see a uniform shape regardless of whether the
     // fixup succeeded, was advisory-only, or raised an error.
     if !result.files_patched.is_empty() {
-        use crate::patch::sidecars::{
-            dispatch_fixup, SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord, SidecarSeverity,
-        };
+        use crate::patch::sidecars::{dispatch_fixup, fixup_failed_record};
         // Include files verified `AlreadyPatched` alongside the ones
         // written this run: a previous apply that failed partway left
         // them patched on disk but returned before this boundary, so
@@ -901,23 +891,14 @@ pub async fn apply_package_patch(
                     .map(|v| v.file.clone()),
             )
             .collect();
-        match dispatch_fixup(package_key, pkg_path, &fixup_files, files).await {
+        match dispatch_fixup(package_key, pkg_path, &fixup_files).await {
             Ok(Some(record)) => result.sidecar = Some(record),
             Ok(None) => {}
             Err(e) => {
-                let ecosystem = crate::crawlers::Ecosystem::from_purl(package_key)
-                    .map(|eco| eco.cli_name().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                result.sidecar = Some(SidecarRecord {
-                    purl: package_key.to_string(),
-                    ecosystem,
-                    files: Vec::new(),
-                    advisory: Some(SidecarAdvisory {
-                        code: SidecarAdvisoryCode::SidecarFixupFailed,
-                        severity: SidecarSeverity::Error,
-                        message: format!("sidecar fixup failed (patch still applied): {}", e),
-                    }),
-                });
+                result.sidecar = Some(fixup_failed_record(
+                    package_key,
+                    format!("sidecar fixup failed (patch still applied): {}", e),
+                ));
             }
         }
     }

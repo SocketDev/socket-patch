@@ -248,46 +248,6 @@ pub async fn verify_file_rollback(
     }
 }
 
-/// Rollback a single file to its original state by writing
-/// `original_content` (whose Git SHA256 must equal `expected_hash`).
-///
-/// This delegates to [`apply_file_patch`](crate::patch::apply::apply_file_patch),
-/// the hardened write path shared with apply. Rolling a file back is the
-/// exact same operation as patching it forward — "safely overwrite this
-/// file with these hash-verified bytes" — so it must get the exact same
-/// guarantees:
-///
-/// * **Atomic** — the bytes are staged in the parent directory, fsync'd,
-///   and `rename(2)`d over the target. A crash or `ENOSPC` mid-write
-///   leaves either the old or the new content, never a truncated file.
-/// * **Copy-on-write safe** — a symlink/hardlink into a shared content
-///   store (pnpm, Nix, the Go module cache) is broken into a private
-///   inode first, so a rollback never bleeds into a sibling project's
-///   copy or the store entry.
-/// * **Validate-before-write** — `original_content` is hash-checked in
-///   memory *before* any disk write, so a corrupt blob is refused
-///   instead of being committed over the file and only then flagged.
-/// * **Permission-faithful** — the file's mode + uid/gid are restored
-///   afterward. Because apply preserves a file's original permissions
-///   when patching, the on-disk patched file already carries the
-///   pre-patch mode (e.g. a read-only `0o444` Go-cache source), and
-///   that exact mode is re-applied to the rolled-back inode.
-///
-/// The previous implementation used a bare in-place `tokio::fs::write`,
-/// which had none of these properties: it could corrupt a hardlinked
-/// sibling, leave a half-written file on a crash, write a bad blob over
-/// the file *before* discovering the hash mismatch, and leave a
-/// read-only file writable.
-pub async fn rollback_file_patch(
-    pkg_path: &Path,
-    file_name: &str,
-    original_content: &[u8],
-    expected_hash: &str,
-) -> Result<(), std::io::Error> {
-    crate::patch::apply::apply_file_patch(pkg_path, file_name, original_content, expected_hash)
-        .await
-}
-
 /// Verify and rollback patches for a single package.
 ///
 /// For each file in `files`, this function:
@@ -331,29 +291,25 @@ pub async fn rollback_package_patch(
         result.files_verified.push(verify_result);
     }
 
-    // Check if all files are already in original state
+    // Stop before touching disk when nothing needs restoring (all files
+    // already original) or on a dry run.
     let all_original = result
         .files_verified
         .iter()
         .all(|v| v.status == VerifyRollbackStatus::AlreadyOriginal);
-    if all_original {
-        result.success = true;
-        return result;
-    }
-
-    // If dry run, stop here
-    if dry_run {
+    if all_original || dry_run {
         result.success = true;
         return result;
     }
 
     // Rollback files that need it
     for (file_name, file_info) in files {
-        let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
-        if let Some(vr) = verify_result {
-            if vr.status == VerifyRollbackStatus::AlreadyOriginal {
-                continue;
-            }
+        let already_original = result
+            .files_verified
+            .iter()
+            .any(|v| v.file == *file_name && v.status == VerifyRollbackStatus::AlreadyOriginal);
+        if already_original {
+            continue;
         }
 
         // New files (empty beforeHash): delete instead of restoring.
@@ -416,8 +372,14 @@ pub async fn rollback_package_patch(
             }
         };
 
-        // Rollback the file
-        if let Err(e) = rollback_file_patch(
+        // Restore via `apply_file_patch`, the hardened write path shared
+        // with apply — rolling a file back is the same operation as patching
+        // it forward ("safely overwrite this file with these hash-verified
+        // bytes") and must get the same guarantees: atomic stage+rename,
+        // hardlink/symlink broken into a private inode before writing (pnpm /
+        // Go-cache stores), blob hash-checked in memory before any disk
+        // write, and the file's original mode + uid/gid restored afterward.
+        if let Err(e) = crate::patch::apply::apply_file_patch(
             pkg_path,
             file_name,
             &original_content,
@@ -441,10 +403,7 @@ pub async fn rollback_package_patch(
     // rollback — the restored bytes are already committed — it surfaces
     // as an `Error`-severity `sidecar_fixup_failed` advisory instead.
     if !result.files_rolled_back.is_empty() {
-        use crate::patch::sidecars::{
-            dispatch_rollback_fixup, SidecarAdvisory, SidecarAdvisoryCode, SidecarRecord,
-            SidecarSeverity,
-        };
+        use crate::patch::sidecars::{dispatch_rollback_fixup, fixup_failed_record};
         // Include files verified `AlreadyOriginal` alongside the ones
         // restored this run: a previous rollback that failed partway
         // restored them but returned before this boundary, so their
@@ -470,19 +429,10 @@ pub async fn rollback_package_patch(
             Ok(Some(record)) => result.sidecar = Some(record),
             Ok(None) => {}
             Err(e) => {
-                let ecosystem = crate::crawlers::Ecosystem::from_purl(package_key)
-                    .map(|eco| eco.cli_name().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                result.sidecar = Some(SidecarRecord {
-                    purl: package_key.to_string(),
-                    ecosystem,
-                    files: Vec::new(),
-                    advisory: Some(SidecarAdvisory {
-                        code: SidecarAdvisoryCode::SidecarFixupFailed,
-                        severity: SidecarSeverity::Error,
-                        message: format!("sidecar resync failed (files still rolled back): {}", e),
-                    }),
-                });
+                result.sidecar = Some(fixup_failed_record(
+                    package_key,
+                    format!("sidecar resync failed (files still rolled back): {}", e),
+                ));
             }
         }
     }
@@ -495,6 +445,10 @@ pub async fn rollback_package_patch(
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    // The rollback write path IS `apply_file_patch` (see the restore loop in
+    // `rollback_package_patch`); these tests pin the guarantees rollback
+    // relies on from it.
+    use crate::patch::apply::apply_file_patch;
 
     #[tokio::test]
     async fn test_verify_file_rollback_not_found() {
@@ -636,7 +590,7 @@ mod tests {
             .await
             .unwrap();
 
-        rollback_file_patch(dir.path(), "index.js", original, &original_hash)
+        apply_file_patch(dir.path(), "index.js", original, &original_hash)
             .await
             .unwrap();
 
@@ -652,7 +606,7 @@ mod tests {
             .unwrap();
 
         let result =
-            rollback_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
+            apply_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -675,7 +629,7 @@ mod tests {
             .unwrap();
 
         let result =
-            rollback_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
+            apply_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
         assert!(result.is_err());
 
         // The file must NOT have been overwritten with the bad blob.
@@ -716,7 +670,7 @@ mod tests {
 
         let original = b"original bytes";
         let original_hash = compute_git_sha256_from_bytes(original);
-        rollback_file_patch(
+        apply_file_patch(
             project.parent().unwrap(),
             "foo.js",
             original,
@@ -752,7 +706,7 @@ mod tests {
             .await
             .unwrap();
 
-        rollback_file_patch(dir.path(), "index.js", original, &original_hash)
+        apply_file_patch(dir.path(), "index.js", original, &original_hash)
             .await
             .unwrap();
 

@@ -18,6 +18,7 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 
 use crate::manifest::schema::PatchFileInfo;
+use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 
 /// Maximum cumulative *decompressed* bytes we accept from a single
 /// archive. Real socket-patch archives are tiny (kilobytes); 64 MiB is a
@@ -45,12 +46,6 @@ pub enum ArchiveError {
     EntryTooLarge { path: String, size: u64, max: u64 },
     #[error("archive contains more than {0} entries")]
     TooManyEntries(usize),
-}
-
-/// Strip the leading `package/` prefix from an entry path, matching the
-/// convention used by `normalize_file_path` in `apply.rs`.
-fn normalize_entry_path(path: &str) -> &str {
-    path.strip_prefix("package/").unwrap_or(path)
 }
 
 /// Read a `.tar.gz` archive into a map of `normalized_path -> bytes`.
@@ -124,59 +119,39 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
         // absolute path `/etc/passwd`. `Path::join` resolves an absolute
         // right-hand side by discarding the base, so that would escape the
         // package directory entirely. Always validate post-normalization.
-        let normalized = normalize_entry_path(&path_str).to_string();
+        let normalized = normalize_file_path(&path_str).to_string();
         let normalized_path = Path::new(&normalized);
 
         // This is THE path-safety chokepoint for archive entries (see the
         // module note): every entry must be a *relative* path that stays
         // strictly inside the package directory. The bytes are later joined
         // onto `pkg_path` and written, so anything that escapes here escapes
-        // for real. Reject, in order:
+        // for real. `is_safe_relative_subpath` (apply.rs) rejects the hazards
+        // shared with manifest keys: empty paths, NUL bytes, absolute paths,
+        // and any component that isn't a plain name or `.` — which covers
+        // `..` parent traversal, root components, and Windows drive prefixes
+        // such as `C:foo` (`Component::Prefix`). Archive entries need two
+        // extra rejections on top:
         //
-        //  - Empty paths. A normalized path of "" (e.g. a raw entry named
-        //    `package/`) resolves to the package directory *itself*; joining
-        //    "" onto `pkg_path` yields `pkg_path`, so a write would target
-        //    the directory. `.` / `./` collapse the same way — neither names
-        //    a file, so both are caught by the "must contain a real segment"
-        //    rule below.
-        //  - NUL bytes. A path like `safe.txt\0../../etc/passwd` can be read
-        //    one way by Rust's `OsStr` and another by a C string boundary;
-        //    refuse the ambiguity outright (mirrors `is_safe_relative_subpath`
-        //    in apply.rs).
-        //  - Leading `/` or `\`. `Path::is_absolute()` is platform-aware: on
-        //    Windows it needs a drive/UNC prefix, so `/etc/passwd` is NOT
-        //    "absolute" there and would slip through; on Unix a leading `\`
-        //    is an ordinary char. Checking the raw leading byte rejects both
-        //    POSIX- and Windows-style root-relative paths on every platform.
-        //  - Any component that isn't a plain name or `.`. This rejects `..`
-        //    parent traversal, a root component, AND a Windows drive prefix
-        //    such as `C:foo` (`Component::Prefix`), which `is_absolute()`
-        //    reports as non-absolute and the old `any(ParentDir)` check
-        //    missed entirely.
-        //  - Paths with no real segment at all (`.`, `./`), which would
-        //    otherwise pass the component filter but still resolve to the
-        //    package directory.
+        //  - Leading `/` or `\` by raw byte. `Path::is_absolute()` is
+        //    platform-aware: on Windows it needs a drive/UNC prefix, so
+        //    `/etc/passwd` is NOT "absolute" there and would slip through; on
+        //    Unix a leading `\` is an ordinary char. Checking the raw leading
+        //    byte rejects both POSIX- and Windows-style root-relative paths
+        //    on every platform.
+        //  - Paths with no real segment: "" (e.g. a raw entry named
+        //    `package/`), `.`, and `./` all collapse to the package directory
+        //    *itself* (`pkg_path.join("")` == `pkg_path`), so a write would
+        //    target the directory, not a file inside it.
         use std::path::Component;
         let leading_separator = normalized
             .as_bytes()
             .first()
             .is_some_and(|b| *b == b'/' || *b == b'\\');
-        let mut saw_normal_component = false;
-        let all_components_safe = normalized_path.components().all(|c| match c {
-            Component::Normal(_) => {
-                saw_normal_component = true;
-                true
-            }
-            Component::CurDir => true,
-            _ => false,
-        });
-        if normalized.is_empty()
-            || normalized.as_bytes().contains(&0)
-            || leading_separator
-            || normalized_path.is_absolute()
-            || !all_components_safe
-            || !saw_normal_component
-        {
+        let has_real_segment = normalized_path
+            .components()
+            .any(|c| matches!(c, Component::Normal(_)));
+        if leading_separator || !has_real_segment || !is_safe_relative_subpath(&normalized) {
             return Err(ArchiveError::UnsafePath(path_str));
         }
 
@@ -212,7 +187,7 @@ pub fn read_archive_filtered(
 ) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     let allowed: std::collections::HashSet<String> = expected_files
         .keys()
-        .map(|k| normalize_entry_path(k).to_string())
+        .map(|k| normalize_file_path(k).to_string())
         .collect();
 
     let all = read_archive_to_map(archive_path)?;
@@ -300,43 +275,7 @@ mod tests {
     /// rejects absolute paths and `..`. This lets us exercise the
     /// defense-in-depth check inside [`read_archive_to_map`].
     fn write_raw_archive(path: &Path, name: &[u8], data: &[u8]) {
-        let mut block = [0u8; 512];
-        // Name (first 100 bytes).
-        let copy_len = name.len().min(100);
-        block[..copy_len].copy_from_slice(&name[..copy_len]);
-        // Mode "0000644\0".
-        block[100..108].copy_from_slice(b"0000644\0");
-        // Size as octal in 11 chars + NUL.
-        let size_str = format!("{:011o}", data.len());
-        block[124..135].copy_from_slice(size_str.as_bytes());
-        block[135] = 0;
-        // mtime
-        block[136..147].copy_from_slice(b"00000000000");
-        block[147] = 0;
-        // typeflag '0' = normal file
-        block[156] = b'0';
-        // ustar magic
-        block[257..263].copy_from_slice(b"ustar\0");
-        block[263..265].copy_from_slice(b"00");
-        // Checksum: spaces during compute.
-        block[148..156].fill(b' ');
-        let sum: u32 = block.iter().map(|&b| b as u32).sum();
-        let sum_str = format!("{:06o}\0 ", sum);
-        block[148..156].copy_from_slice(sum_str.as_bytes());
-
-        let mut tar_bytes = Vec::new();
-        tar_bytes.extend_from_slice(&block);
-        tar_bytes.extend_from_slice(data);
-        // Pad data to 512-byte boundary.
-        let pad = (512 - (data.len() % 512)) % 512;
-        tar_bytes.extend(std::iter::repeat_n(0u8, pad));
-        // Two zero blocks mark end of archive.
-        tar_bytes.extend([0u8; 1024]);
-
-        let file = std::fs::File::create(path).unwrap();
-        let mut gz = GzEncoder::new(file, Compression::default());
-        gz.write_all(&tar_bytes).unwrap();
-        gz.finish().unwrap();
+        write_raw_tar_gz(path, &[raw_entry(name, data.len() as u64, data)]);
     }
 
     #[test]
@@ -482,31 +421,19 @@ mod tests {
     /// way to smuggle bytes a plain ustar name field can't hold — notably an
     /// embedded NUL (the ustar name field is NUL-terminated).
     fn write_gnu_longname_archive(path: &Path, long_name: &[u8], data: &[u8]) {
-        let mut tar_bytes = Vec::new();
         // GNU long-name body = the name plus a single trailing NUL (the tar
         // reader trims exactly one trailing NUL, preserving any embedded ones).
         let mut lname = long_name.to_vec();
         lname.push(0);
-        tar_bytes.extend_from_slice(&ustar_block(b"././@LongLink", b'L', lname.len() as u64));
-        tar_bytes.extend_from_slice(&lname);
+        let mut long_link = Vec::new();
+        long_link.extend_from_slice(&ustar_block(b"././@LongLink", b'L', lname.len() as u64));
+        long_link.extend_from_slice(&lname);
         let pad = (512 - (lname.len() % 512)) % 512;
-        tar_bytes.extend(std::iter::repeat_n(0u8, pad));
+        long_link.extend(std::iter::repeat_n(0u8, pad));
         // The real entry. Its own name field is a harmless placeholder; the
         // preceding long-name entry overrides it.
-        tar_bytes.extend_from_slice(&ustar_block(b"placeholder", b'0', data.len() as u64));
-        tar_bytes.extend_from_slice(data);
-        let pad = if data.is_empty() {
-            0
-        } else {
-            (512 - (data.len() % 512)) % 512
-        };
-        tar_bytes.extend(std::iter::repeat_n(0u8, pad));
-        tar_bytes.extend([0u8; 1024]);
-
-        let file = std::fs::File::create(path).unwrap();
-        let mut gz = GzEncoder::new(file, Compression::default());
-        gz.write_all(&tar_bytes).unwrap();
-        gz.finish().unwrap();
+        let real = raw_entry(b"placeholder", data.len() as u64, data);
+        write_raw_tar_gz(path, &[long_link, real]);
     }
 
     #[test]
@@ -514,9 +441,9 @@ mod tests {
         // A plain ustar name field is NUL-terminated, so an embedded NUL can
         // only reach the validator through a GNU long-name entry. `safe\0evil`
         // is a single path component (no `/`, no `..`, not absolute) — so it
-        // is ONLY rejectable by the explicit NUL guard, which mirrors
-        // `is_safe_relative_subpath` in apply.rs. Refuse the OsStr/C-string
-        // truncation ambiguity outright.
+        // is ONLY rejectable by the explicit NUL guard inside
+        // `is_safe_relative_subpath`. Refuse the OsStr/C-string truncation
+        // ambiguity outright.
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("arc.tar.gz");
         write_gnu_longname_archive(&archive, b"safe\0evil.txt", b"evil");
@@ -643,13 +570,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_entry_path() {
-        assert_eq!(normalize_entry_path("package/lib/x.js"), "lib/x.js");
-        assert_eq!(normalize_entry_path("lib/x.js"), "lib/x.js");
-        assert_eq!(normalize_entry_path("packagefoo/x.js"), "packagefoo/x.js");
-    }
-
-    #[test]
     fn test_read_archive_corrupt_gzip() {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("bogus.tar.gz");
@@ -677,43 +597,22 @@ mod tests {
     /// boundary. Used to forge size-mismatched entries the writer would
     /// normally refuse.
     fn raw_entry(name: &[u8], declared_size: u64, data: &[u8]) -> Vec<u8> {
-        let mut block = [0u8; 512];
-        let copy_len = name.len().min(100);
-        block[..copy_len].copy_from_slice(&name[..copy_len]);
-        block[100..108].copy_from_slice(b"0000644\0");
-        let size_str = format!("{:011o}", declared_size);
-        block[124..135].copy_from_slice(size_str.as_bytes());
-        block[135] = 0;
-        block[136..147].copy_from_slice(b"00000000000");
-        block[147] = 0;
-        block[156] = b'0'; // regular file
-        block[257..263].copy_from_slice(b"ustar\0");
-        block[263..265].copy_from_slice(b"00");
-        block[148..156].fill(b' ');
-        let sum: u32 = block.iter().map(|&b| b as u32).sum();
-        let sum_str = format!("{:06o}\0 ", sum);
-        block[148..156].copy_from_slice(sum_str.as_bytes());
-
         let mut out = Vec::new();
-        out.extend_from_slice(&block);
+        out.extend_from_slice(&ustar_block(name, b'0', declared_size));
         out.extend_from_slice(data);
-        let pad = if data.is_empty() {
-            0
-        } else {
-            (512 - (data.len() % 512)) % 512
-        };
+        let pad = (512 - (data.len() % 512)) % 512;
         out.extend(std::iter::repeat_n(0u8, pad));
         out
     }
 
-    fn write_raw_tar_gz(path: &Path, entries: &[Vec<u8>], trailer: bool) {
+    /// Gzip the concatenated raw `entries` plus the two zero blocks that
+    /// mark end-of-archive, and write the result to `path`.
+    fn write_raw_tar_gz(path: &Path, entries: &[Vec<u8>]) {
         let mut tar_bytes = Vec::new();
         for e in entries {
             tar_bytes.extend_from_slice(e);
         }
-        if trailer {
-            tar_bytes.extend([0u8; 1024]);
-        }
+        tar_bytes.extend([0u8; 1024]);
         let file = std::fs::File::create(path).unwrap();
         let mut gz = GzEncoder::new(file, Compression::default());
         gz.write_all(&tar_bytes).unwrap();
@@ -729,7 +628,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("oversize.tar.gz");
         let entry = raw_entry(b"big.bin", 1024 * 1024 * 1024, b"tiny");
-        write_raw_tar_gz(&archive, &[entry], true);
+        write_raw_tar_gz(&archive, &[entry]);
 
         let err = read_archive_to_map(&archive).unwrap_err();
         assert!(
@@ -748,7 +647,7 @@ mod tests {
         let entries: Vec<Vec<u8>> = (0..(MAX_ENTRIES + 1))
             .map(|i| raw_entry(format!("f{i}").as_bytes(), 0, b""))
             .collect();
-        write_raw_tar_gz(&archive, &entries, true);
+        write_raw_tar_gz(&archive, &entries);
 
         let err = read_archive_to_map(&archive).unwrap_err();
         assert!(
@@ -786,7 +685,7 @@ mod tests {
         // 4 * 15 MiB = 60 MiB declared, just under the 64 MiB cap.
         // Add a fifth to push us over.
         let entry5 = raw_entry(b"e.bin", chunk.len() as u64, &chunk);
-        write_raw_tar_gz(&archive, &[entry1, entry2, entry3, entry4, entry5], true);
+        write_raw_tar_gz(&archive, &[entry1, entry2, entry3, entry4, entry5]);
 
         let result = read_archive_to_map(&archive);
         // Either we get an Io error from truncation or the read

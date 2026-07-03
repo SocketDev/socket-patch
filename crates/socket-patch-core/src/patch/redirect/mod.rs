@@ -20,7 +20,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub mod state;
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::patch::vendor::yarn_berry_lock::yarnrc_compression_level;
+
+mod state;
 pub use state::{load_redirect_state, RedirectState, REDIRECT_STATE_REL};
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
@@ -281,23 +284,6 @@ fn rewrite_npm_v2_deps(
 }
 
 // ── pip requirements.txt ────────────────────────────────────────────────────
-fn normalize_py_name(name: &str) -> String {
-    let mut out = String::new();
-    let mut prev_dash = false;
-    for ch in name.to_lowercase().chars() {
-        if ch == '-' || ch == '_' || ch == '.' {
-            if !prev_dash {
-                out.push('-');
-                prev_dash = true;
-            }
-        } else {
-            out.push(ch);
-            prev_dash = false;
-        }
-    }
-    out
-}
-
 fn rewrite_pypi_requirements(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -321,7 +307,7 @@ fn rewrite_pypi_requirements(
             });
             continue;
         };
-        let target = normalize_py_name(&dep.name);
+        let target = canonicalize_pypi_name(&dep.name);
         for raw in lines.iter_mut() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
@@ -330,7 +316,7 @@ fn rewrite_pypi_requirements(
             let Some(caps) = name_re.captures(line) else {
                 continue;
             };
-            if normalize_py_name(&caps[1]) != target {
+            if canonicalize_pypi_name(&caps[1]) != target {
                 continue;
             }
             // pip-compile --generate-hashes emits backslash continuations
@@ -387,10 +373,6 @@ fn rewrite_pypi_requirements(
 }
 
 // ── cargo (Cargo.toml + .cargo/config.toml + Cargo.lock) ─────────────────────
-fn cargo_registry_name(patch_uuid: &str) -> String {
-    format!("socket-patch-{patch_uuid}")
-}
-
 fn rewrite_cargo(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -431,7 +413,7 @@ fn rewrite_cargo(
             });
             continue;
         };
-        let reg = cargo_registry_name(&dep.patch_uuid);
+        let reg = format!("socket-patch-{}", dep.patch_uuid);
         let index_url = &ov.index_url;
 
         // 1. .cargo/config.toml registry definition (idempotent).
@@ -634,22 +616,20 @@ enum CargoLockRewrite {
 }
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
-/// A `pnpm-lock.yaml` is `pnpm-lock.yaml` at the project root or at any nested
-/// path (e.g. Rush repos keep them under `common/config/rush/`). Every such
-/// files-map key is rewritten under the same grammar.
-fn is_pnpm_lock_key(key: &str) -> bool {
-    key == "pnpm-lock.yaml" || key.ends_with("/pnpm-lock.yaml")
-}
-
 fn rewrite_pnpm_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    // Deterministic order: BTreeMap iterates keys sorted, so goldens are
-    // stable across every pnpm lock in the set.
-    let lock_keys: Vec<&String> = files.keys().filter(|k| is_pnpm_lock_key(k)).collect();
+    // A pnpm lock lives at the project root or at any nested path (e.g. Rush
+    // repos keep them under `common/config/rush/`); every such files-map key
+    // is rewritten under the same grammar. Deterministic order: BTreeMap
+    // iterates keys sorted, so goldens are stable across every lock in the set.
+    let lock_keys: Vec<&String> = files
+        .keys()
+        .filter(|k| k.as_str() == "pnpm-lock.yaml" || k.ends_with("/pnpm-lock.yaml"))
+        .collect();
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
@@ -839,15 +819,6 @@ fn berry_cache_key(content: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// `.yarnrc.yml` `compressionLevel:` scalar, when set (flat top-level line
-/// scan — yarn writes it as a top-level scalar, spike B4).
-fn yarnrc_compression_level(rc: &str) -> Option<String> {
-    rc.lines().find_map(|line| {
-        let rest = line.strip_prefix("compressionLevel:")?;
-        Some(rest.trim().trim_matches(['\'', '"']).to_string())
-    })
 }
 
 /// Split `name@npm:...` at the `@` past a leading `@scope/` marker.
@@ -1046,7 +1017,7 @@ fn rewrite_bun_lock(
     result: &mut RewriteResult,
 ) {
     use crate::patch::bun_lock_text::{
-        check_lock_version, decode_json_string, parse_packages_section, split_name_spec,
+        check_lock_version, decode_json_string, parse_packages_section,
     };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -1122,9 +1093,8 @@ fn rewrite_bun_lock(
                 }
                 deps_verbatim = entry.elems[1].clone();
             } else {
-                // `split_name_spec` guards a same-name-but-unowned entry (user
-                // file:/URL dep, other version) — never touched.
-                let _ = split_name_spec(&spec);
+                // Same-name-but-unowned entry (user file:/URL dep, other
+                // version) — never touched.
                 continue;
             }
             let original = lines[entry.line_idx].clone();
@@ -1181,7 +1151,7 @@ fn rewrite_uv_lock(
         };
         // Find the [[package]] block for this name+version by string bounds
         // (no lookahead in Rust regex). Iterate over [[package]] starts.
-        let target = normalize_py_name(&dep.name);
+        let target = canonicalize_pypi_name(&dep.name);
         let mut matched = false;
         let marker = "[[package]]\n";
         let mut search = 0usize;
@@ -1196,7 +1166,7 @@ fn rewrite_uv_lock(
             search = block_end;
             let name_ok = name_re
                 .captures(&block)
-                .map(|c| normalize_py_name(&c[1]) == target)
+                .map(|c| canonicalize_pypi_name(&c[1]) == target)
                 .unwrap_or(false);
             let version_ok = block.contains(&format!("version = \"{}\"\n", dep.version))
                 || block.contains(&format!("version = \"{}\"", dep.version));
@@ -1812,11 +1782,6 @@ const MVN_CONFIG_ARGS: &[&str] = &[
 const MVN_CONFIG: &str = ".mvn/maven.config";
 const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 
-/// Unique-per-patch maven repository id (valid chars: alnum, `-`, `_`, `.`).
-fn maven_repository_id(patch_uuid: &str) -> String {
-    format!("socket-patch-{patch_uuid}")
-}
-
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
 /// the TS `bareSha256Hex`).
@@ -1954,7 +1919,8 @@ fn rewrite_maven_pom(
         if pom.is_none() {
             continue;
         }
-        let repo_id = maven_repository_id(&dep.patch_uuid);
+        // Unique-per-patch repository id (valid chars: alnum, `-`, `_`, `.`).
+        let repo_id = format!("socket-patch-{}", dep.patch_uuid);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
         // served under its original GAV. Add the repository (transport checksum
@@ -2248,36 +2214,23 @@ fn rewrite_maven_pom(
     }
 }
 
-/// The `<repository>` block for the socket-patch source: releases enabled with
+/// Insert the socket-patch `<repository>` block: releases enabled with
 /// `<checksumPolicy>fail</checksumPolicy>` (the transport-level check against
 /// the served `.jar.sha1`); snapshots disabled (patched artifacts are always
-/// released versions). Indented for insertion under a `<repositories>` element.
-fn maven_repository_block(id: &str, url: &str) -> String {
-    format!(
-        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
-    )
-}
-
-/// Insert the socket-patch repository block. Prefer an existing
-/// `<repositories>` element (single replace, inserted first so it's consulted
-/// before the project's other repositories); otherwise author a full
-/// `<repositories>` section immediately before the closing `</project>`.
-/// `<repositories>` is matched exactly so it never collides with
-/// `<pluginRepositories>`.
+/// released versions). Prefer an existing `<repositories>` element (single
+/// replace, inserted first so it's consulted before the project's other
+/// repositories); otherwise author a full `<repositories>` section immediately
+/// before the closing `</project>`. `<repositories>` is matched exactly so it
+/// never collides with `<pluginRepositories>`.
 fn insert_maven_repository(pom: &str, id: &str, url: &str) -> String {
-    let block = maven_repository_block(id, url);
+    let block = format!(
+        "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
+    );
     if pom.contains("<repositories>") {
         return pom.replacen("<repositories>", &format!("<repositories>\n{block}"), 1);
     }
     let section = format!("  <repositories>\n{block}\n  </repositories>");
     pom.replacen("</project>", &format!("{section}\n</project>"), 1)
-}
-
-/// A `<dependency>` block for a `<dependencyManagement>` pin (2-space step ×4).
-fn maven_management_dependency_block(group_id: &str, artifact_id: &str, version: &str) -> String {
-    format!(
-        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
-    )
 }
 
 /// Add a `<dependencyManagement>` version pin. Prefer extending an existing
@@ -2291,7 +2244,9 @@ fn insert_maven_dependency_management(
     artifact_id: &str,
     version: &str,
 ) -> String {
-    let block = maven_management_dependency_block(group_id, artifact_id, version);
+    let block = format!(
+        "      <dependency>\n        <groupId>{group_id}</groupId>\n        <artifactId>{artifact_id}</artifactId>\n        <version>{version}</version>\n      </dependency>"
+    );
     let dm_re = Regex::new(r"(?s)<dependencyManagement>\s*<dependencies>").unwrap();
     if let Some(m) = dm_re.find(pom) {
         let matched = m.as_str();

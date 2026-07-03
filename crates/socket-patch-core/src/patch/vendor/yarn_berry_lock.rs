@@ -935,8 +935,9 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 
 /// The `.yarnrc.yml` `compressionLevel` value, when set. A flat line scan is
 /// enough: yarn writes the knob as a top-level scalar (spike B4), and any
-/// value we cannot positively read as `0` makes the caller refuse.
-fn yarnrc_compression_level(rc: &str) -> Option<&str> {
+/// value we cannot positively read as `0` makes the caller refuse. Shared
+/// with the hosted-redirect rewriter, whose cache-checksum gate is identical.
+pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
     rc.lines().find_map(|line| {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))

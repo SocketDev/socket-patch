@@ -22,6 +22,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::bun_lock_text;
 use crate::patch::path_safety;
 use crate::utils::purl::strip_purl_qualifiers;
@@ -143,7 +144,7 @@ pub fn lookup<'a>(entries: &'a [LockfileEntry], purl: &str) -> Option<&'a Lockfi
     let (name, version) = (&rest[..at], &rest[at + 1..]);
     // pypi names compare in PEP 503 normalized form.
     let name = if eco == "pypi" {
-        pep503(name)
+        canonicalize_pypi_name(name)
     } else {
         name.to_string()
     };
@@ -830,26 +831,8 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 }
 
 // ─────────────────────────────── pypi locks ───────────────────────────────
-
-/// PEP 503 name normalization (`Foo._Bar` → `foo-bar`) — pypi purls and
-/// lock entries must compare in this form.
-fn pep503(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut last_dash = false;
-    for c in name.chars() {
-        let c = c.to_ascii_lowercase();
-        if c == '-' || c == '_' || c == '.' {
-            if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        } else {
-            out.push(c);
-            last_dash = false;
-        }
-    }
-    out
-}
+// pypi purls and lock entries compare in PEP 503 normalized form
+// (`Foo._Bar` → `foo-bar`) — see `canonicalize_pypi_name`.
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
 /// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
@@ -886,7 +869,7 @@ async fn inventory_uv_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
                  wheel: &mut Option<(String, String)>,
                  out: &mut Vec<LockfileEntry>| {
         if let (Some(n), Some(v)) = (name.take(), version.take()) {
-            let canonical = pep503(&n);
+            let canonical = canonicalize_pypi_name(&n);
             if *sourced_registry
                 && path_safety::is_safe_single_segment(&canonical)
                 && path_safety::is_safe_single_segment(&v)
@@ -979,7 +962,7 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
             continue;
         }
         if let Some(v) = t.strip_prefix("name = ") {
-            name = Some(pep503(v.trim_matches('"')));
+            name = Some(canonicalize_pypi_name(v.trim_matches('"')));
         } else if let Some(v) = t.strip_prefix("version = ") {
             if let Some(n) = name.take() {
                 let v = v.trim_matches('"').to_string();
@@ -1021,7 +1004,7 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
         let Some((raw_name, version)) = spec.split_once("==") else {
             continue;
         };
-        let name = pep503(raw_name.split('[').next().unwrap_or(raw_name).trim());
+        let name = canonicalize_pypi_name(raw_name.split('[').next().unwrap_or(raw_name).trim());
         let version = version.trim().to_string();
         if name.is_empty()
             || !path_safety::is_safe_single_segment(&name)

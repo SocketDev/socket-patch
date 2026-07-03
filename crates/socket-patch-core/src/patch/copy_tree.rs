@@ -1,10 +1,8 @@
-//! Shared tree-copy helpers for the project-local Go `replace`-redirect backend
-//! ([`crate::patch::go_redirect`]). It materialises a project-local **patched
-//! copy** of a module by copying its pristine source out of the read-only,
-//! checksum-verified module cache into a writable dir under `.socket/`, then
-//! patching the copy in place.
-//!
-//! Only compiled when the Go redirect backend is enabled (gated in `mod.rs`).
+//! Shared tree-copy helpers used by the Go `replace`-redirect backend
+//! ([`crate::patch::go_redirect`]) and the vendor backends. They materialise a
+//! project-local **patched copy** of a package by copying its pristine source
+//! out of a read-only registry/module cache into a writable dir under
+//! `.socket/`, then patching the copy in place.
 
 use std::path::Path;
 
@@ -60,12 +58,12 @@ pub(crate) async fn fresh_copy(
         Ok(())
     })
     .await
-    .map_err(|e| std::io::Error::other(e.to_string()))?
+    .map_err(to_io)?
 }
 
 /// Recursively remove a tree, retrying once after relaxing perms (a previously
 /// patched copy may carry read-only file modes copied from the registry/cache).
-pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
+fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -107,7 +105,7 @@ pub async fn remove_tree(dir: &Path) -> std::io::Result<()> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || force_remove_dir_all(&dir))
         .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .map_err(to_io)?
 }
 
 #[cfg(test)]
@@ -273,8 +271,8 @@ mod tests {
     /// Regression: the perm-relax retry in [`force_remove_dir_all`] must not
     /// chmod *through* a symlink. `set_permissions` follows links, so a symlink
     /// entry would silently mutate its target's mode — which can live outside
-    /// the tree. (Copy trees are symlink-free today, but this is a general
-    /// pub(crate) helper and the safety property must hold regardless.)
+    /// the tree. (Copy trees are symlink-free today, but [`remove_tree`] is a
+    /// general pub helper and the safety property must hold regardless.)
     #[cfg(unix)]
     #[tokio::test]
     async fn relax_loop_must_not_chmod_external_symlink_target() {

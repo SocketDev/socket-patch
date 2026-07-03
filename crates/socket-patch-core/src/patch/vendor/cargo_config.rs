@@ -30,11 +30,12 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
+use crate::pth_hook::edit::ensure_table;
 use crate::utils::fs::atomic_write_bytes;
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
-pub const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
+const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
 
 /// Project-relative root of the retired `[patch]`-redirect backend's copies.
 /// Entries under this prefix are still recognised as socket-owned so vendor
@@ -48,7 +49,7 @@ pub struct PatchEntryInfo {
     /// The `path` value as written (verbatim), or `None` for a non-path
     /// source (e.g. `git`/`registry`).
     pub path: Option<String>,
-    /// True iff `path` is under [`CARGO_VENDOR_DIR`] or
+    /// True iff `path` is under `CARGO_VENDOR_DIR` or
     /// [`LEGACY_CARGO_PATCHES_DIR`].
     pub socket_owned: bool,
 }
@@ -192,24 +193,6 @@ fn entry_path(item: &Item) -> Option<&str> {
     item.as_table_like()
         .and_then(|t| t.get("path"))
         .and_then(Item::as_str)
-}
-
-/// Ensure `parent[key]` is a table, creating it if absent. Errors if present
-/// but a non-table. Mirrors `pth_hook::edit::ensure_table`.
-fn ensure_table<'a>(
-    parent: &'a mut Table,
-    key: &str,
-    implicit: bool,
-) -> Result<&'a mut Table, String> {
-    if !parent.contains_key(key) {
-        let mut t = Table::new();
-        t.set_implicit(implicit);
-        parent.insert(key, Item::Table(t));
-    }
-    parent
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| format!("`{key}` is not a table"))
 }
 
 fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Option<String>, String> {

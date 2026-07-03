@@ -35,6 +35,7 @@
 //!   fields, no comments, one CDH per LFH in the same order;
 //! * **EOCD** — single disk, no zip64, no archive comment.
 
+use std::collections::HashSet;
 use std::io::Read;
 
 use flate2::read::GzDecoder;
@@ -96,15 +97,11 @@ fn rebuild_cache_zip(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<u8>, S
 fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry>, String> {
     let prefix = format!("node_modules/{package_ident}");
     let mut entries: Vec<ZipEntry> = Vec::new();
-    let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_dirs: HashSet<String> = HashSet::new();
 
     // mkdirp: emit every missing ancestor of `dirpath` (no trailing slash),
     // shallowest first, exactly once.
-    fn mkdirp(
-        dirpath: &str,
-        seen: &mut std::collections::HashSet<String>,
-        out: &mut Vec<ZipEntry>,
-    ) {
+    fn mkdirp(dirpath: &str, seen: &mut HashSet<String>, out: &mut Vec<ZipEntry>) {
         let parts: Vec<&str> = dirpath.split('/').collect();
         for i in 1..=parts.len() {
             let d = format!("{}/", parts[..i].join("/"));
@@ -133,11 +130,12 @@ fn collect_entries(tgz_bytes: &[u8], package_ident: &str) -> Result<Vec<ZipEntry
             return Err(format!("tar entry name `{raw_name}` is not ASCII"));
         }
         // Strip the first path component (`package/` for npm packs).
-        let stripped = raw_name.split('/').skip(1).collect::<Vec<_>>().join("/");
-        let stripped = stripped.trim_end_matches('/');
+        let stripped = raw_name
+            .split_once('/')
+            .map_or("", |(_, rest)| rest)
+            .trim_end_matches('/');
 
-        let entry_type = entry.header().entry_type();
-        match entry_type {
+        match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 let dir = if stripped.is_empty() {
                     prefix.clone()
@@ -208,10 +206,9 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
 
     let mut blob: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
-    let mut offsets: Vec<u32> = Vec::with_capacity(entries.len());
 
     for e in entries {
-        offsets.push(as_u32(blob.len(), "local header offset")?);
+        let offset = as_u32(blob.len(), "local header offset")?;
         let crc = if e.is_dir {
             0
         } else {
@@ -220,6 +217,8 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
             crc.sum()
         };
         let size = as_u32(e.data.len(), "entry size")?;
+        let name_len =
+            u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?;
         let vneed = if e.is_dir {
             VERSION_NEEDED_DIR
         } else {
@@ -235,10 +234,7 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
         w32(&mut blob, crc);
         w32(&mut blob, size); // compressed == uncompressed (stored)
         w32(&mut blob, size);
-        w16(
-            &mut blob,
-            u16::try_from(e.name.len()).map_err(|_| "entry name too long".to_string())?,
-        );
+        w16(&mut blob, name_len);
         w16(&mut blob, 0); // extra len
         blob.extend_from_slice(e.name.as_bytes());
         blob.extend_from_slice(&e.data);
@@ -253,13 +249,13 @@ fn write_zip(entries: &[ZipEntry]) -> Result<Vec<u8>, String> {
         w32(&mut central, crc);
         w32(&mut central, size);
         w32(&mut central, size);
-        w16(&mut central, e.name.len() as u16);
+        w16(&mut central, name_len);
         w16(&mut central, 0); // extra len
         w16(&mut central, 0); // comment len
         w16(&mut central, 0); // disk number start
         w16(&mut central, 0); // internal attrs
         w32(&mut central, e.mode << 16); // external attrs
-        w32(&mut central, *offsets.last().expect("just pushed"));
+        w32(&mut central, offset);
         central.extend_from_slice(e.name.as_bytes());
     }
 

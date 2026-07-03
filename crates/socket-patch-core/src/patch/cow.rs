@@ -25,7 +25,7 @@
 //! `GetFileInformationByHandle` via `windows-sys` for full Windows
 //! parity.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Outcome of [`break_hardlink_if_needed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,8 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
         // target, a crash), the original would be gone with nothing to
         // roll back to. The rename-over-symlink is a single atomic
         // step — on any failure `path` still holds the original link.
-        // This mirrors the hardlink branch below and `write_atomic`.
+        // This mirrors the hardlink branch below and the apply path's
+        // `utils::fs::atomic_write_bytes`.
         write_via_stage_rename(path, &target_bytes).await?;
         return Ok(CowAction::BrokeSymlink);
     }
@@ -110,14 +111,11 @@ pub async fn break_hardlink_if_needed(path: &Path) -> std::io::Result<CowAction>
 /// `path`. Cross-FS-safe because the stage lives in the same
 /// directory as the target, so `rename(2)` is intra-filesystem.
 async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // Preconditions: cow callers always pass a real file path
-    // inside a package directory, so `path.parent()` and
-    // `path.file_name()` are guaranteed `Some`. The previous
-    // `unwrap_or_else` defaults only fired on `path == "/"`,
-    // which cow can never reach (lstat on "/" returns a directory,
-    // and the hardlink branch's `read("/")` errors out long
-    // before we get here). Using `.expect()` documents the
-    // invariant and eliminates the dead defensive default.
+    // Cow callers always pass a real file path inside a package
+    // directory, so `path.parent()` and `path.file_name()` are
+    // guaranteed `Some`: the only counterexample, `path == "/"`,
+    // is unreachable (lstat on "/" reports a directory, and the
+    // hardlink branch's `read("/")` errors long before we get here).
     let parent = path
         .parent()
         .expect("cow stage path always has a parent — callers pass package-internal files");
@@ -127,13 +125,13 @@ async fn write_via_stage_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()
     // but defense in depth.)
     let stem = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .expect("cow stage path always has a file_name — callers pass package-internal files");
-    let stage: PathBuf = parent.join(format!(".socket-cow-{}-{}", stem, uuid::Uuid::new_v4()));
+        .expect("cow stage path always has a file_name — callers pass package-internal files")
+        .to_string_lossy();
+    let stage = parent.join(format!(".socket-cow-{}-{}", stem, uuid::Uuid::new_v4()));
     // Stage write. If this fails *after* creating the file (e.g. a
     // mid-write ENOSPC), the partial stage would otherwise leak as a
     // `.socket-cow-*` turd, so clean it up before propagating — same
-    // discipline as `apply::write_atomic`'s write arm.
+    // discipline as `utils::fs::atomic_write_bytes`'s write arm.
     if let Err(e) = tokio::fs::write(&stage, bytes).await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);

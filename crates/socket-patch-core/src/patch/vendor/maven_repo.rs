@@ -119,18 +119,12 @@ fn group_id_to_path(group_id: &str) -> String {
 }
 
 /// A groupId is safe to convert to a path and join onto the vendor root: each
-/// dot-delimited segment is non-empty and not a traversal token, and the whole
-/// string carries no separator/backslash/colon/NUL. Mirrors the maven crawler's
+/// dot-delimited segment must be a safe path segment on its own (non-empty, no
+/// separator/backslash/colon/NUL), which also rejects the empty string and
+/// leading/trailing/double dots. Same delegation as the maven crawler's
 /// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
 fn is_safe_group_id(group_id: &str) -> bool {
-    !group_id.is_empty()
-        && !group_id.contains('/')
-        && !group_id.contains('\\')
-        && !group_id.contains(':')
-        && !group_id.contains('\0')
-        && group_id
-            .split('.')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    group_id.split('.').all(is_safe_single_segment)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2

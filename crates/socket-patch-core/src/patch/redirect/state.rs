@@ -47,10 +47,6 @@ impl RedirectState {
             records: BTreeMap::new(),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.edits.is_empty() && self.records.is_empty()
-    }
 }
 
 impl Default for RedirectState {

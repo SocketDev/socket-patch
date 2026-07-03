@@ -72,16 +72,13 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
             if root_exists {
                 let mut nested = Vec::new();
                 search_recursive(start_path, 0, 5, &mut nested).await;
-                results.extend(
-                    nested
-                        .into_iter()
-                        .filter(|p| *p != root_package_json)
-                        .map(|path| PackageJsonLocation {
-                            path,
-                            is_root: false,
-                            is_workspace: false,
-                        }),
-                );
+                results.extend(nested.into_iter().filter(|p| *p != root_package_json).map(
+                    |path| PackageJsonLocation {
+                        path,
+                        is_root: false,
+                        is_workspace: false,
+                    },
+                ));
             }
         }
         _ => {

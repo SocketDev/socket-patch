@@ -1,12 +1,14 @@
 use std::path::Path;
 
 use crate::hash::git_sha256::compute_git_sha256_from_reader;
+use crate::utils::fs::open_regular_file;
 
 /// Compute Git-compatible SHA256 hash of file contents using streaming.
 ///
-/// Opens the file *once* and derives the size from that open handle (an
-/// `fstat`), then streams the same handle through the hasher without loading
-/// the entire file into memory.
+/// Opens the file *once* via [`open_regular_file`] (non-blocking on Unix,
+/// regular files only — see its docs for the FIFO/special-file rationale) and
+/// derives the size from that open handle (an `fstat`), then streams the same
+/// handle through the hasher without loading the entire file into memory.
 ///
 /// Deriving the size from the open file descriptor — rather than `stat`-ing the
 /// path separately and then re-opening it — is what makes this safe under
@@ -17,41 +19,13 @@ use crate::hash::git_sha256::compute_git_sha256_from_reader;
 /// [`compute_git_sha256_from_reader`] and produce a hash whose Git header (the
 /// size) and body came from different inodes. Reading both from the same `fd`
 /// makes that impossible.
-///
-/// Only regular files are accepted. Following a path to a directory or a
-/// special file (FIFO, device, …) and hashing it is never meaningful here, and
-/// on some platforms a directory can read as zero bytes — which would otherwise
-/// be silently reported as the empty-blob hash.
-///
-/// On Unix the open itself is non-blocking (`O_NONBLOCK`): a plain `open(2)`
-/// of a FIFO with `O_RDONLY` waits for a writer that may never come, which
-/// would hang the patch engine forever *before* the regular-file guard below
-/// ever runs. With `O_NONBLOCK` the open returns immediately (it has no effect
-/// on reads of regular files) and the guard rejects the FIFO with an error.
-pub async fn compute_file_git_sha256(filepath: impl AsRef<Path>) -> Result<String, std::io::Error> {
-    let filepath = filepath.as_ref();
-
-    // Open the file once; everything below operates on this single descriptor.
-    #[cfg(unix)]
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(filepath)
-        .await?;
-    #[cfg(not(unix))]
-    let file = tokio::fs::File::open(filepath).await?;
+pub(crate) async fn compute_file_git_sha256(
+    filepath: impl AsRef<Path>,
+) -> Result<String, std::io::Error> {
+    let (file, metadata) = open_regular_file(filepath.as_ref()).await?;
 
     // Size comes from the open handle (fstat), so it and the bytes we hash are
     // guaranteed to refer to the same inode even if the path is replaced.
-    let metadata = file.metadata().await?;
-
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("git sha256: {} is not a regular file", filepath.display()),
-        ));
-    }
-
     let file_size = metadata.len();
     let reader = tokio::io::BufReader::new(file);
 

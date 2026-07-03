@@ -659,7 +659,7 @@ async fn synthesize_go_patches(
     use socket_patch_core::patch::go_mod_edit::{
         read_replace_entries, ReplaceOwner, GO_PATCHES_DIR,
     };
-    use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;
+    use socket_patch_core::patch::go_redirect::{are_safe_redirect_coords, copy_dir_for};
     use socket_patch_core::utils::purl::build_golang_purl;
 
     let mut go_patches = HashMap::new();
@@ -688,10 +688,7 @@ async fn synthesize_go_patches(
         }
         go_patches.insert(
             purl,
-            common
-                .cwd
-                .join(GO_PATCHES_DIR)
-                .join(format!("{}@{version}", entry.module)),
+            copy_dir_for(&common.cwd, GO_PATCHES_DIR, &entry.module, version),
         );
     }
     go_patches

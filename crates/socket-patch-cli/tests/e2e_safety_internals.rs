@@ -17,8 +17,6 @@
 //! No network. No toolchain. Unix-gated for the chmod-based test;
 //! the rest are portable.
 
-use std::collections::HashMap;
-
 use socket_patch_core::patch::cow::{break_hardlink_if_needed, CowAction};
 use socket_patch_core::patch::sidecars::dispatch_fixup;
 
@@ -44,7 +42,7 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 #[tokio::test]
 async fn dispatch_fixup_empty_patched_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = dispatch_fixup("pkg:pypi/requests@2.28.0", tmp.path(), &[], &HashMap::new())
+    let out = dispatch_fixup("pkg:pypi/requests@2.28.0", tmp.path(), &[])
         .await
         .unwrap();
     assert!(
@@ -63,7 +61,6 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
         "pkg:totally-not-an-ecosystem/x@1",
         tmp.path(),
         &["x".to_string()],
-        &HashMap::new(),
     )
     .await
     .unwrap();
@@ -107,7 +104,6 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
         "pkg:cargo/anything@1.0.0",
         pkg,
         &["package/missing-on-disk.txt".to_string()],
-        &HashMap::new(),
     )
     .await;
 
@@ -153,7 +149,6 @@ async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
         "pkg:nuget/Anything@1.0.0",
         &absent,
         &["package/file.txt".to_string()],
-        &HashMap::new(),
     )
     .await
     .unwrap();

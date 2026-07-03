@@ -43,7 +43,7 @@ pub const GO_PATCHES_DIR: &str = ".socket/go-patches";
 /// Project-relative directory holding `vendor`'s committed module copies
 /// (`<GO_VENDOR_DIR>/<patch-uuid>/<module>@<version>`). A `replace` whose
 /// target path is under this prefix is owned by [`ReplaceOwner::Vendor`].
-pub const GO_VENDOR_DIR: &str = ".socket/vendor/golang";
+const GO_VENDOR_DIR: &str = ".socket/vendor/golang";
 
 /// Which socket-managed backend owns a `replace` directive, classified by the
 /// directive's target-path prefix.
@@ -55,25 +55,18 @@ pub enum ReplaceOwner {
     Vendor,
 }
 
-impl ReplaceOwner {
-    /// The classifying path prefix (no trailing slash).
-    pub fn prefix(self) -> &'static str {
-        match self {
-            Self::GoPatches => GO_PATCHES_DIR,
-            Self::Vendor => GO_VENDOR_DIR,
-        }
-    }
-}
-
 /// Classify a `replace` target path: which socket backend owns it, or `None`
 /// for a user-authored path. The two prefixes don't overlap, but `Vendor` is
 /// tested first to keep the intent explicit (`.socket/vendor/golang/` is more
 /// specific than a hypothetical future `.socket/` catch-all).
-pub fn detect_owner(path: &str) -> Option<ReplaceOwner> {
-    for owner in [ReplaceOwner::Vendor, ReplaceOwner::GoPatches] {
-        let norm = path.replace('\\', "/");
-        let norm = norm.strip_prefix("./").unwrap_or(&norm);
-        let prefix = format!("{}/", owner.prefix());
+fn detect_owner(path: &str) -> Option<ReplaceOwner> {
+    let norm = path.replace('\\', "/");
+    let norm = norm.strip_prefix("./").unwrap_or(&norm);
+    for (owner, dir) in [
+        (ReplaceOwner::Vendor, GO_VENDOR_DIR),
+        (ReplaceOwner::GoPatches, GO_PATCHES_DIR),
+    ] {
+        let prefix = format!("{dir}/");
         if norm.starts_with(&prefix) || norm.contains(&format!("/{prefix}")) {
             return Some(owner);
         }
@@ -88,11 +81,6 @@ pub fn detect_owner(path: &str) -> Option<ReplaceOwner> {
 /// accepts forward slashes on every platform.
 pub fn replace_target_path(base_rel: &str, module: &str, version: &str) -> String {
     format!("./{base_rel}/{module}@{version}")
-}
-
-/// The expected `replace` target for an `apply` (go-patches) redirect copy.
-pub fn expected_replace_path(module: &str, version: &str) -> String {
-    replace_target_path(GO_PATCHES_DIR, module, version)
 }
 
 /// One parsed `replace` directive.
@@ -219,6 +207,42 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
+/// Walk every directive body for `keyword` — the single-line form
+/// (`keyword <body>`) and the members of a `keyword ( … )` block — calling
+/// `f(line_index, body)` with the comment stripped and whitespace trimmed.
+fn for_each_directive_body(
+    content: &str,
+    keyword: &str,
+    mut f: impl FnMut(usize, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let single = format!("{keyword} ");
+    let mut in_block = false;
+    for (i, raw) in content.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_block {
+            if line == ")" {
+                in_block = false;
+            } else {
+                f(i, line)?;
+            }
+        } else if let Some(rest) = line.strip_prefix(keyword).map(str::trim_start) {
+            match rest {
+                "(" => in_block = true,
+                "()" => {} // empty inline block — nothing inside
+                _ => {
+                    if let Some(body) = line.strip_prefix(&single) {
+                        f(i, body)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// True if a replacement RHS token is a filesystem path (vs a module path).
 /// Go's rule: a path begins with `./`, `../`, `/`, or a Windows drive/`\`.
 fn rhs_is_path(tok: &str) -> bool {
@@ -256,93 +280,27 @@ fn parse_replace_body(body: &str) -> Option<ReplaceEntry> {
 }
 
 /// Parse every `replace` directive (single-line and block forms).
-pub fn parse_replace_entries(content: &str) -> Vec<ReplaceEntry> {
+fn parse_replace_entries(content: &str) -> Vec<ReplaceEntry> {
     let mut out = Vec::new();
-    let mut in_block = false;
-    for raw in content.lines() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if in_block {
-            if line == ")" {
-                in_block = false;
-                continue;
-            }
-            if let Some(e) = parse_replace_body(line) {
-                out.push(e);
-            }
-            continue;
-        }
-        if let Some(rest) = directive_block_open(line, "replace") {
-            if rest {
-                in_block = true;
-            }
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("replace ") {
-            if let Some(e) = parse_replace_body(body) {
-                out.push(e);
-            }
-        }
-    }
+    let _ = for_each_directive_body(content, "replace", |_, body| {
+        out.extend(parse_replace_body(body));
+        Ok(())
+    });
     out
 }
 
 /// Parse `require` directives into `module -> version` (last wins; the module
 /// graph selects one version per module path).
-pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
+fn parse_required_versions(content: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    let mut in_block = false;
-    for raw in content.lines() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
+    let _ = for_each_directive_body(content, "require", |_, body| {
+        let mut toks = body.split_whitespace();
+        if let (Some(m), Some(v)) = (toks.next(), toks.next()) {
+            out.insert(m.to_string(), v.to_string());
         }
-        if in_block {
-            if line == ")" {
-                in_block = false;
-                continue;
-            }
-            insert_require(&mut out, line);
-            continue;
-        }
-        if let Some(rest) = directive_block_open(line, "require") {
-            if rest {
-                in_block = true;
-            }
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("require ") {
-            insert_require(&mut out, body);
-        }
-    }
+        Ok(())
+    });
     out
-}
-
-fn insert_require(out: &mut HashMap<String, String>, body: &str) {
-    let toks: Vec<&str> = body.split_whitespace().collect();
-    if let (Some(m), Some(v)) = (toks.first(), toks.get(1)) {
-        out.insert((*m).to_string(), (*v).to_string());
-    }
-}
-
-/// For a directive keyword (`replace`/`require`), classify a line:
-/// * `Some(true)`  — opens a `keyword (` block,
-/// * `Some(false)` — a bare `keyword (` … `)` is not this (e.g. `keyword (` only
-///   matches the open form); returns `Some(false)` for `keyword ()` empties,
-/// * `None`        — the line is not a block opener for this keyword.
-fn directive_block_open(line: &str, keyword: &str) -> Option<bool> {
-    // `replace (`  /  `replace(`
-    let rest = line.strip_prefix(keyword)?;
-    let rest = rest.trim_start();
-    if rest == "(" {
-        return Some(true);
-    }
-    if rest == "()" {
-        return Some(false); // empty inline block — nothing inside
-    }
-    None
 }
 
 // ── pure transforms ──────────────────────────────────────────────────────────
@@ -357,37 +315,17 @@ fn upsert_replace_entry(
     let want_path = replace_target_path(base_rel, module, version);
     let want_line = format!("replace {module} {version} => {want_path}");
 
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-
     // Locate an existing socket-owned replace line for `module`, and detect a
     // conflicting user-authored replace pinning the same module+version.
     let mut socket_line: Option<usize> = None;
-    let mut in_block = false;
-    for (i, raw) in lines.iter().enumerate() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if in_block {
-            if line == ")" {
-                in_block = false;
-                continue;
-            }
-            inspect_existing(line, module, version, &want_path, i, &mut socket_line)?;
-            continue;
-        }
-        if let Some(opened) = directive_block_open(line, "replace") {
-            in_block = opened;
-            continue;
-        }
-        if let Some(body) = line.strip_prefix("replace ") {
-            inspect_existing(body, module, version, &want_path, i, &mut socket_line)?;
-        }
-    }
+    for_each_directive_body(content, "replace", |i, body| {
+        inspect_existing(body, module, version, &want_path, i, &mut socket_line)
+    })?;
 
     if let Some(idx) = socket_line {
         // Rewrite the existing socket-owned line in place, preserving whether it
         // was a block member (`\tmodule … => …`) or a single-line `replace …`.
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
         let raw = &lines[idx];
         let indent: String = raw.chars().take_while(|c| c.is_whitespace()).collect();
         let is_block_member = !strip_comment(raw).trim_start().starts_with("replace ");
@@ -472,7 +410,7 @@ fn remove_replace_entry(
     let mut changed = false;
     while i < lines.len() {
         let line = strip_comment(lines[i]).trim();
-        if directive_block_open(line, "replace") == Some(true) {
+        if line.strip_prefix("replace").map(str::trim_start) == Some("(") {
             // Block spans [i, close]; mark socket-owned members for removal.
             let open = i;
             let mut close = i;
@@ -583,9 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn test_expected_path() {
+    fn test_replace_target_path() {
         assert_eq!(
-            expected_replace_path("github.com/foo/bar", "v1.4.2"),
+            replace_target_path(GO_PATCHES_DIR, "github.com/foo/bar", "v1.4.2"),
             "./.socket/go-patches/github.com/foo/bar@v1.4.2"
         );
     }

@@ -25,7 +25,7 @@ use crate::patch::go_mod_edit::{
     self, read_replace_entries, replace_target_path, ReplaceOwner, GO_PATCHES_DIR,
 };
 use crate::patch::go_redirect::{
-    apply_go_redirect, are_safe_redirect_coords, ensure_module_go_mod,
+    apply_go_redirect, are_safe_redirect_coords, copy_dir_for, ensure_module_go_mod,
 };
 use crate::utils::purl::{parse_golang_purl, strip_purl_qualifiers};
 
@@ -126,9 +126,7 @@ pub async fn vendor_go_module(
     // `prior_path` recorded here would be our own vendored pointer.
     let wired =
         prior_path.as_deref() == Some(replace_target_path(&base_rel, module, version).as_str());
-    let copy_dir = project_root
-        .join(&base_rel)
-        .join(format!("{module}@{version}"));
+    let copy_dir = copy_dir_for(project_root, &base_rel, module, version);
     let copy_was_ok = wired && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
     // Vendor auto-force policy (the engine's copy is staged from the
@@ -291,9 +289,7 @@ pub async fn vendor_go_module(
         // the apply backend's copy is now unreachable — delete it (built from
         // OUR validated coordinates, never from the go.mod string). NotFound
         // is fine (the user may have cleaned it already).
-        let stale = project_root
-            .join(GO_PATCHES_DIR)
-            .join(format!("{module}@{version}"));
+        let stale = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
         let _ = remove_tree(&stale).await;
         // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
         // and including the go-patches root. `remove_dir` is non-recursive:
