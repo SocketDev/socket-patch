@@ -8,7 +8,7 @@ use std::path::Path;
 /// carrier). A single, familiar line. Classic Poetry can't express an extra as
 /// a bare key, so [`super::edit`] emits the equivalent
 /// `socket-patch = { extras = ["hook"] }` there instead.
-pub const HOOK_DEP: &str = "socket-patch[hook]";
+pub(crate) const HOOK_DEP: &str = "socket-patch[hook]";
 
 /// Substrings (space-insensitive, lower-cased) that mean the hook is already
 /// declared — the `socket-patch[hook]` extra, the standalone wheel, or the
@@ -124,10 +124,7 @@ pub fn deps_contain_hook(text: &str) -> bool {
         // Drop a `#` comment first (requirements.txt and TOML both comment
         // with `#`): a commented-out `# socket-patch[hook]` declares nothing —
         // pip never installs it — and a marker mentioned inside a trailing
-        // comment must not read as configured. Same first-`#` rule as
-        // `edit::strip_requirement_comment`, so the `setup --check` / state
-        // probes (which call this on raw file content) agree with the editors
-        // (which pre-strip) on identical bytes.
+        // comment must not read as configured.
         let spec = match line.find('#') {
             Some(i) => &line[..i],
             None => line,
@@ -139,11 +136,6 @@ pub fn deps_contain_hook(text: &str) -> bool {
             .collect();
         HOOK_MARKERS.iter().any(|m| normalized.contains(*m))
     })
-}
-
-/// True if a single PEP 508 dependency spec is the hook dependency.
-pub fn spec_is_hook(spec: &str) -> bool {
-    deps_contain_hook(spec)
 }
 
 #[cfg(test)]

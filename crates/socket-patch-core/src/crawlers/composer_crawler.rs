@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::{is_dir, is_file};
+use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
@@ -226,16 +227,10 @@ async fn get_composer_home() -> Option<PathBuf> {
     }
 
     // Try `composer global config home`
-    if let Ok(output) = std::process::Command::new("composer")
-        .args(["global", "config", "home"])
-        .output()
-    {
-        if output.status.success() {
-            if let Some(path) = parse_composer_home_output(&String::from_utf8_lossy(&output.stdout))
-            {
-                if is_dir(&path).await {
-                    return Some(path);
-                }
+    if let Some(stdout) = SystemCommandRunner.run("composer", &["global", "config", "home"]) {
+        if let Some(path) = parse_composer_home_output(&stdout) {
+            if is_dir(&path).await {
+                return Some(path);
             }
         }
     }

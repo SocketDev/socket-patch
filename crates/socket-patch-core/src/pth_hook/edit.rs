@@ -16,7 +16,8 @@ use std::path::Path;
 use tokio::fs;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
-use super::detect::{deps_contain_hook, spec_is_hook, HOOK_DEP};
+use super::detect::{deps_contain_hook, HOOK_DEP};
+use crate::patch::vendor::common::detect_eol;
 use crate::utils::fs::atomic_write_bytes;
 
 /// Which manifest format a path is.
@@ -37,27 +38,45 @@ pub enum PthStatus {
 #[derive(Debug, Clone)]
 pub struct PthEditResult {
     pub path: String,
-    pub kind: ManifestKind,
     pub status: PthStatus,
     pub error: Option<String>,
 }
 
 impl PthEditResult {
-    fn ok(path: &Path, kind: ManifestKind, status: PthStatus) -> Self {
+    fn ok(path: &Path, status: PthStatus) -> Self {
         Self {
             path: path.display().to_string(),
-            kind,
             status,
             error: None,
         }
     }
-    fn err(path: &Path, kind: ManifestKind, msg: impl Into<String>) -> Self {
+    fn err(path: &Path, msg: impl Into<String>) -> Self {
         Self {
             path: path.display().to_string(),
-            kind,
             status: PthStatus::Error,
             error: Some(msg.into()),
         }
+    }
+}
+
+/// Shared tail of add/remove: `None` means already in the desired state,
+/// `Some(new_content)` is written atomically (unless `dry_run`).
+async fn finish(
+    path: &Path,
+    dry_run: bool,
+    outcome: Result<Option<String>, String>,
+) -> PthEditResult {
+    match outcome {
+        Ok(None) => PthEditResult::ok(path, PthStatus::AlreadyConfigured),
+        Ok(Some(new_content)) => {
+            if !dry_run {
+                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
+                    return PthEditResult::err(path, e.to_string());
+                }
+            }
+            PthEditResult::ok(path, PthStatus::Updated)
+        }
+        Err(e) => PthEditResult::err(path, e),
     }
 }
 
@@ -72,26 +91,14 @@ pub async fn add_hook_dependency(path: &Path, kind: ManifestKind, dry_run: bool)
         {
             String::new()
         }
-        Err(e) => return PthEditResult::err(path, kind, e.to_string()),
+        Err(e) => return PthEditResult::err(path, e.to_string()),
     };
 
     let outcome = match kind {
         ManifestKind::Pyproject => pyproject_add(&content),
-        ManifestKind::Requirements => requirements_add(&content),
+        ManifestKind::Requirements => Ok(requirements_add(&content)),
     };
-
-    match outcome {
-        Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
-        Ok(Some(new_content)) => {
-            if !dry_run {
-                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
-                    return PthEditResult::err(path, kind, e.to_string());
-                }
-            }
-            PthEditResult::ok(path, kind, PthStatus::Updated)
-        }
-        Err(e) => PthEditResult::err(path, kind, e),
-    }
+    finish(path, dry_run, outcome).await
 }
 
 /// Remove the hook dependency from a manifest. Idempotent (already-absent ->
@@ -105,82 +112,48 @@ pub async fn remove_hook_dependency(
         Ok(c) => c,
         // Nothing on disk → nothing to remove (idempotent no-op).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured)
+            return PthEditResult::ok(path, PthStatus::AlreadyConfigured)
         }
-        Err(e) => return PthEditResult::err(path, kind, e.to_string()),
+        Err(e) => return PthEditResult::err(path, e.to_string()),
     };
 
     let outcome = match kind {
         ManifestKind::Pyproject => pyproject_remove(&content),
-        ManifestKind::Requirements => requirements_remove(&content),
+        ManifestKind::Requirements => Ok(requirements_remove(&content)),
     };
-
-    match outcome {
-        Ok(None) => PthEditResult::ok(path, kind, PthStatus::AlreadyConfigured),
-        Ok(Some(new_content)) => {
-            if !dry_run {
-                if let Err(e) = atomic_write_bytes(path, new_content.as_bytes()).await {
-                    return PthEditResult::err(path, kind, e.to_string());
-                }
-            }
-            PthEditResult::ok(path, kind, PthStatus::Updated)
-        }
-        Err(e) => PthEditResult::err(path, kind, e),
-    }
+    finish(path, dry_run, outcome).await
 }
 
 // ── requirements.txt ────────────────────────────────────────────────────────
-
-/// The file's dominant newline style, so edits don't rewrite CRLF as LF.
-fn newline_of(content: &str) -> &'static str {
-    if content.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    }
-}
+// The dominant-newline probe (`detect_eol`) keeps CRLF files CRLF.
 
 /// Returns `Some(new_content)` if a line was appended, `None` if already there.
-fn requirements_add(content: &str) -> Result<Option<String>, String> {
-    if content
-        .lines()
-        .any(|l| deps_contain_hook(strip_requirement_comment(l)))
-    {
-        return Ok(None);
+fn requirements_add(content: &str) -> Option<String> {
+    if deps_contain_hook(content) {
+        return None;
     }
-    let nl = newline_of(content);
+    let nl = detect_eol(content);
     let mut new = content.to_string();
     if !new.is_empty() && !new.ends_with('\n') {
         new.push_str(nl);
     }
     new.push_str(HOOK_DEP);
     new.push_str(nl);
-    Ok(Some(new))
+    Some(new)
 }
 
 /// Returns `Some(new_content)` if any hook line was removed, `None` otherwise.
-fn requirements_remove(content: &str) -> Result<Option<String>, String> {
-    let kept: Vec<&str> = content
-        .lines()
-        .filter(|l| !deps_contain_hook(strip_requirement_comment(l)))
-        .collect();
+fn requirements_remove(content: &str) -> Option<String> {
+    let kept: Vec<&str> = content.lines().filter(|l| !deps_contain_hook(l)).collect();
     if kept.len() == content.lines().count() {
-        return Ok(None);
+        return None;
     }
-    let nl = newline_of(content);
+    let nl = detect_eol(content);
     let mut new = kept.join(nl);
     if !new.is_empty() {
         new.push_str(nl);
     }
-    Ok(Some(new))
-}
-
-/// Strip a trailing `# comment` so we match against the requirement spec only.
-fn strip_requirement_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(i) => &line[..i],
-        None => line,
-    }
+    Some(new)
 }
 
 // ── pyproject.toml ───────────────────────────────────────────────────────────
@@ -244,8 +217,8 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
 }
 
 /// Ensure `parent[key]` is a table, creating it if absent. Errors if present
-/// but a non-table. Also used by the cargo vendor backend's
-/// `[patch.crates-io]` editing (`patch::vendor::cargo_config`).
+/// but a non-table. Also used by the vendor backends' TOML editing
+/// (`patch::vendor::cargo_config`, `patch::vendor::pypi_uv`).
 pub(crate) fn ensure_table<'a>(
     parent: &'a mut Table,
     key: &str,
@@ -274,7 +247,7 @@ fn pep621_add(doc: &mut DocumentMut) -> Result<bool, String> {
         .ok_or("`project.dependencies` is not an array")?;
     if deps
         .iter()
-        .any(|v| v.as_str().map(spec_is_hook).unwrap_or(false))
+        .any(|v| v.as_str().map(deps_contain_hook).unwrap_or(false))
     {
         return Ok(false);
     }
@@ -293,7 +266,7 @@ fn pep621_remove(doc: &mut DocumentMut) -> bool {
         None => return false,
     };
     let before = deps.len();
-    deps.retain(|v| !v.as_str().map(spec_is_hook).unwrap_or(false));
+    deps.retain(|v| !v.as_str().map(deps_contain_hook).unwrap_or(false));
     deps.len() != before
 }
 
@@ -426,7 +399,7 @@ pub fn pyproject_contains_hook(content: &str) -> bool {
         .and_then(Item::as_array)
         .map(|deps| {
             deps.iter()
-                .any(|v| v.as_str().map(spec_is_hook).unwrap_or(false))
+                .any(|v| v.as_str().map(deps_contain_hook).unwrap_or(false))
         })
         .unwrap_or(false);
     if in_pep621 {
@@ -464,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_requirements_add() {
-        let out = requirements_add("requests==2.31.0\n").unwrap().unwrap();
+        let out = requirements_add("requests==2.31.0\n").unwrap();
         assert!(out.contains("requests==2.31.0"));
         assert!(out.contains("socket-patch[hook]"));
         assert!(out.ends_with('\n'));
@@ -472,31 +445,27 @@ mod tests {
 
     #[test]
     fn test_requirements_add_no_trailing_newline() {
-        let out = requirements_add("requests").unwrap().unwrap();
+        let out = requirements_add("requests").unwrap();
         assert_eq!(out, "requests\nsocket-patch[hook]\n");
     }
 
     #[test]
     fn test_requirements_add_idempotent() {
         // The extra, the standalone wheel, and a pinned variant are all recognized.
-        assert!(requirements_add("socket-patch[hook]\n").unwrap().is_none());
-        assert!(requirements_add("socket-patch-hook\n").unwrap().is_none());
-        assert!(requirements_add("socket-patch-hook==3.3.0\n")
-            .unwrap()
-            .is_none());
+        assert!(requirements_add("socket-patch[hook]\n").is_none());
+        assert!(requirements_add("socket-patch-hook\n").is_none());
+        assert!(requirements_add("socket-patch-hook==3.3.0\n").is_none());
     }
 
     #[test]
     fn test_requirements_remove() {
-        let out = requirements_remove("requests\nsocket-patch[hook]\n")
-            .unwrap()
-            .unwrap();
+        let out = requirements_remove("requests\nsocket-patch[hook]\n").unwrap();
         assert_eq!(out, "requests\n");
     }
 
     #[test]
     fn test_requirements_remove_absent() {
-        assert!(requirements_remove("requests\n").unwrap().is_none());
+        assert!(requirements_remove("requests\n").is_none());
     }
 
     // ── pyproject PEP 621 ────────────────────────────────────────────
@@ -679,9 +648,9 @@ mod tests {
 
     #[test]
     fn test_requirements_preserves_crlf() {
-        let out = requirements_add("requests\r\n").unwrap().unwrap();
+        let out = requirements_add("requests\r\n").unwrap();
         assert_eq!(out, "requests\r\nsocket-patch[hook]\r\n");
-        let removed = requirements_remove(&out).unwrap().unwrap();
+        let removed = requirements_remove(&out).unwrap();
         assert_eq!(removed, "requests\r\n");
     }
 

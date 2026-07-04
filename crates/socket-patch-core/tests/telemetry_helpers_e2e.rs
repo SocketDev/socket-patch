@@ -238,7 +238,7 @@ fn with_home<T>(home: &str, f: impl FnOnce() -> T) -> T {
         .iter()
         .map(|k| (*k, std::env::var(k).ok()))
         .collect();
-    // home_dir_string() reads HOME first, then USERPROFILE. Clear USERPROFILE
+    // The home lookup reads HOME first, then USERPROFILE. Clear USERPROFILE
     // so HOME is unambiguously the source on every platform.
     std::env::remove_var("USERPROFILE");
     std::env::set_var("HOME", home);

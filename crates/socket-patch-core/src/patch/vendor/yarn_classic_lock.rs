@@ -31,8 +31,8 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
 use super::common::{already_patched_result, detect_eol, refused};
-use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -75,24 +75,9 @@ pub async fn vendor_yarn_classic(
 
     // ── 2. Lockfile ───────────────────────────────────────────────────────
     let lock_path = project_root.join(YARN_LOCK);
-    let text = match tokio::fs::read_to_string(&lock_path).await {
+    let text = match read_yarn_lock(project_root).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "no {YARN_LOCK} at {} — vendoring rewires the lockfile, so one must \
-                     exist (run `yarn install` first)",
-                    project_root.display()
-                ),
-            );
-        }
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("cannot read {YARN_LOCK}: {e}"),
-            );
-        }
+        Err(outcome) => return *outcome,
     };
     // Defensive re-sniff: the flavor router already separates classic from
     // berry, but rewriting a berry lock with classic grammar would corrupt
@@ -162,9 +147,8 @@ pub async fn vendor_yarn_classic(
 
     // ── 8. Lock rewrite: splice each candidate block, byte-preserving ─────
     let eol = detect_eol(&text);
-    let mut new_text = text.clone();
+    let mut new_text = text;
     let mut wiring: Vec<WiringRecord> = Vec::new();
-    let mut recomputed_deps = false;
     for key in &candidate_keys {
         let edit = {
             let blocks = scan_blocks(&new_text);
@@ -204,12 +188,9 @@ pub async fn vendor_yarn_classic(
         if let Some((replaced, rec)) = edit {
             new_text = replaced;
             wiring.push(rec);
-            if staged_pkg_json.is_some() {
-                recomputed_deps = true;
-            }
         }
     }
-    if recomputed_deps {
+    if staged_pkg_json.is_some() && !wiring.is_empty() {
         warnings.push(VendorWarning::new(
             "vendor_dep_manifest_rewritten",
             format!(
@@ -280,14 +261,11 @@ pub async fn revert_yarn_classic(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
-    // SECURITY: `entry.uuid` comes from the committed, tamper-able
-    // state.json and names the directory tree we are about to DELETE —
-    // validate fail-closed before any disk access.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    // SECURITY: shared fail-closed guard on the tamper-able uuid, before any
+    // disk access.
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();
@@ -331,11 +309,13 @@ pub async fn revert_yarn_classic(
     if let Some(mut text) = text {
         let mut changed = false;
         for rec in records {
-            revert_one_block(
+            changed |= revert_recorded_block(
                 &mut text,
                 rec,
                 &entry.uuid,
-                &mut changed,
+                KIND_LOCK_BLOCK,
+                "lock block",
+                |lines| classic_field(lines, "resolved"),
                 &mut outcome.warnings,
             );
         }
@@ -355,50 +335,58 @@ pub async fn revert_yarn_classic(
 
 /// Apply one wiring record in reverse: restore `original` iff the live block
 /// is still ours (drift = a third party re-resolved it; leave theirs alone,
-/// with a warning).
-fn revert_one_block(
+/// with a warning). Returns true when the block was restored.
+///
+/// Shared by the classic and berry lock reverts, which differ only in the
+/// wiring `kind` they own, the noun their warnings use (`lock block` vs
+/// `lock entry`), and the field carrying the vendor path — `vendor_field`
+/// reads it (classic `resolved` / berry `resolution`).
+pub(super) fn revert_recorded_block(
     text: &mut String,
     rec: &WiringRecord,
     entry_uuid: &str,
-    changed: &mut bool,
+    expected_kind: &str,
+    noun: &str,
+    vendor_field: fn(&[String]) -> Option<&str>,
     warnings: &mut Vec<VendorWarning>,
-) {
+) -> bool {
     let Some(key) = rec.key.as_deref() else {
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!("wiring record in {} has no key; left alone", rec.file),
         ));
-        return;
+        return false;
     };
-    if rec.kind != KIND_LOCK_BLOCK {
+    if rec.kind != expected_kind {
         // Forward compatibility: an unknown kind from a newer binary
         // degrades to a warning (see state.rs schema docs).
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!("unknown wiring kind `{}` for `{key}`; left alone", rec.kind),
         ));
-        return;
+        return false;
     }
     let edit = {
         let blocks = scan_blocks(text);
         let Some(block) = blocks.iter().find(|b| b.key == key) else {
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("lock block `{key}` no longer exists; nothing to restore"),
+                format!("{noun} `{key}` no longer exists; nothing to restore"),
             ));
-            return;
+            return false;
         };
-        // Ownership gate: the live block's resolved must still point into
-        // OUR uuid dir — anything else means a third party re-resolved it.
-        let ours = classic_field(&block.lines, "resolved")
+        // Ownership gate: the live block's vendor field must still point
+        // into OUR uuid dir — anything else means a third party re-resolved
+        // it.
+        let ours = vendor_field(&block.lines)
             .and_then(parse_vendor_path)
             .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
-                format!("lock block `{key}` was re-resolved since vendoring; left alone"),
+                format!("{noun} `{key}` was re-resolved since vendoring; left alone"),
             ));
-            return;
+            return false;
         }
         let Some(original) = rec.original.as_ref().and_then(json_to_lines) else {
             // The record rewrote one of our own earlier edits, so there is
@@ -407,21 +395,20 @@ fn revert_one_block(
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
-                    "lock block `{key}` has no recorded pre-vendor original; left as-is \
+                    "{noun} `{key}` has no recorded pre-vendor original; left as-is \
                      (re-run `yarn install` to re-resolve it from the registry)"
                 ),
             ));
-            return;
+            return false;
         };
         replace_block(text, block, &original, detect_eol(text))
     };
     *text = edit;
-    *changed = true;
+    true
 }
 
 // ─────────────────────────── block classification ───────────────────────────
 
-#[derive(Debug)]
 enum BlockClass {
     /// Rewritable instance of the target package.
     Candidate,
@@ -559,8 +546,28 @@ fn is_tarball_path(path: &str) -> bool {
 // (pub(super): the berry backend reuses the same block grammar — key line at
 // column 0 ending `:`, indented body, blank-line separated)
 
+/// Read the project's `yarn.lock` for a vendor run, refusing fail-closed
+/// when it is missing or unreadable (vendoring rewires the lockfile, so one
+/// must exist). Shared verbatim by the classic and berry backends.
+pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<VendorOutcome>> {
+    match tokio::fs::read_to_string(project_root.join(YARN_LOCK)).await {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Box::new(refused(
+            "vendor_lockfile_missing",
+            format!(
+                "no {YARN_LOCK} at {} — vendoring rewires the lockfile, so one must \
+                 exist (run `yarn install` first)",
+                project_root.display()
+            ),
+        ))),
+        Err(e) => Err(Box::new(refused(
+            "vendor_lockfile_missing",
+            format!("cannot read {YARN_LOCK}: {e}"),
+        ))),
+    }
+}
+
 /// One key-line block of a yarn lockfile (classic or berry).
-#[derive(Debug)]
 pub(super) struct LockBlock {
     /// Byte offset of the key line's first byte.
     pub start: usize,
@@ -722,7 +729,7 @@ pub(super) fn pattern_real_name(pattern: &str) -> Option<&str> {
 
 /// yarn v1's lockfile key quoting (stringify.js `shouldWrapKey`): wrap when
 /// the key would not parse bare.
-pub(super) fn quote_yarn_key(key: &str) -> String {
+fn quote_yarn_key(key: &str) -> String {
     let needs = key.is_empty()
         || key.starts_with("true")
         || key.starts_with("false")

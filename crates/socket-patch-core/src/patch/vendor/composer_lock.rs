@@ -490,7 +490,7 @@ async fn composer_service_copy(
             ComposerServiceCopy::FallBack
         }
     };
-    match fetch_verified_archive(cfg, &record.uuid, pkg).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             let _ = remove_tree(copy_dir).await;
             if let Err(e) = tokio::fs::create_dir_all(copy_dir).await {

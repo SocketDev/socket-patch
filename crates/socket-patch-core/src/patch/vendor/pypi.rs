@@ -663,16 +663,8 @@ async fn acquire_patched_wheel(
         // A dry run previews the local build; the service is only consulted for
         // a real vendor.
         if cfg.service_enabled() && !dry_run {
-            match try_pypi_service_wheel(
-                base,
-                raw_name,
-                uuid_dir_rel,
-                project_root,
-                record,
-                cfg,
-                warnings,
-            )
-            .await
+            match try_pypi_service_wheel(base, uuid_dir_rel, project_root, record, cfg, warnings)
+                .await
             {
                 PypiServiceWheel::Used(acq) => return Ok(*acq),
                 PypiServiceWheel::HardFail(outcome) => return Err(*outcome),
@@ -736,7 +728,6 @@ enum PypiServiceWheel {
 /// `auto` and a hard fail under `service`.
 async fn try_pypi_service_wheel(
     base: &str,
-    name: &str,
     uuid_dir_rel: &str,
     project_root: &Path,
     record: &PatchRecord,
@@ -761,7 +752,7 @@ async fn try_pypi_service_wheel(
         }
     };
 
-    match fetch_verified_archive(cfg, &record.uuid, name).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             let Some(wheel_name) = wheel_filename_from_url(&archive.source_url) else {
                 return miss(

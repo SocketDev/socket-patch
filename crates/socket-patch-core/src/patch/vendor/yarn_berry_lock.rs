@@ -41,14 +41,16 @@ use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
 use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
-use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack, tgz_rel_leaf};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::npm_common::{
+    done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, json_to_lines, lines_to_json, replace_block, scan_blocks,
-    split_key_patterns, split_pattern, LockBlock,
+    body_field_line, lines_to_json, read_yarn_lock, replace_block, revert_recorded_block,
+    scan_blocks, split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -94,25 +96,9 @@ pub async fn vendor_yarn_berry(
     let spec = format!("file:./{rel_tgz}");
 
     // ── 2. Lockfile + cacheKey gate ───────────────────────────────────────
-    let lock_path = project_root.join(YARN_LOCK);
-    let lock_text = match tokio::fs::read_to_string(&lock_path).await {
+    let lock_text = match read_yarn_lock(project_root).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "no {YARN_LOCK} at {} — vendoring rewires the lockfile, so one must \
-                     exist (run `yarn install` first)",
-                    project_root.display()
-                ),
-            );
-        }
-        Err(e) => {
-            return refused(
-                "vendor_lockfile_missing",
-                format!("cannot read {YARN_LOCK}: {e}"),
-            );
-        }
+        Err(outcome) => return *outcome,
     };
     let blocks = scan_blocks(&lock_text);
     let Some(meta) = blocks.iter().find(|b| b.key == "__metadata") else {
@@ -243,8 +229,8 @@ pub async fn vendor_yarn_berry(
     }
 
     // ── 6. The single replaceable lock entry ──────────────────────────────
-    let target = match scan_berry_target(&blocks, name, version) {
-        Ok(Some(t)) => t,
+    let (target, target_is_ours) = match scan_berry_target(&blocks, name, version) {
+        Ok(Some((idx, is_ours))) => (&blocks[idx], is_ours),
         Ok(None) => {
             return refused(
                 "vendor_lock_entry_not_found",
@@ -326,15 +312,23 @@ pub async fn vendor_yarn_berry(
             ),
         ));
     }
-    let new_lines = build_entry_lines(&lock_key, version, &resolution, &checksum, &carried);
+    // The exact entry yarn 4 emits for a resolutions-driven `file:` tarball
+    // (spike B3, verbatim), carried sections in yarn's position between
+    // `resolution` and `checksum`.
+    let mut new_lines = vec![
+        format!("{lock_key}:"),
+        format!("  version: {version}"),
+        format!("  resolution: \"{resolution}\""),
+    ];
+    new_lines.extend(carried);
+    new_lines.push(format!("  checksum: {checksum}"));
+    new_lines.push("  languageName: node".to_string());
+    new_lines.push("  linkType: hard".to_string());
 
     // ── 10. In-sync hot path: nothing to write, nothing to record ─────────
-    let pkg_in_sync = pkg_obj
-        .get("resolutions")
-        .and_then(|r| r.get(name))
-        .and_then(Value::as_str)
-        == Some(spec.as_str());
-    if pkg_in_sync && target.is_ours && target.lines == new_lines {
+    let existing_res = pkg_obj.get("resolutions").and_then(|r| r.get(name));
+    let pkg_in_sync = existing_res.and_then(Value::as_str) == Some(spec.as_str());
+    if pkg_in_sync && target_is_ours && target.lines == new_lines {
         return VendorOutcome::Done {
             result: already_patched_result(purl, &dest, &record.files),
             entry: None,
@@ -343,10 +337,7 @@ pub async fn vendor_yarn_berry(
     }
 
     // ── 11. Build both new byte images, then commit pkg-first/lock-second ─
-    let existing_entry = pkg_obj
-        .get("resolutions")
-        .and_then(|r| r.get(name))
-        .is_some();
+    let existing_entry = existing_res.is_some();
     let mut new_pkg = pkg.clone();
     {
         let obj = new_pkg.as_object_mut().expect("validated above");
@@ -363,16 +354,7 @@ pub async fn vendor_yarn_berry(
         Ok(b) => b,
         Err(e) => return done_failure(purl, format!("cannot serialize {PACKAGE_JSON}: {e}")),
     };
-    let new_lock_text = {
-        let blocks_now = scan_blocks(&lock_text);
-        let Some(block) = blocks_now.iter().find(|b| b.key == target.key) else {
-            return done_failure(
-                purl,
-                format!("lock entry `{}` vanished mid-rewrite", target.key),
-            );
-        };
-        replace_block(&lock_text, block, &new_lines, detect_eol(&lock_text))
-    };
+    let new_lock_text = replace_block(&lock_text, target, &new_lines, detect_eol(&lock_text));
     if let Err(e) = commit_pair(
         project_root,
         &new_pkg_bytes,
@@ -415,7 +397,7 @@ pub async fn vendor_yarn_berry(
             kind: KIND_LOCK_ENTRY.to_string(),
             action: WiringAction::Rewritten,
             key: Some(lock_key),
-            original: if target.is_ours {
+            original: if target_is_ours {
                 None
             } else {
                 Some(lines_to_json(&target.lines))
@@ -459,13 +441,11 @@ pub async fn revert_yarn_berry(
     project_root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
-    // SECURITY: validate the tamper-able uuid before any disk access — it
-    // names the directory tree this revert DELETES.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    // SECURITY: shared fail-closed guard on the tamper-able uuid, before any
+    // disk access.
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();
@@ -499,11 +479,13 @@ pub async fn revert_yarn_berry(
             Ok(mut text) => {
                 let mut changed = false;
                 for rec in lock_recs {
-                    revert_lock_record(
+                    changed |= revert_recorded_block(
                         &mut text,
                         rec,
                         &entry.uuid,
-                        &mut changed,
+                        KIND_LOCK_ENTRY,
+                        "lock entry",
+                        |lines| berry_field(lines, "resolution"),
                         &mut outcome.warnings,
                     );
                 }
@@ -584,64 +566,6 @@ pub async fn revert_yarn_berry(
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
-
-/// Restore one recorded lock entry iff the live entry is still ours
-/// (resolution parses into `.socket/vendor/npm/<entry.uuid>/…`).
-fn revert_lock_record(
-    text: &mut String,
-    rec: &WiringRecord,
-    entry_uuid: &str,
-    changed: &mut bool,
-    warnings: &mut Vec<VendorWarning>,
-) {
-    let Some(key) = rec.key.as_deref() else {
-        warnings.push(VendorWarning::new(
-            "vendor_lock_entry_drifted",
-            format!("wiring record in {} has no key; left alone", rec.file),
-        ));
-        return;
-    };
-    if rec.kind != KIND_LOCK_ENTRY {
-        warnings.push(VendorWarning::new(
-            "vendor_lock_entry_drifted",
-            format!("unknown wiring kind `{}` for `{key}`; left alone", rec.kind),
-        ));
-        return;
-    }
-    let edit = {
-        let blocks = scan_blocks(text);
-        let Some(block) = blocks.iter().find(|b| b.key == key) else {
-            warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!("lock entry `{key}` no longer exists; nothing to restore"),
-            ));
-            return;
-        };
-        let ours = berry_field(&block.lines, "resolution")
-            .and_then(parse_vendor_path)
-            .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-        if !ours {
-            warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!("lock entry `{key}` was re-resolved since vendoring; left alone"),
-            ));
-            return;
-        }
-        let Some(original) = rec.original.as_ref().and_then(json_to_lines) else {
-            warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "lock entry `{key}` has no recorded pre-vendor original; left as-is \
-                     (re-run `yarn install` to re-resolve it from the registry)"
-                ),
-            ));
-            return;
-        };
-        replace_block(text, block, &original, detect_eol(text))
-    };
-    *text = edit;
-    *changed = true;
-}
 
 /// Remove our resolutions entry iff the live value still points into our
 /// uuid dir; drop the `resolutions` table when that leaves it empty (we only
@@ -737,25 +661,18 @@ async fn commit_pair(
     Ok(())
 }
 
-/// The single lock entry the rewrite replaces.
-struct BerryTarget {
-    /// Verbatim key (no trailing colon, quotes kept).
-    key: String,
-    lines: Vec<String>,
-    /// Already one of our `file:` entries (stale uuid or current).
-    is_ours: bool,
-}
-
-/// Find the one replaceable entry for `name@version`, refusing fail-closed on
-/// anything a bare-name resolutions entry would also move (other versions of
-/// the name, non-npm protocols, ambiguous duplicates).
+/// Find the one replaceable entry for `name@version` — `(index into blocks,
+/// is_ours)`, where `is_ours` means the entry is already one of our `file:`
+/// entries (stale uuid or current) — refusing fail-closed on anything a
+/// bare-name resolutions entry would also move (other versions of the name,
+/// non-npm protocols, ambiguous duplicates).
 fn scan_berry_target(
     blocks: &[LockBlock],
     name: &str,
     version: &str,
-) -> Result<Option<BerryTarget>, (&'static str, String)> {
-    let mut found: Vec<BerryTarget> = Vec::new();
-    for block in blocks {
+) -> Result<Option<(usize, bool)>, (&'static str, String)> {
+    let mut found: Vec<(usize, bool)> = Vec::new();
+    for (idx, block) in blocks.iter().enumerate() {
         if block.key == "__metadata" {
             continue;
         }
@@ -780,11 +697,7 @@ fn scan_berry_target(
         if parsed.iter().all(|(_, r)| r.starts_with("npm:")) {
             let v = berry_field(&block.lines, "version").unwrap_or("");
             if v == version {
-                found.push(BerryTarget {
-                    key: block.key.clone(),
-                    lines: block.lines.clone(),
-                    is_ours: false,
-                });
+                found.push((idx, false));
             } else {
                 // SECURITY/CORRECTNESS: resolutions selectors are name-keyed;
                 // ours would force-move this OTHER version too on the next
@@ -803,11 +716,7 @@ fn scan_berry_target(
             .iter()
             .all(|(_, r)| parse_vendor_path(r).is_some_and(|p| p.eco == "npm"))
         {
-            found.push(BerryTarget {
-                key: block.key.clone(),
-                lines: block.lines.clone(),
-                is_ours: true,
-            });
+            found.push((idx, true));
         } else {
             return Err((
                 "vendor_override_conflict",
@@ -831,26 +740,6 @@ fn scan_berry_target(
             ),
         )),
     }
-}
-
-/// The exact entry yarn 4 emits for a resolutions-driven `file:` tarball
-/// (spike B3, verbatim), with any carried-over sections (dependencies:, …)
-/// in yarn's position between `resolution` and `checksum`.
-fn build_entry_lines(
-    lock_key: &str,
-    version: &str,
-    resolution: &str,
-    checksum: &str,
-    carried: &[String],
-) -> Vec<String> {
-    let mut out = vec![format!("{lock_key}:")];
-    out.push(format!("  version: {version}"));
-    out.push(format!("  resolution: \"{resolution}\""));
-    out.extend(carried.iter().cloned());
-    out.push(format!("  checksum: {checksum}"));
-    out.push("  languageName: node".to_string());
-    out.push("  linkType: hard".to_string());
-    out
 }
 
 /// Body sections of a lock entry that are NOT the five scalar fields we own

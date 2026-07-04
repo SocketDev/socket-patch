@@ -43,50 +43,33 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
         return result;
     }
 
-    let pkg_json = cwd.join("package.json");
-    let pyproject = cwd.join("pyproject.toml");
-    let cargo = cwd.join("Cargo.toml");
-
-    let pkg_json_exists = tokio::fs::metadata(&pkg_json).await.is_ok();
-    let pyproject_exists = tokio::fs::metadata(&pyproject).await.is_ok();
-    let cargo_exists = tokio::fs::metadata(&cargo).await.is_ok();
-
-    // Names of every manifest present, in priority order — used for the
-    // "detected (...)" portion of the multi-manifest warning.
+    // 2. Package manifests, in priority order. `present` collects every
+    // manifest on disk for the "detected (...)" portion of the
+    // multi-manifest warning; `selected` records the manifest ACTUALLY
+    // used — not merely the highest-priority one present, because that
+    // one may fail to parse (invalid JSON, missing version, workspace
+    // inheritance) and fall through to a lower-priority manifest. The
+    // warning must name what we used, otherwise it misreports the source.
+    let manifests: [(&str, fn(&str) -> Option<String>); 3] = [
+        ("package.json", parse_package_json),
+        ("pyproject.toml", parse_pyproject),
+        ("Cargo.toml", parse_cargo_toml),
+    ];
     let mut present = Vec::new();
-    if pkg_json_exists {
-        present.push("package.json");
-    }
-    if pyproject_exists {
-        present.push("pyproject.toml");
-    }
-    if cargo_exists {
-        present.push("Cargo.toml");
-    }
-
-    // Read manifests in priority order, taking the first that yields a
-    // usable PURL. `selected` records the manifest ACTUALLY used — not
-    // merely the highest-priority one present, because that one may fail
-    // to parse (invalid JSON, missing version, workspace inheritance) and
-    // fall through to a lower-priority manifest. The warning must name
-    // what we used, otherwise it misreports the source.
     let mut selected: Option<&str> = None;
-    if pkg_json_exists {
-        if let Some(purl) = read_package_json(&pkg_json).await {
-            result.purl = Some(purl);
-            selected = Some("package.json");
+    for (name, parse) in manifests {
+        let path = cwd.join(name);
+        if tokio::fs::metadata(&path).await.is_err() {
+            continue;
         }
-    }
-    if result.purl.is_none() && pyproject_exists {
-        if let Some(purl) = read_pyproject(&pyproject).await {
-            result.purl = Some(purl);
-            selected = Some("pyproject.toml");
-        }
-    }
-    if result.purl.is_none() && cargo_exists {
-        if let Some(purl) = read_cargo_toml(&cargo).await {
-            result.purl = Some(purl);
-            selected = Some("Cargo.toml");
+        present.push(name);
+        if result.purl.is_none() {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Some(purl) = parse(&content) {
+                    result.purl = Some(purl);
+                    selected = Some(name);
+                }
+            }
         }
     }
 
@@ -105,9 +88,8 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     result
 }
 
-async fn read_package_json(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
-    let v: serde_json::Value = serde_json::from_str(strip_bom(&content)).ok()?;
+fn parse_package_json(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(strip_bom(content)).ok()?;
     let name = v.get("name")?.as_str()?;
     let version = v.get("version")?.as_str()?;
     if name.is_empty() || version.is_empty() {
@@ -118,21 +100,19 @@ async fn read_package_json(path: &Path) -> Option<String> {
     Some(format!("pkg:npm/{name}@{version}"))
 }
 
-async fn read_pyproject(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+fn parse_pyproject(content: &str) -> Option<String> {
     // No BOM strip here, unlike npm/cargo: tomllib (and pip's vendored
     // tomli) reject a BOM'd pyproject.toml outright, so such a file is
     // not a buildable Python project and must keep yielding None.
     // PEP 621 `[project]` takes precedence (newer projects favor it),
     // then fall back to Poetry's `[tool.poetry]` for legacy layouts.
-    let (name, version) = scan_toml_section(&content, "project")
-        .or_else(|| scan_toml_section(&content, "tool.poetry"))?;
+    let (name, version) = scan_toml_section(content, "project")
+        .or_else(|| scan_toml_section(content, "tool.poetry"))?;
     Some(format!("pkg:pypi/{name}@{version}"))
 }
 
-async fn read_cargo_toml(path: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
-    let (name, version) = scan_toml_section(strip_bom(&content), "package")?;
+fn parse_cargo_toml(content: &str) -> Option<String> {
+    let (name, version) = scan_toml_section(strip_bom(content), "package")?;
     Some(format!("pkg:cargo/{name}@{version}"))
 }
 
@@ -358,11 +338,12 @@ fn parse_toml_string_kv(line: &str, key: &str) -> Option<String> {
     if lhs.trim() != key {
         return None;
     }
-    let rhs = rhs[1..].trim(); // drop the leading '=' and surrounding ws
-                               // The value must open with a string delimiter; match it to its twin.
-                               // `'` is a literal string (no escapes), `"` a basic string — for our
-                               // purposes (names/versions, which never contain escaped quotes) the
-                               // first matching delimiter terminates the value in both cases.
+    // Drop the leading '=' and surrounding whitespace. The value must
+    // open with a string delimiter; match it to its twin. `'` is a
+    // literal string (no escapes), `"` a basic string — for our purposes
+    // (names/versions, which never contain escaped quotes) the first
+    // matching delimiter terminates the value in both cases.
+    let rhs = rhs[1..].trim();
     let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
     let stripped = &rhs[quote.len_utf8()..];
     let end = stripped.find(quote)?;

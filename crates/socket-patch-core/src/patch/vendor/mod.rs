@@ -79,9 +79,9 @@ mod pypi_wheel;
 pub mod registry_fetch;
 pub(crate) mod service_fetch;
 mod toml_surgery;
-pub mod verify;
-pub mod yarn_berry_lock;
-pub mod yarn_classic_lock;
+pub(crate) mod verify;
+pub(crate) mod yarn_berry_lock;
+mod yarn_classic_lock;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub use state::{load_state, lookup_entry, save_state, VendorEntry, VendorState, VENDOR_STATE_REL};

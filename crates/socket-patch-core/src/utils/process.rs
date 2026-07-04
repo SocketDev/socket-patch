@@ -16,7 +16,7 @@
 //! production callers either build the helper with the default
 //! runner or thread a singleton.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Run an external binary with the given args and return its
 /// stdout, trimmed, when the spawn succeeded AND the process exited
@@ -26,27 +26,21 @@ use std::process::{Command, Stdio};
 /// non-zero exit status, empty stdout after trim. Stderr is
 /// captured and discarded — the crawlers treat all failures as
 /// "no information", not as errors to surface.
-pub trait CommandRunner: Send + Sync {
+pub trait CommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String>;
 }
 
 /// Default runner: spawns the real binary via `std::process::Command`.
 ///
-/// Stdin is set to /dev/null so the child can't block waiting for
+/// `output()` nulls stdin so the child can't block waiting for
 /// input. stdout is captured; stderr is captured and dropped (we
 /// don't surface CLI diagnostics — the helpers fall back to other
 /// discovery paths on any failure).
-pub struct SystemCommandRunner;
+pub(crate) struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(bin)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .ok()?;
+        let output = Command::new(bin).args(args).output().ok()?;
         if !output.status.success() {
             return None;
         }

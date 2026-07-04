@@ -369,7 +369,7 @@ async fn go_service_redirect(
             GoServiceRedirect::FallBack
         }
     };
-    match fetch_verified_archive(cfg, &record.uuid, module).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             // Clean copy dir; extract the module zip (strip its literal
             // `{module}@{version}/` prefix) into it.

@@ -32,7 +32,10 @@ static WARNED: Lazy<Mutex<HashSet<&'static str>>> = Lazy::new(|| Mutex::new(Hash
 ///
 /// Returns `None` when neither name is set (or both are set to an empty
 /// string, matching the prior call sites' filtering).
-pub fn read_env_with_legacy(new_name: &'static str, legacy_name: &'static str) -> Option<String> {
+pub(crate) fn read_env_with_legacy(
+    new_name: &'static str,
+    legacy_name: &'static str,
+) -> Option<String> {
     if let Ok(v) = std::env::var(new_name) {
         if !v.is_empty() {
             return Some(v);
@@ -47,11 +50,8 @@ pub fn read_env_with_legacy(new_name: &'static str, legacy_name: &'static str) -
     }
 }
 
-/// Print a one-shot deprecation warning. Public so callers that read the
-/// legacy name through other code paths (e.g. clap's `env =` attribute,
-/// which reads only the new name) can still surface the deprecation when
-/// they detect the legacy name was set.
-pub fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
+/// Print a one-shot deprecation warning for a legacy name.
+fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
     let mut warned = match WARNED.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -82,19 +82,6 @@ pub(crate) fn proxy_url_from_env() -> String {
         .unwrap_or_else(|| crate::constants::DEFAULT_PATCH_API_PROXY_URL.to_string())
 }
 
-/// Renamed env vars whose legacy `SOCKET_PATCH_*` names are still honored.
-///
-/// First entry of each tuple is the new name (what clap and current code
-/// read); second is the legacy name that gets a deprecation warning.
-pub const LEGACY_ENV_RENAMES: &[(&str, &str)] = &[
-    ("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"),
-    ("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG"),
-    (
-        "SOCKET_TELEMETRY_DISABLED",
-        "SOCKET_PATCH_TELEMETRY_DISABLED",
-    ),
-];
-
 /// Promote legacy `SOCKET_PATCH_*` env vars to their new `SOCKET_*` names
 /// in-process. When the new name is unset and the legacy name is set, copy
 /// the value over and emit a one-shot deprecation warning to stderr.
@@ -106,7 +93,14 @@ pub const LEGACY_ENV_RENAMES: &[(&str, &str)] = &[
 /// The warning fires unconditionally — even under `--silent` / `--json`
 /// — so the transition signal isn't swallowed in CI logs.
 pub fn promote_legacy_env_vars() {
-    promote_renames(LEGACY_ENV_RENAMES);
+    promote_renames(&[
+        ("SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"),
+        ("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG"),
+        (
+            "SOCKET_TELEMETRY_DISABLED",
+            "SOCKET_PATCH_TELEMETRY_DISABLED",
+        ),
+    ]);
 }
 
 /// Core of [`promote_legacy_env_vars`], parameterized over the rename table so
@@ -114,18 +108,14 @@ pub fn promote_legacy_env_vars() {
 /// read concurrently by other tests in this binary).
 fn promote_renames(renames: &[(&'static str, &'static str)]) {
     for &(new_name, legacy_name) in renames {
-        let new_already_set = std::env::var(new_name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some();
+        let new_already_set = matches!(std::env::var(new_name).as_deref(), Ok(v) if !v.is_empty());
         if new_already_set {
             continue;
         }
-        if let Ok(value) = std::env::var(legacy_name) {
-            if !value.is_empty() {
-                warn_legacy_once(legacy_name, new_name);
-                std::env::set_var(new_name, value);
-            }
+        // New name is unset/empty, so any value returned here came from the
+        // legacy name (with the one-shot warning already emitted).
+        if let Some(value) = read_env_with_legacy(new_name, legacy_name) {
+            std::env::set_var(new_name, value);
         }
     }
 }

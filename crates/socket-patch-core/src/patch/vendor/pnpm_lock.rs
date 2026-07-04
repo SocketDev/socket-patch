@@ -43,8 +43,10 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
-use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack, tgz_rel_leaf};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::npm_common::{
+    done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -341,11 +343,9 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     // SECURITY: `entry.uuid` comes from the committed, tamper-able
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();
@@ -474,8 +474,7 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     if lock_dirty {
         if let Some(lines) = &lock_lines {
             if let Err(e) =
-                atomic_write_bytes(&project_root.join(PNPM_LOCK), lines.join("\n").as_bytes())
-                    .await
+                atomic_write_bytes(&project_root.join(PNPM_LOCK), lines.join("\n").as_bytes()).await
             {
                 return RevertOutcome::failed(format!("cannot write {PNPM_LOCK}: {e}"));
             }
@@ -612,7 +611,8 @@ fn is_vendor_value(value: &str) -> bool {
 /// several versions, and edits must never treat a SIBLING version's
 /// override/entry as their own.
 fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
-    parse_vendor_path(value).is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
+    parse_vendor_path(value)
+        .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
 }
 
 /// How the package.json `pnpm.overrides` table relates to the package

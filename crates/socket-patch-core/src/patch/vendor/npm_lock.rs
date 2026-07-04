@@ -24,8 +24,8 @@ use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::atomic_write_bytes;
 
 use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
-use super::npm_common::{done_failure, guard_coordinates, stage_patch_pack};
-use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
+use super::npm_common::{done_failure, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack};
+use super::path::parse_vendor_path;
 use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -345,11 +345,9 @@ pub async fn revert_npm(entry: &VendorEntry, project_root: &Path, dry_run: bool)
     // state.json and names the directory tree we are about to DELETE.
     // Validate through the same fail-closed grammar vendor used before any
     // disk access — never delete by an unvalidated path.
-    let Some(uuid_dir_rel) = vendor_uuid_dir_rel("npm", &entry.uuid) else {
-        return RevertOutcome::failed(format!(
-            "refusing revert: `{}` is not a canonical patch uuid (tampered state.json?)",
-            entry.uuid
-        ));
+    let uuid_dir_rel = match guard_revert_uuid_dir(&entry.uuid) {
+        Ok(d) => d,
+        Err(outcome) => return outcome,
     };
     if dry_run {
         return RevertOutcome::ok();

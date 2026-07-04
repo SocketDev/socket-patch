@@ -843,7 +843,7 @@ fn rewrite_requires_dist_entry(
         )
     })?;
     let arr_open = rd_rel + "requires-dist = ".len();
-    let arr_end = balanced_span(unit_text, arr_open, '[', ']').ok_or_else(|| {
+    let arr_end = balanced_span(unit_text, arr_open).ok_or_else(|| {
         (
             "pypi_uv_lock_parse_failed",
             "uv.lock requires-dist array is unbalanced".to_string(),
@@ -950,7 +950,7 @@ fn add_manifest_override(
 
     if let Some(ov_rel) = section_text.find("overrides = [") {
         let arr_open = ov_rel + "overrides = ".len();
-        let arr_end = balanced_span(section_text, arr_open, '[', ']').ok_or_else(|| {
+        let arr_end = balanced_span(section_text, arr_open).ok_or_else(|| {
             (
                 "pypi_uv_lock_parse_failed",
                 "uv.lock [manifest] overrides array is unbalanced".to_string(),

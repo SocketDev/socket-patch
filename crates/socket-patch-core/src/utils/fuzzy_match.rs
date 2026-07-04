@@ -1,50 +1,24 @@
 use crate::crawlers::types::CrawledPackage;
 
-// ---------------------------------------------------------------------------
-// MatchType enum
-// ---------------------------------------------------------------------------
-
-/// Match type for sorting results by relevance.
-///
-/// Lower numeric value = better match. The ordering is:
-/// 1. Exact match on full name (including namespace)
-/// 2. Exact match on package name only
-/// 3. Prefix match on full name
-/// 4. Prefix match on package name
-/// 5. Contains match on full name
-/// 6. Contains match on package name
-///
-/// Internal to this module — `fuzzy_match_packages` is the only
-/// external entry point and it returns plain `Vec<CrawledPackage>`
-/// (sorted), so callers never see the match-type tag.
+/// Match type for sorting results by relevance; declaration order is the
+/// ranking (earlier = better). Internal to this module — `fuzzy_match_packages`
+/// is the only external entry point and it returns a plain sorted
+/// `Vec<CrawledPackage>`, so callers never see the match-type tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum MatchType {
     /// Exact match on full name (including namespace).
-    ExactFull = 0,
+    ExactFull,
     /// Exact match on package name only.
-    ExactName = 1,
+    ExactName,
     /// Query is a prefix of the full name.
-    PrefixFull = 2,
+    PrefixFull,
     /// Query is a prefix of the package name.
-    PrefixName = 3,
+    PrefixName,
     /// Query is contained in the full name.
-    ContainsFull = 4,
+    ContainsFull,
     /// Query is contained in the package name.
-    ContainsName = 5,
+    ContainsName,
 }
-
-// ---------------------------------------------------------------------------
-// Internal match result
-// ---------------------------------------------------------------------------
-
-struct MatchResult {
-    package: CrawledPackage,
-    match_type: MatchType,
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 /// Get the full display name for a package (including namespace if present).
 fn get_full_name(pkg: &CrawledPackage) -> String {
@@ -54,43 +28,25 @@ fn get_full_name(pkg: &CrawledPackage) -> String {
     }
 }
 
-/// Determine the match type for a package against a query.
-/// Returns `None` if there is no match.
-fn get_match_type(pkg: &CrawledPackage, query: &str) -> Option<MatchType> {
-    let lower_query = query.to_lowercase();
-    let full_name = get_full_name(pkg).to_lowercase();
-    let name = pkg.name.to_lowercase();
-
-    // Check exact matches
-    if full_name == lower_query {
-        return Some(MatchType::ExactFull);
+/// Determine the match type for a package against a query, or `None` if there
+/// is no match. All inputs must already be lowercased.
+fn get_match_type(full_name: &str, name: &str, query: &str) -> Option<MatchType> {
+    if full_name == query {
+        Some(MatchType::ExactFull)
+    } else if name == query {
+        Some(MatchType::ExactName)
+    } else if full_name.starts_with(query) {
+        Some(MatchType::PrefixFull)
+    } else if name.starts_with(query) {
+        Some(MatchType::PrefixName)
+    } else if full_name.contains(query) {
+        Some(MatchType::ContainsFull)
+    } else if name.contains(query) {
+        Some(MatchType::ContainsName)
+    } else {
+        None
     }
-    if name == lower_query {
-        return Some(MatchType::ExactName);
-    }
-
-    // Check prefix matches
-    if full_name.starts_with(&lower_query) {
-        return Some(MatchType::PrefixFull);
-    }
-    if name.starts_with(&lower_query) {
-        return Some(MatchType::PrefixName);
-    }
-
-    // Check contains matches
-    if full_name.contains(&lower_query) {
-        return Some(MatchType::ContainsFull);
-    }
-    if name.contains(&lower_query) {
-        return Some(MatchType::ContainsName);
-    }
-
-    None
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Fuzzy match packages against a query string.
 ///
@@ -108,38 +64,28 @@ pub fn fuzzy_match_packages(
     packages: &[CrawledPackage],
     limit: usize,
 ) -> Vec<CrawledPackage> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
         return Vec::new();
     }
 
-    let mut matches: Vec<MatchResult> = Vec::new();
+    let mut matches: Vec<(MatchType, String, CrawledPackage)> = packages
+        .iter()
+        .filter_map(|pkg| {
+            let full_name = get_full_name(pkg).to_lowercase();
+            let match_type = get_match_type(&full_name, &pkg.name.to_lowercase(), &query)?;
+            Some((match_type, full_name, pkg.clone()))
+        })
+        .collect();
 
-    for pkg in packages {
-        if let Some(match_type) = get_match_type(pkg, trimmed) {
-            matches.push(MatchResult {
-                package: pkg.clone(),
-                match_type,
-            });
-        }
-    }
+    // Sort by match type (lower is better), then alphabetically by full name.
+    // Matching is case-insensitive, so the tie-break compares the lowercased
+    // full name too — otherwise byte order sorts uppercase ('Z' = 0x5A) before
+    // lowercase ('a' = 0x61), which is not alphabetical and can flip which
+    // package lands at `matches[0]`.
+    matches.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
 
-    // Sort by match type (lower is better), then alphabetically by full name
-    matches.sort_by(|a, b| {
-        let type_cmp = a.match_type.cmp(&b.match_type);
-        if type_cmp != std::cmp::Ordering::Equal {
-            return type_cmp;
-        }
-        // Tie-break alphabetically by full name. Matching is case-insensitive,
-        // so the ordering must be too — otherwise byte order sorts uppercase
-        // ('Z' = 0x5A) before lowercase ('a' = 0x61), which is not alphabetical
-        // and can flip which package lands at `matches[0]`.
-        get_full_name(&a.package)
-            .to_lowercase()
-            .cmp(&get_full_name(&b.package).to_lowercase())
-    });
-
-    matches.into_iter().take(limit).map(|m| m.package).collect()
+    matches.into_iter().take(limit).map(|m| m.2).collect()
 }
 
 #[cfg(test)]

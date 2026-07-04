@@ -11,7 +11,7 @@
 //! the latter become aliases. When two patches fix the same vuln ID
 //! they merge into one statement with both PURLs as subcomponents.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::manifest::schema::PatchManifest;
 use crate::vex::schema::{
@@ -42,39 +42,21 @@ pub struct BuildOptions {
 /// `applied` are silently dropped — see the design note in
 /// `vex::verify` for why we never emit `affected`.
 ///
+/// PURLs in `vendored` (a subset of `applied`, from
+/// `VerifyOutcome::vendored`) carry the impact-statement phrasing
+/// "Patched via Socket patch `<uuid>` (vendored)" so the attestation
+/// records that the evidence is the committed `.socket/vendor/`
+/// artifact, not the installed tree. PURLs in `redirected` (pointed at
+/// Socket's hosted vendored patches by `scan --redirect`) carry
+/// "(redirected)" instead. The two sets are disjoint in practice
+/// (`--redirect` conflicts with `--vendor`); if a PURL somehow appears
+/// in both, `vendored` wins. Status and justification are identical
+/// across all three phrasings.
+///
 /// Returns `None` when no statements can be emitted (no applied
 /// patches matched the manifest). The CLI converts `None` into a
 /// non-zero exit code per the agreed contract.
 pub fn build_document(
-    manifest: &PatchManifest,
-    applied: &[String],
-    opts: &BuildOptions,
-) -> Option<Document> {
-    build_document_with_vendored(manifest, applied, &[], opts)
-}
-
-/// [`build_document`] with vendored-patch awareness: PURLs in `vendored`
-/// (a subset of `applied`, from `VerifyOutcome::vendored`) carry the
-/// impact-statement phrasing "Patched via Socket patch `<uuid>` (vendored)"
-/// so the attestation records that the evidence is the committed
-/// `.socket/vendor/` artifact, not the installed tree. Status and
-/// justification are identical to the non-vendored form.
-pub fn build_document_with_vendored(
-    manifest: &PatchManifest,
-    applied: &[String],
-    vendored: &[String],
-    opts: &BuildOptions,
-) -> Option<Document> {
-    build_document_with_provenance(manifest, applied, vendored, &[], opts)
-}
-
-/// [`build_document_with_vendored`] extended with a `redirected` set (PURLs
-/// pointed at Socket's hosted vendored patches by `scan --redirect`). A
-/// redirected PURL carries the phrasing "Patched via Socket patch `<uuid>`
-/// (redirected)". `vendored` and `redirected` are disjoint in practice
-/// (`--redirect` conflicts with `--vendor`); if a PURL somehow appears in
-/// both, `vendored` wins. Status and justification are unchanged.
-pub fn build_document_with_provenance(
     manifest: &PatchManifest,
     applied: &[String],
     vendored: &[String],
@@ -82,15 +64,14 @@ pub fn build_document_with_provenance(
     opts: &BuildOptions,
 ) -> Option<Document> {
     let timestamp = now_rfc3339();
-    let applied_set: std::collections::HashSet<&str> = applied.iter().map(|s| s.as_str()).collect();
-    let vendored_set: std::collections::HashSet<&str> =
-        vendored.iter().map(|s| s.as_str()).collect();
-    let redirected_set: std::collections::HashSet<&str> =
-        redirected.iter().map(|s| s.as_str()).collect();
+    let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let vendored_set: HashSet<&str> = vendored.iter().map(String::as_str).collect();
+    let redirected_set: HashSet<&str> = redirected.iter().map(String::as_str).collect();
 
     // vuln-id -> (aliases, impact-statement parts, subcomponent PURLs)
-    // BTreeMap keeps statement order deterministic by vuln id, which
-    // helps reproducibility for downstream diffs.
+    // BTreeMap/BTreeSet keep every output field sorted, which keeps
+    // statement order deterministic and helps reproducibility for
+    // downstream diffs.
     let mut grouped: BTreeMap<String, VulnGroup> = BTreeMap::new();
 
     for (purl, record) in &manifest.patches {
@@ -99,15 +80,11 @@ pub fn build_document_with_provenance(
         }
         for (vuln_id, info) in &record.vulnerabilities {
             let entry = grouped.entry(vuln_id.clone()).or_default();
-            for cve in &info.cves {
-                if !entry.aliases.contains(cve) {
-                    entry.aliases.push(cve.clone());
-                }
-            }
+            entry.aliases.extend(info.cves.iter().cloned());
             entry.subcomponents.insert(purl.clone());
             entry
                 .impact_parts
-                .push(if vendored_set.contains(purl.as_str()) {
+                .insert(if vendored_set.contains(purl.as_str()) {
                     format!("Patched via Socket patch {} (vendored)", record.uuid)
                 } else if redirected_set.contains(purl.as_str()) {
                     format!("Patched via Socket patch {} (redirected)", record.uuid)
@@ -123,12 +100,8 @@ pub fn build_document_with_provenance(
 
     let mut statements = Vec::with_capacity(grouped.len());
     for (vuln_id, group) in grouped {
-        let mut aliases = group.aliases;
-        aliases.sort();
-
-        let mut subcomponent_ids: Vec<String> = group.subcomponents.into_iter().collect();
-        subcomponent_ids.sort();
-        let subcomponents = subcomponent_ids
+        let subcomponents = group
+            .subcomponents
             .into_iter()
             .map(|id| Subcomponent {
                 id,
@@ -137,25 +110,28 @@ pub fn build_document_with_provenance(
             })
             .collect();
 
-        let mut parts = group.impact_parts;
-        parts.sort();
-        parts.dedup();
-        // The `parts.is_empty()` branch is unreachable from the
-        // public API: the loop above pushes one entry per applied
+        // The empty-parts branch is unreachable from the public
+        // API: the loop above inserts one entry per applied
         // (purl, vuln) pair, so every group present in `grouped`
         // has ≥1 entry. The defensive `None` arm stays in case a
         // future refactor decouples grouping from impact tracking.
-        let impact_statement = if parts.is_empty() {
+        let impact_statement = if group.impact_parts.is_empty() {
             None
         } else {
-            Some(parts.join("; "))
+            Some(
+                group
+                    .impact_parts
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
         };
 
         statements.push(Statement {
             id: None,
             vulnerability: Vulnerability {
                 name: vuln_id,
-                aliases,
+                aliases: group.aliases.into_iter().collect(),
             },
             timestamp: Some(timestamp.clone()),
             last_updated: None,
@@ -188,9 +164,9 @@ pub fn build_document_with_provenance(
 
 #[derive(Default)]
 struct VulnGroup {
-    aliases: Vec<String>,
-    subcomponents: std::collections::HashSet<String>,
-    impact_parts: Vec<String>,
+    aliases: BTreeSet<String>,
+    subcomponents: BTreeSet<String>,
+    impact_parts: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -240,10 +216,16 @@ mod tests {
         }
     }
 
+    /// [`build_document`] with no vendored/redirected PURLs and the
+    /// default [`opts`].
+    fn build_plain(manifest: &PatchManifest, applied: &[String]) -> Option<Document> {
+        build_document(manifest, applied, &[], &[], &opts())
+    }
+
     #[test]
     fn empty_applied_returns_none() {
         let manifest = PatchManifest::new();
-        assert!(build_document(&manifest, &[], &opts()).is_none());
+        assert!(build_plain(&manifest, &[]).is_none());
     }
 
     #[test]
@@ -254,7 +236,7 @@ mod tests {
             record("u1", vec![("GHSA-aaaa", vec!["CVE-2024-1"])]),
         );
         // applied is empty → no statements → None.
-        assert!(build_document(&manifest, &[], &opts()).is_none());
+        assert!(build_plain(&manifest, &[]).is_none());
     }
 
     #[test]
@@ -264,8 +246,7 @@ mod tests {
             "pkg:npm/lodash@4.0.0".to_string(),
             record("u1", vec![("GHSA-aaaa", vec!["CVE-2024-1"])]),
         );
-        let doc =
-            build_document(&manifest, &["pkg:npm/lodash@4.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/lodash@4.0.0".to_string()]).unwrap();
 
         assert_eq!(doc.statements.len(), 1);
         let st = &doc.statements[0];
@@ -290,7 +271,7 @@ mod tests {
             "pkg:npm/x@1.0.0".to_string(),
             record("u1", vec![("GHSA-bbbb", vec!["CVE-2024-2", "CVE-2024-3"])]),
         );
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/x@1.0.0".to_string()]).unwrap();
         let aliases = &doc.statements[0].vulnerability.aliases;
         assert_eq!(aliases.len(), 2);
         // Sorted for determinism.
@@ -310,10 +291,9 @@ mod tests {
             record("u2", vec![("GHSA-cccc", vec!["CVE-A"])]),
         );
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &["pkg:npm/x@1.0.0".to_string(), "pkg:npm/y@2.0.0".to_string()],
-            &opts(),
         )
         .unwrap();
 
@@ -340,7 +320,7 @@ mod tests {
             ),
         );
 
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/x@1.0.0".to_string()]).unwrap();
         assert_eq!(doc.statements.len(), 2);
         // BTreeMap order → sorted by vuln id.
         assert_eq!(doc.statements[0].vulnerability.name, "GHSA-aaaa");
@@ -354,7 +334,7 @@ mod tests {
             "pkg:npm/x@1.0.0".to_string(),
             record("u1", vec![("GHSA-aaaa", vec![])]),
         );
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/x@1.0.0".to_string()]).unwrap();
         assert_eq!(doc.context, OPENVEX_CONTEXT_V0_2_0);
         assert_eq!(doc.id, "urn:uuid:test");
         assert_eq!(doc.author, "Socket");
@@ -374,13 +354,12 @@ mod tests {
             record("u1", vec![("GHSA-aaaa", vec!["CVE-1"])]),
         );
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &[
                 "pkg:npm/in-manifest@1.0.0".to_string(),
                 "pkg:npm/ghost@9.9.9".to_string(), // not in manifest
             ],
-            &opts(),
         )
         .unwrap();
 
@@ -404,13 +383,12 @@ mod tests {
             .patches
             .insert("pkg:npm/no-vuln@2.0.0".to_string(), record("u2", vec![]));
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &[
                 "pkg:npm/with-vuln@1.0.0".to_string(),
                 "pkg:npm/no-vuln@2.0.0".to_string(),
             ],
-            &opts(),
         )
         .unwrap();
 
@@ -429,7 +407,7 @@ mod tests {
             "pkg:npm/x@1.0.0".to_string(),
             record("u1", vec![("GHSA-no-cves", vec![])]),
         );
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/x@1.0.0".to_string()]).unwrap();
         assert_eq!(doc.statements[0].vulnerability.aliases.len(), 0);
 
         // Serialize and verify the JSON omits the `aliases` key.
@@ -461,10 +439,9 @@ mod tests {
             ),
         );
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &["pkg:npm/x@1.0.0".to_string(), "pkg:npm/y@2.0.0".to_string()],
-            &opts(),
         )
         .unwrap();
 
@@ -498,10 +475,9 @@ mod tests {
             record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
         );
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &["pkg:npm/x@1.0.0".to_string(), "pkg:npm/x@1.0.1".to_string()],
-            &opts(),
         )
         .unwrap();
         let imp = doc.statements[0].impact_statement.as_ref().unwrap();
@@ -529,7 +505,8 @@ mod tests {
             author: "Socket".to_string(),
             tooling: None,
         };
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts).unwrap();
+        let doc =
+            build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &[], &[], &opts).unwrap();
         assert!(doc.tooling.is_none());
 
         let v = serde_json::to_value(&doc).unwrap();
@@ -551,7 +528,8 @@ mod tests {
             author: String::new(),
             tooling: None,
         };
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts).unwrap();
+        let doc =
+            build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &[], &[], &opts).unwrap();
         assert_eq!(doc.author, "");
     }
 
@@ -579,8 +557,8 @@ mod tests {
 
         let applied = vec!["pkg:npm/x@1.0.0".to_string(), "pkg:npm/y@2.0.0".to_string()];
 
-        let a = build_document(&manifest, &applied, &opts()).unwrap();
-        let b = build_document(&manifest, &applied, &opts()).unwrap();
+        let a = build_plain(&manifest, &applied).unwrap();
+        let b = build_plain(&manifest, &applied).unwrap();
 
         // Sanity-strip the per-run timestamp before comparing.
         let strip = |mut d: Document| -> Document {
@@ -606,7 +584,7 @@ mod tests {
                 vec![("GHSA-a", vec!["CVE-1"]), ("GHSA-b", vec!["CVE-2"])],
             ),
         );
-        let doc = build_document(&manifest, &["pkg:npm/x@1.0.0".to_string()], &opts()).unwrap();
+        let doc = build_plain(&manifest, &["pkg:npm/x@1.0.0".to_string()]).unwrap();
         for st in &doc.statements {
             assert_eq!(st.timestamp.as_deref(), Some(doc.timestamp.as_str()));
         }
@@ -626,10 +604,9 @@ mod tests {
         manifest
             .patches
             .insert("pkg:npm/b@2.0.0".to_string(), record("u2", vec![]));
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &["pkg:npm/a@1.0.0".to_string(), "pkg:npm/b@2.0.0".to_string()],
-            &opts(),
         );
         assert!(
             doc.is_none(),
@@ -694,8 +671,8 @@ mod tests {
             "pkg:npm/aaa@1.0.0".to_string(),
             "pkg:npm/zzz@9.0.0".to_string(),
         ];
-        let da = strip(build_document(&a, &applied, &opts()).unwrap());
-        let db = strip(build_document(&b, &applied, &opts()).unwrap());
+        let da = strip(build_plain(&a, &applied).unwrap());
+        let db = strip(build_plain(&b, &applied).unwrap());
         assert_eq!(da, db, "output must not depend on manifest insertion order");
     }
 
@@ -717,14 +694,13 @@ mod tests {
             record("u-m", vec![("GHSA-shared", vec![])]),
         );
 
-        let doc = build_document(
+        let doc = build_plain(
             &manifest,
             &[
                 "pkg:npm/zzz@1.0.0".to_string(),
                 "pkg:npm/aaa@1.0.0".to_string(),
                 "pkg:npm/mmm@1.0.0".to_string(),
             ],
-            &opts(),
         )
         .unwrap();
 
@@ -735,7 +711,7 @@ mod tests {
         assert_eq!(subs[2].id, "pkg:npm/zzz@1.0.0");
     }
 
-    // ── Vendored-patch phrasing (`build_document_with_vendored`) ──
+    // ── Vendored/redirected-patch phrasing ────────────────────────
 
     /// A vendored PURL's impact statement carries the "(vendored)" suffix;
     /// status/justification stay identical to the non-vendored form.
@@ -747,7 +723,7 @@ mod tests {
             record("u-vend", vec![("GHSA-vvvv", vec!["CVE-2024-7"])]),
         );
         let applied = vec!["pkg:cargo/serde@1.0.0".to_string()];
-        let doc = build_document_with_vendored(&manifest, &applied, &applied, &opts()).unwrap();
+        let doc = build_document(&manifest, &applied, &applied, &[], &opts()).unwrap();
         let st = &doc.statements[0];
         assert_eq!(
             st.impact_statement.as_deref(),
@@ -771,8 +747,7 @@ mod tests {
             record("u-rdir", vec![("GHSA-rrrr", vec!["CVE-2024-8"])]),
         );
         let applied = vec!["pkg:npm/left-pad@1.3.0".to_string()];
-        let doc =
-            build_document_with_provenance(&manifest, &applied, &[], &applied, &opts()).unwrap();
+        let doc = build_document(&manifest, &applied, &[], &applied, &opts()).unwrap();
         let st = &doc.statements[0];
         assert_eq!(
             st.impact_statement.as_deref(),
@@ -796,39 +771,28 @@ mod tests {
             record("u-both", vec![("GHSA-both", vec!["CVE-2024-9"])]),
         );
         let applied = vec!["pkg:cargo/serde@1.0.0".to_string()];
-        let doc = build_document_with_provenance(&manifest, &applied, &applied, &applied, &opts())
-            .unwrap();
+        let doc = build_document(&manifest, &applied, &applied, &applied, &opts()).unwrap();
         assert_eq!(
             doc.statements[0].impact_statement.as_deref(),
             Some("Patched via Socket patch u-both (vendored)")
         );
     }
 
-    /// `build_document` is exactly `build_document_with_vendored(.., &[], ..)`
-    /// — no "(vendored)" phrasing without a vendored set.
+    /// Empty `vendored`/`redirected` sets → the plain phrasing, with
+    /// no "(vendored)" or "(redirected)" suffix.
     #[test]
-    fn build_document_is_empty_vendored_wrapper() {
+    fn empty_provenance_sets_produce_plain_phrasing() {
         let mut manifest = PatchManifest::new();
         manifest.patches.insert(
             "pkg:npm/x@1.0.0".to_string(),
             record("u1", vec![("GHSA-aaaa", vec!["CVE-1"])]),
         );
         let applied = vec!["pkg:npm/x@1.0.0".to_string()];
-        let strip = |mut d: Document| -> Document {
-            d.timestamp = String::new();
-            for s in d.statements.iter_mut() {
-                s.timestamp = None;
-            }
-            d
-        };
-        let a = strip(build_document(&manifest, &applied, &opts()).unwrap());
-        let b = strip(build_document_with_vendored(&manifest, &applied, &[], &opts()).unwrap());
-        assert_eq!(a, b);
-        assert!(!a.statements[0]
-            .impact_statement
-            .as_deref()
-            .unwrap()
-            .contains("(vendored)"));
+        let doc = build_document(&manifest, &applied, &[], &[], &opts()).unwrap();
+        assert_eq!(
+            doc.statements[0].impact_statement.as_deref(),
+            Some("Patched via Socket patch u1")
+        );
     }
 
     /// Same patch UUID across a vendored and a non-vendored PURL sharing a
@@ -847,7 +811,7 @@ mod tests {
         );
         let applied = vec!["pkg:npm/x@1.0.0".to_string(), "pkg:npm/x@1.0.1".to_string()];
         let vendored = vec!["pkg:npm/x@1.0.1".to_string()];
-        let doc = build_document_with_vendored(&manifest, &applied, &vendored, &opts()).unwrap();
+        let doc = build_document(&manifest, &applied, &vendored, &[], &opts()).unwrap();
         let imp = doc.statements[0].impact_statement.as_ref().unwrap();
         assert!(
             imp.contains("Patched via Socket patch shared-uuid (vendored)"),
@@ -880,7 +844,7 @@ mod tests {
             record("shared-uuid", vec![("GHSA-shared", vec!["CVE-1"])]),
         );
         let applied = vec!["pkg:npm/x@1.0.0".to_string(), "pkg:npm/x@1.0.1".to_string()];
-        let doc = build_document_with_vendored(&manifest, &applied, &applied, &opts()).unwrap();
+        let doc = build_document(&manifest, &applied, &applied, &[], &opts()).unwrap();
         let imp = doc.statements[0].impact_statement.as_ref().unwrap();
         assert_eq!(
             imp.matches("shared-uuid").count(),

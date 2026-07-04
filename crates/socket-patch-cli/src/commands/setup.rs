@@ -13,9 +13,12 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
-use socket_patch_core::pth_hook::{
-    add_hook_dependency, deps_contain_hook, detect_python_pm, pyproject_contains_hook,
-    remove_hook_dependency, ManifestKind, PthEditResult, PthStatus, PythonPackageManager,
+use socket_patch_core::pth_hook::detect::{
+    deps_contain_hook, detect_python_pm, PythonPackageManager,
+};
+use socket_patch_core::pth_hook::edit::{
+    add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
+    PthEditResult, PthStatus,
 };
 use socket_patch_core::utils::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches;

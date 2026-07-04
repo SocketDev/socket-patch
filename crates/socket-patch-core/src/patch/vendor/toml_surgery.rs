@@ -1,7 +1,7 @@
 //! Pure text-surgery helpers for lockfile-shaped TOML.
 //!
-//! The pypi/uv backend (and the upcoming poetry/pdm/pipenv ones) edit locks
-//! by TARGETED text surgery rather than a TOML re-serialize: the spike
+//! The pypi/uv, poetry, and pdm backends edit locks by TARGETED text
+//! surgery rather than a TOML re-serialize: the spike
 //! proved a surgical edit reproduces the lock generator's own serializer
 //! output byte-identically, which keeps `--check`-style validations green
 //! and the committed diff minimal. These helpers are the shared, purely
@@ -114,9 +114,9 @@ pub(super) fn replace_files_array(
     files_done.then_some(out)
 }
 
-/// Exclusive end index of the bracket opened at `open_idx` (quote-aware;
+/// Exclusive end index of the `[` array opened at `open_idx` (quote-aware;
 /// TOML basic strings with backslash escapes).
-pub(super) fn balanced_span(text: &str, open_idx: usize, open: char, close: char) -> Option<usize> {
+pub(super) fn balanced_span(text: &str, open_idx: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str = false;
     let mut escaped = false;
@@ -133,12 +133,12 @@ pub(super) fn balanced_span(text: &str, open_idx: usize, open: char, close: char
         }
         if c == '"' {
             in_str = true;
-        } else if c == open {
+        } else if c == '[' {
             depth += 1;
-        } else if c == close {
+        } else if c == ']' {
             depth -= 1;
             if depth == 0 {
-                return Some(open_idx + i + c.len_utf8());
+                return Some(open_idx + i + 1);
             }
         }
     }
@@ -233,11 +233,7 @@ pub(super) fn replace_fragment(
 
 /// Remove the first exact occurrence of `needle`; `None` when absent.
 pub(super) fn remove_substring(text: &str, needle: &str) -> Option<String> {
-    let idx = text.find(needle)?;
-    let mut out = String::with_capacity(text.len() - needle.len());
-    out.push_str(&text[..idx]);
-    out.push_str(&text[idx + needle.len()..]);
-    Some(out)
+    text.contains(needle).then(|| text.replacen(needle, "", 1))
 }
 
 /// Remove the first line that equals `line` exactly; `None` when absent.
@@ -381,10 +377,10 @@ mod tests {
     fn balanced_span_is_quote_aware() {
         let text = "x = [\"a]b\", [1, 2], \"c\\\"]d\"] tail";
         let open = text.find('[').unwrap();
-        let end = balanced_span(text, open, '[', ']').unwrap();
+        let end = balanced_span(text, open).unwrap();
         assert_eq!(&text[open..end], "[\"a]b\", [1, 2], \"c\\\"]d\"]");
         // Unbalanced → None.
-        assert!(balanced_span("[1, 2", 0, '[', ']').is_none());
+        assert!(balanced_span("[1, 2", 0).is_none());
     }
 
     #[test]

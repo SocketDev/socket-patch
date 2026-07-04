@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::detect::PackageManager;
+use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries};
 
 /// Detect the package manager based on lockfiles in the project root.
 /// Checks for pnpm-lock.yaml, pnpm-lock.yml, and pnpm-workspace.yaml.
@@ -346,12 +347,7 @@ fn is_ignored_dir(name: &str) -> bool {
 
 /// Search one level deep for package.json files.
 async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    for entry in list_dir_entries(dir).await {
         let path = entry.path();
         // A single-level `dir/*` glob follows a symlinked direct member, the
         // way npm/pnpm (and our cargo `glob_dir`) resolve a workspace member
@@ -361,11 +357,7 @@ async fn search_one_level(dir: &Path, results: &mut Vec<PathBuf>) {
         // recursive searcher below deliberately does NOT follow symlinks,
         // to avoid loops/escapes — there a symlink's `is_dir() == false` is the
         // desired skip.)
-        if !fs::metadata(&path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
+        if !is_dir(&path).await {
             continue;
         }
         // A `dir/*` pattern must not pick up node_modules/hidden/output dirs as
@@ -388,15 +380,9 @@ async fn search_recursive(dir: &Path, depth: usize, max_depth: usize, results: &
         return;
     }
 
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let ft = match entry.file_type().await {
-            Ok(ft) => ft,
-            Err(_) => continue,
+    for entry in list_dir_entries(dir).await {
+        let Some(ft) = entry_file_type(&entry).await else {
+            continue;
         };
         if !ft.is_dir() {
             continue;

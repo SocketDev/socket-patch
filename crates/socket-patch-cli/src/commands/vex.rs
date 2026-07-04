@@ -22,8 +22,8 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::{track_vex_failed, track_vex_generated};
 use socket_patch_core::vex::{
-    build_document_with_provenance, detect_product, BuildOptions, Document, FailedPatch,
-    VendorContext, VerifyOutcome,
+    build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
+    VerifyOutcome,
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
@@ -413,7 +413,7 @@ async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document_with_provenance(
+    let doc = match build_document(
         manifest,
         &outcome.applied,
         &outcome.vendored,

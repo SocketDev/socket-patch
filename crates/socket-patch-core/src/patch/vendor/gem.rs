@@ -578,7 +578,7 @@ async fn gem_service_copy(
     };
 
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
-    let archive = match fetch_verified_archive(cfg, &record.uuid, name).await {
+    let archive = match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => archive,
         ServiceArtifact::IntegrityMismatch(reason) => {
             return miss(
@@ -613,7 +613,7 @@ async fn gem_service_copy(
     };
 
     // Step 2: the stub gemspec the converter generated alongside the `.gem`.
-    let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND, name).await {
+    let stub = match fetch_verified_secondary(cfg, &archive, GEM_STUB_ARTIFACT_KIND).await {
         SecondaryArtifactResult::Ready(bytes) => bytes,
         SecondaryArtifactResult::Absent => {
             return miss(

@@ -30,7 +30,7 @@ use super::common::{
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
-use super::{VendorOutcome, VendorServiceConfig, VendorWarning};
+use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
 /// [`guard_coordinates`]). `name`/`version` are the percent-DECODED purl
@@ -91,6 +91,21 @@ pub(super) fn guard_coordinates(
         version,
         uuid_dir_rel,
         base_purl: strip_purl_qualifiers(purl).to_string(),
+    })
+}
+
+/// Validate a revert's patch uuid and return the `.socket/vendor/npm/<uuid>`
+/// dir it names.
+///
+/// SECURITY: the uuid comes from the committed, tamper-able state.json and
+/// names the directory tree revert is about to DELETE — validate through the
+/// same fail-closed grammar vendor used, before any disk access. `Err`
+/// carries the ready failure to bubble verbatim.
+pub(super) fn guard_revert_uuid_dir(uuid: &str) -> Result<String, RevertOutcome> {
+    vendor_uuid_dir_rel("npm", uuid).ok_or_else(|| {
+        RevertOutcome::failed(format!(
+            "refusing revert: `{uuid}` is not a canonical patch uuid (tampered state.json?)"
+        ))
     })
 }
 
@@ -293,7 +308,7 @@ async fn try_service_pack(
 ) -> ServicePackDecision {
     let hard_fail =
         |detail: String| ServicePackDecision::HardFail(Box::new(done_failure(purl, detail)));
-    match fetch_verified_archive(cfg, &record.uuid, &coords.name).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             match staged_pack_from_service_bytes(
                 purl,

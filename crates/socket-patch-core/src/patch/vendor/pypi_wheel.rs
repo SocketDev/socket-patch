@@ -435,20 +435,19 @@ pub async fn build_patched_wheel(
         0o644,
     ));
 
-    let zip_bytes =
-        match tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(e)) => {
-                result.success = false;
-                result.error = Some(format!("wheel zip assembly failed: {e}"));
-                return Ok((result, None));
-            }
-            Err(e) => {
-                result.success = false;
-                result.error = Some(format!("wheel zip task failed: {e}"));
-                return Ok((result, None));
-            }
-        };
+    let zip_bytes = match tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            result.success = false;
+            result.error = Some(format!("wheel zip assembly failed: {e}"));
+            return Ok((result, None));
+        }
+        Err(e) => {
+            result.success = false;
+            result.error = Some(format!("wheel zip task failed: {e}"));
+            return Ok((result, None));
+        }
+    };
 
     if let Some(parent) = dest.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {

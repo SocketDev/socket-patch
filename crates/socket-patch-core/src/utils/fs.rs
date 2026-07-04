@@ -40,7 +40,7 @@ use tokio::fs::DirEntry;
 /// iteration stops. The crawlers treat all of these the same way:
 /// surface whatever the readable portion of the subtree yields, but
 /// don't abort the whole crawl.
-pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
+pub(crate) async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
     let mut entries = match tokio::fs::read_dir(path).await {
         Ok(rd) => rd,
         Err(_) => return Vec::new(),
@@ -64,12 +64,9 @@ pub async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 /// would wrongly report `false`. To honor the documented
 /// symlink-following contract — which crawlers like deno/python/ruby
 /// rely on for symlinked package directories — we stat the resolved
-/// `entry.path()` via `tokio::fs::metadata`, which does follow links.
-pub async fn entry_is_dir(entry: &DirEntry) -> bool {
-    tokio::fs::metadata(entry.path())
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
+/// `entry.path()` via [`is_dir`], which does follow links.
+pub(crate) async fn entry_is_dir(entry: &DirEntry) -> bool {
+    is_dir(&entry.path()).await
 }
 
 /// Check whether `path` is a directory, following symlinks.
@@ -79,7 +76,7 @@ pub async fn entry_is_dir(entry: &DirEntry) -> bool {
 /// roots and treat "can't stat" the same as "not there". The
 /// `Path`-taking counterpart of [`entry_is_dir`]; previously
 /// copy-pasted into every crawler.
-pub async fn is_dir(path: &Path) -> bool {
+pub(crate) async fn is_dir(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
         .map(|m| m.is_dir())
@@ -91,7 +88,7 @@ pub async fn is_dir(path: &Path) -> bool {
 /// Returns `false` if the stat fails (missing path, broken symlink,
 /// permission error, etc.) — the file-shaped sibling of [`is_dir`],
 /// with the same "can't stat means not there" contract.
-pub async fn is_file(path: &Path) -> bool {
+pub(crate) async fn is_file(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
         .map(|m| m.is_file())
@@ -145,7 +142,7 @@ pub(crate) async fn open_regular_file(
 /// be treated as scannable-but-non-recurseable). The returned
 /// `FileType` is the symlink-aware kind from `entry.file_type()`,
 /// not the resolved-target kind from `metadata()`.
-pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
+pub(crate) async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
     entry.file_type().await.ok()
 }
 
@@ -153,9 +150,10 @@ pub async fn entry_file_type(entry: &DirEntry) -> Option<FileType> {
 /// (Windows), then a literal `"~"` — a harmless non-existent path so
 /// downstream joins probe nothing rather than panic. The shared
 /// fallback chain for every crawler that scans well-known per-user
-/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …); previously
-/// copy-pasted into each. The go/composer crawlers deliberately use a
-/// stricter no-home-means-no-path chain instead.
+/// package roots (`~/.cargo`, `~/.m2`, `~/.nuget`, …) and for
+/// telemetry's home-dir redaction; previously copy-pasted into each.
+/// The go/composer crawlers deliberately use a stricter
+/// no-home-means-no-path chain instead.
 pub(crate) fn home_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -173,7 +171,7 @@ pub(crate) fn home_dir() -> PathBuf {
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
-pub async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()

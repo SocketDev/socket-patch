@@ -123,7 +123,7 @@ async fn cargo_service_copy(
             CargoServiceCopy::FallBack
         }
     };
-    match fetch_verified_archive(cfg, &record.uuid, name).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => {
             // Clean copy dir, then extract the `.crate` (tar.gz; strip its
             // single `{name}-{version}/` top-level dir) into it.

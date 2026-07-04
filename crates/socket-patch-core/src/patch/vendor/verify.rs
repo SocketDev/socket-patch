@@ -81,21 +81,29 @@ pub async fn verify_vendored_patch_record(
         return Err("vendor_artifact_missing".to_string());
     }
 
-    let path_str = artifact.to_string_lossy().to_string();
-    if path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz") {
-        verify_tarball_members(&artifact, record).await
-    } else if path_str.ends_with(".whl")
-        || path_str.ends_with(".nupkg")
-        || path_str.ends_with(".jar")
-    {
-        // A `.nupkg` is a plain OPC zip (NuGet) and a `.jar` is a plain zip
-        // (Maven) — both carry member paths that are package-relative, exactly
-        // the manifest key space, so the bounded zip reader used for wheels
-        // verifies them verbatim.
-        verify_wheel_members(&artifact, record).await
-    } else {
-        verify_dir_members(&artifact, record).await
+    // Archive-shaped artifacts are decoded in memory and their members hashed:
+    // npm tarballs via the bomb-capped patch-archive reader (it strips the
+    // `package/` prefix, matching `normalize_file_path`'d keys); `.whl` /
+    // `.nupkg` (a plain OPC zip) / `.jar` (a plain zip) via the bounded zip
+    // reader — their member paths are package-relative, exactly the manifest
+    // key space. Everything else is a dir-shaped copy hashed in place.
+    let path_str = artifact.to_string_lossy();
+    let is_tarball = path_str.ends_with(".tgz") || path_str.ends_with(".tar.gz");
+    let is_zip =
+        path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
+    if !is_tarball && !is_zip {
+        return verify_dir_members(&artifact, record).await;
     }
+    let map = tokio::task::spawn_blocking(move || {
+        if is_tarball {
+            read_archive_to_map(&artifact).map_err(|_| "vendor_artifact_unreadable".to_string())
+        } else {
+            read_wheel_to_map(&artifact)
+        }
+    })
+    .await
+    .map_err(|_| "vendor_artifact_unreadable".to_string())??;
+    verify_member_map(&map, record)
 }
 
 /// Dir-shaped ecosystems (cargo/golang/composer/gem): hash files in place,
@@ -113,28 +121,6 @@ async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), Stri
         }
     }
     Ok(())
-}
-
-/// npm tarballs: decode in memory via the bomb-capped patch-archive reader
-/// (it strips the `package/` prefix, matching `normalize_file_path`'d keys)
-/// and hash each member against its afterHash.
-async fn verify_tarball_members(tgz: &Path, record: &PatchRecord) -> Result<(), String> {
-    let tgz = tgz.to_path_buf();
-    let map = tokio::task::spawn_blocking(move || read_archive_to_map(&tgz))
-        .await
-        .map_err(|_| "vendor_artifact_unreadable".to_string())?
-        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
-    verify_member_map(&map, record)
-}
-
-/// pypi wheels: bounded zip decode (member names are site-packages-relative,
-/// exactly the manifest's pypi key space).
-async fn verify_wheel_members(whl: &Path, record: &PatchRecord) -> Result<(), String> {
-    let whl = whl.to_path_buf();
-    let map = tokio::task::spawn_blocking(move || read_wheel_to_map(&whl))
-        .await
-        .map_err(|_| "vendor_artifact_unreadable".to_string())??;
-    verify_member_map(&map, record)
 }
 
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
