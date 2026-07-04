@@ -1253,10 +1253,16 @@ pub(crate) async fn run_vendor_gc(
         }
     };
 
-    // (a) manifest-dropped entries.
+    // (a) manifest-dropped entries. Everything (a) touches is excluded from
+    // (b): in a dry run the ledger keeps the entry, and after a wet revert
+    // failure it does too — either way (b) would list/fail the same purl a
+    // second time, which the wet success path (entry removed before (b)'s
+    // candidate scan) never does.
+    let mut handled_by_a: HashSet<String> = HashSet::new();
     let mut manifest = read_manifest(manifest_path).await.ok().flatten();
     if let Some(m) = &manifest {
         for purl in manifest_dropped_purls(&state, m, common) {
+            handled_by_a.insert(purl.clone());
             if dry_run {
                 out.dropped_reverted.push(purl);
                 continue;
@@ -1279,7 +1285,11 @@ pub(crate) async fn run_vendor_gc(
     let candidates: Vec<String> = state
         .entries
         .iter()
-        .filter(|(_, entry)| !entry.detached && ecosystem_in_scope(common, &entry.ecosystem))
+        .filter(|(purl, entry)| {
+            !entry.detached
+                && ecosystem_in_scope(common, &entry.ecosystem)
+                && !handled_by_a.contains(*purl)
+        })
         .map(|(purl, _)| purl.clone())
         .collect();
     for purl in candidates {
@@ -1329,6 +1339,67 @@ pub(crate) async fn run_vendor_gc(
         .await
         .len();
     out
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use socket_patch_core::patch::vendor::VendorSource;
+
+    /// Fail-closed `--vendor-source=service` must not refuse maven at the
+    /// dispatch gate: the maven backend has a full service path (prebuilt
+    /// jar download + registry pom), and its own errors advise exactly
+    /// that flag. Regression: PR #117 shipped the backend and added nuget
+    /// to `SERVICE_ECOSYSTEMS` but left maven off the list, so the gate
+    /// dead-ended the flag the backend recommends.
+    #[tokio::test]
+    async fn service_mode_gate_admits_maven() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = PatchRecord {
+            uuid: "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f".to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        };
+        let sources = PatchSources {
+            blobs_path: tmp.path(),
+            packages_path: None,
+            diffs_path: None,
+            mem_blobs: None,
+        };
+        let service = VendorServiceConfig {
+            source: VendorSource::Service,
+            client: None,
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+        let outcome = dispatch_vendor_one(
+            "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
+            tmp.path(),
+            tmp.path(),
+            &record,
+            &sources,
+            "2026-01-01T00:00:00Z",
+            false,
+            false,
+            Some(&service),
+        )
+        .await;
+        // The backend itself may refuse (nothing is installed in the
+        // fixture) — the gate just must not be what stops it.
+        match outcome {
+            Some(VendorOutcome::Refused { code, .. }) => assert_ne!(
+                code, "vendor_service_unsupported_ecosystem",
+                "maven has a service backend; the dispatch gate must admit it"
+            ),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1542,6 +1613,36 @@ mod gc_tests {
             .unwrap()
             .entries
             .contains_key(PURL));
+    }
+
+    /// An entry that is BOTH manifest-dropped and lockfile-unused must be
+    /// listed exactly once. The wet pass removes it from the ledger in (a)
+    /// before (b) runs; the dry-run preview leaves the ledger untouched, so
+    /// without excluding (a)-handled purls from (b) the same purl lands in
+    /// both lists and `scan --prune`'s `revertableVendoredEntries` preview
+    /// duplicates it (breaking preview/wet parity).
+    #[tokio::test]
+    async fn vendor_gc_dry_run_lists_dropped_and_unused_entry_once() {
+        let (tmp, common, manifest_path) = gc_fixture(false).await;
+        // Patch gone from the manifest AND dependency gone from the lock.
+        write_manifest(&manifest_path, &PatchManifest::new())
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+
+        let dry = run_vendor_gc(&common, &manifest_path, true).await;
+        assert_eq!(dry.dropped_reverted, vec![PURL.to_string()], "{dry:?}");
+        assert!(
+            dry.unused_reverted.is_empty(),
+            "an (a)-handled entry must not also be previewed as (b)-unused: {dry:?}"
+        );
+
+        // Wet parity: the same single listing.
+        let wet = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(wet.dropped_reverted, vec![PURL.to_string()], "{wet:?}");
+        assert!(wet.unused_reverted.is_empty(), "{wet:?}");
     }
 
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted

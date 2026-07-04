@@ -31,7 +31,9 @@ use socket_patch_core::patch::vendor::{
     self, check_vendored_artifact, file_sha256_hex, load_state, lock_inventory, parse_vendor_path,
     registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
 };
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{
+    normalize_purl, percent_decode_purl_component, strip_purl_qualifiers,
+};
 use socket_patch_core::vex::time::now_rfc3339;
 
 use crate::args::GlobalArgs;
@@ -324,6 +326,39 @@ pub(crate) async fn repair_vendored_artifacts(
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
             ArtifactHealth::Healthy => {
+                // The re-synthesized entry records no sha256, so the health
+                // check above verified only the patched members — whole-file
+                // drift (an altered UNPATCHED member) is invisible to it.
+                // The rewired lockfile integrity is the trust anchor for
+                // these exact bytes: a "surviving" artifact that no longer
+                // matches it leaves the package manager broken, so it must
+                // be rebuilt, never blessed into the reconstructed ledger.
+                if let Some(wired) =
+                    lock_inventory::wired_vendor_integrity(&common.cwd, &entry.artifact.path).await
+                {
+                    let name = npm_coords(&entry.base_purl)
+                        .map(|(n, _)| n)
+                        .unwrap_or_default();
+                    let intact = match tokio::fs::read(common.cwd.join(&entry.artifact.path)).await
+                    {
+                        Ok(bytes) => {
+                            registry_fetch::artifact_matches_integrity(&bytes, &name, &wired)
+                                .is_ok()
+                        }
+                        Err(_) => false,
+                    };
+                    if !intact {
+                        candidates.push(Candidate {
+                            purl,
+                            entry,
+                            record,
+                            detached,
+                            reconstructed: true,
+                            reason: "vendor_artifact_corrupt",
+                        });
+                        continue;
+                    }
+                }
                 // The artifact survived; only the ledger was lost. Restore
                 // the entry (sha/size recomputed) so GC/sweep/revert know
                 // the artifact again — without it the next `scan --prune`
@@ -731,13 +766,23 @@ async fn fetch_record_by_uuid(common: &GlobalArgs, uuid: &str) -> Option<(String
 }
 
 /// `pkg:npm/<name>@<version>` → (name, version); the name may be scoped.
+/// `base_purl` is stored verbatim percent-encoded (`pkg:npm/%40scope/…`),
+/// so each component is decoded like the npm backend's own coordinate
+/// parser — the registry fetch and the berry cache-checksum recipe both
+/// need the decoded name.
 fn npm_coords(base_purl: &str) -> Option<(String, String)> {
     let rest = strip_purl_qualifiers(base_purl).strip_prefix("pkg:npm/")?;
-    let (name, version) = rest.rsplit_once('@')?;
-    if name.is_empty() || version.is_empty() {
+    let (name_raw, version_raw) = rest.rsplit_once('@')?;
+    if name_raw.is_empty() || version_raw.is_empty() {
         return None;
     }
-    Some((name.to_string(), version.to_string()))
+    let name = name_raw
+        .split('/')
+        .map(percent_decode_purl_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let version = percent_decode_purl_component(version_raw).into_owned();
+    Some((name, version))
 }
 
 #[cfg(test)]
@@ -779,5 +824,27 @@ mod tests {
             refs[0].2.ends_with("left-pad-1.3.0.tgz"),
             "trailing colon must be cut: {refs:?}"
         );
+    }
+
+    /// `base_purl` is stored VERBATIM percent-encoded (`pkg:npm/%40scope/…`,
+    /// manifest/ledger key parity — see npm_common's coordinate tests), but
+    /// the registry fetch and the berry cache-checksum recipe both need the
+    /// DECODED npm name.
+    #[test]
+    fn npm_coords_percent_decodes_scoped_names() {
+        assert_eq!(
+            npm_coords("pkg:npm/%40scope/sdk@1.12.0"),
+            Some(("@scope/sdk".to_string(), "1.12.0".to_string()))
+        );
+        // Already-decoded and unscoped spellings pass through unchanged.
+        assert_eq!(
+            npm_coords("pkg:npm/@scope/sdk@1.12.0"),
+            Some(("@scope/sdk".to_string(), "1.12.0".to_string()))
+        );
+        assert_eq!(
+            npm_coords("pkg:npm/left-pad@1.3.0?foo=bar"),
+            Some(("left-pad".to_string(), "1.3.0".to_string()))
+        );
+        assert_eq!(npm_coords("pkg:npm/left-pad"), None);
     }
 }

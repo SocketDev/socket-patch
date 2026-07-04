@@ -551,6 +551,106 @@ fn unlock_release_honors_manifest_path() {
     );
 }
 
+/// `--release --dry-run` must preview, not mutate: the leftover lock
+/// file survives, `released` stays false (nothing was deleted), and
+/// the flat envelope reports the dry run (`dryRun: true`,
+/// `wouldRelease: true`). Regression guard: `unlock` ignored the
+/// global `--dry-run` flag ("Preview, no mutations") and deleted the
+/// file anyway.
+#[test]
+fn unlock_release_dry_run_previews_without_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    std::fs::write(&lock_file, b"crashed-run-leftover").unwrap();
+
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &["unlock", "--json", "--release", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        lock_file.is_file(),
+        "--dry-run must not delete the lock file"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "status"), Some("free"));
+    assert_eq!(
+        env.get("released").and_then(|v| v.as_bool()),
+        Some(false),
+        "a dry run deletes nothing, so released must be false: {stdout}"
+    );
+    assert_eq!(
+        env.get("dryRun").and_then(|v| v.as_bool()),
+        Some(true),
+        "the envelope must report the dry run: {stdout}"
+    );
+    assert_eq!(
+        env.get("wouldRelease").and_then(|v| v.as_bool()),
+        Some(true),
+        "a real run would have removed the leftover, so wouldRelease must be true: {stdout}"
+    );
+}
+
+/// Human-mode `--release --dry-run` with a leftover file announces the
+/// would-be removal without claiming it happened, and leaves the file
+/// on disk.
+#[test]
+fn unlock_human_mode_release_dry_run_previews_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let lock_file = socket_dir.join("apply.lock");
+    std::fs::write(&lock_file, b"crashed-run-leftover").unwrap();
+
+    let (code, stdout, stderr) = run(dir.path(), &["unlock", "--release", "--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let lower = stdout.to_lowercase();
+    assert!(
+        lower.contains("would remove"),
+        "dry-run --release should preview the removal, got:\n{stdout}"
+    );
+    // Must not claim a removal actually happened.
+    assert!(
+        !lower.contains("removed"),
+        "dry-run --release must not claim a completed removal, got:\n{stdout}"
+    );
+    assert!(
+        lock_file.is_file(),
+        "--dry-run must leave the leftover lock file on disk"
+    );
+}
+
+/// A held probe under `--dry-run` stamps the standard error envelope's
+/// `dryRun` field truthfully. Regression guard: `unlock` hardcoded
+/// `dry_run = false` into its `error_envelope` calls, so a
+/// `--dry-run` invocation's failure envelope misreported itself as a
+/// real run.
+#[test]
+fn unlock_dry_run_held_envelope_reports_dry_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_dir = dir.path().join(".socket");
+    let _external = take_external_lock(&socket_dir);
+
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &["unlock", "--json", "--release", "--dry-run"],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let env = parse_json_envelope(&stdout);
+    let code_field = env
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    assert_eq!(code_field, Some("lock_held"), "envelope: {stdout}");
+    assert_eq!(
+        env.get("dryRun").and_then(|v| v.as_bool()),
+        Some(true),
+        "held-lock envelope must carry the invocation's dry-run flag: {stdout}"
+    );
+}
+
 /// Human-mode (`unlock` without `--json`) emits a stderr hint
 /// pointing the user at `--break-lock` when the lock is held.
 /// Pinned at the substring level so the helpful guidance survives

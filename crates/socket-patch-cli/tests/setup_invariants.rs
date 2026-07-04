@@ -538,6 +538,44 @@ fn setup_check_configured_project_exits_zero() {
     assert_eq!(files[0]["status"], "configured");
 }
 
+/// npm and Node strip a UTF-8 BOM in package.json — files saved by Windows
+/// editors commonly carry one — and every other setup surface already
+/// tolerates it: `setup` wires a BOM'd file (update.rs pins) and reports a
+/// BOM'd configured file `already_configured`. `--check` must agree: a BOM'd,
+/// fully-configured file is `configured` (exit 0), NOT `Error: Invalid
+/// package.json` (exit 1). Regression guard: `run_check` raw-parsed the file
+/// without stripping the BOM, so the same file `setup` calls configured
+/// failed `--check`.
+#[test]
+fn setup_check_tolerates_bom_like_npm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write(
+        &tmp.path().join("package.json"),
+        "\u{feff}{\"scripts\":{\"postinstall\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\",\"dependencies\":\"npx @socketsecurity/socket-patch apply --silent --ecosystems npm\"}}",
+    );
+
+    // `setup` itself treats the file as valid and already configured (and
+    // therefore leaves it byte-identical, BOM included).
+    let (setup_code, setup_stdout) = run_setup(tmp.path(), &["--yes"]);
+    assert_eq!(
+        setup_code, 0,
+        "setup must accept a BOM'd configured package.json; stdout=\n{setup_stdout}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&setup_stdout).expect("valid JSON");
+    assert_eq!(v["status"], "already_configured");
+
+    // `--check` must reach the same verdict npm (and `setup`) do.
+    let (code, stdout) = run_setup(tmp.path(), &["--check"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "a BOM'd configured package.json must pass --check; stdout=\n{stdout}"
+    );
+    assert_eq!(v["status"], "configured", "stdout=\n{stdout}");
+    assert_eq!(v["errors"], 0, "stdout=\n{stdout}");
+    assert_eq!(v["files"][0]["status"], "configured", "stdout=\n{stdout}");
+}
+
 #[test]
 fn setup_check_unconfigured_project_exits_nonzero() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -24,7 +24,7 @@ use socket_patch_core::vex::applied_patches;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::args::GlobalArgs;
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
 use crate::output::stdin_is_tty;
 
@@ -99,6 +99,7 @@ pub struct SetupArgs {
 }
 
 pub async fn run(args: SetupArgs) -> i32 {
+    apply_env_toggles(&args.common);
     if args.check {
         run_check(&args).await
     } else if args.remove {

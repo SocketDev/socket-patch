@@ -236,7 +236,8 @@ pub(super) fn severity_order(s: &str) -> u8 {
     match s.to_lowercase().as_str() {
         "critical" => 0,
         "high" => 1,
-        "medium" => 2,
+        // GHSA emits `moderate`; same tier as medium (see get.rs severity_rank).
+        "medium" | "moderate" => 2,
         "low" => 3,
         _ => 4,
     }
@@ -268,6 +269,19 @@ mod tests {
         assert_eq!(severity_order("high"), 1);
         assert_eq!(severity_order("medium"), 2);
         assert_eq!(severity_order("low"), 3);
+    }
+
+    #[test]
+    fn severity_order_moderate_is_medium_tier() {
+        // Regression: GHSA emits `moderate` for the medium tier, and scan
+        // passes raw API severities straight through. get.rs
+        // `severity_rank`, output.rs `format_severity`, and core's
+        // `get_severity_order` all map it to medium; ranking it 4 here
+        // (= unknown, below `low`) made the table's max-severity column
+        // show `low` for a package whose worst vuln is moderate.
+        assert_eq!(severity_order("moderate"), severity_order("medium"));
+        assert!(severity_order("moderate") < severity_order("low"));
+        assert_eq!(severity_order("Moderate"), severity_order("medium"));
     }
 
     #[test]

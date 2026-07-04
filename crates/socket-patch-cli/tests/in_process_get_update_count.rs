@@ -57,6 +57,7 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
 fn params(root: &Path, server: &MockServer) -> DownloadParams {
     DownloadParams {
         cwd: root.to_path_buf(),
+        manifest_path: root.join(".socket/manifest.json"),
         org: Some(ORG.to_string()),
         // save_only isolates download bookkeeping from the apply step.
         save_only: true,

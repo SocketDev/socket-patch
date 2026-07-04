@@ -276,6 +276,106 @@ fn apply_dry_run_with_real_patch_verifies_without_mutating() {
     );
 }
 
+const VENDORED_PURL: &str = "pkg:npm/vendored-pkg@1.0.0";
+
+/// Extend [`make_applicable_npm_patch`] with a SECOND manifest entry that
+/// is vendor-owned: recorded in `.socket/vendor/state.json`, with no
+/// installed tree (the committed artifact is the source of truth). It
+/// reuses the applicable patch's file hashes so the staged blob set stays
+/// complete for `--offline`.
+fn add_vendored_manifest_entry(root: &Path) {
+    let socket = root.join(".socket");
+    let manifest_path = socket.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let template = manifest["patches"][DRYRUN_PURL].clone();
+    manifest["patches"][VENDORED_PURL] = template;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let vendor = socket.join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    let state = format!(
+        r#"{{
+  "version": 1,
+  "entries": {{
+    "{VENDORED_PURL}": {{
+      "ecosystem": "npm",
+      "basePurl": "{VENDORED_PURL}",
+      "uuid": "33333333-3333-4333-8333-333333333333",
+      "artifact": {{
+        "path": ".socket/vendor/npm/33333333-3333-4333-8333-333333333333/vendored-pkg-1.0.0.tgz"
+      }},
+      "wiring": []
+    }}
+  }}
+}}"#
+    );
+    std::fs::write(vendor.join("state.json"), state).unwrap();
+}
+
+/// Regression: the human dry-run summary counted vendor-owned manifest
+/// entries as "can be patched". The same run's JSON envelope classifies
+/// them `skipped`/`vendored` (apply must never re-patch what
+/// `socket-patch vendor` owns), so the human count must exclude them too:
+/// one applicable patch + one vendored patch is "1 package(s) can be
+/// patched", not 2.
+#[test]
+fn apply_dry_run_human_count_excludes_vendored() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    make_applicable_npm_patch(tmp.path());
+    add_vendored_manifest_entry(tmp.path());
+
+    // Prove the fixture is non-vacuous first: in JSON mode the vendored
+    // entry must classify as skipped/vendored (if the vendor ledger were
+    // unreadable it would fail open and this test would assert nothing).
+    let out = Command::new(binary())
+        .args(["apply", "--json", "--dry-run", "--offline"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run apply --json --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON: {e}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(out.status.code(), Some(0), "dry-run should exit 0: {v}");
+    let events = v["events"].as_array().expect("events array");
+    let vendored_ev = events
+        .iter()
+        .find(|e| e["purl"] == VENDORED_PURL)
+        .unwrap_or_else(|| panic!("expected an event for {VENDORED_PURL}: {v}"));
+    assert_eq!(
+        vendored_ev["action"], "skipped",
+        "vendored entry must be skipped: {v}"
+    );
+    assert_eq!(
+        vendored_ev["errorCode"], "vendored",
+        "vendored entry must carry the vendored reason: {v}"
+    );
+
+    // The human summary must agree with that classification: only the
+    // genuinely applicable package counts as patchable.
+    let out = Command::new(binary())
+        .args(["apply", "--dry-run", "--offline"])
+        .current_dir(tmp.path())
+        .env_remove("SOCKET_API_TOKEN")
+        .output()
+        .expect("run apply --dry-run");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 package(s) can be patched"),
+        "human dry-run count must exclude the vendored entry; stdout:\n{stdout}"
+    );
+}
+
 /// `repair --dry-run --offline --json`: dry-run with no patches
 /// should succeed with `dryRun:true`.
 #[test]

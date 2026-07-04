@@ -4,7 +4,7 @@ use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager,
 };
 use socket_patch_core::manifest::operations::read_manifest;
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
@@ -74,25 +74,7 @@ async fn ensure_blobs_for_mismatches(
     if args.common.strict && !args.force {
         return; // strict fails on mismatch — nothing to fetch
     }
-    let mut needed: HashSet<String> = HashSet::new();
-    for (purl, pkg_path) in all_packages {
-        let Some(record) = manifest.patches.get(purl) else {
-            continue;
-        };
-        for (file_name, info) in &record.files {
-            if info.before_hash.is_empty() {
-                continue;
-            }
-            let verify = verify_file_patch(pkg_path, file_name, info).await;
-            if verify.status == VerifyStatus::HashMismatch
-                && tokio::fs::metadata(blobs_path.join(&info.after_hash))
-                    .await
-                    .is_err()
-            {
-                needed.insert(info.after_hash.clone());
-            }
-        }
-    }
+    let needed = mismatch_blob_gaps(manifest, all_packages, blobs_path, args.force).await;
     if needed.is_empty() {
         return;
     }
@@ -117,6 +99,60 @@ async fn ensure_blobs_for_mismatches(
         &needed, blobs_path, &client, None,
     )
     .await;
+}
+
+/// Probe the crawled packages for `beforeHash` mismatches whose
+/// `afterHash` blob is not already staged, returning the missing blob
+/// hashes [`ensure_blobs_for_mismatches`] should fetch.
+///
+/// The crawler keys `all_packages` by BASE purl, but release-variant
+/// ecosystems (PyPI `?artifact_id=`, RubyGems `?platform=`, Maven
+/// `?classifier=&ext=`) key the manifest by QUALIFIED purls — an
+/// exact-key lookup misses every one of them. Match records by
+/// qualifier-stripped key, and probe only the variants the apply loop
+/// will actually attempt (its representative-file installed-distribution
+/// gate, bypassed by `--force`) so a skipped sibling variant's files
+/// don't trigger spurious fetches or `--offline` warnings.
+async fn mismatch_blob_gaps(
+    manifest: &PatchManifest,
+    all_packages: &HashMap<String, PathBuf>,
+    blobs_path: &Path,
+    force: bool,
+) -> HashSet<String> {
+    let mut needed: HashSet<String> = HashSet::new();
+    for (purl, pkg_path) in all_packages {
+        let variant_eco = Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
+        let stripped = strip_purl_qualifiers(purl);
+        for (key, record) in &manifest.patches {
+            if key != purl && strip_purl_qualifiers(key) != stripped {
+                continue;
+            }
+            if variant_eco && !force {
+                if let Some((file_name, file_info)) = representative_file(&record.files) {
+                    let status = verify_file_patch(pkg_path, file_name, file_info)
+                        .await
+                        .status;
+                    if !variant_matches_installed(Some(&status)) {
+                        continue;
+                    }
+                }
+            }
+            for (file_name, info) in &record.files {
+                if info.before_hash.is_empty() {
+                    continue;
+                }
+                let verify = verify_file_patch(pkg_path, file_name, info).await;
+                if verify.status == VerifyStatus::HashMismatch
+                    && tokio::fs::metadata(blobs_path.join(&info.after_hash))
+                        .await
+                        .is_err()
+                {
+                    needed.insert(info.after_hash.clone());
+                }
+            }
+        }
+    }
+    needed
 }
 
 /// The mismatch policy this run applies with: `--force` ⊃ default
@@ -377,15 +413,16 @@ fn all_files_already_patched(result: &ApplyResult) -> bool {
 
 /// Decide whether a release variant describes the distribution that is
 /// actually installed on disk, based on the verification status of its
-/// first patched file.
+/// representative patched file (see [`representative_file`]).
 ///
 /// This is the apply-side mirror of
 /// [`select_installed_variants`](socket_patch_core::patch::apply::select_installed_variants),
-/// which `rollback` and `get` use: a variant matches only when its first
-/// file is [`Ready`](VerifyStatus::Ready) (its `beforeHash` matches the
-/// on-disk bytes) or [`AlreadyPatched`](VerifyStatus::AlreadyPatched)
-/// (its `afterHash` already matches). A variant with no files (`None`)
-/// has nothing to disqualify it and is treated as a match.
+/// which `rollback` and `get` use: a variant matches only when its
+/// representative file is [`Ready`](VerifyStatus::Ready) (its
+/// `beforeHash` matches the on-disk bytes) or
+/// [`AlreadyPatched`](VerifyStatus::AlreadyPatched)
+/// (its `afterHash` already matches). A variant with no representative
+/// (`None`) has nothing to disqualify it and is treated as a match.
 ///
 /// Crucially, both [`HashMismatch`](VerifyStatus::HashMismatch) **and**
 /// [`NotFound`](VerifyStatus::NotFound) mean "this variant's
@@ -400,6 +437,28 @@ pub(crate) fn variant_matches_installed(first_file_status: Option<&VerifyStatus>
         None => true,
         Some(status) => *status == VerifyStatus::Ready || *status == VerifyStatus::AlreadyPatched,
     }
+}
+
+/// The file whose verify status decides whether a release variant
+/// describes the installed distribution (fed to
+/// [`variant_matches_installed`]).
+///
+/// Only a file that modifies existing content (non-empty `beforeHash`)
+/// can discriminate between distributions — a NEW file (empty
+/// `beforeHash`) verifies `Ready` against any environment, so it can
+/// neither identify nor disqualify a variant. Take the lexicographically
+/// smallest such key so the choice is deterministic (`HashMap` iteration
+/// order is randomized per instance). `None` (no files, or only new
+/// files) means nothing can disqualify the variant. Mirrors the
+/// representative pick in core's
+/// [`select_installed_variants`](socket_patch_core::patch::apply::select_installed_variants).
+fn representative_file(
+    files: &HashMap<String, PatchFileInfo>,
+) -> Option<(&String, &PatchFileInfo)> {
+    files
+        .iter()
+        .filter(|(_, info)| !info.before_hash.is_empty())
+        .min_by(|(a, _), (b, _)| a.cmp(b))
 }
 
 /// Translate the core engine's per-package [`ApplyResult`] into a single
@@ -587,7 +646,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // result is folded into the JSON envelope / human output
             // below and flips the exit code on failure (per the
             // fail-the-command contract). `None` => not requested.
-            let vex_result = if success && args.vex.vex.is_some() {
+            //
+            // A dry run applies nothing, so there is no just-applied
+            // state to attest: generating here verified the deliberately
+            // unapplied tree, spuriously failed the whole command with
+            // `no_applicable_patches`, and would write an attestation
+            // file during --dry-run. Skip instead.
+            let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
                 let params = args.vex.to_build_params();
                 Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
@@ -655,7 +720,14 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 }
                 println!("{}", env.to_pretty_json());
             } else if !args.common.silent && !results.is_empty() {
-                let patched: Vec<_> = results.iter().filter(|r| r.success).collect();
+                // Vendor-owned synthesized results are `Skipped`/`vendored`
+                // in the JSON envelope — not appliable work — so keep them
+                // out of the human counts too ("N package(s) can be
+                // patched" must not count them).
+                let patched: Vec<_> = results
+                    .iter()
+                    .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
+                    .collect();
                 let already_patched: Vec<_> = results
                     .iter()
                     .filter(|r| all_files_already_patched(r))
@@ -742,7 +814,11 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     Some(Err(e)) => {
                         eprintln!("Error: VEX generation failed: {}", e.message);
                     }
-                    None => {}
+                    None => {
+                        if args.common.dry_run && args.vex.vex.is_some() {
+                            println!("Skipping VEX generation (--dry-run: nothing was applied).");
+                        }
+                    }
                 }
             }
 
@@ -1026,13 +1102,13 @@ async fn apply_patches_inner(
                     None => continue,
                 };
 
-                // Check the first file's status (skip when --force). A
-                // mismatch *or* a missing file means this variant's
-                // distribution isn't the one on disk, so skip it —
+                // Check the representative file's status (skip when
+                // --force). A mismatch *or* a missing file means this
+                // variant's distribution isn't the one on disk, so skip it —
                 // attempting it would only produce a spurious failure.
                 // Mirrors `select_installed_variants`, used by rollback/get.
                 if !args.force {
-                    let first_status = match patch.files.iter().next() {
+                    let first_status = match representative_file(&patch.files) {
                         Some((file_name, file_info)) => Some(
                             verify_file_patch(pkg_path, file_name, file_info)
                                 .await
@@ -1430,6 +1506,229 @@ mod tests {
         // A variant with no files has nothing to disqualify it — match,
         // mirroring `select_installed_variants`.
         assert!(variant_matches_installed(None));
+    }
+
+    /// Regression (twin of core's `select_installed_variants` fix): the
+    /// representative file that decides "is this variant the installed
+    /// distribution?" must never be a NEW file (empty `beforeHash`) — a
+    /// new file verifies `Ready` against ANY environment, so a
+    /// `HashMap`-iteration-ordered pick let a variant describing a
+    /// different, NOT-installed distribution randomly match and get
+    /// attempted (nondeterministic spurious failures, or wrong-variant
+    /// content overwrites under the default mismatch policy). 64 rounds
+    /// with fresh maps so the randomized per-instance iteration order is
+    /// actually exercised.
+    #[tokio::test]
+    async fn representative_never_picks_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("mod.py"), b"installed wheel content\n")
+            .await
+            .unwrap();
+
+        for round in 0..64 {
+            let mut files: HashMap<String, PatchFileInfo> = HashMap::new();
+            // NEW file (empty beforeHash): verifies Ready everywhere; must
+            // never drive selection. Name varies per round so hash order
+            // varies too.
+            files.insert(
+                format!("aaa_new_{round}.py"),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: "1".repeat(64),
+                },
+            );
+            // Content-modifying file whose beforeHash does NOT match the
+            // on-disk bytes: the discriminating evidence that this variant
+            // is NOT the installed distribution.
+            files.insert(
+                "mod.py".to_string(),
+                PatchFileInfo {
+                    before_hash: "2".repeat(64),
+                    after_hash: "3".repeat(64),
+                },
+            );
+
+            let status = match representative_file(&files) {
+                Some((name, info)) => Some(verify_file_patch(dir.path(), name, info).await.status),
+                None => None,
+            };
+            assert!(
+                !variant_matches_installed(status.as_ref()),
+                "round {round}: non-installed variant matched — the representative \
+                 pick selected the new file instead of the discriminating one"
+            );
+        }
+    }
+
+    /// One-record manifest fixture for the `mismatch_blob_gaps` tests.
+    fn manifest_with_record(key: &str, files: HashMap<String, PatchFileInfo>) -> PatchManifest {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            key.to_string(),
+            PatchRecord {
+                uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+                exported_at: "2024-01-01T00:00:00Z".to_string(),
+                files,
+                vulnerabilities: HashMap::new(),
+                description: "fixture".to_string(),
+                license: "MIT".to_string(),
+                tier: "free".to_string(),
+            },
+        );
+        manifest
+    }
+
+    /// Regression: release-variant ecosystems key the manifest by
+    /// QUALIFIED purl (`?artifact_id=`…) while the crawler keys
+    /// `all_packages` by BASE purl, so the exact-key lookup in the
+    /// mismatch-blob probe missed every PyPI/Gem/Maven record — the
+    /// afterHash blobs that the default (Warn) mismatch policy needs were
+    /// never prefetched, and a locally-modified file in a variant package
+    /// failed to apply under the default diff download mode instead of
+    /// being warn-overwritten.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_matches_qualified_variant_keys() {
+        use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        // Representative file (lex-smallest, non-empty beforeHash) matches
+        // the installed distribution, so the apply loop WILL attempt this
+        // variant...
+        tokio::fs::write(pkg.join("aaa.py"), b"pristine\n")
+            .await
+            .unwrap();
+        // ...but a second file was locally modified: under the default
+        // Warn policy it is overwritten with the full afterHash blob, so
+        // that blob must be prefetched.
+        tokio::fs::write(pkg.join("zzz.py"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"pristine\n"),
+                after_hash: "1".repeat(64),
+            },
+        );
+        files.insert(
+            "zzz.py".to_string(),
+            PatchFileInfo {
+                before_hash: "2".repeat(64),
+                after_hash: "3".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record(
+            "pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0-py3-none-any.whl",
+            files,
+        );
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["3".repeat(64)]),
+            "the qualified variant's mismatched file must have its afterHash blob queued"
+        );
+    }
+
+    /// The counterpart guard: a sibling variant that does NOT describe the
+    /// installed distribution (its representative file mismatches) is
+    /// skipped by the apply loop, so its blobs must not be queued — that
+    /// would mean spurious downloads and spurious `--offline` "will fail
+    /// to apply" warnings on every run. Under `--force` every variant IS
+    /// attempted, so then its blob must be queued.
+    #[tokio::test]
+    async fn mismatch_blob_gaps_skips_non_installed_variant_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("aaa.py"), b"pristine\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        // The sdist variant's only file has a different base than the
+        // on-disk bytes: representative mismatch → not installed.
+        let mut files = HashMap::new();
+        files.insert(
+            "aaa.py".to_string(),
+            PatchFileInfo {
+                before_hash: "4".repeat(64),
+                after_hash: "5".repeat(64),
+            },
+        );
+        let manifest =
+            manifest_with_record("pkg:pypi/foo@1.0.0?artifact_id=foo-1.0.0.tar.gz", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:pypi/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        assert!(
+            needed.is_empty(),
+            "a non-installed variant is never attempted, so its blobs must not be queued: {needed:?}"
+        );
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, true).await;
+        assert_eq!(
+            needed,
+            HashSet::from(["5".repeat(64)]),
+            "--force attempts every variant, so the mismatch blob is needed"
+        );
+    }
+
+    /// Exact-key (npm-shaped) probing keeps working: unqualified manifest
+    /// keys match the crawled purl directly, with no installed-variant
+    /// gate (the npm branch always attempts).
+    #[tokio::test]
+    async fn mismatch_blob_gaps_exact_key_still_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("index.js"), b"locally modified\n")
+            .await
+            .unwrap();
+        let blobs = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: "6".repeat(64),
+                after_hash: "7".repeat(64),
+            },
+        );
+        let manifest = manifest_with_record("pkg:npm/foo@1.0.0", files);
+        let mut all_packages = HashMap::new();
+        all_packages.insert("pkg:npm/foo@1.0.0".to_string(), pkg.clone());
+
+        let needed = mismatch_blob_gaps(&manifest, &all_packages, &blobs, false).await;
+        assert_eq!(needed, HashSet::from(["7".repeat(64)]));
+    }
+
+    /// A variant with no content-modifying files (only new files) has
+    /// nothing to disqualify it: no representative, treated as a match —
+    /// the same no-files contract as core's `select_installed_variants`.
+    #[test]
+    fn representative_none_when_only_new_files() {
+        let mut files: HashMap<String, PatchFileInfo> = HashMap::new();
+        files.insert(
+            "new.py".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: "1".repeat(64),
+            },
+        );
+        assert!(representative_file(&files).is_none());
+        assert!(representative_file(&HashMap::new()).is_none());
     }
 
     /// Regression: a freshly-applied result with an empty `files_verified`

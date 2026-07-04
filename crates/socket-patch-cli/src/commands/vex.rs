@@ -308,8 +308,27 @@ async fn generate_vex(
 
     // Partition manifest into applied / failed.
     let mut outcome = if params.no_verify {
+        // Trust-the-manifest mode still needs the vendored classification:
+        // the property-7 exemption and the "(vendored)" phrasing key off
+        // `outcome.vendored`, and both are about how the patch persists,
+        // not whether this run hashed it. The committed ledger is as
+        // trustworthy as the manifest beside it, and reading it hashes
+        // nothing. An unreadable ledger degrades to "nothing vendored".
+        let entries = socket_patch_core::patch::vendor::load_state(&common.cwd)
+            .await
+            .map(|state| state.entries)
+            .unwrap_or_default();
+        let vendored = manifest
+            .patches
+            .keys()
+            .filter(|purl| {
+                socket_patch_core::patch::vendor::lookup_entry(&entries, purl).is_some()
+            })
+            .cloned()
+            .collect();
         VerifyOutcome {
             applied: manifest.patches.keys().cloned().collect(),
+            vendored,
             ..Default::default()
         }
     } else {

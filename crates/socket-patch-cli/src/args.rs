@@ -1011,6 +1011,71 @@ mod tests {
         });
     }
 
+    /// The mirror only works if every subcommand's `run` actually calls
+    /// `apply_env_toggles`. `list` and `setup` fire telemetry
+    /// (`track_patch_listed` / `track_patch_setup`) whose kill-switch reads
+    /// `SOCKET_TELEMETRY_DISABLED` / `SOCKET_OFFLINE` from the env only — a
+    /// run entry point that skips the mirror silently ignores
+    /// `--no-telemetry` and lets `--offline` (strict airgap: never contact
+    /// the network) still fire the telemetry HTTP request.
+    #[test]
+    #[serial_test::serial]
+    fn list_and_setup_run_mirror_global_toggles_for_airgap() {
+        with_clean_socket_env(|| {
+            with_clean_telemetry_env(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let toggles_on = |cwd: &Path| GlobalArgs {
+                    cwd: cwd.to_path_buf(),
+                    offline: true,
+                    no_telemetry: true,
+                    silent: true,
+                    ..GlobalArgs::default()
+                };
+
+                // Guard against a vacuous pass: the gate must start open.
+                assert!(!socket_patch_core::utils::telemetry::is_telemetry_disabled());
+
+                let tmp = tempfile::tempdir().unwrap();
+                rt.block_on(crate::commands::list::run(
+                    crate::commands::list::ListArgs {
+                        common: toggles_on(tmp.path()),
+                    },
+                ));
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "`list --offline --no-telemetry` must mirror the toggles into the \
+                     env — its telemetry kill-switch reads only SOCKET_OFFLINE / \
+                     SOCKET_TELEMETRY_DISABLED",
+                );
+
+                // Reset the mirrored vars so setup can't pass on list's leftovers.
+                std::env::remove_var("SOCKET_OFFLINE");
+                std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+
+                let tmp = tempfile::tempdir().unwrap();
+                rt.block_on(crate::commands::setup::run(
+                    crate::commands::setup::SetupArgs {
+                        check: false,
+                        remove: false,
+                        exclude: Vec::new(),
+                        common: GlobalArgs {
+                            // `setup` must not write anything from a unit test.
+                            dry_run: true,
+                            ..toggles_on(tmp.path())
+                        },
+                    },
+                ));
+                assert!(
+                    socket_patch_core::utils::telemetry::is_telemetry_disabled(),
+                    "`setup --offline --no-telemetry` must mirror the toggles into the env",
+                );
+            });
+        });
+    }
+
     /// `apply_env_toggles` mirrors `--debug` / `--no-telemetry` into the env
     /// vars core code reads directly, and is a no-op when the flags are off.
     /// `#[serial]` because it mutates process-global env state.

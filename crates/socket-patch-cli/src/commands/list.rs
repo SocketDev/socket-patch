@@ -3,7 +3,7 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::telemetry::track_patch_listed;
 
-use crate::args::GlobalArgs;
+use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
 };
@@ -94,6 +94,7 @@ fn emit_error(args: &ListArgs, code: &str, message: String) {
 }
 
 pub async fn run(args: ListArgs) -> i32 {
+    apply_env_toggles(&args.common);
     let manifest_path = args.common.resolved_manifest_path();
 
     // `read_manifest` is the single source of truth for the three error

@@ -718,6 +718,45 @@ async fn scan_unreachable_api_does_not_panic() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn scan_apply_all_detail_queries_failed_is_an_error() {
+    // The batch phase succeeds (one package with a patch), but EVERY
+    // per-package detail query 500s. Discovery then has no trustworthy
+    // patch data to select from — the same "total failure must not look
+    // like 'no patches'" rule the batch loop enforces one level up. A 404
+    // is different (the client maps it to an empty result = genuinely no
+    // patches); this guards genuine errors only.
+    let server = MockServer::start().await;
+    mock_batch_one(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "in-proc-scan", "1.0.0");
+    let mut args = default_args(tmp.path());
+    args.common.api_url = server.uri();
+    args.apply = true;
+
+    let code = run(args).await;
+
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "a fully-failed detail phase must not write a manifest"
+    );
+    assert_ne!(
+        code, 0,
+        "scan --json --apply must report failure when EVERY patch-detail \
+         query errors; exit 0 masks a total API outage as 'no patches'"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Regression: --batch-size 0 must not panic
 // ---------------------------------------------------------------------------

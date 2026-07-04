@@ -179,11 +179,15 @@ pub(super) async fn run_redirect(
     // --lockfile-only` writes bun.lock, DELETES bun.lockb, needs no network,
     // and fails closed on drift. Dry-run only warns; a failure degrades to the
     // rewriter's own presence-only refusal (the .lockb stays a candidate file).
+    // Gated on an npm-ecosystem override: the migration exists solely so the
+    // bun rewriter has a text lock to edit — with nothing to redirect it would
+    // re-lock (and delete) the user's lockfile as a side effect of a no-op run.
     let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
     let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
     let has_lockb = args.common.cwd.join("bun.lockb").exists();
     let has_bun_lock = args.common.cwd.join("bun.lock").exists();
-    if has_lockb && !has_bun_lock {
+    let has_npm_override = overrides.iter().any(|o| o.ecosystem == "npm");
+    if has_lockb && !has_bun_lock && has_npm_override {
         if args.common.dry_run {
             migration_warnings.push(serde_json::json!({
                 "code": "redirect_bun_lockb_would_migrate",
@@ -192,7 +196,9 @@ pub(super) async fn run_redirect(
                            re-run without --dry-run to apply",
             }));
         } else {
-            let status = std::process::Command::new("bun")
+            // `.output()` (not `.status()`): bun's install chatter must not
+            // interleave with the machine `--json` envelope on stdout.
+            let output = std::process::Command::new("bun")
                 .args([
                     "install",
                     "--save-text-lockfile",
@@ -200,9 +206,9 @@ pub(super) async fn run_redirect(
                     "--lockfile-only",
                 ])
                 .current_dir(&args.common.cwd)
-                .status();
-            let migrated =
-                matches!(status, Ok(s) if s.success()) && args.common.cwd.join("bun.lock").exists();
+                .output();
+            let migrated = matches!(output, Ok(o) if o.status.success())
+                && args.common.cwd.join("bun.lock").exists();
             if migrated {
                 // bun deleted bun.lockb itself. Record the removal so `--revert`
                 // knows the file was replaced (binary — git history is the
@@ -241,12 +247,12 @@ pub(super) async fn run_redirect(
     // keys — the pnpm rewriter is basename-generalized, so nested keys are
     // rewritten in place, and the write-back below is already path-generic.
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut rush_lock_keys: Vec<String> = Vec::new();
     if args.common.cwd.join("rush.json").is_file() {
-        let mut added_rush_lock = false;
         let common_lock = "common/config/rush/pnpm-lock.yaml";
         if let Ok(content) = std::fs::read_to_string(args.common.cwd.join(common_lock)) {
             files.insert(common_lock.to_string(), content);
-            added_rush_lock = true;
+            rush_lock_keys.push(common_lock.to_string());
         }
         let subspaces_dir = args.common.cwd.join("common/config/subspaces");
         if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
@@ -263,39 +269,41 @@ pub(super) async fn run_redirect(
                 };
                 let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
                 if let Ok(content) = std::fs::read_to_string(dir.join("pnpm-lock.yaml")) {
-                    files.insert(key, content);
-                    added_rush_lock = true;
+                    files.insert(key.clone(), content);
+                    rush_lock_keys.push(key);
                 }
             }
-        }
-
-        // Editing a Rush lock outside `rush update` desyncs the
-        // pnpmShrinkwrapHash recorded in repo-state.json. When
-        // preventManualShrinkwrapChanges is enabled, `rush install` then
-        // refuses until `rush update` refreshes that hash — but the redirect
-        // survives `rush update` (pnpm preserves locked resolutions for
-        // unchanged specifiers). Warn only when we actually touched a lock and
-        // the repo-state file that carries the hash is present.
-        if added_rush_lock
-            && args
-                .common
-                .cwd
-                .join("common/config/rush/repo-state.json")
-                .is_file()
-        {
-            rush_warnings.push(serde_json::json!({
-                "code": "redirect_rush_repo_state_stale",
-                "detail":
-                    "pnpm-lock.yaml was edited outside `rush update`; if \
-                     preventManualShrinkwrapChanges is enabled, `rush install` fails until \
-                     `rush update` refreshes repo-state.json (the redirect survives `rush \
-                     update`)",
-            }));
         }
     }
 
     let rewrite = rewrite_registry_redirect(&files, &overrides);
     let rewritten: Vec<String> = rewrite.files.keys().cloned().collect();
+
+    // Editing a Rush lock outside `rush update` desyncs the
+    // pnpmShrinkwrapHash recorded in repo-state.json. When
+    // preventManualShrinkwrapChanges is enabled, `rush install` then
+    // refuses until `rush update` refreshes that hash — but the redirect
+    // survives `rush update` (pnpm preserves locked resolutions for
+    // unchanged specifiers). Warn only when the rewrite actually landed in a
+    // Rush lock and the repo-state file that carries the hash is present.
+    if rush_lock_keys
+        .iter()
+        .any(|key| rewrite.files.contains_key(key))
+        && args
+            .common
+            .cwd
+            .join("common/config/rush/repo-state.json")
+            .is_file()
+    {
+        rush_warnings.push(serde_json::json!({
+            "code": "redirect_rush_repo_state_stale",
+            "detail":
+                "pnpm-lock.yaml was edited outside `rush update`; if \
+                 preventManualShrinkwrapChanges is enabled, `rush install` fails until \
+                 `rush update` refreshes repo-state.json (the redirect survives `rush \
+                 update`)",
+        }));
+    }
 
     // A dep counts as REDIRECTED only if its hosted-artifact URL (or its
     // per-dependency registry index URL) actually landed in the project's
@@ -399,10 +407,16 @@ pub(super) async fn run_redirect(
             ledger.edits.extend(migration_edits.iter().cloned());
             ledger.edits.extend(rewrite.edits.iter().cloned());
             ledger.records.extend(records.clone());
-            let _ = std::fs::write(
+            // The ledger is the only revert path and the VEX record store —
+            // a swallowed write failure would leave the rewritten lockfiles
+            // unrevertable while reporting success.
+            if let Err(e) = std::fs::write(
                 vendor_dir.join("redirect-state.json"),
                 format!("{}\n", serde_json::to_string_pretty(&ledger).unwrap()),
-            );
+            ) {
+                eprintln!("failed to write .socket/vendor/redirect-state.json: {e}");
+                return 1;
+            }
         }
     }
 

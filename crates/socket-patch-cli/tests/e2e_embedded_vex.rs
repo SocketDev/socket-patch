@@ -323,6 +323,61 @@ fn apply_json_envelope_carries_vex_summary() {
     );
 }
 
+/// `--dry-run` applies nothing, so embedded VEX generation must be
+/// skipped entirely. Before the fix, VEX ran anyway and verified the
+/// deliberately-unapplied tree: every patch classified `not_applied`,
+/// `build_document` produced nothing, and the whole command exited 1
+/// with `no_applicable_patches` even though the dry-run verification
+/// itself succeeded. A dry run must exit 0, report no `vex` summary,
+/// and never write an attestation file.
+#[test]
+fn apply_dry_run_skips_embedded_vex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    seed_offline_apply(cwd);
+    let vex_path = cwd.join("apply.vex.json");
+
+    let out = cli()
+        .args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--offline",
+            "--dry-run",
+            "--json",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:npm/my-app@1.0.0",
+        ])
+        .output()
+        .expect("invoke apply");
+    assert!(
+        out.status.success(),
+        "a clean dry run must exit 0 even with --vex requested. stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let env: Value = serde_json::from_slice(&out.stdout).expect("apply envelope JSON");
+    assert_eq!(env["command"], "apply");
+    assert_eq!(env["dryRun"], true);
+    assert_eq!(env["status"], "success");
+    assert!(
+        env["vex"].is_null(),
+        "no vex summary may be reported on a dry run, got {:?}",
+        env["vex"]
+    );
+    assert!(
+        !vex_path.exists(),
+        "a dry run must not write a VEX document"
+    );
+
+    // And the dry run must not have touched the package.
+    let on_disk = std::fs::read(cwd.join("node_modules/vuln-pkg/index.js")).unwrap();
+    assert_eq!(on_disk, b"before contents\n");
+}
+
 #[test]
 fn apply_vex_failure_flips_exit_code() {
     // Apply succeeds, but no product PURL can be detected (no root

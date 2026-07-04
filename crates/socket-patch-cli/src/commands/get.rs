@@ -609,6 +609,12 @@ pub(crate) fn select_patches(
 /// Download parameters shared between get and scan commands.
 pub struct DownloadParams {
     pub cwd: PathBuf,
+    /// Resolved manifest location (`GlobalArgs::resolved_manifest_path`).
+    /// The blobs directory is its parent's `blobs/` — the same layout
+    /// apply/rollback resolve from — so `--manifest-path` is honored here
+    /// like on every other command, not silently replaced with
+    /// `<cwd>/.socket/manifest.json`.
+    pub manifest_path: PathBuf,
     pub org: Option<String>,
     pub save_only: bool,
     pub global: bool,
@@ -813,7 +819,11 @@ pub(crate) async fn download_patch_records(
 ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
     let api_client = api_client_for(params).await;
 
-    let socket_dir = params.cwd.join(".socket");
+    let socket_dir = params
+        .manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let blobs_dir = socket_dir.join("blobs");
     if params.persist_blobs {
         if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
@@ -984,19 +994,23 @@ async fn warn_on_vendored_uuid_drift(
 /// invocation.
 async fn run_nested_apply(
     cwd: &Path,
+    manifest_path: &Path,
     global: bool,
     global_prefix: Option<PathBuf>,
     quiet: bool,
     download_mode: String,
     strict: bool,
 ) -> bool {
+    // Apply re-resolves a relative manifest path against ITS `--cwd`
+    // (`resolved_manifest_path`), but ours is already cwd-resolved —
+    // passing it through relative double-joins the cwd (`proj/proj/...`),
+    // and apply then no-ops on the missing manifest while reporting
+    // success. Absolutize so it passes through verbatim.
+    let manifest_path =
+        std::path::absolute(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
     let apply_args = super::apply::ApplyArgs {
         common: crate::args::GlobalArgs {
-            manifest_path: cwd
-                .join(".socket")
-                .join("manifest.json")
-                .display()
-                .to_string(),
+            manifest_path: manifest_path.display().to_string(),
             cwd: cwd.to_path_buf(),
             global,
             global_prefix,
@@ -1022,9 +1036,12 @@ pub async fn download_and_apply_patches(
 ) -> (i32, serde_json::Value) {
     let api_client = api_client_for(params).await;
 
-    let socket_dir = params.cwd.join(".socket");
+    let manifest_path = params.manifest_path.clone();
+    let socket_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let blobs_dir = socket_dir.join("blobs");
-    let manifest_path = socket_dir.join("manifest.json");
 
     if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
         let err = format!("Failed to create .socket directory: {}", e);
@@ -1227,6 +1244,7 @@ pub async fn download_and_apply_patches(
         }
         apply_succeeded = run_nested_apply(
             &params.cwd,
+            &manifest_path,
             params.global,
             params.global_prefix.clone(),
             params.json || params.silent,
@@ -1638,6 +1656,7 @@ pub async fn run(args: GetArgs) -> i32 {
     // Download and apply
     let params = DownloadParams {
         cwd: args.common.cwd.clone(),
+        manifest_path: args.common.resolved_manifest_path(),
         org: args.common.org.clone(),
         save_only: args.save_only,
         global: args.common.global,
@@ -1712,9 +1731,11 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     // Same "errors only" gate as `run` — informational prints respect
     // `--silent`; errors and the JSON envelope do not.
     let quiet = args.common.json || args.common.silent;
-    let socket_dir = args.common.cwd.join(".socket");
-    let blobs_dir = socket_dir.join("blobs");
-    let manifest_path = socket_dir.join("manifest.json");
+    let manifest_path = args.common.resolved_manifest_path();
+    let blobs_dir = manifest_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("blobs");
 
     if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
         report_error(
@@ -1822,6 +1843,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         }
         apply_succeeded = run_nested_apply(
             &args.common.cwd,
+            &manifest_path,
             args.common.global,
             args.common.global_prefix.clone(),
             quiet,

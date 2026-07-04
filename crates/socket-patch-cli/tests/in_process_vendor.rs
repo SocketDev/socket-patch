@@ -1405,3 +1405,58 @@ fn vendor_resolves_percent_encoded_scope_purl() {
     );
     assert!(!fx.vendor_dir().join("npm").exists(), "artifacts removed");
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 11. --dry-run --vex: skipped, not generated
+// ─────────────────────────────────────────────────────────────────────
+
+/// A dry run vendors nothing, so there is no vendored state to attest:
+/// generating VEX here verified the deliberately untouched tree, spuriously
+/// failed the whole command with `no_applicable_patches`, and would write an
+/// attestation file during --dry-run (the same contract `apply --dry-run
+/// --vex` already honors by skipping generation).
+#[tokio::test]
+async fn dry_run_vex_is_skipped_not_generated() {
+    let fx = npm_fixture();
+    let vex_path = fx.root().join("vendor-dry.vex.json");
+    let mut args = vendor_args(fx.root());
+    args.common.dry_run = true;
+    args.vex.vex = Some(vex_path.clone());
+
+    let code = vendor_run(args).await;
+    assert_eq!(code, 0, "vendor --dry-run --vex must not fail");
+    assert!(
+        !vex_path.exists(),
+        "--dry-run must never write an attestation file"
+    );
+    // The dry run itself stayed read-only.
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+    assert!(!fx.vendor_dir().exists(), "no artifacts staged");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 12. fail-closed --vendor-source=service refuses --offline
+// ─────────────────────────────────────────────────────────────────────
+
+/// `--vendor-source=service` promises "prebuilt service artifacts only",
+/// and `--offline` forbids the network the service needs — the combination
+/// can never be satisfied. It must refuse up front; silently falling back
+/// to a local build (what `service_enabled() == false` otherwise causes in
+/// every backend) violates the fail-closed contract.
+#[tokio::test]
+async fn offline_service_mode_refuses_instead_of_building() {
+    let fx = npm_fixture();
+    let mut args = vendor_args(fx.root());
+    args.common.vendor_source = "service".to_string();
+
+    let code = vendor_run(args).await;
+    assert_ne!(
+        code, 0,
+        "--offline --vendor-source=service cannot be satisfied and must refuse"
+    );
+    assert!(
+        !fx.tgz_path().exists(),
+        "service mode must not silently build a local artifact"
+    );
+    assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
+}

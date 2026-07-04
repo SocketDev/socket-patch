@@ -108,7 +108,7 @@ The rewriter reads a fixed set of candidate files from the project root: the npm
 * `.socket/vendor/state.json` — the **vendored**-mode ledger (see "Ownership, state, and reversal" below): wiring edits with verbatim pre-vendor originals, artifact fingerprints, optional `detached` records.
 * `.socket/vendor/redirect-state.json` — the **hosted**-mode ledger (`RedirectState` in `socket-patch-core/src/patch/redirect/state.rs`): `{ version, mode: "hosted", edits[], records{} }`. `edits` are recorded `FileEdit`s (append-only across re-runs — merge, never clobber: the pre-redirect originals a future revert needs live here); `records` maps PURL → the full manifest `PatchRecord` so a post-install `vex` can attest redirected patches with no manifest entry. The `mode` string is opaque to the loader (pre-rename ledgers carrying `"redirect"` still load; a hosted re-run normalizes them to `"hosted"`). Written identically by this CLI and by the depscan backend's hosted PR flow (`github-patch-pr-hosted.ts`).
 
-`--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` / `remove` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts (`remove --dry-run` skips the confirmation prompt — there is nothing to confirm — and flips its would-be `Removed` events to `Verified` previews, so `summary.removed` stays "entries actually deleted").
+`--dry-run` previews what `apply` / `rollback` / `scan --apply` / `repair` / `remove` / `unlock --release` would do without mutating disk. In JSON mode, the envelope is populated with would-be actions and counts (`remove --dry-run` skips the confirmation prompt — there is nothing to confirm — and flips its would-be `Removed` events to `Verified` previews, so `summary.removed` stays "entries actually deleted"; `unlock --release --dry-run` keeps `released: false` and reports the preview via additive `dryRun` + `wouldRelease` fields).
 
 The hidden alias `--no-apply` on `get --save-only` is **part of the contract** — it does not appear in `--help` but is widely used in existing scripts.
 
@@ -816,7 +816,7 @@ The remaining commands still emit their pre-v3.0 ad-hoc JSON shapes and will mig
 
 Two commands are **intentionally not** plain-envelope and will stay that way (not migration debt):
 
-- `unlock` — **mixed**: the free path emits a flat `{ "command": "unlock", "status": "free", "lockFile": "...", "released": bool }` object (jq-friendly; documented at `src/commands/unlock.rs::emit_free`), while the held/error paths emit the standard envelope (`status: "error"`, code `lock_held` / `lock_io`).
+- `unlock` — **mixed**: the free path emits a flat `{ "command": "unlock", "status": "free", "lockFile": "...", "released": bool }` object (jq-friendly; documented at `src/commands/unlock.rs::emit_free`; under `--dry-run` it gains additive `dryRun: true` and — with `--release` — `wouldRelease: bool` fields, `released` staying truthfully false), while the held/error paths emit the standard envelope (`status: "error"`, code `lock_held` / `lock_io`).
 - `vex` — **hybrid**: the OpenVEX document is itself JSON and is the primary output; the envelope appears only under `--json --output <path>`. See the [vex output channels](#vex-output-channels) table.
 
 ### `patches[]` entry shape for `get` and `scan --apply`

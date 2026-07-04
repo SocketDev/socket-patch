@@ -336,10 +336,14 @@ async fn embed_vex_human(
 /// The per-package discovery + selection step shared by the apply, vendor,
 /// and redirect flows: search each patched package's full patch list, then
 /// resolve the newest accessible patch per PURL. Per-package search errors
-/// are skipped. Passes `is_json = false` to `select_patches`: scan-driven
-/// workflows have no "specify --id" option, so non-TTY runs auto-select
-/// the newest patch rather than erroring with `selection_required`. `Err`
-/// carries `select_patches`' exit code.
+/// are skipped — but when EVERY query errors the step produced no
+/// trustworthy patch data at all, and reporting the empty set would be
+/// indistinguishable from a genuine "no patches" result (the same masking
+/// the batch loop in `run` guards against), so that surfaces as `Err(1)`
+/// with the failure on stderr. Passes `is_json = false` to
+/// `select_patches`: scan-driven workflows have no "specify --id" option,
+/// so non-TTY runs auto-select the newest patch rather than erroring with
+/// `selection_required`. `Err` carries the exit code.
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     org_slug: Option<&str>,
@@ -347,13 +351,24 @@ async fn discover_selected(
     can_access_paid_patches: bool,
 ) -> Result<Vec<PatchSearchResult>, i32> {
     let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
+    let mut error_count = 0usize;
+    let mut last_error: Option<String> = None;
     for pkg in packages {
-        if let Ok(response) = api_client
+        match api_client
             .search_patches_by_package(org_slug, &pkg.purl)
             .await
         {
-            all_search_results.extend(response.patches);
+            Ok(response) => all_search_results.extend(response.patches),
+            Err(e) => {
+                error_count += 1;
+                last_error = Some(e.to_string());
+            }
         }
+    }
+    if error_count > 0 && error_count == packages.len() {
+        let err = last_error.unwrap_or_else(|| "all patch-detail queries failed".to_string());
+        eprintln!("Error: all {error_count} patch-detail queries failed: {err}");
+        return Err(1);
     }
     if all_search_results.is_empty() {
         return Ok(Vec::new());
@@ -367,6 +382,7 @@ async fn discover_selected(
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
+        manifest_path: args.common.resolved_manifest_path(),
         org: args.common.org.clone(),
         save_only,
         global: args.common.global,
@@ -816,12 +832,16 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         });
         // Flag lockfile-only packages so JSON consumers can tell "patch
         // available but not installed" from the installed case. Additive
-        // field; absent means installed.
+        // field; absent means installed. Matching bridges the API's
+        // percent-encoded purl spelling to the supplement's literal form
+        // via `normalize_purl`, like the apply-path skip partitions.
         if let Some(packages) = result["packages"].as_array_mut() {
             for pkg in packages {
-                let is_lockfile_only = pkg["purl"]
-                    .as_str()
-                    .is_some_and(|p| lockfile_only.purls.contains(p));
+                let is_lockfile_only = pkg["purl"].as_str().is_some_and(|p| {
+                    lockfile_only
+                        .purls
+                        .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
+                });
                 if is_lockfile_only {
                     pkg["notInstalled"] = serde_json::json!(true);
                 }
@@ -1085,7 +1105,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             };
             // Lockfile-only packages can be patched by `scan --vendor`
             // (which fetches them pristine) but not applied in place.
-            let not_installed_marker = if lockfile_only.purls.contains(pkg.purl.as_str()) {
+            // `normalize_purl` bridges the API's percent-encoded spelling
+            // to the supplement's literal form, like the JSON flag and the
+            // apply-path skip partitions.
+            let not_installed_marker = if lockfile_only
+                .purls
+                .contains(normalize_purl(strip_purl_qualifiers(&pkg.purl)).as_ref())
+            {
                 color(" [NOT INSTALLED]", "33", use_color)
             } else {
                 String::new()

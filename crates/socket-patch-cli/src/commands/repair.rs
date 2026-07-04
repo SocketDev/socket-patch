@@ -307,7 +307,11 @@ async fn repair_inner(
                 download_mode.as_tag()
             );
             for id in missing_artifacts.iter().take(5) {
-                println!("  - {}...", &id[..12.min(id.len())]);
+                // Truncate by characters, not bytes: manifest hashes are
+                // unvalidated strings, and a byte slice panics when index
+                // 12 lands inside a multibyte char (see format_fetch_result).
+                let short: String = id.chars().take(12).collect();
+                println!("  - {short}...");
             }
             if missing_artifacts.len() > 5 {
                 println!("  ... and {} more", missing_artifacts.len() - 5);
@@ -326,7 +330,9 @@ async fn repair_inner(
             if !quiet {
                 println!("\nDry run - would download:");
                 for id in missing_artifacts.iter().take(10) {
-                    println!("  - {}...", &id[..12.min(id.len())]);
+                    // Chars, not bytes — same constraint as the offline list.
+                    let short: String = id.chars().take(12).collect();
+                    println!("  - {short}...");
                 }
                 if missing_artifacts.len() > 10 {
                     println!("  ... and {} more", missing_artifacts.len() - 10);
@@ -748,6 +754,68 @@ mod tests {
             .join("packages")
             .join("88888888-8888-4888-8888-888888888888.tar.gz")
             .exists());
+    }
+
+    /// A manifest "hash" that is NOT a hex digest: manifest hashes are
+    /// unvalidated strings (serde only), and byte index 12 of this one lands
+    /// inside a multibyte char — so a byte slice `&id[..12]` panics on it.
+    /// 1 ASCII byte + 8×2-byte `é` = 17 bytes; boundaries at 11 and 13.
+    const MULTIBYTE_HASH: &str = "aéééééééé";
+
+    /// Write a `.socket/manifest.json` whose afterHash is `MULTIBYTE_HASH`.
+    fn make_socket_multibyte(root: &Path) -> PathBuf {
+        let socket = root.join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        std::fs::write(
+            socket.join("manifest.json"),
+            MANIFEST_JSON.replace(REFERENCED_HASH, MULTIBYTE_HASH),
+        )
+        .unwrap();
+        socket
+    }
+
+    /// Regression: the human-readable offline warning truncates each missing
+    /// artifact id for display. Truncation must be by characters, not bytes —
+    /// `&id[..12]` panics when byte 12 falls inside a multibyte char, so a
+    /// corrupt or hand-edited manifest crashed `repair --offline` instead of
+    /// warning. (Same class as the `format_fetch_result` fix in blob_fetcher.)
+    #[tokio::test]
+    async fn offline_warning_survives_multibyte_manifest_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket_multibyte(tmp.path());
+        // The truncating print only runs on the human-readable path.
+        let mut args = offline_args(tmp.path());
+        args.common.json = false;
+
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        assert_eq!(counts.downloaded, 0);
+        assert_eq!(env.status, Status::Success);
+    }
+
+    /// Regression twin for the dry-run preview print, which truncated ids the
+    /// same byte-sliced way (its list caps at 10 instead of 5).
+    #[tokio::test]
+    async fn dry_run_preview_survives_multibyte_manifest_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket_multibyte(tmp.path());
+        let mut args = offline_args(tmp.path());
+        args.common.offline = false;
+        args.common.dry_run = true;
+        args.common.json = false;
+
+        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"))
+            .await
+            .expect("repair_inner");
+
+        // The preview event is still recorded once the print survives.
+        assert!(
+            has_download_event(&env),
+            "dry-run must still preview the download; events={:?}",
+            env.events
+        );
     }
 
     /// Offline mode with a missing artifact: the run must succeed (a warning,
