@@ -30,7 +30,7 @@
 //!     `packages.lock.json` byte-identical, DELETES the created `nuget.config`,
 //!     and removes `.socket/vendor` → a re-vendor succeeds again.
 
-#![cfg(all(feature = "docker-e2e", feature = "nuget"))]
+#![cfg(feature = "docker-e2e")]
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;

@@ -150,7 +150,6 @@ pub(crate) fn serialize_json(value: &Value, indent: &str) -> std::io::Result<Vec
 /// Insert `insertion` (already newline-terminated) immediately before the line
 /// containing the first occurrence of `needle`. Returns `None` if `needle` is
 /// absent.
-#[cfg(any(feature = "maven", feature = "nuget"))]
 pub(crate) fn insert_before(haystack: &str, needle: &str, insertion: &str) -> Option<String> {
     let idx = haystack.find(needle)?;
     // Back up to the start of the needle's line so the insertion lands on its
@@ -209,7 +208,6 @@ pub(crate) fn is_executable(metadata: &std::fs::Metadata) -> bool {
 /// central directory, so entry order is free to be lexicographic.
 /// `skip_entry` drops one archive-relative name (NuGet's `.signature.p7s` —
 /// the content changed, so the rebuilt package must read as unsigned).
-#[cfg(any(feature = "maven", feature = "nuget"))]
 pub(crate) fn rebuild_zip(stage: &Path, skip_entry: Option<&str>) -> Result<Vec<u8>, String> {
     let mut entries: Vec<(String, Vec<u8>, u32)> = Vec::new();
     for entry in walkdir::WalkDir::new(stage).follow_links(false) {
@@ -235,7 +233,6 @@ pub(crate) fn rebuild_zip(stage: &Path, skip_entry: Option<&str>) -> Result<Vec<
 /// True when the committed archive (a plain zip: `.jar` / `.nupkg`) exists and
 /// every patched file in it already hashes to its `afterHash` (the zip twin of
 /// [`copy_matches_after_hashes`], reading the archive's entries).
-#[cfg(any(feature = "maven", feature = "nuget"))]
 pub(crate) async fn zip_matches_after_hashes(
     archive_path: &Path,
     files: &HashMap<String, PatchFileInfo>,

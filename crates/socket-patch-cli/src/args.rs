@@ -26,11 +26,8 @@ use socket_patch_core::patch::vendor::VendorSource;
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
-/// Rejects any name this build does not support — both typos and
-/// ecosystems whose Cargo feature is not compiled in (e.g. `maven` /
-/// `nuget` on a default build, which ships npm + PyPI + Ruby gems + Go +
-/// Cargo). `Ecosystem::all()` is itself `#[cfg]`-gated, so the accepted
-/// set tracks the compiled feature set exactly.
+/// Rejects any name that is not a supported ecosystem, so typos fail
+/// loudly instead of silently matching nothing.
 ///
 /// Without this, an unsupported name parsed fine and was then silently
 /// dropped by `partition_purls`/`crawl_all_ecosystems`, so the user got a
@@ -124,8 +121,8 @@ pub struct GlobalArgs {
     )]
     pub proxy_url: String,
 
-    /// Restrict to these ecosystems (comma-separated). Names not supported
-    /// by this build (e.g. `maven`/`nuget` unless compiled in) are rejected.
+    /// Restrict to these ecosystems (comma-separated). Names that are not
+    /// supported ecosystems are rejected.
     #[arg(
         long = "ecosystems",
         short = 'e',
@@ -930,16 +927,16 @@ mod tests {
         );
     }
 
-    /// `parse_supported_ecosystem` accepts every name this build compiles in
+    /// `parse_supported_ecosystem` accepts every supported ecosystem name
     /// and returns it verbatim.
     #[test]
-    fn parse_supported_ecosystem_accepts_compiled_in_names() {
+    fn parse_supported_ecosystem_accepts_supported_names() {
         for e in Ecosystem::all() {
             let name = e.cli_name();
             assert_eq!(
                 parse_supported_ecosystem(name),
                 Ok(name.to_string()),
-                "{name:?} is compiled in and must be accepted",
+                "{name:?} is a supported ecosystem and must be accepted",
             );
         }
     }

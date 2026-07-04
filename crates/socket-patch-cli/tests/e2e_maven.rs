@@ -1,4 +1,3 @@
-#![cfg(feature = "maven")]
 //! End-to-end tests for the Maven/Java package patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with a fake
@@ -7,7 +6,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features maven --test e2e_maven
+//! cargo test -p socket-patch-cli --test e2e_maven
 //! ```
 
 use std::path::PathBuf;

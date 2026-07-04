@@ -1,7 +1,5 @@
 //! Integration coverage for `crawlers::go_crawler`.
 
-#![cfg(feature = "golang")]
-
 use std::path::Path;
 
 use serial_test::serial;

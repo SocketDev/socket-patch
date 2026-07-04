@@ -322,7 +322,11 @@ pub(super) async fn wire_poetry(
 /// Reverse the wiring: restore the verbatim original `[[package]]` unit via
 /// the shared fragment-splice revert (drift-tolerant, poetry.lock-only
 /// allowlist).
-pub(super) async fn revert_poetry(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
+pub(super) async fn revert_poetry(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+) -> RevertOutcome {
     revert_lock_fragment_splice(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "poetry").await
 }
 
@@ -360,14 +364,15 @@ fn rewrite_target_package_unit(
         })?;
     let unit = package_unit_lines(&lock_text[span]);
     let old_unit = unit.join("\n");
-    let mut out = replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
-        // 2.x locks always carry files[]; a unit without one is a shape we
-        // have no fixture for — fail closed rather than guess a placement.
-        (
-            "pypi_poetry_lock_parse_failed",
-            format!("the {canon} [[package]] entry has no files array to rewrite"),
-        )
-    })?;
+    let mut out =
+        replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
+            // 2.x locks always carry files[]; a unit without one is a shape we
+            // have no fixture for — fail closed rather than guess a placement.
+            (
+                "pypi_poetry_lock_parse_failed",
+                format!("the {canon} [[package]] entry has no files array to rewrite"),
+            )
+        })?;
     out.push(String::new());
     out.push("[package.source]".to_string());
     out.push("type = \"file\"".to_string());

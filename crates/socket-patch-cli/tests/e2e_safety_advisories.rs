@@ -34,10 +34,8 @@ mod common;
 use common::{
     git_sha256, parse_json_envelope, run_with_env, write_blob, write_minimal_manifest, PatchEntry,
 };
-// Only the cargo sidecar test needs the bare (un-framed) digest used in
-// `.cargo-checksum.json`; gate the import so a `--no-default-features`
-// (no `cargo`) build doesn't trip the unused-import lint under `-D warnings`.
-#[cfg(feature = "cargo")]
+// The cargo sidecar test needs the bare (un-framed) digest used in
+// `.cargo-checksum.json`.
 use common::sha256_hex;
 
 /// Helper: stage a package layout + manifest + blob, run apply, and
@@ -339,7 +337,6 @@ fn gem_apply_emits_gem_bundle_install_reverts_advisory() {
 /// path followed by `@<version>/`. We pass both `--global-prefix` and
 /// `GOMODCACHE` for redundancy (the apply CLI consumes the former,
 /// some downstream code paths read the latter).
-#[cfg(feature = "golang")]
 #[test]
 fn golang_apply_emits_go_mod_verify_fails_advisory() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -412,7 +409,6 @@ fn golang_apply_emits_go_mod_verify_fails_advisory() {
 /// hash sidecar) and records the deletion under
 /// `envelope.sidecars[].files[]`. No advisory is emitted for the
 /// unsigned case — the deletion alone is the operator surface.
-#[cfg(feature = "nuget")]
 #[test]
 fn nuget_apply_deletes_metadata_and_records_files() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -503,7 +499,7 @@ fn nuget_apply_deletes_metadata_and_records_files() {
 /// also accept arbitrary byte sequences in filenames). Falls back
 /// to a portable shape on other Unices where the filesystem
 /// rejects non-UTF8 names.
-#[cfg(all(unix, feature = "nuget"))]
+#[cfg(unix)]
 #[test]
 fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
     use std::ffi::OsStr;
@@ -612,7 +608,6 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
 /// success and signed-package tests can't reach. As with the
 /// cargo equivalent, the directory-as-file ruse beats chmod
 /// because it fails uniformly across uids and platforms.
-#[cfg(feature = "nuget")]
 #[test]
 fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -693,7 +688,6 @@ fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
 /// at severity `warning`. The old single-variant `SidecarOutcome`
 /// design lost the advisory in this case; the typed schema keeps
 /// both visible.
-#[cfg(feature = "nuget")]
 #[test]
 fn nuget_apply_signed_package_emits_files_and_advisory() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -786,10 +780,9 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
 // ─────────────────────────────────────────────────────────────────────
 // Cargo — file rewrite (no advisory), code path proves
 // `.cargo-checksum.json` is rewritten to the on-disk hash and recorded
-// as `Rewritten`. This is the DEFAULT-feature sidecar and the only one
-// in the shipped binary that *rewrites* a file, so it must have an
-// end-to-end guard that runs under `--features cargo` (the recommended
-// command) — not just core-crate unit tests on `cargo::fixup`.
+// as `Rewritten`. This is the only sidecar in the shipped binary that
+// *rewrites* a file, so it must have an end-to-end guard — not just
+// core-crate unit tests on `cargo::fixup`.
 // ─────────────────────────────────────────────────────────────────────
 
 /// Cargo: patching a file inside a `<name>-<version>/` registry-cache
@@ -804,7 +797,6 @@ fn nuget_apply_signed_package_emits_files_and_advisory() {
 /// checksum file back off disk and pins it — so a regression that
 /// stops rewriting, rewrites the wrong value, clobbers the untouched
 /// sibling / `package` tarball hash, or mislabels the action fires loudly.
-#[cfg(feature = "cargo")]
 #[test]
 fn cargo_apply_rewrites_checksum_and_records_files() {
     let tmp = tempfile::tempdir().expect("tempdir");

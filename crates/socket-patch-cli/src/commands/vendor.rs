@@ -154,15 +154,10 @@ pub(crate) async fn dispatch_vendor_one(
         "npm" => vend!(vendor::npm_flavor::vendor_npm_any),
         "pypi" => vend!(vendor::pypi::vendor_pypi),
         "gem" => vend!(vendor::gem::vendor_gem),
-        #[cfg(feature = "cargo")]
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
-        #[cfg(feature = "golang")]
         "golang" => vend!(vendor::golang::vendor_go_module),
-        #[cfg(feature = "composer")]
         "composer" => vend!(vendor::composer_lock::vendor_composer),
-        #[cfg(feature = "nuget")]
         "nuget" => vend!(vendor::nuget_feed::vendor_nuget),
-        #[cfg(feature = "maven")]
         "maven" => vend!(vendor::maven_repo::vendor_maven),
         _ => return None,
     })
@@ -178,15 +173,10 @@ pub(crate) async fn dispatch_revert_one(
         "npm" => vendor::npm_flavor::revert_npm_any(entry, project_root, dry_run).await,
         "pypi" => vendor::pypi::revert_pypi(entry, project_root, dry_run).await,
         "gem" => vendor::gem::revert_gem(entry, project_root, dry_run).await,
-        #[cfg(feature = "cargo")]
         "cargo" => vendor::cargo::revert_cargo_vendor(entry, project_root, dry_run).await,
-        #[cfg(feature = "golang")]
         "golang" => vendor::golang::revert_go_vendor(entry, project_root, dry_run).await,
-        #[cfg(feature = "composer")]
         "composer" => vendor::composer_lock::revert_composer(entry, project_root, dry_run).await,
-        #[cfg(feature = "nuget")]
         "nuget" => vendor::nuget_feed::revert_nuget(entry, project_root, dry_run).await,
-        #[cfg(feature = "maven")]
         "maven" => vendor::maven_repo::revert_maven(entry, project_root, dry_run).await,
         other => RevertOutcome::failed(format!(
             "this build has no vendor backend for ecosystem `{other}`"
@@ -604,8 +594,7 @@ pub(crate) async fn vendor_records(
     let manifest_purls: Vec<String> = records.keys().cloned().collect();
     let partitioned = partition_purls(&manifest_purls, common.ecosystems.as_deref());
 
-    // Purls with no vendor backend (jsr, or ecosystems compiled out of this
-    // binary) are expected skips, not failures.
+    // Purls with no vendor backend (jsr) are expected skips, not failures.
     let (vendorable, unsupported): (Vec<String>, Vec<String>) = partitioned
         .values()
         .flatten()

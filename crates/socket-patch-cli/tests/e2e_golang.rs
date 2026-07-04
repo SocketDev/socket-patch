@@ -1,4 +1,3 @@
-#![cfg(feature = "golang")]
 //! End-to-end tests for the Go module patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with a fake
@@ -13,7 +12,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features golang --test e2e_golang
+//! cargo test -p socket-patch-cli --test e2e_golang
 //! ```
 
 use std::collections::BTreeSet;

@@ -50,7 +50,7 @@
 //!     `vendor --revert` restores `pom.xml` byte-identical and removes
 //!     `.socket/vendor` → a re-vendor succeeds again.
 
-#![cfg(all(feature = "docker-e2e", feature = "maven"))]
+#![cfg(feature = "docker-e2e")]
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;

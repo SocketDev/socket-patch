@@ -47,8 +47,8 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, json_to_lines, lines_to_json, replace_block, scan_blocks,
-    split_key_patterns, split_pattern, LockBlock,
+    body_field_line, json_to_lines, lines_to_json, replace_block, scan_blocks, split_key_patterns,
+    split_pattern, LockBlock,
 };
 use super::{RevertOutcome, VendorOutcome, VendorWarning};
 

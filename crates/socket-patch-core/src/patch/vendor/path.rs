@@ -39,22 +39,19 @@ use crate::utils::fs::{entry_is_dir, list_dir_entries};
 pub(crate) const VENDOR_DIR: &str = ".socket/vendor";
 
 /// The ecosystem directory names under [`VENDOR_DIR`]. These double as the
-/// `<eco>` capture of the recovery convention and are independent of which
-/// features this binary was compiled with (an orphan sweep must still
-/// recognise — and report, not delete — a dir for a compiled-out ecosystem).
+/// `<eco>` capture of the recovery convention.
 pub(crate) const ECOSYSTEM_DIRS: &[&str] = &[
     "npm", "cargo", "golang", "composer", "gem", "pypi", "nuget", "maven",
 ];
 
 /// The vendor ecosystem-dir name for a PURL, or `None` when the ecosystem has
-/// no vendor backend (jsr) or is compiled out of this binary.
+/// no vendor backend (jsr).
 ///
 /// The dir name is `Ecosystem::cli_name()`: both are persisted contracts
 /// (cli_name in manifests/sidecars, the dir in committed vendor paths) and
 /// they deliberately share one spelling — see `ECOSYSTEM_DIRS` above.
 pub fn ecosystem_dir_for_purl(purl: &str) -> Option<&'static str> {
     match Ecosystem::from_purl(purl)? {
-        #[cfg(feature = "deno")]
         Ecosystem::Deno => None,
         eco => Some(eco.cli_name()),
     }
@@ -373,10 +370,7 @@ mod tests {
                     );
                 }
                 None => {
-                    #[cfg(feature = "deno")]
                     assert_eq!(*eco, Ecosystem::Deno, "only deno lacks a vendor backend");
-                    #[cfg(not(feature = "deno"))]
-                    panic!("no vendor dir for {}", eco.cli_name());
                 }
             }
         }

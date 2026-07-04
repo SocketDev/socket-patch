@@ -2,8 +2,6 @@
 //! docker e2e suite doesn't drive (project-marker gates, env-var
 //! resolution, malformed cache layouts, etc.).
 
-#![cfg(feature = "deno")]
-
 use std::path::Path;
 
 use serial_test::serial;

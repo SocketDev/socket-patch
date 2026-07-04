@@ -38,7 +38,7 @@
 //! gap closed, not that something broke.
 //!
 //! Run: `cargo test -p socket-patch-cli --features setup-e2e --test setup_matrix_nuget`
-#![cfg(all(feature = "setup-e2e", feature = "nuget"))]
+#![cfg(feature = "setup-e2e")]
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;

@@ -154,15 +154,12 @@ pub async fn inventory_project(project_root: &Path) -> Vec<LockfileEntry> {
     if let Some((_, entries)) = inventory_npm_lock(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "cargo")]
     if let Some(entries) = inventory_cargo_lock(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "golang")]
     if let Some(entries) = inventory_go_sum(project_root).await {
         out.extend(entries);
     }
-    #[cfg(feature = "composer")]
     if let Some(entries) = inventory_composer_lock(project_root).await {
         out.extend(entries);
     }
@@ -217,7 +214,6 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
 /// entries are fetchable (their `checksum` is the sha256 of the `.crate`
 /// file); workspace members (no `source`) are skipped, and git/custom-
 /// registry sources stay listed for discovery without a verifier.
-#[cfg(feature = "cargo")]
 async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("Cargo.lock"))
         .await
@@ -292,7 +288,6 @@ async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>>
 /// `/go.mod`-suffixed lines hash only the manifest and are skipped. go.sum
 /// may list more modules than the final build graph — acceptable for
 /// discovery, and the manifest decides what actually gets vendored.
-#[cfg(feature = "golang")]
 async fn inventory_go_sum(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = tokio::fs::read_to_string(project_root.join("go.sum"))
         .await
@@ -641,7 +636,6 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// (sha1 of the dist zip) is frequently empty — such entries stay
 /// discovery-only. Names lowercase to the canonical packagist form;
 /// versions drop the pretty leading `v`.
-#[cfg(feature = "composer")]
 async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let bytes = tokio::fs::read(project_root.join("composer.lock"))
         .await
@@ -1853,7 +1847,6 @@ __metadata:
         assert_eq!(out[0].integrity, LockIntegrity::Sri("sha512-x==".into()));
     }
 
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn cargo_lock_inventories_crates_io_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1906,7 +1899,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         assert_eq!(entry(&entries, "git-dep").integrity, LockIntegrity::None);
     }
 
-    #[cfg(feature = "golang")]
     #[tokio::test]
     async fn go_sum_inventories_module_zip_lines() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1959,7 +1951,6 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
     }
 
-    #[cfg(feature = "composer")]
     #[tokio::test]
     async fn composer_lock_inventories_dist_entries() {
         let tmp = tempfile::tempdir().unwrap();

@@ -32,9 +32,6 @@
 //! reported `rolledBack == 1` for that exact PURL. A broken/removed
 //! rollback dispatch branch yields zero discovered packages → the
 //! assertions fail loudly.
-//!
-//! Feature-gated ecosystems (cargo/golang/maven/composer/nuget) are
-//! `#[cfg(feature = "X")]`-gated so they only run with that feature on.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -201,7 +198,7 @@ fn assert_apply_not_dispatched(env: &Value, ecosystem: &str, out_of_scope_purls:
 }
 
 // ---------------------------------------------------------------------------
-// Default-feature ecosystems: npm, pypi, gem
+// Unconditional install-hook ecosystems: npm, pypi, gem
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -235,10 +232,9 @@ fn dispatch_branch_gem() {
 }
 
 // ---------------------------------------------------------------------------
-// Feature-gated ecosystems
+// Remaining ecosystems
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cargo")]
 #[test]
 fn dispatch_branch_cargo() {
     let tmp = tempfile::tempdir().unwrap();
@@ -249,7 +245,6 @@ fn dispatch_branch_cargo() {
     assert_apply_dispatched(code, &env, "cargo", &[purl]);
 }
 
-#[cfg(feature = "golang")]
 #[test]
 fn dispatch_branch_golang() {
     let tmp = tempfile::tempdir().unwrap();
@@ -260,11 +255,10 @@ fn dispatch_branch_golang() {
     assert_apply_dispatched(code, &env, "golang", &[purl]);
 }
 
-#[cfg(feature = "maven")]
 #[test]
 // Experimental ecosystem: the maven backend is unfinished, so this dispatch
 // e2e is kept OFF the blocking CI suite (it must not gate progress on maven).
-// Still compiled, and runnable on demand: `--features maven -- --ignored`.
+// Still compiled, and runnable on demand with `-- --ignored`.
 #[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
 fn dispatch_branch_maven() {
     let tmp = tempfile::tempdir().unwrap();
@@ -275,7 +269,6 @@ fn dispatch_branch_maven() {
     assert_apply_dispatched(code, &env, "maven", &[purl]);
 }
 
-#[cfg(feature = "composer")]
 #[test]
 fn dispatch_branch_composer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -286,11 +279,10 @@ fn dispatch_branch_composer() {
     assert_apply_dispatched(code, &env, "composer", &[purl]);
 }
 
-#[cfg(feature = "nuget")]
 #[test]
 // Experimental ecosystem: the nuget backend is unfinished, so this dispatch
 // e2e is kept OFF the blocking CI suite (it must not gate progress on nuget).
-// Still compiled, and runnable on demand: `--features nuget -- --ignored`.
+// Still compiled, and runnable on demand with `-- --ignored`.
 #[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn dispatch_branch_nuget() {
     let tmp = tempfile::tempdir().unwrap();
@@ -686,7 +678,6 @@ fn rollback_dispatch_filter_excludes_out_of_scope_package() {
     assert_rollback_restored(tmp.path(), "npm", &fixture);
 }
 
-#[cfg(feature = "cargo")]
 #[test]
 fn rollback_dispatch_branch_cargo() {
     let tmp = tempfile::tempdir().unwrap();
@@ -723,7 +714,6 @@ fn rollback_dispatch_branch_cargo() {
     assert_rollback_restored(root, "cargo", &fixture);
 }
 
-#[cfg(feature = "golang")]
 #[test]
 fn rollback_dispatch_branch_golang() {
     let tmp = tempfile::tempdir().unwrap();
@@ -750,10 +740,9 @@ fn rollback_dispatch_branch_golang() {
     assert_rollback_restored(root, "golang", &fixture);
 }
 
-#[cfg(feature = "maven")]
 #[test]
 // Experimental ecosystem (maven), kept OFF the blocking CI suite — see the
-// note on `dispatch_branch_maven`. Run with `--features maven -- --ignored`.
+// note on `dispatch_branch_maven`. Run with `-- --ignored`.
 #[ignore = "experimental ecosystem (maven): not gating CI until the maven backend is implemented; run with --ignored"]
 fn rollback_dispatch_branch_maven() {
     let tmp = tempfile::tempdir().unwrap();
@@ -781,7 +770,6 @@ fn rollback_dispatch_branch_maven() {
     assert_rollback_restored(root, "maven", &fixture);
 }
 
-#[cfg(feature = "composer")]
 #[test]
 fn rollback_dispatch_branch_composer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -973,12 +961,11 @@ fn setup_check_json_global_prefix_stdout_is_pure_json() {
     assert!(report["files"].is_array(), "stdout={stdout:?}");
 }
 
-#[cfg(feature = "nuget")]
 #[test]
 // Experimental ecosystem (nuget), kept OFF the blocking CI suite — see the
 // note on `dispatch_branch_nuget`. This is the test that was failing in CI
 // (the nuget rollback crawler discovers 0 packages). Run with
-// `--features nuget -- --ignored`.
+// `-- --ignored`.
 #[ignore = "experimental ecosystem (nuget): not gating CI until the nuget backend is implemented; run with --ignored"]
 fn rollback_dispatch_branch_nuget() {
     let tmp = tempfile::tempdir().unwrap();

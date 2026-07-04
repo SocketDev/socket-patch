@@ -1,12 +1,12 @@
 # socket-patch-core
 
-Core library for [socket-patch](https://github.com/SocketDev/socket-patch) — a CLI tool that applies security patches to npm and Python dependencies (plus Cargo, Go, Maven, Ruby, Composer, and NuGet via feature flags) without waiting for upstream fixes.
+Core library for [socket-patch](https://github.com/SocketDev/socket-patch) — a CLI tool that applies security patches to npm, Python, Ruby, Cargo, Go, Maven, Composer, NuGet, and Deno dependencies without waiting for upstream fixes.
 
 ## What this crate provides
 
 - **Manifest management** — read, write, and validate `.socket/manifest.json` patch manifests
 - **Patch engine** — apply and rollback file-level patches using git SHA-256 content hashes
-- **Crawlers** — discover installed packages across npm, PyPI, and Ruby gems (default), plus Cargo, Go, Maven, Composer, and NuGet (via feature flags)
+- **Crawlers** — discover installed packages across npm, PyPI, Ruby gems, Cargo, Go, Maven, Composer, NuGet, and Deno
 - **API client** — fetch patches from the Socket API
 - **Utilities** — PURL parsing, blob storage, hash verification, fuzzy matching
 

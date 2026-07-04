@@ -1,4 +1,3 @@
-#![cfg(feature = "cargo")]
 //! End-to-end: `socket-patch apply` against a Cargo vendor source
 //! followed by `cargo check` succeeds.
 //!

@@ -1,4 +1,3 @@
-#![cfg(feature = "cargo")]
 //! End-to-end tests for the Cargo/Rust crate patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with a fake
@@ -7,7 +6,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features cargo --test e2e_cargo
+//! cargo test -p socket-patch-cli --test e2e_cargo
 //! ```
 
 use std::path::PathBuf;

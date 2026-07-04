@@ -438,14 +438,15 @@ fn rewrite_target_package_unit(
         })?;
     let unit = package_unit_lines(&lock_text[span]);
     let old_unit = unit.join("\n");
-    let mut out = replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
-        // The hash guard already requires hashed files entries; reaching here
-        // means the parsed and textual views disagree — fail closed.
-        (
-            "pypi_pdm_lock_parse_failed",
-            format!("the {canon} [[package]] entry has no files array to rewrite"),
-        )
-    })?;
+    let mut out =
+        replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
+            // The hash guard already requires hashed files entries; reaching here
+            // means the parsed and textual views disagree — fail closed.
+            (
+                "pypi_pdm_lock_parse_failed",
+                format!("the {canon} [[package]] entry has no files array to rewrite"),
+            )
+        })?;
 
     let anchor = out
         .iter()

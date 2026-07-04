@@ -474,8 +474,7 @@ pub async fn revert_pnpm(entry: &VendorEntry, project_root: &Path, dry_run: bool
     if lock_dirty {
         if let Some(lines) = &lock_lines {
             if let Err(e) =
-                atomic_write_bytes(&project_root.join(PNPM_LOCK), lines.join("\n").as_bytes())
-                    .await
+                atomic_write_bytes(&project_root.join(PNPM_LOCK), lines.join("\n").as_bytes()).await
             {
                 return RevertOutcome::failed(format!("cannot write {PNPM_LOCK}: {e}"));
             }
@@ -612,7 +611,8 @@ fn is_vendor_value(value: &str) -> bool {
 /// several versions, and edits must never treat a SIBLING version's
 /// override/entry as their own.
 fn vendor_value_is_for(value: &str, name: &str, version: &str) -> bool {
-    parse_vendor_path(value).is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
+    parse_vendor_path(value)
+        .is_some_and(|p| p.eco == "npm" && p.leaf == tgz_rel_leaf(name, version))
 }
 
 /// How the package.json `pnpm.overrides` table relates to the package

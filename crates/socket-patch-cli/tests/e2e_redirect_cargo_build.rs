@@ -1,4 +1,3 @@
-#![cfg(feature = "cargo")]
 //! Real-cargo hosted-mode (registry-protocol) capstone e2e — the full-chain
 //! proof for `scan --mode hosted` on the cargo-sparse override.
 //!

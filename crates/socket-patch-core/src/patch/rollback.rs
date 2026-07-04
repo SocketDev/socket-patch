@@ -1421,7 +1421,6 @@ mod tests {
     /// in the cargo-build e2e). Rollback must resync the sidecar:
     /// restored files get their original hash back, and the entry for a
     /// patch-added (now deleted) file is removed entirely.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_rollback_package_patch_cargo_resyncs_checksum_sidecar() {
         use sha2::{Digest, Sha256};
@@ -1536,7 +1535,6 @@ mod tests {
     /// fail the rollback (the bytes are already restored) — it surfaces
     /// as an `Error`-severity `sidecar_fixup_failed` advisory, mirroring
     /// apply's boundary in `apply_package_patch`.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_rollback_package_patch_cargo_sidecar_failure_is_best_effort() {
         use crate::patch::sidecars::{SidecarAdvisoryCode, SidecarSeverity};
@@ -1598,7 +1596,6 @@ mod tests {
     /// resync, or its entry stays patched-hash over original bytes and
     /// `cargo build` refuses the crate even though the retry reported
     /// success.
-    #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_rollback_retry_resyncs_already_original_checksum_entries() {
         fn plain_sha256(b: &[u8]) -> String {

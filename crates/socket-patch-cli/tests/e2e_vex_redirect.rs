@@ -354,11 +354,10 @@ fn redirected_no_verify_attests_without_installed_tree() {
 
 // ──────────────────────────────────────────────────────────────────────
 // 5. every ecosystem attests through the redirect ledger, including the
-// ones whose crawler/feature isn't compiled by default (maven/nuget/
-// composer) and the qualified-PURL variants (pypi `?artifact_id=`, gem
-// `?platform=`, maven `?classifier=&ext=`). The redirect bypass means these
-// need neither the ecosystem's cargo feature nor a real toolchain, and the
-// qualified PURL must survive verbatim as the subcomponent id.
+// qualified-PURL variants (pypi `?artifact_id=`, gem `?platform=`, maven
+// `?classifier=&ext=`). The redirect bypass means these need no real
+// toolchain, and the qualified PURL must survive verbatim as the
+// subcomponent id.
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]

@@ -7,9 +7,7 @@ pub mod copy_tree;
 pub mod cow;
 pub mod diff;
 pub(crate) mod file_hash;
-#[cfg(feature = "golang")]
 pub mod go_mod_edit;
-#[cfg(feature = "golang")]
 pub mod go_redirect;
 pub mod package;
 pub(crate) mod path_safety;
