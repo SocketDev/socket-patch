@@ -31,7 +31,7 @@
  *
  * Options:
  *   --features <csv>          cargo features for the suite + single-test runs
- *                             (default: cargo,golang,maven,composer,nuget,deno;
+ *                             (default: none — every ecosystem is unconditional;
  *                             intentionally NOT --all-features, which would pull
  *                             in the infra-gated docker-e2e / setup-e2e suites).
  *   --test-cmd <cmd>          Override the full-suite enumeration command
@@ -82,7 +82,7 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 
-const DEFAULT_FEATURES = "cargo,golang,maven,composer,nuget,deno";
+const DEFAULT_FEATURES = "";
 
 // ---------------------------------------------------------------------------
 // Types

@@ -244,6 +244,19 @@ in this file — see `.github/workflows/release.yml` (`version` job).
 
 ### Changed
 
+- **All ecosystem feature flags removed — every ecosystem is always compiled
+  in.** The `cargo`, `golang`, `maven`, `composer`, `nuget`, and `deno` Cargo
+  features are gone from both crates; npm, PyPI, Ruby gems, Go, Cargo, NuGet,
+  Maven, Composer, and Deno support is now unconditional. Builds that passed
+  `--features <eco>` will get an "unknown feature" error and should simply
+  drop the flag; `--no-default-features` no longer produces a minimal binary
+  (there is nothing left to strip). The runtime gates are unchanged:
+  Maven/NuGet crawling and apply still require `SOCKET_EXPERIMENTAL_MAVEN=1` /
+  `SOCKET_EXPERIMENTAL_NUGET=1`. The only remaining features are the
+  test-suite gates `docker-e2e` and `setup-e2e` on `socket-patch-cli`. (MAJOR
+  for anyone scripting `--features`; no behavior change for default builds
+  beyond composer/deno support now being present.)
+
 - **Token-less `scan` now batch-queries the public proxy.** Proxy-mode scans
   POST `{proxy}/patch/batch` (one request per `--batch-size` chunk, mirroring
   the authenticated `/v0/orgs/{slug}/patches/batch` endpoint) instead of

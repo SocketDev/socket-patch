@@ -1,4 +1,3 @@
-#![cfg(feature = "composer")]
 //! End-to-end tests for the Composer/PHP package patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with a fake
@@ -7,7 +6,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features composer --test e2e_composer
+//! cargo test -p socket-patch-cli --test e2e_composer
 //! ```
 
 use std::path::PathBuf;

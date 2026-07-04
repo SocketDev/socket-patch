@@ -15,13 +15,9 @@
 //! input, not by a crawler that can never find anything.
 
 use socket_patch_core::crawlers::types::CrawlerOptions;
-#[cfg(feature = "cargo")]
 use socket_patch_core::crawlers::CargoCrawler;
-#[cfg(feature = "golang")]
 use socket_patch_core::crawlers::GoCrawler;
-#[cfg(feature = "maven")]
 use socket_patch_core::crawlers::MavenCrawler;
-#[cfg(feature = "nuget")]
 use socket_patch_core::crawlers::NuGetCrawler;
 use socket_patch_core::crawlers::{NpmCrawler, PythonCrawler, RubyCrawler};
 
@@ -284,7 +280,6 @@ async fn ruby_crawler_crawl_all_empty_returns_empty() {
 // cargo
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cargo")]
 #[tokio::test]
 async fn cargo_crawler_find_by_purls_empty_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -313,7 +308,6 @@ async fn cargo_crawler_find_by_purls_empty_returns_empty() {
     assert!(result.is_empty(), "empty PURL list → empty result");
 }
 
-#[cfg(feature = "cargo")]
 #[tokio::test]
 async fn cargo_crawler_crawl_all_empty_returns_empty() {
     let crawler = CargoCrawler;
@@ -352,7 +346,6 @@ async fn cargo_crawler_crawl_all_empty_returns_empty() {
 // golang
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "golang")]
 #[tokio::test]
 async fn go_crawler_find_by_purls_empty_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -388,7 +381,6 @@ async fn go_crawler_find_by_purls_empty_returns_empty() {
 // maven
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "maven")]
 #[tokio::test]
 async fn maven_crawler_find_by_purls_empty_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
@@ -432,7 +424,6 @@ async fn maven_crawler_find_by_purls_empty_returns_empty() {
 // nuget
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "nuget")]
 #[tokio::test]
 async fn nuget_crawler_find_by_purls_empty_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();

@@ -1,5 +1,4 @@
 use clap::Args;
-#[cfg(feature = "composer")]
 use socket_patch_core::composer_setup::{self, ComposerSetupStatus};
 use socket_patch_core::crawlers::python_crawler::is_python_project;
 use socket_patch_core::gem_setup::{self, GemSetupStatus};
@@ -344,7 +343,6 @@ pub(crate) async fn configured_ecosystems(
         }
     }
 
-    #[cfg(feature = "composer")]
     if let Some(composer_json) = composer_setup::discover_composer_project(&common.cwd).await {
         if let Ok(content) = tokio::fs::read_to_string(&composer_json).await {
             if composer_setup::is_hook_present(&content) {
@@ -360,7 +358,6 @@ pub(crate) async fn configured_ecosystems(
 const ECO_NPM: &[&str] = &["npm"];
 const ECO_PYPI: &[&str] = &["pypi", "python"];
 const ECO_GEM: &[&str] = &["gem", "ruby"];
-#[cfg(feature = "composer")]
 const ECO_COMPOSER: &[&str] = &["composer", "php"];
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -508,7 +505,7 @@ async fn finalize_python(plan: &PythonPlan, edits: &[PthEditResult], cwd: &Path)
 // Shared per-ecosystem setup outcome
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Feature-agnostic summary of one ecosystem branch's contribution to a
+/// Summary of one ecosystem branch's contribution to a
 /// setup/remove run. Each `build_*_outcome` returns one of these and the shared
 /// reporting code merges + renders them without naming ecosystem-specific types.
 #[derive(Default)]
@@ -531,8 +528,7 @@ struct SetupOutcome {
 
 /// Build the gem branch's contribution to a setup/remove run: add (or remove)
 /// the managed `plugin "socket-patch"` block in the Gemfile + the generated
-/// `.socket/bundler-plugin/` plugin files. Gem is an unconditional ecosystem,
-/// so this is never feature-gated.
+/// `.socket/bundler-plugin/` plugin files.
 async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_GEM) {
         return SetupOutcome::default();
@@ -603,10 +599,7 @@ fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
 
 /// Build the composer branch's contribution to a setup/remove run: add (or
 /// remove) the `socket-patch apply` command in `composer.json`'s
-/// `post-install-cmd` / `post-update-cmd` script events. Feature-gated behind
-/// `composer` (a no-op `Default` when off) — composer apply itself only exists
-/// with the feature, so wiring a hook without it would be incoherent.
-#[cfg(feature = "composer")]
+/// `post-install-cmd` / `post-update-cmd` script events.
 async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
     if !eco_in_scope(common, ECO_COMPOSER) {
         return SetupOutcome::default();
@@ -659,16 +652,6 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     out
 }
 
-#[cfg(not(feature = "composer"))]
-async fn build_composer_outcome(
-    _common: &GlobalArgs,
-    _remove: bool,
-    _dry_run: bool,
-) -> SetupOutcome {
-    SetupOutcome::default()
-}
-
-#[cfg(feature = "composer")]
 fn composer_status_str(s: &ComposerSetupStatus, for_remove: bool) -> &'static str {
     match (s, for_remove) {
         (ComposerSetupStatus::Updated, false) => "updated",
@@ -683,7 +666,6 @@ fn composer_status_str(s: &ComposerSetupStatus, for_remove: bool) -> &'static st
 /// `run_check` entries list. Returns whether a composer project was found.
 /// Checks the SETUP wiring only — patch consistency is the shared
 /// `append_patch_consistency_entries` pass.
-#[cfg(feature = "composer")]
 async fn append_composer_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
@@ -707,14 +689,6 @@ async fn append_composer_check_entries(
     };
     entries.push(("composer", composer_json.display().to_string(), state, err));
     true
-}
-
-#[cfg(not(feature = "composer"))]
-async fn append_composer_check_entries(
-    _common: &GlobalArgs,
-    _entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
-) -> bool {
-    false
 }
 
 /// Materialise gem patches right after wiring the plugin (the "automatic" step)

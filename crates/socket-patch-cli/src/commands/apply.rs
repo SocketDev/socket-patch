@@ -8,11 +8,9 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
-#[cfg(feature = "golang")]
 use socket_patch_core::patch::go_redirect::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
-#[cfg(feature = "golang")]
 use socket_patch_core::utils::purl::parse_golang_purl;
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::telemetry::{track_patch_applied, track_patch_apply_failed};
@@ -169,11 +167,10 @@ pub struct ApplyArgs {
 // ── local-go redirect helpers ────────────────────────────────────────────────
 // The Go analog of the cargo helpers above: in local mode a `pkg:golang/…` PURL
 // redirects to a project-local patched copy under `.socket/go-patches/` wired via
-// a `go.mod` `replace` directive. Inert stubs without the `golang` feature.
+// a `go.mod` `replace` directive.
 
 /// True for a golang PURL in local mode (no `--global` / `--global-prefix`).
 /// Shared with `rollback`, which drops the same redirects this creates.
-#[cfg(feature = "golang")]
 pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
     !common.global
         && common.global_prefix.is_none()
@@ -182,7 +179,6 @@ pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
 
 /// Whether local-go redirects are in scope (local mode + golang not filtered out
 /// by `--ecosystems`). Gates reconcile / `--check`.
-#[cfg(feature = "golang")]
 fn go_in_local_scope(common: &GlobalArgs) -> bool {
     if common.global || common.global_prefix.is_some() {
         return false;
@@ -198,7 +194,6 @@ fn go_in_local_scope(common: &GlobalArgs) -> bool {
 /// Materialise a local-go redirect for `purl`, or `None` if `purl` isn't a
 /// local-go target (the caller then falls back to in-place apply, i.e. the
 /// `--global` module-cache path).
-#[cfg(feature = "golang")]
 async fn try_local_go_apply(
     purl: &str,
     pkg_path: &Path,
@@ -235,21 +230,8 @@ async fn try_local_go_apply(
     )
 }
 
-#[cfg(not(feature = "golang"))]
-async fn try_local_go_apply(
-    _purl: &str,
-    _pkg_path: &Path,
-    _patch: &PatchRecord,
-    _sources: &PatchSources<'_>,
-    _common: &GlobalArgs,
-    _policy: MismatchPolicy,
-) -> Option<ApplyResult> {
-    None
-}
-
 /// After the apply loop: prune local-go redirects whose patches were dropped
 /// from the manifest. No-op unless local go is in scope.
-#[cfg(feature = "golang")]
 async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet<String>) {
     if !go_in_local_scope(common) {
         return;
@@ -273,14 +255,10 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
     }
 }
 
-#[cfg(not(feature = "golang"))]
-async fn reconcile_local_go(_common: &GlobalArgs, _target_manifest_purls: &HashSet<String>) {}
-
 /// Read-only verification of the committed Go `replace`-redirects for CI /
 /// GitHub-App auditing. Lock-free, crawl-free, offline-safe. Exits 0 when in
 /// sync, 1 on drift. Cargo patches in place (no redirect to audit), so `--check`
 /// covers Go only.
-#[cfg(feature = "golang")]
 async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     let manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
@@ -370,21 +348,6 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         }
         1
     }
-}
-
-#[cfg(not(feature = "golang"))]
-async fn run_check(args: &ApplyArgs, _manifest_path: &Path) -> i32 {
-    // Fail-closed: `--check` is the Go `replace`-redirect audit. A socket-patch
-    // built WITHOUT the `golang` feature cannot verify those redirects, so it
-    // must NOT report "in sync" (exit 0). Exit non-zero with a clear reason.
-    if !args.common.silent && !args.common.json {
-        eprintln!(
-            "socket-patch: this build has no golang support, so it cannot verify \
-             Go patch redirects (`--check`). Install a socket-patch built with the \
-             `golang` feature, or point SOCKET_PATCH_BIN at one."
-        );
-    }
-    2
 }
 
 /// True when every file the engine verified for this package is already
@@ -908,7 +871,7 @@ async fn apply_patches_inner(
     // Partition manifest PURLs by ecosystem up front. The source probes,
     // the offline guard, and the download planner in `fetch_stage` must only
     // consider patches this run can actually apply — the `--ecosystems`
-    // filter plus the ecosystems compiled into this build. An out-of-scope
+    // filter. An out-of-scope
     // patch with no local source must not fail (or trigger fetches for) a
     // run that will never apply it.
     let manifest_purls: Vec<String> = manifest.patches.keys().cloned().collect();
@@ -1166,8 +1129,7 @@ async fn apply_patches_inner(
             // `.socket/go-patches/` wired via a `go.mod` `replace` (the module
             // cache is `go.sum`-verified, so in-place patching can't build).
             // Everything else — npm/pypi/gem and cargo (vendored or registry
-            // cache) — patches in place via `apply_package_patch`. Without the
-            // `golang` feature `try_local_go_apply` is an inert `None`.
+            // cache) — patches in place via `apply_package_patch`.
             let result =
                 match try_local_go_apply(purl, pkg_path, patch, &sources, &args.common, policy)
                     .await

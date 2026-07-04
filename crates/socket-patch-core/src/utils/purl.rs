@@ -127,7 +127,6 @@ fn parse_name_version<'a>(purl: &'a str, prefix: &str) -> Option<(&'a str, &'a s
 /// [`parse_name_version`], then split the name at its FIRST `/` into a
 /// `(namespace, name)` pair (maven groupId/artifactId, composer
 /// vendor/name, jsr @scope/name).
-#[cfg(any(feature = "maven", feature = "composer", feature = "deno"))]
 fn parse_namespaced<'a>(purl: &'a str, prefix: &str) -> Option<((&'a str, &'a str), &'a str)> {
     let (name_part, version) = parse_name_version(purl, prefix)?;
     let (namespace, name) = name_part.split_once('/')?;
@@ -159,14 +158,12 @@ pub(crate) fn build_gem_purl(name: &str, version: &str) -> String {
 /// Parse a Maven PURL to extract groupId, artifactId, and version.
 ///
 /// e.g., `"pkg:maven/org.apache.commons/commons-lang3@3.12.0"` -> `Some(("org.apache.commons", "commons-lang3", "3.12.0"))`
-#[cfg(feature = "maven")]
 pub(crate) fn parse_maven_purl(purl: &str) -> Option<(&str, &str, &str)> {
     let ((group_id, artifact_id), version) = parse_namespaced(purl, "pkg:maven/")?;
     Some((group_id, artifact_id, version))
 }
 
 /// Build a Maven PURL from components.
-#[cfg(feature = "maven")]
 pub(crate) fn build_maven_purl(group_id: &str, artifact_id: &str, version: &str) -> String {
     format!("pkg:maven/{group_id}/{artifact_id}@{version}")
 }
@@ -174,13 +171,11 @@ pub(crate) fn build_maven_purl(group_id: &str, artifact_id: &str, version: &str)
 /// Parse a Go module PURL to extract module path and version.
 ///
 /// e.g., `"pkg:golang/github.com/gin-gonic/gin@v1.9.1"` -> `Some(("github.com/gin-gonic/gin", "v1.9.1"))`
-#[cfg(feature = "golang")]
 pub fn parse_golang_purl(purl: &str) -> Option<(&str, &str)> {
     parse_name_version(purl, "pkg:golang/")
 }
 
 /// Build a Go module PURL from components.
-#[cfg(feature = "golang")]
 pub fn build_golang_purl(module_path: &str, version: &str) -> String {
     format!("pkg:golang/{module_path}@{version}")
 }
@@ -189,13 +184,11 @@ pub fn build_golang_purl(module_path: &str, version: &str) -> String {
 ///
 /// Composer packages always have a namespace (vendor).
 /// e.g., `"pkg:composer/monolog/monolog@3.5.0"` -> `Some((("monolog", "monolog"), "3.5.0"))`
-#[cfg(feature = "composer")]
 pub(crate) fn parse_composer_purl(purl: &str) -> Option<((&str, &str), &str)> {
     parse_namespaced(purl, "pkg:composer/")
 }
 
 /// Build a Composer PURL from components.
-#[cfg(feature = "composer")]
 pub(crate) fn build_composer_purl(namespace: &str, name: &str, version: &str) -> String {
     format!("pkg:composer/{namespace}/{name}@{version}")
 }
@@ -213,10 +206,8 @@ pub(crate) fn build_composer_purl(namespace: &str, name: &str, version: &str) ->
 /// have a `<scope>/<name>` namespace structure. The leading `@` on
 /// the scope is preserved (matching npm's `@scope/name` convention).
 /// `((scope, name), version)` from a JSR purl, percent-decoded.
-#[cfg(feature = "deno")]
 pub(crate) type JsrPurlParts<'a> = ((Cow<'a, str>, Cow<'a, str>), Cow<'a, str>);
 
-#[cfg(feature = "deno")]
 pub(crate) fn parse_jsr_purl(purl: &str) -> Option<JsrPurlParts<'_>> {
     let ((scope, name), version) = parse_namespaced(purl, "pkg:jsr/")?;
 
@@ -237,7 +228,6 @@ pub(crate) fn parse_jsr_purl(purl: &str) -> Option<JsrPurlParts<'_>> {
 }
 
 /// Build a JSR PURL from components.
-#[cfg(feature = "deno")]
 pub(crate) fn build_jsr_purl(scope: &str, name: &str, version: &str) -> String {
     format!("pkg:jsr/{scope}/{name}@{version}")
 }
@@ -245,13 +235,11 @@ pub(crate) fn build_jsr_purl(scope: &str, name: &str, version: &str) -> String {
 /// Parse a NuGet PURL to extract name and version.
 ///
 /// e.g., `"pkg:nuget/Newtonsoft.Json@13.0.3"` -> `Some(("Newtonsoft.Json", "13.0.3"))`
-#[cfg(feature = "nuget")]
 pub(crate) fn parse_nuget_purl(purl: &str) -> Option<(&str, &str)> {
     parse_name_version(purl, "pkg:nuget/")
 }
 
 /// Build a NuGet PURL from components.
-#[cfg(feature = "nuget")]
 pub(crate) fn build_nuget_purl(name: &str, version: &str) -> String {
     format!("pkg:nuget/{name}@{version}")
 }
@@ -259,13 +247,11 @@ pub(crate) fn build_nuget_purl(name: &str, version: &str) -> String {
 /// Parse a Cargo PURL to extract name and version.
 ///
 /// e.g., `"pkg:cargo/serde@1.0.200"` -> `Some(("serde", "1.0.200"))`
-#[cfg(feature = "cargo")]
 pub(crate) fn parse_cargo_purl(purl: &str) -> Option<(&str, &str)> {
     parse_name_version(purl, "pkg:cargo/")
 }
 
 /// Build a Cargo PURL from components.
-#[cfg(feature = "cargo")]
 pub(crate) fn build_cargo_purl(name: &str, version: &str) -> String {
     format!("pkg:cargo/{name}@{version}")
 }
@@ -388,7 +374,6 @@ mod tests {
         assert!(!is_purl("CVE-2024-1234"));
     }
 
-    #[cfg(feature = "cargo")]
     #[test]
     fn test_parse_cargo_purl() {
         assert_eq!(
@@ -404,7 +389,6 @@ mod tests {
         assert_eq!(parse_cargo_purl("pkg:cargo/serde@"), None);
     }
 
-    #[cfg(feature = "cargo")]
     #[test]
     fn test_build_cargo_purl() {
         assert_eq!(
@@ -413,7 +397,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cargo")]
     #[test]
     fn test_cargo_purl_round_trip() {
         let purl = build_cargo_purl("tokio", "1.38.0");
@@ -450,7 +433,6 @@ mod tests {
         assert_eq!(version, "1.16.5");
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_parse_maven_purl() {
         assert_eq!(
@@ -473,7 +455,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_build_maven_purl() {
         assert_eq!(
@@ -482,7 +463,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_maven_purl_round_trip() {
         let purl = build_maven_purl("com.google.guava", "guava", "32.1.3-jre");
@@ -492,7 +472,6 @@ mod tests {
         assert_eq!(version, "32.1.3-jre");
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_parse_golang_purl() {
         assert_eq!(
@@ -508,7 +487,6 @@ mod tests {
         assert_eq!(parse_golang_purl("pkg:golang/github.com/foo/bar@"), None);
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_build_golang_purl() {
         assert_eq!(
@@ -517,7 +495,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_golang_purl_round_trip() {
         let purl = build_golang_purl("golang.org/x/text", "v0.14.0");
@@ -526,7 +503,6 @@ mod tests {
         assert_eq!(version, "v0.14.0");
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_parse_composer_purl() {
         assert_eq!(
@@ -543,7 +519,6 @@ mod tests {
         assert_eq!(parse_composer_purl("pkg:composer/monolog/monolog@"), None);
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_build_composer_purl() {
         assert_eq!(
@@ -552,12 +527,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "deno")]
     fn jsr_parts(purl: &str) -> Option<(String, String, String)> {
         parse_jsr_purl(purl).map(|((s, n), v)| (s.into_owned(), n.into_owned(), v.into_owned()))
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_parse_jsr_purl() {
         assert_eq!(
@@ -578,7 +551,6 @@ mod tests {
         assert_eq!(jsr_parts("pkg:npm/@std/path@0.220.0"), None);
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_build_jsr_purl() {
         assert_eq!(
@@ -587,7 +559,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_jsr_purl_round_trip() {
         let purl = build_jsr_purl("@std", "path", "0.220.0");
@@ -597,7 +568,6 @@ mod tests {
         assert_eq!(version, "0.220.0");
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_composer_purl_round_trip() {
         let purl = build_composer_purl("symfony", "console", "6.4.1");
@@ -607,7 +577,6 @@ mod tests {
         assert_eq!(version, "6.4.1");
     }
 
-    #[cfg(feature = "nuget")]
     #[test]
     fn test_parse_nuget_purl() {
         assert_eq!(
@@ -623,7 +592,6 @@ mod tests {
         assert_eq!(parse_nuget_purl("pkg:nuget/Newtonsoft.Json@"), None);
     }
 
-    #[cfg(feature = "nuget")]
     #[test]
     fn test_build_nuget_purl() {
         assert_eq!(
@@ -632,7 +600,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "nuget")]
     #[test]
     fn test_nuget_purl_round_trip() {
         let purl = build_nuget_purl("System.Text.Json", "8.0.0");
@@ -675,7 +642,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_parse_maven_qualifier_with_embedded_at() {
         // groupId/artifactId split must survive an `@` buried in a
@@ -688,7 +654,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_parse_composer_qualifier_with_embedded_at() {
         assert_eq!(
@@ -697,7 +662,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_parse_golang_keeps_full_module_path() {
         // The module path retains its internal slashes — only the
@@ -708,7 +672,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_parse_jsr_with_trailing_qualifier() {
         // Scope `@` + version `@` + qualifier `@` all coexist; only the
@@ -775,7 +738,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_parse_golang_subpath_stripped() {
         // Go subpaths point at a sub-package of the same module; the parsed
@@ -875,7 +837,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_parse_jsr_purl_percent_encoded_scope() {
         let ((scope, name), version) = parse_jsr_purl("pkg:jsr/%40std/path@0.220.0").unwrap();

@@ -34,7 +34,7 @@ use socket_patch_core::patch::sidecars::dispatch_fixup;
 /// early-return would NOT change the result and the regression would
 /// stay green. We use `pkg:pypi/...` because the pypi arm
 /// *unconditionally* emits an advisory (`Some`) whenever it is reached
-/// — and it is compiled in every feature configuration. So observing
+/// — and it is always compiled in. So observing
 /// `None` here can ONLY mean the empty-patched short-circuit fired
 /// before PURL classification. (This mirrors the in-tree lib test
 /// `empty_patched_short_circuits_before_advisory`, which the original
@@ -84,7 +84,6 @@ async fn dispatch_fixup_unknown_ecosystem_returns_none() {
 /// `sha256_file(on_disk)`, and the open fails with NotFound. The
 /// `.map_err(|source| SidecarError::Io { ... })?` wraps it; the
 /// dispatcher returns `Err(SidecarError::Io)`.
-#[cfg(feature = "cargo")]
 #[tokio::test]
 async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
     use socket_patch_core::patch::sidecars::SidecarError;
@@ -139,7 +138,6 @@ async fn dispatch_fixup_cargo_sha256_file_failure_arm() {
 ///
 /// Together with the no-metadata + signed-marker tests this nails
 /// down every branch in `has_signed_marker`'s setup.
-#[cfg(feature = "nuget")]
 #[tokio::test]
 async fn dispatch_fixup_nuget_with_nonexistent_pkg_path() {
     let tmp = tempfile::tempdir().unwrap();

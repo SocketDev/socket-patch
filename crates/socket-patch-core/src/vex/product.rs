@@ -24,6 +24,10 @@ use std::path::Path;
 // the user's own toolchain accepts yield no PURL.
 use crate::package_json::detect::strip_bom;
 
+/// Version-extracting parser for one manifest flavor, keyed by file name in
+/// the priority table inside [`detect_product`].
+type ManifestParser = fn(&str) -> Option<String>;
+
 /// Outcome of [`detect_product`].
 #[derive(Debug, Clone, Default)]
 pub struct DetectResult {
@@ -50,7 +54,7 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     // one may fail to parse (invalid JSON, missing version, workspace
     // inheritance) and fall through to a lower-priority manifest. The
     // warning must name what we used, otherwise it misreports the source.
-    let manifests: [(&str, fn(&str) -> Option<String>); 3] = [
+    let manifests: [(&str, ManifestParser); 3] = [
         ("package.json", parse_package_json),
         ("pyproject.toml", parse_pyproject),
         ("Cargo.toml", parse_cargo_toml),

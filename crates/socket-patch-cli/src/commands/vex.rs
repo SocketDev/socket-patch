@@ -268,28 +268,20 @@ pub async fn run(args: VexArgs) -> i32 {
 
 /// Map a `setup.manual` entry to an `Ecosystem`. Accepts the canonical
 /// `cli_name` plus the friendly aliases `setup --exclude`/`--ecosystems` accept
-/// (`go`/`golang`, `python`/`pypi`, `ruby`/`gem`, `php`/`composer`). Names for
-/// ecosystems not compiled into this build (or unrecognized) yield `None` and
-/// are ignored.
+/// (`go`/`golang`, `python`/`pypi`, `ruby`/`gem`, `php`/`composer`).
+/// Unrecognized names yield `None` and are ignored.
 fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
     match name.to_ascii_lowercase().as_str() {
         "npm" | "yarn" | "pnpm" | "bun" => Some(Ecosystem::Npm),
         "pypi" | "python" => Some(Ecosystem::Pypi),
         "gem" | "ruby" => Some(Ecosystem::Gem),
-        #[cfg(feature = "cargo")]
         "cargo" | "rust" => Some(Ecosystem::Cargo),
-        #[cfg(feature = "golang")]
         "golang" | "go" => Some(Ecosystem::Golang),
-        #[cfg(feature = "composer")]
         "composer" | "php" => Some(Ecosystem::Composer),
         // The apply-only ecosystems are the primary use of `manual` (hand-applied
-        // patches with no auto-install hook); they must map too, feature-gated to
-        // match the compiled-in `Ecosystem` variants `from_purl` can return.
-        #[cfg(feature = "maven")]
+        // patches with no auto-install hook); they must map too.
         "maven" | "java" => Some(Ecosystem::Maven),
-        #[cfg(feature = "nuget")]
         "nuget" | "dotnet" => Some(Ecosystem::Nuget),
-        #[cfg(feature = "deno")]
         "deno" | "jsr" => Some(Ecosystem::Deno),
         _ => None,
     }
@@ -624,17 +616,7 @@ async fn load_vendor_context(
         }
     };
 
-    let go_patches = {
-        #[cfg(feature = "golang")]
-        {
-            synthesize_go_patches(common, manifest, &entries).await
-        }
-        #[cfg(not(feature = "golang"))]
-        {
-            let _ = manifest;
-            HashMap::new()
-        }
-    };
+    let go_patches = synthesize_go_patches(common, manifest, &entries).await;
 
     if entries.is_empty() && go_patches.is_empty() {
         return None;
@@ -650,7 +632,6 @@ async fn load_vendor_context(
 /// every socket-owned (`.socket/go-patches/`) `replace` in `go.mod` whose
 /// module+version maps to a manifest golang PURL with no explicit vendor
 /// entry, record the absolute redirect copy dir for dir-hash verification.
-#[cfg(feature = "golang")]
 async fn synthesize_go_patches(
     common: &GlobalArgs,
     manifest: &PatchManifest,
@@ -753,30 +734,24 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    // Property 7: every ecosystem the build can classify a PURL for must also be
+    // Property 7: every ecosystem a PURL can classify to must also be
     // declarable `manual`. Apply-only maven/nuget/deno are the *primary* use of
     // `manual`; they were missing originally, silently dropping their patches.
     #[test]
-    fn ecosystem_from_manual_name_maps_compiled_in_ecosystems() {
+    fn ecosystem_from_manual_name_maps_every_ecosystem() {
         assert_eq!(ecosystem_from_manual_name("npm"), Some(Ecosystem::Npm));
         assert_eq!(ecosystem_from_manual_name("PyPI"), Some(Ecosystem::Pypi)); // case-insensitive
         assert_eq!(ecosystem_from_manual_name("python"), Some(Ecosystem::Pypi));
         assert_eq!(ecosystem_from_manual_name("ruby"), Some(Ecosystem::Gem));
         assert_eq!(ecosystem_from_manual_name("nonsense"), None);
-        #[cfg(feature = "cargo")]
         assert_eq!(ecosystem_from_manual_name("cargo"), Some(Ecosystem::Cargo));
-        #[cfg(feature = "golang")]
         assert_eq!(ecosystem_from_manual_name("go"), Some(Ecosystem::Golang));
-        #[cfg(feature = "composer")]
         assert_eq!(
             ecosystem_from_manual_name("composer"),
             Some(Ecosystem::Composer)
         );
-        #[cfg(feature = "maven")]
         assert_eq!(ecosystem_from_manual_name("maven"), Some(Ecosystem::Maven));
-        #[cfg(feature = "nuget")]
         assert_eq!(ecosystem_from_manual_name("nuget"), Some(Ecosystem::Nuget));
-        #[cfg(feature = "deno")]
         assert_eq!(ecosystem_from_manual_name("deno"), Some(Ecosystem::Deno));
     }
 
@@ -806,7 +781,6 @@ mod tests {
     /// `are_safe_redirect_coords`; pin the accept/reject set from the CLI
     /// side — a regression here would let a tampered go.mod `replace` key
     /// an out-of-tree path into the go-patches verification map.
-    #[cfg(feature = "golang")]
     #[test]
     fn go_redirect_coord_guard_matches_core_rules() {
         use socket_patch_core::patch::go_redirect::are_safe_redirect_coords;

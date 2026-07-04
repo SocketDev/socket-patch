@@ -23,31 +23,19 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
 
-/// Always-compiled setup-supported ecosystems, declared `manual` in test
-/// fixtures so the property-7 setup-state filter
-/// (`commands/setup::configured_ecosystems`) does not drop these patches —
-/// these tests exercise VEX document GENERATION, not setup state, so they opt
-/// every patch in via the `manual` escape hatch. Feature-gated apply-only
-/// ecosystems (maven/nuget) are appended by [`all_manual`] when their cargo
-/// feature is on. (`cargo`/`golang`/`composer` are listed here unconditionally:
-/// when their feature is absent `ecosystem_from_manual_name` maps them to
-/// `None`, so the entry is a harmless no-op — the same reason maven/nuget are
-/// safe to add, just made explicit for the two that gate a matrix test.)
+/// Setup-supported ecosystems, declared `manual` in test fixtures so the
+/// property-7 setup-state filter (`commands/setup::configured_ecosystems`)
+/// does not drop these patches — these tests exercise VEX document
+/// GENERATION, not setup state, so they opt every patch in via the `manual`
+/// escape hatch. The apply-only ecosystems (maven/nuget) are appended by
+/// [`all_manual`].
 const ALL_MANUAL: &[&str] = &["npm", "pypi", "cargo", "golang", "gem", "composer"];
 
-/// [`ALL_MANUAL`] plus the feature-gated apply-only ecosystems (maven/nuget),
-/// appended only under their cargo feature — mirroring the `#[cfg]` arms in
-/// `vex::ecosystem_from_manual_name`. Declaring an ecosystem `manual` whose
-/// feature is not compiled in is a silent no-op (the name resolves to `None`),
-/// but gating the append keeps the emitted `setup.manual` honest to the build
-/// and lets the all-ecosystem agent matrix below declare every one of the 8.
+/// [`ALL_MANUAL`] plus the apply-only ecosystems (maven/nuget), so the
+/// all-ecosystem agent matrix below can declare every one of the 8.
 fn all_manual() -> Vec<String> {
-    // `mut` is only exercised by the feature-gated pushes below.
-    #[cfg_attr(not(any(feature = "maven", feature = "nuget")), allow(unused_mut))]
     let mut names: Vec<String> = ALL_MANUAL.iter().map(|s| (*s).to_string()).collect();
-    #[cfg(feature = "maven")]
     names.push("maven".to_string());
-    #[cfg(feature = "nuget")]
     names.push("nuget".to_string());
     names
 }
@@ -291,21 +279,10 @@ fn two_patches_sharing_ghsa_merge_subcomponents() {
 //
 // Unlike the redirect matrix — whose patches bypass BOTH property 7 and
 // `Ecosystem::from_purl` via the `redirected` set — an agent patch routes
-// through `Ecosystem::from_purl` + the `manual` allowlist. That only resolves
-// for ecosystems whose cargo feature is compiled in, so getting all 8
-// statements requires every ecosystem feature present: hence the all-features
-// cfg gate (cargo/golang/nuget are default; maven/composer are the opt-ins
-// this gate additionally demands). Each statement must carry a PLAIN impact
-// statement (NO `(vendored)`/`(redirected)` marker — that is what distinguishes
-// agent provenance) and preserve the (possibly qualified) PURL verbatim as the
-// subcomponent id.
-#[cfg(all(
-    feature = "cargo",
-    feature = "golang",
-    feature = "composer",
-    feature = "maven",
-    feature = "nuget"
-))]
+// through `Ecosystem::from_purl` + the `manual` allowlist. Each statement must
+// carry a PLAIN impact statement (NO `(vendored)`/`(redirected)` marker — that
+// is what distinguishes agent provenance) and preserve the (possibly
+// qualified) PURL verbatim as the subcomponent id.
 #[test]
 fn no_verify_attests_agent_patches_across_ecosystems() {
     let tmp = tempfile::tempdir().unwrap();
@@ -370,8 +347,8 @@ fn no_verify_attests_agent_patches_across_ecosystems() {
             ),
         );
     }
-    // write_manifest stamps setup.manual = all_manual(), which under this
-    // all-features cfg declares every one of the 8 ecosystems.
+    // write_manifest stamps setup.manual = all_manual(), which declares
+    // every one of the 8 ecosystems.
     write_manifest(cwd, &manifest);
 
     let out = cli()

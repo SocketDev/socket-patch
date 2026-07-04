@@ -13,13 +13,6 @@
 //! produce. The Docker e2e tests verify that real installers produce
 //! the same layouts.
 
-// Each test is feature-gated on its ecosystem (e.g. `cfg(feature =
-// "golang")` for the gin tests). With default features (no ecosystems
-// enabled) every test and helper compiles out — quiet the resulting
-// dead-code/unused-import noise so non-feature builds stay warning-
-// clean.
-#![allow(dead_code, unused_imports)]
-
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -202,7 +195,6 @@ fn assert_manifest_records(cwd: &Path, purl: &str, uuid: &str) {
 // golang
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_install_apply_patches_file() {
@@ -262,7 +254,6 @@ async fn golang_handcrafted_install_apply_patches_file() {
 // maven
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_install_apply_patches_file() {
@@ -330,7 +321,6 @@ async fn maven_handcrafted_install_apply_patches_file() {
 /// the (default, narrow) apply path keeps and patches *every* present
 /// classifier variant — exercising the plural `select_installed_variants`
 /// selector — rather than just the first.
-#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_multi_classifier_patches_every_present_jar() {
@@ -451,7 +441,6 @@ async fn maven_multi_classifier_patches_every_present_jar() {
 // composer
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn composer_handcrafted_install_apply_patches_file() {
@@ -520,7 +509,6 @@ async fn composer_handcrafted_install_apply_patches_file() {
 // nuget
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_install_apply_patches_file() {
@@ -585,7 +573,6 @@ async fn nuget_handcrafted_install_apply_patches_file() {
 // Discovery-only tests for each handcrafted layout
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "golang")]
 #[tokio::test]
 #[serial]
 async fn golang_handcrafted_discovery() {
@@ -619,7 +606,6 @@ async fn golang_handcrafted_discovery() {
     std::env::remove_var("GOMODCACHE");
 }
 
-#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_discovery() {
@@ -650,7 +636,6 @@ async fn maven_handcrafted_discovery() {
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
-#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_discovery() {
@@ -754,7 +739,6 @@ async fn npm_handcrafted_scan_apply_writes_manifest_and_patches() {
     assert_manifest_records(tmp.path(), purl, uuid);
 }
 
-#[cfg(feature = "composer")]
 #[tokio::test]
 #[serial]
 async fn composer_handcrafted_scan_apply_writes_manifest() {
@@ -817,7 +801,6 @@ async fn composer_handcrafted_scan_apply_writes_manifest() {
     assert_manifest_records(tmp.path(), purl, uuid);
 }
 
-#[cfg(feature = "maven")]
 #[tokio::test]
 #[serial]
 async fn maven_handcrafted_scan_apply_writes_manifest() {
@@ -876,7 +859,6 @@ async fn maven_handcrafted_scan_apply_writes_manifest() {
     std::env::remove_var("SOCKET_EXPERIMENTAL_MAVEN");
 }
 
-#[cfg(feature = "nuget")]
 #[tokio::test]
 #[serial]
 async fn nuget_handcrafted_scan_apply_writes_manifest() {

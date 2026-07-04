@@ -1,4 +1,3 @@
-#![cfg(feature = "nuget")]
 //! End-to-end tests for the NuGet/.NET package patching lifecycle.
 //!
 //! These tests exercise crawling against a temporary directory with fake
@@ -7,7 +6,7 @@
 //!
 //! # Running
 //! ```sh
-//! cargo test -p socket-patch-cli --features nuget --test e2e_nuget
+//! cargo test -p socket-patch-cli --test e2e_nuget
 //! ```
 
 use std::path::PathBuf;

@@ -5,16 +5,11 @@ use std::path::PathBuf;
 pub enum Ecosystem {
     Npm,
     Pypi,
-    #[cfg(feature = "cargo")]
     Cargo,
     Gem,
-    #[cfg(feature = "golang")]
     Golang,
-    #[cfg(feature = "maven")]
     Maven,
-    #[cfg(feature = "composer")]
     Composer,
-    #[cfg(feature = "nuget")]
     Nuget,
     /// Deno's JSR registry. PURL form
     /// `pkg:jsr/<scope>/<name>@<version>`. Note: Deno's `deno install`
@@ -22,7 +17,6 @@ pub enum Ecosystem {
     /// `pkg:npm/...` packages — those route through `Ecosystem::Npm`
     /// unchanged. Only JSR (the deno-native registry) gets its own
     /// variant.
-    #[cfg(feature = "deno")]
     Deno,
 }
 
@@ -32,48 +26,36 @@ impl Ecosystem {
         &[
             Ecosystem::Npm,
             Ecosystem::Pypi,
-            #[cfg(feature = "cargo")]
             Ecosystem::Cargo,
             Ecosystem::Gem,
-            #[cfg(feature = "golang")]
             Ecosystem::Golang,
-            #[cfg(feature = "maven")]
             Ecosystem::Maven,
-            #[cfg(feature = "composer")]
             Ecosystem::Composer,
-            #[cfg(feature = "nuget")]
             Ecosystem::Nuget,
-            #[cfg(feature = "deno")]
             Ecosystem::Deno,
         ]
     }
 
     /// Match a PURL string to its ecosystem.
     pub fn from_purl(purl: &str) -> Option<Self> {
-        #[cfg(feature = "cargo")]
         if purl.starts_with("pkg:cargo/") {
             return Some(Ecosystem::Cargo);
         }
         if purl.starts_with("pkg:gem/") {
             return Some(Ecosystem::Gem);
         }
-        #[cfg(feature = "golang")]
         if purl.starts_with("pkg:golang/") {
             return Some(Ecosystem::Golang);
         }
-        #[cfg(feature = "maven")]
         if purl.starts_with("pkg:maven/") {
             return Some(Ecosystem::Maven);
         }
-        #[cfg(feature = "composer")]
         if purl.starts_with("pkg:composer/") {
             return Some(Ecosystem::Composer);
         }
-        #[cfg(feature = "nuget")]
         if purl.starts_with("pkg:nuget/") {
             return Some(Ecosystem::Nuget);
         }
-        #[cfg(feature = "deno")]
         if purl.starts_with("pkg:jsr/") {
             return Some(Ecosystem::Deno);
         }
@@ -91,18 +73,12 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "pypi",
-            #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
             Ecosystem::Gem => "gem",
-            #[cfg(feature = "golang")]
             Ecosystem::Golang => "golang",
-            #[cfg(feature = "maven")]
             Ecosystem::Maven => "maven",
-            #[cfg(feature = "composer")]
             Ecosystem::Composer => "composer",
-            #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
-            #[cfg(feature = "deno")]
             Ecosystem::Deno => "deno",
         }
     }
@@ -123,12 +99,7 @@ impl Ecosystem {
     /// out to every variant (release-variant ecosystems) or to match
     /// PURLs 1:1 (everything else).
     pub fn supports_release_variants(&self) -> bool {
-        match self {
-            Ecosystem::Pypi | Ecosystem::Gem => true,
-            #[cfg(feature = "maven")]
-            Ecosystem::Maven => true,
-            _ => false,
-        }
+        matches!(self, Ecosystem::Pypi | Ecosystem::Gem | Ecosystem::Maven)
     }
 
     /// Human-readable name for user-facing messages.
@@ -136,18 +107,12 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "python",
-            #[cfg(feature = "cargo")]
             Ecosystem::Cargo => "cargo",
             Ecosystem::Gem => "ruby",
-            #[cfg(feature = "golang")]
             Ecosystem::Golang => "go",
-            #[cfg(feature = "maven")]
             Ecosystem::Maven => "maven",
-            #[cfg(feature = "composer")]
             Ecosystem::Composer => "php",
-            #[cfg(feature = "nuget")]
             Ecosystem::Nuget => "nuget",
-            #[cfg(feature = "deno")]
             Ecosystem::Deno => "deno",
         }
     }
@@ -267,12 +232,10 @@ mod tests {
         assert_eq!(Ecosystem::Pypi.display_name(), "python");
         assert_eq!(Ecosystem::Gem.cli_name(), "gem");
         assert_eq!(Ecosystem::Gem.display_name(), "ruby");
-        #[cfg(feature = "golang")]
         {
             assert_eq!(Ecosystem::Golang.cli_name(), "golang");
             assert_eq!(Ecosystem::Golang.display_name(), "go");
         }
-        #[cfg(feature = "composer")]
         {
             assert_eq!(Ecosystem::Composer.cli_name(), "composer");
             assert_eq!(Ecosystem::Composer.display_name(), "php");
@@ -290,7 +253,6 @@ mod tests {
             // A synthetic PURL built from the type re-classifies to itself.
             // Deno is the one type whose PURL token (`jsr`) differs from its
             // cli_name (`deno`), so it is exercised separately below.
-            #[cfg(feature = "deno")]
             if *eco == Ecosystem::Deno {
                 continue;
             }
@@ -304,7 +266,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cargo")]
     #[test]
     fn test_from_purl_cargo() {
         assert_eq!(
@@ -318,27 +279,21 @@ mod tests {
         let all = Ecosystem::all();
         #[allow(unused_mut)]
         let mut expected = 3;
-        #[cfg(feature = "cargo")]
         {
             expected += 1;
         }
-        #[cfg(feature = "golang")]
         {
             expected += 1;
         }
-        #[cfg(feature = "maven")]
         {
             expected += 1;
         }
-        #[cfg(feature = "composer")]
         {
             expected += 1;
         }
-        #[cfg(feature = "nuget")]
         {
             expected += 1;
         }
-        #[cfg(feature = "deno")]
         {
             expected += 1;
         }
@@ -357,7 +312,6 @@ mod tests {
         assert_eq!(Ecosystem::Pypi.display_name(), "python");
     }
 
-    #[cfg(feature = "cargo")]
     #[test]
     fn test_cargo_properties() {
         assert_eq!(Ecosystem::Cargo.cli_name(), "cargo");
@@ -369,23 +323,16 @@ mod tests {
         // Multi-artifact ecosystems.
         assert!(Ecosystem::Pypi.supports_release_variants());
         assert!(Ecosystem::Gem.supports_release_variants());
-        #[cfg(feature = "maven")]
         assert!(Ecosystem::Maven.supports_release_variants());
         // Single-artifact ecosystems.
         assert!(!Ecosystem::Npm.supports_release_variants());
-        #[cfg(feature = "cargo")]
         assert!(!Ecosystem::Cargo.supports_release_variants());
-        #[cfg(feature = "nuget")]
         assert!(!Ecosystem::Nuget.supports_release_variants());
-        #[cfg(feature = "golang")]
         assert!(!Ecosystem::Golang.supports_release_variants());
-        #[cfg(feature = "composer")]
         assert!(!Ecosystem::Composer.supports_release_variants());
-        #[cfg(feature = "deno")]
         assert!(!Ecosystem::Deno.supports_release_variants());
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_from_purl_deno_jsr() {
         // JSR packages use the `pkg:jsr/` type but route to Ecosystem::Deno.
@@ -400,7 +347,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "deno")]
     #[test]
     fn test_deno_properties() {
         assert_eq!(Ecosystem::Deno.cli_name(), "deno");
@@ -421,7 +367,6 @@ mod tests {
         assert_eq!(Ecosystem::Gem.display_name(), "ruby");
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_from_purl_maven() {
         assert_eq!(
@@ -430,14 +375,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "maven")]
     #[test]
     fn test_maven_properties() {
         assert_eq!(Ecosystem::Maven.cli_name(), "maven");
         assert_eq!(Ecosystem::Maven.display_name(), "maven");
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_from_purl_golang() {
         assert_eq!(
@@ -446,14 +389,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "golang")]
     #[test]
     fn test_golang_properties() {
         assert_eq!(Ecosystem::Golang.cli_name(), "golang");
         assert_eq!(Ecosystem::Golang.display_name(), "go");
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_from_purl_composer() {
         assert_eq!(
@@ -462,14 +403,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "composer")]
     #[test]
     fn test_composer_properties() {
         assert_eq!(Ecosystem::Composer.cli_name(), "composer");
         assert_eq!(Ecosystem::Composer.display_name(), "php");
     }
 
-    #[cfg(feature = "nuget")]
     #[test]
     fn test_from_purl_nuget() {
         assert_eq!(
@@ -478,7 +417,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "nuget")]
     #[test]
     fn test_nuget_properties() {
         assert_eq!(Ecosystem::Nuget.cli_name(), "nuget");
@@ -491,7 +429,6 @@ mod tests {
     /// classify→cli_name chain must still land on `"deno"` or
     /// `--ecosystems deno` would silently drop every JSR package. The
     /// existing tests pin the two halves separately; this pins the join.
-    #[cfg(feature = "deno")]
     #[test]
     fn test_jsr_purl_classifies_to_deno_cli_token() {
         assert_eq!(
@@ -501,40 +438,34 @@ mod tests {
     }
 
     /// `test_from_purl_ignores_qualifiers` only exercises npm/pypi/gem.
-    /// The feature-gated ecosystems carry qualifiers in the wild too
+    /// The remaining ecosystems carry qualifiers in the wild too
     /// (`?repository_url=` for jsr/maven, `?classifier=&ext=` for maven,
     /// version-suffixed module paths for go), and classification must
     /// still key off the type prefix alone.
     #[test]
-    fn test_from_purl_ignores_qualifiers_feature_gated() {
-        #[cfg(feature = "cargo")]
+    fn test_from_purl_ignores_qualifiers_other_ecosystems() {
         assert_eq!(
             Ecosystem::from_purl("pkg:cargo/serde@1.0.200?foo=bar"),
             Some(Ecosystem::Cargo)
         );
-        #[cfg(feature = "maven")]
         assert_eq!(
             Ecosystem::from_purl(
                 "pkg:maven/org.apache.commons/commons-lang3@3.12.0?classifier=sources&ext=jar"
             ),
             Some(Ecosystem::Maven)
         );
-        #[cfg(feature = "golang")]
         assert_eq!(
             Ecosystem::from_purl("pkg:golang/github.com/go-redis/cache/v9@v9.0.0?foo=bar"),
             Some(Ecosystem::Golang)
         );
-        #[cfg(feature = "composer")]
         assert_eq!(
             Ecosystem::from_purl("pkg:composer/monolog/monolog@3.5.0?dev=true"),
             Some(Ecosystem::Composer)
         );
-        #[cfg(feature = "nuget")]
         assert_eq!(
             Ecosystem::from_purl("pkg:nuget/Newtonsoft.Json@13.0.3?foo=bar"),
             Some(Ecosystem::Nuget)
         );
-        #[cfg(feature = "deno")]
         assert_eq!(
             Ecosystem::from_purl("pkg:jsr/@std/path@0.220.0?repository_url=https://jsr.io"),
             Some(Ecosystem::Deno)

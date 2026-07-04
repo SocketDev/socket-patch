@@ -47,26 +47,19 @@ pub mod state;
 
 mod berry_zip;
 pub mod bun_lock;
-#[cfg(feature = "cargo")]
 pub mod cargo;
-#[cfg(feature = "cargo")]
 pub mod cargo_config;
-#[cfg(feature = "cargo")]
 pub(crate) mod cargo_lock;
 pub(crate) mod common;
-#[cfg(feature = "composer")]
 pub mod composer_lock;
 pub mod gem;
-#[cfg(feature = "golang")]
 pub mod golang;
 pub mod lock_inventory;
-#[cfg(feature = "maven")]
 pub mod maven_repo;
 mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
 mod npm_pack;
-#[cfg(feature = "nuget")]
 pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pypi;

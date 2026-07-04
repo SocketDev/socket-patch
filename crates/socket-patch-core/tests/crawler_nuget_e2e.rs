@@ -6,8 +6,6 @@
 //! hidden-dir skip, `get_nuget_package_paths` discovery branches —
 //! goes uncovered without these tests.
 
-#![cfg(feature = "nuget")]
-
 use std::path::Path;
 
 use serial_test::serial;

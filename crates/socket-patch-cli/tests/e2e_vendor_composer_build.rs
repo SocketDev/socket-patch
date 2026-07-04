@@ -1,4 +1,3 @@
-#![cfg(feature = "composer")]
 //! Real-composer capstone e2e for `socket-patch vendor` — the composer
 //! committability proof on the HOST toolchain (the docker twin is
 //! `docker_e2e_vendor_composer.rs`; this suite adds coverage on developer/CI
